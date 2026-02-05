@@ -1,0 +1,102 @@
+{
+  "_doc": "Custom tool filter mode test vectors. Tests include/exclude logic with explicit cluster and tool lists.",
+  "vectors": [
+    {
+      "desc": "Custom include: by cluster",
+      "filter_enabled": true,
+      "profile": "custom",
+      "mode": "include",
+      "clusters": ["messaging"],
+      "tools": ["health_check"],
+      "cases": [
+        {"tool": "send_message", "cluster": "messaging", "expected": true, "_note": "Included by cluster"},
+        {"tool": "fetch_inbox", "cluster": "messaging", "expected": true, "_note": "Included by cluster"},
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true, "_note": "Included by tool name"},
+        {"tool": "file_reservation_paths", "cluster": "file_reservations", "expected": false, "_note": "Not in either list"}
+      ]
+    },
+    {
+      "desc": "Custom include: by tool name only (no clusters)",
+      "filter_enabled": true,
+      "profile": "custom",
+      "mode": "include",
+      "clusters": [],
+      "tools": ["send_message", "fetch_inbox"],
+      "cases": [
+        {"tool": "send_message", "cluster": "messaging", "expected": true, "_note": "In tools list"},
+        {"tool": "fetch_inbox", "cluster": "messaging", "expected": true, "_note": "In tools list"},
+        {"tool": "reply_message", "cluster": "messaging", "expected": false, "_note": "Not in tools list even though same cluster"}
+      ]
+    },
+    {
+      "desc": "Custom exclude: by cluster",
+      "filter_enabled": true,
+      "profile": "custom",
+      "mode": "exclude",
+      "clusters": ["file_reservations", "build_slots"],
+      "tools": [],
+      "cases": [
+        {"tool": "send_message", "cluster": "messaging", "expected": true, "_note": "Not in exclude list"},
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true, "_note": "Not in exclude list"},
+        {"tool": "file_reservation_paths", "cluster": "file_reservations", "expected": false, "_note": "In exclude cluster list"},
+        {"tool": "acquire_build_slot", "cluster": "build_slots", "expected": false, "_note": "In exclude cluster list"}
+      ]
+    },
+    {
+      "desc": "Custom exclude: by tool name",
+      "filter_enabled": true,
+      "profile": "custom",
+      "mode": "exclude",
+      "clusters": [],
+      "tools": ["search_messages", "summarize_thread"],
+      "cases": [
+        {"tool": "send_message", "cluster": "messaging", "expected": true, "_note": "Not excluded"},
+        {"tool": "search_messages", "cluster": "search", "expected": false, "_note": "In exclude tools list"},
+        {"tool": "summarize_thread", "cluster": "search", "expected": false, "_note": "In exclude tools list"}
+      ]
+    },
+    {
+      "desc": "Custom with empty clusters AND tools: expose all",
+      "filter_enabled": true,
+      "profile": "custom",
+      "mode": "include",
+      "clusters": [],
+      "tools": [],
+      "cases": [
+        {"tool": "any_tool", "cluster": "any_cluster", "expected": true},
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true}
+      ],
+      "_note": "Empty lists = no filtering applied"
+    },
+    {
+      "desc": "Custom include: clusters + tools combined (OR logic)",
+      "filter_enabled": true,
+      "profile": "custom",
+      "mode": "include",
+      "clusters": ["identity"],
+      "tools": ["send_message", "search_messages"],
+      "cases": [
+        {"tool": "register_agent", "cluster": "identity", "expected": true, "_note": "Included by cluster"},
+        {"tool": "create_agent_identity", "cluster": "identity", "expected": true, "_note": "Included by cluster"},
+        {"tool": "send_message", "cluster": "messaging", "expected": true, "_note": "Included by tool name"},
+        {"tool": "search_messages", "cluster": "search", "expected": true, "_note": "Included by tool name"},
+        {"tool": "fetch_inbox", "cluster": "messaging", "expected": false, "_note": "Not in cluster or tools list"},
+        {"tool": "file_reservation_paths", "cluster": "file_reservations", "expected": false}
+      ]
+    },
+    {
+      "desc": "Custom exclude: clusters + tools combined (OR logic for exclusion)",
+      "filter_enabled": true,
+      "profile": "custom",
+      "mode": "exclude",
+      "clusters": ["build_slots"],
+      "tools": ["summarize_thread"],
+      "cases": [
+        {"tool": "send_message", "cluster": "messaging", "expected": true},
+        {"tool": "acquire_build_slot", "cluster": "build_slots", "expected": false, "_note": "Excluded by cluster"},
+        {"tool": "summarize_thread", "cluster": "search", "expected": false, "_note": "Excluded by tool name"},
+        {"tool": "search_messages", "cluster": "search", "expected": true, "_note": "Same cluster but not in tools list"}
+      ]
+    }
+  ]
+}

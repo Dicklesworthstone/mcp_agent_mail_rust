@@ -2521,3 +2521,162 @@ See `crates/mcp-agent-mail-tools/tests/fixtures/llm/` for:
 - `summarize_responses.json`: mock LLM responses for thread summarization
 
 *LLM spec added by CoralBadger | 2026-02-05*
+
+---
+
+## Tool Filtering Profiles
+
+### Overview
+
+Optional context-reduction system that limits which MCP tools are exposed to clients. Applied once at server startup by removing tools from the registry. Disabled by default.
+
+### Environment Variables
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `TOOLS_FILTER_ENABLED` | `"false"` | bool | Master switch for tool filtering |
+| `TOOLS_FILTER_PROFILE` | `"full"` | str | Preset profile name |
+| `TOOLS_FILTER_MODE` | `"include"` | str | For custom profile: `"include"` or `"exclude"` |
+| `TOOLS_FILTER_CLUSTERS` | `""` | CSV | Cluster names for custom profile |
+| `TOOLS_FILTER_TOOLS` | `""` | CSV | Specific tool names for custom profile |
+
+### ToolFilterSettings
+
+```
+ToolFilterSettings:
+  enabled: bool           # default: false
+  profile: str            # default: "full" (full|core|minimal|messaging|custom)
+  mode: str               # default: "include" (include|exclude) - only for custom
+  clusters: Vec<String>   # CSV-parsed cluster names
+  tools: Vec<String>      # CSV-parsed tool names
+```
+
+**Validation**:
+- `profile`: normalize to lowercase, valid values: `full`, `core`, `minimal`, `messaging`, `custom`. Invalid → `"full"`.
+- `mode`: normalize to lowercase, valid values: `include`, `exclude`. Invalid → `"include"`.
+- `clusters` and `tools`: CSV split, trim whitespace, filter empty strings.
+
+### Cluster Constants
+
+| Constant | Value |
+|----------|-------|
+| `CLUSTER_SETUP` | `"infrastructure"` |
+| `CLUSTER_IDENTITY` | `"identity"` |
+| `CLUSTER_MESSAGING` | `"messaging"` |
+| `CLUSTER_CONTACT` | `"contact"` |
+| `CLUSTER_SEARCH` | `"search"` |
+| `CLUSTER_FILE_RESERVATIONS` | `"file_reservations"` |
+| `CLUSTER_MACROS` | `"workflow_macros"` |
+| `CLUSTER_BUILD_SLOTS` | `"build_slots"` |
+| `CLUSTER_PRODUCT` | `"product_bus"` |
+
+### Profile Definitions
+
+#### `full` — All tools (default)
+```
+clusters: []    # empty = no cluster-based filtering
+tools: []
+```
+Special: Empty clusters list means "all clusters allowed".
+
+#### `core` — Essential agent workflow tools
+```
+clusters: [identity, messaging, file_reservations, workflow_macros]
+tools: [health_check, ensure_project]
+```
+
+#### `minimal` — Bare minimum for message passing
+```
+clusters: []    # empty = no cluster-based inclusion
+tools: [health_check, ensure_project, register_agent, send_message, fetch_inbox, acknowledge_message]
+```
+Special: With empty clusters and non-empty tools, only explicit tool names pass.
+
+#### `messaging` — Messaging-focused subset
+```
+clusters: [identity, messaging, contact]
+tools: [health_check, ensure_project, search_messages]
+```
+
+### Decision Logic: _should_expose_tool
+
+```
+fn should_expose_tool(tool_name, cluster, settings) -> bool:
+    if !settings.tool_filter.enabled:
+        return true    # No filtering, expose all
+
+    profile = settings.tool_filter.profile
+
+    if profile == "custom":
+        clusters_list = settings.tool_filter.clusters
+        tools_list = settings.tool_filter.tools
+
+        if clusters_list.is_empty() && tools_list.is_empty():
+            return true    # No explicit filters, expose all
+
+        in_cluster = !clusters_list.is_empty() && clusters_list.contains(cluster)
+        in_tools = !tools_list.is_empty() && tools_list.contains(tool_name)
+
+        if mode == "include":
+            return in_cluster || in_tools
+        else:  # exclude
+            return !(in_cluster || in_tools)
+
+    if profile == "full":
+        return true
+
+    profile_def = PROFILES.get(profile)
+    if profile_def.is_none():
+        return true    # Unknown profile defaults to expose
+
+    profile_clusters = profile_def.clusters
+    profile_tools = profile_def.tools
+
+    if !profile_clusters.is_empty() && profile_clusters.contains(cluster):
+        return true
+    if !profile_tools.is_empty() && profile_tools.contains(tool_name):
+        return true
+
+    # Only filter out if the profile has explicit lists
+    return !(profile_clusters.has_entries() || profile_tools.has_entries())
+```
+
+### Application: _apply_tool_filter
+
+Called once at server startup after all tools are registered:
+
+1. Access FastMCP's internal tool registry (`_tool_manager._tools` dict)
+2. For each registered tool, call `_should_expose_tool()`
+3. Remove tools that return `false`
+4. Also remove from `TOOL_CLUSTER_MAP` and `TOOL_METADATA`
+5. Log: `"Tool filtering active (profile={profile}): removed {count} tools, {remaining} tools exposed"`
+
+### Startup Logging
+
+When filtering is active and tools are removed:
+```
+logger.info(
+    f"Tool filtering active (profile={profile}): removed {removed_count} tools, "
+    f"{exposed_count} tools exposed"
+)
+```
+
+### Config Fields in Rust
+
+```rust
+pub struct ToolFilterSettings {
+    pub enabled: bool,           // default: false
+    pub profile: String,         // default: "full"
+    pub mode: String,            // default: "include"
+    pub clusters: Vec<String>,   // default: []
+    pub tools: Vec<String>,      // default: []
+}
+```
+
+### Test Vectors
+
+See `crates/mcp-agent-mail-conformance/tests/conformance/fixtures/tool_filter/` for:
+- `profiles.json`: profile definitions with expected tool exposure results
+- `custom_filter.json`: custom mode include/exclude test cases
+
+*Tool filtering spec added by CoralBadger | 2026-02-05*

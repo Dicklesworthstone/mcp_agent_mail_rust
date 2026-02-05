@@ -1,0 +1,118 @@
+{
+  "_doc": "Tool filtering profile definitions and expected exposure results. Tests _should_expose_tool() for predefined profiles.",
+  "cluster_constants": {
+    "infrastructure": "infrastructure",
+    "identity": "identity",
+    "messaging": "messaging",
+    "contact": "contact",
+    "search": "search",
+    "file_reservations": "file_reservations",
+    "workflow_macros": "workflow_macros",
+    "build_slots": "build_slots",
+    "product_bus": "product_bus"
+  },
+  "profiles": {
+    "full": {
+      "clusters": [],
+      "tools": [],
+      "_note": "Empty clusters = all clusters allowed. All tools exposed."
+    },
+    "core": {
+      "clusters": ["identity", "messaging", "file_reservations", "workflow_macros"],
+      "tools": ["health_check", "ensure_project"]
+    },
+    "minimal": {
+      "clusters": [],
+      "tools": ["health_check", "ensure_project", "register_agent", "send_message", "fetch_inbox", "acknowledge_message"],
+      "_note": "Empty clusters means no cluster-based inclusion; only explicit tool names."
+    },
+    "messaging": {
+      "clusters": ["identity", "messaging", "contact"],
+      "tools": ["health_check", "ensure_project", "search_messages"]
+    }
+  },
+  "vectors": [
+    {
+      "desc": "Filtering disabled: all tools exposed",
+      "filter_enabled": false,
+      "profile": "full",
+      "cases": [
+        {"tool": "any_tool", "cluster": "any_cluster", "expected": true},
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true},
+        {"tool": "send_message", "cluster": "messaging", "expected": true}
+      ]
+    },
+    {
+      "desc": "Full profile: all tools exposed",
+      "filter_enabled": true,
+      "profile": "full",
+      "cases": [
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true},
+        {"tool": "send_message", "cluster": "messaging", "expected": true},
+        {"tool": "file_reservation_paths", "cluster": "file_reservations", "expected": true},
+        {"tool": "search_messages", "cluster": "search", "expected": true}
+      ]
+    },
+    {
+      "desc": "Core profile: identity + messaging + file_reservations + macros + named tools",
+      "filter_enabled": true,
+      "profile": "core",
+      "cases": [
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true, "_note": "In profile tools list"},
+        {"tool": "ensure_project", "cluster": "infrastructure", "expected": true, "_note": "In profile tools list"},
+        {"tool": "register_agent", "cluster": "identity", "expected": true, "_note": "identity cluster"},
+        {"tool": "send_message", "cluster": "messaging", "expected": true, "_note": "messaging cluster"},
+        {"tool": "fetch_inbox", "cluster": "messaging", "expected": true, "_note": "messaging cluster"},
+        {"tool": "file_reservation_paths", "cluster": "file_reservations", "expected": true, "_note": "file_reservations cluster"},
+        {"tool": "macro_start_session", "cluster": "workflow_macros", "expected": true, "_note": "macros cluster"},
+        {"tool": "search_messages", "cluster": "search", "expected": false, "_note": "search cluster not in core"},
+        {"tool": "set_contact_policy", "cluster": "contact", "expected": false, "_note": "contact cluster not in core"},
+        {"tool": "acquire_build_slot", "cluster": "build_slots", "expected": false, "_note": "build_slots not in core"}
+      ]
+    },
+    {
+      "desc": "Minimal profile: only 6 specific tools",
+      "filter_enabled": true,
+      "profile": "minimal",
+      "cases": [
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true},
+        {"tool": "ensure_project", "cluster": "infrastructure", "expected": true},
+        {"tool": "register_agent", "cluster": "identity", "expected": true},
+        {"tool": "send_message", "cluster": "messaging", "expected": true},
+        {"tool": "fetch_inbox", "cluster": "messaging", "expected": true},
+        {"tool": "acknowledge_message", "cluster": "messaging", "expected": true},
+        {"tool": "reply_message", "cluster": "messaging", "expected": false, "_note": "Not in minimal tools list"},
+        {"tool": "search_messages", "cluster": "search", "expected": false},
+        {"tool": "file_reservation_paths", "cluster": "file_reservations", "expected": false},
+        {"tool": "macro_start_session", "cluster": "workflow_macros", "expected": false}
+      ]
+    },
+    {
+      "desc": "Messaging profile: identity + messaging + contact clusters + named tools",
+      "filter_enabled": true,
+      "profile": "messaging",
+      "cases": [
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true, "_note": "In profile tools list"},
+        {"tool": "ensure_project", "cluster": "infrastructure", "expected": true, "_note": "In profile tools list"},
+        {"tool": "search_messages", "cluster": "search", "expected": true, "_note": "In profile tools list"},
+        {"tool": "register_agent", "cluster": "identity", "expected": true, "_note": "identity cluster"},
+        {"tool": "send_message", "cluster": "messaging", "expected": true, "_note": "messaging cluster"},
+        {"tool": "fetch_inbox", "cluster": "messaging", "expected": true, "_note": "messaging cluster"},
+        {"tool": "set_contact_policy", "cluster": "contact", "expected": true, "_note": "contact cluster"},
+        {"tool": "request_contact", "cluster": "contact", "expected": true, "_note": "contact cluster"},
+        {"tool": "file_reservation_paths", "cluster": "file_reservations", "expected": false, "_note": "file_reservations not in messaging"},
+        {"tool": "macro_start_session", "cluster": "workflow_macros", "expected": false}
+      ]
+    },
+    {
+      "desc": "Unknown profile: defaults to expose all",
+      "filter_enabled": true,
+      "profile": "nonexistent",
+      "cases": [
+        {"tool": "any_tool", "cluster": "any_cluster", "expected": true},
+        {"tool": "health_check", "cluster": "infrastructure", "expected": true}
+      ],
+      "_note": "Invalid profile falls back to 'full' during config parsing"
+    }
+  ]
+}
