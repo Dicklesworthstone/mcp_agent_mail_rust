@@ -1,0 +1,557 @@
+{
+  "source": "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/cli.py",
+  "generated_at": "2026-02-05",
+  "commands": [
+    {
+      "command": "products ensure",
+      "args": [
+        {"name": "product_key", "required": false, "default": null}
+      ],
+      "options": [
+        {"flags": ["--name", "-n"], "required": false, "default": null}
+      ],
+      "env": ["HTTP_HOST", "HTTP_PORT", "HTTP_PATH", "HTTP_BEARER_TOKEN"],
+      "exit_codes": []
+    },
+    {
+      "command": "products link",
+      "args": [
+        {"name": "product_key", "required": true, "default": null},
+        {"name": "project", "required": true, "default": null}
+      ],
+      "options": [],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "products status",
+      "args": [
+        {"name": "product_key", "required": true, "default": null}
+      ],
+      "options": [],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "products search",
+      "args": [
+        {"name": "product_key", "required": true, "default": null},
+        {"name": "query", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--limit", "-l"], "required": false, "default": 20}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "products inbox",
+      "args": [
+        {"name": "product_key", "required": true, "default": null},
+        {"name": "agent", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--limit", "-l"], "required": false, "default": 20},
+        {"flags": ["--urgent-only", "--all"], "required": false, "default": false},
+        {"flags": ["--include-bodies", "--no-bodies"], "required": false, "default": false},
+        {"flags": ["--since-ts"], "required": false, "default": null}
+      ],
+      "env": ["HTTP_HOST", "HTTP_PORT", "HTTP_PATH", "HTTP_BEARER_TOKEN"],
+      "exit_codes": []
+    },
+    {
+      "command": "products summarize-thread",
+      "args": [
+        {"name": "product_key", "required": true, "default": null},
+        {"name": "thread_id", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--per-thread-limit", "-n"], "required": false, "default": 50},
+        {"flags": ["--no-llm"], "required": false, "default": false}
+      ],
+      "env": ["HTTP_HOST", "HTTP_PORT", "HTTP_PATH", "HTTP_BEARER_TOKEN"],
+      "exit_codes": [
+        {"code": 2, "when": "server unavailable for summarize_thread_product"}
+      ]
+    },
+    {
+      "command": "serve-http",
+      "args": [],
+      "options": [
+        {"flags": ["--host"], "required": false, "default": null, "env_default": "HTTP_HOST"},
+        {"flags": ["--port"], "required": false, "default": null, "env_default": "HTTP_PORT"},
+        {"flags": ["--path"], "required": false, "default": null, "env_default": "HTTP_PATH"}
+      ],
+      "env": ["HTTP_HOST", "HTTP_PORT", "HTTP_PATH"],
+      "exit_codes": []
+    },
+    {
+      "command": "serve-stdio",
+      "args": [],
+      "options": [],
+      "env": ["TOOLS_LOG_ENABLED", "LOG_RICH_ENABLED"],
+      "exit_codes": []
+    },
+    {
+      "command": "lint",
+      "args": [],
+      "options": [],
+      "env": [],
+      "exit_codes": [
+        {"code": "nonzero", "when": "ruff returns nonzero"}
+      ]
+    },
+    {
+      "command": "typecheck",
+      "args": [],
+      "options": [],
+      "env": [],
+      "exit_codes": [
+        {"code": "nonzero", "when": "type checker returns nonzero"}
+      ]
+    },
+    {
+      "command": "share export",
+      "args": [],
+      "options": [
+        {"flags": ["--output", "-o"], "required": true, "default": null},
+        {"flags": ["--interactive", "-i"], "required": false, "default": false},
+        {"flags": ["--project", "-p"], "required": false, "default": []},
+        {"flags": ["--inline-threshold"], "required": false, "default": 65536},
+        {"flags": ["--detach-threshold"], "required": false, "default": 26214400},
+        {"flags": ["--scrub-preset"], "required": false, "default": "standard"},
+        {"flags": ["--chunk-threshold"], "required": false, "default": 20971520},
+        {"flags": ["--chunk-size"], "required": false, "default": 4194304},
+        {"flags": ["--dry-run", "--no-dry-run"], "required": false, "default": false},
+        {"flags": ["--zip", "--no-zip"], "required": false, "default": true},
+        {"flags": ["--signing-key"], "required": false, "default": null},
+        {"flags": ["--signing-public-out"], "required": false, "default": null},
+        {"flags": ["--age-recipient"], "required": false, "default": []}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "invalid scrub preset or output path errors"}
+      ]
+    },
+    {
+      "command": "share update",
+      "args": [
+        {"name": "bundle", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--project", "-p"], "required": false, "default": []},
+        {"flags": ["--inline-threshold"], "required": false, "default": null},
+        {"flags": ["--detach-threshold"], "required": false, "default": null},
+        {"flags": ["--chunk-threshold"], "required": false, "default": null},
+        {"flags": ["--chunk-size"], "required": false, "default": null},
+        {"flags": ["--scrub-preset"], "required": false, "default": null},
+        {"flags": ["--zip", "--no-zip"], "required": false, "default": false},
+        {"flags": ["--signing-key"], "required": false, "default": null},
+        {"flags": ["--signing-public-out"], "required": false, "default": null},
+        {"flags": ["--age-recipient"], "required": false, "default": []}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "bundle/manifest missing or invalid overrides"}
+      ]
+    },
+    {
+      "command": "share preview",
+      "args": [
+        {"name": "bundle", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--host"], "required": false, "default": "127.0.0.1"},
+        {"flags": ["--port"], "required": false, "default": 9000},
+        {"flags": ["--open-browser", "--no-open-browser"], "required": false, "default": false}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "bundle path invalid"},
+        {"code": 42, "when": "deploy requested via preview UI"}
+      ]
+    },
+    {
+      "command": "share verify",
+      "args": [
+        {"name": "bundle", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--public-key"], "required": false, "default": null}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "verification fails"}
+      ]
+    },
+    {
+      "command": "share decrypt",
+      "args": [
+        {"name": "encrypted_path", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--output", "-o"], "required": false, "default": null},
+        {"flags": ["--identity", "-i"], "required": false, "default": null},
+        {"flags": ["--passphrase", "-p"], "required": false, "default": false}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "decrypt fails or bad paths"}
+      ]
+    },
+    {
+      "command": "share wizard",
+      "args": [],
+      "options": [],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "archive save",
+      "args": [],
+      "options": [
+        {"flags": ["--project", "-p"], "required": false, "default": []},
+        {"flags": ["--scrub-preset"], "required": false, "default": "archive"},
+        {"flags": ["--label", "-l"], "required": false, "default": null}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "invalid preset or archive creation failure"}
+      ]
+    },
+    {
+      "command": "archive list",
+      "args": [],
+      "options": [
+        {"flags": ["--limit", "-n"], "required": false, "default": 0},
+        {"flags": ["--json"], "required": false, "default": false}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 0, "when": "no archives found"}
+      ]
+    },
+    {
+      "command": "archive restore",
+      "args": [
+        {"name": "archive_file", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--force", "-f"], "required": false, "default": false},
+        {"flags": ["--dry-run"], "required": false, "default": false}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "archive missing or restore fails"}
+      ]
+    },
+    {
+      "command": "clear-and-reset-everything",
+      "args": [],
+      "options": [
+        {"flags": ["--force", "-f"], "required": false, "default": false},
+        {"flags": ["--archive", "--no-archive"], "required": false, "default": null}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "confirmation declined"}
+      ]
+    },
+    {
+      "command": "migrate",
+      "args": [],
+      "options": [],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "list-projects",
+      "args": [],
+      "options": [
+        {"flags": ["--include-agents"], "required": false, "default": false},
+        {"flags": ["--json"], "required": false, "default": false}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "guard install",
+      "args": [
+        {"name": "project", "required": true, "default": null},
+        {"name": "repo", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--prepush", "--no-prepush"], "required": false, "default": false}
+      ],
+      "env": ["WORKTREES_ENABLED"],
+      "exit_codes": []
+    },
+    {
+      "command": "guard uninstall",
+      "args": [
+        {"name": "repo", "required": true, "default": null}
+      ],
+      "options": [],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "guard status",
+      "args": [
+        {"name": "repo", "required": true, "default": null}
+      ],
+      "options": [],
+      "env": ["WORKTREES_ENABLED", "AGENT_MAIL_GUARD_MODE"],
+      "exit_codes": []
+    },
+    {
+      "command": "guard check",
+      "args": [],
+      "options": [
+        {"flags": ["--stdin-nul"], "required": false, "default": false},
+        {"flags": ["--advisory"], "required": false, "default": false},
+        {"flags": ["--repo"], "required": false, "default": null}
+      ],
+      "env": ["AGENT_NAME", "AGENT_MAIL_GUARD_MODE", "AGENT_MAIL_BYPASS"],
+      "exit_codes": [
+        {"code": 1, "when": "conflicts and not advisory"},
+        {"code": 0, "when": "no conflicts or advisory"}
+      ]
+    },
+    {
+      "command": "file_reservations list",
+      "args": [
+        {"name": "project", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--active-only", "--no-active-only"], "required": false, "default": true}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "file_reservations active",
+      "args": [
+        {"name": "project", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--limit"], "required": false, "default": 100}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "file_reservations soon",
+      "args": [
+        {"name": "project", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--minutes"], "required": false, "default": 30}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "acks pending",
+      "args": [
+        {"name": "project", "required": true, "default": null},
+        {"name": "agent", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--limit"], "required": false, "default": 20}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "acks remind",
+      "args": [
+        {"name": "project", "required": true, "default": null},
+        {"name": "agent", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--min-age-minutes"], "required": false, "default": 30},
+        {"flags": ["--limit"], "required": false, "default": 50}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "acks overdue",
+      "args": [
+        {"name": "project", "required": true, "default": null},
+        {"name": "agent", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--ttl-minutes"], "required": false, "default": 60},
+        {"flags": ["--limit"], "required": false, "default": 50}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "list-acks",
+      "args": [],
+      "options": [
+        {"flags": ["--project"], "required": true, "default": null},
+        {"flags": ["--agent"], "required": true, "default": null},
+        {"flags": ["--limit"], "required": false, "default": 20}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "config set-port",
+      "args": [
+        {"name": "port", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--env-file"], "required": false, "default": null}
+      ],
+      "env": ["HTTP_PORT"],
+      "exit_codes": [
+        {"code": 1, "when": "invalid port or write failure"}
+      ]
+    },
+    {
+      "command": "config show-port",
+      "args": [],
+      "options": [],
+      "env": ["HTTP_HOST", "HTTP_PORT", "HTTP_PATH"],
+      "exit_codes": []
+    },
+    {
+      "command": "amctl env",
+      "args": [],
+      "options": [
+        {"flags": ["--path", "-p"], "required": false, "default": "."},
+        {"flags": ["--agent", "-a"], "required": false, "default": null}
+      ],
+      "env": ["AGENT_NAME"],
+      "exit_codes": []
+    },
+    {
+      "command": "am-run",
+      "args": [
+        {"name": "slot", "required": true, "default": null},
+        {"name": "cmd...", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--path", "-p"], "required": false, "default": "."},
+        {"flags": ["--agent", "-a"], "required": false, "default": null},
+        {"flags": ["--ttl-seconds"], "required": false, "default": 3600},
+        {"flags": ["--shared", "--exclusive"], "required": false, "default": false},
+        {"flags": ["--block-on-conflicts", "--no-block-on-conflicts"], "required": false, "default": false}
+      ],
+      "env": ["AGENT_NAME", "AGENT_MAIL_GUARD_MODE"],
+      "exit_codes": [
+        {"code": 1, "when": "exclusive conflicts and --block-on-conflicts set"},
+        {"code": 127, "when": "command not found"},
+        {"code": "subprocess", "when": "child command returns nonzero"}
+      ]
+    },
+    {
+      "command": "projects mark-identity",
+      "args": [
+        {"name": "project_path", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--commit", "--no-commit"], "required": false, "default": true}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "projects discovery-init",
+      "args": [
+        {"name": "project_path", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--product", "-P"], "required": false, "default": null}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "projects adopt",
+      "args": [
+        {"name": "source", "required": true, "default": null},
+        {"name": "target", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--dry-run", "--apply"], "required": false, "default": true}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "mail status",
+      "args": [
+        {"name": "project_path", "required": true, "default": null}
+      ],
+      "options": [],
+      "env": ["WORKTREES_ENABLED", "PROJECT_IDENTITY_MODE", "PROJECT_IDENTITY_REMOTE"],
+      "exit_codes": []
+    },
+    {
+      "command": "docs insert-blurbs",
+      "args": [],
+      "options": [
+        {"flags": ["--scan-dir", "-d"], "required": false, "default": []},
+        {"flags": ["--yes"], "required": false, "default": false},
+        {"flags": ["--dry-run"], "required": false, "default": false},
+        {"flags": ["--max-depth"], "required": false, "default": 6}
+      ],
+      "env": [],
+      "exit_codes": [
+        {"code": 1, "when": "no valid scan roots"}
+      ]
+    },
+    {
+      "command": "doctor check",
+      "args": [
+        {"name": "project", "required": false, "default": null}
+      ],
+      "options": [
+        {"flags": ["--verbose", "-v"], "required": false, "default": false},
+        {"flags": ["--json"], "required": false, "default": false}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "doctor repair",
+      "args": [
+        {"name": "project", "required": false, "default": null}
+      ],
+      "options": [
+        {"flags": ["--dry-run"], "required": false, "default": false},
+        {"flags": ["--yes", "-y"], "required": false, "default": false},
+        {"flags": ["--backup-dir"], "required": false, "default": null}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "doctor backups",
+      "args": [],
+      "options": [
+        {"flags": ["--json"], "required": false, "default": false}
+      ],
+      "env": [],
+      "exit_codes": []
+    },
+    {
+      "command": "doctor restore",
+      "args": [
+        {"name": "backup_path", "required": true, "default": null}
+      ],
+      "options": [
+        {"flags": ["--dry-run"], "required": false, "default": false},
+        {"flags": ["--yes", "-y"], "required": false, "default": false}
+      ],
+      "env": [],
+      "exit_codes": []
+    }
+  ]
+}

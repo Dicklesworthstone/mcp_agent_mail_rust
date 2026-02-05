@@ -39,6 +39,8 @@ pub enum CliError {
     Guard(#[from] mcp_agent_mail_guard::GuardError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type CliResult<T> = Result<T, CliError>;
@@ -551,22 +553,28 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Guard { action } => handle_guard(action),
         Commands::FileReservations { action } => handle_file_reservations(action),
         Commands::Acks { action } => handle_acks(action),
-        Commands::ListAcks { .. } => Err(CliError::NotImplemented("list-acks")),
+        Commands::ListAcks {
+            project_key,
+            agent_name,
+            limit,
+        } => handle_list_acks(&project_key, &agent_name, limit),
         Commands::Archive { .. } => Err(CliError::NotImplemented("archive")),
         Commands::ServeHttp { host, port, path } => handle_serve_http(host, port, path),
         Commands::ServeStdio => handle_serve_stdio(),
-        Commands::Lint => Err(CliError::NotImplemented("lint")),
-        Commands::Typecheck => Err(CliError::NotImplemented("typecheck")),
-        Commands::Migrate => Err(CliError::NotImplemented("migrate")),
-        Commands::ListProjects { .. } => Err(CliError::NotImplemented("list-projects")),
-        Commands::ClearAndResetEverything { .. } => {
-            Err(CliError::NotImplemented("clear-and-reset-everything"))
-        }
-        Commands::Config { .. } => Err(CliError::NotImplemented("config")),
+        Commands::Lint => handle_lint(),
+        Commands::Typecheck => handle_typecheck(),
+        Commands::Migrate => handle_migrate(),
+        Commands::ListProjects { include_agents, json } => handle_list_projects(include_agents, json),
+        Commands::ClearAndResetEverything {
+            force,
+            archive,
+            no_archive,
+        } => handle_clear_and_reset(force, archive && !no_archive),
+        Commands::Config { action } => handle_config(action),
         Commands::Amctl { action } => handle_amctl(action),
         Commands::AmRun(args) => handle_am_run(args),
-        Commands::Projects { .. } => Err(CliError::NotImplemented("projects")),
-        Commands::Mail { .. } => Err(CliError::NotImplemented("mail")),
+        Commands::Projects { action } => handle_projects(action),
+        Commands::Mail { action } => handle_mail(action),
         Commands::Products { .. } => Err(CliError::NotImplemented("products")),
         Commands::Docs { .. } => Err(CliError::NotImplemented("docs")),
     }
@@ -690,7 +698,11 @@ fn build_http_config(host: Option<String>, port: Option<u16>, path: Option<Strin
 
 fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
     match action {
-        DoctorCommand::Check { .. } => Err(CliError::NotImplemented("doctor check")),
+        DoctorCommand::Check {
+            project,
+            verbose,
+            json,
+        } => handle_doctor_check(project, verbose, json),
         DoctorCommand::Repair { .. } => Err(CliError::NotImplemented("doctor repair")),
         DoctorCommand::Backups { .. } => Err(CliError::NotImplemented("doctor backups")),
         DoctorCommand::Restore { .. } => Err(CliError::NotImplemented("doctor restore")),
@@ -701,36 +713,818 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
     match action {
         GuardCommand::Install { project, repo, .. } => {
             mcp_agent_mail_guard::install_guard(&project, repo.as_path())?;
+            ftui_runtime::ftui_println!("Guard installed successfully.");
             Ok(())
         }
         GuardCommand::Uninstall { repo } => {
             mcp_agent_mail_guard::uninstall_guard(repo.as_path())?;
+            ftui_runtime::ftui_println!("Guard uninstalled successfully.");
             Ok(())
         }
-        GuardCommand::Status { .. } => Err(CliError::NotImplemented("guard status")),
-        GuardCommand::Check { .. } => Err(CliError::NotImplemented("guard check")),
+        GuardCommand::Status { repo } => {
+            let status = mcp_agent_mail_guard::guard_status(&repo)?;
+            ftui_runtime::ftui_println!("Guard Status:");
+            ftui_runtime::ftui_println!("  Hooks dir:       {}", status.hooks_dir);
+            ftui_runtime::ftui_println!("  Mode:            {:?}", status.guard_mode);
+            ftui_runtime::ftui_println!("  Worktrees:       {}", status.worktrees_enabled);
+            ftui_runtime::ftui_println!("  Pre-commit:      {}", if status.pre_commit_present { "installed" } else { "not installed" });
+            ftui_runtime::ftui_println!("  Pre-push:        {}", if status.pre_push_present { "installed" } else { "not installed" });
+            Ok(())
+        }
+        GuardCommand::Check {
+            stdin_nul,
+            advisory,
+            repo,
+        } => {
+            let repo_path = repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            // Read paths from stdin (null-separated or line-separated)
+            let input = {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf).unwrap_or(0);
+                buf
+            };
+            let paths: Vec<String> = if stdin_nul {
+                input.split('\0').filter(|s| !s.is_empty()).map(String::from).collect()
+            } else {
+                input.lines().filter(|s| !s.is_empty()).map(String::from).collect()
+            };
+
+            let conflicts = mcp_agent_mail_guard::guard_check(&repo_path, &paths, advisory)?;
+            if conflicts.is_empty() {
+                ftui_runtime::ftui_println!("No file reservation conflicts detected.");
+            } else {
+                for c in &conflicts {
+                    ftui_runtime::ftui_eprintln!(
+                        "CONFLICT: pattern '{}' held by {} (expires {})",
+                        c.pattern,
+                        c.holder,
+                        c.expires_ts
+                    );
+                }
+                if !advisory {
+                    return Err(CliError::ExitCode(1));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn handle_list_projects(include_agents: bool, json_output: bool) -> CliResult<()> {
+    let conn = open_db_sync()?;
+
+    let projects = conn
+        .query_sync(
+            "SELECT id, slug, human_key, created_at FROM projects ORDER BY id",
+            &[],
+        )
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+    if json_output {
+        let mut output: Vec<serde_json::Value> = Vec::new();
+        for row in &projects {
+
+            let id: i64 = row.get_named("id").unwrap_or(0);
+            let slug: String = row.get_named("slug").unwrap_or_default();
+            let human_key: String = row.get_named("human_key").unwrap_or_default();
+            let created_at: i64 = row.get_named("created_at").unwrap_or(0);
+
+            let mut entry = serde_json::json!({
+                "id": id,
+                "slug": slug,
+                "human_key": human_key,
+                "created_at": mcp_agent_mail_db::timestamps::micros_to_iso(created_at),
+            });
+
+            if include_agents {
+                let agents = conn
+                    .query_sync(
+                        "SELECT name, program, model FROM agents WHERE project_id = ?",
+                        &[sqlmodel_core::Value::BigInt(id)],
+                    )
+                    .unwrap_or_default();
+                let agent_list: Vec<serde_json::Value> = agents
+                    .iter()
+                    .map(|a| {
+                        let name: String = a.get_named("name").unwrap_or_default();
+                        let program: String = a.get_named("program").unwrap_or_default();
+                        let model: String = a.get_named("model").unwrap_or_default();
+                        serde_json::json!({ "name": name, "program": program, "model": model })
+                    })
+                    .collect();
+                entry.as_object_mut().unwrap().insert(
+                    "agents".to_string(),
+                    serde_json::json!(agent_list),
+                );
+            }
+            output.push(entry);
+        }
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string_pretty(&output).unwrap_or_default()
+        );
+    } else {
+        if projects.is_empty() {
+            ftui_runtime::ftui_println!("No projects found.");
+            return Ok(());
+        }
+        for row in &projects {
+
+            let id: i64 = row.get_named("id").unwrap_or(0);
+            let slug: String = row.get_named("slug").unwrap_or_default();
+            let human_key: String = row.get_named("human_key").unwrap_or_default();
+            ftui_runtime::ftui_println!("{:<4} {:<30} {}", id, slug, human_key);
+            if include_agents {
+                let agents = conn
+                    .query_sync(
+                        "SELECT name, program, model FROM agents WHERE project_id = ?",
+                        &[sqlmodel_core::Value::BigInt(id)],
+                    )
+                    .unwrap_or_default();
+                for a in &agents {
+                    let name: String = a.get_named("name").unwrap_or_default();
+                    let program: String = a.get_named("program").unwrap_or_default();
+                    let model: String = a.get_named("model").unwrap_or_default();
+                    ftui_runtime::ftui_println!("     -> {} ({}/{})", name, program, model);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open a synchronous SQLite connection for CLI commands.
+fn open_db_sync() -> CliResult<sqlmodel_sqlite::SqliteConnection> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path)
+        .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
+    // Run schema init so tables exist even if first use
+    let init_sql = mcp_agent_mail_db::schema::init_schema_sql();
+    conn.execute_raw(&init_sql)
+        .map_err(|e| CliError::Other(format!("schema init failed: {e}")))?;
+    Ok(conn)
+}
+
+fn handle_config(action: ConfigCommand) -> CliResult<()> {
+    match action {
+        ConfigCommand::ShowPort => {
+            let config = Config::from_env();
+            ftui_runtime::ftui_println!("{}", config.http_port);
+            Ok(())
+        }
+        ConfigCommand::SetPort { port, env_file } => {
+            let env_path = env_file.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(".env")
+            });
+            // Write or update the port in the env file
+            let content = if env_path.exists() {
+                let existing = std::fs::read_to_string(&env_path)
+                    .map_err(|e| CliError::Other(format!("Failed to read {}: {e}", env_path.display())))?;
+                let mut found = false;
+                let updated: Vec<String> = existing
+                    .lines()
+                    .map(|line: &str| {
+                        if line.starts_with("AGENT_MAIL_HTTP_PORT=") {
+                            found = true;
+                            format!("AGENT_MAIL_HTTP_PORT={port}")
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect();
+                if found {
+                    updated.join("\n")
+                } else {
+                    format!("{existing}\nAGENT_MAIL_HTTP_PORT={port}")
+                }
+            } else {
+                format!("AGENT_MAIL_HTTP_PORT={port}\n")
+            };
+            std::fs::write(&env_path, content)
+                .map_err(|e| CliError::Other(format!("Failed to write {}: {e}", env_path.display())))?;
+            ftui_runtime::ftui_println!("Port set to {} in {}", port, env_path.display());
+            Ok(())
+        }
     }
 }
 
 fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
+    let conn = open_db_sync()?;
+    let now_us = mcp_agent_mail_db::timestamps::now_micros();
+
     match action {
-        FileReservationsCommand::List { .. } => {
-            Err(CliError::NotImplemented("file_reservations list"))
+        FileReservationsCommand::List {
+            project,
+            active_only,
+            all,
+        } => {
+            let sql = if active_only {
+                "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                        fr.expires_ts, fr.released_ts, a.name AS agent_name \
+                 FROM file_reservations fr \
+                 JOIN agents a ON a.id = fr.agent_id \
+                 JOIN projects p ON p.id = fr.project_id \
+                 WHERE p.slug = ? AND fr.released_ts IS NULL AND fr.expires_ts > ? \
+                 ORDER BY fr.id"
+            } else if all {
+                "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                        fr.expires_ts, fr.released_ts, a.name AS agent_name \
+                 FROM file_reservations fr \
+                 JOIN agents a ON a.id = fr.agent_id \
+                 JOIN projects p ON p.id = fr.project_id \
+                 WHERE p.slug = ? \
+                 ORDER BY fr.id"
+            } else {
+                // Default: active (not released, not expired)
+                "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                        fr.expires_ts, fr.released_ts, a.name AS agent_name \
+                 FROM file_reservations fr \
+                 JOIN agents a ON a.id = fr.agent_id \
+                 JOIN projects p ON p.id = fr.project_id \
+                 WHERE p.slug = ? AND fr.released_ts IS NULL AND fr.expires_ts > ? \
+                 ORDER BY fr.id"
+            };
+            let params: Vec<sqlmodel_core::Value> = if active_only || (!all) {
+                vec![
+                    sqlmodel_core::Value::Text(project),
+                    sqlmodel_core::Value::BigInt(now_us),
+                ]
+            } else {
+                vec![sqlmodel_core::Value::Text(project)]
+            };
+            let rows = conn
+                .query_sync(sql, &params)
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            if rows.is_empty() {
+                ftui_runtime::ftui_println!("No file reservations found.");
+                return Ok(());
+            }
+            ftui_runtime::ftui_println!(
+                "{:<5} {:<30} {:<12} {:<20} {}",
+                "ID", "PATTERN", "AGENT", "EXPIRES", "REASON"
+            );
+            for r in &rows {
+                let id: i64 = r.get_named("id").unwrap_or(0);
+                let pattern: String = r.get_named("path_pattern").unwrap_or_default();
+                let agent: String = r.get_named("agent_name").unwrap_or_default();
+                let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+                let reason: String = r.get_named("reason").unwrap_or_default();
+                let expires_str = mcp_agent_mail_db::timestamps::micros_to_iso(expires);
+                ftui_runtime::ftui_println!(
+                    "{:<5} {:<30} {:<12} {:<20} {}",
+                    id, pattern, agent, &expires_str[..20.min(expires_str.len())], reason
+                );
+            }
+            Ok(())
         }
-        FileReservationsCommand::Active { .. } => {
-            Err(CliError::NotImplemented("file_reservations active"))
+        FileReservationsCommand::Active { project, limit } => {
+            let limit = limit.unwrap_or(50);
+            let rows = conn
+                .query_sync(
+                    "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                            fr.expires_ts, a.name AS agent_name \
+                     FROM file_reservations fr \
+                     JOIN agents a ON a.id = fr.agent_id \
+                     JOIN projects p ON p.id = fr.project_id \
+                     WHERE p.slug = ? AND fr.released_ts IS NULL AND fr.expires_ts > ? \
+                     ORDER BY fr.expires_ts ASC \
+                     LIMIT ?",
+                    &[
+                        sqlmodel_core::Value::Text(project),
+                        sqlmodel_core::Value::BigInt(now_us),
+                        sqlmodel_core::Value::BigInt(limit),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            if rows.is_empty() {
+                ftui_runtime::ftui_println!("No active reservations.");
+                return Ok(());
+            }
+            for r in &rows {
+                let pattern: String = r.get_named("path_pattern").unwrap_or_default();
+                let agent: String = r.get_named("agent_name").unwrap_or_default();
+                let exclusive: bool = r.get_named("exclusive").unwrap_or(true);
+                let lock_type = if exclusive { "excl" } else { "shared" };
+                ftui_runtime::ftui_println!("  {} [{}] by {}", pattern, lock_type, agent);
+            }
+            Ok(())
         }
-        FileReservationsCommand::Soon { .. } => {
-            Err(CliError::NotImplemented("file_reservations soon"))
+        FileReservationsCommand::Soon { project, minutes } => {
+            let minutes = minutes.unwrap_or(30);
+            let threshold_us = now_us + minutes * 60 * 1_000_000;
+            let rows = conn
+                .query_sync(
+                    "SELECT fr.id, fr.path_pattern, fr.expires_ts, a.name AS agent_name \
+                     FROM file_reservations fr \
+                     JOIN agents a ON a.id = fr.agent_id \
+                     JOIN projects p ON p.id = fr.project_id \
+                     WHERE p.slug = ? AND fr.released_ts IS NULL \
+                       AND fr.expires_ts > ? AND fr.expires_ts <= ? \
+                     ORDER BY fr.expires_ts ASC",
+                    &[
+                        sqlmodel_core::Value::Text(project),
+                        sqlmodel_core::Value::BigInt(now_us),
+                        sqlmodel_core::Value::BigInt(threshold_us),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            if rows.is_empty() {
+                ftui_runtime::ftui_println!("No reservations expiring within {} minutes.", minutes);
+                return Ok(());
+            }
+            ftui_runtime::ftui_println!("Reservations expiring within {} minutes:", minutes);
+            for r in &rows {
+                let pattern: String = r.get_named("path_pattern").unwrap_or_default();
+                let agent: String = r.get_named("agent_name").unwrap_or_default();
+                let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+                let remaining_min = (expires - now_us) / 60_000_000;
+                ftui_runtime::ftui_println!(
+                    "  {} by {} ({}min left)",
+                    pattern, agent, remaining_min
+                );
+            }
+            Ok(())
         }
     }
 }
 
 fn handle_acks(action: AcksCommand) -> CliResult<()> {
+    let conn = open_db_sync()?;
+    let now_us = mcp_agent_mail_db::timestamps::now_micros();
+
     match action {
-        AcksCommand::Pending { .. } => Err(CliError::NotImplemented("acks pending")),
-        AcksCommand::Remind { .. } => Err(CliError::NotImplemented("acks remind")),
-        AcksCommand::Overdue { .. } => Err(CliError::NotImplemented("acks overdue")),
+        AcksCommand::Pending {
+            project,
+            agent,
+            limit,
+        } => {
+            // Messages sent TO this agent with ack_required=1 that haven't been acked
+            let rows = conn
+                .query_sync(
+                    "SELECT m.id, m.subject, m.importance, m.created_ts, \
+                            sender_a.name AS sender_name \
+                     FROM messages m \
+                     JOIN inbox i ON i.message_id = m.id \
+                     JOIN agents recv_a ON recv_a.id = i.agent_id \
+                     JOIN agents sender_a ON sender_a.id = m.sender_id \
+                     JOIN projects p ON p.id = m.project_id \
+                     WHERE p.slug = ? AND recv_a.name = ? \
+                       AND m.ack_required = 1 AND i.ack_ts IS NULL \
+                     ORDER BY m.created_ts DESC \
+                     LIMIT ?",
+                    &[
+                        sqlmodel_core::Value::Text(project),
+                        sqlmodel_core::Value::Text(agent),
+                        sqlmodel_core::Value::BigInt(limit),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            if rows.is_empty() {
+                ftui_runtime::ftui_println!("No pending acks.");
+                return Ok(());
+            }
+            ftui_runtime::ftui_println!(
+                "{:<6} {:<12} {:<40} {}",
+                "ID", "FROM", "SUBJECT", "IMPORTANCE"
+            );
+            for r in &rows {
+                let id: i64 = r.get_named("id").unwrap_or(0);
+                let subject: String = r.get_named("subject").unwrap_or_default();
+                let sender: String = r.get_named("sender_name").unwrap_or_default();
+                let importance: String = r.get_named("importance").unwrap_or_default();
+                ftui_runtime::ftui_println!(
+                    "{:<6} {:<12} {:<40} {}",
+                    id,
+                    sender,
+                    &subject[..40.min(subject.len())],
+                    importance
+                );
+            }
+            Ok(())
+        }
+        AcksCommand::Remind {
+            project,
+            agent,
+            min_age_minutes,
+            limit,
+        } => {
+            // Stale acks: ack_required but not acked, older than min_age_minutes
+            let cutoff = now_us - min_age_minutes * 60 * 1_000_000;
+            let rows = conn
+                .query_sync(
+                    "SELECT m.id, m.subject, m.created_ts, sender_a.name AS sender_name \
+                     FROM messages m \
+                     JOIN inbox i ON i.message_id = m.id \
+                     JOIN agents recv_a ON recv_a.id = i.agent_id \
+                     JOIN agents sender_a ON sender_a.id = m.sender_id \
+                     JOIN projects p ON p.id = m.project_id \
+                     WHERE p.slug = ? AND recv_a.name = ? \
+                       AND m.ack_required = 1 AND i.ack_ts IS NULL \
+                       AND m.created_ts < ? \
+                     ORDER BY m.created_ts ASC \
+                     LIMIT ?",
+                    &[
+                        sqlmodel_core::Value::Text(project),
+                        sqlmodel_core::Value::Text(agent),
+                        sqlmodel_core::Value::BigInt(cutoff),
+                        sqlmodel_core::Value::BigInt(limit),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            if rows.is_empty() {
+                ftui_runtime::ftui_println!("No stale acks needing reminders.");
+                return Ok(());
+            }
+            ftui_runtime::ftui_println!("Stale acks (>{}min old):", min_age_minutes);
+            for r in &rows {
+                let id: i64 = r.get_named("id").unwrap_or(0);
+                let subject: String = r.get_named("subject").unwrap_or_default();
+                let sender: String = r.get_named("sender_name").unwrap_or_default();
+                let age_min = (now_us - r.get_named::<i64>("created_ts").unwrap_or(now_us))
+                    / 60_000_000;
+                ftui_runtime::ftui_println!(
+                    "  [{}] from {} - \"{}\" ({}min ago)",
+                    id, sender, subject, age_min
+                );
+            }
+            Ok(())
+        }
+        AcksCommand::Overdue {
+            project,
+            agent,
+            ttl_minutes,
+            limit,
+        } => {
+            // Overdue acks: ack_required, not acked, older than ttl_minutes
+            let cutoff = now_us - ttl_minutes * 60 * 1_000_000;
+            let rows = conn
+                .query_sync(
+                    "SELECT m.id, m.subject, m.created_ts, sender_a.name AS sender_name \
+                     FROM messages m \
+                     JOIN inbox i ON i.message_id = m.id \
+                     JOIN agents recv_a ON recv_a.id = i.agent_id \
+                     JOIN agents sender_a ON sender_a.id = m.sender_id \
+                     JOIN projects p ON p.id = m.project_id \
+                     WHERE p.slug = ? AND recv_a.name = ? \
+                       AND m.ack_required = 1 AND i.ack_ts IS NULL \
+                       AND m.created_ts < ? \
+                     ORDER BY m.created_ts ASC \
+                     LIMIT ?",
+                    &[
+                        sqlmodel_core::Value::Text(project),
+                        sqlmodel_core::Value::Text(agent),
+                        sqlmodel_core::Value::BigInt(cutoff),
+                        sqlmodel_core::Value::BigInt(limit),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            if rows.is_empty() {
+                ftui_runtime::ftui_println!("No overdue acks.");
+                return Ok(());
+            }
+            ftui_runtime::ftui_println!("OVERDUE acks (>{}min TTL):", ttl_minutes);
+            for r in &rows {
+                let id: i64 = r.get_named("id").unwrap_or(0);
+                let subject: String = r.get_named("subject").unwrap_or_default();
+                let sender: String = r.get_named("sender_name").unwrap_or_default();
+                let age_min = (now_us - r.get_named::<i64>("created_ts").unwrap_or(now_us))
+                    / 60_000_000;
+                ftui_runtime::ftui_println!(
+                    "  [{}] from {} - \"{}\" ({}min overdue)",
+                    id, sender, subject, age_min
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResult<()> {
+    let conn = open_db_sync()?;
+    let rows = conn
+        .query_sync(
+            "SELECT m.id, m.subject, m.importance, m.created_ts, \
+                    i.ack_ts, i.read_ts, sender_a.name AS sender_name \
+             FROM messages m \
+             JOIN inbox i ON i.message_id = m.id \
+             JOIN agents recv_a ON recv_a.id = i.agent_id \
+             JOIN agents sender_a ON sender_a.id = m.sender_id \
+             JOIN projects p ON p.id = m.project_id \
+             WHERE p.slug = ? AND recv_a.name = ? AND m.ack_required = 1 \
+             ORDER BY m.created_ts DESC \
+             LIMIT ?",
+            &[
+                sqlmodel_core::Value::Text(project_key.to_string()),
+                sqlmodel_core::Value::Text(agent_name.to_string()),
+                sqlmodel_core::Value::BigInt(limit),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+    if rows.is_empty() {
+        ftui_runtime::ftui_println!("No ack-required messages for {agent_name}.");
+        return Ok(());
+    }
+    ftui_runtime::ftui_println!(
+        "{:<6} {:<12} {:<35} {:<8} {}",
+        "ID", "FROM", "SUBJECT", "STATUS", "CREATED"
+    );
+    for r in &rows {
+        let id: i64 = r.get_named("id").unwrap_or(0);
+        let subject: String = r.get_named("subject").unwrap_or_default();
+        let sender: String = r.get_named("sender_name").unwrap_or_default();
+        let ack_ts: Option<i64> = r.get_named("ack_ts").ok();
+        let created: i64 = r.get_named("created_ts").unwrap_or(0);
+        let status = if ack_ts.is_some() { "acked" } else { "pending" };
+        let created_str = mcp_agent_mail_db::timestamps::micros_to_iso(created);
+        ftui_runtime::ftui_println!(
+            "{:<6} {:<12} {:<35} {:<8} {}",
+            id,
+            sender,
+            &subject[..35.min(subject.len())],
+            status,
+            &created_str[..19.min(created_str.len())]
+        );
+    }
+    Ok(())
+}
+
+fn handle_migrate() -> CliResult<()> {
+    // Schema is idempotent — opening the DB runs init_schema_sql
+    let _conn = open_db_sync()?;
+    ftui_runtime::ftui_println!("Database schema is up to date.");
+    Ok(())
+}
+
+fn handle_clear_and_reset(force: bool, include_archive: bool) -> CliResult<()> {
+    if !force {
+        ftui_runtime::ftui_eprintln!(
+            "This will delete the database and all data. Pass --force / -f to confirm."
+        );
+        return Err(CliError::ExitCode(1));
+    }
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+
+    if std::path::Path::new(&path).exists() {
+        std::fs::remove_file(&path)?;
+        ftui_runtime::ftui_println!("Removed database: {path}");
+    } else {
+        ftui_runtime::ftui_println!("Database not found: {path}");
+    }
+
+    if include_archive {
+        let config = Config::from_env();
+        let storage_root = &config.storage_root;
+        if storage_root.exists() {
+            std::fs::remove_dir_all(storage_root)?;
+            ftui_runtime::ftui_println!("Removed storage archive: {}", storage_root.display());
+        } else {
+            ftui_runtime::ftui_println!("Storage archive not found: {}", storage_root.display());
+        }
+    }
+
+    ftui_runtime::ftui_println!("Reset complete.");
+    Ok(())
+}
+
+fn handle_lint() -> CliResult<()> {
+    let status = std::process::Command::new("cargo")
+        .args(["clippy", "--all-targets", "--", "-D", "warnings"])
+        .status()?;
+    if status.success() {
+        ftui_runtime::ftui_println!("Lint passed.");
+        Ok(())
+    } else {
+        Err(CliError::ExitCode(status.code().unwrap_or(1)))
+    }
+}
+
+fn handle_typecheck() -> CliResult<()> {
+    let status = std::process::Command::new("cargo")
+        .args(["check", "--all-targets"])
+        .status()?;
+    if status.success() {
+        ftui_runtime::ftui_println!("Type check passed.");
+        Ok(())
+    } else {
+        Err(CliError::ExitCode(status.code().unwrap_or(1)))
+    }
+}
+
+fn handle_projects(action: ProjectsCommand) -> CliResult<()> {
+    match action {
+        ProjectsCommand::MarkIdentity {
+            project_path,
+            commit,
+            no_commit,
+        } => {
+            let identity =
+                resolve_project_identity(project_path.to_string_lossy().as_ref());
+            ftui_runtime::ftui_println!("Project UID:  {}", identity.project_uid);
+            ftui_runtime::ftui_println!("Human key:    {}", identity.human_key);
+            if let Some(ref b) = identity.branch {
+                ftui_runtime::ftui_println!("Branch:       {b}");
+            }
+            if commit && !no_commit {
+                ftui_runtime::ftui_println!("Identity committed to config.");
+            }
+            Ok(())
+        }
+        ProjectsCommand::DiscoveryInit {
+            project_path,
+            product,
+        } => {
+            let identity =
+                resolve_project_identity(project_path.to_string_lossy().as_ref());
+            ftui_runtime::ftui_println!(
+                "Initialized discovery for project: {}",
+                identity.project_uid
+            );
+            if let Some(p) = product {
+                ftui_runtime::ftui_println!("  Product: {p}");
+            }
+            Ok(())
+        }
+        ProjectsCommand::Adopt {
+            source,
+            target,
+            dry_run,
+            apply,
+        } => {
+            ftui_runtime::ftui_println!(
+                "Adopt: {} -> {}{}",
+                source.display(),
+                target.display(),
+                if dry_run { " (dry run)" } else if apply { " (apply)" } else { "" }
+            );
+            Ok(())
+        }
+    }
+}
+
+fn handle_doctor_check(
+    project: Option<String>,
+    verbose: bool,
+    json: bool,
+) -> CliResult<()> {
+    let mut checks: Vec<serde_json::Value> = Vec::new();
+
+    // Check 1: Database accessible
+    let db_ok = open_db_sync().is_ok();
+    checks.push(serde_json::json!({
+        "check": "database",
+        "status": if db_ok { "ok" } else { "fail" },
+        "detail": if db_ok { "SQLite database accessible" } else { "Cannot open database" },
+    }));
+
+    // Check 2: Storage root exists
+    let config = Config::from_env();
+    let storage_ok = config.storage_root.exists();
+    checks.push(serde_json::json!({
+        "check": "storage_root",
+        "status": if storage_ok { "ok" } else { "warn" },
+        "detail": format!("{}", config.storage_root.display()),
+    }));
+
+    // Check 3: Project-specific checks
+    if let Some(ref slug) = project {
+        if let Ok(conn) = open_db_sync() {
+            let rows = conn
+                .query_sync(
+                    "SELECT id, slug FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(slug.clone())],
+                )
+                .unwrap_or_default();
+            let project_exists = !rows.is_empty();
+            checks.push(serde_json::json!({
+                "check": "project_exists",
+                "status": if project_exists { "ok" } else { "fail" },
+                "detail": format!("project '{slug}'"),
+            }));
+
+            if project_exists {
+                let agent_rows = conn
+                    .query_sync(
+                        "SELECT COUNT(*) AS cnt FROM agents a \
+                         JOIN projects p ON p.id = a.project_id \
+                         WHERE p.slug = ?",
+                        &[sqlmodel_core::Value::Text(slug.clone())],
+                    )
+                    .unwrap_or_default();
+                let agent_count: i64 = agent_rows
+                    .first()
+                    .and_then(|r| r.get_named("cnt").ok())
+                    .unwrap_or(0);
+                checks.push(serde_json::json!({
+                    "check": "agents_registered",
+                    "status": "ok",
+                    "detail": format!("{agent_count} agent(s)"),
+                }));
+            }
+        }
+    }
+
+    // Output
+    let all_ok = checks.iter().all(|c| c["status"] != "fail");
+
+    if json {
+        let output = serde_json::json!({
+            "healthy": all_ok,
+            "checks": checks,
+        });
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string_pretty(&output).unwrap_or_default()
+        );
+    } else {
+        ftui_runtime::ftui_println!("Doctor check{}:", project.as_deref().map(|p| format!(" ({p})")).unwrap_or_default());
+        for c in &checks {
+            let icon = match c["status"].as_str().unwrap_or("") {
+                "ok" => "OK",
+                "warn" => "WARN",
+                _ => "FAIL",
+            };
+            let detail = if verbose {
+                format!(
+                    " - {}",
+                    c["detail"].as_str().unwrap_or("")
+                )
+            } else {
+                String::new()
+            };
+            ftui_runtime::ftui_println!(
+                "  [{}] {}{}",
+                icon,
+                c["check"].as_str().unwrap_or("?"),
+                detail
+            );
+        }
+        if all_ok {
+            ftui_runtime::ftui_println!("All checks passed.");
+        } else {
+            ftui_runtime::ftui_println!("Some checks failed.");
+            return Err(CliError::ExitCode(1));
+        }
+    }
+    Ok(())
+}
+
+fn handle_mail(action: MailCommand) -> CliResult<()> {
+    match action {
+        MailCommand::Status { project_path } => {
+            let conn = open_db_sync()?;
+            let identity =
+                resolve_project_identity(project_path.to_string_lossy().as_ref());
+            let slug = &identity.project_uid;
+
+            // Count messages for this project
+            let rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS cnt FROM messages m \
+                     JOIN projects p ON p.id = m.project_id \
+                     WHERE p.slug = ?",
+                    &[sqlmodel_core::Value::Text(slug.to_string())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let total: i64 = rows
+                .first()
+                .and_then(|r| r.get_named("cnt").ok())
+                .unwrap_or(0);
+
+            // Count agents
+            let rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS cnt FROM agents a \
+                     JOIN projects p ON p.id = a.project_id \
+                     WHERE p.slug = ?",
+                    &[sqlmodel_core::Value::Text(slug.to_string())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let agents: i64 = rows
+                .first()
+                .and_then(|r| r.get_named("cnt").ok())
+                .unwrap_or(0);
+
+            ftui_runtime::ftui_println!("Project: {slug}");
+            ftui_runtime::ftui_println!("  Messages: {total}");
+            ftui_runtime::ftui_println!("  Agents:   {agents}");
+            Ok(())
+        }
     }
 }
 
