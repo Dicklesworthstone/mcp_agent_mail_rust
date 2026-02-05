@@ -1,10 +1,12 @@
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
 
-use fastmcp::{Budget, CallToolParams, Content, Cx, ReadResourceParams};
+use fastmcp::{Budget, CallToolParams, Content, Cx, ListToolsParams, ReadResourceParams};
 use fastmcp_core::SessionState;
 use mcp_agent_mail_conformance::{Case, ExpectedError, Fixtures, Normalize};
+use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (Value, Value) {
     for ptr in &norm.ignore_json_pointers {
@@ -85,6 +87,104 @@ fn assert_expected_error(got: &str, expect: &ExpectedError) {
             "expected error message to contain {substr:?}, got {got:?}"
         );
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolFilterFixtures {
+    version: String,
+    generated_at: String,
+    cases: Vec<ToolFilterCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolFilterCase {
+    name: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    expected_tools: Vec<String>,
+}
+
+struct ToolFilterEnvGuard {
+    previous: Vec<(String, Option<String>)>,
+}
+
+impl ToolFilterEnvGuard {
+    fn apply(case_env: &BTreeMap<String, String>) -> Self {
+        let keys = [
+            "TOOLS_FILTER_ENABLED",
+            "TOOLS_FILTER_PROFILE",
+            "TOOLS_FILTER_MODE",
+            "TOOLS_FILTER_CLUSTERS",
+            "TOOLS_FILTER_TOOLS",
+        ];
+
+        let mut previous = Vec::new();
+        for key in keys {
+            let old = std::env::var(key).ok();
+            previous.push((key.to_string(), old));
+            if let Some(value) = case_env.get(key) {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+
+        Self { previous }
+    }
+}
+
+impl Drop for ToolFilterEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            match value {
+                Some(v) => unsafe {
+                    std::env::set_var(&key, v);
+                },
+                None => unsafe {
+                    std::env::remove_var(&key);
+                },
+            }
+        }
+    }
+}
+
+fn load_tool_filter_fixtures() -> ToolFilterFixtures {
+    let path =
+        "tests/conformance/fixtures/tool_filter/cases.json";
+    let raw = std::fs::read_to_string(path).expect("tool filter fixtures missing");
+    let fixtures: ToolFilterFixtures =
+        serde_json::from_str(&raw).expect("tool filter fixtures invalid JSON");
+    assert!(
+        !fixtures.version.trim().is_empty(),
+        "tool filter fixtures version must be non-empty"
+    );
+    assert!(
+        !fixtures.generated_at.trim().is_empty(),
+        "tool filter fixtures generated_at must be non-empty"
+    );
+    fixtures
+}
+
+fn extract_tool_names_from_directory(value: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(clusters) = value.get("clusters").and_then(|v| v.as_array()) else {
+        return names;
+    };
+    for cluster in clusters {
+        let Some(tools) = cluster.get("tools").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for tool in tools {
+            if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 fn args_from_case(case: &Case) -> Option<Value> {
@@ -358,6 +458,64 @@ fn run_fixtures_against_rust_server_router() {
                 ),
             }
         }
+    }
+}
+
+#[test]
+fn tool_filter_profiles_match_fixtures() {
+    let fixtures = load_tool_filter_fixtures();
+
+    for case in fixtures.cases {
+        let _env_guard = ToolFilterEnvGuard::apply(&case.env);
+        let config = mcp_agent_mail_core::Config::from_env();
+        let router = mcp_agent_mail_server::build_server(&config).into_router();
+
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // tools/list
+        let tools_result = router
+            .handle_tools_list(&cx, ListToolsParams::default(), None)
+            .expect("tools/list failed");
+        let mut actual_tools: Vec<String> =
+            tools_result.tools.into_iter().map(|t| t.name).collect();
+        actual_tools.sort();
+
+        let mut expected_tools = case.expected_tools.clone();
+        expected_tools.sort();
+
+        assert_eq!(
+            actual_tools, expected_tools,
+            "tools/list mismatch for case {}",
+            case.name
+        );
+
+        // tooling directory
+        let params = ReadResourceParams {
+            uri: "resource://tooling/directory".to_string(),
+            meta: None,
+        };
+        let result = router
+            .handle_resources_read(
+                &cx,
+                1,
+                &params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+            )
+            .expect("tooling directory read failed");
+        let dir_json = decode_json_from_resource_contents(&params.uri, &result.contents)
+            .expect("tooling directory JSON decode failed");
+        let mut directory_tools = extract_tool_names_from_directory(&dir_json);
+        directory_tools.sort();
+
+        assert_eq!(
+            directory_tools, expected_tools,
+            "tooling/directory mismatch for case {}",
+            case.name
+        );
     }
 }
 
