@@ -10,12 +10,12 @@
 //! - Agent profile writes
 //! - Notification signals
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use git2::{Repository, Signature};
@@ -43,6 +43,16 @@ pub enum StorageError {
 
     #[error("Lock contention: {message}")]
     LockContention { message: String },
+
+    #[error("Git index.lock contention after {attempts} retries: {message}")]
+    GitIndexLock {
+        message: String,
+        lock_path: PathBuf,
+        attempts: usize,
+    },
+
+    #[error("Lock acquisition timed out: {0}")]
+    LockTimeout(String),
 
     #[error("Invalid path: {0}")]
     InvalidPath(String),
@@ -83,6 +93,740 @@ pub struct MessageArchivePaths {
     pub canonical: PathBuf,
     pub outbox: PathBuf,
     pub inbox: Vec<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Advisory file lock (per-project)
+// ---------------------------------------------------------------------------
+
+/// Owner metadata stored alongside the lock file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LockOwnerMeta {
+    pid: u32,
+    created_ts: f64,
+}
+
+/// Per-project advisory file lock with stale detection.
+///
+/// Mirrors the Python `AsyncFileLock` semantics:
+/// - Lock file at the given path (e.g. `<project>/.archive.lock`)
+/// - Owner metadata in `<lock_path>.owner.json` with `{pid, created_ts}`
+/// - Stale detection: owner PID dead, or lock age > stale_timeout
+/// - Exponential backoff with jitter on contention
+pub struct FileLock {
+    path: PathBuf,
+    metadata_path: PathBuf,
+    timeout: Duration,
+    stale_timeout: Duration,
+    max_retries: usize,
+    held: bool,
+}
+
+impl FileLock {
+    /// Create a new advisory file lock.
+    ///
+    /// Defaults match Python: timeout=60s, stale_timeout=180s, max_retries=5.
+    pub fn new(path: PathBuf) -> Self {
+        let metadata_path = {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            path.with_file_name(format!("{name}.owner.json"))
+        };
+        Self {
+            path,
+            metadata_path,
+            timeout: Duration::from_secs(60),
+            stale_timeout: Duration::from_secs(180),
+            max_retries: 5,
+            held: false,
+        }
+    }
+
+    /// Configure timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Configure stale timeout.
+    pub fn with_stale_timeout(mut self, stale_timeout: Duration) -> Self {
+        self.stale_timeout = stale_timeout;
+        self
+    }
+
+    /// Configure max retries.
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Acquire the lock with retry and stale detection.
+    pub fn acquire(&mut self) -> Result<()> {
+        use fs2::FileExt;
+
+        let start = Instant::now();
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        for attempt in 0..=self.max_retries {
+            let elapsed = start.elapsed();
+            if elapsed >= self.timeout && attempt > 0 {
+                break;
+            }
+
+            // Try to create and exclusively lock the file
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&self.path)?;
+
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    // Lock acquired - write owner metadata
+                    self.write_metadata()?;
+                    self.held = true;
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Lock held by another process - check for stale
+                    if self.cleanup_if_stale()? {
+                        // Stale lock cleaned up, retry immediately
+                        continue;
+                    }
+
+                    if attempt >= self.max_retries {
+                        break;
+                    }
+
+                    // Exponential backoff with jitter
+                    let base_ms = if attempt == 0 {
+                        50
+                    } else {
+                        50 * (1u64 << attempt.min(4))
+                    };
+                    let jitter = (base_ms / 4) as i64;
+                    let sleep_ms = base_ms as i64
+                        + (std::process::id() as i64 % (2 * jitter + 1)) - jitter;
+                    let sleep_ms = sleep_ms.max(10) as u64;
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                }
+            }
+        }
+
+        Err(StorageError::LockTimeout(format!(
+            "Timed out acquiring lock {} after {:.2}s ({} attempts)",
+            self.path.display(),
+            start.elapsed().as_secs_f64(),
+            self.max_retries + 1
+        )))
+    }
+
+    /// Release the lock.
+    pub fn release(&mut self) -> Result<()> {
+        if !self.held {
+            return Ok(());
+        }
+        self.held = false;
+
+        // Remove metadata file first
+        let _ = fs::remove_file(&self.metadata_path);
+        // Remove lock file
+        let _ = fs::remove_file(&self.path);
+        Ok(())
+    }
+
+    /// Write owner metadata alongside the lock file.
+    fn write_metadata(&self) -> Result<()> {
+        let meta = LockOwnerMeta {
+            pid: std::process::id(),
+            created_ts: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+        };
+        let content = serde_json::to_string(&meta)?;
+        fs::write(&self.metadata_path, content)?;
+        Ok(())
+    }
+
+    /// Check if the lock is stale and clean it up if so.
+    ///
+    /// A lock is stale if:
+    /// 1. The owning PID is no longer alive, OR
+    /// 2. The lock age exceeds `stale_timeout`
+    fn cleanup_if_stale(&self) -> Result<bool> {
+        if !self.path.exists() {
+            return Ok(false);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // Read owner metadata
+        let meta = if self.metadata_path.exists() {
+            fs::read_to_string(&self.metadata_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<LockOwnerMeta>(&s).ok())
+        } else {
+            None
+        };
+
+        let owner_alive = meta
+            .as_ref()
+            .map(|m| pid_alive(m.pid))
+            .unwrap_or(false);
+
+        let age = meta
+            .as_ref()
+            .map(|m| now - m.created_ts)
+            .or_else(|| {
+                fs::metadata(&self.path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| now - d.as_secs_f64())
+            });
+
+        let is_stale = if !owner_alive {
+            true
+        } else if !self.stale_timeout.is_zero() {
+            age.is_some_and(|a| a >= self.stale_timeout.as_secs_f64())
+        } else {
+            false
+        };
+
+        if !is_stale {
+            return Ok(false);
+        }
+
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.metadata_path);
+        Ok(true)
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+/// Execute a closure while holding the project advisory lock.
+pub fn with_project_lock<F, T>(archive: &ProjectArchive, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let mut lock = FileLock::new(archive.lock_path.clone());
+    lock.acquire()?;
+    let result = f();
+    lock.release()?;
+    result
+}
+
+/// Check if a process with the given PID is alive (Unix only).
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // On Unix, kill(pid, 0) checks if process exists without sending a signal
+    #[cfg(unix)]
+    {
+        let result = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(result, Ok(s) if s.success())
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix, conservatively assume alive
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commit queue with batching
+// ---------------------------------------------------------------------------
+
+/// A request to commit a set of files to a repository.
+struct CommitRequest {
+    repo_root: PathBuf,
+    message: String,
+    rel_paths: Vec<String>,
+}
+
+/// Statistics about commit queue operations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommitQueueStats {
+    pub enqueued: usize,
+    pub batched: usize,
+    pub commits: usize,
+    pub avg_batch_size: f64,
+    pub queue_size: usize,
+}
+
+/// Commit queue that batches multiple commits to reduce git contention.
+///
+/// When multiple write operations happen rapidly (e.g. sending a message
+/// to N recipients), individual commits can be merged into a single
+/// batch commit if they target the same repo and have no path conflicts.
+///
+/// Default settings: max_batch_size=10, max_wait=50ms, max_queue_size=100.
+pub struct CommitQueue {
+    queue: Mutex<VecDeque<CommitRequest>>,
+    max_batch_size: usize,
+    max_wait: Duration,
+    max_queue_size: usize,
+    // Stats
+    stats: Mutex<CommitQueueStats>,
+    batch_sizes: Mutex<VecDeque<usize>>,
+}
+
+impl Default for CommitQueue {
+    fn default() -> Self {
+        Self::new(10, Duration::from_millis(50), 100)
+    }
+}
+
+impl CommitQueue {
+    /// Create a new commit queue.
+    pub fn new(max_batch_size: usize, max_wait: Duration, max_queue_size: usize) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            max_batch_size,
+            max_wait,
+            max_queue_size,
+            stats: Mutex::new(CommitQueueStats::default()),
+            batch_sizes: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Enqueue a commit request. If the queue has capacity, the request is
+    /// buffered; otherwise it falls back to a direct commit.
+    pub fn enqueue(
+        &self,
+        repo_root: PathBuf,
+        config: &Config,
+        message: String,
+        rel_paths: Vec<String>,
+    ) -> Result<()> {
+        if rel_paths.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats.enqueued += 1;
+        }
+
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.len() >= self.max_queue_size {
+            // Queue full - fall back to direct commit
+            drop(queue);
+            let repo = Repository::open(&repo_root)?;
+            let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
+            commit_paths(&repo, config, &message, &refs)?;
+            return Ok(());
+        }
+
+        queue.push_back(CommitRequest {
+            repo_root,
+            message,
+            rel_paths,
+        });
+        drop(queue);
+
+        Ok(())
+    }
+
+    /// Drain the queue and process all pending commits.
+    ///
+    /// This is the synchronous drain that processes batches. In practice,
+    /// callers should call this after a short delay or after a burst of
+    /// enqueue operations.
+    pub fn drain(&self, config: &Config) -> Result<()> {
+        let deadline = Instant::now() + self.max_wait;
+
+        loop {
+            // Collect a batch
+            let batch = {
+                let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if queue.is_empty() {
+                    break;
+                }
+
+                let mut batch = Vec::new();
+                while batch.len() < self.max_batch_size && !queue.is_empty() {
+                    if let Some(req) = queue.pop_front() {
+                        batch.push(req);
+                    }
+                }
+                batch
+            };
+
+            if batch.is_empty() {
+                break;
+            }
+
+            self.process_batch(config, batch)?;
+
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        // Update queue_size stat
+        {
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats.queue_size = queue.len();
+        }
+
+        Ok(())
+    }
+
+    /// Process a batch of commit requests.
+    fn process_batch(&self, config: &Config, batch: Vec<CommitRequest>) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats.batched += batch.len();
+        }
+
+        // Group by repo root
+        let mut by_repo: HashMap<PathBuf, Vec<CommitRequest>> = HashMap::new();
+        for req in batch {
+            by_repo.entry(req.repo_root.clone()).or_default().push(req);
+        }
+
+        for (repo_root, requests) in by_repo {
+            if requests.len() == 1 {
+                // Single request - commit directly
+                let req = &requests[0];
+                let repo = Repository::open(&repo_root)?;
+                let refs: Vec<&str> = req.rel_paths.iter().map(String::as_str).collect();
+                commit_paths(&repo, config, &req.message, &refs)?;
+                self.record_commit(1);
+            } else {
+                // Multiple requests - try to batch non-conflicting ones
+                let mut all_paths = HashSet::new();
+                let mut can_batch = true;
+
+                for req in &requests {
+                    for p in &req.rel_paths {
+                        if !all_paths.insert(p.clone()) {
+                            can_batch = false;
+                            break;
+                        }
+                    }
+                    if !can_batch {
+                        break;
+                    }
+                }
+
+                if can_batch && requests.len() <= 5 {
+                    // Merge into a single commit
+                    let mut merged_paths = Vec::new();
+                    let mut merged_messages = Vec::new();
+
+                    for req in &requests {
+                        merged_paths.extend(req.rel_paths.iter().cloned());
+                        let first_line = req.message.lines().next().unwrap_or("");
+                        merged_messages.push(format!("- {first_line}"));
+                    }
+
+                    let combined = format!(
+                        "batch: {} commits\n\n{}",
+                        requests.len(),
+                        merged_messages.join("\n")
+                    );
+
+                    let repo = Repository::open(&repo_root)?;
+                    let refs: Vec<&str> = merged_paths.iter().map(String::as_str).collect();
+                    commit_paths(&repo, config, &combined, &refs)?;
+                    self.record_commit(requests.len());
+                } else {
+                    // Conflicts or large batch - process sequentially
+                    for req in &requests {
+                        let repo = Repository::open(&repo_root)?;
+                        let refs: Vec<&str> = req.rel_paths.iter().map(String::as_str).collect();
+                        commit_paths(&repo, config, &req.message, &refs)?;
+                        self.record_commit(1);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn record_commit(&self, batch_size: usize) {
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        stats.commits += 1;
+
+        let mut sizes = self.batch_sizes.lock().unwrap_or_else(|e| e.into_inner());
+        sizes.push_back(batch_size);
+        if sizes.len() > 100 {
+            sizes.pop_front();
+        }
+
+        let avg = if sizes.is_empty() {
+            0.0
+        } else {
+            sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
+        };
+        stats.avg_batch_size = (avg * 100.0).round() / 100.0;
+    }
+
+    /// Get queue statistics.
+    pub fn stats(&self) -> CommitQueueStats {
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        stats.queue_size = queue.len();
+        stats
+    }
+}
+
+/// Global commit queue instance.
+static COMMIT_QUEUE: Mutex<Option<CommitQueue>> = Mutex::new(None);
+
+/// Get or create the global commit queue.
+pub fn get_commit_queue() -> &'static Mutex<Option<CommitQueue>> {
+    // Ensure initialized
+    let mut guard = COMMIT_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(CommitQueue::default());
+    }
+    drop(guard);
+    &COMMIT_QUEUE
+}
+
+// ---------------------------------------------------------------------------
+// Git index.lock contention handling
+// ---------------------------------------------------------------------------
+
+/// Determine the commit lock path based on project-scoped rel_paths.
+pub fn commit_lock_path(repo_root: &Path, rel_paths: &[&str]) -> PathBuf {
+    if rel_paths.is_empty() {
+        return repo_root.join(".commit.lock");
+    }
+
+    // Check if all paths are under the same project
+    let mut project_slug: Option<&str> = None;
+    let mut same_project = true;
+
+    for rel_path in rel_paths {
+        let parts: Vec<&str> = rel_path.split('/').collect();
+        if parts.len() < 2 || parts[0] != "projects" {
+            same_project = false;
+            break;
+        }
+        let slug = parts[1];
+        match project_slug {
+            None => project_slug = Some(slug),
+            Some(prev) if prev != slug => {
+                same_project = false;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if same_project {
+        if let Some(slug) = project_slug {
+            return repo_root.join("projects").join(slug).join(".commit.lock");
+        }
+    }
+
+    repo_root.join(".commit.lock")
+}
+
+/// Check if an error is a git index.lock contention error.
+fn is_git_index_lock_error(err: &git2::Error) -> bool {
+    let msg = err.message().to_lowercase();
+    msg.contains("index.lock") || msg.contains("lock at")
+}
+
+/// Try to clean up a stale .git/index.lock file.
+///
+/// Returns `true` if a stale lock was removed.
+fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
+    let lock_path = repo_root.join(".git").join("index.lock");
+    if !lock_path.exists() {
+        return false;
+    }
+
+    let age = fs::metadata(&lock_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs_f64());
+
+    if let Some(age) = age {
+        if age > max_age_seconds {
+            let _ = fs::remove_file(&lock_path);
+            return true;
+        }
+    }
+    false
+}
+
+/// Commit with git index.lock contention retry logic.
+///
+/// Wraps `commit_paths` with retry and exponential backoff for index.lock errors.
+pub fn commit_paths_with_retry(
+    repo_root: &Path,
+    config: &Config,
+    message: &str,
+    rel_paths: &[&str],
+) -> Result<()> {
+    const MAX_INDEX_LOCK_RETRIES: usize = 5;
+
+    let lock_path = commit_lock_path(repo_root, rel_paths);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Use project-scoped commit lock
+    let mut lock = FileLock::new(lock_path);
+    lock.acquire()?;
+
+    let mut last_err_msg: Option<String> = None;
+    let mut did_last_resort_clean = false;
+
+    for attempt in 0..MAX_INDEX_LOCK_RETRIES + 2 {
+        let repo = Repository::open(repo_root)?;
+        match commit_paths(&repo, config, message, rel_paths) {
+            Ok(()) => {
+                lock.release()?;
+                return Ok(());
+            }
+            Err(StorageError::Git(ref git_err)) if is_git_index_lock_error(git_err) => {
+                last_err_msg = Some(git_err.message().to_string());
+
+                if attempt >= MAX_INDEX_LOCK_RETRIES {
+                    if !did_last_resort_clean
+                        && try_clean_stale_git_lock(repo_root, 60.0)
+                    {
+                        did_last_resort_clean = true;
+                        continue;
+                    }
+                    break;
+                }
+
+                // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
+                let delay_ms = 100 * (1u64 << attempt.min(4));
+                std::thread::sleep(Duration::from_millis(delay_ms));
+
+                // Try cleaning stale locks (5 minute threshold)
+                let _ = try_clean_stale_git_lock(repo_root, 300.0);
+            }
+            Err(other) => {
+                lock.release()?;
+                return Err(other);
+            }
+        }
+    }
+
+    lock.release()?;
+
+    let git_lock_path = repo_root.join(".git").join("index.lock");
+    Err(StorageError::GitIndexLock {
+        message: format!(
+            "Git index.lock contention after {} retries. {}",
+            MAX_INDEX_LOCK_RETRIES,
+            last_err_msg.unwrap_or_default()
+        ),
+        lock_path: git_lock_path,
+        attempts: MAX_INDEX_LOCK_RETRIES,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stale lock healing (startup cleanup)
+// ---------------------------------------------------------------------------
+
+/// Scan the archive root for stale lock artifacts and clean them.
+///
+/// Should be called at application startup.
+pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
+    let root = &config.storage_root;
+    if !root.exists() {
+        return Ok(HealResult::default());
+    }
+
+    let mut result = HealResult::default();
+
+    // Walk looking for .lock files
+    fn walk_for_locks(dir: &Path, result: &mut HealResult) -> std::io::Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk_for_locks(&path, result)?;
+            } else if path.extension().is_some_and(|e| e == "lock") {
+                result.locks_scanned += 1;
+
+                // Check if stale using zero-timeout lock
+                let lock = FileLock::new(path.clone())
+                    .with_stale_timeout(Duration::ZERO);
+                if lock.cleanup_if_stale().unwrap_or(false) {
+                    result.locks_removed.push(path.display().to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    walk_for_locks(root, &mut result)?;
+
+    // Clean orphaned metadata files (no matching lock)
+    fn walk_for_orphaned_meta(dir: &Path, result: &mut HealResult) -> std::io::Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk_for_orphaned_meta(&path, result)?;
+            } else {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name.ends_with(".lock.owner.json") {
+                    let lock_name = &name[..name.len() - ".owner.json".len()];
+                    let lock_candidate = path.parent().unwrap_or(dir).join(lock_name);
+                    if !lock_candidate.exists() {
+                        let _ = fs::remove_file(&path);
+                        result.metadata_removed.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    walk_for_orphaned_meta(root, &mut result)?;
+
+    Ok(result)
+}
+
+/// Result of a lock healing scan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HealResult {
+    pub locks_scanned: usize,
+    pub locks_removed: Vec<String>,
+    pub metadata_removed: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +905,35 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
     // Write .gitattributes
     let attrs_path = root.join(".gitattributes");
     if !attrs_path.exists() {
-        write_text(&attrs_path, "*.json text\n*.md text\n")?;
+        write_text(
+            &attrs_path,
+            "# Binary and text file declarations for Git\n\
+             \n\
+             # Binary files\n\
+             *.webp binary\n\
+             *.jpg binary\n\
+             *.jpeg binary\n\
+             *.png binary\n\
+             *.gif binary\n\
+             *.webm binary\n\
+             \n\
+             # Database files\n\
+             *.sqlite3 binary\n\
+             *.db binary\n\
+             *.sqlite binary\n\
+             \n\
+             # Archive and metadata files\n\
+             *.md text eol=lf\n\
+             *.json text eol=lf\n\
+             *.txt text eol=lf\n\
+             *.log text eol=lf\n\
+             \n\
+             # Lock files\n\
+             *.lock binary\n\
+             \n\
+             # Default behavior\n\
+             * text=auto\n",
+        )?;
     }
 
     // Initial commit
@@ -1266,5 +2038,219 @@ mod tests {
 
         let signals2 = list_pending_signals(&config, Some("proj")).unwrap();
         assert!(signals2.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Advisory file lock tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_file_lock_acquire_release() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let mut lock = FileLock::new(lock_path.clone());
+        lock.acquire().unwrap();
+
+        // Owner metadata should exist
+        let meta_path = tmp.path().join("test.lock.owner.json");
+        assert!(meta_path.exists());
+
+        let content = fs::read_to_string(&meta_path).unwrap();
+        let meta: LockOwnerMeta = serde_json::from_str(&content).unwrap();
+        assert_eq!(meta.pid, std::process::id());
+        assert!(meta.created_ts > 0.0);
+
+        lock.release().unwrap();
+
+        // Lock and metadata files should be cleaned up
+        assert!(!lock_path.exists());
+        assert!(!meta_path.exists());
+    }
+
+    #[test]
+    fn test_file_lock_drop_releases() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("drop.lock");
+
+        {
+            let mut lock = FileLock::new(lock_path.clone());
+            lock.acquire().unwrap();
+            assert!(lock_path.exists());
+        }
+        // Drop should release
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn test_file_lock_stale_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("stale.lock");
+        let meta_path = tmp.path().join("stale.lock.owner.json");
+
+        // Create a lock with a dead PID
+        fs::write(&lock_path, "locked").unwrap();
+        let meta = serde_json::json!({
+            "pid": 999999999,  // Almost certainly dead
+            "created_ts": 0.0,  // Ancient timestamp
+        });
+        fs::write(&meta_path, meta.to_string()).unwrap();
+
+        // A new lock should clean up the stale one and acquire
+        let mut lock = FileLock::new(lock_path.clone());
+        lock.acquire().unwrap();
+
+        // Verify we hold the lock now
+        assert!(lock_path.exists());
+        let new_meta: LockOwnerMeta =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(new_meta.pid, std::process::id());
+
+        lock.release().unwrap();
+    }
+
+    #[test]
+    fn test_with_project_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "lock-proj").unwrap();
+
+        let result = with_project_lock(&archive, || {
+            // Lock is held here
+            assert!(archive.lock_path.exists());
+            Ok(42)
+        })
+        .unwrap();
+
+        assert_eq!(result, 42);
+        // Lock should be released
+        assert!(!archive.lock_path.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Commit queue tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_commit_queue_single() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "queue-proj").unwrap();
+
+        // Write a file to commit
+        let test_file = archive.root.join("test.txt");
+        fs::write(&test_file, "hello").unwrap();
+        let rel = rel_path(&archive.repo_root, &test_file).unwrap();
+
+        let queue = CommitQueue::default();
+        queue
+            .enqueue(
+                archive.repo_root.clone(),
+                &config,
+                "test commit".to_string(),
+                vec![rel],
+            )
+            .unwrap();
+
+        queue.drain(&config).unwrap();
+
+        let stats = queue.stats();
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.commits, 1);
+        assert_eq!(stats.queue_size, 0);
+    }
+
+    #[test]
+    fn test_commit_queue_batching() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "batch-proj").unwrap();
+
+        let queue = CommitQueue::default();
+
+        // Enqueue multiple non-conflicting commits
+        for i in 0..3 {
+            let file = archive.root.join(format!("file{i}.txt"));
+            fs::write(&file, format!("content {i}")).unwrap();
+            let rel = rel_path(&archive.repo_root, &file).unwrap();
+            queue
+                .enqueue(
+                    archive.repo_root.clone(),
+                    &config,
+                    format!("commit {i}"),
+                    vec![rel],
+                )
+                .unwrap();
+        }
+
+        queue.drain(&config).unwrap();
+
+        let stats = queue.stats();
+        assert_eq!(stats.enqueued, 3);
+        assert_eq!(stats.batched, 3);
+        // Should be batched into 1 commit (3 non-conflicting paths, <= 5)
+        assert_eq!(stats.commits, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Commit lock path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_commit_lock_path_single_project() {
+        let root = PathBuf::from("/tmp/archive");
+        let paths = &["projects/my-proj/agents/Agent/profile.json"];
+        let lock = commit_lock_path(&root, paths);
+        assert_eq!(lock, root.join("projects/my-proj/.commit.lock"));
+    }
+
+    #[test]
+    fn test_commit_lock_path_different_projects() {
+        let root = PathBuf::from("/tmp/archive");
+        let paths = &[
+            "projects/proj-a/agents/A/profile.json",
+            "projects/proj-b/agents/B/profile.json",
+        ];
+        let lock = commit_lock_path(&root, paths);
+        assert_eq!(lock, root.join(".commit.lock"));
+    }
+
+    #[test]
+    fn test_commit_lock_path_empty() {
+        let root = PathBuf::from("/tmp/archive");
+        let lock = commit_lock_path(&root, &[]);
+        assert_eq!(lock, root.join(".commit.lock"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Heal archive locks tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_heal_archive_locks_empty() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive_root(&config).unwrap();
+
+        let result = heal_archive_locks(&config).unwrap();
+        assert_eq!(result.locks_scanned, 0);
+        assert!(result.locks_removed.is_empty());
+        assert!(result.metadata_removed.is_empty());
+    }
+
+    #[test]
+    fn test_heal_archive_locks_orphaned_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive_root(&config).unwrap();
+
+        // Create an orphaned metadata file (no matching lock)
+        let meta_path = tmp.path().join("projects").join("test.lock.owner.json");
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::write(&meta_path, r#"{"pid": 1, "created_ts": 0.0}"#).unwrap();
+
+        let result = heal_archive_locks(&config).unwrap();
+        assert_eq!(result.metadata_removed.len(), 1);
+        assert!(!meta_path.exists());
     }
 }

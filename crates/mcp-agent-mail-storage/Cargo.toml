@@ -15,6 +15,7 @@ git2 = "0.19"
 sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
+fs2 = "0.4"
 thiserror.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 
