@@ -221,6 +221,36 @@ pub async fn file_reservation_paths(
         })
         .collect();
 
+    // Write reservation artifacts to git archive (best-effort)
+    if !granted_rows.is_empty() {
+        let config = Config::from_env();
+        match mcp_agent_mail_storage::ensure_archive(&config, &project.slug) {
+            Ok(archive) => {
+                let res_jsons: Vec<serde_json::Value> = granted_rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id.unwrap_or(0),
+                            "agent": &agent_name,
+                            "path_pattern": &r.path_pattern,
+                            "exclusive": r.exclusive != 0,
+                            "reason": &r.reason,
+                            "expires_ts": micros_to_iso(r.expires_ts),
+                        })
+                    })
+                    .collect();
+                if let Err(e) = mcp_agent_mail_storage::write_file_reservation_records(
+                    &archive, &config, &res_jsons,
+                ) {
+                    tracing::warn!("Failed to write reservation artifacts to archive: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to ensure archive for reservation write: {e}");
+            }
+        }
+    }
+
     let conflicts_len = conflicts.len();
     let response = ReservationResponse { granted, conflicts };
 
@@ -428,34 +458,100 @@ pub async fn force_release_file_reservation(
         ));
     };
 
-    // TODO: Call storage layer to:
-    // 1. Validate inactivity heuristics
-    // 2. Release the reservation
-    // 3. Optionally notify previous holder
+    // If already released, return early
+    if let Some(released_ts) = reservation.released_ts {
+        let response = serde_json::json!({
+            "released": 0,
+            "released_at": micros_to_iso(released_ts),
+            "already_released": true,
+        });
+        return serde_json::to_string(&response)
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
+    }
 
-    let response = reservation.released_ts.map_or_else(
-        || {
-            serde_json::json!({
-                "released": 1,
-                "released_at": now,
-            })
-        },
-        |released_ts| {
-            serde_json::json!({
-                "released": 0,
-                "released_at": micros_to_iso(released_ts),
-                "already_released": true,
-            })
-        },
-    );
+    // Validate inactivity heuristics:
+    // 1. Check if the reservation holder agent is inactive
+    let holder_agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, reservation.agent_id).await,
+    )?;
+
+    let holder_last_active = holder_agent.last_active_ts;
+    let now_micros = mcp_agent_mail_db::now_micros();
+    let inactive_threshold_micros: i64 = 30 * 60 * 1_000_000; // 30 minutes
+
+    let is_inactive = (now_micros - holder_last_active) > inactive_threshold_micros;
+
+    // 2. Check if the reservation has expired
+    let is_expired = reservation.expires_ts < now_micros;
+
+    if !is_inactive && !is_expired {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!(
+                "Cannot force-release: agent '{}' was active {} seconds ago and reservation has not expired. \
+                 Force release is only allowed when the holder is inactive (>30min) or the reservation has expired.",
+                holder_agent.name,
+                (now_micros - holder_last_active) / 1_000_000
+            ),
+        ));
+    }
+
+    // Actually release the reservation in DB
+    let released_count = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::force_release_reservation(
+            ctx.cx(),
+            &pool,
+            file_reservation_id,
+        )
+        .await,
+    )?;
+
+    // Optionally send notification to previous holder
+    if should_notify && released_count > 0 {
+        let note_text = note.as_deref().unwrap_or("");
+        let notify_body = format!(
+            "Your file reservation `{}` (id={}) on pattern `{}` was force-released by **{}**.\n\n\
+             Reason: {}\n\n\
+             Heuristics: inactive={}s, expired={}",
+            reservation.path_pattern,
+            file_reservation_id,
+            reservation.path_pattern,
+            agent_name,
+            if note_text.is_empty() { "no note provided" } else { note_text },
+            (now_micros - holder_last_active) / 1_000_000,
+            is_expired,
+        );
+
+        // Best-effort notification via send_message (if it fails, don't block the force-release)
+        let _ = mcp_agent_mail_db::queries::create_message(
+            ctx.cx(),
+            &pool,
+            project_id,
+            _agent.id.unwrap_or(0),
+            &format!("Force-released reservation on {}", reservation.path_pattern),
+            &notify_body,
+            None,
+            "normal",
+            false,
+            "[]",
+        )
+        .await;
+    }
+
+    let response = serde_json::json!({
+        "released": released_count,
+        "released_at": now,
+    });
 
     tracing::debug!(
-        "Force releasing reservation {} by {} in project {} (notify: {}, note: {:?})",
+        "Force released reservation {} by {} in project {} (notify: {}, note: {:?}, was_inactive: {}, was_expired: {})",
         file_reservation_id,
         agent_name,
         project_key,
         should_notify,
-        note
+        note,
+        is_inactive,
+        is_expired
     );
 
     serde_json::to_string(&response)
@@ -464,11 +560,16 @@ pub async fn force_release_file_reservation(
 
 /// Install pre-commit guard for file reservation enforcement.
 ///
-/// Resolves `core.hooksPath` and installs the guard hook.
+/// Creates a chain-runner hook and an Agent Mail guard plugin that checks
+/// staged files against active file reservations before allowing commits.
 ///
 /// # Parameters
-/// - `project_key`: Project identifier
-/// - `code_repo_path`: Path to the code repository
+/// - `project_key`: Project identifier (human key or slug)
+/// - `code_repo_path`: Absolute path to the git repository
+///
+/// # Returns
+/// `{"hook": "<path>"}` where path is the installed hook location,
+/// or `{"hook": ""}` if worktrees/guard is not enabled.
 #[tool(description = "Install pre-commit guard for file reservation enforcement.")]
 pub fn install_precommit_guard(
     _ctx: &McpContext,
@@ -482,22 +583,36 @@ pub fn install_precommit_guard(
     }
 
     let repo_path = normalize_repo_path(&code_repo_path);
-    let hook_path = repo_path
-        .join(".git")
-        .join("hooks")
-        .join("pre-commit")
-        .display()
-        .to_string();
 
-    // TODO: Call storage/guard layer to:
-    // 1. Resolve core.hooksPath
-    // 2. Write pre-commit hook script
-    // 3. Make executable
+    if !repo_path.exists() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!("Repository path does not exist: {}", repo_path.display()),
+        ));
+    }
 
+    // Install the guard via the guard crate
+    mcp_agent_mail_guard::install_guard(&project_key, &repo_path).map_err(|e| {
+        McpError::new(
+            McpErrorCode::InternalError,
+            format!("Failed to install guard: {e}"),
+        )
+    })?;
+
+    // Resolve the actual hook path (honors core.hooksPath, worktrees, etc.)
+    let hooks_dir =
+        mcp_agent_mail_guard::resolve_hooks_dir(&repo_path).map_err(|e| {
+            McpError::new(
+                McpErrorCode::InternalError,
+                format!("Failed to resolve hooks dir: {e}"),
+            )
+        })?;
+
+    let hook_path = hooks_dir.join("pre-commit").display().to_string();
     let response = serde_json::json!({ "hook": hook_path });
 
     tracing::debug!(
-        "Installing pre-commit guard for project {} at {}",
+        "Installed pre-commit guard for project {} at {}",
         project_key,
         code_repo_path
     );
@@ -508,18 +623,67 @@ pub fn install_precommit_guard(
 
 /// Uninstall pre-commit guard from a repository.
 ///
+/// Removes the guard plugin and chain-runner (if no other plugins remain).
+/// Restores any previously preserved hooks.
+///
 /// # Parameters
 /// - `code_repo_path`: Path to the code repository
+///
+/// # Returns
+/// `{"removed": true}` if guard artifacts were removed, `{"removed": false}` otherwise.
 #[tool(description = "Uninstall pre-commit guard from a repository.")]
 pub fn uninstall_precommit_guard(_ctx: &McpContext, code_repo_path: String) -> McpResult<String> {
-    let _repo_path = normalize_repo_path(&code_repo_path);
+    let repo_path = normalize_repo_path(&code_repo_path);
 
-    // TODO: Call storage/guard layer to remove hook.
-    // For now, report no-op removal to avoid destructive file operations.
-    let response = serde_json::json!({ "removed": false });
+    if !repo_path.exists() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!("Repository path does not exist: {}", repo_path.display()),
+        ));
+    }
 
-    tracing::debug!("Uninstalling pre-commit guard from {}", code_repo_path);
+    // Check if guard is installed before uninstalling
+    let was_installed = guard_is_installed(&repo_path);
+
+    // Uninstall via the guard crate
+    mcp_agent_mail_guard::uninstall_guard(&repo_path).map_err(|e| {
+        McpError::new(
+            McpErrorCode::InternalError,
+            format!("Failed to uninstall guard: {e}"),
+        )
+    })?;
+
+    let response = serde_json::json!({ "removed": was_installed });
+
+    tracing::debug!("Uninstalled pre-commit guard from {}", code_repo_path);
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Check if the guard is currently installed in a repo.
+fn guard_is_installed(repo_path: &std::path::Path) -> bool {
+    let hooks_dir = match mcp_agent_mail_guard::resolve_hooks_dir(repo_path) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    // Check for our plugin in hooks.d/pre-commit/
+    let plugin = hooks_dir
+        .join("hooks.d")
+        .join("pre-commit")
+        .join("50-agent-mail.py");
+    if plugin.exists() {
+        return true;
+    }
+
+    // Check for legacy single-file hook
+    let hook = hooks_dir.join("pre-commit");
+    if let Ok(content) = std::fs::read_to_string(hook) {
+        if content.contains("mcp-agent-mail") {
+            return true;
+        }
+    }
+
+    false
 }

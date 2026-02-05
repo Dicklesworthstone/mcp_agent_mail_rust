@@ -10,6 +10,7 @@ description = "MCP tools implementation for MCP Agent Mail"
 mcp-agent-mail-core = { workspace = true }
 mcp-agent-mail-db = { workspace = true }
 mcp-agent-mail-storage = { workspace = true }
+mcp-agent-mail-guard = { workspace = true }
 fastmcp = { workspace = true }
 fastmcp-protocol = { workspace = true }
 fastmcp-core = { workspace = true }
@@ -21,6 +22,9 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 git2 = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

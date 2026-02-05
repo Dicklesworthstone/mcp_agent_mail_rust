@@ -3811,9 +3811,11 @@ dependencies = [
  "git2",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
+ "mcp-agent-mail-guard",
  "mcp-agent-mail-storage",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
