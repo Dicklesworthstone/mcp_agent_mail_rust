@@ -3751,10 +3751,12 @@ dependencies = [
 name = "mcp-agent-mail-cli"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "chrono",
  "clap",
  "ftui",
  "ftui-runtime",
+ "hex",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
  "mcp-agent-mail-guard",
@@ -3762,6 +3764,7 @@ dependencies = [
  "mcp-agent-mail-share",
  "serde",
  "serde_json",
+ "sha2",
  "sqlmodel-core",
  "sqlmodel-sqlite",
  "thiserror 2.0.18",

@@ -1,0 +1,33 @@
+{
+  "_description": "Successful TOON encoding with stats. Encoder exits 0, stats parsed from stderr.",
+  "input": {
+    "payload": {
+      "id": 1,
+      "subject": "Hello",
+      "body_md": "Test message body",
+      "importance": "normal"
+    },
+    "format_param": "toon",
+    "toon_stats_enabled": true
+  },
+  "encoder": {
+    "exit_code": 0,
+    "stdout": "~msg{id:1 subject:\"Hello\" body:\"Test message body\" importance:normal}",
+    "stderr": "Token estimates: ~42 (JSON) -> ~18 (TOON)\nSaved ~24 tokens (-57.1%)\n"
+  },
+  "expected": {
+    "format": "toon",
+    "data": "~msg{id:1 subject:\"Hello\" body:\"Test message body\" importance:normal}",
+    "meta": {
+      "requested": "toon",
+      "source": "param",
+      "encoder": "tru",
+      "toon_stats": {
+        "json_tokens": 42,
+        "toon_tokens": 18,
+        "saved_tokens": 24,
+        "saved_percent": -57.1
+      }
+    }
+  }
+}

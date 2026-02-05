@@ -106,8 +106,8 @@ pub fn verify_bundle(
     }
 
     let manifest_bytes = std::fs::read(&manifest_path)?;
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| ShareError::ManifestParse {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|e| ShareError::ManifestParse {
             message: e.to_string(),
         })?;
 
@@ -121,7 +121,8 @@ pub fn verify_bundle(
                     let file_path = bundle_root.join(relative_path);
                     if file_path.exists() {
                         let content = std::fs::read(&file_path)?;
-                        let actual_hash = format!("sha256-{}", base64_encode(&sha256_bytes(&content)));
+                        let actual_hash =
+                            format!("sha256-{}", base64_encode(&sha256_bytes(&content)));
                         if actual_hash != expected {
                             return Ok(VerifyResult {
                                 bundle: bundle_root.display().to_string(),
@@ -140,40 +141,40 @@ pub fn verify_bundle(
         }
     }
 
-    // Check signature
+    // Check Ed25519 signature (requires sig file to exist)
     let sig_path = bundle_root.join("manifest.sig.json");
     let mut signature_checked = false;
     let mut signature_verified = false;
 
-    if sig_path.exists() || public_key_b64.is_some() {
+    if sig_path.exists() {
         signature_checked = true;
 
-        if sig_path.exists() {
-            let sig_json: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(&sig_path)?,
-            )
-            .map_err(|e| ShareError::ManifestParse {
-                message: e.to_string(),
+        let sig_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sig_path)?).map_err(|e| {
+                ShareError::ManifestParse {
+                    message: e.to_string(),
+                }
             })?;
 
-            let pub_key_str = public_key_b64
+        // Explicit public key takes precedence over the one embedded in the sig file
+        let pub_key_str = public_key_b64.map(|s| s.to_string()).or_else(|| {
+            sig_json
+                .get("public_key")
+                .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .or_else(|| sig_json.get("public_key").and_then(|v| v.as_str()).map(|s| s.to_string()));
-            let sig_str = sig_json
-                .get("signature")
-                .and_then(|v| v.as_str());
+        });
+        let sig_str = sig_json.get("signature").and_then(|v| v.as_str());
 
-            if let (Some(pk_b64), Some(sig_b64)) = (pub_key_str, sig_str) {
-                if let (Ok(pk_bytes), Ok(sig_bytes)) = (base64_decode(&pk_b64), base64_decode(sig_b64))
-                {
-                    if pk_bytes.len() == 32 && sig_bytes.len() == 64 {
-                        let pk: [u8; 32] = pk_bytes.try_into().unwrap();
-                        let sig: [u8; 64] = sig_bytes.try_into().unwrap();
-                        if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk) {
-                            let signature = Signature::from_bytes(&sig);
-                            signature_verified =
-                                verifying_key.verify(&manifest_bytes, &signature).is_ok();
-                        }
+        if let (Some(pk_b64), Some(sig_b64)) = (pub_key_str, sig_str) {
+            if let (Ok(pk_bytes), Ok(sig_bytes)) = (base64_decode(&pk_b64), base64_decode(sig_b64))
+            {
+                if pk_bytes.len() == 32 && sig_bytes.len() == 64 {
+                    let pk: [u8; 32] = pk_bytes.try_into().unwrap();
+                    let sig: [u8; 64] = sig_bytes.try_into().unwrap();
+                    if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk) {
+                        let signature = Signature::from_bytes(&sig);
+                        signature_verified =
+                            verifying_key.verify(&manifest_bytes, &signature).is_ok();
                     }
                 }
             }
@@ -230,9 +231,9 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
     let result = cmd.output()?;
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(ShareError::Io(std::io::Error::other(
-            format!("age encryption failed: {stderr}"),
-        )));
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "age encryption failed: {stderr}"
+        ))));
     }
 
     Ok(output)
@@ -284,9 +285,9 @@ pub fn decrypt_with_age(
         let result = cmd.output()?;
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            return Err(ShareError::Io(std::io::Error::other(
-                format!("age decryption failed: {stderr}"),
-            )));
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "age decryption failed: {stderr}"
+            ))));
         }
     }
 
@@ -343,30 +344,127 @@ mod tests {
         assert_eq!(decoded, data);
     }
 
+    fn test_key_bytes() -> [u8; 32] {
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ]
+    }
+
     #[test]
     fn sign_and_verify_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Create a test manifest
         let manifest_path = dir.path().join("manifest.json");
         std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
 
-        // Create a test signing key (32 random bytes)
         let key_path = dir.path().join("test.key");
-        let key_bytes: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-        std::fs::write(&key_path, key_bytes).unwrap();
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
 
         let sig_path = dir.path().join("manifest.sig.json");
         let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
         assert_eq!(sig.algorithm, "ed25519");
         assert!(sig_path.exists());
 
-        // Verify
         let result = verify_bundle(dir.path(), None).unwrap();
         assert!(result.signature_checked);
         assert!(result.signature_verified);
+    }
+
+    #[test]
+    fn tampered_manifest_fails_verification() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Tamper with the manifest
+        std::fs::write(&manifest_path, r#"{"test": false, "tampered": true}"#).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.signature_checked);
+        assert!(
+            !result.signature_verified,
+            "tampered manifest should fail verification"
+        );
+    }
+
+    #[test]
+    fn sign_refuses_overwrite_without_flag() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Second sign without overwrite should fail
+        let result = sign_manifest(&manifest_path, &key_path, &sig_path, false);
+        assert!(result.is_err());
+
+        // With overwrite should succeed
+        let result = sign_manifest(&manifest_path, &key_path, &sig_path, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sign_missing_manifest_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let result = sign_manifest(
+            &dir.path().join("nonexistent.json"),
+            &key_path,
+            &dir.path().join("sig.json"),
+            false,
+        );
+        assert!(matches!(result, Err(ShareError::ManifestNotFound { .. })));
+    }
+
+    #[test]
+    fn sign_short_key_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
+
+        let key_path = dir.path().join("short.key");
+        std::fs::write(&key_path, [1u8; 16]).unwrap(); // Too short
+
+        let result = sign_manifest(
+            &manifest_path,
+            &key_path,
+            &dir.path().join("sig.json"),
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_missing_bundle_errors() {
+        let result = verify_bundle(Path::new("/nonexistent"), None);
+        assert!(matches!(result, Err(ShareError::ManifestNotFound { .. })));
+    }
+
+    #[test]
+    fn verify_no_signature_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(!result.signature_checked);
+        assert!(!result.signature_verified);
+        assert!(!result.sri_checked);
     }
 }

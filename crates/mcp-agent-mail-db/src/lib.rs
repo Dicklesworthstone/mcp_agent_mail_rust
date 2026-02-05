@@ -26,7 +26,14 @@ pub use error::{DbError, DbResult};
 pub use models::*;
 pub use pool::{DbPool, DbPoolConfig, create_pool, get_or_create_pool};
 pub use timestamps::{iso_to_micros, micros_to_iso, micros_to_naive, naive_to_micros, now_micros};
-pub use tracking::{QueryTracker, QueryTrackerSnapshot};
+pub use tracking::{QueryTracker, QueryTrackerSnapshot, SlowQueryEntry, elapsed_us, query_timer};
+
+/// Global query tracker instance.
+///
+/// Disabled by default (zero overhead). Call `QUERY_TRACKER.enable(threshold_ms)`
+/// at startup when `config.instrumentation_enabled` is true.
+pub static QUERY_TRACKER: std::sync::LazyLock<QueryTracker> =
+    std::sync::LazyLock::new(QueryTracker::new);
 
 // Re-export sqlmodel for convenience
 pub use sqlmodel;

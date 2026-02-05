@@ -1,0 +1,72 @@
+{
+  "_description": "Vectors for TOON stats parsing from encoder stderr.",
+  "vectors": [
+    {
+      "name": "full_stats_ascii_arrow",
+      "stderr": "Token estimates: ~42 (JSON) -> ~18 (TOON)\nSaved ~24 tokens (-57.1%)\n",
+      "expected": {
+        "json_tokens": 42,
+        "toon_tokens": 18,
+        "saved_tokens": 24,
+        "saved_percent": -57.1
+      }
+    },
+    {
+      "name": "full_stats_unicode_arrow",
+      "stderr": "Token estimates: ~100 (JSON) \u2192 ~35 (TOON)\nSaved ~65 tokens (-65.0%)\n",
+      "expected": {
+        "json_tokens": 100,
+        "toon_tokens": 35,
+        "saved_tokens": 65,
+        "saved_percent": -65.0
+      }
+    },
+    {
+      "name": "tokens_only_no_saved_line",
+      "stderr": "Token estimates: ~50 (JSON) -> ~30 (TOON)\n",
+      "expected": {
+        "json_tokens": 50,
+        "toon_tokens": 30
+      }
+    },
+    {
+      "name": "zero_savings",
+      "stderr": "Token estimates: ~10 (JSON) -> ~10 (TOON)\nSaved ~0 tokens (0.0%)\n",
+      "expected": {
+        "json_tokens": 10,
+        "toon_tokens": 10,
+        "saved_tokens": 0,
+        "saved_percent": 0.0
+      }
+    },
+    {
+      "name": "negative_savings",
+      "stderr": "Token estimates: ~5 (JSON) -> ~8 (TOON)\nSaved ~-3 tokens (60.0%)\n",
+      "expected_comment": "Negative saved_tokens pattern won't match \\d+ (no minus). saved_tokens/saved_percent may be absent.",
+      "expected": {
+        "json_tokens": 5,
+        "toon_tokens": 8
+      }
+    },
+    {
+      "name": "empty_stderr",
+      "stderr": "",
+      "expected": null
+    },
+    {
+      "name": "unrelated_stderr",
+      "stderr": "warning: deprecated flag --legacy\n",
+      "expected": null
+    },
+    {
+      "name": "stats_with_noise",
+      "stderr": "info: loading config\nToken estimates: ~200 (JSON) -> ~80 (TOON)\nSaved ~120 tokens (-60.0%)\ninfo: done\n",
+      "expected": {
+        "json_tokens": 200,
+        "toon_tokens": 80,
+        "saved_tokens": 120,
+        "saved_percent": -60.0
+      }
+    }
+  ]
+}

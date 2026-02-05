@@ -1,0 +1,27 @@
+{
+  "_description": "Encoder binary not found in PATH. Falls back to JSON envelope with toon_error.",
+  "input": {
+    "payload": {
+      "id": 1,
+      "subject": "Test"
+    },
+    "format_param": "toon",
+    "toon_stats_enabled": false,
+    "encoder_override": "/nonexistent/tru"
+  },
+  "encoder": {
+    "error": "FileNotFoundError"
+  },
+  "expected": {
+    "format": "json",
+    "data": {
+      "id": 1,
+      "subject": "Test"
+    },
+    "meta": {
+      "requested": "toon",
+      "source": "param",
+      "toon_error": "TOON encoder not found: [Errno 2] No such file or directory: '/nonexistent/tru'"
+    }
+  }
+}

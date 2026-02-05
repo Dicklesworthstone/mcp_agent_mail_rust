@@ -150,8 +150,10 @@ pub fn bundle_attachments(
 
             match source_file {
                 Some(source) if source.exists() => {
-                    let file_size = source.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+                    // Read file once — use content.len() for threshold decisions
+                    // to avoid TOCTOU mismatch with metadata().
                     let content = std::fs::read(&source)?;
+                    let file_size = content.len();
                     let sha = hex_sha256(&content);
 
                     if file_size <= inline_threshold {
@@ -364,8 +366,10 @@ pub fn write_bundle_scaffolding(
     db_path_relative: &str,
     db_sha256: &str,
     db_size_bytes: u64,
+    viewer_data: Option<&ViewerDataManifest>,
+    viewer_sri: &HashMap<String, String>,
 ) -> ShareResult<()> {
-    // manifest.json
+    // manifest.json (sorted keys for determinism — matches Python `sort_keys=True`)
     let manifest = build_manifest(
         scope,
         scrub_summary,
@@ -376,11 +380,14 @@ pub fn write_bundle_scaffolding(
         db_path_relative,
         db_sha256,
         db_size_bytes,
+        viewer_data,
+        viewer_sri,
     );
+    let sorted = sort_json_keys(&manifest);
     let manifest_path = output_dir.join("manifest.json");
     std::fs::write(
         &manifest_path,
-        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+        serde_json::to_string_pretty(&sorted).unwrap_or_default(),
     )?;
 
     // README.md
@@ -391,10 +398,32 @@ pub fn write_bundle_scaffolding(
     let deploy = generate_deploy_guide(hosting_hints);
     std::fs::write(output_dir.join("HOW_TO_DEPLOY.md"), deploy)?;
 
-    // index.html (redirect to viewer)
-    let index = r#"<!DOCTYPE html>
-<html><head><meta http-equiv="refresh" content="0; url=viewer/"></head>
-<body><a href="viewer/">Open viewer</a></body></html>"#;
+    // index.html (redirect to viewer — matches legacy Python entry page)
+    let index = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="refresh" content="0; url=./viewer/" />
+  <title>MCP Agent Mail Viewer</title>
+  <link rel="canonical" href="./viewer/" />
+</head>
+<body>
+  <main>
+    <h1>MCP Agent Mail Viewer</h1>
+    <p>You are being redirected to the hosted viewer experience.</p>
+    <p>If you are not redirected automatically, <a href="./viewer/">click here to open the viewer</a>.</p>
+  </main>
+  <script>
+    try {
+      const target = new URL("./viewer/", window.location.href);
+      window.location.replace(target.toString());
+    } catch (error) {
+      window.location.href = "./viewer/";
+    }
+  </script>
+</body>
+</html>"#;
     std::fs::write(output_dir.join("index.html"), index)?;
 
     // .nojekyll (GitHub Pages)
@@ -488,6 +517,7 @@ fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<String>) -> st
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_manifest(
     scope: &ProjectScopeResult,
     scrub_summary: &ScrubSummary,
@@ -498,6 +528,8 @@ fn build_manifest(
     db_path_relative: &str,
     db_sha256: &str,
     db_size_bytes: u64,
+    viewer_data: Option<&ViewerDataManifest>,
+    viewer_sri: &HashMap<String, String>,
 ) -> Value {
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -529,6 +561,22 @@ fn build_manifest(
         })
         .collect();
 
+    // Build viewer section (matches legacy Python manifest format)
+    let viewer_section = if let Some(vd) = viewer_data {
+        // Convert SRI to sorted Value (deterministic)
+        let sri: serde_json::Map<String, Value> = viewer_sri
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect();
+        serde_json::json!({
+            "messages": vd.messages_path,
+            "meta_info": vd.meta_info,
+            "sri": sri,
+        })
+    } else {
+        Value::Null
+    };
+
     serde_json::json!({
         "schema_version": "0.1.0",
         "generated_at": now,
@@ -551,6 +599,7 @@ fn build_manifest(
         "hosting": {
             "detected": hosting_detected,
         },
+        "viewer": viewer_section,
         "export_config": {
             "projects": requested,
             "scrub_preset": scrub_summary.preset,
@@ -558,6 +607,24 @@ fn build_manifest(
             "detach_threshold": attachment_manifest.config.detach_threshold,
         },
     })
+}
+
+/// Recursively sort all object keys in a JSON value for deterministic serialization.
+///
+/// Matches legacy Python's `json.dumps(sort_keys=True)` behavior.
+fn sort_json_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted: Vec<(&String, Value)> =
+                map.iter().map(|(k, v)| (k, sort_json_keys(v))).collect();
+            sorted.sort_by_key(|(a, _)| *a);
+            let ordered: serde_json::Map<String, Value> =
+                sorted.into_iter().map(|(k, v)| (k.clone(), v)).collect();
+            Value::Object(ordered)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sort_json_keys).collect()),
+        other => other.clone(),
+    }
 }
 
 fn generate_readme(scope: &ProjectScopeResult, scrub: &ScrubSummary) -> String {
@@ -608,9 +675,218 @@ fn generate_deploy_guide(hints: &[HostingHint]) -> String {
     guide
 }
 
+/// Copy viewer assets from a source directory into `viewer/` in the bundle.
+///
+/// Recursively copies all files, preserving directory structure.
+/// Files are sorted for deterministic output.
+pub fn copy_viewer_assets(viewer_source: &Path, output_dir: &Path) -> ShareResult<Vec<String>> {
+    let viewer_root = output_dir.join("viewer");
+    std::fs::create_dir_all(&viewer_root)?;
+
+    if !viewer_source.is_dir() {
+        return Err(ShareError::BundleNotFound {
+            path: viewer_source.display().to_string(),
+        });
+    }
+
+    let mut copied = Vec::new();
+
+    // Collect all files sorted for determinism
+    let mut entries = Vec::new();
+    collect_entries(viewer_source, viewer_source, &mut entries)?;
+    entries.sort();
+
+    for relative_path in &entries {
+        let src = viewer_source.join(relative_path);
+        let dest = viewer_root.join(relative_path);
+        if src.is_dir() {
+            std::fs::create_dir_all(&dest)?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src, &dest)?;
+            copied.push(format!("viewer/{relative_path}"));
+        }
+    }
+
+    Ok(copied)
+}
+
+/// Compute SRI (Subresource Integrity) hashes for vendor assets in the viewer directory.
+///
+/// Returns a map of `relative_path -> "sha256-{base64}"` for all files under `viewer/vendor/`.
+#[must_use]
+pub fn compute_viewer_sri(output_dir: &Path) -> HashMap<String, String> {
+    use base64::Engine;
+
+    let vendor_dir = output_dir.join("viewer").join("vendor");
+    let mut sri_map = HashMap::new();
+
+    if !vendor_dir.is_dir() {
+        return sri_map;
+    }
+
+    let mut entries = Vec::new();
+    let _ = collect_entries(&vendor_dir, &vendor_dir, &mut entries);
+    entries.sort();
+
+    for relative_path in &entries {
+        let full_path = vendor_dir.join(relative_path);
+        if full_path.is_file() {
+            if let Ok(data) = std::fs::read(&full_path) {
+                let hash = Sha256::digest(&data);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+                sri_map.insert(format!("vendor/{relative_path}"), format!("sha256-{b64}"));
+            }
+        }
+    }
+
+    sri_map
+}
+
+/// Maximum messages to cache in viewer/data/messages.json.
+const VIEWER_MESSAGE_CACHE_LIMIT: usize = 500;
+
+/// Export viewer data (cached messages + metadata) into the bundle.
+///
+/// Creates `viewer/data/messages.json` and `viewer/data/meta.json` matching legacy format.
+pub fn export_viewer_data(
+    snapshot_path: &Path,
+    output_dir: &Path,
+    fts_enabled: bool,
+) -> ShareResult<ViewerDataManifest> {
+    let data_dir = output_dir.join("viewer").join("data");
+    std::fs::create_dir_all(&data_dir)?;
+
+    let path_str = snapshot_path.display().to_string();
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(|e| {
+        ShareError::Sqlite {
+            message: format!("cannot open snapshot for viewer data: {e}"),
+        }
+    })?;
+
+    // Count total messages
+    let count_rows = conn
+        .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("count messages: {e}"),
+        })?;
+    let total: i64 = count_rows
+        .first()
+        .and_then(|r| r.get_named("cnt").ok())
+        .unwrap_or(0);
+
+    // Fetch latest messages for cache
+    let rows = conn
+        .query_sync(
+            "SELECT id, subject, created_ts, importance, \
+             SUBSTR(body_md, 1, 200) AS snippet \
+             FROM messages ORDER BY created_ts DESC LIMIT ?",
+            &[SqlValue::BigInt(VIEWER_MESSAGE_CACHE_LIMIT as i64)],
+        )
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("fetch viewer messages: {e}"),
+        })?;
+
+    let mut messages = Vec::new();
+    for row in &rows {
+        let id: i64 = row.get_named("id").unwrap_or(0);
+        let subject: String = row.get_named("subject").unwrap_or_default();
+        let created_ts: String = row.get_named("created_ts").unwrap_or_default();
+        let importance: String = row.get_named("importance").unwrap_or_default();
+        let snippet: String = row.get_named("snippet").unwrap_or_default();
+
+        messages.push(serde_json::json!({
+            "id": id,
+            "subject": subject,
+            "created_ts": created_ts,
+            "importance": importance,
+            "snippet": snippet,
+        }));
+    }
+
+    let cached_count = messages.len();
+
+    // Write messages.json
+    std::fs::write(
+        data_dir.join("messages.json"),
+        serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string()),
+    )?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let meta = serde_json::json!({
+        "generated_at": now,
+        "message_count": total,
+        "messages_cached": cached_count,
+        "fts_enabled": fts_enabled,
+    });
+
+    // Write meta.json
+    std::fs::write(
+        data_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap_or_else(|_| "{}".to_string()),
+    )?;
+
+    Ok(ViewerDataManifest {
+        messages_path: "viewer/data/messages.json".to_string(),
+        meta_info: ViewerMetaInfo {
+            generated_at: now,
+            message_count: total,
+            messages_cached: cached_count,
+            fts_enabled,
+        },
+    })
+}
+
+/// Viewer data manifest for inclusion in the bundle manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewerDataManifest {
+    pub messages_path: String,
+    pub meta_info: ViewerMetaInfo,
+}
+
+/// Viewer metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewerMetaInfo {
+    pub generated_at: String,
+    pub message_count: i64,
+    pub messages_cached: usize,
+    pub fts_enabled: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_scrub_summary() -> ScrubSummary {
+        ScrubSummary {
+            preset: "standard".to_string(),
+            pseudonym_salt: String::new(),
+            agents_total: 0,
+            agents_pseudonymized: 0,
+            ack_flags_cleared: 0,
+            recipients_cleared: 0,
+            file_reservations_removed: 0,
+            agent_links_removed: 0,
+            secrets_replaced: 0,
+            attachments_sanitized: 0,
+            bodies_redacted: 0,
+            attachments_cleared: 0,
+        }
+    }
+
+    fn test_remaining_counts() -> crate::scope::RemainingCounts {
+        crate::scope::RemainingCounts {
+            projects: 0,
+            agents: 0,
+            messages: 0,
+            recipients: 0,
+            file_reservations: 0,
+            agent_links: 0,
+            project_sibling_suggestions: 0,
+        }
+    }
 
     #[test]
     fn chunk_small_db_returns_none() {
@@ -674,7 +950,10 @@ mod tests {
         let lines: Vec<&str> = checksums.lines().collect();
         assert_eq!(lines.len(), 4);
         for line in &lines {
-            assert!(line.contains("  chunks/"), "checksum line should have chunks/ prefix: {line}");
+            assert!(
+                line.contains("  chunks/"),
+                "checksum line should have chunks/ prefix: {line}"
+            );
             assert!(line.ends_with(".bin"));
         }
     }
@@ -690,14 +969,18 @@ mod tests {
         std::fs::write(&db1, &data).unwrap();
         let out1 = dir1.path().join("out");
         std::fs::create_dir_all(&out1).unwrap();
-        let m1 = maybe_chunk_database(&db1, &out1, 50_000, 30_000).unwrap().unwrap();
+        let m1 = maybe_chunk_database(&db1, &out1, 50_000, 30_000)
+            .unwrap()
+            .unwrap();
 
         // Run 2
         let db2 = dir2.path().join("db.sqlite3");
         std::fs::write(&db2, &data).unwrap();
         let out2 = dir2.path().join("out");
         std::fs::create_dir_all(&out2).unwrap();
-        let m2 = maybe_chunk_database(&db2, &out2, 50_000, 30_000).unwrap().unwrap();
+        let m2 = maybe_chunk_database(&db2, &out2, 50_000, 30_000)
+            .unwrap()
+            .unwrap();
 
         // Manifests match
         assert_eq!(m1.chunk_count, m2.chunk_count);
@@ -706,7 +989,10 @@ mod tests {
         // Checksums are identical
         let cs1 = std::fs::read_to_string(out1.join("chunks.sha256")).unwrap();
         let cs2 = std::fs::read_to_string(out2.join("chunks.sha256")).unwrap();
-        assert_eq!(cs1, cs2, "checksums should be identical for identical inputs");
+        assert_eq!(
+            cs1, cs2,
+            "checksums should be identical for identical inputs"
+        );
 
         // Chunk files are identical
         for i in 0..m1.chunk_count {
@@ -725,7 +1011,9 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
 
-        let manifest = maybe_chunk_database(&db, &out, 50_000, 30_000).unwrap().unwrap();
+        let manifest = maybe_chunk_database(&db, &out, 50_000, 30_000)
+            .unwrap()
+            .unwrap();
 
         // Reassemble chunks
         let mut reassembled = Vec::new();
@@ -734,7 +1022,10 @@ mod tests {
             reassembled.extend_from_slice(&chunk);
         }
 
-        assert_eq!(reassembled, original, "reassembled data should match original");
+        assert_eq!(
+            reassembled, original,
+            "reassembled data should match original"
+        );
     }
 
     #[test]
@@ -763,7 +1054,7 @@ mod tests {
     fn create_bundle_test_db(dir: &Path, msg_attachments: &[&str]) -> PathBuf {
         let db_path = dir.join("bundle_test.sqlite3");
         let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(&db_path.display().to_string()).unwrap();
+            sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         ).unwrap();
@@ -866,7 +1157,7 @@ mod tests {
         assert_eq!(result.items[0].mode, "inline");
 
         // Verify DB was updated with data: URI
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(&db.display().to_string()).unwrap();
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();
@@ -955,8 +1246,7 @@ mod tests {
         assert_eq!(result.items[3].mode, "missing");
 
         // Verify DB was updated with all 4 types
-        let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(&db.display().to_string()).unwrap();
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();
@@ -966,7 +1256,12 @@ mod tests {
         assert_eq!(parsed[0]["type"], "inline");
         assert!(att.contains("data:text/plain;base64,"));
         assert_eq!(parsed[1]["type"], "file");
-        assert!(parsed[1]["path"].as_str().unwrap().starts_with("attachments/"));
+        assert!(
+            parsed[1]["path"]
+                .as_str()
+                .unwrap()
+                .starts_with("attachments/")
+        );
         assert_eq!(parsed[2]["type"], "external");
         assert!(att.contains("Requires manual hosting"));
         assert_eq!(parsed[3]["type"], "missing");
@@ -1036,8 +1331,7 @@ mod tests {
         assert_eq!(result.stats.inline, 1);
 
         // Verify DB: should have 2 entries, first unchanged
-        let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(&db.display().to_string()).unwrap();
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();
@@ -1061,7 +1355,7 @@ mod tests {
         for i in 0..3 {
             std::fs::write(
                 storage.join(format!("file_{i}.bin")),
-                vec![(i as u8 + 1); 100 * 1024],
+                vec![i as u8 + 1; 100 * 1024],
             )
             .unwrap();
         }
@@ -1085,12 +1379,507 @@ mod tests {
         // Every "file" item has a bundle_path that exists
         for item in &result.items {
             if item.mode == "file" {
-                let bp = item.bundle_path.as_ref().expect("file should have bundle_path");
-                assert!(
-                    output.join(bp).exists(),
-                    "bundle_path should resolve: {bp}"
-                );
+                let bp = item
+                    .bundle_path
+                    .as_ref()
+                    .expect("file should have bundle_path");
+                assert!(output.join(bp).exists(), "bundle_path should resolve: {bp}");
             }
+        }
+    }
+
+    // === Viewer asset tests ===
+
+    #[test]
+    fn copy_viewer_assets_copies_directory_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("viewer_assets");
+        std::fs::create_dir_all(source.join("vendor")).unwrap();
+        std::fs::write(source.join("index.html"), b"<html>viewer</html>").unwrap();
+        std::fs::write(source.join("viewer.js"), b"// viewer code").unwrap();
+        std::fs::write(source.join("styles.css"), b"body {}").unwrap();
+        std::fs::write(source.join("vendor/sql-wasm.js"), b"// sql.js").unwrap();
+        std::fs::write(source.join("vendor/marked.min.js"), b"// marked").unwrap();
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let copied = copy_viewer_assets(&source, &output).unwrap();
+
+        // All files copied
+        assert_eq!(copied.len(), 5);
+        assert!(output.join("viewer/index.html").exists());
+        assert!(output.join("viewer/viewer.js").exists());
+        assert!(output.join("viewer/styles.css").exists());
+        assert!(output.join("viewer/vendor/sql-wasm.js").exists());
+        assert!(output.join("viewer/vendor/marked.min.js").exists());
+
+        // Content preserved
+        let html = std::fs::read_to_string(output.join("viewer/index.html")).unwrap();
+        assert_eq!(html, "<html>viewer</html>");
+    }
+
+    #[test]
+    fn copy_viewer_assets_missing_source_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let result = copy_viewer_assets(Path::new("/nonexistent/viewer"), &output);
+        assert!(matches!(result, Err(ShareError::BundleNotFound { .. })));
+    }
+
+    #[test]
+    fn copy_viewer_assets_deterministic_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("viewer_assets");
+        std::fs::create_dir_all(&source).unwrap();
+        // Create files in non-sorted order
+        for name in &["z.js", "a.css", "m.html", "b.js"] {
+            std::fs::write(source.join(name), name.as_bytes()).unwrap();
+        }
+
+        let out1 = dir.path().join("out1");
+        let out2 = dir.path().join("out2");
+        std::fs::create_dir_all(&out1).unwrap();
+        std::fs::create_dir_all(&out2).unwrap();
+
+        let copied1 = copy_viewer_assets(&source, &out1).unwrap();
+        let copied2 = copy_viewer_assets(&source, &out2).unwrap();
+        assert_eq!(copied1, copied2, "copy order should be deterministic");
+    }
+
+    #[test]
+    fn compute_viewer_sri_generates_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+        let vendor = output.join("viewer/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("test.js"), b"console.log('hello')").unwrap();
+        std::fs::write(vendor.join("test.wasm"), b"\x00asm").unwrap();
+
+        let sri = compute_viewer_sri(&output);
+        assert_eq!(sri.len(), 2);
+        assert!(sri.contains_key("vendor/test.js"));
+        assert!(sri.contains_key("vendor/test.wasm"));
+        assert!(sri["vendor/test.js"].starts_with("sha256-"));
+        assert!(sri["vendor/test.wasm"].starts_with("sha256-"));
+    }
+
+    #[test]
+    fn export_viewer_data_creates_json_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_bundle_test_db(
+            dir.path(),
+            &[
+                "[]", // msg 1
+                "[]", // msg 2
+            ],
+        );
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let manifest = export_viewer_data(&db, &output, true).unwrap();
+
+        // Files exist
+        assert!(output.join("viewer/data/messages.json").exists());
+        assert!(output.join("viewer/data/meta.json").exists());
+
+        // Manifest fields
+        assert_eq!(manifest.messages_path, "viewer/data/messages.json");
+        assert_eq!(manifest.meta_info.message_count, 2);
+        assert_eq!(manifest.meta_info.messages_cached, 2);
+        assert!(manifest.meta_info.fts_enabled);
+
+        // messages.json parseable
+        let msgs_text = std::fs::read_to_string(output.join("viewer/data/messages.json")).unwrap();
+        let msgs: Vec<Value> = serde_json::from_str(&msgs_text).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].get("id").is_some());
+        assert!(msgs[0].get("subject").is_some());
+        assert!(msgs[0].get("snippet").is_some());
+
+        // meta.json parseable
+        let meta_text = std::fs::read_to_string(output.join("viewer/data/meta.json")).unwrap();
+        let meta: Value = serde_json::from_str(&meta_text).unwrap();
+        assert_eq!(meta["message_count"], 2);
+        assert_eq!(meta["messages_cached"], 2);
+        assert_eq!(meta["fts_enabled"], true);
+    }
+
+    #[test]
+    fn headers_file_matches_legacy_format() {
+        let headers = hosting::generate_headers_file();
+        // Must contain comments (legacy format)
+        assert!(headers.contains("# Cross-Origin Isolation"));
+        assert!(headers.contains("# Allow viewer assets"));
+        assert!(headers.contains("# SQLite database"));
+        assert!(headers.contains("# Attachments"));
+        // Must contain all required header rules
+        assert!(headers.contains("Cross-Origin-Opener-Policy: same-origin"));
+        assert!(headers.contains("Cross-Origin-Embedder-Policy: require-corp"));
+        assert!(headers.contains("Cross-Origin-Resource-Policy: same-origin"));
+        assert!(headers.contains("Content-Type: application/x-sqlite3"));
+        assert!(headers.contains("Content-Type: application/octet-stream"));
+        // Must contain path selectors
+        assert!(headers.contains("/*\n"));
+        assert!(headers.contains("/viewer/*\n"));
+        assert!(headers.contains("/*.sqlite3\n"));
+        assert!(headers.contains("/chunks/*\n"));
+        assert!(headers.contains("/attachments/*\n"));
+    }
+
+    // === Manifest + scaffolding tests (br-2ei.4.5.3) ===
+
+    #[test]
+    fn sort_json_keys_sorts_recursively() {
+        let value = serde_json::json!({
+            "z_key": 1,
+            "a_key": {
+                "z_nested": true,
+                "a_nested": false,
+            },
+            "m_key": [{"z": 1, "a": 2}],
+        });
+        let sorted = sort_json_keys(&value);
+        let output = serde_json::to_string(&sorted).unwrap();
+        // Keys should be alphabetically sorted at all levels
+        assert!(output.find("\"a_key\"").unwrap() < output.find("\"m_key\"").unwrap());
+        assert!(output.find("\"m_key\"").unwrap() < output.find("\"z_key\"").unwrap());
+        // Nested keys too
+        assert!(output.find("\"a_nested\"").unwrap() < output.find("\"z_nested\"").unwrap());
+        // Array element keys
+        assert!(output.find("\"a\"").unwrap() < output.find("\"z\"").unwrap());
+    }
+
+    #[test]
+    fn manifest_determinism_serialize_twice() {
+        let scope = ProjectScopeResult {
+            projects: vec![crate::scope::ProjectRecord {
+                id: 1,
+                slug: "test".to_string(),
+                human_key: "/test".to_string(),
+            }],
+            identifiers: vec!["test".to_string()],
+            removed_count: 0,
+            remaining: test_remaining_counts(),
+        };
+        let scrub = test_scrub_summary();
+        let att = AttachmentManifest {
+            stats: AttachmentStats {
+                inline: 0,
+                copied: 0,
+                externalized: 0,
+                missing: 0,
+                bytes_copied: 0,
+            },
+            config: AttachmentConfig {
+                inline_threshold: 65536,
+                detach_threshold: 26214400,
+            },
+            items: vec![],
+        };
+
+        let m1 = build_manifest(
+            &scope,
+            &scrub,
+            &att,
+            None,
+            &[],
+            true,
+            "mailbox.sqlite3",
+            "abc123",
+            1024,
+            None,
+            &HashMap::new(),
+        );
+        let m2 = build_manifest(
+            &scope,
+            &scrub,
+            &att,
+            None,
+            &[],
+            true,
+            "mailbox.sqlite3",
+            "abc123",
+            1024,
+            None,
+            &HashMap::new(),
+        );
+
+        let s1 = serde_json::to_string_pretty(&sort_json_keys(&m1)).unwrap();
+        let s2 = serde_json::to_string_pretty(&sort_json_keys(&m2)).unwrap();
+        // Skip generated_at comparison (timestamps differ) — compare structure
+        // by removing the generated_at line
+        let strip_ts = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.contains("generated_at"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            strip_ts(&s1),
+            strip_ts(&s2),
+            "manifest should be deterministic"
+        );
+    }
+
+    #[test]
+    fn manifest_includes_viewer_section() {
+        let scope = ProjectScopeResult {
+            projects: vec![],
+            identifiers: vec![],
+            removed_count: 0,
+            remaining: test_remaining_counts(),
+        };
+        let scrub = test_scrub_summary();
+        let att = AttachmentManifest {
+            stats: AttachmentStats {
+                inline: 0,
+                copied: 0,
+                externalized: 0,
+                missing: 0,
+                bytes_copied: 0,
+            },
+            config: AttachmentConfig {
+                inline_threshold: 65536,
+                detach_threshold: 26214400,
+            },
+            items: vec![],
+        };
+        let viewer = ViewerDataManifest {
+            messages_path: "viewer/data/messages.json".to_string(),
+            meta_info: ViewerMetaInfo {
+                generated_at: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 42,
+                messages_cached: 42,
+                fts_enabled: true,
+            },
+        };
+        let mut sri = HashMap::new();
+        sri.insert(
+            "vendor/sql-wasm.js".to_string(),
+            "sha256-abc123".to_string(),
+        );
+
+        let manifest = build_manifest(
+            &scope,
+            &scrub,
+            &att,
+            None,
+            &[],
+            true,
+            "db.sqlite3",
+            "hash",
+            1024,
+            Some(&viewer),
+            &sri,
+        );
+
+        // viewer section present
+        assert_eq!(manifest["viewer"]["messages"], "viewer/data/messages.json");
+        assert_eq!(manifest["viewer"]["meta_info"]["message_count"], 42);
+        assert_eq!(
+            manifest["viewer"]["sri"]["vendor/sql-wasm.js"],
+            "sha256-abc123"
+        );
+    }
+
+    #[test]
+    fn manifest_chunked_vs_non_chunked() {
+        let scope = ProjectScopeResult {
+            projects: vec![],
+            identifiers: vec![],
+            removed_count: 0,
+            remaining: test_remaining_counts(),
+        };
+        let scrub = test_scrub_summary();
+        let att = AttachmentManifest {
+            stats: AttachmentStats {
+                inline: 0,
+                copied: 0,
+                externalized: 0,
+                missing: 0,
+                bytes_copied: 0,
+            },
+            config: AttachmentConfig {
+                inline_threshold: 65536,
+                detach_threshold: 26214400,
+            },
+            items: vec![],
+        };
+
+        // Non-chunked
+        let m1 = build_manifest(
+            &scope,
+            &scrub,
+            &att,
+            None,
+            &[],
+            true,
+            "db.sqlite3",
+            "hash",
+            1024,
+            None,
+            &HashMap::new(),
+        );
+        assert_eq!(m1["database"]["chunked"], false);
+        assert!(m1["database"]["chunk_manifest"].is_null());
+
+        // Chunked
+        let chunk = ChunkManifest {
+            version: 1,
+            chunk_size: 4_194_304,
+            chunk_count: 5,
+            pattern: "chunks/{index:05d}.bin".to_string(),
+            original_bytes: 21_000_000,
+            threshold_bytes: 20_971_520,
+        };
+        let m2 = build_manifest(
+            &scope,
+            &scrub,
+            &att,
+            Some(&chunk),
+            &[],
+            true,
+            "db.sqlite3",
+            "hash",
+            21_000_000,
+            None,
+            &HashMap::new(),
+        );
+        assert_eq!(m2["database"]["chunked"], true);
+        assert_eq!(m2["database"]["chunk_manifest"]["chunk_count"], 5);
+        assert_eq!(m2["database"]["chunk_manifest"]["version"], 1);
+    }
+
+    #[test]
+    fn manifest_required_fields_present() {
+        let scope = ProjectScopeResult {
+            projects: vec![],
+            identifiers: vec![],
+            removed_count: 0,
+            remaining: test_remaining_counts(),
+        };
+        let scrub = test_scrub_summary();
+        let att = AttachmentManifest {
+            stats: AttachmentStats {
+                inline: 0,
+                copied: 0,
+                externalized: 0,
+                missing: 0,
+                bytes_copied: 0,
+            },
+            config: AttachmentConfig {
+                inline_threshold: 65536,
+                detach_threshold: 26214400,
+            },
+            items: vec![],
+        };
+
+        let manifest = build_manifest(
+            &scope,
+            &scrub,
+            &att,
+            None,
+            &[],
+            true,
+            "db.sqlite3",
+            "hash",
+            1024,
+            None,
+            &HashMap::new(),
+        );
+
+        // All required top-level fields
+        assert!(manifest.get("schema_version").is_some());
+        assert!(manifest.get("generated_at").is_some());
+        assert!(manifest.get("exporter_version").is_some());
+        assert!(manifest.get("database").is_some());
+        assert!(manifest.get("project_scope").is_some());
+        assert!(manifest.get("scrub").is_some());
+        assert!(manifest.get("attachments").is_some());
+        assert!(manifest.get("hosting").is_some());
+        assert!(manifest.get("export_config").is_some());
+
+        // Database fields
+        let db = &manifest["database"];
+        assert!(db.get("path").is_some());
+        assert!(db.get("size_bytes").is_some());
+        assert!(db.get("sha256").is_some());
+        assert!(db.get("chunked").is_some());
+        assert!(db.get("fts_enabled").is_some());
+
+        // Export config fields
+        let ec = &manifest["export_config"];
+        assert!(ec.get("projects").is_some());
+        assert!(ec.get("scrub_preset").is_some());
+        assert!(ec.get("inline_threshold").is_some());
+        assert!(ec.get("detach_threshold").is_some());
+    }
+
+    #[test]
+    fn manifest_keys_alphabetically_sorted() {
+        let scope = ProjectScopeResult {
+            projects: vec![],
+            identifiers: vec![],
+            removed_count: 0,
+            remaining: test_remaining_counts(),
+        };
+        let scrub = test_scrub_summary();
+        let att = AttachmentManifest {
+            stats: AttachmentStats {
+                inline: 0,
+                copied: 0,
+                externalized: 0,
+                missing: 0,
+                bytes_copied: 0,
+            },
+            config: AttachmentConfig {
+                inline_threshold: 65536,
+                detach_threshold: 26214400,
+            },
+            items: vec![],
+        };
+
+        let manifest = build_manifest(
+            &scope,
+            &scrub,
+            &att,
+            None,
+            &[],
+            true,
+            "db.sqlite3",
+            "hash",
+            1024,
+            None,
+            &HashMap::new(),
+        );
+        let sorted = sort_json_keys(&manifest);
+        let output = serde_json::to_string_pretty(&sorted).unwrap();
+
+        // Top-level keys in alphabetical order
+        let positions: Vec<usize> = [
+            "attachments",
+            "database",
+            "export_config",
+            "exporter_version",
+            "generated_at",
+            "hosting",
+            "project_scope",
+            "schema_version",
+            "scrub",
+            "viewer",
+        ]
+        .iter()
+        .map(|k| output.find(&format!("\"{k}\"")).expect(k))
+        .collect();
+
+        for i in 1..positions.len() {
+            assert!(
+                positions[i - 1] < positions[i],
+                "keys should be alphabetically sorted"
+            );
         }
     }
 }

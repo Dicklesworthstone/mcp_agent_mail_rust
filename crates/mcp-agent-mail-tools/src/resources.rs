@@ -80,11 +80,17 @@ fn percent_decode_component(input: &str) -> String {
 }
 
 fn tool_filter_allows(config: &Config, tool_name: &str) -> bool {
-    if let Some(cluster) = tool_cluster(tool_name) {
-        config.should_expose_tool(tool_name, cluster)
-    } else {
-        true
+    tool_cluster(tool_name).is_none_or(|cluster| config.should_expose_tool(tool_name, cluster))
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ts_f64_to_rfc3339(t: f64) -> Option<String> {
+    if !t.is_finite() {
+        return None;
     }
+    let secs = t.trunc() as i64;
+    let nanos = (t.fract().abs() * 1e9) as u32;
+    chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
 }
 
 // ============================================================================
@@ -674,6 +680,117 @@ fn build_tool_directory() -> ToolDirectory {
                     required_capabilities: vec!["file_reservations".to_string()],
                     usage_examples: vec![ToolUsageExample { hint: "Extend".to_string(), sample: "renew_file_reservations(project_key='backend', agent_name='BlueLake', extend_seconds=1800)".to_string() }],
                     capabilities: vec!["file_reservations".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "force_release_file_reservation".to_string(),
+                    summary: "Force-release stale reservations after inactivity heuristics and optionally notify prior holders.".to_string(),
+                    use_when: "A reservation appears abandoned and is blocking progress.".to_string(),
+                    related: vec!["file_reservation_paths".to_string(), "release_file_reservations".to_string()],
+                    expected_frequency: "Rare; only for stuck reservations.".to_string(),
+                    required_capabilities: vec!["file_reservations".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Recover".to_string(), sample: "force_release_file_reservation(project_key='backend', agent_name='BlueLake', file_reservation_id=101)".to_string() }],
+                    capabilities: vec!["file_reservations".to_string()],
+                    complexity: "medium".to_string(),
+                },
+            ],
+        },
+        ToolCluster {
+            name: "Build Slots".to_string(),
+            purpose: "Coordinate exclusive build/CI slots to avoid redundant runs.".to_string(),
+            tools: vec![
+                ToolDirectoryEntry {
+                    name: "acquire_build_slot".to_string(),
+                    summary: "Acquire an exclusive build slot for a project or scope.".to_string(),
+                    use_when: "Before starting a heavy build or CI run.".to_string(),
+                    related: vec!["renew_build_slot".to_string(), "release_build_slot".to_string()],
+                    expected_frequency: "Per build/CI task.".to_string(),
+                    required_capabilities: vec!["build".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Acquire".to_string(), sample: "acquire_build_slot(project_key='backend', agent_name='BlueLake')".to_string() }],
+                    capabilities: vec!["build".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "renew_build_slot".to_string(),
+                    summary: "Extend a build slot lease without re-acquiring.".to_string(),
+                    use_when: "Builds run longer than the original TTL.".to_string(),
+                    related: vec!["acquire_build_slot".to_string(), "release_build_slot".to_string()],
+                    expected_frequency: "As needed for long builds.".to_string(),
+                    required_capabilities: vec!["build".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Extend".to_string(), sample: "renew_build_slot(project_key='backend', agent_name='BlueLake', extend_seconds=600)".to_string() }],
+                    capabilities: vec!["build".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "release_build_slot".to_string(),
+                    summary: "Release a build slot when work is complete.".to_string(),
+                    use_when: "After build/CI finishes or is cancelled.".to_string(),
+                    related: vec!["acquire_build_slot".to_string(), "renew_build_slot".to_string()],
+                    expected_frequency: "At the end of each build/CI run.".to_string(),
+                    required_capabilities: vec!["build".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Release".to_string(), sample: "release_build_slot(project_key='backend', agent_name='BlueLake')".to_string() }],
+                    capabilities: vec!["build".to_string()],
+                    complexity: "low".to_string(),
+                },
+            ],
+        },
+        ToolCluster {
+            name: "Product Bus".to_string(),
+            purpose: "Group projects into products and query messages across the product graph.".to_string(),
+            tools: vec![
+                ToolDirectoryEntry {
+                    name: "ensure_product".to_string(),
+                    summary: "Create or fetch a product record by UID or name.".to_string(),
+                    use_when: "Establishing a cross-project product grouping.".to_string(),
+                    related: vec!["products_link".to_string()],
+                    expected_frequency: "Per product setup or migration.".to_string(),
+                    required_capabilities: vec!["product".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Create product".to_string(), sample: "ensure_product(product_uid='prod-123', name='Core')".to_string() }],
+                    capabilities: vec!["product".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "products_link".to_string(),
+                    summary: "Link a product to a project for cross-project views.".to_string(),
+                    use_when: "Associating a project with a product.".to_string(),
+                    related: vec!["ensure_product".to_string()],
+                    expected_frequency: "Occasional; during project onboarding.".to_string(),
+                    required_capabilities: vec!["product".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Link".to_string(), sample: "products_link(product_uid='prod-123', project_key='/abs/path/backend')".to_string() }],
+                    capabilities: vec!["product".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "search_messages_product".to_string(),
+                    summary: "Search messages across all projects linked to a product.".to_string(),
+                    use_when: "Global search across a multi-repo product.".to_string(),
+                    related: vec!["fetch_inbox_product".to_string(), "summarize_thread_product".to_string()],
+                    expected_frequency: "Ad hoc during investigation or triage.".to_string(),
+                    required_capabilities: vec!["product".to_string(), "search".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Search".to_string(), sample: "search_messages_product(product_uid='prod-123', query='outage')".to_string() }],
+                    capabilities: vec!["product".to_string(), "search".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "fetch_inbox_product".to_string(),
+                    summary: "Fetch inbox messages across all projects linked to a product.".to_string(),
+                    use_when: "Aggregating inbox visibility across a product portfolio.".to_string(),
+                    related: vec!["search_messages_product".to_string()],
+                    expected_frequency: "Ad hoc when monitoring product-wide activity.".to_string(),
+                    required_capabilities: vec!["product".to_string(), "messaging".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Inbox".to_string(), sample: "fetch_inbox_product(product_uid='prod-123', agent_name='BlueLake')".to_string() }],
+                    capabilities: vec!["product".to_string(), "messaging".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "summarize_thread_product".to_string(),
+                    summary: "Summarize a thread across product-linked projects.".to_string(),
+                    use_when: "Summarizing multi-project incidents.".to_string(),
+                    related: vec!["search_messages_product".to_string()],
+                    expected_frequency: "When threads span multiple repos.".to_string(),
+                    required_capabilities: vec!["product".to_string(), "summarization".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Summarize".to_string(), sample: "summarize_thread_product(product_uid='prod-123', thread_id='INC-42')".to_string() }],
+                    capabilities: vec!["product".to_string(), "summarization".to_string()],
                     complexity: "medium".to_string(),
                 },
             ],
@@ -1336,17 +1453,14 @@ pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
             let holder = l
                 .get("owner")
                 .and_then(|o| o.get("pid"))
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map_or_else(|| "unknown".to_string(), |pid| format!("pid:{pid}"));
             let acquired_ts = l
                 .get("owner")
                 .and_then(|o| o.get("created_ts"))
-                .and_then(|v| v.as_f64())
-                .map_or_else(String::new, |t| {
-                    chrono::DateTime::from_timestamp(t as i64, ((t.fract()) * 1e9) as u32)
-                        .unwrap_or_default()
-                        .to_rfc3339()
-                });
+                .and_then(serde_json::Value::as_f64)
+                .and_then(ts_f64_to_rfc3339)
+                .unwrap_or_default();
             ArchiveLock {
                 project_slug,
                 holder,

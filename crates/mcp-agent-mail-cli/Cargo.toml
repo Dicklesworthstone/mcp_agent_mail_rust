@@ -24,3 +24,6 @@ mcp-agent-mail-db = { workspace = true }
 mcp-agent-mail-share = { workspace = true }
 mcp-agent-mail-guard = { workspace = true }
 mcp-agent-mail-server = { workspace = true }
+sha2.workspace = true
+hex.workspace = true
+asupersync.workspace = true

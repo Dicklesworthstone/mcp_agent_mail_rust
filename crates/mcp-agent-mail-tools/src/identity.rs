@@ -412,7 +412,8 @@ pub async fn whois(
     let pool = get_db_pool()?;
 
     let include_commits = include_recent_commits.unwrap_or(true);
-    let limit = commit_limit.unwrap_or(5).max(0) as usize;
+    let limit_raw = commit_limit.unwrap_or(5).max(0);
+    let limit = usize::try_from(limit_raw).unwrap_or(0);
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);

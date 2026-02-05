@@ -1860,10 +1860,7 @@ pub fn clear_notification_signal(config: &Config, project_slug: &str, agent_name
 }
 
 /// List pending notification signals.
-pub fn list_pending_signals(
-    config: &Config,
-    project_slug: Option<&str>,
-) -> Vec<serde_json::Value> {
+pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<serde_json::Value> {
     if !config.notifications_enabled {
         return Vec::new();
     }
@@ -2677,7 +2674,12 @@ mod tests {
             subject: Some("Hello".to_string()),
             importance: Some("high".to_string()),
         };
-        assert!(emit_notification_signal(&config, "proj", "Agent", Some(&meta)));
+        assert!(emit_notification_signal(
+            &config,
+            "proj",
+            "Agent",
+            Some(&meta)
+        ));
 
         let signals = list_pending_signals(&config, Some("proj"));
         assert_eq!(signals.len(), 1);

@@ -129,6 +129,11 @@ pub struct Config {
     pub instrumentation_enabled: bool,
     pub instrumentation_slow_query_ms: u64,
 
+    // TOON output format
+    pub toon_bin: Option<String>,
+    pub toon_stats_enabled: bool,
+    pub output_format_default: Option<String>,
+
     // Logging
     pub log_level: String,
     pub log_rich_enabled: bool,
@@ -297,6 +302,11 @@ impl Default for Config {
             // Instrumentation
             instrumentation_enabled: false,
             instrumentation_slow_query_ms: 250,
+
+            // TOON output format
+            toon_bin: None,
+            toon_stats_enabled: false,
+            output_format_default: None,
 
             // Logging
             log_level: "INFO".to_string(),
@@ -543,8 +553,10 @@ impl Config {
             "NOTIFICATIONS_INCLUDE_METADATA",
             config.notifications_include_metadata,
         );
-        config.notifications_debounce_ms =
-            env_u64("NOTIFICATIONS_DEBOUNCE_MS", config.notifications_debounce_ms);
+        config.notifications_debounce_ms = env_u64(
+            "NOTIFICATIONS_DEBOUNCE_MS",
+            config.notifications_debounce_ms,
+        );
 
         // Instrumentation
         config.instrumentation_enabled =
@@ -568,6 +580,23 @@ impl Config {
         if let Ok(v) = env::var("TOOLS_FILTER_TOOLS") {
             config.tool_filter.tools = parse_csv_lower(&v);
         }
+
+        // TOON output format
+        // Encoder binary: TOON_TRU_BIN > TOON_BIN > None (will use default "tru")
+        config.toon_bin = env::var("TOON_TRU_BIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| env::var("TOON_BIN").ok().filter(|s| !s.is_empty()));
+        config.toon_stats_enabled = env_bool("TOON_STATS", config.toon_stats_enabled);
+        // Output format default: MCP_AGENT_MAIL_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > None
+        config.output_format_default = env::var("MCP_AGENT_MAIL_OUTPUT_FORMAT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                env::var("TOON_DEFAULT_FORMAT")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
 
         // Logging
         if let Ok(v) = env::var("LOG_LEVEL") {

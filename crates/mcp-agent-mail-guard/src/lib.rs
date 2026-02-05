@@ -552,7 +552,12 @@ pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
 pub fn is_guard_gated() -> bool {
     fn is_truthy(var: &str) -> bool {
         std::env::var(var)
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "t" | "yes" | "y"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "t" | "yes" | "y"
+                )
+            })
             .unwrap_or(false)
     }
     is_truthy("WORKTREES_ENABLED") || is_truthy("GIT_IDENTITY_ENABLED")
@@ -562,7 +567,12 @@ pub fn is_guard_gated() -> bool {
 #[must_use]
 pub fn is_bypass_active() -> bool {
     std::env::var("AGENT_MAIL_BYPASS")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "t" | "yes" | "y"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "t" | "yes" | "y"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -572,10 +582,7 @@ pub fn is_bypass_active() -> bool {
 /// `paths` are the file paths to check (relative to repo root).
 ///
 /// Returns a `GuardCheckResult` with conflicts and mode info.
-pub fn guard_check_full(
-    archive_root: &Path,
-    paths: &[String],
-) -> GuardResult<GuardCheckResult> {
+pub fn guard_check_full(archive_root: &Path, paths: &[String]) -> GuardResult<GuardCheckResult> {
     let mode = GuardMode::from_env();
 
     // Check bypass
@@ -698,7 +705,9 @@ fn paths_conflict(path: &str, pattern: &str) -> bool {
 
     // If pattern ends with /* or /**, check prefix match
     if let Some(prefix) = pattern.strip_suffix("/*") {
-        if path.starts_with(prefix) && (path.len() == prefix.len() || path.as_bytes().get(prefix.len()) == Some(&b'/')) {
+        if path.starts_with(prefix)
+            && (path.len() == prefix.len() || path.as_bytes().get(prefix.len()) == Some(&b'/'))
+        {
             return true;
         }
     }
@@ -710,8 +719,7 @@ fn paths_conflict(path: &str, pattern: &str) -> bool {
 
     // Symmetric fnmatch matching
     if contains_glob(path) || contains_glob(pattern) {
-        return fnmatch_simple(path, pattern)
-            || fnmatch_simple(pattern, path);
+        return fnmatch_simple(path, pattern) || fnmatch_simple(pattern, path);
     }
 
     // For non-glob patterns, check prefix (directory match)
@@ -1292,7 +1300,12 @@ mod tests {
         let records = read_active_reservations_from_archive(&archive).expect("read");
         // Should have: res1 (active exclusive), res4 (active non-exclusive), res5 (active exclusive self)
         // res2 (released) and res3 (expired) should be filtered out
-        assert_eq!(records.len(), 3, "expected 3 active records, got {}", records.len());
+        assert_eq!(
+            records.len(),
+            3,
+            "expected 3 active records, got {}",
+            records.len()
+        );
 
         let patterns: Vec<&str> = records.iter().map(|r| r.path_pattern.as_str()).collect();
         assert!(patterns.contains(&"app/api/*.py"));
@@ -1351,7 +1364,10 @@ mod tests {
 
         // SharedAgent's non-exclusive reservation should not block
         let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent");
-        assert!(conflicts.is_empty(), "non-exclusive reservations should not conflict");
+        assert!(
+            conflicts.is_empty(),
+            "non-exclusive reservations should not conflict"
+        );
     }
 
     #[test]
@@ -1470,7 +1486,8 @@ mod tests {
         let paths = get_staged_paths(&repo_dir).expect("staged paths");
         // Should have both old and new path
         assert!(
-            paths.contains(&"old_name.py".to_string()) || paths.contains(&"new_name.py".to_string()),
+            paths.contains(&"old_name.py".to_string())
+                || paths.contains(&"new_name.py".to_string()),
             "staged paths should include rename: {:?}",
             paths
         );

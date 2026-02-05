@@ -53,7 +53,13 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
+    // Initialize query tracking if instrumentation is enabled
+    if config.instrumentation_enabled {
+        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
+    }
+
     let server = Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"));
 
     let server = add_tool(
@@ -642,6 +648,13 @@ impl HttpState {
             }
             "tools/call" => {
                 let params: fastmcp_protocol::CallToolParams = parse_params(request.params)?;
+                // Extract format param before dispatch (TOON support)
+                let format_value = params
+                    .arguments
+                    .as_ref()
+                    .and_then(|args| args.get("format"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let out = self.router.handle_tools_call(
                     &cx,
                     request_id,
@@ -651,7 +664,11 @@ impl HttpState {
                     None,
                     None,
                 )?;
-                serde_json::to_value(out).map_err(McpError::from)
+                let mut value = serde_json::to_value(out).map_err(McpError::from)?;
+                if let Some(ref fmt) = format_value {
+                    apply_toon_to_content(&mut value, "content", fmt, &self.config);
+                }
+                Ok(value)
             }
             "resources/list" => {
                 let params: fastmcp_protocol::ListResourcesParams =
@@ -673,6 +690,8 @@ impl HttpState {
             }
             "resources/read" => {
                 let params: fastmcp_protocol::ReadResourceParams = parse_params(request.params)?;
+                // Extract format from resource URI query params (TOON support)
+                let format_value = extract_format_from_uri(&params.uri);
                 let out = self.router.handle_resources_read(
                     &cx,
                     request_id,
@@ -682,7 +701,11 @@ impl HttpState {
                     None,
                     None,
                 )?;
-                serde_json::to_value(out).map_err(McpError::from)
+                let mut value = serde_json::to_value(out).map_err(McpError::from)?;
+                if let Some(ref fmt) = format_value {
+                    apply_toon_to_content(&mut value, "contents", fmt, &self.config);
+                }
+                Ok(value)
             }
             "resources/subscribe" | "resources/unsubscribe" | "ping" => Ok(serde_json::json!({})),
             "prompts/list" => {
@@ -802,6 +825,75 @@ impl HttpState {
             &self.config.http_cors_allow_headers,
         );
         resp
+    }
+}
+
+/// Extract `format` query parameter from a resource URI.
+///
+/// E.g. `resource://inbox/BlueLake?project=/backend&format=toon` → `Some("toon")`
+fn extract_format_from_uri(uri: &str) -> Option<String> {
+    let query = uri.split_once('?').map(|(_, q)| q)?;
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if key == "format" {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Apply TOON encoding to the text content blocks in a MCP response value.
+///
+/// `content_key` is "content" for tool results (`CallToolResult.content`)
+/// or "contents" for resource results (`ReadResourceResult.contents`).
+///
+/// Walks each content block, finds ones with `type:"text"`, parses the
+/// text as JSON, applies TOON encoding, and replaces the text with the
+/// envelope JSON string.
+fn apply_toon_to_content(
+    value: &mut serde_json::Value,
+    content_key: &str,
+    format_value: &str,
+    config: &mcp_agent_mail_core::Config,
+) {
+    let Ok(decision) = mcp_agent_mail_core::toon::resolve_output_format(Some(format_value), config)
+    else {
+        return;
+    };
+
+    if decision.resolved != "toon" {
+        return;
+    }
+
+    let Some(blocks) = value.get_mut(content_key).and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    for block in blocks {
+        let is_text = block
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "text");
+        if !is_text {
+            continue;
+        }
+        let Some(text_str) = block.get("text").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        // Try to parse the text as JSON
+        let payload: serde_json::Value = match serde_json::from_str(text_str) {
+            Ok(v) => v,
+            Err(_) => continue, // Not valid JSON: leave as-is
+        };
+        // Apply TOON format wrapping
+        if let Ok(Some(envelope)) =
+            mcp_agent_mail_core::toon::apply_toon_format(&payload, Some(format_value), config)
+        {
+            if let Ok(envelope_json) = serde_json::to_string(&envelope) {
+                block["text"] = serde_json::Value::String(envelope_json);
+            }
+        }
     }
 }
 
@@ -1103,21 +1195,21 @@ fn has_forwarded_headers(req: &Http1Request) -> bool {
         || header_value(req, "forwarded").is_some()
 }
 
-fn peer_addr_host(peer_addr: Option<SocketAddr>) -> Option<String> {
-    peer_addr.map(|addr| match addr.ip() {
+fn peer_addr_host(peer_addr: SocketAddr) -> String {
+    match peer_addr.ip() {
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => v6
             .to_ipv4()
-            .map(|v4| v4.to_string())
-            .unwrap_or_else(|| v6.to_string()),
-    })
+            .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+    }
 }
 
 fn rate_limit_identity(req: &Http1Request, jwt_sub: Option<&str>) -> String {
     if let Some(sub) = jwt_sub.filter(|s| !s.is_empty()) {
         return format!("sub:{sub}");
     }
-    peer_addr_host(req.peer_addr).unwrap_or_else(|| "ip-unknown".to_string())
+    req.peer_addr
+        .map_or_else(|| "ip-unknown".to_string(), peer_addr_host)
 }
 
 fn is_local_peer_addr(peer_addr: Option<SocketAddr>) -> bool {
@@ -1223,10 +1315,12 @@ mod tests {
 
     #[test]
     fn cors_origin_wildcard_uses_star_without_credentials() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_cors_enabled = true;
-        config.http_cors_origins = Vec::new();
-        config.http_cors_allow_credentials = false;
+        let config = mcp_agent_mail_core::Config {
+            http_cors_enabled: true,
+            http_cors_origins: Vec::new(),
+            http_cors_allow_credentials: false,
+            ..Default::default()
+        };
         let state = build_state(config);
         let req = make_request(
             Http1Method::Get,
@@ -1238,10 +1332,12 @@ mod tests {
 
     #[test]
     fn cors_origin_wildcard_echoes_origin_with_credentials() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_cors_enabled = true;
-        config.http_cors_origins = vec!["*".to_string()];
-        config.http_cors_allow_credentials = true;
+        let config = mcp_agent_mail_core::Config {
+            http_cors_enabled: true,
+            http_cors_origins: vec!["*".to_string()],
+            http_cors_allow_credentials: true,
+            ..Default::default()
+        };
         let state = build_state(config);
         let req = make_request(
             Http1Method::Get,
@@ -1256,9 +1352,11 @@ mod tests {
 
     #[test]
     fn cors_origin_denies_unlisted_origin() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_cors_enabled = true;
-        config.http_cors_origins = vec!["http://allowed.com".to_string()];
+        let config = mcp_agent_mail_core::Config {
+            http_cors_enabled: true,
+            http_cors_origins: vec!["http://allowed.com".to_string()],
+            ..Default::default()
+        };
         let state = build_state(config);
         let req = make_request(
             Http1Method::Get,
@@ -1270,13 +1368,15 @@ mod tests {
 
     #[test]
     fn cors_preflight_includes_configured_headers() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_cors_enabled = true;
-        config.http_cors_origins = vec!["*".to_string()];
-        config.http_cors_allow_methods = vec!["*".to_string()];
-        config.http_cors_allow_headers = vec!["*".to_string()];
-        config.http_cors_allow_credentials = false;
-        config.http_bearer_token = Some("secret".to_string());
+        let config = mcp_agent_mail_core::Config {
+            http_cors_enabled: true,
+            http_cors_origins: vec!["*".to_string()],
+            http_cors_allow_methods: vec!["*".to_string()],
+            http_cors_allow_headers: vec!["*".to_string()],
+            http_cors_allow_credentials: false,
+            http_bearer_token: Some("secret".to_string()),
+            ..Default::default()
+        };
         let state = build_state(config);
         let req = make_request(
             Http1Method::Options,
@@ -1305,9 +1405,11 @@ mod tests {
 
     #[test]
     fn cors_headers_present_on_normal_responses() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_cors_enabled = true;
-        config.http_cors_origins = vec!["*".to_string()];
+        let config = mcp_agent_mail_core::Config {
+            http_cors_enabled: true,
+            http_cors_origins: vec!["*".to_string()],
+            ..Default::default()
+        };
         let state = build_state(config);
         let req = make_request(
             Http1Method::Get,
@@ -1324,8 +1426,10 @@ mod tests {
 
     #[test]
     fn cors_disabled_emits_no_headers() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_cors_enabled = false;
+        let config = mcp_agent_mail_core::Config {
+            http_cors_enabled: false,
+            ..Default::default()
+        };
         let state = build_state(config);
         let req = make_request(
             Http1Method::Get,
@@ -1339,8 +1443,10 @@ mod tests {
 
     #[test]
     fn localhost_bypass_requires_local_peer_and_no_forwarded_headers() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_allow_localhost_unauthenticated = true;
+        let config = mcp_agent_mail_core::Config {
+            http_allow_localhost_unauthenticated: true,
+            ..Default::default()
+        };
         let state = build_state(config);
         let local_peer = SocketAddr::from(([127, 0, 0, 1], 4321));
         let non_local_peer = SocketAddr::from(([10, 0, 0, 1], 5555));
@@ -1374,7 +1480,7 @@ mod tests {
     fn peer_addr_helpers_handle_ipv4_mapped_ipv6() {
         let addr: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().expect("parse addr");
         assert!(is_local_peer_addr(Some(addr)));
-        assert_eq!(peer_addr_host(Some(addr)), Some("127.0.0.1".to_string()));
+        assert_eq!(peer_addr_host(addr), "127.0.0.1".to_string());
         let non_local = SocketAddr::from(([10, 1, 2, 3], 9000));
         assert!(!is_local_peer_addr(Some(non_local)));
     }
@@ -1392,10 +1498,12 @@ mod tests {
 
     #[test]
     fn rate_limit_identity_prefers_peer_addr_over_forwarded_headers() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_rate_limit_enabled = true;
-        config.http_rate_limit_tools_per_minute = 1;
-        config.http_rate_limit_tools_burst = 1;
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            ..Default::default()
+        };
         let state = build_state(config);
 
         let params = serde_json::json!({ "name": "health_check", "arguments": {} });
@@ -1420,5 +1528,133 @@ mod tests {
             .check_rbac_and_rate_limit(&req2, &json_rpc)
             .expect("rate limit should trigger");
         assert_eq!(resp.status, 429);
+    }
+
+    // -- TOON wrapping tests --
+
+    #[test]
+    fn extract_format_from_uri_toon() {
+        assert_eq!(
+            extract_format_from_uri("resource://inbox/BlueLake?project=/backend&format=toon"),
+            Some("toon".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_format_from_uri_json() {
+        assert_eq!(
+            extract_format_from_uri("resource://inbox/BlueLake?project=/backend&format=json"),
+            Some("json".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_format_from_uri_none() {
+        assert_eq!(
+            extract_format_from_uri("resource://inbox/BlueLake?project=/backend"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_format_from_uri_no_query() {
+        assert_eq!(extract_format_from_uri("resource://agents/myproj"), None);
+    }
+
+    #[test]
+    fn toon_wrapping_json_format_noop() {
+        let config = mcp_agent_mail_core::Config::default();
+        let mut value = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"id\":1}"}]
+        });
+        apply_toon_to_content(&mut value, "content", "json", &config);
+        // Should be unchanged
+        assert_eq!(value["content"][0]["text"].as_str().unwrap(), "{\"id\":1}");
+    }
+
+    #[test]
+    fn toon_wrapping_invalid_format_noop() {
+        let config = mcp_agent_mail_core::Config::default();
+        let mut value = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"id\":1}"}]
+        });
+        apply_toon_to_content(&mut value, "content", "xml", &config);
+        // Should be unchanged (invalid format)
+        assert_eq!(value["content"][0]["text"].as_str().unwrap(), "{\"id\":1}");
+    }
+
+    #[test]
+    fn toon_wrapping_toon_format_produces_envelope() {
+        let config = mcp_agent_mail_core::Config::default();
+        let mut value = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"id\":1,\"subject\":\"Test\"}"}]
+        });
+        apply_toon_to_content(&mut value, "content", "toon", &config);
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        // Format is either "toon" (encoder present) or "json" (fallback)
+        let fmt = envelope["format"].as_str().unwrap();
+        assert!(fmt == "toon" || fmt == "json", "unexpected format: {fmt}");
+        assert_eq!(envelope["meta"]["requested"], "toon");
+        assert_eq!(envelope["meta"]["source"], "param");
+        if fmt == "toon" {
+            // Successful encode: data is a string, encoder is set
+            assert!(envelope["data"].is_string());
+            assert!(envelope["meta"]["encoder"].as_str().is_some());
+        } else {
+            // Fallback: data is the original JSON, toon_error is set
+            assert_eq!(envelope["data"]["id"], 1);
+            assert_eq!(envelope["data"]["subject"], "Test");
+            assert!(envelope["meta"]["toon_error"].as_str().is_some());
+        }
+    }
+
+    #[test]
+    fn toon_wrapping_invalid_encoder_fallback() {
+        // Force a non-existent encoder to test fallback behavior
+        let config = mcp_agent_mail_core::Config {
+            toon_bin: Some("/nonexistent/tru_binary".to_string()),
+            ..Default::default()
+        };
+        let mut value = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"id\":1,\"subject\":\"Test\"}"}]
+        });
+        apply_toon_to_content(&mut value, "content", "toon", &config);
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["format"], "json"); // fallback
+        assert_eq!(envelope["data"]["id"], 1);
+        assert_eq!(envelope["meta"]["requested"], "toon");
+        assert!(envelope["meta"]["toon_error"].as_str().is_some());
+    }
+
+    #[test]
+    fn toon_wrapping_non_json_text_unchanged() {
+        let config = mcp_agent_mail_core::Config::default();
+        let mut value = serde_json::json!({
+            "content": [{"type": "text", "text": "not json content"}]
+        });
+        apply_toon_to_content(&mut value, "content", "toon", &config);
+        // Non-JSON text should be left as-is
+        assert_eq!(
+            value["content"][0]["text"].as_str().unwrap(),
+            "not json content"
+        );
+    }
+
+    #[test]
+    fn toon_wrapping_respects_content_key() {
+        let config = mcp_agent_mail_core::Config::default();
+        // Resources use "contents" not "content"
+        let mut value = serde_json::json!({
+            "contents": [{"type": "text", "text": "{\"agent\":\"Blue\"}"}]
+        });
+        apply_toon_to_content(&mut value, "contents", "toon", &config);
+        let text = value["contents"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        // Format is either "toon" (encoder present) or "json" (fallback)
+        let fmt = envelope["format"].as_str().unwrap();
+        assert!(fmt == "toon" || fmt == "json");
+        assert_eq!(envelope["meta"]["requested"], "toon");
     }
 }

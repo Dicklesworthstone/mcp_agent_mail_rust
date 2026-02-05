@@ -236,9 +236,7 @@ fn git_remote_url(dir: &Path) -> Option<String> {
 
 /// Check if path is inside a `docs/` directory.
 fn is_inside_docs_dir(path: &Path) -> bool {
-    let abs = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     abs.components().any(|c| {
         c.as_os_str()
             .to_str()
@@ -247,20 +245,37 @@ fn is_inside_docs_dir(path: &Path) -> bool {
 }
 
 /// Generate COOP/COEP headers content for `_headers` file.
+///
+/// Format matches the legacy Python output exactly (Cloudflare Pages / Netlify compatible).
 #[must_use]
 pub fn generate_headers_file() -> String {
-    "/*\n  \
-     Cross-Origin-Opener-Policy: same-origin\n  \
-     Cross-Origin-Embedder-Policy: require-corp\n\
-     /viewer/*\n  \
-     Cross-Origin-Resource-Policy: same-origin\n\
-     /*.sqlite3\n  \
-     Content-Type: application/x-sqlite3\n\
-     /chunks/*\n  \
-     Content-Type: application/octet-stream\n\
-     /attachments/*\n  \
-     Cross-Origin-Resource-Policy: same-origin\n"
-        .to_string()
+    "\
+# Cross-Origin Isolation headers for OPFS and SharedArrayBuffer support
+# Compatible with Cloudflare Pages and Netlify
+# See: https://web.dev/coop-coep/
+
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+# Allow viewer assets to be loaded
+/viewer/*
+  Cross-Origin-Resource-Policy: same-origin
+
+# SQLite database and chunks
+/*.sqlite3
+  Cross-Origin-Resource-Policy: same-origin
+  Content-Type: application/x-sqlite3
+
+/chunks/*
+  Cross-Origin-Resource-Policy: same-origin
+  Content-Type: application/octet-stream
+
+# Attachments
+/attachments/*
+  Cross-Origin-Resource-Policy: same-origin
+"
+    .to_string()
 }
 
 #[cfg(test)]

@@ -162,7 +162,8 @@ pub fn query_timer() -> Instant {
 /// Compute elapsed microseconds since the timer was started.
 #[must_use]
 pub fn elapsed_us(start: Instant) -> u64 {
-    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    let micros = start.elapsed().as_micros().min(u128::from(u64::MAX));
+    u64::try_from(micros).unwrap_or(u64::MAX)
 }
 
 /// Extract the primary table name from a SQL statement.
@@ -182,6 +183,7 @@ fn extract_table(sql: &str) -> String {
 }
 
 /// Round microseconds to milliseconds with 2 decimal places.
+#[allow(clippy::cast_precision_loss)]
 fn round_ms(us: u64) -> f64 {
     let ms = us as f64 / 1000.0;
     (ms * 100.0).round() / 100.0
@@ -193,22 +195,34 @@ mod tests {
 
     #[test]
     fn extract_table_insert() {
-        assert_eq!(extract_table("INSERT INTO messages (id) VALUES (1)"), "messages");
+        assert_eq!(
+            extract_table("INSERT INTO messages (id) VALUES (1)"),
+            "messages"
+        );
     }
 
     #[test]
     fn extract_table_update() {
-        assert_eq!(extract_table("UPDATE agents SET name = 'x' WHERE id = 1"), "agents");
+        assert_eq!(
+            extract_table("UPDATE agents SET name = 'x' WHERE id = 1"),
+            "agents"
+        );
     }
 
     #[test]
     fn extract_table_select() {
-        assert_eq!(extract_table("SELECT * FROM projects WHERE id = 1"), "projects");
+        assert_eq!(
+            extract_table("SELECT * FROM projects WHERE id = 1"),
+            "projects"
+        );
     }
 
     #[test]
     fn extract_table_quoted() {
-        assert_eq!(extract_table(r#"SELECT * FROM "file_reservations" WHERE 1"#), "file_reservations");
+        assert_eq!(
+            extract_table(r#"SELECT * FROM "file_reservations" WHERE 1"#),
+            "file_reservations"
+        );
     }
 
     #[test]

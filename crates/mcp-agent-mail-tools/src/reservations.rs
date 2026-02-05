@@ -15,6 +15,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
@@ -60,7 +61,9 @@ fn patterns_overlap(a: &str, b: &str) -> bool {
     let b_glob = Glob::new(&b_norm).ok().map(|g| g.compile_matcher());
 
     if let (Some(a_matcher), Some(b_matcher)) = (a_glob, b_glob) {
-        return a_matcher.is_match(&b_norm) || b_matcher.is_match(&a_norm) || a_norm == b_norm;
+        let a_matches_b = a_matcher.is_match(&b_norm);
+        let b_matches_a = b_matcher.is_match(&a_norm);
+        return a_matches_b || b_matches_a || a_norm == b_norm;
     }
 
     a_norm == b_norm
@@ -193,8 +196,7 @@ pub async fn file_reservation_paths(
                 continue;
             }
 
-            let is_conflict =
-                res.exclusive != 0 && patterns_overlap(&res.path_pattern, path);
+            let is_conflict = res.exclusive != 0 && patterns_overlap(&res.path_pattern, path);
 
             if is_conflict {
                 let agent_name = agent_names
@@ -531,10 +533,7 @@ pub async fn force_release_file_reservation(
         )
         .await,
     )?;
-    let mail_stale = match mail_activity {
-        Some(ts) => (now_micros - ts) > grace_micros,
-        None => true, // No mail activity = stale
-    };
+    let mail_stale = mail_activity.is_none_or(|ts| (now_micros - ts) > grace_micros);
     if mail_stale {
         stale_reasons.push(format!("no_recent_mail_activity>{grace_seconds}s"));
     } else {
@@ -544,10 +543,7 @@ pub async fn force_release_file_reservation(
     // Signal 3: Git activity (via archive commits)
     let config = Config::from_env();
     let git_activity = get_git_activity_for_agent(&config, &project.slug, &holder_agent.name);
-    let git_stale = match git_activity {
-        Some(ts) => (now_micros - ts) > grace_micros,
-        None => true,
-    };
+    let git_stale = git_activity.is_none_or(|ts| (now_micros - ts) > grace_micros);
     if git_stale {
         stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
     } else {
@@ -579,8 +575,7 @@ pub async fn force_release_file_reservation(
     )?;
 
     // Optionally send notification to previous holder
-    let mut notified = false;
-    if should_notify && released_count > 0 && holder_agent.name != agent_name {
+    let notified = if should_notify && released_count > 0 && holder_agent.name != agent_name {
         let note_text = note.as_deref().unwrap_or("");
         let signals_md = stale_reasons
             .iter()
@@ -589,27 +584,28 @@ pub async fn force_release_file_reservation(
             .join("\n");
 
         let mut details = String::new();
-        details.push_str(&format!(
-            "- last agent activity {} {}s ago\n",
-            '\u{2248}', agent_inactive_secs
-        ));
+        let _ = writeln!(
+            details,
+            "- last agent activity \u{2248} {agent_inactive_secs}s ago"
+        );
         if let Some(ts) = mail_activity {
-            details.push_str(&format!(
-                "- last mail activity {} {}s ago\n",
-                '\u{2248}',
+            let _ = writeln!(
+                details,
+                "- last mail activity \u{2248} {}s ago",
                 (now_micros - ts) / 1_000_000
-            ));
+            );
         }
         if let Some(ts) = git_activity {
-            details.push_str(&format!(
-                "- last git commit {} {}s ago\n",
-                '\u{2248}',
+            let _ = writeln!(
+                details,
+                "- last git commit \u{2248} {}s ago",
                 (now_micros - ts) / 1_000_000
-            ));
+            );
         }
-        details.push_str(&format!(
+        let _ = write!(
+            details,
             "- inactivity threshold={inactivity_seconds}s grace={grace_seconds}s"
-        ));
+        );
 
         let notify_body = format!(
             "Your file reservation on `{}` (id={}) was force-released by **{}**.\n\n\
@@ -645,8 +641,10 @@ pub async fn force_release_file_reservation(
             "[]",
         )
         .await;
-        notified = matches!(result, asupersync::Outcome::Ok(_));
-    }
+        matches!(result, asupersync::Outcome::Ok(_))
+    } else {
+        false
+    };
 
     // Build response matching Python format
     let response = serde_json::json!({
@@ -808,9 +806,8 @@ pub fn uninstall_precommit_guard(_ctx: &McpContext, code_repo_path: String) -> M
 
 /// Check if the guard is currently installed in a repo.
 fn guard_is_installed(repo_path: &std::path::Path) -> bool {
-    let hooks_dir = match mcp_agent_mail_guard::resolve_hooks_dir(repo_path) {
-        Ok(d) => d,
-        Err(_) => return false,
+    let Ok(hooks_dir) = mcp_agent_mail_guard::resolve_hooks_dir(repo_path) else {
+        return false;
     };
 
     // Check for our plugin in hooks.d/pre-commit/

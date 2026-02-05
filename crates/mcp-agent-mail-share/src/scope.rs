@@ -89,7 +89,11 @@ pub fn apply_project_scope(
             let id: i64 = row.get_named("id").unwrap_or(0);
             let slug: String = row.get_named("slug").unwrap_or_default();
             let human_key: String = row.get_named("human_key").unwrap_or_default();
-            ProjectRecord { id, slug, human_key }
+            ProjectRecord {
+                id,
+                slug,
+                human_key,
+            }
         })
         .collect();
 
@@ -201,9 +205,7 @@ pub fn apply_project_scope(
         let msg_values: Vec<Value> = msg_ids.iter().map(|&id| Value::BigInt(id)).collect();
         exec(
             &conn,
-            &format!(
-                "DELETE FROM message_recipients WHERE message_id IN ({msg_placeholders})"
-            ),
+            &format!("DELETE FROM message_recipients WHERE message_id IN ({msg_placeholders})"),
             &msg_values,
         )?;
     }
@@ -296,7 +298,9 @@ fn exec(
 }
 
 /// Count remaining rows in all relevant tables.
-fn count_remaining(conn: &sqlmodel_sqlite::SqliteConnection) -> Result<RemainingCounts, ShareError> {
+fn count_remaining(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+) -> Result<RemainingCounts, ShareError> {
     Ok(RemainingCounts {
         projects: count_table(conn, "projects")?,
         agents: count_table(conn, "agents")?,
@@ -435,20 +439,30 @@ mod tests {
         .unwrap();
 
         // Insert test data: 2 projects, 2 agents, 3 messages
-        conn.execute_raw("INSERT INTO projects (slug, human_key) VALUES ('proj-alpha', '/data/projects/alpha')")
-            .unwrap();
-        conn.execute_raw("INSERT INTO projects (slug, human_key) VALUES ('proj-beta', '/data/projects/beta')")
-            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key) VALUES ('proj-alpha', '/data/projects/alpha')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key) VALUES ('proj-beta', '/data/projects/beta')",
+        )
+        .unwrap();
         conn.execute_raw("INSERT INTO agents (project_id, name) VALUES (1, 'GreenCastle')")
             .unwrap();
         conn.execute_raw("INSERT INTO agents (project_id, name) VALUES (2, 'PurpleBear')")
             .unwrap();
-        conn.execute_raw("INSERT INTO messages (project_id, sender_id, subject) VALUES (1, 1, 'Msg A')")
-            .unwrap();
-        conn.execute_raw("INSERT INTO messages (project_id, sender_id, subject) VALUES (1, 1, 'Msg B')")
-            .unwrap();
-        conn.execute_raw("INSERT INTO messages (project_id, sender_id, subject) VALUES (2, 2, 'Msg C')")
-            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages (project_id, sender_id, subject) VALUES (1, 1, 'Msg A')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages (project_id, sender_id, subject) VALUES (1, 1, 'Msg B')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages (project_id, sender_id, subject) VALUES (2, 2, 'Msg C')",
+        )
+        .unwrap();
         conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 1)")
             .unwrap();
         conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id) VALUES (2, 1)")
@@ -459,8 +473,10 @@ mod tests {
             .unwrap();
         conn.execute_raw("INSERT INTO agent_links (a_project_id, a_agent_id, b_project_id, b_agent_id) VALUES (1, 1, 2, 2)")
             .unwrap();
-        conn.execute_raw("INSERT INTO project_sibling_suggestions (project_a_id, project_b_id) VALUES (1, 2)")
-            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO project_sibling_suggestions (project_a_id, project_b_id) VALUES (1, 2)",
+        )
+        .unwrap();
 
         db_path
     }
@@ -479,8 +495,7 @@ mod tests {
     fn scope_by_slug() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let result =
-            apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
+        let result = apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
         assert_eq!(result.removed_count, 1);
         assert_eq!(result.projects.len(), 1);
         assert_eq!(result.projects[0].slug, "proj-alpha");
@@ -497,8 +512,7 @@ mod tests {
     fn scope_by_human_key_case_insensitive() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let result =
-            apply_project_scope(&db, &["/DATA/PROJECTS/ALPHA".to_string()]).unwrap();
+        let result = apply_project_scope(&db, &["/DATA/PROJECTS/ALPHA".to_string()]).unwrap();
         assert_eq!(result.removed_count, 1);
         assert_eq!(result.projects[0].slug, "proj-alpha");
     }
@@ -523,7 +537,10 @@ mod tests {
 
         let source = fixture_dir.join("needs_scrub.sqlite3");
         if !source.exists() {
-            eprintln!("Skipping conformance test: fixture not found at {}", source.display());
+            eprintln!(
+                "Skipping conformance test: fixture not found at {}",
+                source.display()
+            );
             return;
         }
 
@@ -562,10 +579,12 @@ mod tests {
             ar["file_reservations"], er["file_reservations"],
             "remaining.file_reservations"
         );
-        assert_eq!(ar["agent_links"], er["agent_links"], "remaining.agent_links");
         assert_eq!(
-            ar["project_sibling_suggestions"],
-            er["project_sibling_suggestions"],
+            ar["agent_links"], er["agent_links"],
+            "remaining.agent_links"
+        );
+        assert_eq!(
+            ar["project_sibling_suggestions"], er["project_sibling_suggestions"],
             "remaining.project_sibling_suggestions"
         );
 

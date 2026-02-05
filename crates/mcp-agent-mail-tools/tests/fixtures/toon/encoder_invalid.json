@@ -1,0 +1,28 @@
+{
+  "_description": "Encoder binary exists but fails validation (not toon_rust). ValueError fallback.",
+  "input": {
+    "payload": {
+      "id": 1,
+      "subject": "Test"
+    },
+    "format_param": "toon",
+    "toon_stats_enabled": false,
+    "encoder_override": "node_toon_cli"
+  },
+  "encoder": {
+    "error": "ValueError",
+    "message": "TOON_BIN resolved to 'node_toon_cli', which does not look like toon_rust (expected tru). Refusing to run a non-toon_rust encoder."
+  },
+  "expected": {
+    "format": "json",
+    "data": {
+      "id": 1,
+      "subject": "Test"
+    },
+    "meta": {
+      "requested": "toon",
+      "source": "param",
+      "toon_error": "TOON_BIN resolved to 'node_toon_cli', which does not look like toon_rust (expected tru). Refusing to run a non-toon_rust encoder."
+    }
+  }
+}

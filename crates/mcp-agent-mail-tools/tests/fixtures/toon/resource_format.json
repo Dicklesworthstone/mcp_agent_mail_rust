@@ -1,0 +1,35 @@
+{
+  "_description": "Vectors for resource format=toon query parameter handling.",
+  "vectors": [
+    {
+      "name": "resource_with_format_toon",
+      "uri": "resource://inbox/BlueLake?project=/backend&format=toon&limit=10",
+      "expected_format_param": "toon",
+      "expected_behavior": "Apply TOON encoding to resource response"
+    },
+    {
+      "name": "resource_with_format_json",
+      "uri": "resource://inbox/BlueLake?project=/backend&format=json",
+      "expected_format_param": "json",
+      "expected_behavior": "Return JSON without envelope wrapping"
+    },
+    {
+      "name": "resource_without_format",
+      "uri": "resource://inbox/BlueLake?project=/backend",
+      "expected_format_param": null,
+      "expected_behavior": "Use default format from settings (usually implicit json)"
+    },
+    {
+      "name": "resource_with_mime_alias",
+      "uri": "resource://agents/myproj?format=application/toon",
+      "expected_format_param": "application/toon",
+      "expected_resolved": "toon",
+      "expected_behavior": "Normalize MIME alias to 'toon', apply TOON encoding"
+    },
+    {
+      "name": "agent_with_query_embedded",
+      "uri": "resource://inbox/BlueLake?project=/backend&format=toon",
+      "note": "Some resources parse query params from the agent path segment if '?' is present"
+    }
+  ]
+}

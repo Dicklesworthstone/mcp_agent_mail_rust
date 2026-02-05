@@ -10,7 +10,8 @@ pub mod snapshot;
 
 pub use bundle::{
     AttachmentConfig, AttachmentItem, AttachmentManifest, AttachmentStats, ChunkManifest,
-    bundle_attachments, maybe_chunk_database, package_directory_as_zip, write_bundle_scaffolding,
+    ViewerDataManifest, ViewerMetaInfo, bundle_attachments, compute_viewer_sri, copy_viewer_assets,
+    export_viewer_data, maybe_chunk_database, package_directory_as_zip, write_bundle_scaffolding,
 };
 pub use crypto::{
     ManifestSignature, VerifyResult, decrypt_with_age, encrypt_with_age, sign_manifest,

@@ -239,10 +239,7 @@ pub fn scrub_snapshot(
             exec_count(
                 &conn,
                 "UPDATE messages SET attachments = ? WHERE id = ?",
-                &[
-                    SqlValue::Text(sanitized_json),
-                    SqlValue::BigInt(*msg_id),
-                ],
+                &[SqlValue::Text(sanitized_json), SqlValue::BigInt(*msg_id)],
             )?;
         }
 
@@ -266,10 +263,7 @@ pub fn scrub_snapshot(
                 exec_count(
                     &conn,
                     "UPDATE messages SET body_md = ? WHERE id = ?",
-                    &[
-                        SqlValue::Text(placeholder),
-                        SqlValue::BigInt(*msg_id),
-                    ],
+                    &[SqlValue::Text(placeholder), SqlValue::BigInt(*msg_id)],
                 )?;
             }
         } else if body != *body_original {
@@ -436,8 +430,7 @@ mod tests {
 
     #[test]
     fn scrub_text_finds_multiple_patterns() {
-        let input =
-            "Use sk-abcdef0123456789012345 and bearer MyToken1234567890123456.";
+        let input = "Use sk-abcdef0123456789012345 and bearer MyToken1234567890123456.";
         let (result, count) = scrub_text(input);
         assert_eq!(result, "Use [REDACTED] and [REDACTED]");
         assert_eq!(count, 2);
@@ -614,8 +607,10 @@ mod tests {
         .unwrap();
         conn.execute_raw("INSERT INTO projects VALUES (1, 'test', '/test', '')")
             .unwrap();
-        conn.execute_raw("INSERT INTO agents VALUES (1, 1, 'TestAgent', '', '', '', '', '', 'auto', 'auto')")
-            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (1, 1, 'TestAgent', '', '', '', '', '', 'auto', 'auto')",
+        )
+        .unwrap();
         conn.execute_raw("INSERT INTO messages VALUES (1, 1, 1, NULL, 'Hi', 'Hello world', 'normal', 0, '', '[]')")
             .unwrap();
         conn.execute_raw("INSERT INTO message_recipients VALUES (1, 1, 'to', NULL, NULL)")

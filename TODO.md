@@ -36,7 +36,7 @@
   - [x] Compare outputs and report diffs.
 - [ ] Add conformance CLI helper to regenerate fixtures.
 - [ ] Add CI task for conformance tests.
-- [ ] Add tool-filter conformance fixtures (profiles + custom include/exclude).
+- [x] Add tool-filter conformance fixtures (profiles + custom include/exclude).
 
 ## 3. DB Layer (sqlmodel_rust) — Models & Schema
 ### Models (done - CoralBadger)

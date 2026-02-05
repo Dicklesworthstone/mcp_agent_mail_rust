@@ -6,6 +6,7 @@
 //! resources should rely on these helpers rather than embedding raw SQL.
 
 #![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::explicit_auto_deref)]
 
 use crate::error::DbError;
 use crate::models::{
@@ -19,6 +20,38 @@ use sqlmodel::prelude::*;
 use sqlmodel_core::Error as SqlError;
 use sqlmodel_core::Value;
 use sqlmodel_query::{raw_execute, raw_query};
+
+// =============================================================================
+// Tracked query wrappers
+// =============================================================================
+
+/// Execute a raw query with timing instrumentation.
+async fn traw_query(
+    cx: &Cx,
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    sql: &str,
+    params: &[Value],
+) -> Outcome<Vec<sqlmodel_core::Row>, SqlError> {
+    let start = crate::tracking::query_timer();
+    let result = raw_query(cx, conn, sql, params).await;
+    let elapsed = crate::tracking::elapsed_us(start);
+    crate::QUERY_TRACKER.record(sql, elapsed);
+    result
+}
+
+/// Execute a raw statement with timing instrumentation.
+async fn traw_execute(
+    cx: &Cx,
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    sql: &str,
+    params: &[Value],
+) -> Outcome<u64, SqlError> {
+    let start = crate::tracking::query_timer();
+    let result = raw_execute(cx, conn, sql, params).await;
+    let elapsed = crate::tracking::elapsed_us(start);
+    crate::QUERY_TRACKER.record(sql, elapsed);
+    result
+}
 
 // =============================================================================
 // Project Queries
@@ -52,6 +85,12 @@ fn map_sql_outcome<T>(out: Outcome<T, SqlError>) -> Outcome<T, DbError> {
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
     }
+}
+
+fn placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn acquire_conn(
@@ -357,7 +396,7 @@ pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<(), D
     let now = now_micros();
     let sql = "UPDATE agents SET last_active_ts = ? WHERE id = ?";
     let params = [Value::BigInt(now), Value::BigInt(agent_id)];
-    match map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await) {
+    match map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await) {
         Outcome::Ok(_) => Outcome::Ok(()),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -386,7 +425,7 @@ pub async fn set_agent_contact_policy(
         Value::BigInt(now),
         Value::BigInt(agent_id),
     ];
-    let out = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
 
     match out {
         Outcome::Ok(_) => {
@@ -532,7 +571,7 @@ pub async fn list_thread_messages(
         params.push(Value::BigInt(limit_i64));
     }
 
-    let rows_out = map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -594,6 +633,58 @@ pub async fn list_thread_messages(
                     attachments,
                     from,
                 });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// List unique recipient agent names for a set of message ids.
+pub async fn list_message_recipient_names_for_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    message_ids: &[i64],
+) -> Outcome<Vec<String>, DbError> {
+    if message_ids.is_empty() {
+        return Outcome::Ok(vec![]);
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let placeholders = placeholders(message_ids.len());
+    let sql = format!(
+        "SELECT DISTINCT a.name \
+         FROM message_recipients r \
+         JOIN agents a ON a.id = r.agent_id \
+         JOIN messages m ON m.id = r.message_id \
+         WHERE m.project_id = ? AND r.message_id IN ({placeholders})"
+    );
+
+    let mut params: Vec<Value> = Vec::with_capacity(message_ids.len() + 1);
+    params.push(Value::BigInt(project_id));
+    for id in message_ids {
+        params.push(Value::BigInt(*id));
+    }
+
+    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let name: String = match row.get_named("name") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                out.push(name);
             }
             Outcome::Ok(out)
         }
@@ -677,7 +768,7 @@ pub async fn fetch_inbox(
     sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
     params.push(Value::BigInt(limit_i64));
 
-    let rows_out = map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -805,7 +896,7 @@ pub async fn search_messages(
         Value::BigInt(limit_i64),
     ];
 
-    let rows_out = map_sql_outcome(raw_query(cx, &*conn, sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &*conn, sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -919,7 +1010,7 @@ pub async fn mark_message_read(
         Value::BigInt(agent_id),
         Value::BigInt(message_id),
     ];
-    let out = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
     match out {
         Outcome::Ok(rows) => {
             if rows == 0 {
@@ -963,7 +1054,7 @@ pub async fn acknowledge_message(
         Value::BigInt(agent_id),
         Value::BigInt(message_id),
     ];
-    let out = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
     match out {
         Outcome::Ok(rows) => {
             if rows == 0 {
@@ -1117,7 +1208,7 @@ pub async fn release_reservations(
         }
     }
 
-    let out = map_sql_outcome(raw_execute(cx, &*conn, &sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &*conn, &sql, &params).await);
     match out {
         Outcome::Ok(n) => usize::try_from(n).map_or_else(
             |_| {
@@ -1189,7 +1280,7 @@ pub async fn renew_reservations(
         }
     }
 
-    let rows_out = map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
     let mut reservations: Vec<FileReservationRow> = match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -1217,7 +1308,7 @@ pub async fn renew_reservations(
 
         let sql = "UPDATE file_reservations SET expires_ts = ? WHERE id = ?";
         let params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
-        let updated = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
+        let updated = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
         match updated {
             Outcome::Ok(_) => {}
             Outcome::Err(e) => return Outcome::Err(e),
@@ -1243,14 +1334,20 @@ pub async fn list_file_reservations(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let sql = if active_only {
-        "SELECT * FROM file_reservations WHERE project_id = ? AND released_ts IS NULL ORDER BY id"
+    let (sql, params) = if active_only {
+        let now = now_micros();
+        (
+            "SELECT * FROM file_reservations WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ? ORDER BY id".to_string(),
+            vec![Value::BigInt(project_id), Value::BigInt(now)],
+        )
     } else {
-        "SELECT * FROM file_reservations WHERE project_id = ? ORDER BY id"
+        (
+            "SELECT * FROM file_reservations WHERE project_id = ? ORDER BY id".to_string(),
+            vec![Value::BigInt(project_id)],
+        )
     };
-    let params = [Value::BigInt(project_id)];
 
-    let rows_out = map_sql_outcome(raw_query(cx, &*conn, sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -1513,6 +1610,140 @@ pub async fn list_contacts(
     }
 }
 
+/// List approved contact targets for a sender within a project.
+pub async fn list_approved_contact_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    candidate_ids: &[i64],
+) -> Outcome<Vec<i64>, DbError> {
+    if candidate_ids.is_empty() {
+        return Outcome::Ok(vec![]);
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let placeholders = placeholders(candidate_ids.len());
+    let sql = format!(
+        "SELECT b_agent_id FROM agent_links \
+         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? \
+           AND status = 'approved' AND b_agent_id IN ({placeholders})"
+    );
+
+    let mut params: Vec<Value> = Vec::with_capacity(candidate_ids.len() + 3);
+    params.push(Value::BigInt(project_id));
+    params.push(Value::BigInt(sender_id));
+    params.push(Value::BigInt(project_id));
+    for id in candidate_ids {
+        params.push(Value::BigInt(*id));
+    }
+
+    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: i64 = match row.get_named("b_agent_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                out.push(id);
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// List recent contact counterpart IDs for a sender within a project.
+pub async fn list_recent_contact_agent_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    candidate_ids: &[i64],
+    since_ts: i64,
+) -> Outcome<Vec<i64>, DbError> {
+    if candidate_ids.is_empty() {
+        return Outcome::Ok(vec![]);
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let placeholders = placeholders(candidate_ids.len());
+    let sql_sent = format!(
+        "SELECT DISTINCT r.agent_id \
+         FROM message_recipients r \
+         JOIN messages m ON m.id = r.message_id \
+         WHERE m.project_id = ? AND m.sender_id = ? AND m.created_ts > ? \
+           AND r.agent_id IN ({placeholders})"
+    );
+    let mut params_sent: Vec<Value> = Vec::with_capacity(candidate_ids.len() + 3);
+    params_sent.push(Value::BigInt(project_id));
+    params_sent.push(Value::BigInt(sender_id));
+    params_sent.push(Value::BigInt(since_ts));
+    for id in candidate_ids {
+        params_sent.push(Value::BigInt(*id));
+    }
+
+    let sql_recv = format!(
+        "SELECT DISTINCT m.sender_id \
+         FROM messages m \
+         JOIN message_recipients r ON r.message_id = m.id \
+         WHERE m.project_id = ? AND r.agent_id = ? AND m.created_ts > ? \
+           AND m.sender_id IN ({placeholders})"
+    );
+    let mut params_recv: Vec<Value> = Vec::with_capacity(candidate_ids.len() + 3);
+    params_recv.push(Value::BigInt(project_id));
+    params_recv.push(Value::BigInt(sender_id));
+    params_recv.push(Value::BigInt(since_ts));
+    for id in candidate_ids {
+        params_recv.push(Value::BigInt(*id));
+    }
+
+    let sent_rows = map_sql_outcome(traw_query(cx, &*conn, &sql_sent, &params_sent).await);
+    let recv_rows = map_sql_outcome(traw_query(cx, &*conn, &sql_recv, &params_recv).await);
+
+    match (sent_rows, recv_rows) {
+        (Outcome::Ok(sent), Outcome::Ok(recv)) => {
+            let mut out = Vec::new();
+            for row in sent {
+                let id: i64 = match row.get_named("agent_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                out.push(id);
+            }
+            for row in recv {
+                let id: i64 = match row.get_named("sender_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                out.push(id);
+            }
+            out.sort_unstable();
+            out.dedup();
+            Outcome::Ok(out)
+        }
+        (Outcome::Err(e), _) | (_, Outcome::Err(e)) => Outcome::Err(e),
+        (Outcome::Cancelled(r), _) | (_, Outcome::Cancelled(r)) => Outcome::Cancelled(r),
+        (Outcome::Panicked(p), _) | (_, Outcome::Panicked(p)) => Outcome::Panicked(p),
+    }
+}
+
 /// Check if contact is allowed between two agents.
 ///
 /// Returns true if there's an approved link or if both agents have `auto` contact policy.
@@ -1670,7 +1901,7 @@ pub async fn link_product_to_projects(
             Value::BigInt(project_id),
             Value::BigInt(now),
         ];
-        let out = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
+        let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
 
         match out {
             Outcome::Ok(n) => {
@@ -1735,7 +1966,7 @@ pub async fn force_release_reservation(
     let sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ? AND released_ts IS NULL";
     let params = [Value::BigInt(now), Value::BigInt(reservation_id)];
 
-    let out = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
     match out {
         Outcome::Ok(n) => usize::try_from(n).map_or_else(
             |_| {
@@ -1777,7 +2008,7 @@ pub async fn get_agent_last_mail_activity(
     let sql_sent =
         "SELECT MAX(created_ts) as max_ts FROM messages WHERE sender_id = ? AND project_id = ?";
     let params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-    let sent_ts = match map_sql_outcome(raw_query(cx, &*conn, sql_sent, &params).await) {
+    let sent_ts = match map_sql_outcome(traw_query(cx, &*conn, sql_sent, &params).await) {
         Outcome::Ok(rows) => rows.first().and_then(|r| {
             r.get(0).and_then(|v| match v {
                 Value::BigInt(n) => Some(*n),
@@ -1796,7 +2027,8 @@ pub async fn get_agent_last_mail_activity(
                     JOIN messages m ON m.id = r.message_id \
                     WHERE r.agent_id = ? AND m.project_id = ?";
     let params2 = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-    let (read_ts, ack_ts) = match map_sql_outcome(raw_query(cx, &*conn, sql_read, &params2).await) {
+    let (read_ts, ack_ts) = match map_sql_outcome(traw_query(cx, &*conn, sql_read, &params2).await)
+    {
         Outcome::Ok(rows) => {
             let row = rows.first();
             let read = row.and_then(|r| {
@@ -1843,7 +2075,7 @@ pub async fn list_product_projects(
                WHERE ppl.product_id = ?";
     let params = [Value::BigInt(product_id)];
 
-    let rows_out = map_sql_outcome(raw_query(cx, &*conn, sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &*conn, sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());

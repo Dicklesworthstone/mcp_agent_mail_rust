@@ -1816,7 +1816,168 @@ PERMISSION_ERROR, CONNECTION_ERROR, UNHANDLED_EXCEPTION
 
 ---
 
+## TOON Output Format (Token-Optimized Output Notation)
+
+Source: `app.py` lines 888-1178.
+
+### Overview
+
+TOON is an optional output encoding that compresses JSON tool/resource responses via an external encoder binary (`tru`). All TOON-formatted responses are wrapped in an **envelope** with metadata. When encoding fails, the system falls back gracefully to a JSON envelope with error details.
+
+### Envelope Schema
+
+**Successful TOON encoding:**
+```json
+{
+  "format": "toon",
+  "data": "<TOON-encoded-string>",
+  "meta": {
+    "requested": "toon",
+    "source": "param|default|implicit",
+    "encoder": "tru|<path-to-encoder>",
+    "toon_stats": {
+      "json_tokens": 123,
+      "toon_tokens": 45,
+      "saved_tokens": 78,
+      "saved_percent": 63.4
+    },
+    "toon_stats_raw": null
+  }
+}
+```
+
+**Fallback (encoding failed):**
+```json
+{
+  "format": "json",
+  "data": { /* original JSON payload */ },
+  "meta": {
+    "requested": "toon",
+    "source": "param|default|implicit",
+    "toon_error": "<error description>"
+  }
+}
+```
+
+Required keys: `format`, `data`, `meta`. `meta` always has `requested` and `source`. On success, `meta.encoder` is present. On failure, `meta.toon_error` is present.
+
+### Format Resolution
+
+Resolution order for determining output format:
+
+1. **Explicit parameter** (`format` tool arg or `?format=toon` query param):
+   - Normalize via aliases, check validity
+   - If valid: `source="param"`
+   - If invalid: raise `ValueError`
+
+2. **Config defaults** (if no explicit parameter):
+   - Check `MCP_AGENT_MAIL_OUTPUT_FORMAT` env var first
+   - Then check `TOON_DEFAULT_FORMAT` env var
+   - If valid: `source="default"`
+
+3. **Implicit fallback** (no parameter, no default):
+   - Return `"json"` with `source="implicit"`, `requested=null`
+
+**Auto-values** (treated as None/use defaults): `""`, `"auto"`, `"default"`, `"none"`, `"null"`.
+
+**MIME type aliases:**
+
+| Input | Normalized |
+|-------|-----------|
+| `application/json` | `json` |
+| `text/json` | `json` |
+| `application/toon` | `toon` |
+| `text/toon` | `toon` |
+
+### Encoder Selection
+
+Precedence for the TOON encoder binary:
+
+1. `TOON_TRU_BIN` env var (highest priority)
+2. `TOON_BIN` env var
+3. Hardcoded default `"tru"`
+
+The value is split via `shlex.split()` (falls back to `[raw]` on parse error), then validated by `_looks_like_toon_rust_encoder()`.
+
+### Encoder Validation
+
+The `_looks_like_toon_rust_encoder(exe)` function (cached via LRU, max 32):
+
+1. Extract basename (handle both `/` and `\` separators)
+2. **Reject immediately** if basename is `toon` or `toon.exe` (Node.js CLI protection)
+3. Run `exe --help`: if output contains `"reference implementation in rust"` (case-insensitive) → accept
+4. Run `exe --version`: if output starts with `"tru "` or `"toon_rust "` (case-insensitive) → accept
+5. Otherwise → reject
+
+If validation fails: `ValueError` with message `"TOON_BIN resolved to {exe!r}, which does not look like toon_rust"`.
+
+### Encoding Execution
+
+Command: `[encoder, "--encode"]` + optional `"--stats"` if `TOON_STATS` enabled.
+
+Input: JSON payload via stdin (text mode).
+Output: TOON text from stdout, stats from stderr.
+Non-blocking: run in `asyncio.to_thread` for async tool handlers.
+
+### Fallback Triggers
+
+In order of checking:
+1. JSON serialization of payload fails → `toon_error: "json serialization failed: {e}"`
+2. Encoder config invalid (validation fails) → `toon_error: "{ValueError message}"`
+3. Encoder not found (`FileNotFoundError`) → `toon_error: "TOON encoder not found: {e}"`
+4. OS error running encoder → `toon_error: "TOON encoder failed: {e}"`
+5. Non-zero exit code → `toon_error: "TOON encoder exited with {code}"` + `toon_stderr: "<truncated stderr>"`
+
+### Statistics Parsing
+
+When `TOON_STATS=true` (env var), encoder runs with `--stats` flag. Stderr is parsed with two regexes:
+
+**Tokens regex:** `Token estimates:\s*~(\d+)\s*\(JSON\)\s*(?:->|→)\s*~(\d+)\s*\(TOON\)`
+**Saved regex:** `Saved\s*~(\d+)\s*tokens\s*\((-?\d+(?:\.\d+)?)%\)`
+
+Expected stderr format:
+```
+Token estimates: ~10 (JSON) -> ~5 (TOON)
+Saved ~5 tokens (-50.0%)
+```
+
+Parsed result: `{json_tokens, toon_tokens, saved_tokens, saved_percent}` or `None`.
+
+If stats enabled but parsing fails, `meta.toon_stats_raw` contains truncated stderr (max 2000 chars).
+
+### Tool Format Application
+
+When a tool is called with a `format` parameter (or default format is configured):
+1. Resolve format decision
+2. If not TOON, return result unchanged
+3. Extract structured payload from result
+4. Encode payload via subprocess in thread pool
+5. Return envelope (success or fallback)
+
+### Resource Format Application
+
+Resources accept `format` as a query parameter: `resource://inbox/{agent}?format=toon`.
+
+All resource handlers pass `format_value` through `_apply_resource_output_format()` which:
+1. Resolves format decision
+2. If not TOON, returns payload unchanged
+3. Encodes payload synchronously (resources are already sync)
+4. Returns envelope (success or fallback)
+
+### Environment Variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `MCP_AGENT_MAIL_OUTPUT_FORMAT` | Default format for all tools/resources | (unset) |
+| `TOON_DEFAULT_FORMAT` | Default format (lower precedence) | (unset) |
+| `TOON_TRU_BIN` | Encoder binary path (highest priority) | (unset) |
+| `TOON_BIN` | Encoder binary path (fallback) | (unset) |
+| `TOON_STATS` | Enable stats gathering | `"false"` |
+
+---
+
 *Spec extracted by FuchsiaForge | 2026-02-04*
 *Updated by IndigoCreek | 2026-02-04*
 *Share/Export spec added by CoralBadger | 2026-02-05*
 *HTTP Background Workers spec added by CoralBadger | 2026-02-05*
+*TOON Output Format spec added by CoralBadger | 2026-02-05*

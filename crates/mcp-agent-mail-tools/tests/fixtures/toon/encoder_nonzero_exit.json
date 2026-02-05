@@ -1,0 +1,29 @@
+{
+  "_description": "Encoder exits with non-zero code. Falls back to JSON with error and stderr.",
+  "input": {
+    "payload": {
+      "id": 1,
+      "subject": "Test"
+    },
+    "format_param": "toon",
+    "toon_stats_enabled": false
+  },
+  "encoder": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "error: invalid JSON input at line 1 column 5\n"
+  },
+  "expected": {
+    "format": "json",
+    "data": {
+      "id": 1,
+      "subject": "Test"
+    },
+    "meta": {
+      "requested": "toon",
+      "source": "param",
+      "toon_error": "TOON encoder exited with 1",
+      "toon_stderr": "error: invalid JSON input at line 1 column 5\n"
+    }
+  }
+}

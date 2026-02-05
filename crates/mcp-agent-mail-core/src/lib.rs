@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod identity;
 pub mod models;
+pub mod toon;
 
 // Re-export key types for convenience
 pub use config::{

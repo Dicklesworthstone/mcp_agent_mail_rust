@@ -1,0 +1,27 @@
+{
+  "_description": "Successful TOON encoding without stats. TOON_STATS disabled, no --stats flag.",
+  "input": {
+    "payload": {
+      "agents": [
+        {"name": "BlueLake", "program": "claude-code"},
+        {"name": "GreenCastle", "program": "codex-cli"}
+      ]
+    },
+    "format_param": "toon",
+    "toon_stats_enabled": false
+  },
+  "encoder": {
+    "exit_code": 0,
+    "stdout": "~list[~agent{name:BlueLake prog:claude-code} ~agent{name:GreenCastle prog:codex-cli}]",
+    "stderr": ""
+  },
+  "expected": {
+    "format": "toon",
+    "data": "~list[~agent{name:BlueLake prog:claude-code} ~agent{name:GreenCastle prog:codex-cli}]",
+    "meta": {
+      "requested": "toon",
+      "source": "param",
+      "encoder": "tru"
+    }
+  }
+}

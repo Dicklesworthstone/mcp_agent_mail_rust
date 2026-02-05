@@ -12,7 +12,7 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use globset::Glob;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{micros_to_iso, DbError};
+use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -49,6 +49,95 @@ fn try_write_message_archive(
             tracing::warn!("Failed to ensure archive for message write: {e}");
         }
     }
+}
+
+fn normalize_pattern(pattern: &str) -> String {
+    let mut normalized = pattern.trim().replace('\\', "/");
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    normalized.trim_start_matches('/').to_string()
+}
+
+fn patterns_overlap(a: &str, b: &str) -> bool {
+    let a_norm = normalize_pattern(a);
+    let b_norm = normalize_pattern(b);
+
+    let a_glob = Glob::new(&a_norm).ok().map(|g| g.compile_matcher());
+    let b_glob = Glob::new(&b_norm).ok().map(|g| g.compile_matcher());
+
+    if let (Some(a_matcher), Some(b_matcher)) = (a_glob, b_glob) {
+        let a_matches_b = a_matcher.is_match(&b_norm);
+        let b_matches_a = b_matcher.is_match(&a_norm);
+        return a_matches_b || b_matches_a || a_norm == b_norm;
+    }
+
+    a_norm == b_norm
+}
+
+async fn resolve_or_register_agent(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    agent_name: &str,
+    sender: &mcp_agent_mail_db::AgentRow,
+    config: &Config,
+) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await {
+        Outcome::Ok(agent) => Ok(agent),
+        Outcome::Err(DbError::NotFound { .. }) if config.messaging_auto_register_recipients => {
+            let _ = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::register_agent(
+                    ctx.cx(),
+                    pool,
+                    project_id,
+                    agent_name,
+                    &sender.program,
+                    &sender.model,
+                    Some(sender.task_description.as_str()),
+                    Some(sender.attachments_policy.as_str()),
+                )
+                .await,
+            )?;
+            db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await,
+            )
+        }
+        Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
+        Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+        Outcome::Panicked(p) => Err(McpError::internal_error(format!(
+            "Internal panic: {}",
+            p.message()
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn push_recipient(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    name: &str,
+    kind: &str,
+    sender: &mcp_agent_mail_db::AgentRow,
+    config: &Config,
+    recipient_map: &mut HashMap<String, mcp_agent_mail_db::AgentRow>,
+    all_recipients: &mut Vec<(i64, String)>,
+    resolved_list: &mut Vec<String>,
+) -> McpResult<()> {
+    let name_key = name.to_lowercase();
+    let agent = if let Some(existing) = recipient_map.get(&name_key) {
+        existing.clone()
+    } else {
+        let agent = resolve_or_register_agent(ctx, pool, project_id, name, sender, config).await?;
+        let key = agent.name.to_lowercase();
+        recipient_map.insert(key, agent.clone());
+        agent
+    };
+    let agent_id = agent.id.unwrap_or(0);
+    all_recipients.push((agent_id, kind.to_string()));
+    resolved_list.push(agent.name);
+    Ok(())
 }
 
 /// Message delivery result
@@ -200,6 +289,8 @@ pub async fn send_message(
         ));
     }
 
+    let config = Config::from_env();
+
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -208,47 +299,358 @@ pub async fn send_message(
     let sender = resolve_agent(ctx, &pool, project_id, &sender_name).await?;
     let sender_id = sender.id.unwrap_or(0);
 
-    // Resolve all recipients (to, cc, bcc)
+    // Resolve all recipients (to, cc, bcc) with optional auto-registration
     let cc_list = cc.unwrap_or_default();
     let bcc_list = bcc.unwrap_or_default();
 
-    let mut all_recipients: Vec<(i64, &str)> = Vec::new();
+    let mut all_recipients: Vec<(i64, String)> = Vec::new();
     let mut resolved_to: Vec<String> = Vec::new();
     let mut resolved_cc_recipients: Vec<String> = Vec::new();
     let mut resolved_bcc_recipients: Vec<String> = Vec::new();
+    let mut recipient_map: HashMap<String, mcp_agent_mail_db::AgentRow> = HashMap::new();
 
     for name in &to {
-        let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "to"));
-        resolved_to.push(agent.name);
+        push_recipient(
+            ctx,
+            &pool,
+            project_id,
+            name,
+            "to",
+            &sender,
+            &config,
+            &mut recipient_map,
+            &mut all_recipients,
+            &mut resolved_to,
+        )
+        .await?;
     }
     for name in &cc_list {
-        let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "cc"));
-        resolved_cc_recipients.push(agent.name);
+        push_recipient(
+            ctx,
+            &pool,
+            project_id,
+            name,
+            "cc",
+            &sender,
+            &config,
+            &mut recipient_map,
+            &mut all_recipients,
+            &mut resolved_cc_recipients,
+        )
+        .await?;
     }
     for name in &bcc_list {
-        let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "bcc"));
-        resolved_bcc_recipients.push(agent.name);
+        push_recipient(
+            ctx,
+            &pool,
+            project_id,
+            name,
+            "bcc",
+            &sender,
+            &config,
+            &mut recipient_map,
+            &mut all_recipients,
+            &mut resolved_bcc_recipients,
+        )
+        .await?;
     }
 
-    // Log optional parameters for debugging
-    if let Some(paths) = &attachment_paths {
-        tracing::debug!("Attachments: {:?}", paths);
+    // Determine attachment processing settings
+    let embed_policy =
+        mcp_agent_mail_storage::EmbedPolicy::from_str_policy(&sender.attachments_policy);
+    let sender_forces_convert = matches!(
+        embed_policy,
+        mcp_agent_mail_storage::EmbedPolicy::Inline | mcp_agent_mail_storage::EmbedPolicy::File
+    );
+    let do_convert = if sender_forces_convert {
+        true
+    } else {
+        convert_images.unwrap_or(config.convert_images)
+    };
+
+    // Process attachments and markdown images
+    let mut final_body = body_md.clone();
+    let mut all_attachment_meta: Vec<serde_json::Value> = Vec::new();
+
+    if do_convert {
+        let slug = &project.slug;
+        let archive = mcp_agent_mail_storage::ensure_archive(&config, slug);
+        if let Ok(archive) = archive {
+            // Process inline markdown images
+            if let Ok((updated_body, md_meta, _rel_paths)) =
+                mcp_agent_mail_storage::process_markdown_images(
+                    &archive,
+                    &config,
+                    &body_md,
+                    embed_policy,
+                )
+            {
+                final_body = updated_body;
+                for m in &md_meta {
+                    if let Ok(v) = serde_json::to_value(m) {
+                        all_attachment_meta.push(v);
+                    }
+                }
+            }
+
+            // Process explicit attachment_paths
+            if let Some(ref paths) = attachment_paths {
+                if !paths.is_empty() {
+                    if let Ok((att_meta, _rel_paths)) = mcp_agent_mail_storage::process_attachments(
+                        &archive,
+                        &config,
+                        paths,
+                        embed_policy,
+                    ) {
+                        for m in &att_meta {
+                            if let Ok(v) = serde_json::to_value(m) {
+                                all_attachment_meta.push(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(ref paths) = attachment_paths {
+        // No conversion: store raw path references
+        for p in paths {
+            all_attachment_meta.push(serde_json::json!({
+                "type": "file",
+                "path": p,
+                "media_type": "application/octet-stream",
+            }));
+        }
     }
-    if let Some(convert) = convert_images {
-        tracing::debug!("Convert images: {}", convert);
-    }
+
     if let Some(auto_contact) = auto_contact_if_blocked {
         tracing::debug!("Auto contact if blocked: {}", auto_contact);
     }
 
-    // Serialize attachments as JSON array
-    let attachments_json = serde_json::to_string(&attachment_paths.clone().unwrap_or_default())
-        .unwrap_or_else(|_| "[]".to_string());
+    // Enforce contact policies (best-effort parity with legacy)
+    if config.contact_enforcement_enabled {
+        let mut auto_ok_names: HashSet<String> = HashSet::new();
 
-    // Create message in DB
+        if let Some(thread) = thread_id.as_deref() {
+            let thread = thread.trim();
+            if !thread.is_empty() {
+                let thread_rows = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::list_thread_messages(
+                        ctx.cx(),
+                        &pool,
+                        project_id,
+                        thread,
+                        Some(500),
+                    )
+                    .await,
+                )
+                .unwrap_or_default();
+                let mut message_ids: Vec<i64> = Vec::new();
+                for row in &thread_rows {
+                    auto_ok_names.insert(row.from.clone());
+                    message_ids.push(row.id);
+                }
+                let recipients = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::list_message_recipient_names_for_messages(
+                        ctx.cx(),
+                        &pool,
+                        project_id,
+                        &message_ids,
+                    )
+                    .await,
+                )
+                .unwrap_or_default();
+                for name in recipients {
+                    auto_ok_names.insert(name);
+                }
+            }
+        }
+
+        // Allow if sender and recipient share overlapping active file reservations.
+        let reservations = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
+        )
+        .unwrap_or_default();
+        let mut patterns_by_agent: HashMap<i64, Vec<String>> = HashMap::new();
+        for res in reservations {
+            patterns_by_agent
+                .entry(res.agent_id)
+                .or_default()
+                .push(res.path_pattern);
+        }
+        let sender_patterns = patterns_by_agent
+            .get(&sender_id)
+            .cloned()
+            .unwrap_or_default();
+        if !sender_patterns.is_empty() {
+            for agent in recipient_map.values() {
+                if let Some(rec_id) = agent.id {
+                    if let Some(rec_patterns) = patterns_by_agent.get(&rec_id) {
+                        let overlaps = sender_patterns
+                            .iter()
+                            .any(|a| rec_patterns.iter().any(|b| patterns_overlap(a, b)));
+                        if overlaps {
+                            auto_ok_names.insert(agent.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let now_micros = mcp_agent_mail_db::now_micros();
+        let ttl_seconds = i64::try_from(config.contact_auto_ttl_seconds).unwrap_or(i64::MAX);
+        let ttl_micros = ttl_seconds.saturating_mul(1_000_000);
+        let since_ts = now_micros.saturating_sub(ttl_micros);
+
+        let mut candidate_ids: Vec<i64> = recipient_map
+            .values()
+            .filter_map(|agent| agent.id)
+            .filter(|id| *id != sender_id)
+            .collect();
+        candidate_ids.sort_unstable();
+        candidate_ids.dedup();
+
+        let recent_ids = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
+                ctx.cx(),
+                &pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+                since_ts,
+            )
+            .await,
+        )
+        .unwrap_or_default();
+        let recent_set: HashSet<i64> = recent_ids.into_iter().collect();
+
+        let approved_ids = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_approved_contact_ids(
+                ctx.cx(),
+                &pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+            )
+            .await,
+        )
+        .unwrap_or_default();
+        let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
+
+        let mut blocked: Vec<String> = Vec::new();
+        for agent in recipient_map.values() {
+            if agent.name == sender.name {
+                continue;
+            }
+            if auto_ok_names.contains(&agent.name) {
+                continue;
+            }
+            let rec_id = agent.id.unwrap_or(0);
+            let mut policy = agent.contact_policy.to_lowercase();
+            if !["open", "auto", "contacts_only", "block_all"].contains(&policy.as_str()) {
+                policy = "auto".to_string();
+            }
+            if policy == "open" {
+                continue;
+            }
+            if policy == "block_all" {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    "CONTACT_BLOCKED: Recipient is not accepting messages.",
+                ));
+            }
+            let approved = approved_set.contains(&rec_id);
+            let recent = recent_set.contains(&rec_id);
+            if policy == "auto" {
+                if approved || recent {
+                    continue;
+                }
+            } else if policy == "contacts_only" && approved {
+                continue;
+            }
+            blocked.push(agent.name.clone());
+        }
+
+        if !blocked.is_empty() {
+            let effective_auto_contact =
+                auto_contact_if_blocked.unwrap_or(config.messaging_auto_handshake_on_block);
+            if effective_auto_contact {
+                for name in &blocked {
+                    let _ = Box::pin(crate::macros::macro_contact_handshake(
+                        ctx,
+                        project.human_key.clone(),
+                        Some(sender.name.clone()),
+                        Some(name.clone()),
+                        None,
+                        None,
+                        None,
+                        Some("auto-handshake by send_message".to_string()),
+                        Some(true),
+                        Some(ttl_seconds),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .await;
+                }
+
+                let approved_ids = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::list_approved_contact_ids(
+                        ctx.cx(),
+                        &pool,
+                        project_id,
+                        sender_id,
+                        &candidate_ids,
+                    )
+                    .await,
+                )
+                .unwrap_or_default();
+                let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
+
+                blocked.retain(|name| {
+                    if let Some(agent) = recipient_map.get(&name.to_lowercase()) {
+                        let rec_id = agent.id.unwrap_or(0);
+                        let mut policy = agent.contact_policy.to_lowercase();
+                        if !["open", "auto", "contacts_only", "block_all"]
+                            .contains(&policy.as_str())
+                        {
+                            policy = "auto".to_string();
+                        }
+                        let approved = approved_set.contains(&rec_id);
+                        if policy == "open" {
+                            return false;
+                        }
+                        if policy == "auto" && approved {
+                            return false;
+                        }
+                        if policy == "contacts_only" && approved {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+        }
+
+        if !blocked.is_empty() {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                format!(
+                    "CONTACT_BLOCKED: Missing contact approval for {}",
+                    blocked.join(", ")
+                ),
+            ));
+        }
+    }
+
+    // Serialize processed attachment metadata as JSON array
+    let attachments_json =
+        serde_json::to_string(&all_attachment_meta).unwrap_or_else(|_| "[]".to_string());
+
+    // Create message in DB (use processed body with inline replacements)
     let message = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::create_message(
             ctx.cx(),
@@ -256,7 +658,7 @@ pub async fn send_message(
             project_id,
             sender_id,
             &subject,
-            &body_md,
+            &final_body,
             thread_id.as_deref(),
             &importance_val,
             ack_required.unwrap_or(false),
@@ -268,12 +670,33 @@ pub async fn send_message(
     let message_id = message.id.unwrap_or(0);
 
     // Add recipients
+    let recipient_refs: Vec<(i64, &str)> = all_recipients
+        .iter()
+        .map(|(id, kind)| (*id, kind.as_str()))
+        .collect();
     db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::add_recipients(ctx.cx(), &pool, message_id, &all_recipients)
+        mcp_agent_mail_db::queries::add_recipients(ctx.cx(), &pool, message_id, &recipient_refs)
             .await,
     )?;
 
-    let attachments = attachment_paths.unwrap_or_default();
+    // Emit notification signals for to/cc recipients only (never bcc).
+    let notification_meta = mcp_agent_mail_storage::NotificationMessage {
+        id: Some(message_id),
+        from: Some(sender_name.clone()),
+        subject: Some(message.subject.clone()),
+        importance: Some(message.importance.clone()),
+    };
+    let mut notified = HashSet::new();
+    for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
+        if notified.insert(name.clone()) {
+            let _ = mcp_agent_mail_storage::emit_notification_signal(
+                &config,
+                &project.slug,
+                name,
+                Some(&notification_meta),
+            );
+        }
+    }
 
     // Write message bundle to git archive (best-effort)
     {
@@ -294,7 +717,7 @@ pub async fn send_message(
             "project_slug": &project.slug,
             "importance": &message.importance,
             "ack_required": message.ack_required != 0,
-            "attachments": &attachments,
+            "attachments": &all_attachment_meta,
         });
         try_write_message_archive(
             &project.slug,
@@ -304,6 +727,12 @@ pub async fn send_message(
             &all_recipient_names,
         );
     }
+
+    // Extract path strings from processed metadata for response format
+    let attachment_paths_out: Vec<String> = all_attachment_meta
+        .iter()
+        .filter_map(|m| m.get("path").and_then(|p| p.as_str()).map(str::to_string))
+        .collect();
 
     let payload = MessagePayload {
         id: message_id,
@@ -315,7 +744,7 @@ pub async fn send_message(
         importance: message.importance,
         ack_required: message.ack_required != 0,
         created_ts: Some(micros_to_iso(message.created_ts)),
-        attachments: attachments.clone(),
+        attachments: attachment_paths_out.clone(),
         from: sender_name.clone(),
         to: resolved_to,
         cc: resolved_cc_recipients,
@@ -328,7 +757,7 @@ pub async fn send_message(
             payload,
         }],
         count: 1,
-        attachments,
+        attachments: attachment_paths_out,
     };
 
     tracing::debug!(
@@ -416,24 +845,24 @@ pub async fn reply_message(
     let bcc_names = bcc.unwrap_or_default();
 
     // Resolve all recipients
-    let mut all_recipients: Vec<(i64, &str)> = Vec::new();
+    let mut all_recipients: Vec<(i64, String)> = Vec::new();
     let mut resolved_to: Vec<String> = Vec::new();
     let mut resolved_cc_recipients: Vec<String> = Vec::new();
     let mut resolved_bcc_recipients: Vec<String> = Vec::new();
 
     for name in &to_names {
         let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "to"));
+        all_recipients.push((agent.id.unwrap_or(0), "to".to_string()));
         resolved_to.push(agent.name);
     }
     for name in &cc_names {
         let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "cc"));
+        all_recipients.push((agent.id.unwrap_or(0), "cc".to_string()));
         resolved_cc_recipients.push(agent.name);
     }
     for name in &bcc_names {
         let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "bcc"));
+        all_recipients.push((agent.id.unwrap_or(0), "bcc".to_string()));
         resolved_bcc_recipients.push(agent.name);
     }
 
@@ -457,8 +886,12 @@ pub async fn reply_message(
     let reply_id = reply.id.unwrap_or(0);
 
     // Add recipients
+    let recipient_refs: Vec<(i64, &str)> = all_recipients
+        .iter()
+        .map(|(id, kind)| (*id, kind.as_str()))
+        .collect();
     db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::add_recipients(ctx.cx(), &pool, reply_id, &all_recipients)
+        mcp_agent_mail_db::queries::add_recipients(ctx.cx(), &pool, reply_id, &recipient_refs)
             .await,
     )?;
 
@@ -650,6 +1083,10 @@ pub async fn fetch_inbox(
         urgent,
         since_ts
     );
+
+    // Clear notification signal (best-effort).
+    let config = Config::from_env();
+    let _ = mcp_agent_mail_storage::clear_notification_signal(&config, &project.slug, &agent.name);
 
     serde_json::to_string(&messages)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))

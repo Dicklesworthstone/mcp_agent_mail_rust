@@ -1,0 +1,80 @@
+{
+  "_description": "Format resolution precedence vectors for _resolve_output_format().",
+  "vectors": [
+    {
+      "name": "explicit_toon_param",
+      "format_value": "toon",
+      "env_default": null,
+      "expected_resolved": "toon",
+      "expected_source": "param",
+      "expected_requested": "toon"
+    },
+    {
+      "name": "explicit_json_param",
+      "format_value": "json",
+      "env_default": null,
+      "expected_resolved": "json",
+      "expected_source": "param",
+      "expected_requested": "json"
+    },
+    {
+      "name": "mime_type_toon",
+      "format_value": "application/toon",
+      "env_default": null,
+      "expected_resolved": "toon",
+      "expected_source": "param",
+      "expected_requested": "toon"
+    },
+    {
+      "name": "mime_type_json",
+      "format_value": "text/json",
+      "env_default": null,
+      "expected_resolved": "json",
+      "expected_source": "param",
+      "expected_requested": "json"
+    },
+    {
+      "name": "auto_value_uses_default",
+      "format_value": "auto",
+      "env_default": "toon",
+      "expected_resolved": "toon",
+      "expected_source": "default",
+      "expected_requested": "toon"
+    },
+    {
+      "name": "null_value_uses_default",
+      "format_value": null,
+      "env_default": "toon",
+      "expected_resolved": "toon",
+      "expected_source": "default",
+      "expected_requested": "toon"
+    },
+    {
+      "name": "empty_string_uses_default",
+      "format_value": "",
+      "env_default": "json",
+      "expected_resolved": "json",
+      "expected_source": "default",
+      "expected_requested": "json"
+    },
+    {
+      "name": "no_param_no_default_implicit_json",
+      "format_value": null,
+      "env_default": null,
+      "expected_resolved": "json",
+      "expected_source": "implicit",
+      "expected_requested": null
+    },
+    {
+      "name": "invalid_format_rejected",
+      "format_value": "xml",
+      "env_default": null,
+      "expected_error": "Invalid format 'xml'. Expected 'json' or 'toon'."
+    },
+    {
+      "name": "auto_aliases",
+      "cases": ["", "auto", "default", "none", "null"],
+      "description": "All treated as None (use defaults or implicit fallback)"
+    }
+  ]
+}

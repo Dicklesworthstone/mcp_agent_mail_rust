@@ -14,7 +14,7 @@
 | FastMCP server (HTTP) | Implemented | `crates/mcp-agent-mail-server/src/lib.rs` |
 | Tool registry + tool clusters | Verified (Conformance) | `crates/mcp-agent-mail-server/src/lib.rs` |
 | Resource URI system (`resource://...`) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
-| Tool filtering profiles (full/core/minimal/messaging/custom) | Implemented | `crates/mcp-agent-mail-core/src/config.rs`, `crates/mcp-agent-mail-tools/src/lib.rs`, `crates/mcp-agent-mail-server/src/lib.rs` |
+| Tool filtering profiles (full/core/minimal/messaging/custom) | Verified (Tests) | `crates/mcp-agent-mail-core/src/config.rs`, `crates/mcp-agent-mail-tools/src/lib.rs`, `crates/mcp-agent-mail-server/src/lib.rs`, `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
 | Tool metrics snapshot | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Recent tool usage tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 
