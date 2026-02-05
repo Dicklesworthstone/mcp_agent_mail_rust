@@ -6,6 +6,28 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Tool filtering configuration for context reduction.
+#[derive(Debug, Clone)]
+pub struct ToolFilterSettings {
+    pub enabled: bool,
+    pub profile: String,
+    pub mode: String,
+    pub clusters: Vec<String>,
+    pub tools: Vec<String>,
+}
+
+impl Default for ToolFilterSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profile: "full".to_string(),
+            mode: "include".to_string(),
+            clusters: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+}
+
 /// Main configuration struct for MCP Agent Mail
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -93,6 +115,19 @@ pub struct Config {
     pub llm_temperature: f64,
     pub llm_max_tokens: u32,
     pub llm_cache_enabled: bool,
+
+    // Notifications
+    pub notifications_enabled: bool,
+    pub notifications_signals_dir: PathBuf,
+    pub notifications_include_metadata: bool,
+    pub notifications_debounce_ms: u64,
+
+    // Tool filtering
+    pub tool_filter: ToolFilterSettings,
+
+    // Instrumentation / query tracking
+    pub instrumentation_enabled: bool,
+    pub instrumentation_slow_query_ms: u64,
 
     // Logging
     pub log_level: String,
@@ -247,6 +282,22 @@ impl Default for Config {
             llm_max_tokens: 512,
             llm_cache_enabled: true,
 
+            // Notifications
+            notifications_enabled: false,
+            notifications_signals_dir: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".mcp_agent_mail")
+                .join("signals"),
+            notifications_include_metadata: true,
+            notifications_debounce_ms: 100,
+
+            // Tool filtering
+            tool_filter: ToolFilterSettings::default(),
+
+            // Instrumentation
+            instrumentation_enabled: false,
+            instrumentation_slow_query_ms: 250,
+
             // Logging
             log_level: "INFO".to_string(),
             log_rich_enabled: true,
@@ -255,6 +306,10 @@ impl Default for Config {
 }
 
 impl Config {
+    fn apply_environment_defaults(&mut self) {
+        self.http_cors_enabled = self.app_environment == AppEnvironment::Development;
+    }
+
     /// Load configuration from environment variables
     #[must_use]
     #[allow(clippy::too_many_lines)]
@@ -268,6 +323,8 @@ impl Config {
                 _ => AppEnvironment::Development,
             };
         }
+        // Align CORS default with legacy behavior: enabled in development, disabled in production.
+        config.apply_environment_defaults();
         config.worktrees_enabled = env_bool("WORKTREES_ENABLED", config.worktrees_enabled);
         if let Ok(v) = env::var("PROJECT_IDENTITY_MODE") {
             config.project_identity_mode = match v.to_lowercase().as_str() {
@@ -476,6 +533,42 @@ impl Config {
         config.llm_max_tokens = env_u32("LLM_MAX_TOKENS", config.llm_max_tokens);
         config.llm_cache_enabled = env_bool("LLM_CACHE_ENABLED", config.llm_cache_enabled);
 
+        // Notifications
+        config.notifications_enabled =
+            env_bool("NOTIFICATIONS_ENABLED", config.notifications_enabled);
+        if let Ok(v) = env::var("NOTIFICATIONS_SIGNALS_DIR") {
+            config.notifications_signals_dir = PathBuf::from(shellexpand::tilde(&v).into_owned());
+        }
+        config.notifications_include_metadata = env_bool(
+            "NOTIFICATIONS_INCLUDE_METADATA",
+            config.notifications_include_metadata,
+        );
+        config.notifications_debounce_ms =
+            env_u64("NOTIFICATIONS_DEBOUNCE_MS", config.notifications_debounce_ms);
+
+        // Instrumentation
+        config.instrumentation_enabled =
+            env_bool("INSTRUMENTATION_ENABLED", config.instrumentation_enabled);
+        config.instrumentation_slow_query_ms = env_u64(
+            "INSTRUMENTATION_SLOW_QUERY_MS",
+            config.instrumentation_slow_query_ms,
+        );
+
+        // Tool filtering
+        config.tool_filter.enabled = env_bool("TOOLS_FILTER_ENABLED", config.tool_filter.enabled);
+        if let Ok(v) = env::var("TOOLS_FILTER_PROFILE") {
+            config.tool_filter.profile = normalize_tool_filter_profile(&v);
+        }
+        if let Ok(v) = env::var("TOOLS_FILTER_MODE") {
+            config.tool_filter.mode = normalize_tool_filter_mode(&v);
+        }
+        if let Ok(v) = env::var("TOOLS_FILTER_CLUSTERS") {
+            config.tool_filter.clusters = parse_csv_lower(&v);
+        }
+        if let Ok(v) = env::var("TOOLS_FILTER_TOOLS") {
+            config.tool_filter.tools = parse_csv_lower(&v);
+        }
+
         // Logging
         if let Ok(v) = env::var("LOG_LEVEL") {
             config.log_level = v;
@@ -489,6 +582,69 @@ impl Config {
     #[must_use]
     pub fn is_production(&self) -> bool {
         self.app_environment == AppEnvironment::Production
+    }
+
+    /// Determine if a tool should be exposed based on tool filter settings.
+    #[must_use]
+    pub fn should_expose_tool(&self, tool_name: &str, cluster: &str) -> bool {
+        let filter = &self.tool_filter;
+        if !filter.enabled {
+            return true;
+        }
+
+        let profile = filter.profile.as_str();
+        if profile == "custom" {
+            if filter.clusters.is_empty() && filter.tools.is_empty() {
+                return true;
+            }
+            let in_cluster = filter.clusters.iter().any(|c| c == cluster);
+            let in_tools = filter.tools.iter().any(|t| t == tool_name);
+            if filter.mode == "exclude" {
+                return !(in_cluster || in_tools);
+            }
+            return in_cluster || in_tools;
+        }
+
+        if profile == "full" {
+            return true;
+        }
+
+        let (profile_clusters, profile_tools) = match profile {
+            "core" => (
+                &[
+                    "identity",
+                    "messaging",
+                    "file_reservations",
+                    "workflow_macros",
+                ][..],
+                &["health_check", "ensure_project"][..],
+            ),
+            "minimal" => (
+                &[][..],
+                &[
+                    "health_check",
+                    "ensure_project",
+                    "register_agent",
+                    "send_message",
+                    "fetch_inbox",
+                    "acknowledge_message",
+                ][..],
+            ),
+            "messaging" => (
+                &["identity", "messaging", "contact"][..],
+                &["health_check", "ensure_project", "search_messages"][..],
+            ),
+            _ => (&[][..], &[][..]),
+        };
+
+        let in_cluster = profile_clusters.contains(&cluster);
+        let in_tools = profile_tools.contains(&tool_name);
+
+        if in_cluster || in_tools {
+            return true;
+        }
+
+        profile_clusters.is_empty() && profile_tools.is_empty()
     }
 }
 
@@ -528,6 +684,28 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn parse_csv_lower(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn normalize_tool_filter_profile(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "full" | "core" | "minimal" | "messaging" | "custom" => value.trim().to_lowercase(),
+        _ => "full".to_string(),
+    }
+}
+
+fn normalize_tool_filter_mode(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "include" | "exclude" => value.trim().to_lowercase(),
+        _ => "include".to_string(),
+    }
+}
+
 fn env_f64(key: &str, default: f64) -> f64 {
     env::var(key)
         .ok()
@@ -555,5 +733,22 @@ mod tests {
     fn test_from_env() {
         // This just tests that from_env doesn't panic
         let _config = Config::from_env();
+    }
+
+    #[test]
+    fn test_cors_defaults_follow_environment() {
+        let mut config = Config {
+            app_environment: AppEnvironment::Development,
+            ..Config::default()
+        };
+        config.apply_environment_defaults();
+        assert!(config.http_cors_enabled);
+
+        let mut config = Config {
+            app_environment: AppEnvironment::Production,
+            ..Config::default()
+        };
+        config.apply_environment_defaults();
+        assert!(!config.http_cors_enabled);
     }
 }

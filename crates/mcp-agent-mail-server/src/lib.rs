@@ -30,58 +30,267 @@ use mcp_agent_mail_tools::{
     ToolingLocksResource, ToolingMetricsQueryResource, ToolingMetricsResource,
     ToolingRecentResource, ToolingSchemasQueryResource, ToolingSchemasResource,
     UninstallPrecommitGuard, ViewsAckOverdueResource, ViewsAckRequiredResource,
-    ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois,
+    ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+fn add_tool<T: fastmcp::ToolHandler + 'static>(
+    server: fastmcp_server::ServerBuilder,
+    config: &mcp_agent_mail_core::Config,
+    tool_name: &str,
+    cluster: &str,
+    tool: T,
+) -> fastmcp_server::ServerBuilder {
+    if config.should_expose_tool(tool_name, cluster) {
+        server.tool(tool)
+    } else {
+        server
+    }
+}
+
 #[must_use]
-pub fn build_server() -> Server {
-    Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"))
+pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
+    let server = Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"));
+
+    let server = add_tool(
+        server,
+        config,
+        "health_check",
+        clusters::INFRASTRUCTURE,
+        HealthCheck,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "ensure_project",
+        clusters::INFRASTRUCTURE,
+        EnsureProject,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "register_agent",
+        clusters::IDENTITY,
+        RegisterAgent,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "create_agent_identity",
+        clusters::IDENTITY,
+        CreateAgentIdentity,
+    );
+    let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
+    let server = add_tool(
+        server,
+        config,
+        "send_message",
+        clusters::MESSAGING,
+        SendMessage,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "reply_message",
+        clusters::MESSAGING,
+        ReplyMessage,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "fetch_inbox",
+        clusters::MESSAGING,
+        FetchInbox,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "mark_message_read",
+        clusters::MESSAGING,
+        MarkMessageRead,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "acknowledge_message",
+        clusters::MESSAGING,
+        AcknowledgeMessage,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "request_contact",
+        clusters::CONTACT,
+        RequestContact,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "respond_contact",
+        clusters::CONTACT,
+        RespondContact,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "list_contacts",
+        clusters::CONTACT,
+        ListContacts,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "set_contact_policy",
+        clusters::CONTACT,
+        SetContactPolicy,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "file_reservation_paths",
+        clusters::FILE_RESERVATIONS,
+        FileReservationPaths,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "release_file_reservations",
+        clusters::FILE_RESERVATIONS,
+        ReleaseFileReservations,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "renew_file_reservations",
+        clusters::FILE_RESERVATIONS,
+        RenewFileReservations,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "force_release_file_reservation",
+        clusters::FILE_RESERVATIONS,
+        ForceReleaseFileReservation,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "install_precommit_guard",
+        clusters::INFRASTRUCTURE,
+        InstallPrecommitGuard,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "uninstall_precommit_guard",
+        clusters::INFRASTRUCTURE,
+        UninstallPrecommitGuard,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "search_messages",
+        clusters::SEARCH,
+        SearchMessages,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "summarize_thread",
+        clusters::SEARCH,
+        SummarizeThread,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "macro_start_session",
+        clusters::WORKFLOW_MACROS,
+        MacroStartSession,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "macro_prepare_thread",
+        clusters::WORKFLOW_MACROS,
+        MacroPrepareThread,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "macro_file_reservation_cycle",
+        clusters::WORKFLOW_MACROS,
+        MacroFileReservationCycle,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "macro_contact_handshake",
+        clusters::WORKFLOW_MACROS,
+        MacroContactHandshake,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "ensure_product",
+        clusters::PRODUCT_BUS,
+        EnsureProduct,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "products_link",
+        clusters::PRODUCT_BUS,
+        ProductsLink,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "search_messages_product",
+        clusters::PRODUCT_BUS,
+        SearchMessagesProduct,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "fetch_inbox_product",
+        clusters::PRODUCT_BUS,
+        FetchInboxProduct,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "summarize_thread_product",
+        clusters::PRODUCT_BUS,
+        SummarizeThreadProduct,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "acquire_build_slot",
+        clusters::BUILD_SLOTS,
+        AcquireBuildSlot,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "renew_build_slot",
+        clusters::BUILD_SLOTS,
+        RenewBuildSlot,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "release_build_slot",
+        clusters::BUILD_SLOTS,
+        ReleaseBuildSlot,
+    );
+
+    server
         // Identity
-        .tool(HealthCheck)
-        .tool(EnsureProject)
-        .tool(RegisterAgent)
-        .tool(CreateAgentIdentity)
-        .tool(Whois)
-        // Messaging
-        .tool(SendMessage)
-        .tool(ReplyMessage)
-        .tool(FetchInbox)
-        .tool(MarkMessageRead)
-        .tool(AcknowledgeMessage)
-        // Contact
-        .tool(RequestContact)
-        .tool(RespondContact)
-        .tool(ListContacts)
-        .tool(SetContactPolicy)
-        // File reservations
-        .tool(FileReservationPaths)
-        .tool(ReleaseFileReservations)
-        .tool(RenewFileReservations)
-        .tool(ForceReleaseFileReservation)
-        .tool(InstallPrecommitGuard)
-        .tool(UninstallPrecommitGuard)
-        // Search
-        .tool(SearchMessages)
-        .tool(SummarizeThread)
-        // Macros
-        .tool(MacroStartSession)
-        .tool(MacroPrepareThread)
-        .tool(MacroFileReservationCycle)
-        .tool(MacroContactHandshake)
-        // Product bus
-        .tool(EnsureProduct)
-        .tool(ProductsLink)
-        .tool(SearchMessagesProduct)
-        .tool(FetchInboxProduct)
-        .tool(SummarizeThreadProduct)
-        // Build slots
-        .tool(AcquireBuildSlot)
-        .tool(RenewBuildSlot)
-        .tool(ReleaseBuildSlot)
         // Resources
         .resource(ConfigEnvironmentResource)
         .resource(ConfigEnvironmentQueryResource)
@@ -115,12 +324,12 @@ pub fn build_server() -> Server {
         .build()
 }
 
-pub fn run_stdio(_config: &mcp_agent_mail_core::Config) {
-    build_server().run_stdio();
+pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
+    build_server(config).run_stdio();
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
-    let server = build_server();
+    let server = build_server(config);
     let server_info = server.info().clone();
     let server_capabilities = server.capabilities().clone();
     let router = Arc::new(server.into_router());
@@ -379,9 +588,7 @@ impl HttpState {
         // Rate limiting (memory backend only)
         if self.config.http_rate_limit_enabled {
             let (rpm, burst) = rate_limits_for(&self.config, kind);
-            let identity = header_value(req, "x-forwarded-for")
-                .or_else(|| header_value(req, "x-real-ip"))
-                .unwrap_or("ip-unknown");
+            let identity = rate_limit_identity(req, None);
             let endpoint = tool_name.as_deref().unwrap_or("*");
             let key = format!("{kind}:{endpoint}:{identity}");
 
@@ -534,7 +741,7 @@ impl HttpState {
         if has_forwarded_headers(req) {
             return false;
         }
-        is_local_bind_host(&self.config.http_host)
+        is_local_peer_addr(req.peer_addr)
     }
 
     fn cors_origin(&self, req: &Http1Request) -> Option<String> {
@@ -543,7 +750,13 @@ impl HttpState {
         }
         let origin = header_value(req, "origin")?.to_string();
         if cors_allows(&self.config.http_cors_origins, &origin) {
-            Some(origin)
+            if cors_wildcard(&self.config.http_cors_origins)
+                && !self.config.http_cors_allow_credentials
+            {
+                Some("*".to_string())
+            } else {
+                Some(origin)
+            }
         } else {
             None
         }
@@ -833,6 +1046,13 @@ fn apply_cors_headers(
     let Some(origin) = origin else {
         return;
     };
+    resp.headers.retain(|(k, _)| {
+        let key = k.to_lowercase();
+        key != "access-control-allow-origin"
+            && key != "access-control-allow-methods"
+            && key != "access-control-allow-headers"
+            && key != "access-control-allow-credentials"
+    });
     resp.headers
         .push(("access-control-allow-origin".to_string(), origin));
     resp.headers.push((
@@ -861,6 +1081,13 @@ fn cors_list_value(values: &[String]) -> String {
     values.join(", ")
 }
 
+fn cors_wildcard(allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    allowed.iter().any(|o| o == "*")
+}
+
 fn header_value<'a>(req: &'a Http1Request, name: &str) -> Option<&'a str> {
     let name = name.to_lowercase();
     req.headers
@@ -876,8 +1103,35 @@ fn has_forwarded_headers(req: &Http1Request) -> bool {
         || header_value(req, "forwarded").is_some()
 }
 
-fn is_local_bind_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "::1" | "localhost")
+fn peer_addr_host(peer_addr: Option<SocketAddr>) -> Option<String> {
+    peer_addr.map(|addr| match addr.ip() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4()
+            .map(|v4| v4.to_string())
+            .unwrap_or_else(|| v6.to_string()),
+    })
+}
+
+fn rate_limit_identity(req: &Http1Request, jwt_sub: Option<&str>) -> String {
+    if let Some(sub) = jwt_sub.filter(|s| !s.is_empty()) {
+        return format!("sub:{sub}");
+    }
+    peer_addr_host(req.peer_addr).unwrap_or_else(|| "ip-unknown".to_string())
+}
+
+fn is_local_peer_addr(peer_addr: Option<SocketAddr>) -> bool {
+    let Some(addr) = peer_addr else {
+        return false;
+    };
+    is_loopback_ip(addr.ip())
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4().is_some_and(|v4| v4.is_loopback()),
+    }
 }
 
 fn cors_allows(allowed: &[String], origin: &str) -> bool {
@@ -910,5 +1164,261 @@ const fn http_error_status(
         }
         HttpError::Timeout | HttpError::Closed => HttpStatus::SERVICE_UNAVAILABLE,
         HttpError::Transport(_) => HttpStatus::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asupersync::http::h1::types::Version as Http1Version;
+
+    fn build_state(config: mcp_agent_mail_core::Config) -> HttpState {
+        let server = build_server(&config);
+        let server_info = server.info().clone();
+        let server_capabilities = server.capabilities().clone();
+        let router = Arc::new(server.into_router());
+        HttpState::new(router, server_info, server_capabilities, config)
+    }
+
+    fn make_request(method: Http1Method, uri: &str, headers: &[(&str, &str)]) -> Http1Request {
+        make_request_with_peer_addr(method, uri, headers, None)
+    }
+
+    fn make_request_with_peer_addr(
+        method: Http1Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        peer_addr: Option<SocketAddr>,
+    ) -> Http1Request {
+        Http1Request {
+            method,
+            uri: uri.to_string(),
+            version: Http1Version::Http11,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: Vec::new(),
+            trailers: Vec::new(),
+            peer_addr,
+        }
+    }
+
+    fn response_header<'a>(resp: &'a Http1Response, name: &str) -> Option<&'a str> {
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn cors_list_value_defaults_to_star() {
+        assert_eq!(cors_list_value(&[]), "*");
+        assert_eq!(cors_list_value(&["*".to_string()]), "*");
+        assert_eq!(
+            cors_list_value(&["GET".to_string(), "POST".to_string()]),
+            "GET, POST"
+        );
+    }
+
+    #[test]
+    fn cors_origin_wildcard_uses_star_without_credentials() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_cors_enabled = true;
+        config.http_cors_origins = Vec::new();
+        config.http_cors_allow_credentials = false;
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("Origin", "http://example.com")],
+        );
+        assert_eq!(state.cors_origin(&req), Some("*".to_string()));
+    }
+
+    #[test]
+    fn cors_origin_wildcard_echoes_origin_with_credentials() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_cors_enabled = true;
+        config.http_cors_origins = vec!["*".to_string()];
+        config.http_cors_allow_credentials = true;
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("Origin", "http://example.com")],
+        );
+        assert_eq!(
+            state.cors_origin(&req),
+            Some("http://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn cors_origin_denies_unlisted_origin() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_cors_enabled = true;
+        config.http_cors_origins = vec!["http://allowed.com".to_string()];
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("Origin", "http://blocked.com")],
+        );
+        assert_eq!(state.cors_origin(&req), None);
+    }
+
+    #[test]
+    fn cors_preflight_includes_configured_headers() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_cors_enabled = true;
+        config.http_cors_origins = vec!["*".to_string()];
+        config.http_cors_allow_methods = vec!["*".to_string()];
+        config.http_cors_allow_headers = vec!["*".to_string()];
+        config.http_cors_allow_credentials = false;
+        config.http_bearer_token = Some("secret".to_string());
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Options,
+            "/api/",
+            &[
+                ("Origin", "http://example.com"),
+                ("Access-Control-Request-Method", "POST"),
+            ],
+        );
+        let resp = block_on(state.handle(req));
+        assert!(resp.status == 200 || resp.status == 204);
+        assert_eq!(
+            response_header(&resp, "access-control-allow-origin"),
+            Some("*")
+        );
+        assert_eq!(
+            response_header(&resp, "access-control-allow-methods"),
+            Some("*")
+        );
+        assert_eq!(
+            response_header(&resp, "access-control-allow-headers"),
+            Some("*")
+        );
+        assert!(response_header(&resp, "access-control-allow-credentials").is_none());
+    }
+
+    #[test]
+    fn cors_headers_present_on_normal_responses() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_cors_enabled = true;
+        config.http_cors_origins = vec!["*".to_string()];
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("Origin", "http://example.com")],
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            response_header(&resp, "access-control-allow-origin"),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn cors_disabled_emits_no_headers() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_cors_enabled = false;
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("Origin", "http://example.com")],
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert!(response_header(&resp, "access-control-allow-origin").is_none());
+    }
+
+    #[test]
+    fn localhost_bypass_requires_local_peer_and_no_forwarded_headers() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_allow_localhost_unauthenticated = true;
+        let state = build_state(config);
+        let local_peer = SocketAddr::from(([127, 0, 0, 1], 4321));
+        let non_local_peer = SocketAddr::from(([10, 0, 0, 1], 5555));
+
+        let req = make_request_with_peer_addr(
+            Http1Method::Get,
+            "/health/liveness",
+            &[],
+            Some(local_peer),
+        );
+        assert!(state.allow_local_unauthenticated(&req));
+
+        let req_forwarded = make_request_with_peer_addr(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("X-Forwarded-For", "1.2.3.4")],
+            Some(local_peer),
+        );
+        assert!(!state.allow_local_unauthenticated(&req_forwarded));
+
+        let req_host_header = make_request_with_peer_addr(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("Host", "localhost")],
+            Some(non_local_peer),
+        );
+        assert!(!state.allow_local_unauthenticated(&req_host_header));
+    }
+
+    #[test]
+    fn peer_addr_helpers_handle_ipv4_mapped_ipv6() {
+        let addr: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().expect("parse addr");
+        assert!(is_local_peer_addr(Some(addr)));
+        assert_eq!(peer_addr_host(Some(addr)), Some("127.0.0.1".to_string()));
+        let non_local = SocketAddr::from(([10, 1, 2, 3], 9000));
+        assert!(!is_local_peer_addr(Some(non_local)));
+    }
+
+    #[test]
+    fn rate_limit_identity_prefers_jwt_sub() {
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[],
+            Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+        );
+        assert_eq!(rate_limit_identity(&req, Some("user-123")), "sub:user-123");
+    }
+
+    #[test]
+    fn rate_limit_identity_prefers_peer_addr_over_forwarded_headers() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_rate_limit_enabled = true;
+        config.http_rate_limit_tools_per_minute = 1;
+        config.http_rate_limit_tools_burst = 1;
+        let state = build_state(config);
+
+        let params = serde_json::json!({ "name": "health_check", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let req1 = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("X-Forwarded-For", "1.2.3.4")],
+            Some(peer),
+        );
+        assert!(state.check_rbac_and_rate_limit(&req1, &json_rpc).is_none());
+
+        let req2 = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("X-Forwarded-For", "5.6.7.8")],
+            Some(peer),
+        );
+        let resp = state
+            .check_rbac_and_rate_limit(&req2, &json_rpc)
+            .expect("rate limit should trigger");
+        assert_eq!(resp.status, 429);
     }
 }

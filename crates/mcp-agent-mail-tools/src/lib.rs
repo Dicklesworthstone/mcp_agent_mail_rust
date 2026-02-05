@@ -103,12 +103,71 @@ pub(crate) mod tool_util {
 
 /// Tool cluster identifiers for grouping and RBAC
 pub mod clusters {
+    pub const INFRASTRUCTURE: &str = "infrastructure";
     pub const IDENTITY: &str = "identity";
     pub const MESSAGING: &str = "messaging";
     pub const CONTACT: &str = "contact";
     pub const FILE_RESERVATIONS: &str = "file_reservations";
     pub const SEARCH: &str = "search";
-    pub const MACROS: &str = "macros";
-    pub const PRODUCT: &str = "product";
+    pub const WORKFLOW_MACROS: &str = "workflow_macros";
+    pub const PRODUCT_BUS: &str = "product_bus";
     pub const BUILD_SLOTS: &str = "build_slots";
+}
+
+/// Tool name → cluster mapping used for filtering and tooling metadata.
+pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
+    // Infrastructure
+    ("health_check", clusters::INFRASTRUCTURE),
+    ("ensure_project", clusters::INFRASTRUCTURE),
+    ("install_precommit_guard", clusters::INFRASTRUCTURE),
+    ("uninstall_precommit_guard", clusters::INFRASTRUCTURE),
+    // Identity
+    ("register_agent", clusters::IDENTITY),
+    ("create_agent_identity", clusters::IDENTITY),
+    ("whois", clusters::IDENTITY),
+    // Messaging
+    ("send_message", clusters::MESSAGING),
+    ("reply_message", clusters::MESSAGING),
+    ("fetch_inbox", clusters::MESSAGING),
+    ("mark_message_read", clusters::MESSAGING),
+    ("acknowledge_message", clusters::MESSAGING),
+    // Contact
+    ("request_contact", clusters::CONTACT),
+    ("respond_contact", clusters::CONTACT),
+    ("list_contacts", clusters::CONTACT),
+    ("set_contact_policy", clusters::CONTACT),
+    // File reservations
+    ("file_reservation_paths", clusters::FILE_RESERVATIONS),
+    ("release_file_reservations", clusters::FILE_RESERVATIONS),
+    ("renew_file_reservations", clusters::FILE_RESERVATIONS),
+    (
+        "force_release_file_reservation",
+        clusters::FILE_RESERVATIONS,
+    ),
+    // Search
+    ("search_messages", clusters::SEARCH),
+    ("summarize_thread", clusters::SEARCH),
+    // Workflow macros
+    ("macro_start_session", clusters::WORKFLOW_MACROS),
+    ("macro_prepare_thread", clusters::WORKFLOW_MACROS),
+    ("macro_file_reservation_cycle", clusters::WORKFLOW_MACROS),
+    ("macro_contact_handshake", clusters::WORKFLOW_MACROS),
+    // Product bus
+    ("ensure_product", clusters::PRODUCT_BUS),
+    ("products_link", clusters::PRODUCT_BUS),
+    ("search_messages_product", clusters::PRODUCT_BUS),
+    ("fetch_inbox_product", clusters::PRODUCT_BUS),
+    ("summarize_thread_product", clusters::PRODUCT_BUS),
+    // Build slots
+    ("acquire_build_slot", clusters::BUILD_SLOTS),
+    ("renew_build_slot", clusters::BUILD_SLOTS),
+    ("release_build_slot", clusters::BUILD_SLOTS),
+];
+
+#[must_use]
+pub fn tool_cluster(tool_name: &str) -> Option<&'static str> {
+    TOOL_CLUSTER_MAP
+        .iter()
+        .find(|(name, _)| *name == tool_name)
+        .map(|(_, cluster)| *cluster)
 }

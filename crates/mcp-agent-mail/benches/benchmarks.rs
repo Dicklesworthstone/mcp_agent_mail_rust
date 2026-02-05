@@ -26,7 +26,8 @@ fn seed_fixtures(fixtures: &Fixtures) {
     SEEDED.call_once(|| {
         // Reuse the conformance fixtures to seed a realistic DB state.
         // This ensures benchmarks remain aligned with parity expectations.
-        let router = mcp_agent_mail_server::build_server().into_router();
+        let config = mcp_agent_mail_core::Config::from_env();
+        let router = mcp_agent_mail_server::build_server(&config).into_router();
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
         let mut req_id: u64 = 1;
@@ -71,7 +72,8 @@ fn bench_tools(c: &mut Criterion) {
     let fixtures = Fixtures::load(fixtures_path()).expect("fixtures");
     seed_fixtures(&fixtures);
 
-    let router = mcp_agent_mail_server::build_server().into_router();
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
 
