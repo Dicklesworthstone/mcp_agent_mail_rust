@@ -23,5 +23,12 @@ agent-detect = ["coding-agent-search"]
 workspace = true
 optional = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "toon_bench"
+harness = false
+
 [lints]
 workspace = true

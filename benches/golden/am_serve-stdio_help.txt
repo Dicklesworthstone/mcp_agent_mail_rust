@@ -1,0 +1,4 @@
+Usage: am serve-stdio
+
+Options:
+  -h, --help  Print help

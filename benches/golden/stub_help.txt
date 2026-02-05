@@ -1,0 +1,2 @@
+toon_stub_encoder — reference implementation in rust (stub)
+Usage: toon_stub_encoder --encode [--stats]

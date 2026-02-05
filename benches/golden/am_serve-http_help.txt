@@ -1,0 +1,7 @@
+Usage: am serve-http [OPTIONS]
+
+Options:
+      --host <HOST>  
+      --port <PORT>  
+      --path <PATH>  
+  -h, --help         Print help

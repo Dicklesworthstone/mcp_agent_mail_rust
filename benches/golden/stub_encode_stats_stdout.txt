@@ -1,0 +1,3 @@
+~stub_toon_output
+  payload_length: 8
+  checksum: stub

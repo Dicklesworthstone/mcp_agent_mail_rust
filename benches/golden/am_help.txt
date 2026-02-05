@@ -1,0 +1,31 @@
+MCP Agent Mail CLI (Rust)
+
+Usage: am <COMMAND>
+
+Commands:
+  serve-http                  
+  serve-stdio                 
+  lint                        
+  typecheck                   
+  share                       
+  archive                     
+  guard                       
+  file_reservations           
+  acks                        
+  list-acks                   
+  migrate                     
+  list-projects               
+  clear-and-reset-everything  
+  config                      
+  amctl                       
+  am-run                      
+  projects                    
+  mail                        
+  products                    
+  docs                        
+  doctor                      
+  help                        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

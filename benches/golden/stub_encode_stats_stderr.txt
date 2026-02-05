@@ -1,0 +1,2 @@
+Token estimates: ~25 (JSON) -> ~12 (TOON)
+Saved ~13 tokens (-52.0%)
