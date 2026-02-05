@@ -55,6 +55,17 @@
               "/created_at"
             ]
           }
+        },
+        {
+          "name": "relative_path_error",
+          "input": {
+            "human_key": "./backend"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "absolute"
+            }
+          }
         }
       ]
     },
@@ -882,6 +893,19 @@
               "/granted/0/expires_ts"
             ]
           }
+        },
+        {
+          "name": "empty_paths_error",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "BlueLake",
+            "paths": []
+          },
+          "expect": {
+            "err": {
+              "message_contains": "paths list cannot be empty"
+            }
+          }
         }
       ]
     },
@@ -934,6 +958,59 @@
             "ignore_json_pointers": [
               "/released_at"
             ]
+          }
+        }
+      ]
+    },
+    "force_release_file_reservation": {
+      "cases": [
+        {
+          "name": "force_release_missing",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "BlueLake",
+            "file_reservation_id": 9999
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        }
+      ]
+    },
+    "install_precommit_guard": {
+      "cases": [
+        {
+          "name": "install_precommit_guard_default",
+          "input": {
+            "project_key": "abs-path-backend",
+            "code_repo_path": "/tmp/agent-mail-fixtures/repo_install"
+          },
+          "expect": {
+            "ok": {
+              "hook": null
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/hook"
+            ]
+          }
+        }
+      ]
+    },
+    "uninstall_precommit_guard": {
+      "cases": [
+        {
+          "name": "uninstall_precommit_guard_default",
+          "input": {
+            "code_repo_path": "/tmp/agent-mail-fixtures/repo_uninstall"
+          },
+          "expect": {
+            "ok": {
+              "removed": false
+            }
           }
         }
       ]

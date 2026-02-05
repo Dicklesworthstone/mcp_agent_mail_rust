@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -61,6 +62,8 @@ _VOLATILE_KEY_EXACT: frozenset[str] = frozenset(
         "timestamp",
         # Git diff excerpts may embed volatile timestamps.
         "excerpt",
+        # Hook paths depend on temp repo roots.
+        "hook",
     }
 )
 
@@ -104,6 +107,12 @@ def _mk_run_dir() -> Path:
     run_dir = scratch_root / f"run_{uuid.uuid4().hex}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def _init_git_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "-C", str(path), "init"], check=True, capture_output=True, text=True)
+    return path
 
 
 def _set_legacy_env(run_dir: Path) -> None:
@@ -224,6 +233,30 @@ async def _generate() -> dict[str, Any]:
             tool_entry["cases"].append(case)
             return out
 
+        async def record_tool_error(
+            tool_name: str,
+            case_name: str,
+            tool_args: dict[str, Any],
+            message_contains: str,
+        ) -> None:
+            try:
+                await _call_tool(mcp, ctx, tool_name, tool_args)
+            except Exception as exc:
+                msg = str(exc)
+                if message_contains not in msg:
+                    raise RuntimeError(
+                        f"expected error containing {message_contains!r}, got {msg!r}"
+                    ) from exc
+                case = {
+                    "name": case_name,
+                    "input": tool_args,
+                    "expect": {"err": {"message_contains": message_contains}},
+                }
+                tool_entry = tools.setdefault(tool_name, {"cases": []})
+                tool_entry["cases"].append(case)
+                return
+            raise RuntimeError(f"expected error for tool {tool_name} case {case_name}")
+
         # --- Tool scenario (ordered) ---------------------------------------------------------
         await record_tool("health_check", "default", {})
 
@@ -232,7 +265,18 @@ async def _generate() -> dict[str, Any]:
             "abs_path_backend",
             {"human_key": "/abs/path/backend"},
         )
+        await record_tool_error(
+            "ensure_project",
+            "relative_path_error",
+            {"human_key": "./backend"},
+            "absolute directory path",
+        )
         project_slug = ensure_project_out["slug"]
+        repo_root = Path(
+            os.environ.get("AM_FIXTURE_REPO_ROOT", "/tmp/agent-mail-fixtures")
+        ).resolve()
+        repo_install = _init_git_repo(repo_root / "repo_install")
+        repo_uninstall = _init_git_repo(repo_root / "repo_uninstall")
 
         # --- Product Bus / Build Slots (worktrees-enabled) ---------------------------------
         ensure_product_out = await record_tool(
@@ -476,6 +520,16 @@ async def _generate() -> dict[str, Any]:
             },
         )
 
+        await record_tool_error(
+            "file_reservation_paths",
+            "empty_paths_error",
+            {
+                "project_key": project_slug,
+                "agent_name": "BlueLake",
+                "paths": [],
+            },
+            "paths list cannot be empty",
+        )
         await record_tool(
             "file_reservation_paths",
             "reserve_src_glob",
@@ -503,6 +557,31 @@ async def _generate() -> dict[str, Any]:
             {
                 "project_key": project_slug,
                 "agent_name": "BlueLake",
+            },
+        )
+        await record_tool_error(
+            "force_release_file_reservation",
+            "force_release_missing",
+            {
+                "project_key": project_slug,
+                "agent_name": "BlueLake",
+                "file_reservation_id": 9999,
+            },
+            "not found",
+        )
+        await record_tool(
+            "install_precommit_guard",
+            "install_precommit_guard_default",
+            {
+                "project_key": project_slug,
+                "code_repo_path": str(repo_install),
+            },
+        )
+        await record_tool(
+            "uninstall_precommit_guard",
+            "uninstall_precommit_guard_default",
+            {
+                "code_repo_path": str(repo_uninstall),
             },
         )
 
