@@ -2132,3 +2132,193 @@ See `crates/mcp-agent-mail-db/tests/fixtures/instrumentation/` for:
 *HTTP Background Workers spec added by CoralBadger | 2026-02-05*
 *TOON Output Format spec added by CoralBadger | 2026-02-05*
 *Instrumentation spec added by CoralBadger | 2026-02-05*
+
+---
+
+## Notifications (Signals)
+
+### Overview
+
+Optional push-notification system using local signal files. When enabled, sending a message touches a `.signal` file that agents can watch via inotify/FSEvents/kqueue for zero-poll notification. Entirely opt-in, designed for local multi-agent development.
+
+### Environment Variables
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `NOTIFICATIONS_ENABLED` | `"false"` | bool | Master switch for signal file emission |
+| `NOTIFICATIONS_SIGNALS_DIR` | `"~/.mcp_agent_mail/signals"` | str | Root directory for signal files |
+| `NOTIFICATIONS_INCLUDE_METADATA` | `"true"` | bool | Include message metadata in signal JSON |
+| `NOTIFICATIONS_DEBOUNCE_MS` | `"100"` | int | Debounce window in milliseconds |
+
+### NotificationSettings
+
+```
+NotificationSettings:
+  enabled: bool           # Master switch
+  signals_dir: str        # Root directory (supports ~ expansion)
+  include_metadata: bool  # Include message fields in signal JSON
+  debounce_ms: int        # Debounce window in ms (0 = always emit)
+```
+
+### Signal File Layout
+
+```
+{signals_dir}/
+└── projects/
+    ├── {project_slug}/
+    │   └── agents/
+    │       ├── {agent_name1}.signal    <- JSON file
+    │       └── {agent_name2}.signal    <- JSON file
+    └── {another_project}/
+        └── agents/
+            └── ...
+```
+
+Path formula: `{signals_dir}/projects/{project_slug}/agents/{agent_name}.signal`
+
+The `signals_dir` path is expanded via `expanduser()` and `resolve()` (follow symlinks).
+
+### Signal File JSON Payload
+
+**With metadata** (`include_metadata=true` AND `message_metadata` provided):
+```json
+{
+  "timestamp": "2024-01-01T12:00:00+00:00",
+  "project": "test_project",
+  "agent": "TestAgent",
+  "message": {
+    "id": 123,
+    "from": "SenderAgent",
+    "subject": "Hello World",
+    "importance": "high"
+  }
+}
+```
+
+**Without metadata** (`include_metadata=false` OR no `message_metadata`):
+```json
+{
+  "timestamp": "2024-01-01T12:00:00+00:00",
+  "project": "test_project",
+  "agent": "TestAgent"
+}
+```
+
+**Timestamp format**: ISO-8601 with timezone, from `datetime.now(timezone.utc).isoformat()`.
+
+**Message metadata fields** (all from the `message_metadata` dict):
+- `id`: message ID (int or null if absent)
+- `from`: sender name (str or null if absent)
+- `subject`: message subject (str or null if absent)
+- `importance`: message importance (str, defaults to `"normal"` if absent)
+
+### Debounce Semantics
+
+- **State**: In-memory dict mapping `(project_slug, agent_name)` → last emission timestamp (ms)
+- **Time source**: `time.time() * 1000` (wall clock milliseconds)
+- **Check**: `now_ms - last_signal < debounce_ms` → skip (return false)
+- **Update**: On successful emission, record `now_ms` for the debounce key
+- **Reset**: In tests, clear the debounce dict with `_SIGNAL_DEBOUNCE.clear()`
+- **Key granularity**: Per-project per-agent (different agents in the same project debounce independently)
+
+When `debounce_ms=0`, every emission passes the check (since `now - last >= 0`).
+
+### emit_notification_signal
+
+```
+async fn emit_notification_signal(
+    settings, project_slug, agent_name, message_metadata
+) -> bool
+```
+
+**Flow**:
+1. If `!settings.notifications.enabled` → return `false`
+2. Debounce check: if `now_ms - last_signal_ms < debounce_ms` → return `false`
+3. Update debounce state: `debounce[(project, agent)] = now_ms`
+4. Build signal JSON payload (see above)
+5. Create parent directories (`mkdir -p`)
+6. Write signal file atomically (overwrite existing)
+7. Return `true` on success, `false` on any exception (best-effort)
+
+### clear_notification_signal
+
+```
+async fn clear_notification_signal(
+    settings, project_slug, agent_name
+) -> bool
+```
+
+**Flow**:
+1. If `!settings.notifications.enabled` → return `false`
+2. Compute signal path
+3. If file exists, delete it → return `true`
+4. If file doesn't exist → return `false`
+5. On any exception → return `false` (best-effort)
+
+### list_pending_signals
+
+```
+fn list_pending_signals(settings, project_slug: Option) -> Vec<dict>
+```
+
+**Flow**:
+1. If `!settings.notifications.enabled` → return `[]`
+2. If `signals_dir` doesn't exist → return `[]`
+3. If `projects/` subdir doesn't exist → return `[]`
+4. If `project_slug` provided, iterate only that project dir; otherwise iterate all project dirs
+5. For each `agents/*.signal` file:
+   - Parse JSON → append to results
+   - On parse failure → append `{"project": dir_name, "agent": stem, "error": "Failed to parse signal file"}`
+6. Return all results
+
+**Note**: This function is synchronous (not async) in the Python implementation.
+
+### Tool Wrapper Integration
+
+**send_message** (after message is stored in DB + archive):
+```
+if settings.notifications.enabled:
+    message_meta = {id, from: sender.name, subject, importance}
+    for agent in to_agents + cc_agents:    # NOT bcc
+        suppress(Exception):
+            await emit_notification_signal(settings, project.slug, agent.name, message_meta)
+```
+
+Key: BCC recipients do NOT receive signals (blind copies shouldn't trigger visible notifications).
+
+**fetch_inbox** (after successful inbox retrieval):
+```
+if settings.notifications.enabled:
+    suppress(Exception):
+        await clear_notification_signal(settings, project.slug, agent.name)
+```
+
+### Error Handling
+
+All three functions are best-effort:
+- `emit_notification_signal`: wraps file write in try/except, returns `false` on failure
+- `clear_notification_signal`: wraps file delete in try/except, returns `false` on failure
+- `list_pending_signals`: wraps individual file reads in try/except, includes error entries
+- Integration in `send_message` and `fetch_inbox`: wrapped in `suppress(Exception)`
+
+No notification failure should ever propagate up to cause a tool invocation failure.
+
+### Config Fields in Rust
+
+```rust
+pub struct NotificationSettings {
+    pub enabled: bool,              // default: false
+    pub signals_dir: String,        // default: "~/.mcp_agent_mail/signals"
+    pub include_metadata: bool,     // default: true
+    pub debounce_ms: u64,           // default: 100
+}
+```
+
+### Test Vectors
+
+See `crates/mcp-agent-mail-storage/tests/fixtures/notifications/` for:
+- `signal_payloads.json`: expected signal JSON for metadata on/off cases
+- `debounce_scenarios.json`: sequence of emissions with expected outcomes
+- `list_scenarios.json`: directory layouts with expected list results
+
+*Notifications spec added by CoralBadger | 2026-02-05*

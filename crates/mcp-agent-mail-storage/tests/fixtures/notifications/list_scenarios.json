@@ -1,0 +1,132 @@
+{
+  "_doc": "list_pending_signals scenarios. Each scenario describes a directory layout and expected results. The function is SYNCHRONOUS.",
+  "vectors": [
+    {
+      "desc": "Empty signals dir: no projects subdir",
+      "layout": {},
+      "filter_project": null,
+      "expected_count": 0
+    },
+    {
+      "desc": "Single project, single agent",
+      "layout": {
+        "projects/proj1/agents/Agent1.signal": {
+          "project": "proj1",
+          "agent": "Agent1",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        }
+      },
+      "filter_project": null,
+      "expected_count": 1,
+      "expected_agents": ["Agent1"]
+    },
+    {
+      "desc": "Multiple projects, multiple agents",
+      "layout": {
+        "projects/proj1/agents/Agent1.signal": {
+          "project": "proj1",
+          "agent": "Agent1",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        },
+        "projects/proj1/agents/Agent2.signal": {
+          "project": "proj1",
+          "agent": "Agent2",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        },
+        "projects/proj2/agents/Agent3.signal": {
+          "project": "proj2",
+          "agent": "Agent3",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        }
+      },
+      "filter_project": null,
+      "expected_count": 3
+    },
+    {
+      "desc": "Filter by project slug",
+      "layout": {
+        "projects/proj1/agents/Agent1.signal": {
+          "project": "proj1",
+          "agent": "Agent1",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        },
+        "projects/proj1/agents/Agent2.signal": {
+          "project": "proj1",
+          "agent": "Agent2",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        },
+        "projects/proj2/agents/Agent3.signal": {
+          "project": "proj2",
+          "agent": "Agent3",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        }
+      },
+      "filter_project": "proj1",
+      "expected_count": 2,
+      "expected_projects": ["proj1", "proj1"]
+    },
+    {
+      "desc": "Filter by nonexistent project returns empty",
+      "layout": {
+        "projects/proj1/agents/Agent1.signal": {
+          "project": "proj1",
+          "agent": "Agent1",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        }
+      },
+      "filter_project": "nonexistent",
+      "expected_count": 0
+    },
+    {
+      "desc": "Corrupted signal file: includes error entry",
+      "layout": {
+        "projects/proj1/agents/Good.signal": {
+          "project": "proj1",
+          "agent": "Good",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        },
+        "projects/proj1/agents/Bad.signal": "NOT VALID JSON {{{",
+        "_note": "Bad.signal contains invalid JSON"
+      },
+      "filter_project": null,
+      "expected_count": 2,
+      "expected_error_entry": {
+        "project": "proj1",
+        "agent": "Bad",
+        "error": "Failed to parse signal file"
+      }
+    },
+    {
+      "desc": "Notifications disabled: always returns empty",
+      "notifications_enabled": false,
+      "layout": {
+        "projects/proj1/agents/Agent1.signal": {
+          "project": "proj1",
+          "agent": "Agent1",
+          "timestamp": "2024-01-01T00:00:00+00:00"
+        }
+      },
+      "filter_project": null,
+      "expected_count": 0
+    },
+    {
+      "desc": "Signal with full metadata",
+      "layout": {
+        "projects/proj1/agents/Agent1.signal": {
+          "project": "proj1",
+          "agent": "Agent1",
+          "timestamp": "2024-01-01T00:00:00+00:00",
+          "message": {
+            "id": 42,
+            "from": "Sender",
+            "subject": "Test msg",
+            "importance": "urgent"
+          }
+        }
+      },
+      "filter_project": null,
+      "expected_count": 1,
+      "expected_has_message": true
+    }
+  ]
+}

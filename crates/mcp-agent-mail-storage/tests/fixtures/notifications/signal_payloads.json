@@ -1,0 +1,108 @@
+{
+  "_doc": "Expected signal file JSON payloads for various configurations. 'timestamp' is placeholder - actual value is ISO-8601 UTC. Fields in 'message' come from message_metadata dict with defaults.",
+  "vectors": [
+    {
+      "desc": "Full metadata: all fields present",
+      "include_metadata": true,
+      "project_slug": "test_project",
+      "agent_name": "TestAgent",
+      "message_metadata": {
+        "id": 123,
+        "from": "SenderAgent",
+        "subject": "Hello World",
+        "importance": "high"
+      },
+      "expected": {
+        "timestamp": "TIMESTAMP",
+        "project": "test_project",
+        "agent": "TestAgent",
+        "message": {
+          "id": 123,
+          "from": "SenderAgent",
+          "subject": "Hello World",
+          "importance": "high"
+        }
+      }
+    },
+    {
+      "desc": "Metadata enabled but importance missing (defaults to 'normal')",
+      "include_metadata": true,
+      "project_slug": "proj1",
+      "agent_name": "Agent1",
+      "message_metadata": {
+        "id": 456,
+        "from": "Sender2",
+        "subject": "No importance field"
+      },
+      "expected": {
+        "timestamp": "TIMESTAMP",
+        "project": "proj1",
+        "agent": "Agent1",
+        "message": {
+          "id": 456,
+          "from": "Sender2",
+          "subject": "No importance field",
+          "importance": "normal"
+        }
+      }
+    },
+    {
+      "desc": "Metadata enabled but sparse metadata dict (missing from, subject)",
+      "include_metadata": true,
+      "project_slug": "proj1",
+      "agent_name": "Agent2",
+      "message_metadata": {
+        "id": 789
+      },
+      "expected": {
+        "timestamp": "TIMESTAMP",
+        "project": "proj1",
+        "agent": "Agent2",
+        "message": {
+          "id": 789,
+          "from": null,
+          "subject": null,
+          "importance": "normal"
+        }
+      }
+    },
+    {
+      "desc": "Metadata disabled: no message field even with metadata provided",
+      "include_metadata": false,
+      "project_slug": "test_project",
+      "agent_name": "TestAgent",
+      "message_metadata": {
+        "id": 123,
+        "from": "Sender",
+        "subject": "Hello",
+        "importance": "high"
+      },
+      "expected": {
+        "timestamp": "TIMESTAMP",
+        "project": "test_project",
+        "agent": "TestAgent"
+      }
+    },
+    {
+      "desc": "Metadata enabled but no metadata dict provided (null)",
+      "include_metadata": true,
+      "project_slug": "test_project",
+      "agent_name": "TestAgent",
+      "message_metadata": null,
+      "expected": {
+        "timestamp": "TIMESTAMP",
+        "project": "test_project",
+        "agent": "TestAgent"
+      }
+    },
+    {
+      "desc": "Metadata enabled with empty metadata dict",
+      "include_metadata": true,
+      "project_slug": "proj1",
+      "agent_name": "Agent1",
+      "message_metadata": {},
+      "expected_has_message_key": false,
+      "_note": "Python: 'if settings.notifications.include_metadata and message_metadata' - empty dict is falsy, so no message key"
+    }
+  ]
+}

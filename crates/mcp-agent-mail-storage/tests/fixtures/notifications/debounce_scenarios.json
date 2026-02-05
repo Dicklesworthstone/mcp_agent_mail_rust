@@ -1,0 +1,69 @@
+{
+  "_doc": "Debounce scenario sequences. Each scenario has a debounce_ms setting and a sequence of (project, agent, time_offset_ms) emissions with expected results. Time offsets are relative to scenario start.",
+  "vectors": [
+    {
+      "desc": "No debounce (debounce_ms=0): all emissions pass",
+      "debounce_ms": 0,
+      "emissions": [
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 0, "expected": true},
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 1, "expected": true},
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 2, "expected": true}
+      ]
+    },
+    {
+      "desc": "Within debounce window: second emission blocked",
+      "debounce_ms": 10000,
+      "emissions": [
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 0, "expected": true},
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 500, "expected": false},
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 5000, "expected": false}
+      ]
+    },
+    {
+      "desc": "After debounce window: emission succeeds again",
+      "debounce_ms": 100,
+      "emissions": [
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 0, "expected": true},
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 50, "expected": false},
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 150, "expected": true}
+      ]
+    },
+    {
+      "desc": "Different agents debounce independently",
+      "debounce_ms": 10000,
+      "emissions": [
+        {"project": "proj", "agent": "Agent1", "time_offset_ms": 0, "expected": true},
+        {"project": "proj", "agent": "Agent1", "time_offset_ms": 100, "expected": false},
+        {"project": "proj", "agent": "Agent2", "time_offset_ms": 100, "expected": true},
+        {"project": "proj", "agent": "Agent2", "time_offset_ms": 200, "expected": false}
+      ]
+    },
+    {
+      "desc": "Different projects debounce independently",
+      "debounce_ms": 10000,
+      "emissions": [
+        {"project": "proj1", "agent": "Agent", "time_offset_ms": 0, "expected": true},
+        {"project": "proj1", "agent": "Agent", "time_offset_ms": 100, "expected": false},
+        {"project": "proj2", "agent": "Agent", "time_offset_ms": 100, "expected": true},
+        {"project": "proj2", "agent": "Agent", "time_offset_ms": 200, "expected": false}
+      ]
+    },
+    {
+      "desc": "Exact boundary: offset == debounce_ms passes (check is strictly less-than)",
+      "debounce_ms": 100,
+      "emissions": [
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 0, "expected": true},
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 99, "expected": false},
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 100, "expected": true}
+      ]
+    },
+    {
+      "desc": "Disabled notifications: all emissions return false regardless",
+      "debounce_ms": 0,
+      "notifications_enabled": false,
+      "emissions": [
+        {"project": "proj", "agent": "Agent", "time_offset_ms": 0, "expected": false}
+      ]
+    }
+  ]
+}
