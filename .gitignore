@@ -12,5 +12,8 @@ _tmp_storage_root/
 # Misc build output
 a.out
 
+# E2E test artifacts (generated per-run)
+tests/artifacts/
+
 # bv (beads viewer) local config and caches
 .bv/
