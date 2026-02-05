@@ -663,6 +663,18 @@ fn handle_serve_http(
     port: Option<u16>,
     path: Option<String>,
 ) -> CliResult<()> {
+    let config = build_http_config(host, port, path);
+    mcp_agent_mail_server::run_http(&config)?;
+    Ok(())
+}
+
+fn handle_serve_stdio() -> CliResult<()> {
+    let config = Config::from_env();
+    mcp_agent_mail_server::run_stdio(&config);
+    Ok(())
+}
+
+fn build_http_config(host: Option<String>, port: Option<u16>, path: Option<String>) -> Config {
     let mut config = Config::from_env();
     if let Some(host) = host {
         config.http_host = host;
@@ -673,14 +685,7 @@ fn handle_serve_http(
     if let Some(path) = path {
         config.http_path = path;
     }
-    mcp_agent_mail_server::run_http(&config)?;
-    Ok(())
-}
-
-fn handle_serve_stdio() -> CliResult<()> {
-    let config = Config::from_env();
-    mcp_agent_mail_server::run_stdio(&config);
-    Ok(())
+    config
 }
 
 fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
@@ -761,6 +766,46 @@ fn handle_amctl(action: AmctlCommand) -> CliResult<()> {
             ftui_runtime::ftui_println!("CACHE_KEY={cache_key}");
             ftui_runtime::ftui_println!("ARTIFACT_DIR={}", artifact_dir.display());
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_http_overrides_are_applied() {
+        let config = build_http_config(
+            Some("0.0.0.0".to_string()),
+            Some(9000),
+            Some("/api/v2/".to_string()),
+        );
+        assert_eq!(config.http_host, "0.0.0.0");
+        assert_eq!(config.http_port, 9000);
+        assert_eq!(config.http_path, "/api/v2/");
+    }
+
+    #[test]
+    fn clap_parses_serve_http_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "serve-http",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9999",
+            "--path",
+            "/api/x/",
+        ])
+        .expect("failed to parse serve-http flags");
+        match cli.command {
+            Commands::ServeHttp { host, port, path } => {
+                assert_eq!(host.as_deref(), Some("0.0.0.0"));
+                assert_eq!(port, Some(9999));
+                assert_eq!(path.as_deref(), Some("/api/x/"));
+            }
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 }
