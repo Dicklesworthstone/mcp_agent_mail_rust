@@ -351,6 +351,10 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
     let exe = validate_encoder(&encoder_parts).map_err(EncoderError::Validation)?;
 
     let mut cmd = Command::new(&exe);
+    // Pass any extra args from config (e.g. TOON_BIN="tru --experimental")
+    if encoder_parts.len() > 1 {
+        cmd.args(&encoder_parts[1..]);
+    }
     cmd.arg("--encode");
     if config.toon_stats_enabled {
         cmd.arg("--stats");
@@ -410,6 +414,7 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
 }
 
 /// Successful encoder result.
+#[derive(Debug)]
 pub struct EncoderSuccess {
     pub encoded: String,
     pub encoder: String,
@@ -418,6 +423,7 @@ pub struct EncoderSuccess {
 }
 
 /// Encoder error variants.
+#[derive(Debug)]
 pub enum EncoderError {
     /// Encoder binary validation failed (not `toon_rust`).
     Validation(String),
@@ -1010,5 +1016,169 @@ mod tests {
         assert!(parsed["meta"].get("toon_stats").is_none());
         assert!(parsed["meta"].get("toon_stats_raw").is_none());
         assert!(parsed["meta"]["toon_error"].is_string());
+    }
+
+    // -- validate_encoder direct tests --
+
+    #[test]
+    fn validate_encoder_empty_command_rejected() {
+        let parts: Vec<String> = vec![];
+        assert!(validate_encoder(&parts).is_err());
+    }
+
+    #[test]
+    fn validate_encoder_nonexistent_path() {
+        let parts = vec!["/nonexistent/tru_binary".to_string()];
+        let err = validate_encoder(&parts).unwrap_err();
+        // Nonexistent binary: either "not found" or "does not look like toon_rust"
+        // depending on how the OS reports the error to looks_like_toon_rust_encoder
+        assert!(
+            err.contains("not found") || err.contains("not look like"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -- looks_like_toon_rust_encoder basename rejection --
+
+    #[test]
+    fn basename_toon_rejected() {
+        // "toon" basename should be rejected regardless of path
+        let result = looks_like_toon_rust_encoder("toon");
+        match result {
+            Ok(false) => {}
+            Ok(true) => panic!("should reject 'toon' basename"),
+            Err(_) => {} // not found is also acceptable
+        }
+    }
+
+    #[test]
+    fn basename_toon_exe_rejected() {
+        let result = looks_like_toon_rust_encoder("toon.exe");
+        match result {
+            Ok(false) => {}
+            Ok(true) => panic!("should reject 'toon.exe' basename"),
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn basename_toon_in_path_rejected() {
+        let result = looks_like_toon_rust_encoder("/usr/local/bin/toon");
+        match result {
+            Ok(false) => {}
+            Ok(true) => panic!("should reject '/usr/local/bin/toon'"),
+            Err(_) => {}
+        }
+    }
+
+    // -- EncoderError variants --
+
+    #[test]
+    fn encoder_error_not_found_message() {
+        let err = EncoderError::NotFound("TOON encoder not found: No such file".to_string());
+        assert!(err.to_error_string().contains("not found"));
+        assert!(err.stderr().is_none());
+    }
+
+    #[test]
+    fn encoder_error_os_error_message() {
+        let err = EncoderError::OsError("TOON encoder failed: permission denied".to_string());
+        assert!(err.to_error_string().contains("permission denied"));
+        assert!(err.stderr().is_none());
+    }
+
+    // -- parse_toon_stats edge cases --
+
+    #[test]
+    fn parse_stats_large_numbers() {
+        let stderr = "Token estimates: ~100000 (JSON) -> ~35000 (TOON)\nSaved ~65000 tokens (-65.0%)\n";
+        let stats = parse_toon_stats(stderr).unwrap();
+        assert_eq!(stats.json_tokens, 100_000);
+        assert_eq!(stats.toon_tokens, 35_000);
+        assert_eq!(stats.saved_tokens, Some(65_000));
+    }
+
+    #[test]
+    fn parse_stats_single_digit() {
+        let stderr = "Token estimates: ~1 (JSON) -> ~1 (TOON)\nSaved ~0 tokens (0.0%)\n";
+        let stats = parse_toon_stats(stderr).unwrap();
+        assert_eq!(stats.json_tokens, 1);
+        assert_eq!(stats.toon_tokens, 1);
+        assert_eq!(stats.saved_tokens, Some(0));
+    }
+
+    // -- resolve_output_format with config default --
+
+    #[test]
+    fn resolve_default_config_toon() {
+        let config = Config {
+            output_format_default: Some("toon".to_string()),
+            ..test_config()
+        };
+        let d = resolve_output_format(None, &config).unwrap();
+        assert_eq!(d.resolved, "toon");
+        assert_eq!(d.source, "default");
+        assert_eq!(d.requested, Some("toon".to_string()));
+    }
+
+    #[test]
+    fn resolve_explicit_overrides_default() {
+        let config = Config {
+            output_format_default: Some("toon".to_string()),
+            ..test_config()
+        };
+        // Explicit "json" should override default "toon"
+        let d = resolve_output_format(Some("json"), &config).unwrap();
+        assert_eq!(d.resolved, "json");
+        assert_eq!(d.source, "param");
+    }
+
+    #[test]
+    fn resolve_default_mime_alias() {
+        let config = Config {
+            output_format_default: Some("application/toon".to_string()),
+            ..test_config()
+        };
+        let d = resolve_output_format(None, &config).unwrap();
+        assert_eq!(d.resolved, "toon");
+        assert_eq!(d.source, "default");
+    }
+
+    #[test]
+    fn resolve_default_invalid_rejected() {
+        let config = Config {
+            output_format_default: Some("yaml".to_string()),
+            ..test_config()
+        };
+        let err = resolve_output_format(None, &config).unwrap_err();
+        assert!(err.contains("Invalid format"));
+    }
+
+    // -- ToonEnvelope JSON contract --
+
+    #[test]
+    fn envelope_with_all_fields_serializes() {
+        let envelope = ToonEnvelope {
+            format: "json".to_string(),
+            data: serde_json::json!({"id": 1}),
+            meta: ToonMeta {
+                requested: Some("toon".to_string()),
+                source: "param".to_string(),
+                encoder: None,
+                toon_error: Some("encoder failed".to_string()),
+                toon_stderr: Some("error: bad input".to_string()),
+                toon_stats: None,
+                toon_stats_raw: Some("raw stderr content".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // All non-None fields should be present
+        assert!(parsed["meta"]["toon_error"].is_string());
+        assert!(parsed["meta"]["toon_stderr"].is_string());
+        assert!(parsed["meta"]["toon_stats_raw"].is_string());
+        // None fields should be absent
+        assert!(parsed["meta"].get("encoder").is_none());
+        assert!(parsed["meta"].get("toon_stats").is_none());
     }
 }
