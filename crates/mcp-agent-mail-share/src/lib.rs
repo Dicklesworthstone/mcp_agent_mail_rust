@@ -1,5 +1,30 @@
 #![forbid(unsafe_code)]
 
+pub mod bundle;
+pub mod crypto;
+pub mod finalize;
+pub mod hosting;
+pub mod scope;
+pub mod scrub;
+pub mod snapshot;
+
+pub use bundle::{
+    AttachmentConfig, AttachmentItem, AttachmentManifest, AttachmentStats, ChunkManifest,
+    bundle_attachments, maybe_chunk_database, package_directory_as_zip, write_bundle_scaffolding,
+};
+pub use crypto::{
+    ManifestSignature, VerifyResult, decrypt_with_age, encrypt_with_age, sign_manifest,
+    verify_bundle as verify_bundle_crypto,
+};
+pub use finalize::{
+    FinalizeResult, build_materialized_views, build_search_indexes, create_performance_indexes,
+    finalize_export_db, finalize_snapshot_for_export,
+};
+pub use hosting::{HostingHint, detect_hosting_hints, generate_headers_file};
+pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
+pub use scrub::{ScrubSummary, scrub_snapshot};
+pub use snapshot::{SnapshotContext, create_snapshot_context, create_sqlite_snapshot};
+
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -53,6 +78,16 @@ pub enum ShareError {
     ManifestNotFound { path: String },
     #[error("failed to parse manifest.json: {message}")]
     ManifestParse { message: String },
+    #[error("snapshot source not found: {path}")]
+    SnapshotSourceNotFound { path: String },
+    #[error("snapshot destination already exists: {path}")]
+    SnapshotDestinationExists { path: String },
+    #[error("database has no projects")]
+    ScopeNoProjects,
+    #[error("project identifier not found: {identifier}")]
+    ScopeIdentifierNotFound { identifier: String },
+    #[error("sqlite error: {message}")]
+    Sqlite { message: String },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -139,6 +174,31 @@ pub fn default_decrypt_output(encrypted_path: &Path) -> PathBuf {
         file_name.push_str(suffix);
     }
     encrypted_path.with_file_name(file_name)
+}
+
+/// Resolve the SQLite database path from a config database URL.
+pub fn resolve_sqlite_database_path(database_url: &str) -> ShareResult<PathBuf> {
+    // Strip SQLAlchemy-style prefixes
+    let path_str = database_url
+        .strip_prefix("sqlite+aiosqlite:///")
+        .or_else(|| database_url.strip_prefix("sqlite:///"))
+        .or_else(|| database_url.strip_prefix("sqlite:"))
+        .unwrap_or(database_url);
+
+    if path_str.is_empty() {
+        return Err(ShareError::SnapshotSourceNotFound {
+            path: "empty database URL".to_string(),
+        });
+    }
+
+    let path = PathBuf::from(path_str);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(ShareError::Io)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,29 +335,4 @@ pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportC
         chunk_size,
         scrub_preset,
     })
-}
-
-// Placeholder API surfaces for future implementation.
-pub fn export_bundle() -> ShareResult<()> {
-    Err(ShareError::NotImplemented)
-}
-
-pub fn update_bundle() -> ShareResult<()> {
-    Err(ShareError::NotImplemented)
-}
-
-pub fn preview_bundle() -> ShareResult<()> {
-    Err(ShareError::NotImplemented)
-}
-
-pub fn verify_bundle() -> ShareResult<()> {
-    Err(ShareError::NotImplemented)
-}
-
-pub fn decrypt_bundle() -> ShareResult<()> {
-    Err(ShareError::NotImplemented)
-}
-
-pub fn launch_wizard() -> ShareResult<()> {
-    Err(ShareError::NotImplemented)
 }

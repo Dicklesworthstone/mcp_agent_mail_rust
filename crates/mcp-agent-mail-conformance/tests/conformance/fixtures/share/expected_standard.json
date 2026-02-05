@@ -1,0 +1,63 @@
+{
+  "agent_links_remaining": 0,
+  "db_sha256_after_finalize": "b8d68c6a1c9591f0235cfdaf96f4558a440c528af0aabcc06e4f0dc76cd04a77",
+  "file_reservations_remaining": 0,
+  "messages_after": [
+    {
+      "ack_required": 0,
+      "attachments": "[]",
+      "body_md": "Use this token: [REDACTED] for API access. Also [REDACTED]",
+      "id": 1,
+      "subject": "Deploy key: [REDACTED]"
+    },
+    {
+      "ack_required": 0,
+      "attachments": "[]",
+      "body_md": "New JWT: [REDACTED]",
+      "id": 2,
+      "subject": "Auth token refresh"
+    },
+    {
+      "ack_required": 0,
+      "attachments": "[{\"bytes\":500,\"media_type\":\"application/json\",\"path\":\"data.json\",\"type\":\"file\"}]",
+      "body_md": "Slack token: [REDACTED] and PAT: [REDACTED]",
+      "id": 3,
+      "subject": "Credentials for staging"
+    }
+  ],
+  "preset": "standard",
+  "recipients_after": [
+    {
+      "ack_ts": null,
+      "agent_id": 1,
+      "message_id": 1,
+      "read_ts": null
+    },
+    {
+      "ack_ts": null,
+      "agent_id": 1,
+      "message_id": 2,
+      "read_ts": null
+    },
+    {
+      "ack_ts": null,
+      "agent_id": 2,
+      "message_id": 3,
+      "read_ts": null
+    }
+  ],
+  "summary": {
+    "ack_flags_cleared": 3,
+    "agent_links_removed": 1,
+    "agents_pseudonymized": 0,
+    "agents_total": 2,
+    "attachments_cleared": 0,
+    "attachments_sanitized": 1,
+    "bodies_redacted": 0,
+    "file_reservations_removed": 1,
+    "preset": "standard",
+    "pseudonym_salt": "standard",
+    "recipients_cleared": 3,
+    "secrets_replaced": 6
+  }
+}

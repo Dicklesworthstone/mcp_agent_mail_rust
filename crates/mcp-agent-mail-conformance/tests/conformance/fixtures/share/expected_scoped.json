@@ -1,0 +1,22 @@
+{
+  "identifiers": [
+    "proj-alpha"
+  ],
+  "projects": [
+    {
+      "human_key": "/data/projects/alpha",
+      "id": 1,
+      "slug": "proj-alpha"
+    }
+  ],
+  "remaining": {
+    "agent_links": 0,
+    "agents": 1,
+    "file_reservations": 1,
+    "messages": 2,
+    "project_sibling_suggestions": 0,
+    "projects": 1,
+    "recipients": 2
+  },
+  "removed_count": 1
+}

@@ -1,0 +1,63 @@
+{
+  "agent_links_remaining": 0,
+  "db_sha256_after_finalize": "be5d406e9a0e8e2811bbe3d564bf3badeca94c6c4121cd538a88205624a5a062",
+  "file_reservations_remaining": 0,
+  "messages_after": [
+    {
+      "ack_required": 0,
+      "attachments": "[]",
+      "body_md": "[Message body redacted]",
+      "id": 1,
+      "subject": "Deploy key: [REDACTED]"
+    },
+    {
+      "ack_required": 0,
+      "attachments": "[]",
+      "body_md": "[Message body redacted]",
+      "id": 2,
+      "subject": "Auth token refresh"
+    },
+    {
+      "ack_required": 0,
+      "attachments": "[]",
+      "body_md": "[Message body redacted]",
+      "id": 3,
+      "subject": "Credentials for staging"
+    }
+  ],
+  "preset": "strict",
+  "recipients_after": [
+    {
+      "ack_ts": null,
+      "agent_id": 1,
+      "message_id": 1,
+      "read_ts": null
+    },
+    {
+      "ack_ts": null,
+      "agent_id": 1,
+      "message_id": 2,
+      "read_ts": null
+    },
+    {
+      "ack_ts": null,
+      "agent_id": 2,
+      "message_id": 3,
+      "read_ts": null
+    }
+  ],
+  "summary": {
+    "ack_flags_cleared": 3,
+    "agent_links_removed": 1,
+    "agents_pseudonymized": 0,
+    "agents_total": 2,
+    "attachments_cleared": 1,
+    "attachments_sanitized": 1,
+    "bodies_redacted": 3,
+    "file_reservations_removed": 1,
+    "preset": "strict",
+    "pseudonym_salt": "strict",
+    "recipients_cleared": 3,
+    "secrets_replaced": 6
+  }
+}

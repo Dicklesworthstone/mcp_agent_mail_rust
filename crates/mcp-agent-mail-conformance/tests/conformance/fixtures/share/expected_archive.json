@@ -1,0 +1,63 @@
+{
+  "agent_links_remaining": 1,
+  "db_sha256_after_finalize": "5f72edde5a6693435102e9a96c744973626bcd46f74fbea6cedd0f15bd67499f",
+  "file_reservations_remaining": 1,
+  "messages_after": [
+    {
+      "ack_required": 1,
+      "attachments": "[]",
+      "body_md": "Use this token: sk-abcdef0123456789012345 for API access. Also bearer MyToken1234567890123456.",
+      "id": 1,
+      "subject": "Deploy key: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"
+    },
+    {
+      "ack_required": 0,
+      "attachments": "[]",
+      "body_md": "New JWT: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+      "id": 2,
+      "subject": "Auth token refresh"
+    },
+    {
+      "ack_required": 1,
+      "attachments": "[{\"type\": \"file\", \"path\": \"data.json\", \"media_type\": \"application/json\", \"bytes\": 500, \"download_url\": \"https://secret.example.com/file\", \"signed_url\": \"https://storage.example.com/signed?token=abc\", \"authorization\": \"Bearer xoxb-1234567890-abcdefghij\", \"bearer_token\": \"ghp_AAAAABBBBCCCCDDDDEEEEFFFFFGGGG12345\"}]",
+      "body_md": "Slack token: xoxb-1234567890-abcdefghij and PAT: github_pat_abcdefghijklmnopqrstuvwxyz",
+      "id": 3,
+      "subject": "Credentials for staging"
+    }
+  ],
+  "preset": "archive",
+  "recipients_after": [
+    {
+      "ack_ts": "2026-01-15T12:00:00+00:00",
+      "agent_id": 1,
+      "message_id": 1,
+      "read_ts": "2026-01-15T12:00:00+00:00"
+    },
+    {
+      "ack_ts": null,
+      "agent_id": 1,
+      "message_id": 2,
+      "read_ts": "2026-01-15T12:00:00+00:00"
+    },
+    {
+      "ack_ts": null,
+      "agent_id": 2,
+      "message_id": 3,
+      "read_ts": null
+    }
+  ],
+  "summary": {
+    "ack_flags_cleared": 0,
+    "agent_links_removed": 0,
+    "agents_pseudonymized": 0,
+    "agents_total": 2,
+    "attachments_cleared": 0,
+    "attachments_sanitized": 0,
+    "bodies_redacted": 0,
+    "file_reservations_removed": 0,
+    "preset": "archive",
+    "pseudonym_salt": "archive",
+    "recipients_cleared": 0,
+    "secrets_replaced": 0
+  }
+}
