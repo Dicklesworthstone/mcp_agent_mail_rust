@@ -1,0 +1,220 @@
+{
+  "_doc": "Sequence of (sql, duration_ms) queries -> expected to_dict() output. Tests QueryTracker.record() accumulation and to_dict() formatting (sorting, rounding, slow query capture).",
+  "vectors": [
+    {
+      "desc": "Single fast query",
+      "slow_query_ms": 250.0,
+      "queries": [
+        {"sql": "SELECT * FROM messages WHERE id=1", "duration_ms": 5.123}
+      ],
+      "expected": {
+        "total": 1,
+        "total_time_ms": 5.12,
+        "per_table": {"messages": 1},
+        "slow_query_ms": 250.0,
+        "slow_queries": []
+      }
+    },
+    {
+      "desc": "Multiple queries across tables with sorting",
+      "slow_query_ms": 250.0,
+      "queries": [
+        {"sql": "SELECT * FROM agents WHERE name=?", "duration_ms": 3.0},
+        {"sql": "SELECT * FROM messages WHERE agent_id=?", "duration_ms": 4.0},
+        {"sql": "INSERT INTO messages (body) VALUES (?)", "duration_ms": 6.0},
+        {"sql": "SELECT * FROM agents WHERE id=?", "duration_ms": 2.0},
+        {"sql": "SELECT * FROM messages WHERE thread_id=?", "duration_ms": 5.0},
+        {"sql": "UPDATE projects SET last_active=?", "duration_ms": 3.0}
+      ],
+      "expected": {
+        "total": 6,
+        "total_time_ms": 23.0,
+        "per_table": {"messages": 3, "agents": 2, "projects": 1},
+        "slow_query_ms": 250.0,
+        "slow_queries": []
+      }
+    },
+    {
+      "desc": "Slow queries captured",
+      "slow_query_ms": 100.0,
+      "queries": [
+        {"sql": "SELECT * FROM messages WHERE body LIKE ?", "duration_ms": 150.456},
+        {"sql": "SELECT * FROM agents WHERE name=?", "duration_ms": 5.0},
+        {"sql": "UPDATE messages SET read_ts=?", "duration_ms": 280.123}
+      ],
+      "expected": {
+        "total": 3,
+        "total_time_ms": 435.58,
+        "per_table": {"messages": 2, "agents": 1},
+        "slow_query_ms": 100.0,
+        "slow_queries": [
+          {"table": "messages", "duration_ms": 150.46},
+          {"table": "messages", "duration_ms": 280.12}
+        ]
+      }
+    },
+    {
+      "desc": "Slow query threshold exactly at boundary (>=)",
+      "slow_query_ms": 100.0,
+      "queries": [
+        {"sql": "SELECT * FROM messages WHERE id=1", "duration_ms": 100.0},
+        {"sql": "SELECT * FROM agents WHERE id=1", "duration_ms": 99.999}
+      ],
+      "expected": {
+        "total": 2,
+        "total_time_ms": 200.0,
+        "per_table": {"agents": 1, "messages": 1},
+        "slow_query_ms": 100.0,
+        "slow_queries": [
+          {"table": "messages", "duration_ms": 100.0}
+        ]
+      }
+    },
+    {
+      "desc": "No slow query tracking when threshold is null",
+      "slow_query_ms": null,
+      "queries": [
+        {"sql": "SELECT * FROM messages WHERE id=1", "duration_ms": 5000.0}
+      ],
+      "expected": {
+        "total": 1,
+        "total_time_ms": 5000.0,
+        "per_table": {"messages": 1},
+        "slow_query_ms": null,
+        "slow_queries": []
+      }
+    },
+    {
+      "desc": "Empty tracker",
+      "slow_query_ms": 250.0,
+      "queries": [],
+      "expected": {
+        "total": 0,
+        "total_time_ms": 0.0,
+        "per_table": {},
+        "slow_query_ms": 250.0,
+        "slow_queries": []
+      }
+    },
+    {
+      "desc": "Unextractable table in slow query records null table",
+      "slow_query_ms": 10.0,
+      "queries": [
+        {"sql": "PRAGMA journal_mode=WAL", "duration_ms": 50.0}
+      ],
+      "expected": {
+        "total": 1,
+        "total_time_ms": 50.0,
+        "per_table": {},
+        "slow_query_ms": 10.0,
+        "slow_queries": [
+          {"table": null, "duration_ms": 50.0}
+        ]
+      }
+    },
+    {
+      "desc": "per_table sorting: tiebreak by name ascending",
+      "slow_query_ms": 250.0,
+      "queries": [
+        {"sql": "SELECT * FROM zebra WHERE id=1", "duration_ms": 1.0},
+        {"sql": "SELECT * FROM alpha WHERE id=1", "duration_ms": 1.0},
+        {"sql": "SELECT * FROM middle WHERE id=1", "duration_ms": 1.0}
+      ],
+      "expected": {
+        "total": 3,
+        "total_time_ms": 3.0,
+        "per_table": {"alpha": 1, "middle": 1, "zebra": 1},
+        "slow_query_ms": 250.0,
+        "slow_queries": []
+      }
+    },
+    {
+      "desc": "per_table sorting: count descending then name ascending",
+      "slow_query_ms": 250.0,
+      "queries": [
+        {"sql": "SELECT * FROM agents WHERE id=1", "duration_ms": 1.0},
+        {"sql": "SELECT * FROM messages WHERE id=1", "duration_ms": 1.0},
+        {"sql": "SELECT * FROM messages WHERE id=2", "duration_ms": 1.0},
+        {"sql": "SELECT * FROM agents WHERE id=2", "duration_ms": 1.0},
+        {"sql": "SELECT * FROM projects WHERE id=1", "duration_ms": 1.0},
+        {"sql": "SELECT * FROM messages WHERE id=3", "duration_ms": 1.0}
+      ],
+      "expected": {
+        "total": 6,
+        "total_time_ms": 6.0,
+        "per_table": {"messages": 3, "agents": 2, "projects": 1},
+        "slow_query_ms": 250.0,
+        "slow_queries": []
+      }
+    },
+    {
+      "desc": "Rounding: total_time_ms rounds to 2 decimal places",
+      "slow_query_ms": 250.0,
+      "queries": [
+        {"sql": "SELECT * FROM messages WHERE id=1", "duration_ms": 1.111},
+        {"sql": "SELECT * FROM messages WHERE id=2", "duration_ms": 2.222},
+        {"sql": "SELECT * FROM messages WHERE id=3", "duration_ms": 3.333}
+      ],
+      "expected": {
+        "total": 3,
+        "total_time_ms": 6.67,
+        "per_table": {"messages": 3},
+        "slow_query_ms": 250.0,
+        "slow_queries": []
+      }
+    },
+    {
+      "desc": "Rounding: slow query duration_ms rounds to 2 decimal places",
+      "slow_query_ms": 50.0,
+      "queries": [
+        {"sql": "SELECT * FROM messages WHERE body LIKE ?", "duration_ms": 123.456789}
+      ],
+      "expected": {
+        "total": 1,
+        "total_time_ms": 123.46,
+        "per_table": {"messages": 1},
+        "slow_query_ms": 50.0,
+        "slow_queries": [
+          {"table": "messages", "duration_ms": 123.46}
+        ]
+      }
+    },
+    {
+      "desc": "INSERT INTO priority over FROM",
+      "slow_query_ms": 250.0,
+      "queries": [
+        {"sql": "INSERT INTO inbox SELECT * FROM outbox", "duration_ms": 10.0}
+      ],
+      "expected": {
+        "total": 1,
+        "total_time_ms": 10.0,
+        "per_table": {"inbox": 1},
+        "slow_query_ms": 250.0,
+        "slow_queries": []
+      }
+    },
+    {
+      "desc": "High volume: many queries same table",
+      "slow_query_ms": 250.0,
+      "queries": [
+        {"sql": "SELECT * FROM messages WHERE id=1", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=2", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=3", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=4", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=5", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=6", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=7", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=8", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=9", "duration_ms": 0.5},
+        {"sql": "SELECT * FROM messages WHERE id=10", "duration_ms": 0.5}
+      ],
+      "expected": {
+        "total": 10,
+        "total_time_ms": 5.0,
+        "per_table": {"messages": 10},
+        "slow_query_ms": 250.0,
+        "slow_queries": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,145 @@
+{
+  "_doc": "SQL statement -> expected table name extraction. Patterns tried in order: INSERT INTO, UPDATE, FROM. After match: strip whitespace, take last segment after '.', strip quote chars (`\"[]).",
+  "vectors": [
+    {
+      "desc": "Simple SELECT FROM",
+      "sql": "SELECT * FROM messages WHERE id=1",
+      "expected": "messages"
+    },
+    {
+      "desc": "Schema-qualified INSERT INTO with double quotes",
+      "sql": "INSERT INTO \"public\".\"agents\" (name) VALUES (?)",
+      "expected": "agents"
+    },
+    {
+      "desc": "Schema-qualified UPDATE with brackets",
+      "sql": "UPDATE [dbo].[projects] SET name=?",
+      "expected": "projects"
+    },
+    {
+      "desc": "No table clause returns null",
+      "sql": "SELECT 1",
+      "expected": null
+    },
+    {
+      "desc": "INSERT INTO takes priority over FROM in subquery",
+      "sql": "INSERT INTO inbox SELECT * FROM outbox WHERE id=5",
+      "expected": "inbox"
+    },
+    {
+      "desc": "UPDATE takes priority over FROM in subquery",
+      "sql": "UPDATE agents SET active=1 WHERE id IN (SELECT id FROM projects)",
+      "expected": "agents"
+    },
+    {
+      "desc": "Case insensitive FROM",
+      "sql": "select count(*) FROM Messages",
+      "expected": "Messages"
+    },
+    {
+      "desc": "Case insensitive INSERT INTO",
+      "sql": "Insert Into file_reservations (path) values (?)",
+      "expected": "file_reservations"
+    },
+    {
+      "desc": "Case insensitive UPDATE",
+      "sql": "update agent_links set status='approved'",
+      "expected": "agent_links"
+    },
+    {
+      "desc": "Backtick-quoted table",
+      "sql": "SELECT * FROM `messages` WHERE id=1",
+      "expected": "messages"
+    },
+    {
+      "desc": "Double-quoted table",
+      "sql": "SELECT * FROM \"messages\" WHERE id=1",
+      "expected": "messages"
+    },
+    {
+      "desc": "Bracket-quoted table",
+      "sql": "SELECT * FROM [messages] WHERE id=1",
+      "expected": "messages"
+    },
+    {
+      "desc": "Schema prefix with backticks",
+      "sql": "SELECT * FROM `public`.`messages`",
+      "expected": "messages"
+    },
+    {
+      "desc": "Deep schema prefix (three segments)",
+      "sql": "SELECT * FROM catalog.schema.messages",
+      "expected": "messages"
+    },
+    {
+      "desc": "Multiline SQL with FROM on second line",
+      "sql": "SELECT id, name\nFROM agents\nWHERE active=1",
+      "expected": "agents"
+    },
+    {
+      "desc": "INSERT INTO with extra whitespace",
+      "sql": "INSERT   INTO   messages  (body) VALUES (?)",
+      "expected": "messages"
+    },
+    {
+      "desc": "UPDATE with extra whitespace",
+      "sql": "UPDATE    projects   SET archived=1",
+      "expected": "projects"
+    },
+    {
+      "desc": "FROM with JOIN (first table extracted)",
+      "sql": "SELECT a.* FROM agents a JOIN projects p ON a.project_id=p.id",
+      "expected": "agents"
+    },
+    {
+      "desc": "Subquery only (FROM in subquery)",
+      "sql": "SELECT (SELECT count(*) FROM messages) AS cnt",
+      "expected": "messages"
+    },
+    {
+      "desc": "DELETE FROM (matched by FROM pattern)",
+      "sql": "DELETE FROM old_messages WHERE created_ts < ?",
+      "expected": "old_messages"
+    },
+    {
+      "desc": "PRAGMA statement returns null",
+      "sql": "PRAGMA journal_mode=WAL",
+      "expected": null
+    },
+    {
+      "desc": "CREATE TABLE returns null (no INSERT/UPDATE/FROM match)",
+      "sql": "CREATE TABLE IF NOT EXISTS new_table (id INTEGER)",
+      "expected": null
+    },
+    {
+      "desc": "Empty string returns null",
+      "sql": "",
+      "expected": null
+    },
+    {
+      "desc": "Whitespace only returns null",
+      "sql": "   ",
+      "expected": null
+    },
+    {
+      "desc": "Table with underscores",
+      "sql": "SELECT * FROM file_reservation_paths WHERE agent=?",
+      "expected": "file_reservation_paths"
+    },
+    {
+      "desc": "Mixed quotes: schema with brackets, table with double quotes",
+      "sql": "SELECT * FROM [public].\"messages\"",
+      "expected": "messages"
+    },
+    {
+      "desc": "INSERT with RETURNING clause",
+      "sql": "INSERT INTO agents (name, program) VALUES (?, ?) RETURNING id",
+      "expected": "agents"
+    },
+    {
+      "desc": "INSERT OR REPLACE (SQLite upsert)",
+      "sql": "INSERT OR REPLACE INTO agent_links (from_id, to_id) VALUES (?, ?)",
+      "expected": "agent_links"
+    }
+  ]
+}

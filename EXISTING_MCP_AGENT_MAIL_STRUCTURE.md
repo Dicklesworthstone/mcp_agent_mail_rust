@@ -1976,8 +1976,159 @@ All resource handlers pass `format_value` through `_apply_resource_output_format
 
 ---
 
+## Instrumentation / Query Tracking
+
+### Overview
+
+Optional per-tool query instrumentation that captures SQL statistics (total queries, time, per-table breakdown, slow queries) for each tool invocation. Entirely opt-in via environment variables.
+
+### Environment Variables
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `INSTRUMENTATION_ENABLED` | `"false"` | bool | Master switch for query tracking |
+| `INSTRUMENTATION_SLOW_QUERY_MS` | `"250"` | int | Threshold for slow query capture (ms) |
+| `TOOLS_LOG_ENABLED` | `"true"` | bool | Enable rich logger integration |
+
+### QueryTracker
+
+A per-invocation tracker that accumulates statistics across all SQL queries during a single tool call.
+
+#### Fields
+
+```
+QueryTracker:
+  total: int               # Total number of SQL queries executed
+  total_time_ms: float     # Sum of all query durations, rounded to 2 decimal places
+  per_table: dict[str,int] # Query count per table, sorted by (-count, name)
+  slow_query_ms: float?    # Threshold for slow queries (None if disabled)
+  slow_queries: list       # Captured slow queries (max 50)
+```
+
+#### Slow Query Capture
+
+- **Threshold**: `settings.instrumentation_slow_query_ms` (default 250ms)
+- **Limit**: 50 queries per tool invocation (`_SLOW_QUERY_LIMIT = 50`)
+- **Each slow query records**:
+  - `table`: extracted table name (or None if extraction fails)
+  - `duration_ms`: query time rounded to 2 decimal places
+
+#### `to_dict()` Output Shape
+
+```json
+{
+  "total": 12,
+  "total_time_ms": 45.67,
+  "per_table": {"messages": 5, "agents": 4, "projects": 3},
+  "slow_query_ms": 250.0,
+  "slow_queries": [
+    {"table": "messages", "duration_ms": 312.45},
+    {"table": "agents", "duration_ms": 280.10}
+  ]
+}
+```
+
+**Sorting rules for `per_table`**: sorted by count descending, then table name ascending (alphabetical tiebreaker).
+
+**Rounding rules**:
+- `total_time_ms`: `round(value, 2)` — 2 decimal places
+- `slow_queries[].duration_ms`: `round(value, 2)` — 2 decimal places
+- `total`: integer, no rounding
+- `slow_query_ms`: stored as-is (float from config), no rounding
+
+### SQL Table Name Extraction
+
+Three regex patterns tried in order (first match wins):
+
+1. **INSERT INTO**: `\binsert\s+into\s+([\w\.\"`\[\]]+)` (case-insensitive)
+2. **UPDATE**: `\bupdate\s+([\w\.\"`\[\]]+)` (case-insensitive)
+3. **FROM**: `\bfrom\s+([\w\.\"`\[\]]+)` (case-insensitive)
+
+After matching, the raw table name is cleaned:
+1. Strip leading/trailing whitespace
+2. If contains `.`, take only the last segment (strip schema prefix)
+3. Strip surrounding quote characters: `` ` `` `"` `[` `]`
+
+**Examples**:
+- `SELECT * FROM messages WHERE id=1` → `"messages"`
+- `INSERT INTO "public"."agents" (name) VALUES (?)` → `"agents"`
+- `UPDATE [dbo].[projects] SET name=?` → `"projects"`
+- `SELECT 1` → `None` (no FROM/INSERT/UPDATE clause)
+
+### Tool Wrapper Integration
+
+The query tracker is wired into the tool handler wrapper in `app.py`:
+
+**Start tracking** (before tool execution):
+```
+if no active tracker AND instrumentation_enabled:
+    create new QueryTracker(slow_ms=settings.instrumentation_slow_query_ms)
+    set as active via context variable
+```
+
+**Collect stats** (after tool execution):
+```
+if tracker exists:
+    query_stats = tracker.to_dict()
+```
+
+**Emit log** (only when stats exist AND instrumentation enabled):
+```
+logger.info("tool_query_stats", extra={
+    "tool": tool_name,          # str: tool function name
+    "project": project_value,   # str?: resolved project slug
+    "agent": agent_value,       # str?: resolved agent name
+    "queries": total,           # int: total query count
+    "query_time_ms": time_ms,   # float: total time (rounded)
+    "per_table": per_table,     # dict: sorted table breakdown
+    "slow_query_ms": threshold  # float?: slow query threshold
+})
+```
+
+**Log event name**: `"tool_query_stats"`
+
+**Cleanup** (always, in finally block):
+```
+if tracker_token exists:
+    reset context variable
+```
+
+### Rich Logger Presentation
+
+When query stats are available, the rich logger renders a panel with:
+
+1. **Table**: "DB Query Breakdown" showing top 5 tables by query count
+2. **Slow queries section**: if any slow queries, shows "Slow queries (>= Nms)" header followed by top 5 slow queries with `table: Nms` format
+
+### Interaction with DB Hooks
+
+The tracking is powered by SQLAlchemy event hooks (legacy Python uses `before_cursor_execute` / `after_cursor_execute`). In Rust:
+
+- Hook into sqlmodel_rust query execution (or wrap query calls)
+- Use `std::time::Instant` for timing (not wall-clock)
+- Context variable equivalent: thread-local or task-local storage
+- Hook installation is idempotent (global flag prevents double-install)
+
+### Config Fields in Rust
+
+```rust
+// In Config struct
+pub instrumentation_enabled: bool,        // default: false
+pub instrumentation_slow_query_ms: u64,   // default: 250
+pub tools_log_enabled: bool,              // default: true
+```
+
+### Test Vectors
+
+See `crates/mcp-agent-mail-db/tests/fixtures/instrumentation/` for:
+- `table_extraction.json`: SQL statement → expected table name
+- `tracker_aggregation.json`: sequence of queries → expected to_dict() output
+
+---
+
 *Spec extracted by FuchsiaForge | 2026-02-04*
 *Updated by IndigoCreek | 2026-02-04*
 *Share/Export spec added by CoralBadger | 2026-02-05*
 *HTTP Background Workers spec added by CoralBadger | 2026-02-05*
 *TOON Output Format spec added by CoralBadger | 2026-02-05*
+*Instrumentation spec added by CoralBadger | 2026-02-05*
