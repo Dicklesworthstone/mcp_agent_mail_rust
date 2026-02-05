@@ -1119,7 +1119,13 @@ fn subject_slug_re() -> &'static Regex {
 }
 
 fn sanitize_thread_id(thread_id: &str) -> String {
-    let raw = subject_slug_re().replace_all(thread_id, "-");
+    // Strip path traversal components before slugifying
+    let no_traversal: String = thread_id
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+    let raw = subject_slug_re().replace_all(&no_traversal, "-");
     let trimmed = raw
         .trim_matches(|c: char| c == '-' || c == '_')
         .to_lowercase();
@@ -2600,8 +2606,8 @@ mod tests {
         let inbox_dir = archive.root.join("agents/RecipientAgent/inbox/2026/01");
         assert!(inbox_dir.exists());
 
-        // Check thread digest
-        let digest = archive.root.join("messages/threads/TKT-1.md");
+        // Check thread digest (sanitize_thread_id lowercases)
+        let digest = archive.root.join("messages/threads/tkt-1.md");
         assert!(digest.exists());
     }
 

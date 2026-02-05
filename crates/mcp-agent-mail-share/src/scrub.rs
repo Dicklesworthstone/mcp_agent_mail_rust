@@ -122,178 +122,199 @@ pub fn scrub_snapshot(
             message: format!("PRAGMA foreign_keys failed: {e}"),
         })?;
 
-    // Count agents
-    let agents_total = count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM agents")?;
-
-    // Clear ack state
-    let ack_flags_cleared = if cfg.clear_ack_state {
-        exec_count(&conn, "UPDATE messages SET ack_required = 0", &[])?
-    } else {
-        0
-    };
-
-    // Clear recipient timestamps
-    let recipients_cleared = if cfg.clear_recipients {
-        exec_count(
-            &conn,
-            "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL",
-            &[],
-        )?
-    } else {
-        0
-    };
-
-    // Delete file reservations
-    let file_reservations_removed = if cfg.clear_file_reservations {
-        exec_count(&conn, "DELETE FROM file_reservations", &[])?
-    } else {
-        0
-    };
-
-    // Delete agent links
-    let agent_links_removed = if cfg.clear_agent_links {
-        if table_exists(&conn, "agent_links")? {
-            exec_count(&conn, "DELETE FROM agent_links", &[])?
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    // Iterate messages and scrub
-    let mut secrets_replaced: i64 = 0;
-    let mut attachments_sanitized: i64 = 0;
-    let mut bodies_redacted: i64 = 0;
-    let mut attachments_cleared: i64 = 0;
-
-    let message_rows = conn
-        .query_sync(
-            "SELECT id, subject, body_md, attachments FROM messages",
-            &[],
-        )
+    conn.execute_raw("BEGIN IMMEDIATE")
         .map_err(|e| ShareError::Sqlite {
-            message: format!("SELECT messages failed: {e}"),
+            message: format!("BEGIN transaction failed: {e}"),
         })?;
 
-    // Collect messages to process (avoid borrowing conn during iteration)
-    let messages: Vec<(i64, String, String, String)> = message_rows
-        .iter()
-        .map(|row| {
-            let id: i64 = row.get_named("id").unwrap_or(0);
-            let subject: String = row.get_named("subject").unwrap_or_default();
-            let body_md: String = row.get_named("body_md").unwrap_or_default();
-            let attachments: String = row.get_named("attachments").unwrap_or_default();
-            (id, subject, body_md, attachments)
-        })
-        .collect();
+    let result = (|| {
+        // Count agents
+        let agents_total = count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM agents")?;
 
-    for (msg_id, subject_original, body_original, attachments_value) in &messages {
-        let mut subject = subject_original.clone();
-        let mut body = body_original.clone();
-        let mut subj_replacements: i64 = 0;
-        let mut body_replacements: i64 = 0;
+        // Clear ack state
+        let ack_flags_cleared = if cfg.clear_ack_state {
+            exec_count(&conn, "UPDATE messages SET ack_required = 0", &[])?
+        } else {
+            0
+        };
 
-        if cfg.scrub_secrets {
-            let (s, sr) = scrub_text(&subject);
-            subject = s;
-            subj_replacements = sr;
-            let (b, br) = scrub_text(&body);
-            body = b;
-            body_replacements = br;
-        }
-        secrets_replaced += subj_replacements + body_replacements;
+        // Clear recipient timestamps
+        let recipients_cleared = if cfg.clear_recipients {
+            exec_count(
+                &conn,
+                "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL",
+                &[],
+            )?
+        } else {
+            0
+        };
 
-        // Parse attachments JSON
-        let mut attachments_data: Vec<Value> = parse_attachments_json(attachments_value);
-        let mut attachments_updated = false;
-        let mut attachment_replacements: i64 = 0;
+        // Delete file reservations
+        let file_reservations_removed = if cfg.clear_file_reservations {
+            exec_count(&conn, "DELETE FROM file_reservations", &[])?
+        } else {
+            0
+        };
 
-        // Drop attachments if preset requires it
-        if cfg.drop_attachments && !attachments_data.is_empty() {
-            attachments_data = Vec::new();
-            attachments_cleared += 1;
-            attachments_updated = true;
-        }
+        // Delete agent links
+        let agent_links_removed = if cfg.clear_agent_links {
+            if table_exists(&conn, "agent_links")? {
+                exec_count(&conn, "DELETE FROM agent_links", &[])?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
-        // Scrub secrets in attachment structure
-        if cfg.scrub_secrets && !attachments_data.is_empty() {
-            let (sanitized, rep_count, keys_removed) =
-                scrub_structure(&Value::Array(attachments_data.clone()));
-            attachment_replacements += rep_count;
-            if let Value::Array(arr) = sanitized {
-                if arr != attachments_data {
-                    attachments_data = arr;
+        // Iterate messages and scrub
+        let mut secrets_replaced: i64 = 0;
+        let mut attachments_sanitized: i64 = 0;
+        let mut bodies_redacted: i64 = 0;
+        let mut attachments_cleared: i64 = 0;
+
+        let message_rows = conn
+            .query_sync(
+                "SELECT id, subject, body_md, attachments FROM messages",
+                &[],
+            )
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("SELECT messages failed: {e}"),
+            })?;
+
+        // Collect messages to process (avoid borrowing conn during iteration)
+        let messages: Vec<(i64, String, String, String)> = message_rows
+            .iter()
+            .map(|row| {
+                let id: i64 = row.get_named("id").unwrap_or(0);
+                let subject: String = row.get_named("subject").unwrap_or_default();
+                let body_md: String = row.get_named("body_md").unwrap_or_default();
+                let attachments: String = row.get_named("attachments").unwrap_or_default();
+                (id, subject, body_md, attachments)
+            })
+            .collect();
+
+        for (msg_id, subject_original, body_original, attachments_value) in &messages {
+            let mut subject = subject_original.clone();
+            let mut body = body_original.clone();
+            let mut subj_replacements: i64 = 0;
+            let mut body_replacements: i64 = 0;
+
+            if cfg.scrub_secrets {
+                let (s, sr) = scrub_text(&subject);
+                subject = s;
+                subj_replacements = sr;
+                let (b, br) = scrub_text(&body);
+                body = b;
+                body_replacements = br;
+            }
+            secrets_replaced += subj_replacements + body_replacements;
+
+            // Parse attachments JSON
+            let mut attachments_data: Vec<Value> = parse_attachments_json(attachments_value);
+            let mut attachments_updated = false;
+            let mut attachment_replacements: i64 = 0;
+
+            // Drop attachments if preset requires it
+            if cfg.drop_attachments && !attachments_data.is_empty() {
+                attachments_data = Vec::new();
+                attachments_cleared += 1;
+                attachments_updated = true;
+            }
+
+            // Scrub secrets in attachment structure
+            if cfg.scrub_secrets && !attachments_data.is_empty() {
+                let (sanitized, rep_count, keys_removed) =
+                    scrub_structure(&Value::Array(attachments_data.clone()));
+                attachment_replacements += rep_count;
+                if let Value::Array(arr) = sanitized {
+                    if arr != attachments_data {
+                        attachments_data = arr;
+                        attachments_updated = true;
+                    }
+                }
+                if keys_removed > 0 {
                     attachments_updated = true;
                 }
             }
-            if keys_removed > 0 {
-                attachments_updated = true;
+
+            // Write back attachment changes
+            if attachments_updated {
+                let sanitized_json =
+                    serde_json::to_string(&attachments_data).unwrap_or_else(|_| "[]".to_string());
+                exec_count(
+                    &conn,
+                    "UPDATE messages SET attachments = ? WHERE id = ?",
+                    &[SqlValue::Text(sanitized_json), SqlValue::BigInt(*msg_id)],
+                )?;
             }
-        }
 
-        // Write back attachment changes
-        if attachments_updated {
-            let sanitized_json =
-                serde_json::to_string(&attachments_data).unwrap_or_else(|_| "[]".to_string());
-            exec_count(
-                &conn,
-                "UPDATE messages SET attachments = ? WHERE id = ?",
-                &[SqlValue::Text(sanitized_json), SqlValue::BigInt(*msg_id)],
-            )?;
-        }
+            // Write back subject changes
+            if subject != *subject_original {
+                exec_count(
+                    &conn,
+                    "UPDATE messages SET subject = ? WHERE id = ?",
+                    &[SqlValue::Text(subject), SqlValue::BigInt(*msg_id)],
+                )?;
+            }
 
-        // Write back subject changes
-        if subject != *subject_original {
-            exec_count(
-                &conn,
-                "UPDATE messages SET subject = ? WHERE id = ?",
-                &[SqlValue::Text(subject), SqlValue::BigInt(*msg_id)],
-            )?;
-        }
-
-        // Redact body or write back secret-scrubbed body
-        if cfg.redact_body {
-            let placeholder = cfg
-                .body_placeholder
-                .unwrap_or("[Message body redacted]")
-                .to_string();
-            if *body_original != placeholder {
-                bodies_redacted += 1;
+            // Redact body or write back secret-scrubbed body
+            if cfg.redact_body {
+                let placeholder = cfg
+                    .body_placeholder
+                    .unwrap_or("[Message body redacted]")
+                    .to_string();
+                if *body_original != placeholder {
+                    bodies_redacted += 1;
+                    exec_count(
+                        &conn,
+                        "UPDATE messages SET body_md = ? WHERE id = ?",
+                        &[SqlValue::Text(placeholder), SqlValue::BigInt(*msg_id)],
+                    )?;
+                }
+            } else if body != *body_original {
                 exec_count(
                     &conn,
                     "UPDATE messages SET body_md = ? WHERE id = ?",
-                    &[SqlValue::Text(placeholder), SqlValue::BigInt(*msg_id)],
+                    &[SqlValue::Text(body), SqlValue::BigInt(*msg_id)],
                 )?;
             }
-        } else if body != *body_original {
-            exec_count(
-                &conn,
-                "UPDATE messages SET body_md = ? WHERE id = ?",
-                &[SqlValue::Text(body), SqlValue::BigInt(*msg_id)],
-            )?;
+
+            secrets_replaced += attachment_replacements;
+            if attachments_updated || attachment_replacements > 0 {
+                attachments_sanitized += 1;
+            }
         }
 
-        secrets_replaced += attachment_replacements;
-        if attachments_updated || attachment_replacements > 0 {
-            attachments_sanitized += 1;
+        Ok(ScrubSummary {
+            preset: preset.as_str().to_string(),
+            pseudonym_salt: preset.as_str().to_string(),
+            agents_total,
+            agents_pseudonymized: 0,
+            ack_flags_cleared,
+            recipients_cleared,
+            file_reservations_removed,
+            agent_links_removed,
+            secrets_replaced,
+            attachments_sanitized,
+            bodies_redacted,
+            attachments_cleared,
+        })
+    })();
+
+    match result {
+        Ok(summary) => {
+            conn.execute_raw("COMMIT")
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("COMMIT failed: {e}"),
+                })?;
+            Ok(summary)
+        }
+        Err(err) => {
+            let _ = conn.execute_raw("ROLLBACK");
+            Err(err)
         }
     }
-
-    Ok(ScrubSummary {
-        preset: preset.as_str().to_string(),
-        pseudonym_salt: preset.as_str().to_string(),
-        agents_total,
-        agents_pseudonymized: 0,
-        ack_flags_cleared,
-        recipients_cleared,
-        file_reservations_removed,
-        agent_links_removed,
-        secrets_replaced,
-        attachments_sanitized,
-        bodies_redacted,
-        attachments_cleared,
-    })
 }
 
 /// Replace secret patterns in text with `[REDACTED]`.

@@ -39,7 +39,7 @@
 | Summarize thread (LLM disabled mode) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/search.rs` |
 | Acknowledge + read tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Ack-required views | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
-| Attachment handling + WebP conversion | Not Started | |
+| Attachment handling + WebP conversion | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` (7 tests), `crates/mcp-agent-mail-tools/src/messaging.rs` |
 
 ## File Reservations
 | Feature | Status | Evidence |
@@ -77,12 +77,12 @@
 | Lock status diagnostics | Implemented | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Thread digest (append-only) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Storage-to-tools wiring | Verified (Tests) | identity.rs, messaging.rs, reservations.rs, resources.rs |
-| Query tracking + slow queries | Not Started | |
+| Query tracking + slow queries | Implemented | `crates/mcp-agent-mail-db/src/tracking.rs` (6 tests), `crates/mcp-agent-mail-db/src/queries.rs` (all calls instrumented), `crates/mcp-agent-mail-server/src/lib.rs` (auto-enable) |
 
 ## CLI & Ops
 | Feature | Status | Evidence |
 | --- | --- | --- |
-| CLI command parity | In Progress | `crates/mcp-agent-mail-cli/src/lib.rs` (~70% of commands) |
+| CLI command parity | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (40+ commands, 75+ tests, only `--interactive` deferred) |
 | Config management (show-port, set-port) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | list-projects (--json, --include-agents) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | file_reservations (list/active/soon) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
@@ -96,14 +96,14 @@
 | doctor check (--verbose, --json) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | Guard install/uninstall + conflict detection | Implemented | `crates/mcp-agent-mail-guard/src/lib.rs` |
 | Guard status / guard check (Rust native) | Implemented | `crates/mcp-agent-mail-guard/src/lib.rs` |
-| Doctor repair/backups/restore | Not Started | |
-| Share export/update/verify | Not Started | |
-| Static bundle preview | Not Started | |
+| Doctor repair/backups/restore | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` (repair, backups, restore commands) |
+| Share export/update/verify/decrypt/preview | Verified (Tests) | `crates/mcp-agent-mail-share/src/` (8 modules, 62 tests), `crates/mcp-agent-mail-cli/src/lib.rs` |
+| Archive save/list/restore | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 
 ## Conformance & Benchmarks
 | Feature | Status | Evidence |
 | --- | --- | --- |
 | Python fixture generator | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance/python_reference/generate_fixtures.py` |
-| Rust conformance tests (20 tools) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
+| Rust conformance tests (23 tools) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
 | All resources (23+) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Benchmark suite | Verified (Tests) | `crates/mcp-agent-mail/benches/benchmarks.rs` |

@@ -161,103 +161,126 @@ pub fn apply_project_scope(
     let placeholders = build_placeholders(matched_ids.len());
     let id_values: Vec<Value> = matched_ids.iter().map(|&id| Value::BigInt(id)).collect();
 
-    // Delete order — use NOT IN (allowed_ids) for safety
-    // 1. agent_links (cross-project)
-    if table_exists(&conn, "agent_links")? {
-        let sql = format!(
-            "DELETE FROM agent_links WHERE a_project_id NOT IN ({p}) OR b_project_id NOT IN ({p})",
-            p = placeholders
-        );
-        let mut params = id_values.clone();
-        params.extend(id_values.iter().cloned());
-        exec(&conn, &sql, &params)?;
-    }
-
-    // 2. project_sibling_suggestions
-    if table_exists(&conn, "project_sibling_suggestions")? {
-        let sql = format!(
-            "DELETE FROM project_sibling_suggestions WHERE project_a_id NOT IN ({p}) OR project_b_id NOT IN ({p})",
-            p = placeholders
-        );
-        let mut params = id_values.clone();
-        params.extend(id_values.iter().cloned());
-        exec(&conn, &sql, &params)?;
-    }
-
-    // 3. Collect message IDs for non-allowed projects
-    let msg_sql = format!(
-        "SELECT id FROM messages WHERE project_id NOT IN ({p})",
-        p = placeholders
-    );
-    let msg_rows = conn
-        .query_sync(&msg_sql, &id_values)
+    conn.execute_sync("BEGIN IMMEDIATE", &[])
         .map_err(|e| ShareError::Sqlite {
-            message: format!("SELECT messages failed: {e}"),
+            message: format!("BEGIN transaction failed: {e}"),
         })?;
-    let msg_ids: Vec<i64> = msg_rows
-        .iter()
-        .filter_map(|r| r.get_named::<i64>("id").ok())
-        .collect();
 
-    // 4. Delete message_recipients for collected message IDs
-    if !msg_ids.is_empty() {
-        let msg_placeholders = build_placeholders(msg_ids.len());
-        let msg_values: Vec<Value> = msg_ids.iter().map(|&id| Value::BigInt(id)).collect();
+    let result = (|| {
+        // Delete order — use NOT IN (allowed_ids) for safety
+        // 1. agent_links (cross-project)
+        if table_exists(&conn, "agent_links")? {
+            let sql = format!(
+                "DELETE FROM agent_links WHERE a_project_id NOT IN ({p}) OR b_project_id NOT IN ({p})",
+                p = placeholders
+            );
+            let mut params = id_values.clone();
+            params.extend(id_values.iter().cloned());
+            exec(&conn, &sql, &params)?;
+        }
+
+        // 2. project_sibling_suggestions
+        if table_exists(&conn, "project_sibling_suggestions")? {
+            let sql = format!(
+                "DELETE FROM project_sibling_suggestions WHERE project_a_id NOT IN ({p}) OR project_b_id NOT IN ({p})",
+                p = placeholders
+            );
+            let mut params = id_values.clone();
+            params.extend(id_values.iter().cloned());
+            exec(&conn, &sql, &params)?;
+        }
+
+        // 3. Collect message IDs for non-allowed projects
+        let msg_sql = format!(
+            "SELECT id FROM messages WHERE project_id NOT IN ({p})",
+            p = placeholders
+        );
+        let msg_rows = conn
+            .query_sync(&msg_sql, &id_values)
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("SELECT messages failed: {e}"),
+            })?;
+        let msg_ids: Vec<i64> = msg_rows
+            .iter()
+            .filter_map(|r| r.get_named::<i64>("id").ok())
+            .collect();
+
+        // 4. Delete message_recipients for collected message IDs
+        if !msg_ids.is_empty() {
+            let msg_placeholders = build_placeholders(msg_ids.len());
+            let msg_values: Vec<Value> = msg_ids.iter().map(|&id| Value::BigInt(id)).collect();
+            exec(
+                &conn,
+                &format!(
+                    "DELETE FROM message_recipients WHERE message_id IN ({msg_placeholders})"
+                ),
+                &msg_values,
+            )?;
+        }
+
+        // 5. Delete messages
         exec(
             &conn,
-            &format!("DELETE FROM message_recipients WHERE message_id IN ({msg_placeholders})"),
-            &msg_values,
+            &format!(
+                "DELETE FROM messages WHERE project_id NOT IN ({p})",
+                p = placeholders
+            ),
+            &id_values,
         )?;
+
+        // 6. Delete file_reservations
+        exec(
+            &conn,
+            &format!(
+                "DELETE FROM file_reservations WHERE project_id NOT IN ({p})",
+                p = placeholders
+            ),
+            &id_values,
+        )?;
+
+        // 7. Delete agents
+        exec(
+            &conn,
+            &format!(
+                "DELETE FROM agents WHERE project_id NOT IN ({p})",
+                p = placeholders
+            ),
+            &id_values,
+        )?;
+
+        // 8. Delete projects
+        exec(
+            &conn,
+            &format!(
+                "DELETE FROM projects WHERE id NOT IN ({p})",
+                p = placeholders
+            ),
+            &id_values,
+        )?;
+
+        let remaining = count_remaining(&conn)?;
+
+        Ok(ProjectScopeResult {
+            identifiers: identifiers.to_vec(),
+            projects: matched,
+            removed_count,
+            remaining,
+        })
+    })();
+
+    match result {
+        Ok(out) => {
+            conn.execute_sync("COMMIT", &[])
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("COMMIT failed: {e}"),
+                })?;
+            Ok(out)
+        }
+        Err(err) => {
+            let _ = conn.execute_sync("ROLLBACK", &[]);
+            Err(err)
+        }
     }
-
-    // 5. Delete messages
-    exec(
-        &conn,
-        &format!(
-            "DELETE FROM messages WHERE project_id NOT IN ({p})",
-            p = placeholders
-        ),
-        &id_values,
-    )?;
-
-    // 6. Delete file_reservations
-    exec(
-        &conn,
-        &format!(
-            "DELETE FROM file_reservations WHERE project_id NOT IN ({p})",
-            p = placeholders
-        ),
-        &id_values,
-    )?;
-
-    // 7. Delete agents
-    exec(
-        &conn,
-        &format!(
-            "DELETE FROM agents WHERE project_id NOT IN ({p})",
-            p = placeholders
-        ),
-        &id_values,
-    )?;
-
-    // 8. Delete projects
-    exec(
-        &conn,
-        &format!(
-            "DELETE FROM projects WHERE id NOT IN ({p})",
-            p = placeholders
-        ),
-        &id_values,
-    )?;
-
-    let remaining = count_remaining(&conn)?;
-
-    Ok(ProjectScopeResult {
-        identifiers: identifiers.to_vec(),
-        projects: matched,
-        removed_count,
-        remaining,
-    })
 }
 
 /// Build `?,?,?` placeholder string for `n` parameters.

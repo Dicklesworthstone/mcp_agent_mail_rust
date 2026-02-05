@@ -3791,6 +3791,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "coding-agent-search",
+ "criterion",
  "dirs",
  "regex",
  "serde",

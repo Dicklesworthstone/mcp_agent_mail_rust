@@ -3,7 +3,7 @@
 //! Mirrors the Python `share.py` bundle pipeline.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -150,13 +150,12 @@ pub fn bundle_attachments(
 
             match source_file {
                 Some(source) if source.exists() => {
-                    // Read file once — use content.len() for threshold decisions
-                    // to avoid TOCTOU mismatch with metadata().
-                    let content = std::fs::read(&source)?;
-                    let file_size = content.len();
-                    let sha = hex_sha256(&content);
+                    let file_size = source.metadata().map(|m| m.len() as usize).unwrap_or(0);
 
                     if file_size <= inline_threshold {
+                        let content = std::fs::read(&source)?;
+                        let file_size = content.len();
+                        let sha = hex_sha256(&content);
                         // Inline as base64 data URI
                         let data_uri = format!(
                             "data:{};base64,{}",
@@ -183,6 +182,7 @@ pub fn bundle_attachments(
                         updated = true;
                     } else if file_size >= detach_threshold {
                         // External — too large to bundle
+                        let sha = sha256_file(&source)?;
                         obj.insert("type".to_string(), Value::String("external".to_string()));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
                         obj.insert(
@@ -208,6 +208,7 @@ pub fn bundle_attachments(
                         updated = true;
                     } else {
                         // Copy to bundle with deduplication
+                        let sha = sha256_file(&source)?;
                         let bundle_rel = if let Some(existing) = dedup_map.get(&sha) {
                             // Deduplicate: reuse existing path
                             existing.clone()
@@ -220,7 +221,7 @@ pub fn bundle_attachments(
                             if let Some(parent) = dest.parent() {
                                 std::fs::create_dir_all(parent)?;
                             }
-                            std::fs::write(&dest, &content)?;
+                            std::fs::copy(&source, &dest)?;
                             stats.bytes_copied += file_size as u64;
                             dedup_map.insert(sha.clone(), rel.clone());
                             rel
@@ -310,14 +311,17 @@ pub fn maybe_chunk_database(
     let chunks_dir = output_dir.join("chunks");
     std::fs::create_dir_all(&chunks_dir)?;
 
-    let data = std::fs::read(snapshot_path)?;
     let mut sha_lines = Vec::new();
     let mut index = 0usize;
-    let mut offset = 0usize;
+    let mut file = std::fs::File::open(snapshot_path)?;
+    let mut buf = vec![0u8; chunk_bytes];
 
-    while offset < data.len() {
-        let end = (offset + chunk_bytes).min(data.len());
-        let chunk = &data[offset..end];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
 
         let chunk_name = format!("{index:05}.bin");
         let chunk_path = chunks_dir.join(&chunk_name);
@@ -327,7 +331,6 @@ pub fn maybe_chunk_database(
         sha_lines.push(format!("{hash}  chunks/{chunk_name}\n"));
 
         index += 1;
-        offset = end;
     }
 
     // Write checksums
@@ -438,7 +441,6 @@ pub fn write_bundle_scaffolding(
 
 /// Create a deterministic ZIP archive of a directory.
 pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareResult<PathBuf> {
-    use std::io::Read;
     use zip::write::SimpleFileOptions;
 
     let file = std::fs::File::create(destination)?;
@@ -461,9 +463,7 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
             zip.start_file(relative_path.clone(), options)
                 .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
             let mut f = std::fs::File::open(&full_path)?;
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf)?;
-            zip.write_all(&buf)?;
+            std::io::copy(&mut f, &mut zip)?;
         }
     }
 
@@ -493,6 +493,24 @@ fn resolve_attachment_path(storage_root: &Path, path: &str) -> Option<PathBuf> {
 fn hex_sha256(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     hex::encode(hash)
+}
+
+fn sha256_reader<R: Read>(reader: &mut R) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    sha256_reader(&mut file)
 }
 
 fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<String>) -> std::io::Result<()> {

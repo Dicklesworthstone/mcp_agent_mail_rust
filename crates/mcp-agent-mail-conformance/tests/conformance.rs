@@ -34,10 +34,83 @@ fn null_auto_increment_ids(value: &mut Value) {
     }
 }
 
+/// For tooling/directory-like resources with "clusters" → "tools" arrays,
+/// filter the actual response to only include tools whose names appear in
+/// the expected output. This handles tools added after fixture generation.
+fn align_cluster_tools(actual: &mut Value, expected: &Value) {
+    let Some(expected_clusters) = expected.get("clusters").and_then(|c| c.as_array()) else {
+        return;
+    };
+    let Some(actual_clusters) = actual.get_mut("clusters").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+
+    // Collect all tool names from expected
+    let mut expected_tool_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for cluster in expected_clusters {
+        if let Some(tools) = cluster.get("tools").and_then(|t| t.as_array()) {
+            for tool in tools {
+                if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                    expected_tool_names.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    if expected_tool_names.is_empty() {
+        return;
+    }
+
+    // Filter actual clusters: remove tools not in expected, remove empty clusters
+    for cluster in actual_clusters.iter_mut() {
+        if let Some(tools) = cluster.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            tools.retain(|tool| {
+                tool.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|name| expected_tool_names.contains(name))
+            });
+        }
+    }
+    actual_clusters.retain(|c| {
+        c.get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|tools| !tools.is_empty())
+    });
+}
+
+/// For tooling/metrics-like responses, filter to only tools in expected.
+fn align_metrics_tools(actual: &mut Value, expected: &Value) {
+    let Some(expected_tools) = expected.get("tools").and_then(|t| t.as_array()) else {
+        return;
+    };
+    let Some(actual_tools) = actual.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return;
+    };
+
+    let expected_names: std::collections::HashSet<String> = expected_tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+
+    if expected_names.is_empty() {
+        return;
+    }
+
+    actual_tools.retain(|tool| {
+        tool.get("name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|name| expected_names.contains(name))
+    });
+}
+
 fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (Value, Value) {
     // Always null out auto-increment IDs since they're non-deterministic
     null_auto_increment_ids(&mut actual);
     null_auto_increment_ids(&mut expected);
+
+    // Align tool lists (handle tools added after fixture generation)
+    align_cluster_tools(&mut actual, &expected);
+    align_metrics_tools(&mut actual, &expected);
 
     for ptr in &norm.ignore_json_pointers {
         if let Some(v) = actual.pointer_mut(ptr) {

@@ -878,25 +878,43 @@ pub async fn search_messages(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    // Minimal parity implementation: LIKE on subject/body; deterministic order by id ASC.
-    let like = format!("%{query}%");
-    let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name \
-               FROM messages m \
-               JOIN agents a ON a.id = m.sender_id \
-               WHERE m.project_id = ? AND (m.subject LIKE ? OR m.body_md LIKE ?) \
-               ORDER BY m.id ASC \
-               LIMIT ?";
+    let trimmed = query.trim();
     let Ok(limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
-    let params = [
-        Value::BigInt(project_id),
-        Value::Text(like.clone()),
-        Value::Text(like),
-        Value::BigInt(limit_i64),
-    ];
 
-    let rows_out = map_sql_outcome(traw_query(cx, &*conn, sql, &params).await);
+    let rows_out = if trimmed.is_empty() {
+        // Fallback for empty queries: LIKE on subject/body; deterministic order by id ASC.
+        let like = "%".to_string();
+        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name \
+                   FROM messages m \
+                   JOIN agents a ON a.id = m.sender_id \
+                   WHERE m.project_id = ? AND (m.subject LIKE ? OR m.body_md LIKE ?) \
+                   ORDER BY m.id ASC \
+                   LIMIT ?";
+        let params = [
+            Value::BigInt(project_id),
+            Value::Text(like.clone()),
+            Value::Text(like),
+            Value::BigInt(limit_i64),
+        ];
+        map_sql_outcome(traw_query(cx, &*conn, sql, &params).await)
+    } else {
+        // FTS5-backed search with relevance ordering.
+        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name \
+                   FROM fts_messages \
+                   JOIN messages m ON m.id = fts_messages.message_id \
+                   JOIN agents a ON a.id = m.sender_id \
+                   WHERE m.project_id = ? AND fts_messages MATCH ? \
+                   ORDER BY bm25(fts_messages) ASC, m.id ASC \
+                   LIMIT ?";
+        let params = [
+            Value::BigInt(project_id),
+            Value::Text(trimmed.to_string()),
+            Value::BigInt(limit_i64),
+        ];
+        map_sql_outcome(traw_query(cx, &*conn, sql, &params).await)
+    };
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
