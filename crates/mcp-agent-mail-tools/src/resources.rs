@@ -11,11 +11,15 @@
 
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
+use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool};
+use crate::{
+    tool_cluster,
+    tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_project},
+};
 
 fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
     if let Some((base, query)) = input.split_once('?') {
@@ -75,6 +79,14 @@ fn percent_decode_component(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+fn tool_filter_allows(config: &Config, tool_name: &str) -> bool {
+    if let Some(cluster) = tool_cluster(tool_name) {
+        config.should_expose_tool(tool_name, cluster)
+    } else {
+        true
+    }
+}
+
 // ============================================================================
 // Configuration Resources
 // ============================================================================
@@ -94,6 +106,15 @@ pub struct HttpSnapshot {
     pub path: String,
 }
 
+fn redact_database_url(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        if let Some((_creds, host)) = rest.rsplit_once('@') {
+            return format!("{scheme}://****@{host}");
+        }
+    }
+    url.to_string()
+}
+
 /// Get environment configuration snapshot.
 #[resource(
     uri = "resource://config/environment",
@@ -105,7 +126,7 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
 
     let snapshot = EnvironmentSnapshot {
         environment: config.app_environment.to_string(),
-        database_url: config.database_url,
+        database_url: redact_database_url(&config.database_url),
         http: HttpSnapshot {
             host: config.http_host,
             port: config.http_port,
@@ -146,14 +167,25 @@ pub struct GitIdentity {
     description = "Git identity resolution for a project"
 )]
 pub fn identity_project(_ctx: &McpContext, project: String) -> McpResult<String> {
-    // TODO: Call storage layer to resolve Git identity
-    let (project, _query) = split_param_and_query(&project);
+    let (project_slug, _query) = split_param_and_query(&project);
+
+    // Try to resolve git information from the archive
+    let config = mcp_agent_mail_core::Config::from_env();
+    let (git_toplevel, git_common_dir) =
+        match mcp_agent_mail_storage::ensure_archive(&config, &project_slug) {
+            Ok(archive) => {
+                let toplevel = archive.repo_root.to_string_lossy().to_string();
+                let common_dir = archive.repo_root.join(".git").to_string_lossy().to_string();
+                (Some(toplevel), Some(common_dir))
+            }
+            Err(_) => (None, None),
+        };
 
     let identity = GitIdentity {
-        project_slug: project,
+        project_slug,
         git_remote: None,
-        git_toplevel: None,
-        git_common_dir: None,
+        git_toplevel,
+        git_common_dir,
     };
 
     serde_json::to_string(&identity)
@@ -360,6 +392,7 @@ pub struct ToolDirectory {
 
 #[allow(clippy::too_many_lines)]
 fn build_tool_directory() -> ToolDirectory {
+    let config = Config::from_env();
     let output_formats = OutputFormats {
         default: "json".to_string(),
         tool_param: "format".to_string(),
@@ -374,7 +407,7 @@ fn build_tool_directory() -> ToolDirectory {
         },
     };
 
-    let clusters = vec![
+    let mut clusters = vec![
         ToolCluster {
             name: "Infrastructure & Workspace Setup".to_string(),
             purpose: "Bootstrap coordination and guardrails before agents begin editing.".to_string(),
@@ -697,6 +730,15 @@ fn build_tool_directory() -> ToolDirectory {
         },
     ];
 
+    if config.tool_filter.enabled {
+        for cluster in &mut clusters {
+            cluster
+                .tools
+                .retain(|tool| tool_filter_allows(&config, &tool.name));
+        }
+        clusters.retain(|cluster| !cluster.tools.is_empty());
+    }
+
     let playbooks = vec![
         Playbook {
             workflow: "Kick off new agent session (macro)".to_string(),
@@ -825,6 +867,7 @@ pub struct ToolSchemasResponse {
     description = "Tool schemas and JSON definitions"
 )]
 pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
+    let config = Config::from_env();
     let output_formats = OutputFormats {
         default: "json".to_string(),
         tool_param: "format".to_string(),
@@ -895,6 +938,10 @@ pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
         },
     );
 
+    if config.tool_filter.enabled {
+        tools.retain(|name, _| tool_filter_allows(&config, name));
+    }
+
     let response = ToolSchemasResponse {
         generated_at: None,
         global_optional: vec!["format".to_string()],
@@ -941,10 +988,11 @@ pub struct ToolMetricsResponse {
 )]
 #[allow(clippy::too_many_lines)]
 pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
+    let config = Config::from_env();
     // Return static metrics matching Python fixture format
     // In a real implementation, these would be tracked at runtime
     // Tools sorted alphabetically to match Python fixture
-    let tools = vec![
+    let mut tools = vec![
         ToolMetricsEntry {
             name: "acknowledge_message".to_string(),
             calls: 1,
@@ -1212,6 +1260,10 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
         },
     ];
 
+    if config.tool_filter.enabled {
+        tools.retain(|entry| tool_filter_allows(&config, &entry.name));
+    }
+
     let response = ToolMetricsResponse {
         generated_at: None,
         tools,
@@ -1258,12 +1310,58 @@ pub struct LocksResponse {
 /// Get active archive locks.
 #[resource(uri = "resource://tooling/locks", description = "Active archive locks")]
 pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
-    // TODO: Call storage layer
+    let config = mcp_agent_mail_core::Config::from_env();
+    let lock_info = mcp_agent_mail_storage::collect_lock_status(&config).unwrap_or_else(|e| {
+        tracing::warn!("Failed to collect lock status: {e}");
+        serde_json::json!({"archive_root": "", "exists": false, "locks": []})
+    });
+
+    let raw_locks = lock_info
+        .get("locks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let locks: Vec<ArchiveLock> = raw_locks
+        .iter()
+        .map(|l| {
+            let path = l.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            // Extract project slug from path (e.g. ".../projects/<slug>/...")
+            let project_slug = path
+                .split("projects/")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let holder = l
+                .get("owner")
+                .and_then(|o| o.get("pid"))
+                .and_then(|v| v.as_u64())
+                .map_or_else(|| "unknown".to_string(), |pid| format!("pid:{pid}"));
+            let acquired_ts = l
+                .get("owner")
+                .and_then(|o| o.get("created_ts"))
+                .and_then(|v| v.as_f64())
+                .map_or_else(String::new, |t| {
+                    chrono::DateTime::from_timestamp(t as i64, ((t.fract()) * 1e9) as u32)
+                        .unwrap_or_default()
+                        .to_rfc3339()
+                });
+            ArchiveLock {
+                project_slug,
+                holder,
+                acquired_ts,
+            }
+        })
+        .collect();
+
+    let total = locks.len() as u64;
+
     let response = LocksResponse {
-        locks: vec![],
+        locks,
         summary: LocksSummary {
-            total: 0,
-            active: 0,
+            total,
+            active: total,
             stale: 0,
             metadata_missing: 0,
         },
@@ -1336,13 +1434,14 @@ pub struct ToolingRecentSnapshot {
 )]
 #[allow(clippy::too_many_lines)]
 pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<String> {
+    let config = Config::from_env();
     let (window_seconds_str, query) = split_param_and_query(&window_seconds);
     let window_seconds: u64 = window_seconds_str.parse().unwrap_or(0);
     let agent = query.get("agent").cloned();
     let project = query.get("project").cloned();
 
     // Return static entries matching Python fixture format when agent and project are specified
-    let entries = if agent.is_some() && project.is_some() {
+    let mut entries = if agent.is_some() && project.is_some() {
         let agent_name = agent.as_deref().unwrap_or("");
         let project_name = project.as_deref().unwrap_or("");
         vec![
@@ -1462,6 +1561,10 @@ pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<St
     } else {
         vec![]
     };
+
+    if config.tool_filter.enabled {
+        entries.retain(|entry| tool_filter_allows(&config, &entry.tool));
+    }
 
     let count = entries.len();
     let snapshot = ToolingRecentSnapshot {
@@ -1749,11 +1852,19 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
     }
 
     let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
 
     // Get message from DB
     let msg = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_message(ctx.cx(), &pool, msg_id).await,
     )?;
+    if msg.project_id != project_id {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Message not found",
+        ));
+    }
 
     // Get sender name
     let sender = db_outcome_to_mcp_result(

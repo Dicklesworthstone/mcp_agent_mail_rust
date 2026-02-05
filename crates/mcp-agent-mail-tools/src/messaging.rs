@@ -9,10 +9,42 @@
 
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
+use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 
 use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
+
+/// Write a message bundle to the git archive (best-effort, non-blocking).
+/// Failures are logged but never fail the tool call.
+fn try_write_message_archive(
+    project_slug: &str,
+    message_json: &serde_json::Value,
+    body_md: &str,
+    sender: &str,
+    all_recipient_names: &[String],
+) {
+    let config = Config::from_env();
+    match mcp_agent_mail_storage::ensure_archive(&config, project_slug) {
+        Ok(archive) => {
+            if let Err(e) = mcp_agent_mail_storage::write_message_bundle(
+                &archive,
+                &config,
+                message_json,
+                body_md,
+                sender,
+                all_recipient_names,
+                &[],
+                None,
+            ) {
+                tracing::warn!("Failed to write message bundle to archive: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to ensure archive for message write: {e}");
+        }
+    }
+}
 
 /// Message delivery result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +270,36 @@ pub async fn send_message(
 
     let attachments = attachment_paths.unwrap_or_default();
 
+    // Write message bundle to git archive (best-effort)
+    {
+        let mut all_recipient_names: Vec<String> = resolved_to.clone();
+        all_recipient_names.extend(resolved_cc_recipients.clone());
+        all_recipient_names.extend(resolved_bcc_recipients.clone());
+
+        let msg_json = serde_json::json!({
+            "id": message_id,
+            "from": &sender_name,
+            "to": &resolved_to,
+            "cc": &resolved_cc_recipients,
+            "bcc": &resolved_bcc_recipients,
+            "subject": &message.subject,
+            "created": micros_to_iso(message.created_ts),
+            "thread_id": &message.thread_id,
+            "project": &project.human_key,
+            "project_slug": &project.slug,
+            "importance": &message.importance,
+            "ack_required": message.ack_required != 0,
+            "attachments": &attachments,
+        });
+        try_write_message_archive(
+            &project.slug,
+            &msg_json,
+            &message.body_md,
+            &sender_name,
+            &all_recipient_names,
+        );
+    }
+
     let payload = MessagePayload {
         id: message_id,
         project_id,
@@ -314,6 +376,12 @@ pub async fn reply_message(
     let original = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_message(ctx.cx(), &pool, message_id).await,
     )?;
+    if original.project_id != project_id {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Message not found",
+        ));
+    }
 
     // Resolve sender
     let sender = resolve_agent(ctx, &pool, project_id, &sender_name).await?;
@@ -388,6 +456,37 @@ pub async fn reply_message(
         mcp_agent_mail_db::queries::add_recipients(ctx.cx(), &pool, reply_id, &all_recipients)
             .await,
     )?;
+
+    // Write reply message bundle to git archive (best-effort)
+    {
+        let mut all_recipient_names: Vec<String> = resolved_to.clone();
+        all_recipient_names.extend(resolved_cc_recipients.clone());
+        all_recipient_names.extend(resolved_bcc_recipients.clone());
+
+        let msg_json = serde_json::json!({
+            "id": reply_id,
+            "from": &sender_name,
+            "to": &resolved_to,
+            "cc": &resolved_cc_recipients,
+            "bcc": &resolved_bcc_recipients,
+            "subject": &reply.subject,
+            "created": micros_to_iso(reply.created_ts),
+            "thread_id": &thread_id,
+            "project": &project.human_key,
+            "project_slug": &project.slug,
+            "importance": &reply.importance,
+            "ack_required": reply.ack_required != 0,
+            "attachments": serde_json::Value::Array(vec![]),
+            "reply_to": message_id,
+        });
+        try_write_message_archive(
+            &project.slug,
+            &msg_json,
+            &reply.body_md,
+            &sender_name,
+            &all_recipient_names,
+        );
+    }
 
     let payload = MessagePayload {
         id: reply_id,
