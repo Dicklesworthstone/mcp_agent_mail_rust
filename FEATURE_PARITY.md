@@ -14,16 +14,17 @@
 | FastMCP server (HTTP) | Implemented | `crates/mcp-agent-mail-server/src/lib.rs` |
 | Tool registry + tool clusters | Verified (Conformance) | `crates/mcp-agent-mail-server/src/lib.rs` |
 | Resource URI system (`resource://...`) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
-| Tool filtering profiles (full/core/minimal/messaging/custom) | Not Started | |
-| Tool metrics snapshot | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` (`resource://tooling/metrics`) |
-| Recent tool usage tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` (`resource://tooling/recent/{window_seconds}`) |
+| Tool filtering profiles (full/core/minimal/messaging/custom) | Implemented | `crates/mcp-agent-mail-core/src/config.rs`, `crates/mcp-agent-mail-tools/src/lib.rs`, `crates/mcp-agent-mail-server/src/lib.rs` |
+| Tool metrics snapshot | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
+| Recent tool usage tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 
 ## Identity & Projects
 | Feature | Status | Evidence |
 | --- | --- | --- |
-| Ensure project | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/identity.rs` |
-| Register agent | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/identity.rs` |
-| Create agent identity | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/identity.rs` |
+| Ensure project (+ archive init) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/identity.rs` |
+| Register agent (+ profile archive write) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/identity.rs` |
+| Create agent identity (+ profile archive write) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/identity.rs` |
+| Whois (+ recent commits from archive) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/identity.rs` |
 | Agent contact policy | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/contacts.rs` |
 | Agent links (contact requests) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/contacts.rs` |
 | Product bus (products + links) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/products.rs` |
@@ -31,21 +32,22 @@
 ## Messaging
 | Feature | Status | Evidence |
 | --- | --- | --- |
-| Send message (attachments stubbed) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
-| Reply message | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
+| Send message (+ archive write) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
+| Reply message (+ archive write) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Fetch inbox | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Search messages (FTS: LIKE fallback) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/search.rs` |
 | Summarize thread (LLM disabled mode) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/search.rs` |
 | Acknowledge + read tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Ack-required views | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
+| Attachment handling + WebP conversion | Not Started | |
 
 ## File Reservations
 | Feature | Status | Evidence |
 | --- | --- | --- |
-| Reserve paths (exclusive/shared) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/reservations.rs` |
+| Reserve paths (+ archive artifact write) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/reservations.rs` |
 | Renew reservations | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/reservations.rs` |
 | Release reservations | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/reservations.rs` |
-| Force-release stale reservations | Not Started | |
+| Force-release stale reservations | Implemented | `crates/mcp-agent-mail-tools/src/reservations.rs` (inactivity heuristics + notification) |
 | Reservation views | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 
 ## Build Slots
@@ -55,16 +57,6 @@
 | Renew build slot | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/build_slots.rs` |
 | Release build slot | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/build_slots.rs` |
 
-## CLI & Ops
-| Feature | Status | Evidence |
-| --- | --- | --- |
-| CLI command parity | Not Started | |
-| Config management | Not Started | |
-| Doctor check/repair | Not Started | |
-| Guard install/uninstall | Not Started | |
-| Share export/update/verify | Not Started | |
-| Static bundle preview | Not Started | |
-
 ## Storage & Database
 | Feature | Status | Evidence |
 | --- | --- | --- |
@@ -72,14 +64,46 @@
 | DB pool + WAL PRAGMAs | Verified (Tests) | `crates/mcp-agent-mail-db/src/pool.rs` |
 | Core queries used by tools | Verified (Conformance) | `crates/mcp-agent-mail-db/src/queries.rs` |
 | FTS indexing | Implemented | `crates/mcp-agent-mail-db/src/schema.rs` |
-| Git archive write pipeline | Not Started | |
-| Attachment handling + WebP conversion | Not Started | |
+| Git archive init + per-project repos | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Agent profile archive writes | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Message bundle write pipeline | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| File reservation artifact writes | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Advisory file locks (stale detection) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Commit queue with batching | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Git index.lock contention retry | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Stale lock healing (startup) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Notification signals | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Recent commits (path-filtered) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Lock status diagnostics | Implemented | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Thread digest (append-only) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Storage-to-tools wiring | Verified (Tests) | identity.rs, messaging.rs, reservations.rs, resources.rs |
 | Query tracking + slow queries | Not Started | |
+
+## CLI & Ops
+| Feature | Status | Evidence |
+| --- | --- | --- |
+| CLI command parity | In Progress | `crates/mcp-agent-mail-cli/src/lib.rs` (~70% of commands) |
+| Config management (show-port, set-port) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| list-projects (--json, --include-agents) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| file_reservations (list/active/soon) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| acks (pending/remind/overdue) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| list-acks | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| mail status | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| migrate | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| clear-and-reset-everything | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| lint / typecheck | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| projects (mark-identity/discovery-init/adopt) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| doctor check (--verbose, --json) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| Guard install/uninstall + conflict detection | Implemented | `crates/mcp-agent-mail-guard/src/lib.rs` |
+| Guard status / guard check (Rust native) | Implemented | `crates/mcp-agent-mail-guard/src/lib.rs` |
+| Doctor repair/backups/restore | Not Started | |
+| Share export/update/verify | Not Started | |
+| Static bundle preview | Not Started | |
 
 ## Conformance & Benchmarks
 | Feature | Status | Evidence |
 | --- | --- | --- |
 | Python fixture generator | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance/python_reference/generate_fixtures.py` |
-| Rust conformance tests | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
+| Rust conformance tests (20 tools) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
+| All resources (23+) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Benchmark suite | Verified (Tests) | `crates/mcp-agent-mail/benches/benchmarks.rs` |
-| Feature parity report complete | Not Started | |

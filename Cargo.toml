@@ -68,6 +68,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["std"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [workspace.lints.rust]

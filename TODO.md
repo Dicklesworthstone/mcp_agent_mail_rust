@@ -36,6 +36,7 @@
   - [x] Compare outputs and report diffs.
 - [ ] Add conformance CLI helper to regenerate fixtures.
 - [ ] Add CI task for conformance tests.
+- [ ] Add tool-filter conformance fixtures (profiles + custom include/exclude).
 
 ## 3. DB Layer (sqlmodel_rust) — Models & Schema
 ### Models (done - CoralBadger)
@@ -97,21 +98,24 @@
 - [ ] Implement query parsing for static resources (`resource://projects?format=` etc.).
 
 ## 5. Storage Layer (Git Archive)
-- [ ] Implement archive root creation + `.gitattributes`.
-- [ ] Implement per-project locks (`.archive.lock`) and commit locks.
-- [ ] Implement commit queue batching.
-- [ ] Implement message write pipeline (canonical + inbox/outbox + commit).
-- [ ] Implement file reservation writes (digest + id files).
+- [x] Implement archive root creation + `.gitattributes`.
+- [x] Implement per-project locks (`.archive.lock`) and commit locks.
+- [x] Implement commit queue batching.
+- [x] Implement message write pipeline (canonical + inbox/outbox + commit).
+- [x] Implement file reservation writes (digest + id files).
 - [ ] Implement attachment pipeline (WebP, originals, manifests, audit logs).
-- [ ] Implement notification signals (debounced signal files).
-- [ ] Implement read helpers (message by id, thread digest, commit history).
+- [x] Implement notification signals (debounced signal files).
+- [x] Implement read helpers (message by id, thread digest, commit history).
+- [x] Wire storage into identity, messaging, reservation, and resource tools.
 
 ## 6. Guard (Pre-commit/Pre-push)
-- [ ] Implement guard install/uninstall with chain-runner hook.
-- [ ] Implement pre-commit check (staged paths, rename handling).
-- [ ] Implement pre-push check (commit diff scanning).
-- [ ] Implement path matching (pathspec + fnmatch fallback).
-- [ ] Implement advisory mode and bypass env var.
+- [x] Implement guard install/uninstall with chain-runner hook.
+- [x] Implement pre-commit check (staged paths, rename handling).
+- [x] Implement pre-push check (commit diff scanning).
+- [x] Implement path matching (pathspec + fnmatch fallback).
+- [x] Implement advisory mode and bypass env var.
+- [x] Implement Rust-native conflict detection (guard_check, guard_check_full).
+- [x] Implement guard status command.
 
 ## 7. Share / Export
 - [ ] Implement SQLite snapshot (WAL checkpoint + backup).
@@ -123,19 +127,25 @@
 - [ ] Implement preview server and verify/decrypt.
 
 ## 8. CLI
-- [ ] Implement all Typer-equivalent commands in Rust CLI:
-  - [ ] `serve-http`, `serve-stdio` (if needed), `lint`, `typecheck`.
-  - [ ] `share` subcommands (export/update/preview/verify/decrypt/wizard).
-  - [ ] `archive` subcommands (save/list/restore).
-  - [ ] `guard` subcommands (install/uninstall/status/check).
-  - [ ] `acks` subcommands (pending/remind/overdue).
-  - [ ] `file_reservations` subcommands (list/active/soon).
-  - [ ] `config` subcommands (set-port/show-port).
-  - [ ] `doctor` subcommands (check/repair/backups/restore).
-  - [ ] `projects` subcommands (mark-identity/discovery-init/adopt).
-  - [ ] `products` subcommands (ensure/link/status/search/inbox/summarize-thread).
-  - [ ] `docs insert-blurbs`.
-  - [ ] `am-run` and `amctl env`.
+- [x] `serve-http`, `serve-stdio`.
+- [x] `lint`, `typecheck`.
+- [x] `guard` subcommands (install/uninstall/status/check).
+- [x] `acks` subcommands (pending/remind/overdue).
+- [x] `file_reservations` subcommands (list/active/soon).
+- [x] `config` subcommands (set-port/show-port).
+- [x] `doctor check` (--verbose, --json).
+- [x] `projects` subcommands (mark-identity/discovery-init/adopt).
+- [x] `list-projects` (--json, --include-agents).
+- [x] `list-acks`.
+- [x] `mail status`.
+- [x] `migrate`.
+- [x] `clear-and-reset-everything`.
+- [x] `am-run` and `amctl env`.
+- [ ] `share` subcommands (export/update/preview/verify/decrypt/wizard).
+- [ ] `archive` subcommands (save/list/restore).
+- [ ] `doctor` subcommands (repair/backups/restore).
+- [ ] `products` subcommands (ensure/link/status/search/inbox/summarize-thread).
+- [ ] `docs insert-blurbs`.
 
 ## 9. Benchmarks (done — CoralBadger)
 - [x] Create benchmarks reusing conformance fixtures.
