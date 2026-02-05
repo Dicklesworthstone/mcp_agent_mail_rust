@@ -7,13 +7,18 @@
 //! - `mark_message_read`: Mark message as read
 //! - `acknowledge_message`: Acknowledge a message
 
+use asupersync::Outcome;
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
+use globset::Glob;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::micros_to_iso;
+use mcp_agent_mail_db::{micros_to_iso, DbError};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
+use crate::tool_util::{
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project,
+};
 
 /// Write a message bundle to the git archive (best-effort, non-blocking).
 /// Failures are logged but never fail the tool call.

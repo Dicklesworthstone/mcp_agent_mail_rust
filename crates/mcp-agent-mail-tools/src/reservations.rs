@@ -10,9 +10,11 @@
 
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
+use globset::Glob;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
@@ -40,6 +42,28 @@ pub struct ConflictHolder {
     pub agent_name: String,
     pub reservation_id: i64,
     pub expires_ts: String,
+}
+
+fn normalize_pattern(pattern: &str) -> String {
+    let mut normalized = pattern.trim().replace('\\', "/");
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    normalized.trim_start_matches('/').to_string()
+}
+
+fn patterns_overlap(a: &str, b: &str) -> bool {
+    let a_norm = normalize_pattern(a);
+    let b_norm = normalize_pattern(b);
+
+    let a_glob = Glob::new(&a_norm).ok().map(|g| g.compile_matcher());
+    let b_glob = Glob::new(&b_norm).ok().map(|g| g.compile_matcher());
+
+    if let (Some(a_matcher), Some(b_matcher)) = (a_glob, b_glob) {
+        return a_matcher.is_match(&b_norm) || b_matcher.is_match(&a_norm) || a_norm == b_norm;
+    }
+
+    a_norm == b_norm
 }
 
 /// File reservation response
@@ -148,14 +172,19 @@ pub async fn file_reservation_paths(
     let active = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
     )?;
+    let agent_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+    )?;
+    let agent_names: HashMap<i64, String> = agent_rows
+        .into_iter()
+        .filter_map(|row| row.id.map(|id| (id, row.name)))
+        .collect();
 
     let mut conflicts: Vec<ReservationConflict> = Vec::new();
     let mut paths_to_grant: Vec<&str> = Vec::new();
 
     for path in &paths {
         // Check if any active exclusive reservation conflicts with this path
-        // Conflict: either the existing pattern matches our path, or our path matches their pattern
-        // Using simple string equality for now; full fnmatch would require glob crate
         let mut path_conflicts: Vec<ConflictHolder> = Vec::new();
 
         for res in &active {
@@ -164,17 +193,16 @@ pub async fn file_reservation_paths(
                 continue;
             }
 
-            // Check for conflict (simple check: pattern equality or one is prefix of other)
-            let is_conflict = res.exclusive != 0
-                && (res.path_pattern == *path
-                    || path.starts_with(&res.path_pattern)
-                    || res.path_pattern.starts_with(path));
+            let is_conflict =
+                res.exclusive != 0 && patterns_overlap(&res.path_pattern, path);
 
             if is_conflict {
-                // We need to get agent name for the conflict holder
-                // For now, just use agent_id as string (proper lookup would query agents table)
+                let agent_name = agent_names
+                    .get(&res.agent_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("agent_{}", res.agent_id));
                 path_conflicts.push(ConflictHolder {
-                    agent_name: format!("agent_{}", res.agent_id),
+                    agent_name,
                     reservation_id: res.id.unwrap_or(0),
                     expires_ts: micros_to_iso(res.expires_ts),
                 });

@@ -1,0 +1,170 @@
+{
+  "version": "legacy-python@0.3.0",
+  "generated_at": "1970-01-01T00:00:00Z",
+  "cases": [
+    {
+      "name": "disabled_full",
+      "env": {
+        "TOOLS_FILTER_ENABLED": "false"
+      },
+      "expected_tools": [
+        "health_check",
+        "ensure_project",
+        "register_agent",
+        "create_agent_identity",
+        "whois",
+        "send_message",
+        "reply_message",
+        "fetch_inbox",
+        "mark_message_read",
+        "acknowledge_message",
+        "request_contact",
+        "respond_contact",
+        "list_contacts",
+        "set_contact_policy",
+        "file_reservation_paths",
+        "release_file_reservations",
+        "renew_file_reservations",
+        "force_release_file_reservation",
+        "install_precommit_guard",
+        "uninstall_precommit_guard",
+        "search_messages",
+        "summarize_thread",
+        "macro_start_session",
+        "macro_prepare_thread",
+        "macro_file_reservation_cycle",
+        "macro_contact_handshake",
+        "ensure_product",
+        "products_link",
+        "search_messages_product",
+        "fetch_inbox_product",
+        "summarize_thread_product",
+        "acquire_build_slot",
+        "renew_build_slot",
+        "release_build_slot"
+      ]
+    },
+    {
+      "name": "profile_minimal",
+      "env": {
+        "TOOLS_FILTER_ENABLED": "true",
+        "TOOLS_FILTER_PROFILE": "minimal"
+      },
+      "expected_tools": [
+        "health_check",
+        "ensure_project",
+        "register_agent",
+        "send_message",
+        "fetch_inbox",
+        "acknowledge_message"
+      ]
+    },
+    {
+      "name": "profile_core",
+      "env": {
+        "TOOLS_FILTER_ENABLED": "true",
+        "TOOLS_FILTER_PROFILE": "core"
+      },
+      "expected_tools": [
+        "health_check",
+        "ensure_project",
+        "register_agent",
+        "create_agent_identity",
+        "whois",
+        "send_message",
+        "reply_message",
+        "fetch_inbox",
+        "mark_message_read",
+        "acknowledge_message",
+        "file_reservation_paths",
+        "release_file_reservations",
+        "renew_file_reservations",
+        "force_release_file_reservation",
+        "macro_start_session",
+        "macro_prepare_thread",
+        "macro_file_reservation_cycle",
+        "macro_contact_handshake"
+      ]
+    },
+    {
+      "name": "profile_messaging",
+      "env": {
+        "TOOLS_FILTER_ENABLED": "true",
+        "TOOLS_FILTER_PROFILE": "messaging"
+      },
+      "expected_tools": [
+        "health_check",
+        "ensure_project",
+        "register_agent",
+        "create_agent_identity",
+        "whois",
+        "send_message",
+        "reply_message",
+        "fetch_inbox",
+        "mark_message_read",
+        "acknowledge_message",
+        "request_contact",
+        "respond_contact",
+        "list_contacts",
+        "set_contact_policy",
+        "search_messages"
+      ]
+    },
+    {
+      "name": "custom_include",
+      "env": {
+        "TOOLS_FILTER_ENABLED": "true",
+        "TOOLS_FILTER_PROFILE": "custom",
+        "TOOLS_FILTER_MODE": "include",
+        "TOOLS_FILTER_CLUSTERS": "messaging",
+        "TOOLS_FILTER_TOOLS": "health_check"
+      },
+      "expected_tools": [
+        "health_check",
+        "send_message",
+        "reply_message",
+        "fetch_inbox",
+        "mark_message_read",
+        "acknowledge_message"
+      ]
+    },
+    {
+      "name": "custom_exclude",
+      "env": {
+        "TOOLS_FILTER_ENABLED": "true",
+        "TOOLS_FILTER_PROFILE": "custom",
+        "TOOLS_FILTER_MODE": "exclude",
+        "TOOLS_FILTER_CLUSTERS": "file_reservations,build_slots"
+      },
+      "expected_tools": [
+        "health_check",
+        "ensure_project",
+        "register_agent",
+        "create_agent_identity",
+        "whois",
+        "send_message",
+        "reply_message",
+        "fetch_inbox",
+        "mark_message_read",
+        "acknowledge_message",
+        "request_contact",
+        "respond_contact",
+        "list_contacts",
+        "set_contact_policy",
+        "install_precommit_guard",
+        "uninstall_precommit_guard",
+        "search_messages",
+        "summarize_thread",
+        "macro_start_session",
+        "macro_prepare_thread",
+        "macro_file_reservation_cycle",
+        "macro_contact_handshake",
+        "ensure_product",
+        "products_link",
+        "search_messages_product",
+        "fetch_inbox_product",
+        "summarize_thread_product"
+      ]
+    }
+  ]
+}

@@ -58,11 +58,15 @@ pub struct AttachmentConfig {
 }
 
 /// Chunk manifest when DB is split into pieces.
+///
+/// Field names and ordering match the legacy Python config exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkManifest {
-    pub chunk_count: usize,
+    pub version: u32,
     pub chunk_size: usize,
-    pub total_bytes: u64,
+    pub chunk_count: usize,
+    pub pattern: String,
+    pub original_bytes: u64,
     pub threshold_bytes: usize,
 }
 
@@ -318,7 +322,7 @@ pub fn maybe_chunk_database(
         std::fs::write(&chunk_path, chunk)?;
 
         let hash = hex_sha256(chunk);
-        sha_lines.push(format!("{hash}  {chunk_name}"));
+        sha_lines.push(format!("{hash}  chunks/{chunk_name}\n"));
 
         index += 1;
         offset = end;
@@ -326,13 +330,16 @@ pub fn maybe_chunk_database(
 
     // Write checksums
     let sha_path = output_dir.join("chunks.sha256");
-    std::fs::write(&sha_path, sha_lines.join("\n") + "\n")?;
+    let checksums_text: String = sha_lines.into_iter().collect();
+    std::fs::write(&sha_path, &checksums_text)?;
 
-    // Write chunk config
+    // Write chunk config (matches legacy Python format exactly)
     let config = ChunkManifest {
-        chunk_count: index,
+        version: 1,
         chunk_size: chunk_bytes,
-        total_bytes: file_size,
+        chunk_count: index,
+        pattern: "chunks/{index:05d}.bin".to_string(),
+        original_bytes: file_size,
         threshold_bytes,
     };
     let config_path = output_dir.join("mailbox.sqlite3.config.json");
@@ -616,6 +623,33 @@ mod tests {
     }
 
     #[test]
+    fn chunk_at_exact_threshold_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("exact.sqlite3");
+        std::fs::write(&db, vec![0u8; 50_000]).unwrap();
+        // size == threshold → no chunking (matches legacy `<=`)
+        let result = maybe_chunk_database(&db, dir.path(), 50_000, 10_000).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn chunk_one_byte_over_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("over.sqlite3");
+        std::fs::write(&db, vec![0u8; 50_001]).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // size > threshold → chunking triggered
+        let result = maybe_chunk_database(&db, &out, 50_000, 30_000).unwrap();
+        assert!(result.is_some());
+        let manifest = result.unwrap();
+        assert_eq!(manifest.chunk_count, 2); // 50001 / 30000 = 1.67 → 2 chunks
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.pattern, "chunks/{index:05d}.bin");
+        assert_eq!(manifest.original_bytes, 50_001);
+    }
+
+    #[test]
     fn chunk_large_db() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("large.sqlite3");
@@ -626,8 +660,103 @@ mod tests {
         assert!(result.is_some());
         let manifest = result.unwrap();
         assert_eq!(manifest.chunk_count, 4); // 100k / 30k = 3.33 → 4 chunks
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.chunk_size, 30_000);
+        assert_eq!(manifest.original_bytes, 100_000);
+        assert_eq!(manifest.threshold_bytes, 50_000);
+        assert_eq!(manifest.pattern, "chunks/{index:05d}.bin");
         assert!(out.join("chunks/00000.bin").exists());
+        assert!(out.join("chunks/00003.bin").exists());
         assert!(out.join("chunks.sha256").exists());
+
+        // Verify checksums file format matches legacy (chunks/ prefix)
+        let checksums = std::fs::read_to_string(out.join("chunks.sha256")).unwrap();
+        let lines: Vec<&str> = checksums.lines().collect();
+        assert_eq!(lines.len(), 4);
+        for line in &lines {
+            assert!(line.contains("  chunks/"), "checksum line should have chunks/ prefix: {line}");
+            assert!(line.ends_with(".bin"));
+        }
+    }
+
+    #[test]
+    fn chunk_deterministic_across_runs() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let data = vec![0xABu8; 100_000];
+
+        // Run 1
+        let db1 = dir1.path().join("db.sqlite3");
+        std::fs::write(&db1, &data).unwrap();
+        let out1 = dir1.path().join("out");
+        std::fs::create_dir_all(&out1).unwrap();
+        let m1 = maybe_chunk_database(&db1, &out1, 50_000, 30_000).unwrap().unwrap();
+
+        // Run 2
+        let db2 = dir2.path().join("db.sqlite3");
+        std::fs::write(&db2, &data).unwrap();
+        let out2 = dir2.path().join("out");
+        std::fs::create_dir_all(&out2).unwrap();
+        let m2 = maybe_chunk_database(&db2, &out2, 50_000, 30_000).unwrap().unwrap();
+
+        // Manifests match
+        assert_eq!(m1.chunk_count, m2.chunk_count);
+        assert_eq!(m1.original_bytes, m2.original_bytes);
+
+        // Checksums are identical
+        let cs1 = std::fs::read_to_string(out1.join("chunks.sha256")).unwrap();
+        let cs2 = std::fs::read_to_string(out2.join("chunks.sha256")).unwrap();
+        assert_eq!(cs1, cs2, "checksums should be identical for identical inputs");
+
+        // Chunk files are identical
+        for i in 0..m1.chunk_count {
+            let c1 = std::fs::read(out1.join(format!("chunks/{i:05}.bin"))).unwrap();
+            let c2 = std::fs::read(out2.join(format!("chunks/{i:05}.bin"))).unwrap();
+            assert_eq!(c1, c2, "chunk {i} should be identical");
+        }
+    }
+
+    #[test]
+    fn chunk_reassembles_to_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = vec![0xCDu8; 100_000];
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, &original).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let manifest = maybe_chunk_database(&db, &out, 50_000, 30_000).unwrap().unwrap();
+
+        // Reassemble chunks
+        let mut reassembled = Vec::new();
+        for i in 0..manifest.chunk_count {
+            let chunk = std::fs::read(out.join(format!("chunks/{i:05}.bin"))).unwrap();
+            reassembled.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(reassembled, original, "reassembled data should match original");
+    }
+
+    #[test]
+    fn chunk_config_json_matches_legacy_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, vec![0u8; 100_000]).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        maybe_chunk_database(&db, &out, 50_000, 30_000).unwrap();
+
+        let config_text = std::fs::read_to_string(out.join("mailbox.sqlite3.config.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_text).unwrap();
+
+        // Verify all legacy fields present
+        assert_eq!(config["version"], 1);
+        assert_eq!(config["chunk_size"], 30_000);
+        assert_eq!(config["chunk_count"], 4);
+        assert_eq!(config["pattern"], "chunks/{index:05d}.bin");
+        assert_eq!(config["original_bytes"], 100_000);
+        assert_eq!(config["threshold_bytes"], 50_000);
     }
 
     /// Helper to create a DB with attachment entries pointing to storage files.
