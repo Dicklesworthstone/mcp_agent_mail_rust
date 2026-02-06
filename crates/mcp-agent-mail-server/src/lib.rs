@@ -330,7 +330,7 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     mcp_agent_mail_storage::wbq_start();
     build_server(config).run_stdio();
-    mcp_agent_mail_storage::wbq_shutdown();
+    // run_stdio() does not return; WBQ drain thread exits with the process.
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {

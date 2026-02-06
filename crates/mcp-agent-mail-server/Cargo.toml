@@ -18,6 +18,7 @@ fastmcp-transport.workspace = true
 chrono.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "../mcp-agent-mail-db" }
+mcp-agent-mail-storage = { path = "../mcp-agent-mail-storage" }
 mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools" }
 
 [lints]

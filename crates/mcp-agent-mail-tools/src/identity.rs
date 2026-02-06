@@ -31,17 +31,27 @@ fn redact_database_url(url: &str) -> String {
 
 /// Try to write an agent profile to the git archive. Failures are logged
 /// but do not fail the tool call – the DB is the source of truth.
+///
+/// Uses the write-behind queue when available; falls back to synchronous
+/// write if the queue is full.
 fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &serde_json::Value) {
-    match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
-        Ok(archive) => {
-            if let Err(e) = mcp_agent_mail_storage::write_agent_profile_with_config(
-                &archive, config, agent_json,
-            ) {
-                tracing::warn!("Failed to write agent profile to archive: {e}");
+    let op = mcp_agent_mail_storage::WriteOp::AgentProfile {
+        project_slug: project_slug.to_string(),
+        config: config.clone(),
+        agent_json: agent_json.clone(),
+    };
+    if !mcp_agent_mail_storage::wbq_enqueue(op) {
+        match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
+            Ok(archive) => {
+                if let Err(e) = mcp_agent_mail_storage::write_agent_profile_with_config(
+                    &archive, config, agent_json,
+                ) {
+                    tracing::warn!("Failed to write agent profile to archive: {e}");
+                }
             }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to ensure archive for profile write: {e}");
+            Err(e) => {
+                tracing::warn!("Failed to ensure archive for profile write: {e}");
+            }
         }
     }
 }

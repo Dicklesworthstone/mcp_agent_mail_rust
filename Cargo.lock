@@ -1836,6 +1836,7 @@ name = "ftui-layout"
 version = "0.1.1"
 dependencies = [
  "ftui-core",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -3850,6 +3851,7 @@ dependencies = [
  "fastmcp-transport",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
+ "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",
  "serde",
  "serde_json",
@@ -3895,6 +3897,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -3908,6 +3911,7 @@ dependencies = [
  "fastmcp-rust",
  "fastmcp-server",
  "git2",
+ "glob",
  "globset",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",

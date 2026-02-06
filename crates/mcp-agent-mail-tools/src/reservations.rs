@@ -276,32 +276,40 @@ pub async fn file_reservation_paths(
         })
         .collect();
 
-    // Write reservation artifacts to git archive (best-effort)
+    // Write reservation artifacts to git archive (best-effort, via WBQ)
     if !granted_rows.is_empty() {
         let config = Config::from_env();
-        match mcp_agent_mail_storage::ensure_archive(&config, &project.slug) {
-            Ok(archive) => {
-                let res_jsons: Vec<serde_json::Value> = granted_rows
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "id": r.id.unwrap_or(0),
-                            "agent": &agent_name,
-                            "path_pattern": &r.path_pattern,
-                            "exclusive": r.exclusive != 0,
-                            "reason": &r.reason,
-                            "expires_ts": micros_to_iso(r.expires_ts),
-                        })
-                    })
-                    .collect();
-                if let Err(e) = mcp_agent_mail_storage::write_file_reservation_records(
-                    &archive, &config, &res_jsons,
-                ) {
-                    tracing::warn!("Failed to write reservation artifacts to archive: {e}");
+        let res_jsons: Vec<serde_json::Value> = granted_rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id.unwrap_or(0),
+                    "agent": &agent_name,
+                    "path_pattern": &r.path_pattern,
+                    "exclusive": r.exclusive != 0,
+                    "reason": &r.reason,
+                    "expires_ts": micros_to_iso(r.expires_ts),
+                })
+            })
+            .collect();
+        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+            project_slug: project.slug.clone(),
+            config: config.clone(),
+            reservations: res_jsons.clone(),
+        };
+        if !mcp_agent_mail_storage::wbq_enqueue(op) {
+            // Fallback: synchronous write
+            match mcp_agent_mail_storage::ensure_archive(&config, &project.slug) {
+                Ok(archive) => {
+                    if let Err(e) = mcp_agent_mail_storage::write_file_reservation_records(
+                        &archive, &config, &res_jsons,
+                    ) {
+                        tracing::warn!("Failed to write reservation artifacts to archive: {e}");
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to ensure archive for reservation write: {e}");
+                Err(e) => {
+                    tracing::warn!("Failed to ensure archive for reservation write: {e}");
+                }
             }
         }
     }

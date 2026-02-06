@@ -22,6 +22,9 @@ use crate::tool_util::{
 
 /// Write a message bundle to the git archive (best-effort, non-blocking).
 /// Failures are logged but never fail the tool call.
+///
+/// Uses the write-behind queue when available; falls back to synchronous
+/// write if the queue is full.
 fn try_write_message_archive(
     config: &Config,
     project_slug: &str,
@@ -30,23 +33,34 @@ fn try_write_message_archive(
     sender: &str,
     all_recipient_names: &[String],
 ) {
-    match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
-        Ok(archive) => {
-            if let Err(e) = mcp_agent_mail_storage::write_message_bundle(
-                &archive,
-                config,
-                message_json,
-                body_md,
-                sender,
-                all_recipient_names,
-                &[],
-                None,
-            ) {
-                tracing::warn!("Failed to write message bundle to archive: {e}");
+    let op = mcp_agent_mail_storage::WriteOp::MessageBundle {
+        project_slug: project_slug.to_string(),
+        config: config.clone(),
+        message_json: message_json.clone(),
+        body_md: body_md.to_string(),
+        sender: sender.to_string(),
+        recipients: all_recipient_names.to_vec(),
+    };
+    if !mcp_agent_mail_storage::wbq_enqueue(op) {
+        // Fallback: synchronous write
+        match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
+            Ok(archive) => {
+                if let Err(e) = mcp_agent_mail_storage::write_message_bundle(
+                    &archive,
+                    config,
+                    message_json,
+                    body_md,
+                    sender,
+                    all_recipient_names,
+                    &[],
+                    None,
+                ) {
+                    tracing::warn!("Failed to write message bundle to archive: {e}");
+                }
             }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to ensure archive for message write: {e}");
+            Err(e) => {
+                tracing::warn!("Failed to ensure archive for message write: {e}");
+            }
         }
     }
 }
@@ -672,12 +686,20 @@ pub async fn send_message(
     let mut notified = HashSet::new();
     for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
         if notified.insert(name.clone()) {
-            let _ = mcp_agent_mail_storage::emit_notification_signal(
-                &config,
-                &project.slug,
-                name,
-                Some(&notification_meta),
-            );
+            let op = mcp_agent_mail_storage::WriteOp::NotificationSignal {
+                config: config.clone(),
+                project_slug: project.slug.clone(),
+                agent_name: name.clone(),
+                metadata: Some(notification_meta.clone()),
+            };
+            if !mcp_agent_mail_storage::wbq_enqueue(op) {
+                let _ = mcp_agent_mail_storage::emit_notification_signal(
+                    &config,
+                    &project.slug,
+                    name,
+                    Some(&notification_meta),
+                );
+            }
         }
     }
 

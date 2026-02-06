@@ -711,7 +711,7 @@ fn run_fixtures_against_rust_server_router() {
     req_id += 1;
     assert!(!ensure_result.is_error, "ensure_project returned error");
 
-    for name in ["BoldCastle", "CalmRiver", "DeepMeadow", "IronPeak"] {
+    for name in ["BoldCastle", "CalmRiver", "QuietMeadow", "SilverPeak"] {
         let register_params = CallToolParams {
             name: "register_agent".to_string(),
             arguments: Some(serde_json::json!({
@@ -747,8 +747,8 @@ fn run_fixtures_against_rust_server_router() {
             "project_key": project_key.clone(),
             "sender_name": "BoldCastle",
             "to": ["CalmRiver"],
-            "cc": ["DeepMeadow"],
-            "bcc": ["IronPeak"],
+            "cc": ["QuietMeadow"],
+            "bcc": ["SilverPeak"],
             "subject": "Signal test",
             "body_md": "Hello from notifications test.",
             "importance": "high",
@@ -785,8 +785,8 @@ fn run_fixtures_against_rust_server_router() {
         .join(&project_slug)
         .join("agents");
     let to_signal = signal_root.join("CalmRiver.signal");
-    let cc_signal = signal_root.join("DeepMeadow.signal");
-    let bcc_signal = signal_root.join("IronPeak.signal");
+    let cc_signal = signal_root.join("QuietMeadow.signal");
+    let bcc_signal = signal_root.join("SilverPeak.signal");
 
     // Debug: check signal directory structure
     eprintln!("signal_root: {}", signal_root.display());
@@ -822,8 +822,8 @@ fn run_fixtures_against_rust_server_router() {
     }
 
     assert!(to_signal.exists(), "expected CalmRiver signal file");
-    assert!(cc_signal.exists(), "expected DeepMeadow signal file");
-    assert!(!bcc_signal.exists(), "did not expect IronPeak signal file");
+    assert!(cc_signal.exists(), "expected QuietMeadow signal file");
+    assert!(!bcc_signal.exists(), "did not expect SilverPeak signal file");
 
     let to_payload: Value = serde_json::from_str(
         &std::fs::read_to_string(&to_signal).expect("failed to read CalmRiver signal"),
@@ -861,7 +861,7 @@ fn run_fixtures_against_rust_server_router() {
         !to_signal.exists(),
         "expected CalmRiver signal to be cleared after fetch_inbox"
     );
-    assert!(cc_signal.exists(), "expected DeepMeadow signal to remain");
+    assert!(cc_signal.exists(), "expected QuietMeadow signal to remain");
 }
 
 #[test]
