@@ -5,6 +5,7 @@
 use crate::error::{DbError, DbResult};
 use crate::schema;
 use asupersync::{Cx, Outcome};
+use mcp_agent_mail_core::config::env_value;
 use sqlmodel_core::Error as SqlError;
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
 use sqlmodel_sqlite::SqliteConnection;
@@ -12,11 +13,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Default pool configuration values (from legacy Python)
-pub const DEFAULT_POOL_SIZE: usize = 3;
-pub const DEFAULT_MAX_OVERFLOW: usize = 4;
-pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 45_000;
-pub const DEFAULT_POOL_RECYCLE_MS: u64 = 30 * 60 * 1000; // 30 minutes
+/// Default pool configuration values.
+///
+/// Tuned for extreme concurrent load: 8 base + 12 overflow = 20 max connections.
+/// With WAL mode, all 20 can read concurrently; writes serialize through the WAL
+/// writer lock but the 120s busy_timeout (set in PRAGMAs) prevents SQLITE_BUSY.
+pub const DEFAULT_POOL_SIZE: usize = 8;
+pub const DEFAULT_MAX_OVERFLOW: usize = 12;
+pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 60_000;
+pub const DEFAULT_POOL_RECYCLE_MS: u64 = 60 * 60 * 1000; // 60 minutes
 
 /// Pool configuration
 #[derive(Debug, Clone)]
@@ -52,21 +57,18 @@ impl DbPoolConfig {
     /// Create config from environment
     #[must_use]
     pub fn from_env() -> Self {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "sqlite:///./storage.sqlite3".to_string());
+        let database_url =
+            env_value("DATABASE_URL").unwrap_or_else(|| "sqlite:///./storage.sqlite3".to_string());
 
-        let pool_size = std::env::var("DATABASE_POOL_SIZE")
-            .ok()
+        let pool_size = env_value("DATABASE_POOL_SIZE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_POOL_SIZE);
 
-        let max_overflow = std::env::var("DATABASE_MAX_OVERFLOW")
-            .ok()
+        let max_overflow = env_value("DATABASE_MAX_OVERFLOW")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_MAX_OVERFLOW);
 
-        let pool_timeout = std::env::var("DATABASE_POOL_TIMEOUT")
-            .ok()
+        let pool_timeout = env_value("DATABASE_POOL_TIMEOUT")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_POOL_TIMEOUT_MS);
 

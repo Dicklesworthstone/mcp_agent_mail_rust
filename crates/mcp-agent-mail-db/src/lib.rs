@@ -26,7 +26,10 @@ pub use error::{DbError, DbResult};
 pub use models::*;
 pub use pool::{DbPool, DbPoolConfig, create_pool, get_or_create_pool};
 pub use timestamps::{iso_to_micros, micros_to_iso, micros_to_naive, naive_to_micros, now_micros};
-pub use tracking::{QueryTracker, QueryTrackerSnapshot, SlowQueryEntry, elapsed_us, query_timer};
+pub use tracking::{
+    ActiveTrackerGuard, QueryTracker, QueryTrackerSnapshot, SlowQueryEntry, active_tracker,
+    elapsed_us, query_timer, set_active_tracker,
+};
 
 /// Global query tracker instance.
 ///

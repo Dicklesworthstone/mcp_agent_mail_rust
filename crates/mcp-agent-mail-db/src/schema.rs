@@ -160,14 +160,27 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
 END;
 ";
 
-/// SQL for WAL mode and performance settings
+/// SQL for WAL mode and performance settings.
+///
+/// Tuned for extreme concurrent load (dozens of agents, thousands of ops/sec):
+///
+/// - **WAL mode**: readers never block writers, writers never block readers
+/// - **synchronous=NORMAL**: fsync on commit (not per-statement) — safe with WAL
+/// - **busy_timeout=120s**: generous wait under extreme contention before SQLITE_BUSY
+/// - **wal_autocheckpoint=2000**: fewer checkpoints under sustained write bursts
+/// - **cache_size=64MB**: large page cache to avoid disk reads for hot data
+/// - **mmap_size=512MB**: memory-mapped I/O for sequential scan acceleration
+/// - **temp_store=MEMORY**: temp tables and indices stay in RAM (never hit disk)
+/// - **threads=4**: allow SQLite to parallelize sorting and other internal work
 pub const PRAGMA_SETTINGS_SQL: &str = r"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
-PRAGMA busy_timeout = 60000;
-PRAGMA wal_autocheckpoint = 1000;
-PRAGMA cache_size = -32768;
-PRAGMA mmap_size = 268435456;
+PRAGMA busy_timeout = 120000;
+PRAGMA wal_autocheckpoint = 2000;
+PRAGMA cache_size = -65536;
+PRAGMA mmap_size = 536870912;
+PRAGMA temp_store = MEMORY;
+PRAGMA threads = 4;
 ";
 
 /// Initialize the database schema

@@ -17,8 +17,7 @@ const SLOW_QUERY_LIMIT: usize = 50;
 /// Compiled table extraction patterns (built once, reused).
 static TABLE_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
-        Regex::new(r#"(?i)\binsert\s+(?:or\s+\w+\s+)?into\s+([\w.`"\[\]]+)"#)
-            .unwrap(),
+        Regex::new(r#"(?i)\binsert\s+(?:or\s+\w+\s+)?into\s+([\w.`"\[\]]+)"#).unwrap(),
         Regex::new(r#"(?i)\bupdate\s+([\w.`"\[\]]+)"#).unwrap(),
         Regex::new(r#"(?i)\bfrom\s+([\w.`"\[\]]+)"#).unwrap(),
     ]
@@ -253,13 +252,10 @@ pub fn active_tracker() -> Option<Arc<QueryTracker>> {
     ACTIVE_TRACKER.with(|slot| slot.borrow().clone())
 }
 
-/// Global tracker singleton, used as a fallback when no active tracker is set.
-static GLOBAL_TRACKER: LazyLock<QueryTracker> = LazyLock::new(QueryTracker::new);
-
 /// Access the global tracker for enabling/disabling and snapshots.
 #[must_use]
 pub fn global_tracker() -> &'static QueryTracker {
-    &GLOBAL_TRACKER
+    &crate::QUERY_TRACKER
 }
 
 /// Record a query against the active tracker (or the global fallback).
@@ -270,7 +266,7 @@ pub fn record_query(sql: &str, duration_us: u64) {
     if let Some(tracker) = active_tracker() {
         tracker.record(sql, duration_us);
     } else {
-        GLOBAL_TRACKER.record(sql, duration_us);
+        crate::QUERY_TRACKER.record(sql, duration_us);
     }
 }
 
@@ -289,8 +285,8 @@ fn extract_table(sql: &str) -> Option<String> {
                 let raw = m.as_str();
                 // Take last segment after schema dots, then strip quote chars
                 let last_segment = SCHEMA_DOT.split(raw).last().unwrap_or(raw);
-                let table = last_segment
-                    .trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']');
+                let table =
+                    last_segment.trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']');
                 if table.is_empty() {
                     return None;
                 }
@@ -311,6 +307,15 @@ fn round_ms(us: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn round_f64_to_u64(value: f64) -> u64 {
+        if value.is_sign_negative() {
+            0
+        } else {
+            value.round() as u64
+        }
+    }
 
     #[test]
     fn extract_table_insert() {
@@ -409,7 +414,8 @@ mod tests {
             let expected = v["expected"].as_str().map(String::from);
             let actual = extract_table(sql);
             assert_eq!(
-                actual, expected,
+                actual,
+                expected,
                 "table_extraction vector {i}: {desc}",
                 desc = v["desc"].as_str().unwrap_or("?")
             );
@@ -429,7 +435,7 @@ mod tests {
             let slow_threshold_ms = if v["slow_query_ms"].is_null() {
                 None
             } else {
-                Some(v["slow_query_ms"].as_f64().unwrap() as u64)
+                Some(round_f64_to_u64(v["slow_query_ms"].as_f64().unwrap()))
             };
 
             let tracker = QueryTracker::new();
@@ -440,8 +446,8 @@ mod tests {
                 let sql = q["sql"].as_str().unwrap();
                 let duration_ms = q["duration_ms"].as_f64().unwrap();
                 // Convert ms to us for the tracker
-                let duration_us = (duration_ms * 1000.0) as u64;
-                tracker.record(sql, duration_us);
+                let duration_micros = round_f64_to_u64(duration_ms * 1000.0);
+                tracker.record(sql, duration_micros);
             }
 
             let snap = tracker.snapshot();
@@ -503,8 +509,11 @@ mod tests {
                 expected_slow.len(),
                 "aggregation vector {i} ({desc}): slow_queries count mismatch"
             );
-            for (j, (actual_sq, expected_sq)) in
-                snap.slow_queries.iter().zip(expected_slow.iter()).enumerate()
+            for (j, (actual_sq, expected_sq)) in snap
+                .slow_queries
+                .iter()
+                .zip(expected_slow.iter())
+                .enumerate()
             {
                 let exp_table = expected_sq["table"].as_str().map(String::from);
                 assert_eq!(

@@ -1184,7 +1184,11 @@ pub fn sanitize_fts_query(query: &str) -> Option<String> {
     // Match: POL-358, FEAT-123, foo-bar-baz (not already quoted)
     result = quote_hyphenated_tokens(&result);
 
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 /// Quote hyphenated tokens (e.g. `POL-358` → `"POL-358"`) for FTS5.
@@ -1193,7 +1197,10 @@ fn quote_hyphenated_tokens(query: &str) -> String {
         return query.to_string();
     }
     // If the entire query is a single quoted string, leave it alone
-    if query.starts_with('"') && query.ends_with('"') && query.chars().filter(|c| *c == '"').count() == 2 {
+    if query.starts_with('"')
+        && query.ends_with('"')
+        && query.chars().filter(|c| *c == '"').count() == 2
+    {
         return query.to_string();
     }
 
@@ -1261,7 +1268,9 @@ fn quote_hyphenated_tokens(query: &str) -> String {
 fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
     const STOPWORDS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
     let mut terms: Vec<String> = Vec::new();
-    for token in query.split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '/' && c != '-') {
+    for token in query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '/' && c != '-')
+    {
         if token.len() < 2 {
             continue;
         }
@@ -2543,30 +2552,30 @@ pub async fn get_agent_last_mail_activity(
                     JOIN messages m ON m.id = r.message_id \
                     WHERE r.agent_id = ? AND m.project_id = ?";
     let params2 = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-    let (read_ts, ack_ts) = match map_sql_outcome(traw_query(cx, &tracked, sql_read, &params2).await)
-    {
-        Outcome::Ok(rows) => {
-            let row = rows.first();
-            let read = row.and_then(|r| {
-                r.get(0).and_then(|v| match v {
-                    Value::BigInt(n) if *n > 0 => Some(*n),
-                    Value::Int(n) if *n > 0 => Some(i64::from(*n)),
-                    _ => None,
-                })
-            });
-            let ack = row.and_then(|r| {
-                r.get(1).and_then(|v| match v {
-                    Value::BigInt(n) if *n > 0 => Some(*n),
-                    Value::Int(n) if *n > 0 => Some(i64::from(*n)),
-                    _ => None,
-                })
-            });
-            (read, ack)
-        }
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    let (read_ts, ack_ts) =
+        match map_sql_outcome(traw_query(cx, &tracked, sql_read, &params2).await) {
+            Outcome::Ok(rows) => {
+                let row = rows.first();
+                let read = row.and_then(|r| {
+                    r.get(0).and_then(|v| match v {
+                        Value::BigInt(n) if *n > 0 => Some(*n),
+                        Value::Int(n) if *n > 0 => Some(i64::from(*n)),
+                        _ => None,
+                    })
+                });
+                let ack = row.and_then(|r| {
+                    r.get(1).and_then(|v| match v {
+                        Value::BigInt(n) if *n > 0 => Some(*n),
+                        Value::Int(n) if *n > 0 => Some(i64::from(*n)),
+                        _ => None,
+                    })
+                });
+                (read, ack)
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
     // Return the maximum of all timestamps
     let max_ts = [sent_ts, read_ts, ack_ts].into_iter().flatten().max();
