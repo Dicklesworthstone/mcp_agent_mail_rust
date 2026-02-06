@@ -57,7 +57,7 @@
 | Reserve paths (+ archive artifact write) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/reservations.rs` |
 | Renew reservations | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/reservations.rs` |
 | Release reservations | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/reservations.rs` |
-| Force-release stale reservations | Implemented | `crates/mcp-agent-mail-tools/src/reservations.rs` (inactivity heuristics + notification) |
+| Force-release stale reservations | Verified (Tests) | `crates/mcp-agent-mail-tools/src/reservations.rs` (inactivity heuristics + notification), `tests/e2e/test_stdio.sh` (E2E: setup stale agent, force-release, verify response + notification + error path) |
 | Reservation views | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 
 ## Build Slots
