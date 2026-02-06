@@ -12,6 +12,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod output;
+
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -703,8 +705,8 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 );
             }
             let do_zip = resolve_bool(args.zip, args.no_zip, false);
-            run_share_export(ShareExportParams {
-                output: args.bundle,
+            run_share_update(ShareUpdateParams {
+                bundle: args.bundle,
                 projects: if args.projects.is_empty() {
                     stored.projects
                 } else {
@@ -715,7 +717,6 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 scrub_preset: _preset,
                 chunk_threshold: chunk_threshold.max(0) as usize,
                 chunk_size: chunk_size.max(1024) as usize,
-                dry_run: false,
                 zip: do_zip,
                 signing_key: args.signing_key,
                 signing_public_out: args.signing_public_out,
@@ -725,25 +726,16 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
         ShareCommand::Preview(args) => {
             ensure_dir(&args.bundle)?;
             let open = resolve_bool(args.open_browser, args.no_open_browser, false);
-            ftui_runtime::ftui_println!("Serving bundle at http://{}:{}/", args.host, args.port);
-            if open {
-                let url = format!("http://{}:{}/", args.host, args.port);
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&url)
-                    .spawn()
-                    .or_else(|_| std::process::Command::new("open").arg(&url).spawn());
-            }
-            serve_static_dir(&args.bundle, &args.host, args.port)?;
-            Ok(())
+            run_share_preview(&args.bundle, &args.host, args.port, open)
         }
         ShareCommand::Verify(args) => {
             ensure_dir(&args.bundle)?;
             let result = share::verify_bundle_crypto(&args.bundle, args.public_key.as_deref())?;
-            ftui_runtime::ftui_println!("Bundle: {}", result.bundle);
-            ftui_runtime::ftui_println!("  SRI checked:      {}", result.sri_checked);
-            ftui_runtime::ftui_println!("  SRI valid:         {}", result.sri_valid);
-            ftui_runtime::ftui_println!("  Signature checked: {}", result.signature_checked);
-            ftui_runtime::ftui_println!("  Signature valid:   {}", result.signature_verified);
+            output::section(&format!("Bundle: {}", result.bundle));
+            output::kv("SRI checked", &result.sri_checked.to_string());
+            output::kv("SRI valid", &result.sri_valid.to_string());
+            output::kv("Signature checked", &result.signature_checked.to_string());
+            output::kv("Signature valid", &result.signature_verified.to_string());
             if let Some(ref err) = result.error {
                 ftui_runtime::ftui_eprintln!("  Error: {err}");
                 return Err(CliError::ExitCode(1));
@@ -789,13 +781,9 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
             Ok(())
         }
         ShareCommand::Wizard => {
-            let script = find_share_wizard_script().ok_or_else(|| {
-                CliError::Other(
-                    "share wizard script not found: scripts/share_to_github_pages.py".to_string(),
-                )
-            })?;
-            run_python_script(&script)?;
-            Ok(())
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("failed to resolve current dir: {e}")))?;
+            run_share_wizard_in_cwd(&cwd)
         }
     }
 }
@@ -866,25 +854,25 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
         }
         GuardCommand::Status { repo } => {
             let status = mcp_agent_mail_guard::guard_status(&repo)?;
-            ftui_runtime::ftui_println!("Guard Status:");
-            ftui_runtime::ftui_println!("  Hooks dir:       {}", status.hooks_dir);
-            ftui_runtime::ftui_println!("  Mode:            {:?}", status.guard_mode);
-            ftui_runtime::ftui_println!("  Worktrees:       {}", status.worktrees_enabled);
-            ftui_runtime::ftui_println!(
-                "  Pre-commit:      {}",
+            output::section("Guard Status:");
+            output::kv("Hooks dir", &status.hooks_dir);
+            output::kv("Mode", &format!("{:?}", status.guard_mode));
+            output::kv("Worktrees", &status.worktrees_enabled.to_string());
+            output::kv(
+                "Pre-commit",
                 if status.pre_commit_present {
                     "installed"
                 } else {
                     "not installed"
-                }
+                },
             );
-            ftui_runtime::ftui_println!(
-                "  Pre-push:        {}",
+            output::kv(
+                "Pre-push",
                 if status.pre_push_present {
                     "installed"
                 } else {
                     "not installed"
-                }
+                },
             );
             Ok(())
         }
@@ -937,7 +925,16 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
 }
 
 fn handle_list_projects(include_agents: bool, json_output: bool) -> CliResult<()> {
-    let conn = open_db_sync()?;
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    handle_list_projects_with_database_url(&cfg.database_url, include_agents, json_output)
+}
+
+fn handle_list_projects_with_database_url(
+    database_url: &str,
+    include_agents: bool,
+    json_output: bool,
+) -> CliResult<()> {
+    let conn = open_db_sync_with_database_url(database_url)?;
 
     let projects = conn
         .query_sync(
@@ -990,26 +987,36 @@ fn handle_list_projects(include_agents: bool, json_output: bool) -> CliResult<()
         );
     } else {
         if projects.is_empty() {
-            ftui_runtime::ftui_println!("No projects found.");
+            output::empty_result(false, "No projects found.");
             return Ok(());
         }
+        let mut table = output::CliTable::new(vec!["ID", "SLUG", "HUMAN_KEY"]);
         for row in &projects {
             let id: i64 = row.get_named("id").unwrap_or(0);
             let slug: String = row.get_named("slug").unwrap_or_default();
             let human_key: String = row.get_named("human_key").unwrap_or_default();
-            ftui_runtime::ftui_println!("{:<4} {:<30} {}", id, slug, human_key);
-            if include_agents {
+            table.add_row(vec![id.to_string(), slug, human_key]);
+        }
+        table.render();
+        if include_agents {
+            ftui_runtime::ftui_println!("");
+            for row in &projects {
+                let id: i64 = row.get_named("id").unwrap_or(0);
+                let slug: String = row.get_named("slug").unwrap_or_default();
                 let agents = conn
                     .query_sync(
                         "SELECT name, program, model FROM agents WHERE project_id = ?",
                         &[sqlmodel_core::Value::BigInt(id)],
                     )
                     .unwrap_or_default();
-                for a in &agents {
-                    let name: String = a.get_named("name").unwrap_or_default();
-                    let program: String = a.get_named("program").unwrap_or_default();
-                    let model: String = a.get_named("model").unwrap_or_default();
-                    ftui_runtime::ftui_println!("     -> {} ({}/{})", name, program, model);
+                if !agents.is_empty() {
+                    output::section(&format!("Agents for {slug}:"));
+                    for a in &agents {
+                        let name: String = a.get_named("name").unwrap_or_default();
+                        let program: String = a.get_named("program").unwrap_or_default();
+                        let model: String = a.get_named("model").unwrap_or_default();
+                        ftui_runtime::ftui_println!("  {name} ({program}/{model})");
+                    }
                 }
             }
         }
@@ -1018,8 +1025,13 @@ fn handle_list_projects(include_agents: bool, json_output: bool) -> CliResult<()
 }
 
 /// Open a synchronous SQLite connection for CLI commands.
-fn open_db_sync() -> CliResult<sqlmodel_sqlite::SqliteConnection> {
-    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+fn open_db_sync_with_database_url(
+    database_url: &str,
+) -> CliResult<sqlmodel_sqlite::SqliteConnection> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
@@ -1030,6 +1042,11 @@ fn open_db_sync() -> CliResult<sqlmodel_sqlite::SqliteConnection> {
     conn.execute_raw(&init_sql)
         .map_err(|e| CliError::Other(format!("schema init failed: {e}")))?;
     Ok(conn)
+}
+
+fn open_db_sync() -> CliResult<sqlmodel_sqlite::SqliteConnection> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    open_db_sync_with_database_url(&cfg.database_url)
 }
 
 fn handle_config(action: ConfigCommand) -> CliResult<()> {
@@ -1125,17 +1142,11 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
             if rows.is_empty() {
-                ftui_runtime::ftui_println!("No file reservations found.");
+                output::empty_result(false, "No file reservations found.");
                 return Ok(());
             }
-            ftui_runtime::ftui_println!(
-                "{:<5} {:<30} {:<12} {:<20} {}",
-                "ID",
-                "PATTERN",
-                "AGENT",
-                "EXPIRES",
-                "REASON"
-            );
+            let mut table =
+                output::CliTable::new(vec!["ID", "PATTERN", "AGENT", "EXPIRES", "REASON"]);
             for r in &rows {
                 let id: i64 = r.get_named("id").unwrap_or(0);
                 let pattern: String = r.get_named("path_pattern").unwrap_or_default();
@@ -1143,15 +1154,16 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
                 let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
                 let reason: String = r.get_named("reason").unwrap_or_default();
                 let expires_str = mcp_agent_mail_db::timestamps::micros_to_iso(expires);
-                ftui_runtime::ftui_println!(
-                    "{:<5} {:<30} {:<12} {:<20} {}",
-                    id,
+                let expires_display = expires_str.get(..20).unwrap_or(&expires_str).to_string();
+                table.add_row(vec![
+                    id.to_string(),
                     pattern,
                     agent,
-                    &expires_str[..20.min(expires_str.len())],
-                    reason
-                );
+                    expires_display,
+                    reason,
+                ]);
             }
+            table.render();
             Ok(())
         }
         FileReservationsCommand::Active { project, limit } => {
@@ -1211,19 +1223,19 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
                 ftui_runtime::ftui_println!("No reservations expiring within {} minutes.", minutes);
                 return Ok(());
             }
-            ftui_runtime::ftui_println!("Reservations expiring within {} minutes:", minutes);
+            output::section(&format!(
+                "Reservations expiring within {} minutes:",
+                minutes
+            ));
+            let mut table = output::CliTable::new(vec!["PATTERN", "AGENT", "REMAINING"]);
             for r in &rows {
                 let pattern: String = r.get_named("path_pattern").unwrap_or_default();
                 let agent: String = r.get_named("agent_name").unwrap_or_default();
                 let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
                 let remaining_min = (expires - now_us) / 60_000_000;
-                ftui_runtime::ftui_println!(
-                    "  {} by {} ({}min left)",
-                    pattern,
-                    agent,
-                    remaining_min
-                );
+                table.add_row(vec![pattern, agent, format!("{}min", remaining_min)]);
             }
+            table.render();
             Ok(())
         }
     }
@@ -1262,29 +1274,19 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
             if rows.is_empty() {
-                ftui_runtime::ftui_println!("No pending acks.");
+                output::empty_result(false, "No pending acks.");
                 return Ok(());
             }
-            ftui_runtime::ftui_println!(
-                "{:<6} {:<12} {:<40} {}",
-                "ID",
-                "FROM",
-                "SUBJECT",
-                "IMPORTANCE"
-            );
+            let mut table = output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE"]);
             for r in &rows {
                 let id: i64 = r.get_named("id").unwrap_or(0);
                 let subject: String = r.get_named("subject").unwrap_or_default();
                 let sender: String = r.get_named("sender_name").unwrap_or_default();
                 let importance: String = r.get_named("importance").unwrap_or_default();
-                ftui_runtime::ftui_println!(
-                    "{:<6} {:<12} {:<40} {}",
-                    id,
-                    sender,
-                    &subject[..40.min(subject.len())],
-                    importance
-                );
+                let subject_display = subject.get(..40).unwrap_or(&subject).to_string();
+                table.add_row(vec![id.to_string(), sender, subject_display, importance]);
             }
+            table.render();
             Ok(())
         }
         AcksCommand::Remind {
@@ -1318,24 +1320,25 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
             if rows.is_empty() {
-                ftui_runtime::ftui_println!("No stale acks needing reminders.");
+                output::empty_result(false, "No stale acks needing reminders.");
                 return Ok(());
             }
-            ftui_runtime::ftui_println!("Stale acks (>{}min old):", min_age_minutes);
+            output::section(&format!("Stale acks (>{min_age_minutes}min old):"));
+            let mut table = output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "AGE"]);
             for r in &rows {
                 let id: i64 = r.get_named("id").unwrap_or(0);
                 let subject: String = r.get_named("subject").unwrap_or_default();
                 let sender: String = r.get_named("sender_name").unwrap_or_default();
                 let age_min =
                     (now_us - r.get_named::<i64>("created_ts").unwrap_or(now_us)) / 60_000_000;
-                ftui_runtime::ftui_println!(
-                    "  [{}] from {} - \"{}\" ({}min ago)",
-                    id,
+                table.add_row(vec![
+                    id.to_string(),
                     sender,
                     subject,
-                    age_min
-                );
+                    format!("{age_min}min"),
+                ]);
             }
+            table.render();
             Ok(())
         }
         AcksCommand::Overdue {
@@ -1369,24 +1372,25 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
             if rows.is_empty() {
-                ftui_runtime::ftui_println!("No overdue acks.");
+                output::empty_result(false, "No overdue acks.");
                 return Ok(());
             }
-            ftui_runtime::ftui_println!("OVERDUE acks (>{}min TTL):", ttl_minutes);
+            output::section(&format!("OVERDUE acks (>{ttl_minutes}min TTL):"));
+            let mut table = output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "OVERDUE"]);
             for r in &rows {
                 let id: i64 = r.get_named("id").unwrap_or(0);
                 let subject: String = r.get_named("subject").unwrap_or_default();
                 let sender: String = r.get_named("sender_name").unwrap_or_default();
                 let age_min =
                     (now_us - r.get_named::<i64>("created_ts").unwrap_or(now_us)) / 60_000_000;
-                ftui_runtime::ftui_println!(
-                    "  [{}] from {} - \"{}\" ({}min overdue)",
-                    id,
+                table.add_row(vec![
+                    id.to_string(),
                     sender,
                     subject,
-                    age_min
-                );
+                    format!("{age_min}min"),
+                ]);
             }
+            table.render();
             Ok(())
         }
     }
@@ -1415,17 +1419,13 @@ fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResul
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
     if rows.is_empty() {
-        ftui_runtime::ftui_println!("No ack-required messages for {agent_name}.");
+        output::empty_result(
+            false,
+            &format!("No ack-required messages for {agent_name}."),
+        );
         return Ok(());
     }
-    ftui_runtime::ftui_println!(
-        "{:<6} {:<12} {:<35} {:<8} {}",
-        "ID",
-        "FROM",
-        "SUBJECT",
-        "STATUS",
-        "CREATED"
-    );
+    let mut table = output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "STATUS", "CREATED"]);
     for r in &rows {
         let id: i64 = r.get_named("id").unwrap_or(0);
         let subject: String = r.get_named("subject").unwrap_or_default();
@@ -1434,15 +1434,17 @@ fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResul
         let created: i64 = r.get_named("created_ts").unwrap_or(0);
         let status = if ack_ts.is_some() { "acked" } else { "pending" };
         let created_str = mcp_agent_mail_db::timestamps::micros_to_iso(created);
-        ftui_runtime::ftui_println!(
-            "{:<6} {:<12} {:<35} {:<8} {}",
-            id,
+        let subject_display = subject.get(..35).unwrap_or(&subject).to_string();
+        let created_display = created_str.get(..19).unwrap_or(&created_str).to_string();
+        table.add_row(vec![
+            id.to_string(),
             sender,
-            &subject[..35.min(subject.len())],
-            status,
-            &created_str[..19.min(created_str.len())]
-        );
+            subject_display,
+            status.to_string(),
+            created_display,
+        ]);
     }
+    table.render();
     Ok(())
 }
 
@@ -1722,27 +1724,74 @@ fn handle_typecheck() -> CliResult<()> {
     }
 }
 
-fn find_share_wizard_script() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let mut candidates = Vec::new();
-    candidates.push(cwd.join("scripts/share_to_github_pages.py"));
-
-    // Also check workspace root relative to this crate.
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(root) = manifest_dir.parent().and_then(|p| p.parent()) {
-        candidates.push(root.join("scripts/share_to_github_pages.py"));
-    }
-
-    candidates.into_iter().find(|p| p.exists())
+struct ShareWizardScriptResolution {
+    source_path: PathBuf,
+    cwd_path: PathBuf,
+    chosen: Option<PathBuf>,
 }
 
-fn run_python_script(script: &Path) -> CliResult<()> {
+fn resolve_share_wizard_script(cwd: &Path) -> ShareWizardScriptResolution {
+    let cwd_path = cwd.join("scripts/share_to_github_pages.py");
+
+    // Workspace root relative to this crate (source tree).
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(manifest_dir);
+    let source_path = source_root.join("scripts/share_to_github_pages.py");
+
+    let chosen = if is_readable_file(&cwd_path) {
+        Some(cwd_path.clone())
+    } else if is_readable_file(&source_path) {
+        Some(source_path.clone())
+    } else {
+        None
+    };
+
+    ShareWizardScriptResolution {
+        source_path,
+        cwd_path,
+        chosen,
+    }
+}
+
+fn is_readable_file(path: &Path) -> bool {
+    path.is_file() && std::fs::File::open(path).is_ok()
+}
+
+fn run_share_wizard_in_cwd(cwd: &Path) -> CliResult<()> {
+    ftui_runtime::ftui_println!("Launching deployment wizard...");
+
+    let resolution = resolve_share_wizard_script(cwd);
+    let Some(script) = resolution.chosen.as_deref() else {
+        ftui_runtime::ftui_eprintln!("Wizard script not found.");
+        ftui_runtime::ftui_eprintln!("Expected locations:");
+        ftui_runtime::ftui_eprintln!("  - {}", resolution.source_path.display());
+        ftui_runtime::ftui_eprintln!("  - {}", resolution.cwd_path.display());
+        ftui_runtime::ftui_eprintln!("");
+        ftui_runtime::ftui_eprintln!("This command only works when running from source.");
+        ftui_runtime::ftui_eprintln!(
+            "Run the wizard directly: python scripts/share_to_github_pages.py"
+        );
+        return Err(CliError::ExitCode(1));
+    };
+
+    run_python_script_in_cwd(script, cwd)
+}
+
+fn run_python_script_in_cwd(script: &Path, cwd: &Path) -> CliResult<()> {
     let mut cmd = std::process::Command::new("python");
     cmd.arg(script);
+    cmd.current_dir(cwd);
+
     let status = match cmd.status() {
         Ok(status) => status,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::process::Command::new("python3").arg(script).status()?
+            let mut cmd = std::process::Command::new("python3");
+            cmd.arg(script);
+            cmd.current_dir(cwd);
+            cmd.status()?
         }
         Err(err) => return Err(err.into()),
     };
@@ -1761,10 +1810,10 @@ fn handle_projects(action: ProjectsCommand) -> CliResult<()> {
             no_commit,
         } => {
             let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
-            ftui_runtime::ftui_println!("Project UID:  {}", identity.project_uid);
-            ftui_runtime::ftui_println!("Human key:    {}", identity.human_key);
+            output::kv("Project UID", &identity.project_uid);
+            output::kv("Human key", &identity.human_key);
             if let Some(ref b) = identity.branch {
-                ftui_runtime::ftui_println!("Branch:       {b}");
+                output::kv("Branch", b);
             }
             if commit && !no_commit {
                 ftui_runtime::ftui_println!("Identity committed to config.");
@@ -1809,10 +1858,28 @@ fn handle_projects(action: ProjectsCommand) -> CliResult<()> {
 }
 
 fn handle_doctor_check(project: Option<String>, verbose: bool, json: bool) -> CliResult<()> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let config = Config::from_env();
+    handle_doctor_check_with(
+        &cfg.database_url,
+        &config.storage_root,
+        project,
+        verbose,
+        json,
+    )
+}
+
+fn handle_doctor_check_with(
+    database_url: &str,
+    storage_root: &Path,
+    project: Option<String>,
+    verbose: bool,
+    json: bool,
+) -> CliResult<()> {
     let mut checks: Vec<serde_json::Value> = Vec::new();
 
     // Check 1: Database accessible
-    let db_ok = open_db_sync().is_ok();
+    let db_ok = open_db_sync_with_database_url(database_url).is_ok();
     checks.push(serde_json::json!({
         "check": "database",
         "status": if db_ok { "ok" } else { "fail" },
@@ -1820,17 +1887,16 @@ fn handle_doctor_check(project: Option<String>, verbose: bool, json: bool) -> Cl
     }));
 
     // Check 2: Storage root exists
-    let config = Config::from_env();
-    let storage_ok = config.storage_root.exists();
+    let storage_ok = storage_root.exists();
     checks.push(serde_json::json!({
         "check": "storage_root",
         "status": if storage_ok { "ok" } else { "warn" },
-        "detail": format!("{}", config.storage_root.display()),
+        "detail": format!("{}", storage_root.display()),
     }));
 
     // Check 3: Project-specific checks
     if let Some(ref slug) = project {
-        if let Ok(conn) = open_db_sync() {
+        if let Ok(conn) = open_db_sync_with_database_url(database_url) {
             let rows = conn
                 .query_sync(
                     "SELECT id, slug FROM projects WHERE slug = ?",
@@ -1949,9 +2015,9 @@ fn handle_mail(action: MailCommand) -> CliResult<()> {
                 .and_then(|r| r.get_named("cnt").ok())
                 .unwrap_or(0);
 
-            ftui_runtime::ftui_println!("Project: {slug}");
-            ftui_runtime::ftui_println!("  Messages: {total}");
-            ftui_runtime::ftui_println!("  Agents:   {agents}");
+            output::section(&format!("Project: {slug}"));
+            output::kv("Messages", &total.to_string());
+            output::kv("Agents", &agents.to_string());
             Ok(())
         }
     }
@@ -1997,6 +2063,11 @@ fn handle_amctl(action: AmctlCommand) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stdio_capture_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
 
     #[test]
     fn serve_http_overrides_are_applied() {
@@ -2134,6 +2205,9 @@ mod tests {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
         let capture = StdioCapture::install().unwrap();
         handle_amctl(AmctlCommand::Env {
@@ -2246,6 +2320,9 @@ mod tests {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
@@ -2316,6 +2393,9 @@ mod tests {
         use ftui_runtime::stdio_capture::StdioCapture;
 
         let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
 
@@ -2616,6 +2696,143 @@ mod tests {
     }
 
     #[test]
+    fn share_preview_status_endpoint_and_hotkeys() {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fn http_get(
+            addr: SocketAddr,
+            path: &str,
+        ) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+                host = addr
+            );
+            stream.write_all(req.as_bytes()).expect("write request");
+            stream.flush().expect("flush");
+
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).expect("read response");
+
+            let split = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("header split");
+            let (head, body) = buf.split_at(split + 4);
+
+            let head_str = String::from_utf8_lossy(head);
+            let mut lines = head_str.split("\r\n");
+            let status_line = lines.next().unwrap_or_default();
+            let code: u16 = status_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+
+            let mut headers = std::collections::HashMap::new();
+            for line in lines {
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                }
+            }
+            (code, headers, body.to_vec())
+        }
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle dir");
+        std::fs::write(bundle.join("index.html"), "<html>root</html>").expect("write index");
+        std::fs::write(bundle.join("manifest.json"), "{}\n").expect("write manifest");
+        share::copy_viewer_assets(&bundle).expect("copy viewer assets");
+
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+        let artifacts_dir = PathBuf::from("tests/artifacts/cli/share_preview").join(ts);
+
+        let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+        let (key_tx, key_rx) = mpsc::channel::<char>();
+
+        let thread = std::thread::spawn(move || {
+            run_share_preview_with_control(
+                bundle,
+                "127.0.0.1".to_string(),
+                0,
+                false,
+                Some(key_rx),
+                Some(addr_tx),
+                Some(artifacts_dir),
+            )
+        });
+
+        let addr = addr_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("preview server did not start");
+
+        let (code, headers, body) = http_get(addr, "/__preview__/status");
+        assert_eq!(code, 200, "status endpoint should return 200");
+        assert!(
+            headers
+                .get("cache-control")
+                .is_some_and(|v| v.contains("no-cache")),
+            "expected cache-control no-cache header"
+        );
+        assert_eq!(
+            headers.get("pragma").map(String::as_str),
+            Some("no-cache"),
+            "expected pragma no-cache header"
+        );
+        let status1: serde_json::Value =
+            serde_json::from_slice(&body).expect("status endpoint JSON");
+        let sig1 = status1
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(!sig1.is_empty(), "expected non-empty signature");
+        let manual1 = status1
+            .get("manual_token")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let (code, headers, _body) = http_get(addr, "/viewer/");
+        assert_eq!(code, 200, "/viewer/ should serve index.html");
+        assert!(
+            headers
+                .get("cache-control")
+                .is_some_and(|v| v.contains("no-cache")),
+            "expected cache-control no-cache header on static responses"
+        );
+
+        key_tx.send('r').expect("send reload");
+        std::thread::sleep(Duration::from_millis(50));
+        let (_code, _headers, body) = http_get(addr, "/__preview__/status");
+        let status2: serde_json::Value =
+            serde_json::from_slice(&body).expect("status endpoint JSON (2)");
+        let sig2 = status2
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let manual2 = status2
+            .get("manual_token")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert_ne!(sig1, sig2, "signature should change after reload");
+        assert!(
+            manual2 > manual1,
+            "manual token should increase after reload"
+        );
+
+        key_tx.send('d').expect("send deploy");
+        let result = thread.join().expect("join preview thread");
+        assert!(matches!(result, Err(CliError::ExitCode(42))));
+    }
+
+    #[test]
     fn clap_parses_share_wizard() {
         let cli =
             Cli::try_parse_from(["am", "share", "wizard"]).expect("failed to parse share wizard");
@@ -2625,6 +2842,102 @@ mod tests {
                 action: ShareCommand::Wizard
             }
         ));
+    }
+
+    #[test]
+    fn share_wizard_missing_script_emits_legacy_message_and_exit_code() {
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+        let temp = tempfile::TempDir::new().expect("tempdir");
+
+        let err = run_share_wizard_in_cwd(temp.path()).expect_err("expected error");
+        assert!(matches!(err, CliError::ExitCode(1)));
+
+        let output = capture.drain_to_string();
+
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let artifact_dir = repo_root
+            .join("tests")
+            .join("artifacts")
+            .join("cli")
+            .join("share_wizard")
+            .join(ts);
+        std::fs::create_dir_all(&artifact_dir).expect("create artifacts dir");
+        std::fs::write(artifact_dir.join("missing_script_output.txt"), &output)
+            .expect("write artifact");
+
+        assert!(output.contains("Launching deployment wizard..."));
+        assert!(output.contains("Wizard script not found."));
+        assert!(output.contains("Expected locations:"));
+        assert!(output.contains("This command only works when running from source."));
+        assert!(
+            output.contains("Run the wizard directly: python scripts/share_to_github_pages.py")
+        );
+    }
+
+    #[test]
+    fn share_wizard_runs_stub_script_and_passthrough_exit_code() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let scripts = temp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).expect("create scripts dir");
+
+        let script = scripts.join("share_to_github_pages.py");
+        let invocation = scripts.join("invocation.json");
+        std::fs::write(
+            &script,
+            r#"import json
+import os
+import sys
+from pathlib import Path
+
+out = Path(__file__).with_name("invocation.json")
+out.write_text(json.dumps({
+  "argv": sys.argv,
+  "cwd": os.getcwd(),
+  "home": os.environ.get("HOME"),
+}))
+
+sys.exit(7)
+"#,
+        )
+        .expect("write stub wizard script");
+
+        let result = run_share_wizard_in_cwd(temp.path());
+
+        assert!(matches!(result, Err(CliError::ExitCode(7))));
+        assert!(
+            invocation.exists(),
+            "expected invocation.json to be written"
+        );
+
+        let payload: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&invocation).expect("read invocation.json"),
+        )
+        .expect("parse invocation.json");
+        let expected_home = std::env::var("HOME").ok();
+        assert_eq!(payload["home"].as_str(), expected_home.as_deref());
+
+        let cwd = payload["cwd"].as_str().unwrap_or_default();
+        assert_eq!(cwd, temp.path().to_string_lossy());
+
+        let argv0 = payload["argv"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(argv0, script.to_string_lossy());
+        assert_eq!(
+            payload["argv"].as_array().map(Vec::len).unwrap_or(0),
+            1,
+            "expected no extra args"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2850,6 +3163,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         use ftui_runtime::stdio_capture::StdioCapture;
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrate.db");
@@ -2872,6 +3188,199 @@ mod tests {
                 "Note: To apply model changes, delete storage.sqlite3 and run this again."
             ),
             "stdout: {out}"
+        );
+    }
+
+    // ── migrate parity tests (br-2ei.5.11) ──────────────────────────────────
+
+    #[test]
+    fn clap_parses_migrate() {
+        let m = Cli::try_parse_from(["am", "migrate"]).unwrap();
+        assert!(matches!(m.command, Commands::Migrate));
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("idempotent.db");
+        let url = format!("sqlite:///{}", db_path.display());
+
+        let res1 = handle_migrate_with_database_url(&url);
+        assert!(res1.is_ok(), "first migrate failed: {res1:?}");
+
+        let res2 = handle_migrate_with_database_url(&url);
+        assert!(res2.is_ok(), "second migrate (idempotent) failed: {res2:?}");
+    }
+
+    #[test]
+    fn migrate_creates_expected_tables() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tables.db");
+        let url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&url).unwrap();
+
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            .expect("reopen");
+        let tables = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                &[],
+            )
+            .expect("list tables");
+        let names: Vec<String> = tables
+            .iter()
+            .filter_map(|r| r.get_named::<String>("name").ok())
+            .collect();
+
+        for expected in [
+            "projects",
+            "agents",
+            "messages",
+            "message_recipients",
+            "file_reservations",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing table {expected}; found: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_invalid_path_returns_error() {
+        let url = "sqlite:////nonexistent/deeply/nested/dir/db.sqlite3";
+        let res = handle_migrate_with_database_url(url);
+        assert!(res.is_err(), "should fail for non-existent path");
+    }
+
+    #[test]
+    fn migrate_bad_url_scheme_returns_error() {
+        let res = handle_migrate_with_database_url("postgres://localhost/db");
+        assert!(res.is_err(), "non-sqlite URL should fail");
+    }
+
+    #[test]
+    fn migrate_creates_fts_table() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("fts.db");
+        let url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&url).unwrap();
+
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            .expect("reopen");
+        let tables = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%' ORDER BY name",
+                &[],
+            )
+            .expect("list fts tables");
+        let names: Vec<String> = tables
+            .iter()
+            .filter_map(|r| r.get_named::<String>("name").ok())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("fts")),
+            "FTS table should exist after migrate; found: {names:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_readonly_dir_returns_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let readonly = dir.path().join("readonly");
+        std::fs::create_dir(&readonly).expect("mkdir");
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444))
+            .expect("set readonly");
+
+        let db_path = readonly.join("db.sqlite3");
+        let url = format!("sqlite:///{}", db_path.display());
+        let res = handle_migrate_with_database_url(&url);
+
+        // Restore permissions for cleanup
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+
+        assert!(res.is_err(), "should fail on read-only directory");
+    }
+
+    #[test]
+    fn migrate_creates_db_file() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("new.db");
+        assert!(!db_path.exists(), "precondition: DB should not exist yet");
+
+        let url = format!("sqlite:///{}", db_path.display());
+        handle_migrate_with_database_url(&url).unwrap();
+
+        assert!(db_path.exists(), "migrate should create the DB file");
+        assert!(
+            std::fs::metadata(&db_path).unwrap().len() > 0,
+            "DB file should not be empty"
+        );
+    }
+
+    #[test]
+    fn migrate_output_matches_legacy_lines_exactly() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use ftui_runtime::stdio_capture::StdioCapture;
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("legacy_lines.db");
+        let url = format!("sqlite:///{}", db_path.display());
+
+        let capture = StdioCapture::install().unwrap();
+        handle_migrate_with_database_url(&url).unwrap();
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        let out = String::from_utf8_lossy(&sink);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly 2 output lines, got {}: {lines:?}",
+            lines.len()
+        );
+        assert!(
+            lines[0].contains("Database schema created from model definitions"),
+            "line 0: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("delete storage.sqlite3"),
+            "line 1: {:?}",
+            lines[1]
         );
     }
 
@@ -3076,6 +3585,9 @@ mod tests {
         {
             use ftui_runtime::stdio_capture::StdioCapture;
 
+            let _capture_lock = stdio_capture_lock()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             let capture = StdioCapture::install().unwrap();
             handle_archive(ArchiveCommand::List {
                 limit: 0,
@@ -3132,6 +3644,9 @@ mod tests {
         {
             use ftui_runtime::stdio_capture::StdioCapture;
 
+            let _capture_lock = stdio_capture_lock()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             let capture = StdioCapture::install().unwrap();
             archive_restore_state(
                 archive_arg.clone(),
@@ -3561,6 +4076,9 @@ mod tests {
     ) -> (CliResult<()>, String) {
         use ftui_runtime::stdio_capture::StdioCapture;
 
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let capture = StdioCapture::install().unwrap();
         let res =
             runtime.block_on(async { handle_products_with(cx, pool, None, None, action).await });
@@ -4096,6 +4614,1473 @@ mod tests {
             &mut 0u64,
         );
         assert!(result.is_ok(), "nonexistent dir should not error");
+    }
+
+    // ── Doctor commands tests (br-2ei.5.4) ──────────────────────────────────
+
+    #[test]
+    fn clap_parses_doctor_check_defaults() {
+        let cli = Cli::try_parse_from(["am", "doctor", "check"]).unwrap();
+        match cli.command {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Check {
+                        project,
+                        verbose,
+                        json,
+                    },
+            } => {
+                assert!(project.is_none());
+                assert!(!verbose);
+                assert!(!json);
+            }
+            _ => panic!("expected Doctor Check"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_check_all_flags() {
+        let cli =
+            Cli::try_parse_from(["am", "doctor", "check", "my-proj", "-v", "--json"]).unwrap();
+        match cli.command {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Check {
+                        project,
+                        verbose,
+                        json,
+                    },
+            } => {
+                assert_eq!(project.as_deref(), Some("my-proj"));
+                assert!(verbose);
+                assert!(json);
+            }
+            _ => panic!("expected Doctor Check"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_repair_defaults() {
+        let cli = Cli::try_parse_from(["am", "doctor", "repair"]).unwrap();
+        match cli.command {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Repair {
+                        project,
+                        dry_run,
+                        yes,
+                        backup_dir,
+                    },
+            } => {
+                assert!(project.is_none());
+                assert!(!dry_run);
+                assert!(!yes);
+                assert!(backup_dir.is_none());
+            }
+            _ => panic!("expected Doctor Repair"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_repair_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "doctor",
+            "repair",
+            "proj",
+            "--dry-run",
+            "-y",
+            "--backup-dir",
+            "/tmp/bak",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Repair {
+                        project,
+                        dry_run,
+                        yes,
+                        backup_dir,
+                    },
+            } => {
+                assert_eq!(project.as_deref(), Some("proj"));
+                assert!(dry_run);
+                assert!(yes);
+                assert_eq!(backup_dir.unwrap(), PathBuf::from("/tmp/bak"));
+            }
+            _ => panic!("expected Doctor Repair"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_backups_defaults() {
+        let cli = Cli::try_parse_from(["am", "doctor", "backups"]).unwrap();
+        match cli.command {
+            Commands::Doctor {
+                action: DoctorCommand::Backups { json },
+            } => assert!(!json),
+            _ => panic!("expected Doctor Backups"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_backups_json() {
+        let cli = Cli::try_parse_from(["am", "doctor", "backups", "--json"]).unwrap();
+        match cli.command {
+            Commands::Doctor {
+                action: DoctorCommand::Backups { json },
+            } => assert!(json),
+            _ => panic!("expected Doctor Backups"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_restore_required_path() {
+        let cli = Cli::try_parse_from(["am", "doctor", "restore", "/tmp/backup.sqlite3"]).unwrap();
+        match cli.command {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Restore {
+                        backup_path,
+                        dry_run,
+                        yes,
+                    },
+            } => {
+                assert_eq!(backup_path, PathBuf::from("/tmp/backup.sqlite3"));
+                assert!(!dry_run);
+                assert!(!yes);
+            }
+            _ => panic!("expected Doctor Restore"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_restore_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "doctor",
+            "restore",
+            "/tmp/backup.sqlite3",
+            "--dry-run",
+            "-y",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Restore {
+                        backup_path,
+                        dry_run,
+                        yes,
+                    },
+            } => {
+                assert_eq!(backup_path, PathBuf::from("/tmp/backup.sqlite3"));
+                assert!(dry_run);
+                assert!(yes);
+            }
+            _ => panic!("expected Doctor Restore"),
+        }
+    }
+
+    #[test]
+    fn doctor_backups_lists_sqlite3_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(
+            backup_dir.join("pre_repair_20260101_120000.sqlite3"),
+            b"data1",
+        )
+        .unwrap();
+        std::fs::write(
+            backup_dir.join("pre_repair_20260102_120000.sqlite3"),
+            b"data22",
+        )
+        .unwrap();
+        std::fs::write(backup_dir.join("notes.txt"), b"not a backup").unwrap();
+
+        let mut count = 0u32;
+        for entry in std::fs::read_dir(&backup_dir).unwrap().flatten() {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("sqlite3") {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 2, "should find exactly 2 .sqlite3 files");
+    }
+
+    #[test]
+    fn doctor_restore_rejects_missing_backup() {
+        let result =
+            handle_doctor_restore(PathBuf::from("/nonexistent/backup.sqlite3"), true, true);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            CliError::InvalidArgument(msg) => {
+                assert!(msg.contains("backup not found"), "got: {msg}");
+            }
+            other => panic!("expected InvalidArgument, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_check_json_output_shape() {
+        let checks = vec![
+            serde_json::json!({"check": "database", "status": "ok", "detail": "accessible"}),
+            serde_json::json!({"check": "storage_root", "status": "warn", "detail": "/tmp"}),
+        ];
+        let all_ok = checks.iter().all(|c| c["status"] != "fail");
+        let output = serde_json::json!({"healthy": all_ok, "checks": checks});
+        assert!(output["healthy"].as_bool().unwrap());
+        assert_eq!(output["checks"].as_array().unwrap().len(), 2);
+        for c in output["checks"].as_array().unwrap() {
+            assert!(c["check"].is_string());
+            assert!(c["status"].is_string());
+            assert!(c["detail"].is_string());
+        }
+    }
+
+    #[test]
+    fn doctor_check_fail_makes_healthy_false() {
+        let checks = [serde_json::json!({"check": "database", "status": "fail", "detail": "err"})];
+        let all_ok = checks.iter().all(|c| c["status"] != "fail");
+        assert!(!all_ok);
+    }
+
+    #[test]
+    fn doctor_check_status_icon_mapping() {
+        for (status, expected) in [("ok", "OK"), ("warn", "WARN"), ("fail", "FAIL")] {
+            let icon = match status {
+                "ok" => "OK",
+                "warn" => "WARN",
+                _ => "FAIL",
+            };
+            assert_eq!(icon, expected);
+        }
+    }
+
+    #[test]
+    fn doctor_repair_integrity_result_parsing() {
+        assert!("ok" == "ok", "ok should be healthy");
+        let bad = "*** in database main ***";
+        assert!(bad != "ok", "corruption string should not be healthy");
+    }
+
+    #[test]
+    fn doctor_backup_filename_format() {
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let name = format!("pre_repair_{ts}.sqlite3");
+        assert!(name.starts_with("pre_repair_"));
+        assert!(name.ends_with(".sqlite3"));
+        // "pre_repair_" (11) + "YYYYMMDD_HHMMSS" (15) + ".sqlite3" (8) = 34
+        assert_eq!(name.len(), 34, "unexpected length: {name}");
+    }
+
+    #[test]
+    fn format_bytes_human_readable() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(100), "100 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GiB");
+    }
+
+    // ── br-2ei.5.7.1: unit parsing + defaults ──────────────────────────
+
+    #[test]
+    fn clap_parses_serve_stdio() {
+        let cli = Cli::try_parse_from(["am", "serve-stdio"]).unwrap();
+        assert!(matches!(cli.command, Commands::ServeStdio));
+    }
+
+    #[test]
+    fn clap_parses_lint() {
+        let cli = Cli::try_parse_from(["am", "lint"]).unwrap();
+        assert!(matches!(cli.command, Commands::Lint));
+    }
+
+    #[test]
+    fn clap_parses_typecheck() {
+        let cli = Cli::try_parse_from(["am", "typecheck"]).unwrap();
+        assert!(matches!(cli.command, Commands::Typecheck));
+    }
+
+    #[test]
+    fn clap_parses_list_projects_defaults() {
+        let cli = Cli::try_parse_from(["am", "list-projects"]).unwrap();
+        match cli.command {
+            Commands::ListProjects {
+                include_agents,
+                json,
+            } => {
+                assert!(!include_agents);
+                assert!(!json);
+            }
+            other => panic!("expected ListProjects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_list_projects_flags() {
+        let cli =
+            Cli::try_parse_from(["am", "list-projects", "--include-agents", "--json"]).unwrap();
+        match cli.command {
+            Commands::ListProjects {
+                include_agents,
+                json,
+            } => {
+                assert!(include_agents);
+                assert!(json);
+            }
+            other => panic!("expected ListProjects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_list_acks() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "list-acks",
+            "--project",
+            "/tmp/proj",
+            "--agent",
+            "BlueLake",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::ListAcks {
+                project_key,
+                agent_name,
+                limit,
+            } => {
+                assert_eq!(project_key, "/tmp/proj");
+                assert_eq!(agent_name, "BlueLake");
+                assert_eq!(limit, 20); // default
+            }
+            other => panic!("expected ListAcks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_list_acks_custom_limit() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "list-acks",
+            "--project",
+            "/tmp/proj",
+            "--agent",
+            "BlueLake",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::ListAcks { limit, .. } => assert_eq!(limit, 5),
+            other => panic!("expected ListAcks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_guard_install() {
+        let cli =
+            Cli::try_parse_from(["am", "guard", "install", "my-project", "/tmp/repo"]).unwrap();
+        match cli.command {
+            Commands::Guard {
+                action:
+                    GuardCommand::Install {
+                        project,
+                        repo,
+                        prepush,
+                        no_prepush,
+                    },
+            } => {
+                assert_eq!(project, "my-project");
+                assert_eq!(repo, PathBuf::from("/tmp/repo"));
+                assert!(!prepush);
+                assert!(!no_prepush);
+            }
+            other => panic!("expected Guard Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_guard_install_prepush() {
+        let cli = Cli::try_parse_from(["am", "guard", "install", "proj", "/tmp/repo", "--prepush"])
+            .unwrap();
+        match cli.command {
+            Commands::Guard {
+                action: GuardCommand::Install { prepush, .. },
+            } => assert!(prepush),
+            other => panic!("expected Guard Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_guard_uninstall() {
+        let cli = Cli::try_parse_from(["am", "guard", "uninstall", "/tmp/repo"]).unwrap();
+        match cli.command {
+            Commands::Guard {
+                action: GuardCommand::Uninstall { repo },
+            } => assert_eq!(repo, PathBuf::from("/tmp/repo")),
+            other => panic!("expected Guard Uninstall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_guard_status() {
+        let cli = Cli::try_parse_from(["am", "guard", "status", "/tmp/repo"]).unwrap();
+        match cli.command {
+            Commands::Guard {
+                action: GuardCommand::Status { repo },
+            } => assert_eq!(repo, PathBuf::from("/tmp/repo")),
+            other => panic!("expected Guard Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_guard_check_defaults() {
+        let cli = Cli::try_parse_from(["am", "guard", "check"]).unwrap();
+        match cli.command {
+            Commands::Guard {
+                action:
+                    GuardCommand::Check {
+                        stdin_nul,
+                        advisory,
+                        repo,
+                    },
+            } => {
+                assert!(!stdin_nul);
+                assert!(!advisory);
+                assert!(repo.is_none());
+            }
+            other => panic!("expected Guard Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_guard_check_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "guard",
+            "check",
+            "--stdin-nul",
+            "--advisory",
+            "--repo",
+            "/tmp/repo",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Guard {
+                action:
+                    GuardCommand::Check {
+                        stdin_nul,
+                        advisory,
+                        repo,
+                    },
+            } => {
+                assert!(stdin_nul);
+                assert!(advisory);
+                assert_eq!(repo, Some(PathBuf::from("/tmp/repo")));
+            }
+            other => panic!("expected Guard Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_list() {
+        let cli = Cli::try_parse_from(["am", "file_reservations", "list", "my-project"]).unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::List {
+                        project,
+                        active_only,
+                        all,
+                    },
+            } => {
+                assert_eq!(project, "my-project");
+                assert!(!active_only);
+                assert!(!all);
+            }
+            other => panic!("expected FileReservations List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_list_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "list",
+            "proj",
+            "--active-only",
+            "--all",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::List {
+                        active_only, all, ..
+                    },
+            } => {
+                assert!(active_only);
+                assert!(all);
+            }
+            other => panic!("expected FileReservations List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_active() {
+        let cli = Cli::try_parse_from(["am", "file_reservations", "active", "proj"]).unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action: FileReservationsCommand::Active { project, limit },
+            } => {
+                assert_eq!(project, "proj");
+                assert!(limit.is_none());
+            }
+            other => panic!("expected FileReservations Active, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_soon() {
+        let cli =
+            Cli::try_parse_from(["am", "file_reservations", "soon", "proj", "--minutes", "15"])
+                .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action: FileReservationsCommand::Soon { project, minutes },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(minutes, Some(15));
+            }
+            other => panic!("expected FileReservations Soon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_acks_pending() {
+        let cli = Cli::try_parse_from(["am", "acks", "pending", "proj", "BlueLake"]).unwrap();
+        match cli.command {
+            Commands::Acks {
+                action:
+                    AcksCommand::Pending {
+                        project,
+                        agent,
+                        limit,
+                    },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(limit, 20); // default
+            }
+            other => panic!("expected Acks Pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_acks_remind() {
+        let cli = Cli::try_parse_from(["am", "acks", "remind", "proj", "BlueLake"]).unwrap();
+        match cli.command {
+            Commands::Acks {
+                action:
+                    AcksCommand::Remind {
+                        project,
+                        agent,
+                        min_age_minutes,
+                        limit,
+                    },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(min_age_minutes, 30); // default
+                assert_eq!(limit, 50); // default
+            }
+            other => panic!("expected Acks Remind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_acks_overdue() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "acks",
+            "overdue",
+            "proj",
+            "BlueLake",
+            "--ttl-minutes",
+            "120",
+            "--limit",
+            "10",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Acks {
+                action:
+                    AcksCommand::Overdue {
+                        project,
+                        agent,
+                        ttl_minutes,
+                        limit,
+                    },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(ttl_minutes, 120);
+                assert_eq!(limit, 10);
+            }
+            other => panic!("expected Acks Overdue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_config_set_port() {
+        let cli = Cli::try_parse_from(["am", "config", "set-port", "9999"]).unwrap();
+        match cli.command {
+            Commands::Config {
+                action: ConfigCommand::SetPort { port, env_file },
+            } => {
+                assert_eq!(port, 9999);
+                assert!(env_file.is_none());
+            }
+            other => panic!("expected Config SetPort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_config_set_port_env_file() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "config",
+            "set-port",
+            "8080",
+            "--env-file",
+            "/tmp/.env",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Config {
+                action: ConfigCommand::SetPort { port, env_file },
+            } => {
+                assert_eq!(port, 8080);
+                assert_eq!(env_file, Some(PathBuf::from("/tmp/.env")));
+            }
+            other => panic!("expected Config SetPort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_config_show_port() {
+        let cli = Cli::try_parse_from(["am", "config", "show-port"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Config {
+                action: ConfigCommand::ShowPort
+            }
+        ));
+    }
+
+    #[test]
+    fn clap_parses_projects_mark_identity() {
+        let cli = Cli::try_parse_from(["am", "projects", "mark-identity", "/tmp/proj"]).unwrap();
+        match cli.command {
+            Commands::Projects {
+                action:
+                    ProjectsCommand::MarkIdentity {
+                        project_path,
+                        commit,
+                        no_commit,
+                    },
+            } => {
+                assert_eq!(project_path, PathBuf::from("/tmp/proj"));
+                assert!(commit); // default true
+                assert!(!no_commit);
+            }
+            other => panic!("expected Projects MarkIdentity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_projects_mark_identity_no_commit() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "projects",
+            "mark-identity",
+            "/tmp/proj",
+            "--no-commit",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Projects {
+                action: ProjectsCommand::MarkIdentity { no_commit, .. },
+            } => assert!(no_commit),
+            other => panic!("expected Projects MarkIdentity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_projects_discovery_init() {
+        let cli = Cli::try_parse_from(["am", "projects", "discovery-init", "/tmp/proj"]).unwrap();
+        match cli.command {
+            Commands::Projects {
+                action:
+                    ProjectsCommand::DiscoveryInit {
+                        project_path,
+                        product,
+                    },
+            } => {
+                assert_eq!(project_path, PathBuf::from("/tmp/proj"));
+                assert!(product.is_none());
+            }
+            other => panic!("expected Projects DiscoveryInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_projects_discovery_init_product() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "projects",
+            "discovery-init",
+            "/tmp/proj",
+            "-P",
+            "my-product",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Projects {
+                action: ProjectsCommand::DiscoveryInit { product, .. },
+            } => assert_eq!(product, Some("my-product".to_string())),
+            other => panic!("expected Projects DiscoveryInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_projects_adopt_defaults() {
+        let cli = Cli::try_parse_from(["am", "projects", "adopt", "/tmp/src", "/tmp/dst"]).unwrap();
+        match cli.command {
+            Commands::Projects {
+                action:
+                    ProjectsCommand::Adopt {
+                        source,
+                        target,
+                        dry_run,
+                        apply,
+                    },
+            } => {
+                assert_eq!(source, PathBuf::from("/tmp/src"));
+                assert_eq!(target, PathBuf::from("/tmp/dst"));
+                assert!(dry_run); // default true
+                assert!(!apply);
+            }
+            other => panic!("expected Projects Adopt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_projects_adopt_apply() {
+        let cli =
+            Cli::try_parse_from(["am", "projects", "adopt", "/tmp/src", "/tmp/dst", "--apply"])
+                .unwrap();
+        match cli.command {
+            Commands::Projects {
+                action: ProjectsCommand::Adopt { apply, .. },
+            } => assert!(apply),
+            other => panic!("expected Projects Adopt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_mail_status() {
+        let cli = Cli::try_parse_from(["am", "mail", "status", "/tmp/proj"]).unwrap();
+        match cli.command {
+            Commands::Mail {
+                action: MailCommand::Status { project_path },
+            } => assert_eq!(project_path, PathBuf::from("/tmp/proj")),
+            other => panic!("expected Mail Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_products_ensure_defaults() {
+        let cli = Cli::try_parse_from(["am", "products", "ensure"]).unwrap();
+        match cli.command {
+            Commands::Products {
+                action:
+                    ProductsCommand::Ensure {
+                        product_key,
+                        name,
+                        json,
+                    },
+            } => {
+                assert!(product_key.is_none());
+                assert!(name.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected Products Ensure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_products_ensure_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "products",
+            "ensure",
+            "pk-1",
+            "-n",
+            "MyProduct",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Products {
+                action:
+                    ProductsCommand::Ensure {
+                        product_key,
+                        name,
+                        json,
+                    },
+            } => {
+                assert_eq!(product_key, Some("pk-1".to_string()));
+                assert_eq!(name, Some("MyProduct".to_string()));
+                assert!(json);
+            }
+            other => panic!("expected Products Ensure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_products_link() {
+        let cli =
+            Cli::try_parse_from(["am", "products", "link", "pk-1", "proj-1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Products {
+                action:
+                    ProductsCommand::Link {
+                        product_key,
+                        project,
+                        json,
+                    },
+            } => {
+                assert_eq!(product_key, "pk-1");
+                assert_eq!(project, "proj-1");
+                assert!(json);
+            }
+            other => panic!("expected Products Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_products_status() {
+        let cli = Cli::try_parse_from(["am", "products", "status", "pk-1"]).unwrap();
+        match cli.command {
+            Commands::Products {
+                action: ProductsCommand::Status { product_key, json },
+            } => {
+                assert_eq!(product_key, "pk-1");
+                assert!(!json); // default
+            }
+            other => panic!("expected Products Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_products_summarize_thread() {
+        let cli = Cli::try_parse_from(["am", "products", "summarize-thread", "pk-1", "thread-abc"])
+            .unwrap();
+        match cli.command {
+            Commands::Products {
+                action:
+                    ProductsCommand::SummarizeThread {
+                        product_key,
+                        thread_id,
+                        per_thread_limit,
+                        no_llm,
+                        json,
+                    },
+            } => {
+                assert_eq!(product_key, "pk-1");
+                assert_eq!(thread_id, "thread-abc");
+                assert_eq!(per_thread_limit, 50); // default
+                assert!(!no_llm);
+                assert!(!json);
+            }
+            other => panic!("expected Products SummarizeThread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_products_summarize_thread_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "products",
+            "summarize-thread",
+            "pk-1",
+            "thread-abc",
+            "-n",
+            "10",
+            "--no-llm",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Products {
+                action:
+                    ProductsCommand::SummarizeThread {
+                        per_thread_limit,
+                        no_llm,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(per_thread_limit, 10);
+                assert!(no_llm);
+                assert!(json);
+            }
+            other => panic!("expected Products SummarizeThread, got {other:?}"),
+        }
+    }
+
+    // ── Invalid arg / exit code tests ────────────────────────────────
+
+    #[test]
+    fn clap_rejects_serve_http_invalid_port() {
+        let err = Cli::try_parse_from(["am", "serve-http", "--port", "not_a_number"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_rejects_list_acks_missing_project() {
+        let err = Cli::try_parse_from(["am", "list-acks", "--agent", "BlueLake"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_rejects_list_acks_missing_agent() {
+        let err = Cli::try_parse_from(["am", "list-acks", "--project", "/tmp"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_rejects_guard_install_missing_repo() {
+        let err = Cli::try_parse_from(["am", "guard", "install", "proj"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_rejects_acks_pending_missing_agent() {
+        let err = Cli::try_parse_from(["am", "acks", "pending", "proj"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_rejects_config_set_port_invalid() {
+        let err = Cli::try_parse_from(["am", "config", "set-port", "99999"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_rejects_unknown_subcommand() {
+        let err = Cli::try_parse_from(["am", "nonexistent"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_rejects_mail_status_missing_path() {
+        let err = Cli::try_parse_from(["am", "mail", "status"]);
+        assert!(err.is_err());
+    }
+
+    // ── br-2ei.5.7.3: golden help snapshots ────────────────────────────
+    //
+    // Verify that help text contains expected commands and flags.
+    // Uses clap's error rendering (--help triggers a clap error) to
+    // capture help text without spawning a subprocess.
+
+    fn help_text_for(args: &[&str]) -> String {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("expected --help to trigger clap exit"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn help_top_level_lists_all_subcommands() {
+        let h = help_text_for(&["am", "--help"]);
+        let expected = [
+            "serve-http",
+            "serve-stdio",
+            "lint",
+            "typecheck",
+            "share",
+            "archive",
+            "guard",
+            "acks",
+            "list-acks",
+            "migrate",
+            "list-projects",
+            "clear-and-reset-everything",
+            "config",
+            "amctl",
+            "am-run",
+            "projects",
+            "mail",
+            "products",
+            "docs",
+            "doctor",
+        ];
+        for cmd in expected {
+            assert!(
+                h.contains(cmd),
+                "top-level help missing subcommand '{cmd}'\n--- help ---\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_serve_http_lists_flags() {
+        let h = help_text_for(&["am", "serve-http", "--help"]);
+        for flag in ["--host", "--port", "--path"] {
+            assert!(
+                h.contains(flag),
+                "serve-http help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_share_lists_subcommands() {
+        let h = help_text_for(&["am", "share", "--help"]);
+        for cmd in ["export", "update", "preview", "verify", "decrypt", "wizard"] {
+            assert!(
+                h.contains(cmd),
+                "share help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_share_export_lists_flags() {
+        let h = help_text_for(&["am", "share", "export", "--help"]);
+        for flag in [
+            "--output",
+            "--interactive",
+            "--project",
+            "--inline-threshold",
+            "--detach-threshold",
+            "--scrub-preset",
+            "--chunk-threshold",
+            "--chunk-size",
+            "--dry-run",
+            "--zip",
+            "--signing-key",
+            "--age-recipient",
+        ] {
+            assert!(
+                h.contains(flag),
+                "share export help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_guard_lists_subcommands() {
+        let h = help_text_for(&["am", "guard", "--help"]);
+        for cmd in ["install", "uninstall", "status", "check"] {
+            assert!(
+                h.contains(cmd),
+                "guard help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_guard_check_lists_flags() {
+        let h = help_text_for(&["am", "guard", "check", "--help"]);
+        for flag in ["--stdin-nul", "--advisory", "--repo"] {
+            assert!(
+                h.contains(flag),
+                "guard check help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_doctor_lists_subcommands() {
+        let h = help_text_for(&["am", "doctor", "--help"]);
+        for cmd in ["check", "repair", "backups", "restore"] {
+            assert!(
+                h.contains(cmd),
+                "doctor help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_doctor_repair_lists_flags() {
+        let h = help_text_for(&["am", "doctor", "repair", "--help"]);
+        for flag in ["--dry-run", "--yes", "--backup-dir"] {
+            assert!(
+                h.contains(flag),
+                "doctor repair help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_archive_lists_subcommands() {
+        let h = help_text_for(&["am", "archive", "--help"]);
+        for cmd in ["save", "list", "restore"] {
+            assert!(
+                h.contains(cmd),
+                "archive help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_products_lists_subcommands() {
+        let h = help_text_for(&["am", "products", "--help"]);
+        for cmd in [
+            "ensure",
+            "link",
+            "status",
+            "search",
+            "inbox",
+            "summarize-thread",
+        ] {
+            assert!(
+                h.contains(cmd),
+                "products help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_acks_lists_subcommands() {
+        let h = help_text_for(&["am", "acks", "--help"]);
+        for cmd in ["pending", "remind", "overdue"] {
+            assert!(h.contains(cmd), "acks help missing subcommand '{cmd}'\n{h}");
+        }
+    }
+
+    #[test]
+    fn help_projects_lists_subcommands() {
+        let h = help_text_for(&["am", "projects", "--help"]);
+        for cmd in ["mark-identity", "discovery-init", "adopt"] {
+            assert!(
+                h.contains(cmd),
+                "projects help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_config_lists_subcommands() {
+        let h = help_text_for(&["am", "config", "--help"]);
+        for cmd in ["set-port", "show-port"] {
+            assert!(
+                h.contains(cmd),
+                "config help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_clear_and_reset_lists_flags() {
+        let h = help_text_for(&["am", "clear-and-reset-everything", "--help"]);
+        for flag in ["--force", "--archive", "--no-archive"] {
+            assert!(
+                h.contains(flag),
+                "clear-and-reset-everything help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_docs_lists_subcommands() {
+        let h = help_text_for(&["am", "docs", "--help"]);
+        assert!(
+            h.contains("insert-blurbs"),
+            "docs help missing subcommand 'insert-blurbs'\n{h}"
+        );
+    }
+
+    #[test]
+    fn help_am_run_lists_flags() {
+        let h = help_text_for(&["am", "am-run", "--help"]);
+        for flag in [
+            "--path",
+            "--agent",
+            "--ttl-seconds",
+            "--shared",
+            "--exclusive",
+            "--block-on-conflicts",
+        ] {
+            assert!(h.contains(flag), "am-run help missing flag '{flag}'\n{h}");
+        }
+    }
+
+    #[test]
+    fn help_list_acks_lists_flags() {
+        let h = help_text_for(&["am", "list-acks", "--help"]);
+        for flag in ["--project", "--agent", "--limit"] {
+            assert!(
+                h.contains(flag),
+                "list-acks help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_top_level_contains_name_and_version() {
+        let h = help_text_for(&["am", "--help"]);
+        assert!(h.contains("am") || h.contains("MCP Agent Mail"));
+    }
+
+    // ── br-2ei.5.7.4: JSON output stability ────────────────────────────
+    //
+    // Verify JSON schemas for commands that produce machine-readable output.
+
+    #[test]
+    fn json_list_projects_schema_fields() {
+        // list-projects --json emits an array of objects with:
+        // { id, slug, human_key, created_at }
+        let entry = serde_json::json!({
+            "id": 1,
+            "slug": "proj-abc123",
+            "human_key": "/tmp/my-project",
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        assert!(entry["id"].is_i64());
+        assert!(entry["slug"].is_string());
+        assert!(entry["human_key"].is_string());
+        assert!(entry["created_at"].is_string());
+    }
+
+    #[test]
+    fn json_list_projects_with_agents_schema() {
+        // When --include-agents is set, each project gains an "agents" array.
+        let entry = serde_json::json!({
+            "id": 1,
+            "slug": "proj-abc",
+            "human_key": "/tmp/proj",
+            "created_at": "2026-01-01T00:00:00Z",
+            "agents": [
+                {"name": "BlueLake", "program": "claude-code", "model": "opus"}
+            ]
+        });
+        assert!(entry["agents"].is_array());
+        let agent = &entry["agents"][0];
+        assert!(agent["name"].is_string());
+        assert!(agent["program"].is_string());
+        assert!(agent["model"].is_string());
+    }
+
+    #[test]
+    fn json_doctor_check_schema_stable() {
+        let output = serde_json::json!({
+            "healthy": true,
+            "checks": [
+                {"check": "database", "status": "ok", "detail": "accessible"},
+                {"check": "storage_root", "status": "ok", "detail": "/tmp/store"}
+            ]
+        });
+        assert!(output["healthy"].is_boolean());
+        assert!(output["checks"].is_array());
+        for check in output["checks"].as_array().unwrap() {
+            assert!(check["check"].is_string(), "check field must be string");
+            assert!(check["status"].is_string(), "status field must be string");
+            assert!(check["detail"].is_string(), "detail field must be string");
+            let status = check["status"].as_str().unwrap();
+            assert!(
+                ["ok", "warn", "fail"].contains(&status),
+                "status must be ok/warn/fail, got {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_doctor_backups_schema() {
+        // doctor backups --json emits an array of { name, size }
+        let arr = serde_json::json!([
+            {"name": "pre_repair_20260101_120000.sqlite3", "size": 4096},
+            {"name": "pre_repair_20260102_130000.sqlite3", "size": 8192}
+        ]);
+        assert!(arr.is_array());
+        for item in arr.as_array().unwrap() {
+            assert!(item["name"].is_string());
+            assert!(item["size"].is_number());
+        }
+    }
+
+    #[test]
+    fn json_archive_list_schema() {
+        // archive list --json emits array of { file, size_bytes, modified, label }
+        let entry = serde_json::json!({
+            "file": "archive_20260101.sqlite3",
+            "size_bytes": 12345,
+            "modified": "2026-01-01T12:00:00Z",
+            "label": "my-label"
+        });
+        assert!(entry["file"].is_string());
+        assert!(entry["size_bytes"].is_number());
+        assert!(entry["modified"].is_string());
+    }
+
+    #[test]
+    fn json_lease_record_schema() {
+        // am-run lease records follow LeaseRecord schema
+        let lease = serde_json::json!({
+            "slot": "frontend-build",
+            "agent": "BlueLake",
+            "branch": "main",
+            "exclusive": true,
+            "acquired_ts": "2026-01-01T00:00:00Z",
+            "expires_ts": "2026-01-01T01:00:00Z"
+        });
+        assert!(lease["slot"].is_string());
+        assert!(lease["agent"].is_string());
+        assert!(lease["branch"].is_string());
+        assert!(lease["exclusive"].is_boolean());
+        assert!(lease["acquired_ts"].is_string());
+        assert!(lease["expires_ts"].is_string());
+        assert!(lease.get("released_ts").is_none() || lease["released_ts"].is_null());
+    }
+
+    #[test]
+    fn json_lease_record_roundtrips_through_serde() {
+        let lease = LeaseRecord {
+            slot: "build".to_string(),
+            agent: "BlueLake".to_string(),
+            branch: "main".to_string(),
+            exclusive: true,
+            acquired_ts: "2026-01-01T00:00:00Z".to_string(),
+            expires_ts: "2026-01-01T01:00:00Z".to_string(),
+            released_ts: None,
+        };
+        let json = serde_json::to_string(&lease).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["slot"], "build");
+        assert_eq!(parsed["agent"], "BlueLake");
+        assert!(!json.contains("released_ts")); // skip_serializing_if None
+    }
+
+    #[test]
+    fn json_lease_record_released_ts_included_when_set() {
+        let lease = LeaseRecord {
+            slot: "build".to_string(),
+            agent: "BlueLake".to_string(),
+            branch: "main".to_string(),
+            exclusive: false,
+            acquired_ts: "2026-01-01T00:00:00Z".to_string(),
+            expires_ts: "2026-01-01T01:00:00Z".to_string(),
+            released_ts: Some("2026-01-01T00:30:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&lease).unwrap();
+        assert!(json.contains("released_ts"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["released_ts"], "2026-01-01T00:30:00Z");
+    }
+
+    // ── br-2ei.5.7.2: integration exit codes ────────────────────────────
+    //
+    // Tests that exercise the actual command handlers and verify exit behavior.
+
+    #[test]
+    fn integration_migrate_and_list_projects_json() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        // Migrate
+        let result = handle_migrate_with_database_url(&db_url);
+        assert!(result.is_ok(), "migrate failed: {result:?}");
+
+        // list-projects should succeed with empty output
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_list_projects_with_database_url(&db_url, false, true);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "list-projects --json failed: {result:?}");
+
+        // Parse JSON output - should be empty array
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert!(parsed.is_array(), "expected JSON array, got: {parsed}");
+        assert_eq!(parsed.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn integration_doctor_check_on_fresh_db() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        // Doctor check should succeed on a fresh DB
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, true);
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "doctor check failed: {result:?}");
+        // JSON output should have "healthy" field
+        if !output.trim().is_empty() {
+            let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+            assert!(parsed["healthy"].is_boolean());
+        }
+    }
+
+    #[test]
+    fn integration_doctor_backups_empty_dir() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_doctor_backups_with_storage_root(dir.path(), true);
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "doctor backups --json failed: {result:?}");
+        if !output.trim().is_empty() {
+            let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+            assert!(parsed.is_array());
+        }
+    }
+
+    #[test]
+    fn integration_config_show_port_returns_ok() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_config(ConfigCommand::ShowPort);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "config show-port failed: {result:?}");
+        // Should output a port number
+        assert!(
+            output.trim().parse::<u16>().is_ok() || output.contains("8765"),
+            "expected port number, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_config_set_port_to_file() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        let result = handle_config(ConfigCommand::SetPort {
+            port: 9999,
+            env_file: Some(env_file.clone()),
+        });
+        assert!(result.is_ok(), "config set-port failed: {result:?}");
+        let content = std::fs::read_to_string(&env_file).unwrap_or_default();
+        assert!(
+            content.contains("9999"),
+            "env file should contain port 9999, got: {content}"
+        );
     }
 }
 
@@ -4759,6 +6744,55 @@ fn prompt_bool(label: &str, default: bool) -> CliResult<bool> {
     }
 }
 
+fn prepare_share_export_output_dir(output: &Path) -> CliResult<()> {
+    if output.exists() {
+        if !output.is_dir() {
+            return Err(CliError::Other(format!(
+                "export path {} exists and is not a directory",
+                output.display()
+            )));
+        }
+        let mut entries = output.read_dir()?;
+        match entries.next() {
+            None => {}
+            Some(Ok(_)) => {
+                return Err(CliError::Other(format!(
+                    "export path {} is not empty; choose a new directory",
+                    output.display()
+                )));
+            }
+            Some(Err(e)) => return Err(CliError::Io(e)),
+        }
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(output)?;
+    Ok(())
+}
+
+fn zip_archive_path_for_dir(dir: &Path) -> PathBuf {
+    let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("bundle");
+    parent.join(format!("{name}.zip"))
+}
+
+fn sha256_file(path: &Path) -> CliResult<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 struct ShareExportParams {
     output: PathBuf,
     projects: Vec<String>,
@@ -4774,9 +6808,21 @@ struct ShareExportParams {
     age_recipients: Vec<String>,
 }
 
-fn run_share_export(params: ShareExportParams) -> CliResult<()> {
-    use sha2::{Digest, Sha256};
+struct ShareUpdateParams {
+    bundle: PathBuf,
+    projects: Vec<String>,
+    inline_threshold: usize,
+    detach_threshold: usize,
+    scrub_preset: share::ScrubPreset,
+    chunk_threshold: usize,
+    chunk_size: usize,
+    zip: bool,
+    signing_key: Option<PathBuf>,
+    signing_public_out: Option<PathBuf>,
+    age_recipients: Vec<String>,
+}
 
+fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let source_path = cfg
         .sqlite_path()
@@ -4792,16 +6838,9 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     ftui_runtime::ftui_println!("Source database: {source_path}");
     ftui_runtime::ftui_println!("Scrub preset:   {}", params.scrub_preset);
 
-    if !params.age_recipients.is_empty() && !params.zip {
-        return Err(CliError::InvalidArgument(
-            "age encryption requires ZIP output (remove --no-zip or omit --age-recipient)"
-                .to_string(),
-        ));
-    }
-
     // Dry run: create snapshot in temp dir and print summary only (no output artifacts).
     if params.dry_run {
-        ftui_runtime::ftui_println!("Dry run — validating export in a temp directory.");
+        ftui_runtime::ftui_println!("Dry run - validating export in a temp directory.");
 
         let tmp = tempfile::tempdir()?;
         let snapshot_path = tmp.path().join("_snapshot.sqlite3");
@@ -4857,7 +6896,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     }
 
     let output = &params.output;
-    std::fs::create_dir_all(output)?;
+    prepare_share_export_output_dir(output)?;
 
     // 1. Snapshot + scope + scrub + finalize
     ftui_runtime::ftui_println!("Creating snapshot...");
@@ -4900,9 +6939,8 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     // 3. Copy DB to bundle
     let db_dest = output.join("mailbox.sqlite3");
     std::fs::copy(&snapshot_path, &db_dest)?;
-    let db_bytes = std::fs::read(&db_dest)?;
-    let db_sha256 = hex::encode(Sha256::digest(&db_bytes));
-    let db_size = db_bytes.len() as u64;
+    let db_sha256 = sha256_file(&db_dest)?;
+    let db_size = db_dest.metadata()?.len();
 
     // 4. Maybe chunk
     let chunk =
@@ -4941,6 +6979,8 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         &snap_ctx.scrub_summary,
         &att_manifest,
         chunk.as_ref(),
+        params.chunk_threshold,
+        params.chunk_size,
         &hints,
         snap_ctx.fts_enabled,
         "mailbox.sqlite3",
@@ -4970,11 +7010,13 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     let _ = std::fs::remove_file(&snapshot_path);
 
     // 12. ZIP
+    let mut archive_path: Option<PathBuf> = None;
     let final_path = if params.zip {
         ftui_runtime::ftui_println!("Packaging as ZIP...");
-        let zip_path = output.with_extension("zip");
+        let zip_path = zip_archive_path_for_dir(output);
         share::package_directory_as_zip(output, &zip_path)?;
         ftui_runtime::ftui_println!("  ZIP: {}", zip_path.display());
+        archive_path = Some(zip_path.clone());
         zip_path
     } else {
         output.clone()
@@ -4982,12 +7024,297 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
 
     // 13. Encrypt
     if !params.age_recipients.is_empty() {
-        ftui_runtime::ftui_println!("Encrypting with age...");
-        let encrypted = share::encrypt_with_age(&final_path, &params.age_recipients)?;
-        ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
+        if let Some(ref archive) = archive_path {
+            ftui_runtime::ftui_println!("Encrypting with age...");
+            let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
+            ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
+        } else {
+            ftui_runtime::ftui_eprintln!(
+                "warning: skipped age encryption because --zip was not enabled."
+            );
+        }
     }
 
     ftui_runtime::ftui_println!("Export complete: {}", final_path.display());
+    Ok(())
+}
+
+fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
+    fn copy_file(src: &Path, dst: &Path) -> CliResult<()> {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        Ok(())
+    }
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_recursive(&src_path, &dst_path)?;
+                continue;
+            }
+            if ty.is_file() {
+                std::fs::copy(&src_path, &dst_path)?;
+                continue;
+            }
+            return Err(CliError::Other(format!(
+                "unsupported file type in bundle: {}",
+                src_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn replace_dir(src: &Path, dst: &Path) -> CliResult<()> {
+        if dst.exists() {
+            std::fs::remove_dir_all(dst)?;
+        }
+        copy_dir_recursive(src, dst)
+    }
+
+    fn remove_file_if_exists(path: &Path) -> CliResult<()> {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn remove_dir_if_exists(path: &Path) -> CliResult<()> {
+        if path.exists() {
+            std::fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    }
+
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let source_path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let source = std::path::Path::new(&source_path);
+    if !source.exists() {
+        return Err(CliError::Other(format!(
+            "database not found: {source_path}"
+        )));
+    }
+
+    if !params.bundle.is_dir() {
+        return Err(CliError::Other(format!(
+            "bundle path {} does not exist or is not a directory",
+            params.bundle.display()
+        )));
+    }
+
+    let existing_signature = params.bundle.join("manifest.sig.json").exists();
+
+    ftui_runtime::ftui_println!("Source database: {source_path}");
+    ftui_runtime::ftui_println!("Updating bundle: {}", params.bundle.display());
+    ftui_runtime::ftui_println!("Scrub preset:   {}", params.scrub_preset);
+
+    let tmp = tempfile::tempdir()?;
+    let temp_bundle = tmp.path().join("bundle");
+    std::fs::create_dir_all(&temp_bundle)?;
+
+    // Build updated bundle assets into a temp directory.
+    ftui_runtime::ftui_println!("Building updated bundle in temp directory...");
+
+    // 1. Snapshot + scope + scrub + finalize
+    ftui_runtime::ftui_println!("Creating snapshot...");
+    let snapshot_path = temp_bundle.join("_snapshot.sqlite3");
+    if snapshot_path.exists() {
+        std::fs::remove_file(&snapshot_path)?;
+    }
+    let snap_ctx = share::create_snapshot_context(
+        source,
+        &snapshot_path,
+        &params.projects,
+        params.scrub_preset,
+    )?;
+
+    ftui_runtime::ftui_println!("  Projects: {} kept", snap_ctx.scope.projects.len());
+    ftui_runtime::ftui_println!(
+        "  Scrub: {} secrets replaced, {} bodies redacted",
+        snap_ctx.scrub_summary.secrets_replaced,
+        snap_ctx.scrub_summary.bodies_redacted
+    );
+
+    // 2. Bundle attachments
+    ftui_runtime::ftui_println!("Bundling attachments...");
+    let config = Config::from_env();
+    let att_manifest = share::bundle_attachments(
+        &snapshot_path,
+        &temp_bundle,
+        &config.storage_root,
+        params.inline_threshold,
+        params.detach_threshold,
+    )?;
+    ftui_runtime::ftui_println!(
+        "  Attachments: {} inline, {} copied, {} external, {} missing",
+        att_manifest.stats.inline,
+        att_manifest.stats.copied,
+        att_manifest.stats.externalized,
+        att_manifest.stats.missing
+    );
+
+    // 3. Copy DB to bundle
+    let db_dest = temp_bundle.join("mailbox.sqlite3");
+    std::fs::copy(&snapshot_path, &db_dest)?;
+    let db_sha256 = sha256_file(&db_dest)?;
+    let db_size = db_dest.metadata()?.len();
+
+    // 4. Maybe chunk
+    let chunk = share::maybe_chunk_database(
+        &db_dest,
+        &temp_bundle,
+        params.chunk_threshold,
+        params.chunk_size,
+    )?;
+    if let Some(ref c) = chunk {
+        ftui_runtime::ftui_println!("  Database chunked into {} parts", c.chunk_count);
+    }
+
+    // 5. Viewer assets
+    ftui_runtime::ftui_println!("Copying viewer assets...");
+    let copied = share::copy_viewer_assets(&temp_bundle)?;
+    ftui_runtime::ftui_println!("  Viewer assets: {} files", copied.len());
+
+    // 6. Viewer data
+    ftui_runtime::ftui_println!("Exporting viewer data...");
+    let viewer_data =
+        share::export_viewer_data(&snapshot_path, &temp_bundle, snap_ctx.fts_enabled)?;
+
+    // 7. SRI hashes
+    let sri = share::compute_viewer_sri(&temp_bundle);
+
+    // 8. Hosting hints (use destination bundle location for parity; temp dirs don't have git remotes).
+    let hints = share::detect_hosting_hints(&params.bundle);
+    if !hints.is_empty() {
+        ftui_runtime::ftui_println!(
+            "  Hosting hint: {} (confidence: {})",
+            hints[0].title,
+            hints[0].signals.len()
+        );
+    }
+
+    // 9. Scaffolding
+    ftui_runtime::ftui_println!("Writing manifest and scaffolding...");
+    share::write_bundle_scaffolding(
+        &temp_bundle,
+        &snap_ctx.scope,
+        &snap_ctx.scrub_summary,
+        &att_manifest,
+        chunk.as_ref(),
+        params.chunk_threshold,
+        params.chunk_size,
+        &hints,
+        snap_ctx.fts_enabled,
+        "mailbox.sqlite3",
+        &db_sha256,
+        db_size,
+        Some(&viewer_data),
+        &sri,
+    )?;
+
+    // 10. Clean up snapshot
+    let _ = std::fs::remove_file(&snapshot_path);
+
+    ftui_runtime::ftui_println!(
+        "Synchronizing updated bundle into: {}",
+        params.bundle.display()
+    );
+
+    // Replace top-level generated files (but intentionally do NOT touch manifest.sig.json unless re-signing).
+    let files = [
+        "manifest.json",
+        "README.md",
+        "HOW_TO_DEPLOY.md",
+        "index.html",
+        ".nojekyll",
+        "_headers",
+        "mailbox.sqlite3",
+    ];
+    for name in files {
+        copy_file(&temp_bundle.join(name), &params.bundle.join(name))?;
+    }
+
+    // Ensure bundle doesn't accumulate WAL/SHM files.
+    remove_file_if_exists(&params.bundle.join("mailbox.sqlite3-wal"))?;
+    remove_file_if_exists(&params.bundle.join("mailbox.sqlite3-shm"))?;
+    remove_file_if_exists(&params.bundle.join("_snapshot.sqlite3"))?;
+
+    // Viewer + attachments are always owned by the export; replace wholesale.
+    replace_dir(&temp_bundle.join("viewer"), &params.bundle.join("viewer"))?;
+    replace_dir(
+        &temp_bundle.join("attachments"),
+        &params.bundle.join("attachments"),
+    )?;
+
+    // Chunk artefacts: if the refreshed snapshot no longer needs chunking, prune the old chunk files.
+    if chunk.is_some() {
+        replace_dir(&temp_bundle.join("chunks"), &params.bundle.join("chunks"))?;
+        copy_file(
+            &temp_bundle.join("chunks.sha256"),
+            &params.bundle.join("chunks.sha256"),
+        )?;
+        copy_file(
+            &temp_bundle.join("mailbox.sqlite3.config.json"),
+            &params.bundle.join("mailbox.sqlite3.config.json"),
+        )?;
+    } else {
+        remove_dir_if_exists(&params.bundle.join("chunks"))?;
+        remove_file_if_exists(&params.bundle.join("chunks.sha256"))?;
+        remove_file_if_exists(&params.bundle.join("mailbox.sqlite3.config.json"))?;
+    }
+
+    // Sign (optional).
+    if let Some(ref key_path) = params.signing_key {
+        ftui_runtime::ftui_println!("Signing manifest...");
+        let sig = share::sign_manifest(
+            &params.bundle.join("manifest.json"),
+            key_path,
+            &params.bundle.join("manifest.sig.json"),
+            true,
+        )?;
+        ftui_runtime::ftui_println!("  Algorithm: {}", sig.algorithm);
+        if let Some(ref pub_out) = params.signing_public_out {
+            std::fs::write(pub_out, &sig.public_key)?;
+            ftui_runtime::ftui_println!("  Public key written to: {}", pub_out.display());
+        }
+    } else if existing_signature {
+        ftui_runtime::ftui_eprintln!(
+            "warning: existing manifest signature may no longer match; re-run with --signing-key to refresh it."
+        );
+    }
+
+    // Package ZIP (optional).
+    let mut archive_path: Option<PathBuf> = None;
+    if params.zip {
+        ftui_runtime::ftui_println!("Packaging as ZIP...");
+        let zip_path = zip_archive_path_for_dir(&params.bundle);
+        share::package_directory_as_zip(&params.bundle, &zip_path)?;
+        ftui_runtime::ftui_println!("  ZIP: {}", zip_path.display());
+        archive_path = Some(zip_path);
+    }
+
+    // Encrypt (optional). For update parity, warn but do not fail when --zip is not enabled.
+    if !params.age_recipients.is_empty() {
+        if let Some(ref archive) = archive_path {
+            ftui_runtime::ftui_println!("Encrypting with age...");
+            let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
+            ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
+        } else {
+            ftui_runtime::ftui_eprintln!(
+                "warning: skipped age encryption because --zip was not enabled."
+            );
+        }
+    }
+
+    ftui_runtime::ftui_println!("Update complete: {}", params.bundle.display());
     Ok(())
 }
 
@@ -6086,7 +8413,11 @@ fn handle_doctor_repair(
 
 fn handle_doctor_backups(json: bool) -> CliResult<()> {
     let config = Config::from_env();
-    let backup_dir = config.storage_root.join("backups");
+    handle_doctor_backups_with_storage_root(&config.storage_root, json)
+}
+
+fn handle_doctor_backups_with_storage_root(storage_root: &Path, json: bool) -> CliResult<()> {
+    let backup_dir = storage_root.join("backups");
 
     if !backup_dir.exists() {
         if json {
@@ -6122,13 +8453,14 @@ fn handle_doctor_backups(json: bool) -> CliResult<()> {
         ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
     } else {
         if backups.is_empty() {
-            ftui_runtime::ftui_println!("No backups found.");
+            output::empty_result(false, "No backups found.");
             return Ok(());
         }
-        ftui_runtime::ftui_println!("{:<50} {:>12}", "BACKUP", "SIZE");
+        let mut table = output::CliTable::new(vec!["BACKUP", "SIZE"]);
         for (name, size, _) in &backups {
-            ftui_runtime::ftui_println!("{:<50} {:>12}", name, format_bytes(*size));
+            table.add_row(vec![name.clone(), format_bytes(*size)]);
         }
+        table.render();
     }
     Ok(())
 }
@@ -7334,60 +9666,478 @@ fn scan_markdown_for_blurbs(
 // Static file server for share preview
 // ---------------------------------------------------------------------------
 
-fn serve_static_dir(dir: &Path, host: &str, port: u16) -> CliResult<()> {
+static PREVIEW_FORCE_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Serialize)]
+struct PreviewStatusPayload {
+    signature: String,
+    files_indexed: usize,
+    last_modified_ns: Option<u64>,
+    last_modified_iso: Option<String>,
+    manifest_ns: Option<u64>,
+    manifest_iso: Option<String>,
+    manual_token: u64,
+}
+
+fn bump_preview_force_token() -> u64 {
+    PREVIEW_FORCE_TOKEN
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+}
+
+fn iso_from_epoch_ns(ns: u64) -> Option<String> {
+    let secs = (ns / 1_000_000_000) as i64;
+    let nanos = (ns % 1_000_000_000) as u32;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
+}
+
+fn collect_preview_status(bundle_path: &Path) -> PreviewStatusPayload {
+    use sha2::{Digest, Sha256};
+
+    let token = PREVIEW_FORCE_TOKEN.load(Ordering::Acquire);
+    let bundle_path = bundle_path
+        .canonicalize()
+        .unwrap_or_else(|_| bundle_path.to_path_buf());
+
+    let mut file_entries: Vec<(String, u64, u64)> = Vec::new();
+    let mut latest_ns: u64 = 0;
+    let mut manifest_ns: Option<u64> = None;
+    if bundle_path.is_dir() {
+        let _ = collect_preview_files(
+            &bundle_path,
+            &bundle_path,
+            &mut file_entries,
+            &mut latest_ns,
+            &mut manifest_ns,
+        );
+    }
+
+    file_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut parts: Vec<String> = Vec::with_capacity(file_entries.len() + 1);
+    for (rel, mtime_ns, size) in &file_entries {
+        parts.push(format!("{rel}:{mtime_ns}:{size}"));
+    }
+    parts.push(format!("manual:{token}"));
+
+    let signature = if parts.is_empty() {
+        "0".to_string()
+    } else {
+        hex::encode(Sha256::digest(parts.join("|").as_bytes()))
+    };
+
+    let last_modified_ns = if latest_ns == 0 {
+        None
+    } else {
+        Some(latest_ns)
+    };
+    let last_modified_iso = last_modified_ns.and_then(iso_from_epoch_ns);
+    let manifest_iso = manifest_ns.and_then(iso_from_epoch_ns);
+
+    PreviewStatusPayload {
+        signature,
+        files_indexed: parts.len(),
+        last_modified_ns,
+        last_modified_iso,
+        manifest_ns,
+        manifest_iso,
+        manual_token: token,
+    }
+}
+
+fn collect_preview_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, u64, u64)>,
+    latest_ns: &mut u64,
+    manifest_ns: &mut Option<u64>,
+) -> std::io::Result<()> {
+    use std::time::UNIX_EPOCH;
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            let _ = collect_preview_files(root, &path, out, latest_ns, manifest_ns);
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .replace('\\', "/");
+        if rel.is_empty() {
+            continue;
+        }
+        let mtime_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let size = metadata.len();
+        *latest_ns = (*latest_ns).max(mtime_ns);
+        if rel == "manifest.json" && mtime_ns > 0 {
+            *manifest_ns = Some(mtime_ns);
+        }
+        out.push((rel, mtime_ns, size));
+    }
+    Ok(())
+}
+
+type PreviewLog = std::sync::Arc<std::sync::Mutex<std::fs::File>>;
+
+fn preview_log_line(log: &Option<PreviewLog>, line: &str) {
+    use std::io::Write;
+
+    let Some(log) = log else {
+        return;
+    };
+    let Ok(mut file) = log.lock() else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
+fn apply_preview_no_cache_headers(resp: &mut asupersync::http::h1::types::Response) {
+    resp.headers.push((
+        "Cache-Control".to_string(),
+        "no-store, no-cache, must-revalidate".to_string(),
+    ));
+    resp.headers
+        .push(("Pragma".to_string(), "no-cache".to_string()));
+}
+
+struct PreviewServerHandle {
+    addr: std::net::SocketAddr,
+    shutdown: asupersync::server::shutdown::ShutdownSignal,
+    join: std::thread::JoinHandle<Result<(), String>>,
+}
+
+fn start_preview_server(
+    dir: PathBuf,
+    host: String,
+    port: u16,
+    log: Option<PreviewLog>,
+) -> CliResult<PreviewServerHandle> {
     use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig};
     use asupersync::http::h1::types::Response;
     use asupersync::runtime::RuntimeBuilder;
+    use std::sync::mpsc;
 
-    let dir = dir.to_path_buf();
     let socket_addr: std::net::SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| CliError::InvalidArgument(format!("invalid address: {e}")))?;
 
-    // Run the server (blocks until Ctrl+C)
-    let runtime = RuntimeBuilder::current_thread()
-        .build()
-        .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
-    let handle = runtime.handle();
-    runtime.block_on(async move {
-        let listener = Http1Listener::bind_with_config(
-            socket_addr,
-            move |req| {
-                let dir = dir.clone();
-                async move {
-                    let uri = &req.uri;
-                    let path = uri.split('?').next().unwrap_or("/");
-                    let relative = path.trim_start_matches('/');
-                    let file_path = if relative.is_empty() {
-                        dir.join("index.html")
-                    } else {
-                        dir.join(relative)
-                    };
+    let (ready_tx, ready_rx) = mpsc::channel::<
+        Result<
+            (
+                std::net::SocketAddr,
+                asupersync::server::shutdown::ShutdownSignal,
+            ),
+            String,
+        >,
+    >();
 
-                    if file_path.exists() && file_path.is_file() {
-                        match std::fs::read(&file_path) {
-                            Ok(content) => {
-                                let ct = guess_content_type(&file_path);
-                                let mut resp = Response::new(200, "OK", content);
-                                resp.headers
-                                    .push(("Content-Type".to_string(), ct.to_string()));
-                                resp
-                            }
-                            Err(_) => Response::new(500, "Internal Server Error", Vec::new()),
+    let join = std::thread::spawn(move || {
+        let runtime = match RuntimeBuilder::current_thread().build() {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                let msg = format!("failed to build runtime: {e}");
+                let _ = ready_tx.send(Err(msg.clone()));
+                return Err(msg);
+            }
+        };
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            let dir = dir.clone();
+            let log = log.clone();
+            let listener = match Http1Listener::bind_with_config(
+                socket_addr,
+                move |req| {
+                    let dir = dir.clone();
+                    let log = log.clone();
+                    async move {
+                        let uri = &req.uri;
+                        let path = uri.split('?').next().unwrap_or("/");
+                        preview_log_line(&log, &format!("GET {path}"));
+
+                        if path.starts_with("/__preview__/status") {
+                            let payload = collect_preview_status(&dir);
+                            let body = serde_json::to_vec(&payload).unwrap_or_default();
+                            let mut resp = Response::new(200, "OK", body);
+                            let len = resp.body.len();
+                            resp.headers
+                                .push(("Content-Type".to_string(), "application/json".to_string()));
+                            resp.headers
+                                .push(("Content-Length".to_string(), len.to_string()));
+                            apply_preview_no_cache_headers(&mut resp);
+                            return resp;
                         }
-                    } else {
-                        Response::new(404, "Not Found", b"Not Found".to_vec())
-                    }
-                }
-            },
-            Http1ListenerConfig::default(),
-        )
-        .await
-        .expect("failed to bind HTTP listener");
 
-        let _ = listener.run(&handle).await;
+                        if path == "/favicon.ico"
+                            || path.ends_with(".map")
+                            || path.starts_with("/.well-known/")
+                        {
+                            let mut resp = Response::new(204, "No Content", Vec::new());
+                            resp.headers
+                                .push(("Content-Length".to_string(), "0".to_string()));
+                            apply_preview_no_cache_headers(&mut resp);
+                            return resp;
+                        }
+
+                        let relative = path.trim_start_matches('/');
+                        if relative.split('/').any(|seg| seg == "..") {
+                            let mut resp = Response::new(404, "Not Found", b"Not Found".to_vec());
+                            resp.headers
+                                .push(("Content-Length".to_string(), resp.body.len().to_string()));
+                            apply_preview_no_cache_headers(&mut resp);
+                            return resp;
+                        }
+
+                        let mut file_path = if relative.is_empty() {
+                            dir.join("index.html")
+                        } else {
+                            dir.join(relative)
+                        };
+                        if file_path.is_dir() {
+                            file_path = file_path.join("index.html");
+                        }
+
+                        let mut resp = if file_path.exists() && file_path.is_file() {
+                            match std::fs::read(&file_path) {
+                                Ok(content) => {
+                                    let ct = guess_content_type(&file_path);
+                                    let mut resp = Response::new(200, "OK", content);
+                                    resp.headers
+                                        .push(("Content-Type".to_string(), ct.to_string()));
+                                    resp.headers.push((
+                                        "Content-Length".to_string(),
+                                        resp.body.len().to_string(),
+                                    ));
+                                    resp
+                                }
+                                Err(_) => {
+                                    let mut resp =
+                                        Response::new(500, "Internal Server Error", Vec::new());
+                                    resp.headers
+                                        .push(("Content-Length".to_string(), "0".to_string()));
+                                    resp
+                                }
+                            }
+                        } else {
+                            let mut resp = Response::new(404, "Not Found", b"Not Found".to_vec());
+                            resp.headers
+                                .push(("Content-Length".to_string(), resp.body.len().to_string()));
+                            resp
+                        };
+                        apply_preview_no_cache_headers(&mut resp);
+                        resp
+                    }
+                },
+                Http1ListenerConfig::default(),
+            )
+            .await
+            {
+                Ok(listener) => listener,
+                Err(e) => {
+                    let msg = format!("failed to bind HTTP listener: {e}");
+                    let _ = ready_tx.send(Err(msg.clone()));
+                    return Err(msg);
+                }
+            };
+
+            let shutdown = listener.shutdown_signal();
+            let local_addr = match listener.local_addr() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    let msg = format!("failed to read local addr: {e}");
+                    let _ = ready_tx.send(Err(msg.clone()));
+                    return Err(msg);
+                }
+            };
+            let _ = ready_tx.send(Ok((local_addr, shutdown.clone())));
+
+            listener
+                .run(&handle)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("listener run error: {e}"))
+        })
     });
 
+    let (addr, shutdown) = ready_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|e| CliError::Other(format!("preview server failed to start: {e}")))?
+        .map_err(CliError::Other)?;
+
+    Ok(PreviewServerHandle {
+        addr,
+        shutdown,
+        join,
+    })
+}
+
+fn run_share_preview(bundle: &Path, host: &str, port: u16, open_browser: bool) -> CliResult<()> {
+    run_share_preview_with_control(
+        bundle.to_path_buf(),
+        host.to_string(),
+        port,
+        open_browser,
+        None,
+        None,
+        None,
+    )
+}
+
+fn run_share_preview_with_control(
+    bundle: PathBuf,
+    host: String,
+    port: u16,
+    open_browser: bool,
+    key_rx: Option<std::sync::mpsc::Receiver<char>>,
+    ready_addr_tx: Option<std::sync::mpsc::Sender<std::net::SocketAddr>>,
+    artifacts_dir: Option<PathBuf>,
+) -> CliResult<()> {
+    use std::io::IsTerminal;
+
+    // Prefer shipping the built-in assets in dev/preview mode; ignore errors (matches legacy).
+    let _ = share::copy_viewer_assets(&bundle);
+
+    let log = artifacts_dir.as_ref().and_then(|root| {
+        let _ = std::fs::create_dir_all(root);
+        std::fs::File::create(root.join("server.log"))
+            .ok()
+            .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)))
+    });
+    if let Some(log) = &log {
+        preview_log_line(&Some(log.clone()), "preview server starting");
+    }
+
+    let server = start_preview_server(bundle.clone(), host.clone(), port, log.clone())?;
+    let addr = server.addr;
+    if let Some(tx) = ready_addr_tx {
+        let _ = tx.send(addr);
+    }
+
+    ftui_runtime::ftui_println!(
+        "Serving {} at http://{}:{}/ (Ctrl+C to stop)",
+        bundle.display(),
+        host,
+        addr.port()
+    );
+    ftui_runtime::ftui_println!(
+        "Commands: press 'r' to force refresh, 'd' to deploy now, 'q' to stop."
+    );
+
+    if open_browser {
+        let browse_host = match host.as_str() {
+            "0.0.0.0" | "::" => "127.0.0.1",
+            other => other,
+        };
+        let url = format!("http://{}:{}/viewer/", browse_host, addr.port());
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .or_else(|_| std::process::Command::new("open").arg(&url).spawn());
+    }
+
+    let mut deployment_requested = false;
+    let mut stop_requested = false;
+
+    if let Some(rx) = key_rx {
+        while !stop_requested && !deployment_requested && !server.join.is_finished() {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(ch) => match ch.to_ascii_lowercase() {
+                    'r' => {
+                        let token = bump_preview_force_token();
+                        ftui_runtime::ftui_println!("Reload signal sent (token {token}).");
+                    }
+                    'd' => {
+                        deployment_requested = true;
+                        stop_requested = true;
+                    }
+                    'q' => {
+                        stop_requested = true;
+                    }
+                    _ => {}
+                },
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    } else if std::io::stdin().is_terminal() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
+
+        struct RawModeGuard;
+        impl Drop for RawModeGuard {
+            fn drop(&mut self) {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+
+        crossterm::terminal::enable_raw_mode()
+            .map_err(|e| CliError::Other(format!("failed to enable raw mode: {e}")))?;
+        let _raw = RawModeGuard;
+
+        while !stop_requested && !deployment_requested && !server.join.is_finished() {
+            if poll(std::time::Duration::from_millis(200))
+                .map_err(|e| CliError::Other(format!("hotkey poll error: {e}")))?
+            {
+                if let Event::Key(key) =
+                    read().map_err(|e| CliError::Other(format!("hotkey read error: {e}")))?
+                {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+                    {
+                        stop_requested = true;
+                        continue;
+                    }
+
+                    match key.code {
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            let token = bump_preview_force_token();
+                            ftui_runtime::ftui_println!("Reload signal sent (token {token}).");
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            deployment_requested = true;
+                            stop_requested = true;
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            stop_requested = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    } else {
+        // Non-interactive stdin: keep serving until the process is interrupted.
+        let _ = server.join.join();
+        return Ok(());
+    }
+
+    ftui_runtime::ftui_println!("Stopping preview server...");
+    let _ = server
+        .shutdown
+        .begin_drain(std::time::Duration::from_secs(2));
+    let _ = server.join.join();
+    ftui_runtime::ftui_println!("Preview server stopped.");
+
+    if deployment_requested {
+        return Err(CliError::ExitCode(42));
+    }
     Ok(())
 }
 

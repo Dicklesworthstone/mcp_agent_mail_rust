@@ -29,3 +29,7 @@ hex.workspace = true
 asupersync.workspace = true
 tempfile.workspace = true
 zip.workspace = true
+crossterm = "0.28.1"
+
+[dev-dependencies]
+similar.workspace = true

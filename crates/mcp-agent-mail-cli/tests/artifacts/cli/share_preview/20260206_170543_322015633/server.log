@@ -1,0 +1,4 @@
+preview server starting
+GET /__preview__/status
+GET /viewer/
+GET /__preview__/status
