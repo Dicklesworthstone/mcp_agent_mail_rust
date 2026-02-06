@@ -10,7 +10,7 @@
 ## Core Server Features
 | Feature | Status | Evidence |
 | --- | --- | --- |
-| FastMCP server (stdio transport) | Implemented | `crates/mcp-agent-mail-server/src/lib.rs` |
+| FastMCP server (stdio transport) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs`, `tests/e2e/test_stdio.sh` (10 E2E assertions: initialize, tools/list, tool call, invalid JSON, clean exit) |
 | FastMCP server (HTTP) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs`, `scripts/e2e_http.sh` (47 E2E assertions), `tests/e2e/test_http.sh` |
 | Tool registry + tool clusters | Verified (Conformance) | `crates/mcp-agent-mail-server/src/lib.rs` |
 | Resource URI system (`resource://...`) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
@@ -93,6 +93,7 @@
 | Feature | Status | Evidence |
 | --- | --- | --- |
 | CLI command parity | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (40+ commands, 123+ tests, only `--interactive` deferred) |
+| `mcp-agent-mail` binary unsupported commands fail fast with CLI guidance | Verified (Tests) | `crates/mcp-agent-mail/src/main.rs` (non-zero exit + guidance + regression test) |
 | CLI output module (TTY-aware tables, JSON mode) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/output.rs` (CliTable, json_or_table, 33 tests) |
 | Config management (show-port, set-port) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: show-port returns port, set-port writes env file) |
 | list-projects (--json, --include-agents) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (integration test), `tests/cli_json_snapshots.rs` (JSON snapshot) |
