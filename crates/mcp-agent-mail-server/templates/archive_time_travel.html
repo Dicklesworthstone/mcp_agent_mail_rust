@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+
+{% block title %}Time Travel — Agent Mail{% endblock %}
+
+{% block breadcrumbs %}
+<nav class="flex items-center gap-2 text-sm">
+  <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">Projects</a>
+  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
+  <a href="/mail/archive/guide" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">Archive</a>
+  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
+  <span class="text-slate-900 dark:text-white font-medium">Time Travel</span>
+</nav>
+{% endblock %}
+
+{% block content %}
+<div class="page-transition" x-data="timeTravelManager()">
+  <div class="mb-8">
+    <div class="flex items-center gap-4">
+      <div class="w-14 h-14 bg-primary-600 rounded-xl flex items-center justify-center shadow-md">
+        <i data-lucide="clock" class="w-8 h-8 text-white"></i>
+      </div>
+      <div>
+        <h1 class="text-4xl font-bold text-slate-900 dark:text-white mb-1">Time Travel</h1>
+        <p class="text-slate-600 dark:text-slate-400">View historical snapshots of agent inboxes</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="bg-white dark:bg-slate-800 rounded-2xl shadow-soft border-2 border-slate-200 dark:border-slate-700 p-8 mb-6">
+    <h3 class="text-lg font-bold text-slate-900 dark:text-white mb-6 flex items-center gap-2">
+      <i data-lucide="settings" class="w-5 h-5 text-primary-600"></i>
+      Time Travel Settings
+    </h3>
+
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div>
+        <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">Project</label>
+        <select x-model="selectedProject" class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-900 border-2 border-slate-200 dark:border-slate-700 rounded-xl text-slate-900 dark:text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+          <option value="">Select project...</option>
+          {% for proj in projects %}
+            <option value="{{ proj }}">{{ proj }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">Agent</label>
+        <select x-model="selectedAgent" :disabled="!selectedProject || loadingAgents" class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-900 border-2 border-slate-200 dark:border-slate-700 rounded-xl text-slate-900 dark:text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent disabled:opacity-60 disabled:cursor-not-allowed disabled:bg-slate-100 dark:disabled:bg-slate-800 disabled:text-slate-400">
+          <option value="" x-text="loadingAgents ? 'Loading agents...' : (!selectedProject ? 'Select project first...' : (agents.length === 0 ? 'No agents found' : 'Select agent...'))"></option>
+          <template x-for="agent in agents" :key="agent">
+            <option :value="agent" x-text="agent"></option>
+          </template>
+        </select>
+      </div>
+
+      <div>
+        <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">Date & Time</label>
+        <input type="datetime-local" x-model="selectedTime" class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-900 border-2 border-slate-200 dark:border-slate-700 rounded-xl text-slate-900 dark:text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+      </div>
+    </div>
+
+    <div class="mt-6">
+      <button @click="timeTravel()" :disabled="!selectedProject || !selectedAgent || !selectedTime" class="w-full px-6 py-4 bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white font-bold rounded-xl transition-all duration-200 shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3">
+        <i data-lucide="zap" class="w-5 h-5"></i>
+        Travel to This Moment
+      </button>
+    </div>
+  </div>
+
+  <template x-if="snapshot">
+    <div class="bg-white dark:bg-slate-800 rounded-2xl shadow-soft border-2 border-slate-200 dark:border-slate-700 overflow-hidden">
+      <div class="bg-gradient-to-r from-indigo-600 to-indigo-700 dark:from-indigo-700 dark:to-indigo-800 p-6">
+        <div class="flex items-center justify-between text-white mb-4">
+          <div>
+            <h3 class="text-2xl font-bold mb-1">Historical Snapshot</h3>
+            <p class="text-white/90">
+              <span x-text="selectedAgent"></span> inbox as of <span x-text="selectedTime"></span>
+            </p>
+          </div>
+          <div class="text-right">
+            <div class="text-3xl font-bold" x-text="snapshot.messages.length"></div>
+            <div class="text-sm text-white/80">Messages</div>
+          </div>
+        </div>
+
+        <!-- Commit Info -->
+        <template x-if="snapshot.commit_sha">
+          <div class="bg-white/10 backdrop-blur-sm rounded-xl p-4 space-y-2">
+            <div class="flex items-center gap-2 text-white/90 text-sm">
+              <i data-lucide="git-commit" class="w-4 h-4"></i>
+              <span class="font-mono" x-text="snapshot.commit_sha.substring(0, 8)"></span>
+              <span class="text-white/70">—</span>
+              <span x-text="new Date(snapshot.snapshot_time).toLocaleString()"></span>
+            </div>
+            <template x-if="snapshot.note">
+              <p class="text-white/80 text-xs" x-text="snapshot.note"></p>
+            </template>
+            <template x-if="snapshot.error">
+              <div class="flex items-start gap-2 text-yellow-200 text-xs">
+                <i data-lucide="alert-triangle" class="w-4 h-4 flex-shrink-0 mt-0.5"></i>
+                <span x-text="snapshot.error"></span>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+
+      <div class="p-6 space-y-3">
+        <template x-for="msg in snapshot.messages" :key="msg.id">
+          <div class="p-4 bg-slate-50 dark:bg-slate-900 rounded-xl border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all">
+            <div class="flex items-start justify-between gap-4 mb-2">
+              <div class="flex items-center gap-2 flex-1">
+                <h4 class="font-bold text-slate-900 dark:text-white" x-text="msg.subject"></h4>
+                <template x-if="msg.importance && msg.importance !== 'normal'">
+                  <span class="px-2 py-0.5 text-xs font-semibold rounded-full"
+                        :class="{
+                          'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400': msg.importance === 'urgent' || msg.importance === 'high',
+                          'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400': msg.importance === 'low'
+                        }"
+                        x-text="msg.importance.toUpperCase()">
+                  </span>
+                </template>
+              </div>
+              <span class="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap" x-text="msg.date"></span>
+            </div>
+            <div class="text-sm text-slate-600 dark:text-slate-400">
+              From: <span class="font-medium" x-text="msg.from"></span>
+            </div>
+          </div>
+        </template>
+
+        <template x-if="snapshot.messages.length === 0">
+          <div class="flex flex-col items-center justify-center py-12 text-slate-500 dark:text-slate-400">
+            <i data-lucide="inbox" class="w-16 h-16 mb-4"></i>
+            <p class="text-base mb-2">Inbox was empty at this time</p>
+            <p class="text-sm text-slate-400 dark:text-slate-500 max-w-md text-center">No messages existed in this agent's inbox at the selected timestamp. Messages may have been received later or already processed before this point.</p>
+          </div>
+        </template>
+      </div>
+    </div>
+  </template>
+</div>
+
+<script>
+function timeTravelManager() {
+  return {
+    selectedProject: '',
+    selectedAgent: '',
+    selectedTime: '',
+    snapshot: null,
+    agents: [],
+    loadingAgents: false,
+    _lastProjectLoaded: null,
+
+    async init() {
+      // Watch for project changes
+      this.$watch('selectedProject', async (newProject) => {
+        // Clear agent selection when project changes
+        this.selectedAgent = '';
+        this.agents = [];
+
+        if (newProject) {
+          await this.loadAgents(newProject);
+        } else {
+          // User deselected - clear the last loaded project marker
+          // to prevent stale fetches from populating agents
+          this._lastProjectLoaded = null;
+          this.loadingAgents = false;
+        }
+      });
+    },
+
+    async loadAgents(project) {
+      // Store the project we're loading to detect race conditions
+      this._lastProjectLoaded = project;
+      this.loadingAgents = true;
+
+      try {
+        const response = await fetch(`/mail/api/projects/${encodeURIComponent(project)}/agents`);
+        const data = await response.json();
+
+        // Only update agents if this is still the current project
+        // (user might have switched projects while we were loading)
+        if (this._lastProjectLoaded === project) {
+          this.agents = data.agents || [];
+        }
+      } catch (error) {
+        console.error('Failed to load agents:', error);
+        // Only clear agents if this is still the current project
+        if (this._lastProjectLoaded === project) {
+          this.agents = [];
+        }
+      } finally {
+        // Only clear loading state if this is still the current project
+        if (this._lastProjectLoaded === project) {
+          this.loadingAgents = false;
+        }
+      }
+    },
+
+    async timeTravel() {
+      try {
+        const params = new URLSearchParams({
+          project: this.selectedProject,
+          agent: this.selectedAgent,
+          timestamp: this.selectedTime
+        });
+
+        const response = await fetch(`/mail/archive/time-travel/snapshot?${params}`);
+
+        if (!response.ok) {
+          // Handle HTTP errors (400, 500, etc.)
+          const errorData = await response.json().catch(() => ({}));
+          this.snapshot = {
+            messages: [],
+            snapshot_time: null,
+            commit_sha: null,
+            requested_time: this.selectedTime,
+            error: errorData.detail || errorData.error || `Server error: ${response.status}`
+          };
+          // Render lucide icons (for the alert-triangle icon in error display)
+          lucide.createIcons();
+          return;
+        }
+
+        this.snapshot = await response.json();
+        lucide.createIcons();
+      } catch (error) {
+        // Handle network errors or other exceptions
+        console.error('Time travel failed:', error);
+        this.snapshot = {
+          messages: [],
+          snapshot_time: null,
+          commit_sha: null,
+          requested_time: this.selectedTime,
+          error: 'Failed to retrieve snapshot. Please check your connection and try again.'
+        };
+        // Render lucide icons (for the alert-triangle icon in error display)
+        lucide.createIcons();
+      }
+    }
+  };
+}
+</script>
+{% endblock %}

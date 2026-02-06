@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-use asupersync::http::h1::listener::Http1Listener;
 use asupersync::http::h1::HttpClient;
+use asupersync::http::h1::listener::Http1Listener;
 use asupersync::http::h1::types::{
     Method as Http1Method, Request as Http1Request, Response as Http1Response, default_reason,
 };
@@ -39,6 +39,7 @@ use mcp_agent_mail_tools::{
     ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -432,6 +433,25 @@ impl HttpState {
 
     #[allow(clippy::unused_async)] // Required for Http1Listener interface
     async fn handle(&self, req: Http1Request) -> Http1Response {
+        if !self.config.http_request_log_enabled {
+            return self.handle_inner(req).await;
+        }
+
+        let start = Instant::now();
+        let method = req.method.clone();
+        let (path, _query) = split_path_query(&req.uri);
+        let client_ip = req
+            .peer_addr
+            .map_or_else(|| "-".to_string(), |addr| addr.ip().to_string());
+
+        let resp = self.handle_inner(req).await;
+        let dur_ms = u64::try_from(start.elapsed().as_millis().min(u128::from(u64::MAX)))
+            .unwrap_or(u64::MAX);
+        self.emit_http_request_log(method.as_str(), &path, resp.status, dur_ms, &client_ip);
+        resp
+    }
+
+    async fn handle_inner(&self, req: Http1Request) -> Http1Response {
         if let Some(resp) = self.handle_options(&req) {
             return resp;
         }
@@ -486,6 +506,58 @@ impl HttpState {
         )
     }
 
+    fn emit_http_request_log(
+        &self,
+        method: &str,
+        path: &str,
+        status: u16,
+        duration_ms: u64,
+        client_ip: &str,
+    ) {
+        // Legacy parity: request logging must not affect request/response behavior.
+        // All failures are swallowed.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+            // structlog-like emission (stderr)
+            let line = if self.config.log_json_enabled {
+                http_request_log_json_line(&timestamp, method, path, status, duration_ms, client_ip)
+                    .unwrap_or_else(|| {
+                        http_request_log_kv_line(
+                            &timestamp,
+                            method,
+                            path,
+                            status,
+                            duration_ms,
+                            client_ip,
+                        )
+                    })
+            } else {
+                http_request_log_kv_line(&timestamp, method, path, status, duration_ms, client_ip)
+            };
+            ftui_runtime::ftui_eprintln!("{line}");
+
+            // Rich-ish panel output (stdout), fallback to legacy plain-text line on any error.
+            let use_ansi = std::io::stdout().is_terminal();
+            if let Some(panel) = render_http_request_panel(
+                100,
+                method,
+                path,
+                status,
+                duration_ms,
+                client_ip,
+                use_ansi,
+            ) {
+                ftui_runtime::ftui_println!("{panel}");
+            } else {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    http_request_log_fallback_line(method, path, status, duration_ms, client_ip)
+                );
+            }
+        }));
+    }
+
     fn handle_options(&self, req: &Http1Request) -> Option<Http1Response> {
         if !matches!(req.method, Http1Method::Options) {
             return None;
@@ -534,6 +606,20 @@ impl HttpState {
             _ => {}
         }
 
+        if path == "/mail/api/locks" {
+            if !matches!(req.method, Http1Method::Get) {
+                return Some(self.error_response(req, 405, "Method Not Allowed"));
+            }
+            let payload = match mcp_agent_mail_storage::collect_lock_status(&self.config) {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = format!("lock status error: {err}");
+                    return Some(self.error_response(req, 500, &msg));
+                }
+            };
+            return Some(self.json_response(req, 200, &payload));
+        }
+
         if path == "/mail" || path.starts_with("/mail/") {
             return Some(self.error_response(req, 404, "Mail UI not implemented"));
         }
@@ -541,12 +627,22 @@ impl HttpState {
         None
     }
 
+    /// Check if `path` is under the configured MCP base path.
+    ///
+    /// Legacy parity: FastAPI `mount(base_no_slash, app)` + `mount(base_with_slash, app)`
+    /// routes the exact base **and** all sub-paths to the stateless MCP app.
     fn path_allowed(&self, path: &str) -> bool {
         let base = normalize_base_path(&self.config.http_path);
         if base == "/" {
             return true;
         }
-        path == base || path == format!("{}/", base.trim_end_matches('/'))
+        let base_no_slash = base.trim_end_matches('/');
+        // Exact match: /api
+        if path == base_no_slash {
+            return true;
+        }
+        // With trailing slash and any sub-path: /api/ or /api/foo
+        path.starts_with(&format!("{base_no_slash}/"))
     }
 
     fn check_bearer_auth(&self, req: &Http1Request) -> Option<Http1Response> {
@@ -719,7 +815,10 @@ impl HttpState {
             Some(serde_json::Value::String(s)) => vec![s.clone()],
             Some(serde_json::Value::Array(items)) => items
                 .iter()
-                .map(|v| v.as_str().map_or_else(|| v.to_string(), ToString::to_string))
+                .map(|v| {
+                    v.as_str()
+                        .map_or_else(|| v.to_string(), ToString::to_string)
+                })
                 .collect(),
             _ => Vec::new(),
         };
@@ -1411,7 +1510,25 @@ fn to_mcp_http_request(req: &Http1Request, path: &str) -> HttpRequest {
     };
     let mut headers = HashMap::new();
     for (k, v) in &req.headers {
-        headers.insert(k.to_lowercase(), v.clone());
+        let lk = k.to_lowercase();
+        // Legacy parity: strip any existing Accept header; we force it below.
+        if lk == "accept" {
+            continue;
+        }
+        headers.insert(lk, v.clone());
+    }
+    // Legacy parity (StatelessMCPASGIApp): ensure Accept includes both JSON and SSE
+    // so StreamableHTTP transport never rejects the request.
+    headers.insert(
+        "accept".to_string(),
+        "application/json, text/event-stream".to_string(),
+    );
+    // Legacy parity: ensure Content-Type is present for POST requests.
+    if matches!(req.method, Http1Method::Post) && !headers.contains_key("content-type") {
+        headers.insert(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        );
     }
     HttpRequest {
         method,
@@ -1560,6 +1677,281 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+fn py_repr_str(s: &str) -> String {
+    // Cheap approximation of Python's `repr(str)` used by structlog's KeyValueRenderer.
+    // Good enough for stable snapshots and human scanning.
+    let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+fn http_request_log_kv_line(
+    timestamp: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+    duration_ms: u64,
+    client_ip: &str,
+) -> String {
+    // Legacy key_order: ["event","path","status"].
+    // Remaining keys follow the common structlog insertion order: kwargs first, then processors.
+    [
+        format!("event={}", py_repr_str("request")),
+        format!("path={}", py_repr_str(path)),
+        format!("status={status}"),
+        format!("method={}", py_repr_str(method)),
+        format!("duration_ms={duration_ms}"),
+        format!("client_ip={}", py_repr_str(client_ip)),
+        format!("timestamp={}", py_repr_str(timestamp)),
+        format!("level={}", py_repr_str("info")),
+    ]
+    .join(" ")
+}
+
+fn http_request_log_json_line(
+    timestamp: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+    duration_ms: u64,
+    client_ip: &str,
+) -> Option<String> {
+    let value = serde_json::json!({
+        "timestamp": timestamp,
+        "level": "info",
+        "event": "request",
+        "method": method,
+        "path": path,
+        "status": status,
+        "duration_ms": duration_ms,
+        "client_ip": client_ip,
+    });
+    serde_json::to_string(&value).ok()
+}
+
+fn http_request_log_fallback_line(
+    method: &str,
+    path: &str,
+    status: u16,
+    duration_ms: u64,
+    client_ip: &str,
+) -> String {
+    // Must match legacy fallback string exactly.
+    format!("http method={method} path={path} status={status} ms={duration_ms} client={client_ip}")
+}
+
+fn render_http_request_panel(
+    width: usize,
+    method: &str,
+    path: &str,
+    status: u16,
+    duration_ms: u64,
+    client_ip: &str,
+    use_ansi: bool,
+) -> Option<String> {
+    // `rich.console.Console(width=100)` - keep deterministic, but avoid panicking on tiny widths.
+    if width < 20 {
+        return None;
+    }
+    let inner_width = width.saturating_sub(2);
+
+    let status_str = status.to_string();
+    let dur_str = format!("{duration_ms}ms");
+
+    // Title formatting mirrors legacy spacing: "METHOD␠␠PATH␠␠STATUS␠␠DUR".
+    let reserved = method.len() + status_str.len() + dur_str.len() + 8; // 6 spaces between + 2 edge spaces
+    let max_path = inner_width.saturating_sub(reserved).max(1);
+    let path = if path.len() <= max_path {
+        path.to_string()
+    } else if max_path <= 3 {
+        path[..max_path].to_string()
+    } else {
+        format!("{}...", &path[..(max_path - 3)])
+    };
+
+    let title_plain = format!("{method}  {path}  {status_str}  {dur_str}");
+
+    let title_styled = if use_ansi {
+        const RESET: &str = "\x1b[0m";
+        const BOLD_BLUE: &str = "\x1b[1;34m";
+        const BOLD_WHITE: &str = "\x1b[1;37m";
+        const BOLD_GREEN: &str = "\x1b[1;32m";
+        const BOLD_RED: &str = "\x1b[1;31m";
+        const BOLD_YELLOW: &str = "\x1b[1;33m";
+
+        let status_color = if (200..400).contains(&status) {
+            BOLD_GREEN
+        } else {
+            BOLD_RED
+        };
+
+        format!(
+            "{BOLD_BLUE}{method}{RESET}  {BOLD_WHITE}{path}{RESET}  {status_color}{status_str}{RESET}  {BOLD_YELLOW}{dur_str}{RESET}",
+        )
+    } else {
+        title_plain.clone()
+    };
+
+    let mut top = format!(" {title_styled} ");
+    let top_plain_len = title_plain.len().saturating_add(2);
+    if top_plain_len > inner_width {
+        return None;
+    }
+    top.push_str(&"-".repeat(inner_width.saturating_sub(top_plain_len)));
+
+    // Body: "client: <ip>"
+    let mut body_plain = format!(" client: {client_ip}");
+    if body_plain.len() > inner_width {
+        // Truncate client_ip to fit.
+        let reserved = " client: ".len();
+        let max_ip = inner_width.saturating_sub(reserved).max(1);
+        let ip = if client_ip.len() <= max_ip {
+            client_ip.to_string()
+        } else if max_ip <= 3 {
+            client_ip[..max_ip].to_string()
+        } else {
+            format!("{}...", &client_ip[..(max_ip - 3)])
+        };
+        body_plain = format!(" client: {ip}");
+    }
+
+    let body_plain_len = body_plain.len();
+
+    let body_styled = if use_ansi {
+        const RESET: &str = "\x1b[0m";
+        const CYAN: &str = "\x1b[36m";
+        const WHITE: &str = "\x1b[37m";
+
+        let prefix = " client: ";
+        let ip = body_plain.strip_prefix(prefix).unwrap_or(client_ip);
+        format!(" {CYAN}client: {RESET}{WHITE}{ip}{RESET}")
+    } else {
+        body_plain
+    };
+
+    let mut body = body_styled;
+    if body_plain_len > inner_width {
+        return None;
+    }
+    body.push_str(&" ".repeat(inner_width.saturating_sub(body_plain_len)));
+
+    let bottom = "-".repeat(inner_width);
+
+    Some(format!("+{top}+\n|{body}|\n+{bottom}+"))
+}
+
+// ---------------------------------------------------------------------------
+// Expected Error Filter (Legacy Parity Helper)
+// ---------------------------------------------------------------------------
+//
+// Legacy python applies this as a stdlib logging.Filter to the logger:
+//   "fastmcp.tools.tool_manager"
+//
+// In Rust, we expose the same classification logic so whichever logging backend
+// we settle on (log, tracing, etc) can replicate the behavior without letting
+// expected errors spam stacktraces or error-level logs.
+
+#[allow(dead_code)]
+const EXPECTED_ERROR_FILTER_TARGET: &str = "fastmcp.tools.tool_manager";
+
+#[allow(dead_code)]
+const EXPECTED_ERROR_PATTERNS: [&str; 8] = [
+    "not found in project",
+    "index.lock",
+    "git_index_lock",
+    "resource_busy",
+    "temporarily locked",
+    "recoverable=true",
+    "use register_agent",
+    "available agents:",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SimpleLogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl SimpleLogLevel {
+    const fn is_error_or_higher(self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+struct ExpectedErrorOutcome {
+    is_expected: bool,
+    suppress_exc: bool,
+    effective_level: SimpleLogLevel,
+}
+
+#[allow(dead_code)]
+fn expected_error_filter(
+    target: &str,
+    has_exc: bool,
+    level: SimpleLogLevel,
+    message: &str,
+    recoverable: bool,
+    cause_chain: &[(/* message */ &str, /* recoverable */ bool)],
+) -> ExpectedErrorOutcome {
+    // Legacy behavior: filter only when there is exception info.
+    if !has_exc {
+        return ExpectedErrorOutcome {
+            is_expected: false,
+            suppress_exc: false,
+            effective_level: level,
+        };
+    }
+
+    // Legacy behavior: apply only to the specific tool-manager logger.
+    if target != EXPECTED_ERROR_FILTER_TARGET {
+        return ExpectedErrorOutcome {
+            is_expected: false,
+            suppress_exc: false,
+            effective_level: level,
+        };
+    }
+
+    let msg_matches_patterns = |msg: &str| {
+        let msg = msg.to_ascii_lowercase();
+        EXPECTED_ERROR_PATTERNS
+            .iter()
+            .any(|needle| msg.contains(needle))
+    };
+
+    let mut expected = recoverable || msg_matches_patterns(message);
+    if !expected {
+        for (cause_msg, cause_recoverable) in cause_chain {
+            if *cause_recoverable || msg_matches_patterns(cause_msg) {
+                expected = true;
+                break;
+            }
+        }
+    }
+
+    if expected {
+        ExpectedErrorOutcome {
+            is_expected: true,
+            suppress_exc: true,
+            effective_level: if level.is_error_or_higher() {
+                SimpleLogLevel::Info
+            } else {
+                level
+            },
+        }
+    } else {
+        ExpectedErrorOutcome {
+            is_expected: false,
+            suppress_exc: false,
+            effective_level: level,
+        }
+    }
+}
+
 const fn http_error_status(
     err: &fastmcp_transport::http::HttpError,
 ) -> fastmcp_transport::http::HttpStatus {
@@ -1579,6 +1971,10 @@ const fn http_error_status(
 mod tests {
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
+    use ftui_runtime::stdio_capture::StdioCapture;
+    use std::sync::Mutex;
+
+    static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
     fn build_state(config: mcp_agent_mail_core::Config) -> HttpState {
         let server = build_server(&config);
@@ -1680,6 +2076,28 @@ mod tests {
             &[("Origin", "http://blocked.com")],
         );
         assert_eq!(state.cors_origin(&req), None);
+    }
+
+    #[test]
+    fn mail_api_locks_returns_json() {
+        let storage_root = std::env::temp_dir().join(format!(
+            "mcp-agent-mail-mail-locks-test-{}",
+            std::process::id()
+        ));
+        let config = mcp_agent_mail_core::Config {
+            storage_root,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/mail/api/locks", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("locks response json");
+        assert!(
+            payload.get("locks").and_then(|v| v.as_array()).is_some(),
+            "locks missing or not array: {payload}"
+        );
     }
 
     #[test]
@@ -1799,6 +2217,82 @@ mod tests {
         assert_eq!(peer_addr_host(addr), "127.0.0.1".to_string());
         let non_local = SocketAddr::from(([10, 1, 2, 3], 9000));
         assert!(!is_local_peer_addr(Some(non_local)));
+    }
+
+    // ── Additional localhost auth tests (br-1bm.4.4) ─────────────────────
+
+    #[test]
+    fn localhost_bypass_ipv6_loopback() {
+        let config = mcp_agent_mail_core::Config {
+            http_allow_localhost_unauthenticated: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let ipv6_loopback: SocketAddr = "[::1]:9000".parse().expect("ipv6 loopback");
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[],
+            Some(ipv6_loopback),
+        );
+        assert!(
+            state.allow_local_unauthenticated(&req),
+            "::1 must be recognized as localhost"
+        );
+    }
+
+    #[test]
+    fn localhost_bypass_disabled_rejects_all() {
+        let config = mcp_agent_mail_core::Config {
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let local = SocketAddr::from(([127, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(Http1Method::Post, "/api", &[], Some(local));
+        assert!(
+            !state.allow_local_unauthenticated(&req),
+            "when config disabled, localhost must not bypass"
+        );
+    }
+
+    #[test]
+    fn localhost_bypass_no_peer_addr_rejects() {
+        let config = mcp_agent_mail_core::Config {
+            http_allow_localhost_unauthenticated: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Post, "/api", &[]);
+        assert!(
+            !state.allow_local_unauthenticated(&req),
+            "missing peer_addr must not bypass"
+        );
+    }
+
+    // ── Stateless dispatch tests (br-1bm.4.5) ────────────────────────────
+
+    #[test]
+    fn dispatch_returns_none_for_notification() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let notification = JsonRpcRequest::notification("notifications/cancelled", None);
+        // Stateless dispatch: notification returns None (no response)
+        assert!(state.dispatch(notification).is_none());
+    }
+
+    #[test]
+    fn dispatch_returns_error_for_unknown_method() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let request = JsonRpcRequest::new("nonexistent/method", None, 1_i64);
+        let resp = state.dispatch(request);
+        assert!(resp.is_some(), "unknown method should still return a response");
+        let resp = resp.unwrap();
+        assert!(
+            resp.error.is_some(),
+            "unknown method must return an error response"
+        );
     }
 
     #[test]
@@ -1999,9 +2493,7 @@ mod tests {
         // a single-threaded async runtime.
         std::thread::scope(|s| {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind jwks listener");
-            listener
-                .set_nonblocking(true)
-                .expect("set_nonblocking");
+            listener.set_nonblocking(true).expect("set_nonblocking");
             let addr = listener.local_addr().expect("listener addr");
             let jwks_body = jwks_bytes.clone();
             let accepted = Arc::new(AtomicBool::new(false));
@@ -2072,7 +2564,12 @@ mod tests {
                     Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
                 );
                 let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
-                assert!(state.check_rbac_and_rate_limit(&req, &json_rpc).await.is_none());
+                assert!(
+                    state
+                        .check_rbac_and_rate_limit(&req, &json_rpc)
+                        .await
+                        .is_none()
+                );
             });
         });
     }
@@ -2203,5 +2700,455 @@ mod tests {
         let fmt = envelope["format"].as_str().unwrap();
         assert!(fmt == "toon" || fmt == "json");
         assert_eq!(envelope["meta"]["requested"], "toon");
+    }
+
+    #[test]
+    fn http_request_logging_disabled_emits_no_output() {
+        let _guard = STDIO_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            http_request_log_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let capture = StdioCapture::install().expect("stdio capture install");
+        let req = make_request(Http1Method::Get, "/health/liveness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let out = capture.drain_to_string();
+        assert!(
+            out.trim().is_empty(),
+            "expected no output when request logging disabled, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn http_request_logging_kv_branch_emits_structured_and_panel_output() {
+        let _guard = STDIO_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            http_request_log_enabled: true,
+            log_json_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let capture = StdioCapture::install().expect("stdio capture install");
+        let req = make_request_with_peer_addr(
+            Http1Method::Get,
+            "/health/liveness",
+            &[],
+            Some("127.0.0.1:12345".parse().unwrap()),
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let out = capture.drain_to_string();
+
+        // KeyValueRenderer-ish line
+        assert!(out.contains("event='request'"), "missing event: {out:?}");
+        assert!(
+            out.contains("path='/health/liveness'"),
+            "missing path: {out:?}"
+        );
+        assert!(out.contains("status=200"), "missing status: {out:?}");
+        assert!(out.contains("method='GET'"), "missing method: {out:?}");
+        assert!(out.contains("duration_ms="), "missing duration_ms: {out:?}");
+        assert!(
+            out.contains("client_ip='127.0.0.1'"),
+            "missing client_ip: {out:?}"
+        );
+
+        // Panel output
+        assert!(
+            out.contains("+ GET  /health/liveness  200 "),
+            "missing panel title: {out:?}"
+        );
+        assert!(
+            out.contains("| client: 127.0.0.1"),
+            "missing panel body: {out:?}"
+        );
+    }
+
+    #[test]
+    fn http_request_logging_json_branch_emits_json_and_panel_output() {
+        let _guard = STDIO_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            http_request_log_enabled: true,
+            log_json_enabled: true,
+            http_otel_enabled: true,
+            http_otel_service_name: "mcp-agent-mail-test".to_string(),
+            http_otel_exporter_otlp_endpoint: "http://127.0.0.1:4318".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let capture = StdioCapture::install().expect("stdio capture install");
+        let req = make_request_with_peer_addr(
+            Http1Method::Get,
+            "/health/liveness",
+            &[],
+            Some("127.0.0.1:12345".parse().unwrap()),
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let out = capture.drain_to_string();
+
+        // Find and parse the JSON log line.
+        let json_line = out
+            .lines()
+            .find(|line| line.trim_start().starts_with('{') && line.trim_end().ends_with('}'))
+            .expect("expected JSON log line");
+        let value: serde_json::Value =
+            serde_json::from_str(json_line).expect("json log line should parse");
+        assert_eq!(value["event"], "request");
+        assert_eq!(value["method"], "GET");
+        assert_eq!(value["path"], "/health/liveness");
+        assert_eq!(value["status"], 200);
+        assert_eq!(value["client_ip"], "127.0.0.1");
+
+        // Panel output
+        assert!(
+            out.contains("+ GET  /health/liveness  200 "),
+            "missing panel title: {out:?}"
+        );
+        assert!(
+            out.contains("| client: 127.0.0.1"),
+            "missing panel body: {out:?}"
+        );
+    }
+
+    #[test]
+    fn http_request_panel_tiny_width_returns_none_and_fallback_is_exact() {
+        assert!(render_http_request_panel(0, "GET", "/", 200, 1, "x", false).is_none());
+        assert_eq!(
+            http_request_log_fallback_line("GET", "/x", 404, 12, "127.0.0.1"),
+            "http method=GET path=/x status=404 ms=12 client=127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn expected_error_filter_skips_without_exc_info() {
+        let out = expected_error_filter(
+            EXPECTED_ERROR_FILTER_TARGET,
+            false,
+            SimpleLogLevel::Error,
+            "index.lock contention",
+            false,
+            &[],
+        );
+        assert!(!out.is_expected);
+        assert!(!out.suppress_exc);
+        assert_eq!(out.effective_level, SimpleLogLevel::Error);
+    }
+
+    #[test]
+    fn expected_error_filter_applies_only_to_target_logger() {
+        let out = expected_error_filter(
+            "some.other.logger",
+            true,
+            SimpleLogLevel::Error,
+            "index.lock contention",
+            false,
+            &[],
+        );
+        assert!(!out.is_expected);
+        assert!(!out.suppress_exc);
+        assert_eq!(out.effective_level, SimpleLogLevel::Error);
+    }
+
+    #[test]
+    fn expected_error_filter_matches_patterns_and_downgrades_error_to_info() {
+        let out = expected_error_filter(
+            EXPECTED_ERROR_FILTER_TARGET,
+            true,
+            SimpleLogLevel::Error,
+            "Git index.lock temporarily locked",
+            false,
+            &[],
+        );
+        assert!(out.is_expected);
+        assert!(out.suppress_exc);
+        assert_eq!(out.effective_level, SimpleLogLevel::Info);
+    }
+
+    #[test]
+    fn expected_error_filter_matches_recoverable_flag_even_without_pattern() {
+        let out = expected_error_filter(
+            EXPECTED_ERROR_FILTER_TARGET,
+            true,
+            SimpleLogLevel::Error,
+            "some random error",
+            true,
+            &[],
+        );
+        assert!(out.is_expected);
+        assert!(out.suppress_exc);
+        assert_eq!(out.effective_level, SimpleLogLevel::Info);
+    }
+
+    #[test]
+    fn expected_error_filter_matches_cause_chain() {
+        let out = expected_error_filter(
+            EXPECTED_ERROR_FILTER_TARGET,
+            true,
+            SimpleLogLevel::Error,
+            "top-level error",
+            false,
+            &[("Available agents: ...", false)],
+        );
+        assert!(out.is_expected);
+        assert!(out.suppress_exc);
+        assert_eq!(out.effective_level, SimpleLogLevel::Info);
+    }
+
+    // ── Base path mount + passthrough tests (br-1bm.4.3) ────────────────
+
+    #[test]
+    fn normalize_base_path_defaults() {
+        assert_eq!(normalize_base_path(""), "/");
+        assert_eq!(normalize_base_path("/"), "/");
+        assert_eq!(normalize_base_path("  "), "/");
+    }
+
+    #[test]
+    fn normalize_base_path_strips_trailing_slash() {
+        assert_eq!(normalize_base_path("/api/"), "/api");
+        assert_eq!(normalize_base_path("/api/mcp/"), "/api/mcp");
+    }
+
+    #[test]
+    fn normalize_base_path_adds_leading_slash() {
+        assert_eq!(normalize_base_path("api"), "/api");
+        assert_eq!(normalize_base_path("api/mcp"), "/api/mcp");
+    }
+
+    #[test]
+    fn path_allowed_root_base_accepts_everything() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        assert!(state.path_allowed("/"));
+        assert!(state.path_allowed("/anything"));
+        assert!(state.path_allowed("/foo/bar"));
+    }
+
+    #[test]
+    fn path_allowed_accepts_base_with_and_without_slash() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/api".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        assert!(state.path_allowed("/api"), "exact base must be allowed");
+        assert!(
+            state.path_allowed("/api/"),
+            "base with trailing slash must be allowed"
+        );
+    }
+
+    #[test]
+    fn path_allowed_accepts_sub_paths() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/api".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        assert!(
+            state.path_allowed("/api/mcp"),
+            "sub-path under base must be allowed (mount semantics)"
+        );
+        assert!(state.path_allowed("/api/v1/rpc"));
+    }
+
+    #[test]
+    fn path_allowed_rejects_unrelated_paths() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/api".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        assert!(!state.path_allowed("/"), "root must not match /api base");
+        assert!(
+            !state.path_allowed("/apifoo"),
+            "prefix without slash separator must not match"
+        );
+        assert!(!state.path_allowed("/other/path"));
+    }
+
+    #[test]
+    fn path_allowed_nested_base() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/api/mcp".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        assert!(state.path_allowed("/api/mcp"));
+        assert!(state.path_allowed("/api/mcp/"));
+        assert!(state.path_allowed("/api/mcp/sub"));
+        assert!(!state.path_allowed("/api"));
+        assert!(!state.path_allowed("/api/"));
+    }
+
+    // ── Header normalization tests (br-1bm.4.2) ──────────────────────────
+
+    #[test]
+    fn header_normalization_forces_accept() {
+        let req = Http1Request {
+            method: Http1Method::Post,
+            uri: "/api".to_string(),
+            version: Http1Version::Http11,
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: Vec::new(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        };
+        let mcp = to_mcp_http_request(&req, "/api");
+        assert_eq!(
+            mcp.headers.get("accept").map(String::as_str),
+            Some("application/json, text/event-stream"),
+            "Accept must always be forced to JSON+SSE"
+        );
+    }
+
+    #[test]
+    fn header_normalization_replaces_existing_accept() {
+        let req = Http1Request {
+            method: Http1Method::Post,
+            uri: "/api".to_string(),
+            version: Http1Version::Http11,
+            headers: vec![
+                ("Accept".to_string(), "text/html".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body: Vec::new(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        };
+        let mcp = to_mcp_http_request(&req, "/api");
+        assert_eq!(
+            mcp.headers.get("accept").map(String::as_str),
+            Some("application/json, text/event-stream"),
+            "Existing Accept header must be replaced, not preserved"
+        );
+    }
+
+    #[test]
+    fn header_normalization_replaces_accept_case_insensitive() {
+        let req = Http1Request {
+            method: Http1Method::Get,
+            uri: "/api".to_string(),
+            version: Http1Version::Http11,
+            headers: vec![("ACCEPT".to_string(), "text/xml".to_string())],
+            body: Vec::new(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        };
+        let mcp = to_mcp_http_request(&req, "/api");
+        assert_eq!(
+            mcp.headers.get("accept").map(String::as_str),
+            Some("application/json, text/event-stream"),
+            "Accept replacement must be case-insensitive"
+        );
+        // The original ACCEPT=text/xml must not survive under any casing
+        assert!(
+            !mcp.headers.values().any(|v| v == "text/xml"),
+            "Original Accept value must be gone"
+        );
+    }
+
+    #[test]
+    fn header_normalization_adds_content_type_for_post() {
+        let req = Http1Request {
+            method: Http1Method::Post,
+            uri: "/api".to_string(),
+            version: Http1Version::Http11,
+            headers: vec![], // no headers at all
+            body: Vec::new(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        };
+        let mcp = to_mcp_http_request(&req, "/api");
+        assert_eq!(
+            mcp.headers.get("content-type").map(String::as_str),
+            Some("application/json"),
+            "Content-Type must be added for POST when missing"
+        );
+    }
+
+    #[test]
+    fn header_normalization_preserves_existing_content_type() {
+        let req = Http1Request {
+            method: Http1Method::Post,
+            uri: "/api".to_string(),
+            version: Http1Version::Http11,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "multipart/form-data".to_string(),
+            )],
+            body: Vec::new(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        };
+        let mcp = to_mcp_http_request(&req, "/api");
+        assert_eq!(
+            mcp.headers.get("content-type").map(String::as_str),
+            Some("multipart/form-data"),
+            "Existing Content-Type must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn header_normalization_no_content_type_for_get() {
+        let req = Http1Request {
+            method: Http1Method::Get,
+            uri: "/api".to_string(),
+            version: Http1Version::Http11,
+            headers: vec![],
+            body: Vec::new(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        };
+        let mcp = to_mcp_http_request(&req, "/api");
+        assert!(
+            !mcp.headers.contains_key("content-type"),
+            "Content-Type must NOT be injected for non-POST methods"
+        );
+    }
+
+    #[test]
+    fn header_normalization_preserves_other_headers() {
+        let req = Http1Request {
+            method: Http1Method::Post,
+            uri: "/api".to_string(),
+            version: Http1Version::Http11,
+            headers: vec![
+                ("Authorization".to_string(), "Bearer tok".to_string()),
+                ("X-Custom".to_string(), "val".to_string()),
+                ("Accept".to_string(), "text/plain".to_string()),
+            ],
+            body: b"hello".to_vec(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        };
+        let mcp = to_mcp_http_request(&req, "/api");
+        assert_eq!(
+            mcp.headers.get("authorization").map(String::as_str),
+            Some("Bearer tok"),
+            "Authorization must be preserved"
+        );
+        assert_eq!(
+            mcp.headers.get("x-custom").map(String::as_str),
+            Some("val"),
+            "Custom headers must be preserved"
+        );
+        assert_eq!(
+            mcp.headers.get("accept").map(String::as_str),
+            Some("application/json, text/event-stream"),
+            "Accept must still be forced"
+        );
     }
 }

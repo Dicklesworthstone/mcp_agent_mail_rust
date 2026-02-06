@@ -1,0 +1,712 @@
+{% extends "base.html" %}
+
+{% block title %}Projects — Agent Mail{% endblock %}
+
+{% block content %}
+<div class="page-transition">
+  <!-- Enhanced Hero Header Section -->
+  <div class="mb-12 text-center relative overflow-hidden">
+    <!-- Animated gradient background -->
+    <div class="absolute inset-0 gradient-mesh opacity-30 pointer-events-none"></div>
+    <div class="absolute inset-0 bg-gradient-to-b from-primary-500/5 via-purple-500/5 to-transparent pointer-events-none"></div>
+
+    <!-- Floating particles effect -->
+    <div class="absolute inset-0 overflow-hidden pointer-events-none">
+      <div class="absolute top-10 left-10 w-2 h-2 bg-primary-500 rounded-full opacity-40 animate-pulse"></div>
+      <div class="absolute top-20 right-20 w-3 h-3 bg-purple-500 rounded-full opacity-30 animate-pulse" style="animation-delay: 0.5s;"></div>
+      <div class="absolute bottom-20 left-1/4 w-2 h-2 bg-pink-500 rounded-full opacity-40 animate-pulse" style="animation-delay: 1s;"></div>
+    </div>
+
+    <div class="relative z-10 py-8">
+      <div class="inline-flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-primary-100 via-purple-100 to-pink-100 dark:from-primary-900/30 dark:via-purple-900/30 dark:to-pink-900/30 rounded-full text-primary-700 dark:text-primary-300 text-sm font-medium mb-4 animate-slide-down shadow-sm border border-primary-200 dark:border-primary-800">
+        <i data-lucide="sparkles" class="w-4 h-4 animate-pulse"></i>
+        <span>Multi-Agent Collaboration Platform</span>
+        <div class="w-2 h-2 bg-primary-500 rounded-full animate-pulse"></div>
+      </div>
+
+      <h1 class="text-5xl md:text-6xl font-bold text-slate-900 dark:text-white mb-4 animate-fade-in" data-splitting>
+        Your <span class="bg-gradient-to-r from-primary-600 via-purple-600 to-pink-600 bg-clip-text text-transparent animate-gradient-x inline-block">Projects</span>
+      </h1>
+
+      <p class="text-xl text-slate-600 dark:text-slate-400 max-w-2xl mx-auto animate-slide-up leading-relaxed">
+        Orchestrate, coordinate, and empower AI agents to collaborate seamlessly
+      </p>
+
+      <!-- Quick action buttons -->
+      <div class="flex items-center justify-center gap-4 mt-8 animate-fade-in" style="animation-delay: 0.3s;">
+        <button onclick="document.querySelector('input[name=q]')?.focus()"
+                class="inline-flex items-center gap-2 px-6 py-3 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm hover:shadow-md transition-all duration-200 btn-magnetic"
+                data-tippy-content="Quick search across all projects">
+          <i data-lucide="search" class="w-4 h-4"></i>
+          <span class="font-medium">Search</span>
+          <kbd class="px-2 py-1 bg-slate-100 dark:bg-slate-700 rounded text-xs border border-slate-300 dark:border-slate-600">/</kbd>
+        </button>
+        <button onclick="window.restartTutorial()"
+                class="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-primary-600 to-purple-600 hover:from-primary-700 hover:to-purple-700 text-white rounded-xl shadow-md hover:shadow-lg transition-all duration-200 btn-magnetic"
+                data-tippy-content="Learn how Agent Mail works">
+          <i data-lucide="play-circle" class="w-4 h-4"></i>
+          <span class="font-medium">Take a Tour</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stats Overview -->
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
+    <div class="group bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-soft border border-slate-200 dark:border-slate-700 hover:shadow-large transition-all duration-300 card-hover stagger-item">
+      <div class="flex items-center justify-between mb-4">
+        <div class="w-14 h-14 bg-gradient-to-br from-primary-500 to-primary-700 rounded-2xl flex items-center justify-center shadow-medium group-hover:shadow-glow transition-all duration-300 float">
+          <i data-lucide="folder" class="w-7 h-7 text-white"></i>
+        </div>
+        <div class="w-10 h-10 bg-primary-100 dark:bg-primary-900/30 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+          <i data-lucide="trending-up" class="w-5 h-5 text-primary-600 dark:text-primary-400"></i>
+        </div>
+      </div>
+      <div class="space-y-2">
+        <p class="text-sm font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Total Projects</p>
+        <p class="text-4xl font-bold text-slate-900 dark:text-white stat-number">{{ projects|length }}</p>
+        <p class="text-sm text-slate-500 dark:text-slate-500">
+          Currently active
+        </p>
+      </div>
+    </div>
+
+    <div class="group bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-soft border border-slate-200 dark:border-slate-700 hover:shadow-large transition-all duration-300 card-hover stagger-item" style="animation-delay: 0.1s;">
+      <div class="flex items-center justify-between mb-4">
+        <div class="w-14 h-14 bg-gradient-to-br from-success-500 to-success-700 rounded-2xl flex items-center justify-center shadow-medium group-hover:shadow-glow transition-all duration-300 float" style="animation-delay: 0.5s;">
+          <i data-lucide="users" class="w-7 h-7 text-white"></i>
+        </div>
+        <div class="w-10 h-10 bg-success-100 dark:bg-success-900/30 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+          <i data-lucide="activity" class="w-5 h-5 text-success-600 dark:text-success-400"></i>
+        </div>
+      </div>
+      <div class="space-y-2">
+        <p class="text-sm font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Active Agents</p>
+        <p class="text-4xl font-bold text-slate-400 dark:text-slate-500 stat-number">—</p>
+        <p class="text-sm text-slate-500 dark:text-slate-500">Metrics coming soon</p>
+      </div>
+    </div>
+
+    <div class="group bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-soft border border-slate-200 dark:border-slate-700 hover:shadow-large transition-all duration-300 card-hover stagger-item" style="animation-delay: 0.2s;">
+      <div class="flex items-center justify-between mb-4">
+        <div class="w-14 h-14 bg-gradient-to-br from-warning-500 to-warning-700 rounded-2xl flex items-center justify-center shadow-medium group-hover:shadow-glow transition-all duration-300 float" style="animation-delay: 1s;">
+          <i data-lucide="message-square" class="w-7 h-7 text-white"></i>
+        </div>
+        <div class="w-10 h-10 bg-warning-100 dark:bg-warning-900/30 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+          <i data-lucide="zap" class="w-5 h-5 text-warning-600 dark:text-warning-400"></i>
+        </div>
+      </div>
+      <div class="space-y-2">
+        <p class="text-sm font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Total Messages</p>
+        <p class="text-4xl font-bold text-slate-400 dark:text-slate-500 stat-number">—</p>
+        <p class="text-sm text-slate-500 dark:text-slate-500">Metrics coming soon</p>
+      </div>
+    </div>
+  </div>
+
+  {% if projects %}
+    <!-- Enhanced Projects Section Header with Search -->
+    <div class="mb-8" x-data="{ searchQuery: '', view: 'grid' }">
+      <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
+        <div class="flex items-center gap-3">
+          <div class="w-1 h-10 bg-gradient-to-b from-primary-600 to-primary-800 rounded-full"></div>
+          <div>
+            <h2 class="text-2xl font-bold text-slate-900 dark:text-white">Active Projects</h2>
+            <p class="text-sm text-slate-600 dark:text-slate-400 mt-0.5">{{ projects|length }} project{{ 's' if projects|length != 1 else '' }} in total</p>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <!-- Search input -->
+          <div class="relative search-spotlight">
+            <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+              <i data-lucide="search" class="w-4 h-4 text-slate-400"></i>
+            </div>
+            <input
+              type="text"
+              x-model="searchQuery"
+              placeholder="Filter projects..."
+              class="pl-10 pr-4 py-2 bg-white dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 focus:border-primary-500 dark:focus:border-primary-500 rounded-xl text-sm text-slate-900 dark:text-white placeholder-slate-500 dark:placeholder-slate-400 transition-all duration-200 w-full md:w-64"
+              aria-label="Filter projects"
+            />
+          </div>
+
+          <!-- View Toggle -->
+          <div class="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
+            <button @click="view = 'grid'"
+                    :class="view === 'grid' ? 'bg-white dark:bg-slate-700 text-primary-600 dark:text-primary-400 shadow-sm' : 'text-slate-600 dark:text-slate-400'"
+                    class="p-2 rounded-md transition-all duration-200"
+                    data-tippy-content="Grid view"
+                    aria-label="Grid view">
+              <i data-lucide="grid-3x3" class="w-4 h-4"></i>
+            </button>
+            <button @click="view = 'list'"
+                    :class="view === 'list' ? 'bg-white dark:bg-slate-700 text-primary-600 dark:text-primary-400 shadow-sm' : 'text-slate-600 dark:text-slate-400'"
+                    class="p-2 rounded-md transition-all duration-200"
+                    data-tippy-content="List view"
+                    aria-label="List view">
+              <i data-lucide="list" class="w-4 h-4"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Projects Grid with filtering -->
+      <div :class="view === 'grid' ? 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6' : 'space-y-4'">
+        {% for p in projects %}
+        <a href="/mail/{{ p.slug }}"
+           x-show="!searchQuery || $el.dataset.projectSearch.includes((searchQuery || '').toLowerCase())"
+           x-transition:enter="transition ease-out duration-200"
+           x-transition:enter-start="opacity-0 transform scale-95"
+           x-transition:enter-end="opacity-100 transform scale-100"
+           x-transition:leave="transition ease-in duration-150"
+           x-transition:leave-start="opacity-100 transform scale-100"
+           x-transition:leave-end="opacity-0 transform scale-95"
+           class="group relative bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-primary-400 dark:hover:border-primary-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
+           data-anim-delay="{{ [loop.index0 * 0.05, 1.0]|min }}"
+           data-project-card="true"
+           data-project-id="{{ p.id }}"
+           data-project-search="{{ (p.human_key ~ ' ' ~ p.slug)|lower }}">
+
+          <!-- Decorative gradient blob -->
+          <div class="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary-500/10 to-purple-500/10 rounded-full blur-3xl group-hover:scale-150 transition-transform duration-500 pointer-events-none"></div>
+
+          <!-- Project Icon & Status -->
+          <div class="relative flex items-start justify-between mb-6">
+            <div class="w-16 h-16 bg-gradient-to-br from-primary-500 to-primary-700 rounded-2xl flex items-center justify-center shadow-medium group-hover:shadow-glow group-hover:scale-110 transition-all duration-300">
+              <i data-lucide="git-branch" class="w-8 h-8 text-white"></i>
+            </div>
+            <div class="flex flex-col items-end gap-2">
+              <span class="px-3 py-1.5 bg-gradient-to-r from-success-100 to-success-200 dark:from-success-900/30 dark:to-success-800/30 text-success-700 dark:text-success-300 text-xs font-bold rounded-full flex items-center gap-1.5 shadow-sm">
+                <span class="w-2 h-2 bg-success-500 rounded-full animate-pulse"></span>
+                Active
+              </span>
+            </div>
+          </div>
+
+          <!-- Project Name -->
+          <h3 class="relative text-xl font-bold text-slate-900 dark:text-white mb-3 group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors line-clamp-2 min-h-[3.5rem]">
+            {{ p.human_key }}
+          </h3>
+
+          <!-- Project Meta -->
+          <div class="relative space-y-3 mb-6">
+            <div class="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
+              <div class="w-6 h-6 bg-slate-100 dark:bg-slate-700 rounded-lg flex items-center justify-center">
+                <i data-lucide="hash" class="w-3.5 h-3.5"></i>
+              </div>
+              <span class="font-mono text-xs truncate">{{ p.slug }}</span>
+            </div>
+            <div class="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
+              <div class="w-6 h-6 bg-slate-100 dark:bg-slate-700 rounded-lg flex items-center justify-center">
+                <i data-lucide="calendar" class="w-3.5 h-3.5"></i>
+              </div>
+              <span class="text-xs">{{ p.created_at }}</span>
+            </div>
+          </div>
+
+          <!-- Project Stats -->
+          <div class="relative pt-6 border-t border-slate-200 dark:border-slate-700">
+            <div class="flex items-center justify-between text-sm">
+              <div class="flex items-center gap-2 text-slate-600 dark:text-slate-400">
+                <div class="flex -space-x-2">
+                  <div class="w-7 h-7 bg-gradient-to-br from-blue-500 to-blue-600 rounded-full border-2 border-white dark:border-slate-800 flex items-center justify-center" data-tippy-content="Agents">
+                    <i data-lucide="users" class="w-3.5 h-3.5 text-white"></i>
+                  </div>
+                  <div class="w-7 h-7 bg-gradient-to-br from-purple-500 to-purple-600 rounded-full border-2 border-white dark:border-slate-800 flex items-center justify-center" data-tippy-content="Messages">
+                    <i data-lucide="mail" class="w-3.5 h-3.5 text-white"></i>
+                  </div>
+                </div>
+                <span class="text-xs font-medium">0 agents • 0 msgs</span>
+              </div>
+              <div class="flex items-center gap-2 text-primary-600 dark:text-primary-400 font-medium group-hover:gap-3 transition-all duration-300">
+                <span class="text-xs">Open</span>
+                <i data-lucide="arrow-right" class="w-4 h-4"></i>
+              </div>
+            </div>
+          </div>
+
+          {% if p.confirmed_siblings or p.suggested_siblings %}
+          <div class="mt-6 space-y-4 border-t border-slate-200 dark:border-slate-700 pt-6" data-sibling-section>
+            <!-- Section Header -->
+            <div class="flex items-center gap-3 mb-4">
+              <div class="flex items-center gap-2">
+                <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center">
+                  <i data-lucide="git-branch" class="w-4 h-4 text-white"></i>
+                </div>
+                <h4 class="text-sm font-bold text-slate-900 dark:text-white">Related Projects</h4>
+              </div>
+              <div class="flex-1 h-px bg-gradient-to-r from-slate-200 to-transparent dark:from-slate-700"></div>
+            </div>
+
+            <!-- Value Proposition Explainer -->
+            {% if p.suggested_siblings %}
+            <div class="bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-indigo-950/30 dark:to-purple-950/30 rounded-xl p-4 border-2 border-indigo-200 dark:border-indigo-800 mb-4">
+              <div class="flex items-start gap-3">
+                <div class="w-8 h-8 rounded-lg bg-indigo-500 flex items-center justify-center flex-shrink-0 mt-0.5">
+                  <i data-lucide="sparkles" class="w-4 h-4 text-white"></i>
+                </div>
+                <div class="flex-1 space-y-2">
+                  <h5 class="font-bold text-slate-900 dark:text-white text-sm">Why Link Projects?</h5>
+                  <p class="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                    Confirming related projects helps agents discover relevant context across your workspace.
+                    When projects are linked, agents can:
+                  </p>
+                  <ul class="text-xs text-slate-600 dark:text-slate-400 space-y-1.5 ml-1">
+                    <li class="flex items-start gap-2">
+                      <i data-lucide="zap" class="w-3.5 h-3.5 text-indigo-500 flex-shrink-0 mt-0.5"></i>
+                      <span><strong class="text-slate-700 dark:text-slate-300">Find dependencies:</strong> Discover related code and shared components</span>
+                    </li>
+                    <li class="flex items-start gap-2">
+                      <i data-lucide="message-circle" class="w-3.5 h-3.5 text-indigo-500 flex-shrink-0 mt-0.5"></i>
+                      <span><strong class="text-slate-700 dark:text-slate-300">Coordinate work:</strong> Connect with agents working on related systems</span>
+                    </li>
+                    <li class="flex items-start gap-2">
+                      <i data-lucide="shield-check" class="w-3.5 h-3.5 text-indigo-500 flex-shrink-0 mt-0.5"></i>
+                      <span><strong class="text-slate-700 dark:text-slate-300">Maintain consistency:</strong> Keep shared patterns and conventions aligned</span>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            {% if p.confirmed_siblings %}
+            <div class="flex flex-wrap gap-2" data-sibling-confirmed-container>
+              {% for sibling in p.confirmed_siblings %}
+              <button type="button"
+                      class="group inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-900/20 dark:to-teal-900/20 border border-emerald-200 dark:border-emerald-800 hover:shadow-md hover:scale-105 transition-all duration-200"
+                      data-sibling-confirmed="true"
+                      data-sibling-action="reset"
+                      data-project="{{ p.id }}"
+                      data-other="{{ sibling.peer.id }}"
+                      data-tippy-content="{{ sibling.rationale or 'Confirmed sibling project' }}\nPath: {{ sibling.peer.human_key }}">
+                <div class="w-5 h-5 rounded-full bg-emerald-500 flex items-center justify-center flex-shrink-0">
+                  <i data-lucide="check" class="w-3 h-3 text-white"></i>
+                </div>
+                <span class="text-xs font-semibold text-emerald-700 dark:text-emerald-300 break-all text-left">
+                  {{ sibling.peer.human_key }}
+                </span>
+                <span class="ml-1 inline-flex items-center gap-1 text-[10px] font-medium text-emerald-700/80 dark:text-emerald-300/80 opacity-80">
+                  <i data-lucide="undo" class="w-3 h-3"></i>
+                  Undo
+                </span>
+              </button>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="hidden" data-sibling-confirmed-container></div>
+            {% endif %}
+
+            {% if p.suggested_siblings %}
+            <div class="space-y-3" data-sibling-suggested-container>
+              {% for sibling in p.suggested_siblings %}
+              <div class="group relative overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700 bg-gradient-to-br from-white to-slate-50/50 dark:from-slate-800 dark:to-slate-900/50 hover:shadow-lg hover:border-violet-300 dark:hover:border-violet-700 transition-all duration-300"
+                   data-sibling-row
+                   data-project="{{ p.id }}"
+                   data-other="{{ sibling.peer.id }}"
+                   data-suggestion-id="{{ sibling.suggestion_id }}"
+                   data-anim-delay-full="{{ [loop.index0 * 0.1, 1.0]|min }}">
+
+                <!-- Confidence indicator gradient bar at top -->
+                <div class="h-1 bg-gradient-to-r from-violet-500 via-purple-500 to-pink-500" data-opacity="{{ sibling.score or 0 }}"></div>
+
+                <div class="p-5 space-y-4">
+                  <!-- Header with project name and confidence -->
+                  <div class="flex items-start justify-between gap-4">
+                    <div class="flex-1 min-w-0">
+                      <div class="flex items-center gap-3 mb-2">
+                        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center flex-shrink-0 shadow-md">
+                          <i data-lucide="git-merge" class="w-5 h-5 text-white"></i>
+                        </div>
+                        <div class="flex-1 min-w-0">
+                          <h5 class="text-sm font-bold text-slate-900 dark:text-white truncate">
+                            {{ sibling.peer.human_key }}
+                          </h5>
+                          <p class="text-xs text-slate-500 dark:text-slate-400">
+                            Suggested sibling project
+                          </p>
+                          <div class="text-[11px] font-mono text-slate-600 dark:text-slate-400 break-all mt-1">
+                            {{ sibling.peer.human_key }}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- Confidence badge -->
+                    <div class="flex flex-col items-end gap-1">
+                      <div class="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-violet-100 dark:bg-violet-900/30 border border-violet-200 dark:border-violet-800">
+                        <div class="w-2 h-2 rounded-full bg-violet-500 animate-pulse"></div>
+                        <span class="text-xs font-bold text-violet-700 dark:text-violet-300">
+                          {{ (((sibling.score or 0) * 100)|round(0)|int) }}% match
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- Rationale -->
+                  {% if sibling.rationale %}
+                  <div class="relative pl-4 border-l-2 border-slate-200 dark:border-slate-700">
+                    <p class="text-sm text-slate-600 dark:text-slate-400 leading-relaxed italic">
+                      "{{ sibling.rationale }}"
+                    </p>
+                  </div>
+                  {% endif %}
+
+                  <!-- Action buttons -->
+                  <div class="flex items-center gap-3 pt-2">
+                    <button type="button"
+                            class="flex-1 group/btn relative overflow-hidden px-4 py-2.5 rounded-xl bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-700 hover:to-purple-700 text-white text-sm font-semibold shadow-md hover:shadow-xl transition-all duration-200 hover:scale-105"
+                            data-sibling-action="confirm">
+                      <span class="relative z-10 flex items-center justify-center gap-2">
+                        <i data-lucide="link" class="w-4 h-4"></i>
+                        Confirm Link
+                      </span>
+                      <div class="absolute inset-0 bg-gradient-to-r from-white/0 via-white/20 to-white/0 translate-x-[-100%] group-hover/btn:translate-x-[100%] transition-transform duration-700"></div>
+                    </button>
+                    <button type="button"
+                            class="px-4 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-sm font-semibold transition-all duration-200 hover:scale-105 flex items-center justify-center gap-2"
+                            data-sibling-action="dismiss">
+                      <i data-lucide="x" class="w-4 h-4"></i>
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="hidden" data-sibling-suggested-container></div>
+            {% endif %}
+          </div>
+          {% endif %}
+        </a>
+        {% endfor %}
+      </div>
+
+      <!-- No results state -->
+      <div x-show="searchQuery && !Array.from(document.querySelectorAll('[data-project-card]')).some(card => card.style.display !== 'none')"
+           x-transition:enter="transition ease-out duration-200"
+           x-transition:enter-start="opacity-0 transform scale-95"
+           x-transition:enter-end="opacity-100 transform scale-100"
+           class="text-center py-16 bg-white dark:bg-slate-800 rounded-2xl border-2 border-dashed border-slate-300 dark:border-slate-700">
+        <div class="w-16 h-16 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center mx-auto mb-4">
+          <i data-lucide="search-x" class="w-8 h-8 text-slate-400"></i>
+        </div>
+        <h3 class="text-xl font-bold text-slate-900 dark:text-white mb-2">No matching projects</h3>
+        <p class="text-slate-600 dark:text-slate-400 mb-4">No project names or slugs match your search query. Try different keywords or clear the search to see all projects.</p>
+        <button @click="searchQuery = ''"
+                class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition-colors">
+          <i data-lucide="x" class="w-4 h-4"></i>
+          <span>Clear search</span>
+        </button>
+      </div>
+    </div>
+
+  {% else %}
+    <!-- Premium Empty State -->
+    <div class="flex flex-col items-center justify-center py-20 animate-fade-in">
+      <div class="relative mb-8">
+        <!-- Decorative circles -->
+        <div class="absolute inset-0 flex items-center justify-center">
+          <div class="w-40 h-40 bg-primary-500/10 rounded-full animate-pulse"></div>
+        </div>
+        <div class="absolute inset-0 flex items-center justify-center">
+          <div class="w-32 h-32 bg-primary-500/20 rounded-full animate-pulse" style="animation-delay: 0.5s;"></div>
+        </div>
+
+        <!-- Icon -->
+        <div class="relative w-24 h-24 bg-gradient-to-br from-primary-500 to-primary-700 rounded-3xl flex items-center justify-center shadow-large float">
+          <i data-lucide="folder-plus" class="w-12 h-12 text-white"></i>
+        </div>
+      </div>
+
+      <h3 class="text-3xl font-bold text-slate-900 dark:text-white mb-3">
+        Ready to get started?
+      </h3>
+      <p class="text-lg text-slate-600 dark:text-slate-400 mb-8 text-center max-w-md">
+        Create your first project to enable seamless multi-agent collaboration and coordination.
+      </p>
+
+      <!-- Feature highlights -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8 max-w-3xl">
+        <div class="flex flex-col items-center text-center p-6 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
+          <div class="w-12 h-12 bg-primary-100 dark:bg-primary-900/30 rounded-xl flex items-center justify-center mb-3">
+            <i data-lucide="mail" class="w-6 h-6 text-primary-600 dark:text-primary-400"></i>
+          </div>
+          <h4 class="font-semibold text-slate-900 dark:text-white mb-2">Agent Messaging</h4>
+          <p class="text-sm text-slate-600 dark:text-slate-400">Enable agents to communicate and share context</p>
+        </div>
+        <div class="flex flex-col items-center text-center p-6 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
+          <div class="w-12 h-12 bg-success-100 dark:bg-success-900/30 rounded-xl flex items-center justify-center mb-3">
+            <i data-lucide="lock" class="w-6 h-6 text-success-600 dark:text-success-400"></i>
+          </div>
+          <h4 class="font-semibold text-slate-900 dark:text-white mb-2">File Reservations</h4>
+          <p class="text-sm text-slate-600 dark:text-slate-400">Signal editing intent to coordinate between agents</p>
+        </div>
+        <div class="flex flex-col items-center text-center p-6 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
+          <div class="w-12 h-12 bg-warning-100 dark:bg-warning-900/30 rounded-xl flex items-center justify-center mb-3">
+            <i data-lucide="git-branch" class="w-6 h-6 text-warning-600 dark:text-warning-400"></i>
+          </div>
+          <h4 class="font-semibold text-slate-900 dark:text-white mb-2">Full History</h4>
+          <p class="text-sm text-slate-600 dark:text-slate-400">Track all interactions with Git-backed storage</p>
+        </div>
+      </div>
+
+      <button disabled
+              class="px-8 py-4 bg-slate-300 dark:bg-slate-700 text-slate-500 dark:text-slate-400 rounded-xl shadow-large flex items-center gap-3 opacity-70 cursor-not-allowed relative"
+              data-tippy-content="Coming soon - Create projects through the UI"
+              aria-label="Create Your First Project (Coming Soon)">
+        <i data-lucide="plus-circle" class="w-5 h-5"></i>
+        <span>Create Your First Project</span>
+        <span class="absolute -top-2 -right-2 px-2 py-1 bg-amber-500 text-white text-xs font-bold rounded-full shadow-md">Coming Soon</span>
+      </button>
+    </div>
+  {% endif %}
+</div>
+
+<script>
+  (() => {
+    // Apply declarative animation attributes to avoid inline style with template expressions
+    requestAnimationFrame(() => {
+      document.querySelectorAll('[data-project-card][data-anim-delay]').forEach((el) => {
+        const delay = parseFloat(el.getAttribute('data-anim-delay') || '0');
+        el.style.animationDelay = `${delay}s`;
+      });
+      document.querySelectorAll('[data-sibling-row][data-anim-delay-full]').forEach((el) => {
+        const delay = parseFloat(el.getAttribute('data-anim-delay-full') || '0');
+        el.style.animation = `slideInRight 0.3s ease-out ${delay}s both`;
+      });
+      document.querySelectorAll('[data-opacity]').forEach((el) => {
+        const op = parseFloat(el.getAttribute('data-opacity') || '0');
+        el.style.opacity = String(Math.max(0, Math.min(1, op)));
+      });
+    });
+    function findCard(projectId) {
+      return document.querySelector(`[data-project-card][data-project-id="${projectId}"]`);
+    }
+
+    function removeSuggestionRow(projectId, otherId) {
+      const selector = `[data-project-card][data-project-id="${projectId}"] [data-sibling-row][data-project="${projectId}"][data-other="${otherId}"]`;
+      document.querySelectorAll(selector).forEach((el) => el.remove());
+    }
+
+    function toggleContainerVisibility(card) {
+      if (!card) return;
+      const confirmedContainer = card.querySelector('[data-sibling-confirmed-container]');
+      const suggestedContainer = card.querySelector('[data-sibling-suggested-container]');
+      const section = card.querySelector('[data-sibling-section]');
+
+      const hasConfirmed = confirmedContainer && confirmedContainer.querySelector('[data-sibling-confirmed="true"]');
+      const hasSuggested = suggestedContainer && suggestedContainer.querySelector('[data-sibling-row]');
+
+      if (confirmedContainer) {
+        if (hasConfirmed) {
+          confirmedContainer.classList.remove('hidden');
+        } else {
+          confirmedContainer.classList.add('hidden');
+        }
+      }
+
+      if (suggestedContainer) {
+        if (hasSuggested) {
+          suggestedContainer.classList.remove('hidden');
+        } else {
+          suggestedContainer.classList.add('hidden');
+        }
+      }
+
+      if (section) {
+        if (hasConfirmed || hasSuggested) {
+          section.classList.remove('hidden');
+        } else {
+          section.classList.add('hidden');
+        }
+      }
+    }
+
+    function appendConfirmedBadge(card, currentId, peer, rationale) {
+      if (!card || !peer || !peer.id) return;
+      const container = card.querySelector('[data-sibling-confirmed-container]');
+      if (!container) return;
+      const selector = `[data-sibling-confirmed="true"][data-project="${currentId}"][data-other="${peer.id}"]`;
+      const existing = container.querySelector(selector);
+      if (existing) {
+        if (rationale) existing.setAttribute('data-tippy-content', rationale);
+        return;
+      }
+
+      // Create badge matching the template design
+      const badge = document.createElement('button');
+      badge.type = 'button';
+      badge.className = 'group inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-900/20 dark:to-teal-900/20 border border-emerald-200 dark:border-emerald-800 hover:shadow-md hover:scale-105 transition-all duration-200 opacity-0 scale-95';
+      badge.setAttribute('data-sibling-confirmed', 'true');
+      badge.setAttribute('data-project', String(currentId));
+      badge.setAttribute('data-other', String(peer.id));
+      badge.setAttribute('data-sibling-action', 'reset');
+      {
+        const tips = [];
+        if (rationale) tips.push(rationale);
+        if (peer.human_key) tips.push(`Path: ${peer.human_key}`);
+        if (tips.length) badge.setAttribute('data-tippy-content', tips.join('\n'));
+      }
+
+      // Create structure safely to prevent XSS
+      const iconWrapper = document.createElement('div');
+      iconWrapper.className = 'w-5 h-5 rounded-full bg-emerald-500 flex items-center justify-center flex-shrink-0';
+      iconWrapper.innerHTML = '<i data-lucide="check" class="w-3 h-3 text-white"></i>';
+
+      const textSpan = document.createElement('span');
+      textSpan.className = 'text-xs font-semibold text-emerald-700 dark:text-emerald-300 break-all text-left';
+      textSpan.textContent = peer.human_key || peer.slug || `Project ${peer.id}`;
+
+      const undoSpan = document.createElement('span');
+      undoSpan.className = 'ml-1 inline-flex items-center gap-1 text-[10px] font-medium text-emerald-700/80 dark:text-emerald-300/80 opacity-80';
+      undoSpan.innerHTML = '<i data-lucide="undo" class="w-3 h-3"></i>Undo';
+
+      badge.appendChild(iconWrapper);
+      badge.appendChild(textSpan);
+      badge.appendChild(undoSpan);
+
+      container.classList.remove('hidden');
+      container.appendChild(badge);
+
+      // Animate in
+      requestAnimationFrame(() => {
+        badge.style.transition = 'opacity 0.3s ease-out, transform 0.3s ease-out';
+        badge.classList.remove('opacity-0', 'scale-95');
+        badge.classList.add('opacity-100', 'scale-100');
+      });
+
+      // Initialize Lucide icons and tooltips
+      if (window.lucide && typeof window.lucide.createIcons === 'function') {
+        window.lucide.createIcons({ elements: [badge] });
+      }
+      if (window.tippy && rationale) {
+        window.tippy(badge, { content: rationale });
+      }
+    }
+
+    async function handleSiblingAction(button) {
+      const action = button.getAttribute('data-sibling-action');
+      if (!action) return;
+      const row = button.closest('[data-sibling-row]');
+
+      const originalHTML = button.innerHTML;
+      const isConfirm = action === 'confirm';
+      const isDismiss = action === 'dismiss';
+      const isReset = action === 'reset';
+
+      let projectId = null;
+      let otherId = null;
+      if (row) {
+        projectId = row.getAttribute('data-project');
+        otherId = row.getAttribute('data-other');
+      } else {
+        projectId = button.getAttribute('data-project');
+        otherId = button.getAttribute('data-other');
+      }
+      if (!projectId || !otherId) return;
+
+      // Disable relevant controls
+      const allButtons = row ? row.querySelectorAll('button[data-sibling-action]') : [button];
+      allButtons.forEach(btn => {
+        btn.disabled = true;
+        btn.classList.add('opacity-50', 'cursor-not-allowed');
+      });
+
+      // Loading state
+      button.innerHTML = `
+        <span class="flex items-center justify-center gap-2">
+          <svg class="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+          </svg>
+          ${isConfirm ? 'Confirming...' : isDismiss ? 'Dismissing...' : 'Undoing...'}
+        </span>
+      `;
+
+      try {
+        const encodedProjectId = encodeURIComponent(projectId);
+        const encodedOtherId = encodeURIComponent(otherId);
+        const response = await fetch(`/mail/api/projects/${encodedProjectId}/siblings/${encodedOtherId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || 'Request failed');
+        }
+
+        const suggestion = payload.suggestion || {};
+        const status = payload.status || '';
+        const projectA = suggestion.project_a || {};
+        const projectB = suggestion.project_b || {};
+
+        if (row) {
+          // Suggestion row path (confirm/dismiss)
+          const rowsToRemove = [
+            document.querySelector(`[data-sibling-row][data-project="${projectId}"][data-other="${otherId}"]`),
+            document.querySelector(`[data-sibling-row][data-project="${otherId}"][data-other="${projectId}"]`)
+          ].filter(Boolean);
+
+          if (status === 'confirmed') {
+            row.style.transition = 'all 0.2s ease-out';
+            row.style.background = 'linear-gradient(to right, rgb(16 185 129 / 0.1), rgb(20 184 166 / 0.1))';
+            await new Promise(resolve => setTimeout(resolve, 300));
+            appendConfirmedBadge(findCard(projectA.id), projectA.id, projectB, suggestion.rationale);
+            appendConfirmedBadge(findCard(projectB.id), projectB.id, projectA, suggestion.rationale);
+          }
+
+          rowsToRemove.forEach(r => { r.style.animation = 'fadeOutCollapse 0.4s ease-out forwards'; });
+          await new Promise(resolve => setTimeout(resolve, 400));
+          rowsToRemove.forEach(r => r.remove());
+        } else if (isReset) {
+          // Confirmed badge undo path
+          const badgesToRemove = [
+            document.querySelector(`[data-sibling-confirmed="true"][data-project="${projectId}"][data-other="${otherId}"]`),
+            document.querySelector(`[data-sibling-confirmed="true"][data-project="${otherId}"][data-other="${projectId}"]`)
+          ].filter(Boolean);
+          badgesToRemove.forEach(b => { b.style.animation = 'fadeOutCollapse 0.3s ease-out forwards'; });
+          await new Promise(resolve => setTimeout(resolve, 300));
+          badgesToRemove.forEach(b => b.remove());
+        }
+
+        if (status === 'confirmed') {
+          window.showToast('Projects linked successfully', 'success', 2500);
+        } else if (status === 'dismissed') {
+          window.showToast('Suggestion dismissed', 'info', 2000);
+        } else if (isReset) {
+          window.showToast('Link undone', 'info', 2000);
+        } else {
+          window.showToast('Relationship updated', 'success', 2000);
+        }
+
+        // Update visibility on both cards
+        toggleContainerVisibility(findCard(projectId));
+        toggleContainerVisibility(findCard(otherId));
+      } catch (error) {
+        console.error('Sibling action failed', error);
+        window.showToast(error.message || 'Unable to update suggestion', 'error', 3000);
+        button.innerHTML = originalHTML;
+        allButtons.forEach(btn => {
+          btn.disabled = false;
+          btn.classList.remove('opacity-50', 'cursor-not-allowed');
+        });
+        if (window.lucide && typeof window.lucide.createIcons === 'function') {
+          window.lucide.createIcons({ elements: allButtons });
+        }
+      }
+    }
+
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-sibling-action]');
+      if (!button) return;
+      event.preventDefault();
+      event.stopPropagation();
+      handleSiblingAction(button);
+    });
+  })();
+</script>
+{% endblock %}

@@ -1,0 +1,550 @@
+{% extends "base.html" %}
+
+{% block title %}{{ agent }} — Inbox{% endblock %}
+
+{% block breadcrumbs %}
+<nav class="flex items-center gap-2 text-sm">
+  <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
+    Projects
+  </a>
+  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
+  <a href="/mail/{{ project.slug }}" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
+    {{ project.human_key }}
+  </a>
+  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
+  <span class="text-slate-900 dark:text-white font-medium">{{ agent }} Inbox</span>
+</nav>
+{% endblock %}
+
+{% block content %}
+<div class="space-y-6 animate-fade-in" x-data="inboxManager()">
+  <!-- Inbox Header with Filters -->
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-8 shadow-soft border border-slate-200 dark:border-slate-700">
+    <!-- Top Row: Title and Actions -->
+    <div class="flex items-center justify-between mb-6">
+      <div class="flex items-center gap-4">
+        <div class="w-16 h-16 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-medium float">
+          <i data-lucide="inbox" class="w-8 h-8 text-white"></i>
+        </div>
+        <div>
+          <h1 class="text-3xl font-bold text-slate-900 dark:text-white mb-1">
+            {{ agent }}
+          </h1>
+          <p class="text-slate-600 dark:text-slate-400">
+            Inbox
+            <template x-if="filteredItems.length > 0">
+              <span>
+                <span class="text-slate-400 dark:text-slate-500">•</span>
+                <span class="font-medium" x-text="filteredItems.length + ' message' + (filteredItems.length !== 1 ? 's' : '')"></span>
+                <template x-if="unreadCount > 0">
+                  <span class="ml-2 px-2 py-0.5 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-bold rounded-full" x-text="unreadCount + ' unread'"></span>
+                </template>
+              </span>
+            </template>
+          </p>
+        </div>
+      </div>
+
+      <!-- Quick Actions -->
+      <div class="flex items-center gap-2">
+        <button @click="refresh()"
+                class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-all duration-200 flex items-center gap-2 shadow-sm hover:shadow-md"
+                data-tippy-content="Refresh inbox"
+                aria-label="Refresh inbox">
+          <i data-lucide="refresh-cw" class="w-4 h-4" :class="{ 'animate-spin': isRefreshing }"></i>
+          <span class="hidden sm:inline">Refresh</span>
+        </button>
+
+        <!-- Bulk Actions (shown when messages are selected) -->
+        <div x-show="selectedMessages.length > 0"
+             x-transition:enter="transition ease-out duration-200"
+             x-transition:enter-start="opacity-0 transform scale-95"
+             x-transition:enter-end="opacity-100 transform scale-100"
+             class="flex items-center gap-2 border-l border-slate-300 dark:border-slate-600 pl-2 ml-2">
+          <span class="text-sm text-slate-600 dark:text-slate-400" x-text="selectedMessages.length + ' selected'"></span>
+          <button @click="markSelectedAsRead()"
+                  class="px-3 py-2 bg-green-100 dark:bg-green-900/30 hover:bg-green-200 dark:hover:bg-green-800/40 text-green-700 dark:text-green-300 rounded-lg transition-colors flex items-center gap-1.5 text-sm font-medium"
+                  data-tippy-content="Mark selected as read"
+                  aria-label="Mark selected messages as read">
+            <i data-lucide="check" class="w-4 h-4"></i>
+            <span class="hidden sm:inline">Mark Read</span>
+          </button>
+          <button @click="clearSelection()"
+                  class="px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-1.5 text-sm"
+                  data-tippy-content="Clear selection"
+                  aria-label="Clear selection">
+            <i data-lucide="x" class="w-4 h-4"></i>
+          </button>
+        </div>
+
+        <button @click="markAllAsRead()"
+                :disabled="isRefreshing"
+                class="px-4 py-2 bg-success-600 hover:bg-success-500 dark:bg-success-600 dark:hover:bg-success-500 text-white rounded-lg transition-all duration-200 flex items-center gap-2 shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
+                data-tippy-content="Mark all messages as read"
+                aria-label="Mark All Read">
+          <i data-lucide="check-check" class="w-4 h-4" :class="{ 'animate-spin': isRefreshing }"></i>
+          <span class="hidden sm:inline">Mark All Read</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Filters and Search Bar -->
+    <div class="flex flex-col sm:flex-row gap-4 p-6 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-700">
+      <!-- Search -->
+      <div class="relative flex-1">
+        <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+          <i data-lucide="search" class="w-4 h-4 text-slate-400"></i>
+        </div>
+        <input x-model="searchQuery"
+               @input="filterMessages()"
+               type="text"
+               placeholder="Search messages..."
+               class="w-full pl-11 pr-4 py-2.5 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg text-slate-900 dark:text-white placeholder-slate-500 dark:placeholder-slate-400 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all duration-200 text-sm"
+               aria-label="Search messages" />
+      </div>
+
+      <!-- Filter Buttons -->
+      <div class="flex items-center gap-2 flex-wrap">
+        <button @click="activeFilter = 'all'; filterMessages()"
+                :class="activeFilter === 'all' ? 'bg-primary-600 text-white ring-2 ring-primary-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
+                class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
+          <i data-lucide="inbox" class="w-4 h-4"></i>
+          <span>All</span>
+        </button>
+        <button @click="activeFilter = 'unread'; filterMessages()"
+                :class="activeFilter === 'unread' ? 'bg-primary-600 text-white ring-2 ring-primary-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
+                class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
+          <i data-lucide="mail" class="w-4 h-4"></i>
+          <span>Unread</span>
+        </button>
+        <button @click="activeFilter = 'urgent'; filterMessages()"
+                :class="activeFilter === 'urgent' ? 'bg-danger-600 text-white ring-2 ring-danger-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
+                class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
+          <i data-lucide="alert-circle" class="w-4 h-4"></i>
+          <span>Urgent</span>
+        </button>
+
+        <!-- Sort Dropdown -->
+        <div class="relative" x-data="{ open: false }">
+          <button @click="open = !open"
+                  class="px-4 py-2.5 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm border border-slate-300 dark:border-slate-600">
+            <i data-lucide="arrow-up-down" class="w-4 h-4"></i>
+            <span>Sort</span>
+            <i data-lucide="chevron-down" class="w-4 h-4 transition-transform" :class="{ 'rotate-180': open }"></i>
+          </button>
+
+          <div x-show="open"
+               @click.outside="open = false"
+               x-transition:enter="transition ease-out duration-200"
+               x-transition:enter-start="opacity-0 transform scale-95 -translate-y-2"
+               x-transition:enter-end="opacity-100 transform scale-100 translate-y-0"
+               class="absolute right-0 mt-2 w-48 bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 py-2 z-10">
+            <button @click="sortBy = 'newest'; filterMessages(); open = false"
+                    :class="sortBy === 'newest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
+                    class="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+              <i data-lucide="arrow-down" class="w-4 h-4"></i>
+              Newest First
+            </button>
+            <button @click="sortBy = 'oldest'; filterMessages(); open = false"
+                    :class="sortBy === 'oldest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
+                    class="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+              <i data-lucide="arrow-up" class="w-4 h-4"></i>
+              Oldest First
+            </button>
+            <button @click="sortBy = 'sender'; filterMessages(); open = false"
+                    :class="sortBy === 'sender' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
+                    class="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
+              <i data-lucide="user" class="w-4 h-4"></i>
+              By Sender
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Messages List -->
+  <template x-if="filteredItems.length > 0">
+    <div class="space-y-3">
+      <template x-for="(item, index) in filteredItems" :key="item.id">
+        <div class="bg-white dark:bg-slate-800 rounded-xl shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:shadow-medium hover:border-primary-300 dark:hover:border-primary-700 transition-all duration-300 transform hover:-translate-y-0.5 overflow-hidden stagger-item"
+             :style="`animation-delay: ${Math.min(index * 0.05, 1.0)}s;`">
+          <div class="flex items-start p-6 gap-4">
+            <!-- Checkbox for bulk selection -->
+            <div class="flex-shrink-0 pt-1">
+              <input type="checkbox"
+                     :value="item.id"
+                     @change="toggleSelection(item.id)"
+                     :checked="selectedMessages.includes(item.id)"
+                     class="w-5 h-5 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200 cursor-pointer"
+                     :aria-label="'Select message: ' + item.subject" />
+            </div>
+
+            <!-- Message Content (clickable) -->
+            <a :href="`/mail/{{ project.slug }}/message/${item.id}`"
+               class="flex-1 min-w-0 group">
+
+              <!-- Message Header -->
+              <div class="flex items-start justify-between mb-3">
+                <div class="flex-1 min-w-0">
+                  <h3 class="text-lg font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors line-clamp-1 mb-2"
+                      x-text="item.subject"></h3>
+
+                  <!-- Message Meta -->
+                  <div class="flex items-center gap-4 text-sm text-slate-600 dark:text-slate-400 flex-wrap">
+                    <div class="flex items-center gap-1.5">
+                      <i data-lucide="user" class="w-4 h-4"></i>
+                      <span class="font-medium" x-text="item.sender"></span>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                      <i data-lucide="calendar" class="w-4 h-4"></i>
+                      <span x-text="item.created"></span>
+                    </div>
+                    <template x-if="item.thread_id">
+                      <a :href="`/mail/{{ project.slug }}/thread/${item.thread_id}`"
+                         @click.stop
+                         class="flex items-center gap-1.5 px-2 py-1 bg-primary-100 dark:bg-primary-900/30 hover:bg-primary-200 dark:hover:bg-primary-800/40 text-primary-700 dark:text-primary-300 rounded-md transition-colors">
+                        <i data-lucide="messages-square" class="w-3.5 h-3.5"></i>
+                        <span class="font-mono text-xs font-medium">Thread</span>
+                        <span class="font-mono text-xs opacity-75" x-text="'#' + item.thread_id"></span>
+                      </a>
+                    </template>
+                  </div>
+                </div>
+
+                <!-- Badges and Status -->
+                <div class="flex items-center gap-2 ml-4">
+                  <!-- Importance Badge -->
+                  <template x-if="item.importance === 'urgent'">
+                    <span class="px-3 py-1.5 bg-danger-100 dark:bg-danger-900/30 text-danger-700 dark:text-danger-300 text-xs font-semibold rounded-full flex items-center gap-1.5 badge-pulse">
+                      <i data-lucide="alert-circle" class="w-3.5 h-3.5"></i>
+                      Urgent
+                    </span>
+                  </template>
+                  <template x-if="item.importance === 'high'">
+                    <span class="px-3 py-1.5 bg-warning-100 dark:bg-warning-900/30 text-warning-700 dark:text-warning-300 text-xs font-semibold rounded-full flex items-center gap-1.5">
+                      <i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>
+                      High
+                    </span>
+                  </template>
+                  <template x-if="item.importance === 'low'">
+                    <span class="px-3 py-1.5 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400 text-xs font-medium rounded-full">
+                      Low
+                    </span>
+                  </template>
+                  <template x-if="!item.importance || item.importance === 'normal'">
+                    <span class="px-3 py-1.5 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-medium rounded-full">
+                      Normal
+                    </span>
+                  </template>
+
+                  <!-- Arrow Icon -->
+                  <div class="text-slate-400 group-hover:text-primary-600 dark:group-hover:text-primary-400 group-hover:translate-x-1 transition-all duration-300">
+                    <i data-lucide="arrow-right" class="w-5 h-5"></i>
+                  </div>
+                </div>
+              </div>
+            </a>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- Pagination -->
+    {% if prev_page or next_page %}
+      <div class="flex items-center justify-center gap-3 pt-6">
+        {% if prev_page %}
+          <a href="?page={{ prev_page }}&limit={{ limit }}"
+             class="px-6 py-3 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium rounded-lg shadow-soft hover:shadow-medium border border-slate-200 dark:border-slate-700 transition-all duration-300 flex items-center gap-2">
+            <i data-lucide="chevron-left" class="w-4 h-4"></i>
+            Newer Messages
+          </a>
+        {% endif %}
+
+        {% if next_page %}
+          <a href="?page={{ next_page }}&limit={{ limit }}"
+             class="px-6 py-3 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium rounded-lg shadow-soft hover:shadow-medium border border-slate-200 dark:border-slate-700 transition-all duration-300 flex items-center gap-2">
+            Older Messages
+            <i data-lucide="chevron-right" class="w-4 h-4"></i>
+          </a>
+        {% endif %}
+      </div>
+    {% endif %}
+
+  </template>
+
+  <!-- Dynamic Empty State (when filtered) -->
+  <template x-if="filteredItems.length === 0">
+    <div class="bg-white dark:bg-slate-800 rounded-xl p-16 shadow-soft border border-slate-200 dark:border-slate-700 text-center">
+      <div class="w-24 h-24 bg-slate-100 dark:bg-slate-700 rounded-full flex items-center justify-center mx-auto mb-6">
+        <i data-lucide="mail-open" class="w-12 h-12 text-slate-400 dark:text-slate-500"></i>
+      </div>
+      <h3 class="text-2xl font-semibold text-slate-900 dark:text-white mb-3">
+        <template x-if="searchQuery || activeFilter !== 'all'">
+          <span>No matching messages</span>
+        </template>
+        <template x-if="!searchQuery && activeFilter === 'all'">
+          <span>Inbox is empty</span>
+        </template>
+      </h3>
+      <p class="text-slate-600 dark:text-slate-400 mb-6 max-w-md mx-auto">
+        <template x-if="searchQuery || activeFilter !== 'all'">
+          <span>No messages match your current search or filter criteria. Try broadening your search terms or clearing the active filters to see all messages.</span>
+        </template>
+        <template x-if="!searchQuery && activeFilter === 'all'">
+          <span>Messages sent to <strong class="text-slate-900 dark:text-white font-semibold">{{ agent }}</strong> will appear here automatically. Messages are typically delivered by other agents, external systems, or API integrations configured for this project.</span>
+        </template>
+      </p>
+      <template x-if="searchQuery || activeFilter !== 'all'">
+        <button @click="searchQuery = ''; activeFilter = 'all'; filterMessages()"
+                class="inline-flex items-center gap-2 px-6 py-3 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg shadow-medium hover:shadow-large transition-all duration-300 btn-ripple">
+          <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+          Clear Filters
+        </button>
+      </template>
+      <template x-if="!searchQuery && activeFilter === 'all'">
+        <a href="/mail/{{ project.slug }}"
+           class="inline-flex items-center gap-2 px-6 py-3 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg shadow-medium hover:shadow-large transition-all duration-300 btn-ripple">
+          <i data-lucide="arrow-left" class="w-4 h-4"></i>
+          Back to Project
+        </a>
+      </template>
+    </div>
+  </template>
+</div>
+
+<script>
+  function inboxManager() {
+    return {
+      // Data
+      items: {{ items | tojson if items else '[]' }},
+      filteredItems: [],
+      selectedMessages: [],
+      searchQuery: '',
+      activeFilter: 'all',
+      sortBy: 'newest',
+      isRefreshing: false,
+
+      // Computed
+      get unreadCount() {
+        // In a real implementation, this would filter items marked as unread
+        return 0;
+      },
+
+      init() {
+        this.filteredItems = [...this.items];
+        this.filterMessages();
+      },
+
+      // Filtering
+      filterMessages() {
+        let filtered = [...this.items];
+
+        // Apply search
+        if (this.searchQuery) {
+          const query = this.searchQuery.toLowerCase();
+          filtered = filtered.filter(item => {
+            const subject = (item.subject ?? '').toString().toLowerCase();
+            const sender = (item.sender ?? '').toString().toLowerCase();
+            return subject.includes(query) || sender.includes(query);
+          });
+        }
+
+        // Apply filter
+        switch (this.activeFilter) {
+          case 'unread':
+            // In real implementation, filter by unread status
+            // filtered = filtered.filter(item => item.unread);
+            break;
+          case 'urgent':
+            filtered = filtered.filter(item =>
+              item.importance === 'urgent' || item.importance === 'high'
+            );
+            break;
+        }
+
+        // Apply sort
+        switch (this.sortBy) {
+          case 'newest':
+            filtered.sort((a, b) => {
+              const timeA = Date.parse(a.created || '') || 0;
+              const timeB = Date.parse(b.created || '') || 0;
+              return timeB - timeA;
+            });
+            break;
+          case 'oldest':
+            filtered.sort((a, b) => {
+              const timeA = Date.parse(a.created || '') || 0;
+              const timeB = Date.parse(b.created || '') || 0;
+              return timeA - timeB;
+            });
+            break;
+          case 'sender':
+            filtered.sort((a, b) => {
+              const senderA = (a.sender || '').toString().toLowerCase();
+              const senderB = (b.sender || '').toString().toLowerCase();
+              return senderA.localeCompare(senderB);
+            });
+            break;
+        }
+
+        this.filteredItems = filtered;
+
+        // Re-render Lucide icons after filtering
+        this.$nextTick(() => {
+          if (typeof lucide !== 'undefined') {
+            lucide.createIcons();
+          }
+        });
+      },
+
+      // Selection
+      toggleSelection(id) {
+        const index = this.selectedMessages.indexOf(id);
+        if (index > -1) {
+          this.selectedMessages.splice(index, 1);
+        } else {
+          this.selectedMessages.push(id);
+        }
+      },
+
+      clearSelection() {
+        this.selectedMessages = [];
+      },
+
+      // Actions
+      refresh() {
+        this.isRefreshing = true;
+        window.location.reload();
+      },
+
+      async markSelectedAsRead() {
+        if (this.selectedMessages.length === 0) return;
+
+        const count = this.selectedMessages.length;
+        const confirmMsg = `Mark ${count} selected message${count !== 1 ? 's' : ''} as read?`;
+        if (!confirm(confirmMsg)) return;
+
+        try {
+          const projectSlug = {{ project.slug | tojson }};
+          const agentName = {{ agent | tojson }};
+
+          const response = await fetch(`/mail/${projectSlug}/inbox/${agentName}/mark-read`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              message_ids: this.selectedMessages
+            })
+          });
+
+          if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || error.error || `Server error: ${response.status}`);
+          }
+
+          const result = await response.json();
+          const markedCount = result.marked_count || 0;
+
+          if (typeof window.showToast === 'function') {
+            window.showToast(
+              `Successfully marked ${markedCount} message${markedCount !== 1 ? 's' : ''} as read`,
+              'success'
+            );
+          } else {
+            alert(`Successfully marked ${markedCount} message${markedCount !== 1 ? 's' : ''} as read`);
+          }
+
+          this.clearSelection();
+
+          // Reload to show updated state
+          setTimeout(() => {
+            window.location.reload();
+          }, 1000);
+
+        } catch (error) {
+          console.error('Failed to mark messages as read:', error);
+
+          if (typeof window.showToast === 'function') {
+            window.showToast(
+              `Failed to mark messages as read: ${error.message}`,
+              'error'
+            );
+          } else {
+            alert(`Failed to mark messages as read: ${error.message}`);
+          }
+        }
+      },
+
+      async markAllAsRead() {
+        if (this.isRefreshing) return;
+
+        const confirmMsg = 'Are you sure you want to mark all messages as read? This cannot be undone.';
+        if (!confirm(confirmMsg)) return;
+
+        this.isRefreshing = true;
+        try {
+          const projectSlug = {{ project.slug | tojson }};
+          const agentName = {{ agent | tojson }};
+
+          const response = await fetch(`/mail/${projectSlug}/inbox/${agentName}/mark-all-read`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          });
+
+          if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || error.error || `Server error: ${response.status}`);
+          }
+
+          const result = await response.json();
+          const count = result.marked_count || 0;
+
+          // Handle case where there were no unread messages
+          if (count === 0) {
+            if (typeof window.showToast === 'function') {
+              window.showToast('No unread messages to mark as read', 'info');
+            } else {
+              alert('No unread messages to mark as read');
+            }
+            this.isRefreshing = false;
+            return;
+          }
+
+          // Show success message
+          if (typeof window.showToast === 'function') {
+            window.showToast(
+              `Successfully marked ${count} message${count !== 1 ? 's' : ''} as read`,
+              'success'
+            );
+          } else {
+            alert(`Successfully marked ${count} message${count !== 1 ? 's' : ''} as read`);
+          }
+
+          // Reload to show updated state
+          setTimeout(() => {
+            window.location.reload();
+          }, 1500);
+
+        } catch (error) {
+          console.error('Failed to mark all as read:', error);
+
+          if (typeof window.showToast === 'function') {
+            window.showToast(
+              `Failed to mark messages as read: ${error.message}`,
+              'error'
+            );
+          } else {
+            alert(`Failed to mark messages as read: ${error.message}`);
+          }
+
+          this.isRefreshing = false;
+        }
+      }
+    };
+  }
+</script>
+{% endblock %}
