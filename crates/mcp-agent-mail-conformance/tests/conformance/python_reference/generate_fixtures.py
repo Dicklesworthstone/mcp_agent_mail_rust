@@ -70,6 +70,9 @@ _VOLATILE_KEY_EXACT: frozenset[str] = frozenset(
         "excerpt",
         # Hook paths depend on temp repo roots.
         "hook",
+        # Identity resource fields (paths are machine-specific).
+        "git_toplevel",
+        "git_common_dir",
     }
 )
 
@@ -129,6 +132,10 @@ def _set_legacy_env(run_dir: Path) -> None:
     os.environ.setdefault("HTTP_PORT", "8765")
     os.environ.setdefault("HTTP_PATH", "/api/")
 
+    # Deterministic LLM paths for llm_mode fixtures.
+    os.environ.setdefault("LLM_ENABLED", "true")
+    os.environ.setdefault("MCP_AGENT_MAIL_LLM_STUB", "1")
+
     # Disable rich tool call panels (we generate fixtures, not interactive UX).
     os.environ["TOOLS_LOG_ENABLED"] = "false"
     os.environ["LOG_RICH_ENABLED"] = "false"
@@ -146,6 +153,95 @@ def _patch_legacy_noise() -> None:
         import mcp_agent_mail.app as app_mod
 
         app_mod._render_commit_panel = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        # Deterministic LLM completions (no network) for llm_mode conformance fixtures.
+        import mcp_agent_mail.llm as llm_mod
+
+        original_complete_system_user = llm_mod.complete_system_user
+
+        async def stub_complete_system_user(
+            system: str,
+            user: str,
+            *,
+            model: str | None = None,
+            temperature: float | None = None,
+            max_tokens: int | None = None,
+        ) -> llm_mod.LlmOutput:
+            enabled = os.environ.get("MCP_AGENT_MAIL_LLM_STUB", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if not enabled:
+                return await original_complete_system_user(
+                    system,
+                    user,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+
+            sys_lower = (system or "").lower()
+            if "digest across threads" in sys_lower or user.startswith("Digest these threads:") or "# Thread" in user:
+                content = (
+                    "Ok, here's the digest:\n"
+                    "{\n"
+                    "  \"threads\": [\n"
+                    "    {\n"
+                    "      \"thread_id\": \"T-1\",\n"
+                    "      \"key_points\": [\"API v2 schema finalized\"],\n"
+                    "      \"actions\": [\"Update OpenAPI spec\"]\n"
+                    "    },\n"
+                    "    {\n"
+                    "      \"thread_id\": \"T-2\",\n"
+                    "      \"key_points\": [\"Migration to new DB\"],\n"
+                    "      \"actions\": [\"Run migration script\"]\n"
+                    "    }\n"
+                    "  ],\n"
+                    "  \"aggregate\": {\n"
+                    "    \"top_mentions\": [\"Alice\", \"Bob\"],\n"
+                    "    \"key_points\": [\"API schema and DB migration are the two main workstreams\"],\n"
+                    "    \"action_items\": [\"Update OpenAPI spec\", \"Run migration script\"]\n"
+                    "  }\n"
+                    "}\n"
+                    "Done."
+                )
+                return llm_mod.LlmOutput(
+                    content=content,
+                    model=str(model or "stub"),
+                    provider="stub",
+                    estimated_cost_usd=0.0,
+                )
+
+            content = (
+                "Here is the summary:\n"
+                "```json\n"
+                "{\n"
+                "  \"participants\": [\"BlueLake\", \"GreenCastle\"],\n"
+                "  \"key_points\": [\n"
+                "    \"API migration planned for next sprint\",\n"
+                "    \"Staging deployment needed before review\"\n"
+                "  ],\n"
+                "  \"action_items\": [\"Deploy to staging\", \"Update API docs\"],\n"
+                "  \"mentions\": [{\"name\": \"Carol\", \"count\": 2}],\n"
+                "  \"code_references\": [\"api/v2/users\"],\n"
+                "  \"total_messages\": 2,\n"
+                "  \"open_actions\": 1,\n"
+                "  \"done_actions\": 0\n"
+                "}\n"
+                "```\n"
+            )
+            return llm_mod.LlmOutput(
+                content=content,
+                model=str(model or "stub"),
+                provider="stub",
+                estimated_cost_usd=0.0,
+            )
+
+        llm_mod.complete_system_user = stub_complete_system_user  # type: ignore[assignment]
+        # app.py imported complete_system_user into its module global; patch that too.
+        app_mod.complete_system_user = stub_complete_system_user  # type: ignore[assignment]
     except Exception:
         return
 
@@ -435,6 +531,50 @@ async def _generate() -> dict[str, Any]:
         )
         message_id = send_out["deliveries"][0]["payload"]["id"]
 
+        await record_tool_error(
+            "send_message",
+            "nonexistent_sender_error",
+            {
+                "project_key": project_slug,
+                "sender_name": "NonExistentAgent",
+                "to": ["GreenCastle"],
+                "subject": "Should fail",
+                "body_md": "This should fail because sender doesn't exist.",
+            },
+            "not found",
+        )
+
+        # --- LLM mode threads (created before any replies) --------------------------------
+        # Conformance runner executes tool fixtures grouped by tool name. To keep message_id
+        # references stable across tools, we create all send_message cases before reply_message.
+        t1_out = await record_tool(
+            "send_message",
+            "llm_thread_t1_root",
+            {
+                "project_key": project_slug,
+                "sender_name": "BlueLake",
+                "to": ["GreenCastle"],
+                "subject": "LLM Thread T-1",
+                "body_md": "- TODO: deploy to staging\n- discussed API changes\n",
+                "thread_id": "T-1",
+            },
+        )
+        t1_message_id = t1_out["deliveries"][0]["payload"]["id"]
+
+        t2_out = await record_tool(
+            "send_message",
+            "llm_thread_t2_root",
+            {
+                "project_key": project_slug,
+                "sender_name": "BlueLake",
+                "to": ["GreenCastle"],
+                "subject": "LLM Thread T-2",
+                "body_md": "- NEXT: migrate DB\n- ACTION: run script\n",
+                "thread_id": "T-2",
+            },
+        )
+        t2_message_id = t2_out["deliveries"][0]["payload"]["id"]
+
         await record_tool(
             "reply_message",
             "reply_in_thread",
@@ -443,6 +583,26 @@ async def _generate() -> dict[str, Any]:
                 "message_id": message_id,
                 "sender_name": "GreenCastle",
                 "body_md": "Reply",
+            },
+        )
+        await record_tool(
+            "reply_message",
+            "llm_thread_t1_reply",
+            {
+                "project_key": project_slug,
+                "message_id": t1_message_id,
+                "sender_name": "GreenCastle",
+                "body_md": "- ACK: will deploy\n- [ ] TODO: update docs\n`api/v2/users`\n@Carol\n",
+            },
+        )
+        await record_tool(
+            "reply_message",
+            "llm_thread_t2_reply",
+            {
+                "project_key": project_slug,
+                "message_id": t2_message_id,
+                "sender_name": "GreenCastle",
+                "body_md": "- BLOCKED: waiting on infra\n",
             },
         )
 
@@ -485,6 +645,15 @@ async def _generate() -> dict[str, Any]:
                 "limit": 10,
             },
         )
+        await record_tool_error(
+            "search_messages",
+            "empty_query_error",
+            {
+                "project_key": project_slug,
+                "query": "",
+            },
+            "empty",
+        )
         await record_tool(
             "summarize_thread",
             "summarize_thread_root",
@@ -494,6 +663,15 @@ async def _generate() -> dict[str, Any]:
                 "include_examples": True,
                 "llm_mode": False,
             },
+        )
+        await record_tool_error(
+            "summarize_thread",
+            "empty_thread_id_error",
+            {
+                "project_key": project_slug,
+                "thread_id": "",
+            },
+            "empty",
         )
 
         await record_tool(
@@ -523,6 +701,38 @@ async def _generate() -> dict[str, Any]:
                 "thread_id": str(message_id),
                 "include_examples": True,
                 "llm_mode": False,
+            },
+        )
+
+        # --- LLM mode conformance fixtures -----------------------------------------------
+        await record_tool(
+            "summarize_thread",
+            "summarize_thread_t1_llm",
+            {
+                "project_key": project_slug,
+                "thread_id": "T-1",
+                "include_examples": True,
+                "llm_mode": True,
+            },
+        )
+        await record_tool(
+            "summarize_thread_product",
+            "product_summarize_thread_t1_llm",
+            {
+                "product_key": product_key,
+                "thread_id": "T-1",
+                "include_examples": True,
+                "llm_mode": True,
+            },
+        )
+
+        await record_tool(
+            "summarize_thread",
+            "summarize_thread_multi_llm",
+            {
+                "project_key": project_slug,
+                "thread_id": "T-1,T-2",
+                "llm_mode": True,
             },
         )
 
@@ -556,6 +766,16 @@ async def _generate() -> dict[str, Any]:
                 "agent_name": "BlueLake",
                 "extend_seconds": 600,
             },
+        )
+        await record_tool_error(
+            "renew_file_reservations",
+            "insufficient_extend_seconds_error",
+            {
+                "project_key": project_slug,
+                "agent_name": "BlueLake",
+                "extend_seconds": 5,
+            },
+            "60",
         )
         await record_tool(
             "release_file_reservations",
@@ -600,6 +820,15 @@ async def _generate() -> dict[str, Any]:
                 "include_recent_commits": False,
             },
         )
+        await record_tool_error(
+            "whois",
+            "whois_nonexistent_error",
+            {
+                "project_key": project_slug,
+                "agent_name": "ZzzNonExistentAgent",
+            },
+            "not found",
+        )
 
         await record_tool(
             "macro_start_session",
@@ -623,6 +852,19 @@ async def _generate() -> dict[str, Any]:
                 "agent_name": "BlueLake",
                 "include_examples": True,
                 "llm_mode": False,
+            },
+        )
+        await record_tool(
+            "macro_prepare_thread",
+            "macro_prepare_thread_llm",
+            {
+                "project_key": project_slug,
+                "thread_id": "T-1",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "agent_name": "BlueLake",
+                "include_examples": True,
+                "llm_mode": True,
             },
         )
         await record_tool(
@@ -656,6 +898,7 @@ async def _generate() -> dict[str, Any]:
         resource_uris.append(("resource://config/environment", "default"))
         resource_uris.append(("resource://projects", "all_projects"))
         resource_uris.append((f"resource://project/{project_slug}", "project_detail"))
+        resource_uris.append((f"resource://identity/{project_slug}", "identity_project"))
         resource_uris.append((f"resource://agents/{project_slug}", "agents_list"))
         resource_uris.append((f"resource://product/{product_key}", "product_detail"))
         resource_uris.append((f"resource://inbox/GreenCastle?project={project_slug}&include_bodies=true&limit=10", "inbox_resource"))

@@ -63,7 +63,7 @@
           },
           "expect": {
             "err": {
-              "message_contains": "absolute"
+              "message_contains": "absolute directory path"
             }
           }
         }
@@ -457,9 +457,103 @@
           }
         },
         {
+          "name": "llm_thread_t1_root",
+          "input": {
+            "project_key": "abs-path-backend",
+            "sender_name": "BlueLake",
+            "to": [
+              "GreenCastle"
+            ],
+            "subject": "LLM Thread T-1",
+            "body_md": "- TODO: deploy to staging\n- discussed API changes\n",
+            "thread_id": "T-1"
+          },
+          "expect": {
+            "ok": {
+              "deliveries": [
+                {
+                  "project": "/abs/path/backend",
+                  "payload": {
+                    "id": 4,
+                    "project_id": 1,
+                    "sender_id": 1,
+                    "thread_id": "T-1",
+                    "subject": "LLM Thread T-1",
+                    "importance": "normal",
+                    "ack_required": false,
+                    "created_ts": null,
+                    "attachments": [],
+                    "body_md": "- TODO: deploy to staging\n- discussed API changes\n",
+                    "from": "BlueLake",
+                    "to": [
+                      "GreenCastle"
+                    ],
+                    "cc": [],
+                    "bcc": []
+                  }
+                }
+              ],
+              "count": 1,
+              "attachments": []
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/deliveries/0/payload/created_ts"
+            ]
+          }
+        },
+        {
+          "name": "llm_thread_t2_root",
+          "input": {
+            "project_key": "abs-path-backend",
+            "sender_name": "BlueLake",
+            "to": [
+              "GreenCastle"
+            ],
+            "subject": "LLM Thread T-2",
+            "body_md": "- NEXT: migrate DB\n- ACTION: run script\n",
+            "thread_id": "T-2"
+          },
+          "expect": {
+            "ok": {
+              "deliveries": [
+                {
+                  "project": "/abs/path/backend",
+                  "payload": {
+                    "id": 6,
+                    "project_id": 1,
+                    "sender_id": 1,
+                    "thread_id": "T-2",
+                    "subject": "LLM Thread T-2",
+                    "importance": "normal",
+                    "ack_required": false,
+                    "created_ts": null,
+                    "attachments": [],
+                    "body_md": "- NEXT: migrate DB\n- ACTION: run script\n",
+                    "from": "BlueLake",
+                    "to": [
+                      "GreenCastle"
+                    ],
+                    "cc": [],
+                    "bcc": []
+                  }
+                }
+              ],
+              "count": 1,
+              "attachments": []
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/deliveries/0/payload/created_ts"
+            ]
+          }
+        },
+        {
           "name": "nonexistent_sender_error",
           "input": {
-            "project_key": "/abs/path/backend",
+            "project_key": "abs-path-backend",
             "sender_name": "NonExistentAgent",
             "to": [
               "GreenCastle"
@@ -471,8 +565,7 @@
             "err": {
               "message_contains": "not found"
             }
-          },
-          "normalize": {}
+          }
         }
       ]
     },
@@ -537,6 +630,126 @@
               "/deliveries/0/payload/created_ts"
             ]
           }
+        },
+        {
+          "name": "llm_thread_t1_reply",
+          "input": {
+            "project_key": "abs-path-backend",
+            "message_id": 3,
+            "sender_name": "GreenCastle",
+            "body_md": "- ACK: will deploy\n- [ ] TODO: update docs\n`api/v2/users`\n@Carol\n"
+          },
+          "expect": {
+            "ok": {
+              "id": 5,
+              "project_id": 1,
+              "sender_id": 2,
+              "thread_id": "T-1",
+              "subject": "Re: LLM Thread T-1",
+              "importance": "normal",
+              "ack_required": false,
+              "created_ts": null,
+              "attachments": [],
+              "body_md": "- ACK: will deploy\n- [ ] TODO: update docs\n`api/v2/users`\n@Carol\n",
+              "from": "GreenCastle",
+              "to": [
+                "BlueLake"
+              ],
+              "cc": [],
+              "bcc": [],
+              "reply_to": 4,
+              "deliveries": [
+                {
+                  "project": "/abs/path/backend",
+                  "payload": {
+                    "id": 5,
+                    "project_id": 1,
+                    "sender_id": 2,
+                    "thread_id": "T-1",
+                    "subject": "Re: LLM Thread T-1",
+                    "importance": "normal",
+                    "ack_required": false,
+                    "created_ts": null,
+                    "attachments": [],
+                    "body_md": "- ACK: will deploy\n- [ ] TODO: update docs\n`api/v2/users`\n@Carol\n",
+                    "from": "GreenCastle",
+                    "to": [
+                      "BlueLake"
+                    ],
+                    "cc": [],
+                    "bcc": []
+                  }
+                }
+              ],
+              "count": 1
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/created_ts",
+              "/deliveries/0/payload/created_ts"
+            ]
+          }
+        },
+        {
+          "name": "llm_thread_t2_reply",
+          "input": {
+            "project_key": "abs-path-backend",
+            "message_id": 4,
+            "sender_name": "GreenCastle",
+            "body_md": "- BLOCKED: waiting on infra\n"
+          },
+          "expect": {
+            "ok": {
+              "id": 7,
+              "project_id": 1,
+              "sender_id": 2,
+              "thread_id": "T-2",
+              "subject": "Re: LLM Thread T-2",
+              "importance": "normal",
+              "ack_required": false,
+              "created_ts": null,
+              "attachments": [],
+              "body_md": "- BLOCKED: waiting on infra\n",
+              "from": "GreenCastle",
+              "to": [
+                "BlueLake"
+              ],
+              "cc": [],
+              "bcc": [],
+              "reply_to": 6,
+              "deliveries": [
+                {
+                  "project": "/abs/path/backend",
+                  "payload": {
+                    "id": 7,
+                    "project_id": 1,
+                    "sender_id": 2,
+                    "thread_id": "T-2",
+                    "subject": "Re: LLM Thread T-2",
+                    "importance": "normal",
+                    "ack_required": false,
+                    "created_ts": null,
+                    "attachments": [],
+                    "body_md": "- BLOCKED: waiting on infra\n",
+                    "from": "GreenCastle",
+                    "to": [
+                      "BlueLake"
+                    ],
+                    "cc": [],
+                    "bcc": []
+                  }
+                }
+              ],
+              "count": 1
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/created_ts",
+              "/deliveries/0/payload/created_ts"
+            ]
+          }
         }
       ]
     },
@@ -552,6 +765,34 @@
           },
           "expect": {
             "ok": [
+              {
+                "id": 6,
+                "project_id": 1,
+                "sender_id": 1,
+                "thread_id": "T-2",
+                "subject": "LLM Thread T-2",
+                "importance": "normal",
+                "ack_required": false,
+                "created_ts": null,
+                "attachments": [],
+                "body_md": "- NEXT: migrate DB\n- ACTION: run script\n",
+                "from": "BlueLake",
+                "kind": "to"
+              },
+              {
+                "id": 4,
+                "project_id": 1,
+                "sender_id": 1,
+                "thread_id": "T-1",
+                "subject": "LLM Thread T-1",
+                "importance": "normal",
+                "ack_required": false,
+                "created_ts": null,
+                "attachments": [],
+                "body_md": "- TODO: deploy to staging\n- discussed API changes\n",
+                "from": "BlueLake",
+                "kind": "to"
+              },
               {
                 "id": 2,
                 "project_id": 1,
@@ -586,6 +827,9 @@
             "ignore_json_pointers": [
               "/0/created_ts",
               "/1/created_ts"
+              ,
+              "/2/created_ts",
+              "/3/created_ts"
             ]
           }
         }
@@ -684,15 +928,14 @@
         {
           "name": "empty_query_error",
           "input": {
-            "project_key": "/abs/path/backend",
+            "project_key": "abs-path-backend",
             "query": ""
           },
           "expect": {
             "err": {
               "message_contains": "empty"
             }
-          },
-          "normalize": {}
+          }
         }
       ]
     },
@@ -747,35 +990,148 @@
         {
           "name": "empty_thread_id_error",
           "input": {
-            "project_key": "/abs/path/backend",
+            "project_key": "abs-path-backend",
             "thread_id": ""
           },
           "expect": {
             "err": {
               "message_contains": "empty"
             }
-          },
-          "normalize": {}
+          }
         },
         {
-          "name": "summarize_thread_no_llm",
+          "name": "summarize_thread_t1_llm",
           "input": {
-            "project_key": "/abs/path/backend",
-            "thread_id": "2",
-            "llm_mode": false
+            "project_key": "abs-path-backend",
+            "thread_id": "T-1",
+            "include_examples": true,
+            "llm_mode": true
           },
           "expect": {
             "ok": {
-              "thread_id": "2",
-              "summary": null,
-              "examples": null
+              "thread_id": "T-1",
+              "summary": {
+                "participants": [
+                  "BlueLake",
+                  "GreenCastle"
+                ],
+                "key_points": [
+                  "API migration planned for next sprint",
+                  "Staging deployment needed before review",
+                  "TODO: deploy to staging",
+                  "TODO: update docs"
+                ],
+                "action_items": [
+                  "Deploy to staging",
+                  "Update API docs"
+                ],
+                "total_messages": 2,
+                "open_actions": 1,
+                "done_actions": 0,
+                "mentions": [
+                  {
+                    "name": "Carol",
+                    "count": 2
+                  }
+                ],
+                "code_references": [
+                  "api/v2/users"
+                ]
+              },
+              "examples": [
+                {
+                  "id": 4,
+                  "subject": "LLM Thread T-1",
+                  "from": "BlueLake",
+                  "created_ts": null
+                },
+                {
+                  "id": 5,
+                  "subject": "Re: LLM Thread T-1",
+                  "from": "GreenCastle",
+                  "created_ts": null
+                }
+              ]
             }
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/summary",
-              "/examples"
+              "/examples/0/created_ts",
+              "/examples/1/created_ts"
             ]
+          }
+        },
+        {
+          "name": "summarize_thread_multi_llm",
+          "input": {
+            "project_key": "abs-path-backend",
+            "thread_id": "T-1,T-2",
+            "llm_mode": true
+          },
+          "expect": {
+            "ok": {
+              "threads": [
+                {
+                  "thread_id": "T-1",
+                  "summary": {
+                    "participants": [
+                      "BlueLake",
+                      "GreenCastle"
+                    ],
+                    "key_points": [
+                      "API v2 schema finalized"
+                    ],
+                    "action_items": [
+                      "Update OpenAPI spec"
+                    ],
+                    "total_messages": 2,
+                    "open_actions": 1,
+                    "done_actions": 0,
+                    "mentions": [
+                      {
+                        "name": "Carol",
+                        "count": 1
+                      }
+                    ],
+                    "code_references": [
+                      "api/v2/users"
+                    ]
+                  }
+                },
+                {
+                  "thread_id": "T-2",
+                  "summary": {
+                    "participants": [
+                      "BlueLake",
+                      "GreenCastle"
+                    ],
+                    "key_points": [
+                      "Migration to new DB"
+                    ],
+                    "action_items": [
+                      "Run migration script"
+                    ],
+                    "total_messages": 2,
+                    "open_actions": 0,
+                    "done_actions": 0,
+                    "mentions": []
+                  }
+                }
+              ],
+              "aggregate": {
+                "top_mentions": [
+                  "Alice",
+                  "Bob"
+                ],
+                "action_items": [
+                  "Update OpenAPI spec",
+                  "Run migration script"
+                ],
+                "key_points": [
+                  "API schema and DB migration are the two main workstreams"
+                ]
+              }
+            }
           }
         }
       ]
@@ -837,6 +1193,34 @@
           "expect": {
             "ok": [
               {
+                "id": 6,
+                "project_id": 1,
+                "sender_id": 1,
+                "thread_id": "T-2",
+                "subject": "LLM Thread T-2",
+                "importance": "normal",
+                "ack_required": false,
+                "created_ts": null,
+                "attachments": [],
+                "body_md": "- NEXT: migrate DB\n- ACTION: run script\n",
+                "from": "BlueLake",
+                "kind": "to"
+              },
+              {
+                "id": 4,
+                "project_id": 1,
+                "sender_id": 1,
+                "thread_id": "T-1",
+                "subject": "LLM Thread T-1",
+                "importance": "normal",
+                "ack_required": false,
+                "created_ts": null,
+                "attachments": [],
+                "body_md": "- TODO: deploy to staging\n- discussed API changes\n",
+                "from": "BlueLake",
+                "kind": "to"
+              },
+              {
                 "id": 2,
                 "project_id": 1,
                 "sender_id": 1,
@@ -869,7 +1253,9 @@
           "normalize": {
             "ignore_json_pointers": [
               "/0/created_ts",
-              "/1/created_ts"
+              "/1/created_ts",
+              "/2/created_ts",
+              "/3/created_ts"
             ]
           }
         }
@@ -922,11 +1308,86 @@
               "/examples/1/created_ts"
             ]
           }
+        },
+        {
+          "name": "product_summarize_thread_t1_llm",
+          "input": {
+            "product_key": "0123456789abcdef0123",
+            "thread_id": "T-1",
+            "include_examples": true,
+            "llm_mode": true
+          },
+          "expect": {
+            "ok": {
+              "thread_id": "T-1",
+              "summary": {
+                "participants": [
+                  "BlueLake",
+                  "GreenCastle"
+                ],
+                "key_points": [
+                  "API migration planned for next sprint",
+                  "Staging deployment needed before review",
+                  "TODO: deploy to staging",
+                  "TODO: update docs"
+                ],
+                "action_items": [
+                  "Deploy to staging",
+                  "Update API docs"
+                ],
+                "total_messages": 2,
+                "open_actions": 1,
+                "done_actions": 0,
+                "mentions": [
+                  {
+                    "name": "Carol",
+                    "count": 2
+                  }
+                ],
+                "code_references": [
+                  "api/v2/users"
+                ]
+              },
+              "examples": [
+                {
+                  "id": 4,
+                  "subject": "LLM Thread T-1",
+                  "from": "BlueLake",
+                  "created_ts": null
+                },
+                {
+                  "id": 5,
+                  "subject": "Re: LLM Thread T-1",
+                  "from": "GreenCastle",
+                  "created_ts": null
+                }
+              ]
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/examples/0/created_ts",
+              "/examples/1/created_ts"
+            ]
+          }
         }
       ]
     },
     "file_reservation_paths": {
       "cases": [
+        {
+          "name": "empty_paths_error",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "BlueLake",
+            "paths": []
+          },
+          "expect": {
+            "err": {
+              "message_contains": "paths list cannot be empty"
+            }
+          }
+        },
         {
           "name": "reserve_src_glob",
           "input": {
@@ -957,19 +1418,6 @@
             "ignore_json_pointers": [
               "/granted/0/expires_ts"
             ]
-          }
-        },
-        {
-          "name": "empty_paths_error",
-          "input": {
-            "project_key": "abs-path-backend",
-            "agent_name": "BlueLake",
-            "paths": []
-          },
-          "expect": {
-            "err": {
-              "message_contains": "paths list cannot be empty"
-            }
           }
         }
       ]
@@ -1006,7 +1454,7 @@
         {
           "name": "insufficient_extend_seconds_error",
           "input": {
-            "project_key": "/abs/path/backend",
+            "project_key": "abs-path-backend",
             "agent_name": "BlueLake",
             "extend_seconds": 5
           },
@@ -1014,8 +1462,7 @@
             "err": {
               "message_contains": "60"
             }
-          },
-          "normalize": {}
+          }
         }
       ]
     },
@@ -1127,15 +1574,14 @@
         {
           "name": "whois_nonexistent_error",
           "input": {
-            "project_key": "/abs/path/backend",
+            "project_key": "abs-path-backend",
             "agent_name": "ZzzNonExistentAgent"
           },
           "expect": {
             "err": {
               "message_contains": "not found"
             }
-          },
-          "normalize": {}
+          }
         }
       ]
     },
@@ -1250,6 +1696,32 @@
               },
               "inbox": [
                 {
+                  "id": 7,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "T-2",
+                  "subject": "Re: LLM Thread T-2",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "to"
+                },
+                {
+                  "id": 5,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "T-1",
+                  "subject": "Re: LLM Thread T-1",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "to"
+                },
+                {
                   "id": 3,
                   "project_id": 1,
                   "sender_id": 2,
@@ -1270,6 +1742,140 @@
               "/agent/inception_ts",
               "/agent/last_active_ts",
               "/inbox/0/created_ts",
+              "/inbox/1/created_ts",
+              "/inbox/2/created_ts",
+              "/project/created_at",
+              "/thread/examples/0/created_ts",
+              "/thread/examples/1/created_ts"
+            ]
+          }
+        },
+        {
+          "name": "macro_prepare_thread_llm",
+          "input": {
+            "project_key": "abs-path-backend",
+            "thread_id": "T-1",
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "agent_name": "BlueLake",
+            "include_examples": true,
+            "llm_mode": true
+          },
+          "expect": {
+            "ok": {
+              "project": {
+                "id": 1,
+                "slug": "abs-path-backend",
+                "human_key": "/abs/path/backend",
+                "created_at": null
+              },
+              "agent": {
+                "id": 1,
+                "name": "BlueLake",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "task_description": "",
+                "inception_ts": null,
+                "last_active_ts": null,
+                "project_id": 1,
+                "attachments_policy": "auto"
+              },
+              "thread": {
+                "thread_id": "T-1",
+                "summary": {
+                  "participants": [
+                    "BlueLake",
+                    "GreenCastle"
+                  ],
+                  "key_points": [
+                    "API migration planned for next sprint",
+                    "Staging deployment needed before review",
+                    "TODO: deploy to staging",
+                    "TODO: update docs"
+                  ],
+                  "action_items": [
+                    "Deploy to staging",
+                    "Update API docs"
+                  ],
+                  "total_messages": 2,
+                  "open_actions": 1,
+                  "done_actions": 0,
+                  "mentions": [
+                    {
+                      "name": "Carol",
+                      "count": 2
+                    }
+                  ],
+                  "code_references": [
+                    "api/v2/users"
+                  ]
+                },
+                "examples": [
+                  {
+                    "id": 4,
+                    "subject": "LLM Thread T-1",
+                    "from": "BlueLake",
+                    "created_ts": null
+                  },
+                  {
+                    "id": 5,
+                    "subject": "Re: LLM Thread T-1",
+                    "from": "GreenCastle",
+                    "created_ts": null
+                  }
+                ],
+                "total_messages": 2
+              },
+              "inbox": [
+                {
+                  "id": 7,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "T-2",
+                  "subject": "Re: LLM Thread T-2",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "to"
+                },
+                {
+                  "id": 5,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "T-1",
+                  "subject": "Re: LLM Thread T-1",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "to"
+                },
+                {
+                  "id": 3,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "2",
+                  "subject": "Re: Hello",
+                  "importance": "urgent",
+                  "ack_required": true,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "to"
+                }
+              ]
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/agent/inception_ts",
+              "/agent/last_active_ts",
+              "/inbox/0/created_ts",
+              "/inbox/1/created_ts",
+              "/inbox/2/created_ts",
               "/project/created_at",
               "/thread/examples/0/created_ts",
               "/thread/examples/1/created_ts"
@@ -1481,6 +2087,28 @@
         }
       ]
     },
+    "resource://identity/abs-path-backend": {
+      "cases": [
+        {
+          "name": "identity_project",
+          "input": {},
+          "expect": {
+            "ok": {
+              "project_slug": "abs-path-backend",
+              "git_remote": null,
+              "git_toplevel": null,
+              "git_common_dir": null
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/git_toplevel",
+              "/git_common_dir"
+            ]
+          }
+        }
+      ]
+    },
     "resource://agents/abs-path-backend": {
       "cases": [
         {
@@ -1503,7 +2131,7 @@
                   "last_active_ts": null,
                   "project_id": 1,
                   "attachments_policy": "auto",
-                  "unread_count": 1
+                  "unread_count": 3
                 },
                 {
                   "id": 2,
@@ -1515,7 +2143,7 @@
                   "last_active_ts": null,
                   "project_id": 1,
                   "attachments_policy": "auto",
-                  "unread_count": 1
+                  "unread_count": 3
                 },
                 {
                   "id": 3,
@@ -1540,28 +2168,6 @@
               "/agents/1/last_active_ts",
               "/agents/2/inception_ts",
               "/agents/2/last_active_ts"
-            ]
-          }
-        }
-      ]
-    },
-    "resource://identity/abs-path-backend": {
-      "cases": [
-        {
-          "name": "identity_project",
-          "input": {},
-          "expect": {
-            "ok": {
-              "project_slug": "abs-path-backend",
-              "git_remote": null,
-              "git_toplevel": null,
-              "git_common_dir": null
-            }
-          },
-          "normalize": {
-            "ignore_json_pointers": [
-              "/git_toplevel",
-              "/git_common_dir"
             ]
           }
         }
@@ -1606,8 +2212,58 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 2,
+              "count": 4,
               "messages": [
+                {
+                  "id": 6,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": "T-2",
+                  "subject": "LLM Thread T-2",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "body_md": "- NEXT: migrate DB\n- ACTION: run script\n",
+                  "from": "BlueLake",
+                  "kind": "to",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-2",
+                    "authored_ts": null,
+                    "insertions": 21,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 1,
+                      "excerpt": null
+                    }
+                  }
+                },
+                {
+                  "id": 4,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": "T-1",
+                  "subject": "LLM Thread T-1",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "body_md": "- TODO: deploy to staging\n- discussed API changes\n",
+                  "from": "BlueLake",
+                  "kind": "to",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-1",
+                    "authored_ts": null,
+                    "insertions": 21,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 1,
+                      "excerpt": null
+                    }
+                  }
+                },
                 {
                   "id": 2,
                   "project_id": 1,
@@ -1670,7 +2326,15 @@
               "/messages/1/commit/authored_ts",
               "/messages/1/commit/diff_summary/excerpt",
               "/messages/1/commit/hexsha",
-              "/messages/1/created_ts"
+              "/messages/1/created_ts",
+              "/messages/2/commit/authored_ts",
+              "/messages/2/commit/diff_summary/excerpt",
+              "/messages/2/commit/hexsha",
+              "/messages/2/created_ts",
+              "/messages/3/commit/authored_ts",
+              "/messages/3/commit/diff_summary/excerpt",
+              "/messages/3/commit/hexsha",
+              "/messages/3/created_ts"
             ]
           }
         }
@@ -1907,7 +2571,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent—per repository setup.",
+                      "expected_frequency": "Infrequent\u2014per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -2062,7 +2726,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent—core write operation.",
+                      "expected_frequency": "Frequent\u2014core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -2190,7 +2854,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional—when new communication lines are needed.",
+                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -2664,7 +3328,7 @@
               "tools": [
                 {
                   "name": "acknowledge_message",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2675,7 +3339,7 @@
                 },
                 {
                   "name": "acquire_build_slot",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "build_slots",
                   "capabilities": [
@@ -2685,7 +3349,7 @@
                 },
                 {
                   "name": "create_agent_identity",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "identity",
                   "capabilities": [
@@ -2695,7 +3359,7 @@
                 },
                 {
                   "name": "ensure_product",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2705,8 +3369,8 @@
                 },
                 {
                   "name": "ensure_project",
-                  "calls": 0,
-                  "errors": 0,
+                  "calls": 2,
+                  "errors": 1,
                   "cluster": "infrastructure",
                   "capabilities": [
                     "infrastructure",
@@ -2716,7 +3380,7 @@
                 },
                 {
                   "name": "fetch_inbox",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2727,7 +3391,7 @@
                 },
                 {
                   "name": "fetch_inbox_product",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2738,8 +3402,19 @@
                 },
                 {
                   "name": "file_reservation_paths",
-                  "calls": 0,
-                  "errors": 0,
+                  "calls": 3,
+                  "errors": 1,
+                  "cluster": "file_reservations",
+                  "capabilities": [
+                    "file_reservations",
+                    "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "force_release_file_reservation",
+                  "calls": 1,
+                  "errors": 1,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations",
@@ -2749,7 +3424,7 @@
                 },
                 {
                   "name": "health_check",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
@@ -2758,8 +3433,19 @@
                   "complexity": "low"
                 },
                 {
+                  "name": "install_precommit_guard",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "infrastructure",
+                  "capabilities": [
+                    "infrastructure",
+                    "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
                   "name": "list_contacts",
-                  "calls": 0,
+                  "calls": 2,
                   "errors": 0,
                   "cluster": "contact",
                   "capabilities": [
@@ -2770,7 +3456,7 @@
                 },
                 {
                   "name": "macro_contact_handshake",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
@@ -2782,7 +3468,7 @@
                 },
                 {
                   "name": "macro_file_reservation_cycle",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
@@ -2794,7 +3480,7 @@
                 },
                 {
                   "name": "macro_prepare_thread",
-                  "calls": 0,
+                  "calls": 2,
                   "errors": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
@@ -2806,7 +3492,7 @@
                 },
                 {
                   "name": "macro_start_session",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
@@ -2819,7 +3505,7 @@
                 },
                 {
                   "name": "mark_message_read",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2830,7 +3516,7 @@
                 },
                 {
                   "name": "products_link",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2840,7 +3526,7 @@
                 },
                 {
                   "name": "register_agent",
-                  "calls": 0,
+                  "calls": 2,
                   "errors": 0,
                   "cluster": "identity",
                   "capabilities": [
@@ -2850,7 +3536,7 @@
                 },
                 {
                   "name": "release_build_slot",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "build_slots",
                   "capabilities": [
@@ -2860,7 +3546,7 @@
                 },
                 {
                   "name": "release_file_reservations",
-                  "calls": 0,
+                  "calls": 2,
                   "errors": 0,
                   "cluster": "file_reservations",
                   "capabilities": [
@@ -2870,7 +3556,7 @@
                 },
                 {
                   "name": "renew_build_slot",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "build_slots",
                   "capabilities": [
@@ -2880,8 +3566,8 @@
                 },
                 {
                   "name": "renew_file_reservations",
-                  "calls": 0,
-                  "errors": 0,
+                  "calls": 2,
+                  "errors": 1,
                   "cluster": "file_reservations",
                   "capabilities": [
                     "file_reservations"
@@ -2890,7 +3576,7 @@
                 },
                 {
                   "name": "reply_message",
-                  "calls": 0,
+                  "calls": 3,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2901,7 +3587,7 @@
                 },
                 {
                   "name": "request_contact",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "contact",
                   "capabilities": [
@@ -2911,7 +3597,7 @@
                 },
                 {
                   "name": "respond_contact",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "contact",
                   "capabilities": [
@@ -2921,8 +3607,8 @@
                 },
                 {
                   "name": "search_messages",
-                  "calls": 0,
-                  "errors": 0,
+                  "calls": 2,
+                  "errors": 1,
                   "cluster": "search",
                   "capabilities": [
                     "search"
@@ -2931,7 +3617,7 @@
                 },
                 {
                   "name": "search_messages_product",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2941,8 +3627,8 @@
                 },
                 {
                   "name": "send_message",
-                  "calls": 0,
-                  "errors": 0,
+                  "calls": 4,
+                  "errors": 1,
                   "cluster": "messaging",
                   "capabilities": [
                     "messaging",
@@ -2952,7 +3638,7 @@
                 },
                 {
                   "name": "set_contact_policy",
-                  "calls": 0,
+                  "calls": 1,
                   "errors": 0,
                   "cluster": "contact",
                   "capabilities": [
@@ -2963,8 +3649,8 @@
                 },
                 {
                   "name": "summarize_thread",
-                  "calls": 0,
-                  "errors": 0,
+                  "calls": 4,
+                  "errors": 1,
                   "cluster": "search",
                   "capabilities": [
                     "search",
@@ -2974,7 +3660,7 @@
                 },
                 {
                   "name": "summarize_thread_product",
-                  "calls": 0,
+                  "calls": 2,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2984,9 +3670,20 @@
                   "complexity": "medium"
                 },
                 {
-                  "name": "whois",
-                  "calls": 0,
+                  "name": "uninstall_precommit_guard",
+                  "calls": 1,
                   "errors": 0,
+                  "cluster": "infrastructure",
+                  "capabilities": [
+                    "infrastructure",
+                    "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "whois",
+                  "calls": 2,
+                  "errors": 1,
                   "cluster": "identity",
                   "capabilities": [
                     "audit",
@@ -3054,7 +3751,7 @@
             "ok": {
               "generated_at": null,
               "window_seconds": 60,
-              "count": 16,
+              "count": 21,
               "entries": [
                 {
                   "timestamp": null,
@@ -3107,6 +3804,27 @@
                 },
                 {
                   "timestamp": null,
+                  "tool": "send_message",
+                  "project": "abs-path-backend",
+                  "agent": "BlueLake",
+                  "cluster": "messaging"
+                },
+                {
+                  "timestamp": null,
+                  "tool": "send_message",
+                  "project": "abs-path-backend",
+                  "agent": "BlueLake",
+                  "cluster": "messaging"
+                },
+                {
+                  "timestamp": null,
+                  "tool": "file_reservation_paths",
+                  "project": "abs-path-backend",
+                  "agent": "BlueLake",
+                  "cluster": "file_reservations"
+                },
+                {
+                  "timestamp": null,
                   "tool": "file_reservation_paths",
                   "project": "abs-path-backend",
                   "agent": "BlueLake",
@@ -3128,10 +3846,24 @@
                 },
                 {
                   "timestamp": null,
+                  "tool": "force_release_file_reservation",
+                  "project": "abs-path-backend",
+                  "agent": "BlueLake",
+                  "cluster": "file_reservations"
+                },
+                {
+                  "timestamp": null,
                   "tool": "whois",
                   "project": "abs-path-backend",
                   "agent": "BlueLake",
                   "cluster": "identity"
+                },
+                {
+                  "timestamp": null,
+                  "tool": "macro_prepare_thread",
+                  "project": "abs-path-backend",
+                  "agent": "BlueLake",
+                  "cluster": "workflow_macros"
                 },
                 {
                   "timestamp": null,
@@ -3181,7 +3913,12 @@
               "/entries/13/timestamp",
               "/entries/14/timestamp",
               "/entries/15/timestamp",
+              "/entries/16/timestamp",
+              "/entries/17/timestamp",
+              "/entries/18/timestamp",
+              "/entries/19/timestamp",
               "/entries/2/timestamp",
+              "/entries/20/timestamp",
               "/entries/3/timestamp",
               "/entries/4/timestamp",
               "/entries/5/timestamp",
@@ -3306,8 +4043,42 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 2,
+              "count": 4,
               "messages": [
+                {
+                  "id": 6,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": "T-2",
+                  "subject": "LLM Thread T-2",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "BlueLake",
+                  "kind": "to",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "file_reservation: BlueLake src/**"
+                  }
+                },
+                {
+                  "id": 4,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": "T-1",
+                  "subject": "LLM Thread T-1",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "BlueLake",
+                  "kind": "to",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "file_reservation: BlueLake src/**"
+                  }
+                },
                 {
                   "id": 2,
                   "project_id": 1,
@@ -3350,7 +4121,11 @@
               "/messages/0/commit/hexsha",
               "/messages/0/created_ts",
               "/messages/1/commit/hexsha",
-              "/messages/1/created_ts"
+              "/messages/1/created_ts",
+              "/messages/2/commit/hexsha",
+              "/messages/2/created_ts",
+              "/messages/3/commit/hexsha",
+              "/messages/3/created_ts"
             ]
           }
         }
@@ -3365,8 +4140,56 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 2,
+              "count": 4,
               "messages": [
+                {
+                  "id": 6,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": "T-2",
+                  "subject": "LLM Thread T-2",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "BlueLake",
+                  "kind": "to",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-2",
+                    "authored_ts": null,
+                    "insertions": 21,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 1,
+                      "excerpt": null
+                    }
+                  }
+                },
+                {
+                  "id": 4,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": "T-1",
+                  "subject": "LLM Thread T-1",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "BlueLake",
+                  "kind": "to",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-1",
+                    "authored_ts": null,
+                    "insertions": 21,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 1,
+                      "excerpt": null
+                    }
+                  }
+                },
                 {
                   "id": 2,
                   "project_id": 1,
@@ -3427,7 +4250,15 @@
               "/messages/1/commit/authored_ts",
               "/messages/1/commit/diff_summary/excerpt",
               "/messages/1/commit/hexsha",
-              "/messages/1/created_ts"
+              "/messages/1/created_ts",
+              "/messages/2/commit/authored_ts",
+              "/messages/2/commit/diff_summary/excerpt",
+              "/messages/2/commit/hexsha",
+              "/messages/2/created_ts",
+              "/messages/3/commit/authored_ts",
+              "/messages/3/commit/diff_summary/excerpt",
+              "/messages/3/commit/hexsha",
+              "/messages/3/created_ts"
             ]
           }
         }
@@ -3442,8 +4273,66 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "BlueLake",
-              "count": 2,
+              "count": 4,
               "messages": [
+                {
+                  "id": 6,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": "T-2",
+                  "subject": "LLM Thread T-2",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "body_md": "- NEXT: migrate DB\n- ACTION: run script\n",
+                  "from": "BlueLake",
+                  "to": [
+                    "GreenCastle"
+                  ],
+                  "cc": [],
+                  "bcc": [],
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-2",
+                    "authored_ts": null,
+                    "insertions": 21,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 1,
+                      "excerpt": null
+                    }
+                  }
+                },
+                {
+                  "id": 4,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": "T-1",
+                  "subject": "LLM Thread T-1",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "body_md": "- TODO: deploy to staging\n- discussed API changes\n",
+                  "from": "BlueLake",
+                  "to": [
+                    "GreenCastle"
+                  ],
+                  "cc": [],
+                  "bcc": [],
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-1",
+                    "authored_ts": null,
+                    "insertions": 21,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 1,
+                      "excerpt": null
+                    }
+                  }
+                },
                 {
                   "id": 2,
                   "project_id": 1,
@@ -3514,7 +4403,15 @@
               "/messages/1/commit/authored_ts",
               "/messages/1/commit/diff_summary/excerpt",
               "/messages/1/commit/hexsha",
-              "/messages/1/created_ts"
+              "/messages/1/created_ts",
+              "/messages/2/commit/authored_ts",
+              "/messages/2/commit/diff_summary/excerpt",
+              "/messages/2/commit/hexsha",
+              "/messages/2/created_ts",
+              "/messages/3/commit/authored_ts",
+              "/messages/3/commit/diff_summary/excerpt",
+              "/messages/3/commit/hexsha",
+              "/messages/3/created_ts"
             ]
           }
         }

@@ -363,6 +363,9 @@ fn setup_fixture_env() -> FixtureEnv {
         ("WORKTREES_ENABLED", "1"),
         ("STORAGE_ROOT", storage_root_str),
         ("TOOLS_FILTER_ENABLED", "0"),
+        // Deterministic LLM paths for llm_mode=true conformance fixtures.
+        ("LLM_ENABLED", "1"),
+        ("MCP_AGENT_MAIL_LLM_STUB", "1"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),
         ("TOOLS_FILTER_CLUSTERS", ""),
@@ -434,6 +437,10 @@ fn run_fixtures_against_rust_server_router() {
     let storage_root = env.tmp.path().join("archive");
     let fixtures = &env.fixtures;
     let router = &env.router;
+
+    // Tool metrics are tracked in a global registry; reset so this test's
+    // `resource://tooling/metrics` assertion is deterministic.
+    mcp_agent_mail_tools::reset_tool_metrics();
 
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
