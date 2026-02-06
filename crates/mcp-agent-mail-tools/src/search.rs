@@ -600,3 +600,223 @@ pub async fn summarize_thread(
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mcp_agent_mail_db::queries::ThreadMessageRow;
+
+    fn make_msg(from: &str, body: &str) -> ThreadMessageRow {
+        ThreadMessageRow {
+            id: 1,
+            project_id: 1,
+            sender_id: 1,
+            thread_id: None,
+            subject: "test".to_string(),
+            body_md: body.to_string(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: 0,
+            attachments: "[]".to_string(),
+            from: from.to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // is_ordered_prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ordered_prefix_valid() {
+        assert!(is_ordered_prefix("1. First item"));
+        assert!(is_ordered_prefix("2. Second item"));
+        assert!(is_ordered_prefix("5. Last supported"));
+    }
+
+    #[test]
+    fn ordered_prefix_too_high() {
+        // Only 1-5 are recognized
+        assert!(!is_ordered_prefix("6. Sixth item"));
+        assert!(!is_ordered_prefix("9. Ninth item"));
+    }
+
+    #[test]
+    fn ordered_prefix_no_dot() {
+        assert!(!is_ordered_prefix("1 no dot"));
+    }
+
+    #[test]
+    fn ordered_prefix_too_short() {
+        assert!(!is_ordered_prefix("1"));
+        assert!(!is_ordered_prefix(""));
+    }
+
+    #[test]
+    fn ordered_prefix_letter_start() {
+        assert!(!is_ordered_prefix("a. letter"));
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_messages: participants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_collects_participants() {
+        let rows = vec![
+            make_msg("Alice", "Hello"),
+            make_msg("Bob", "Hi"),
+            make_msg("Alice", "Again"),
+        ];
+        let summary = summarize_messages(&rows);
+        assert_eq!(summary.participants, vec!["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn summarize_empty_messages() {
+        let summary = summarize_messages(&[]);
+        assert!(summary.participants.is_empty());
+        assert_eq!(summary.total_messages, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_messages: mentions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_extracts_mentions() {
+        let rows = vec![
+            make_msg("Alice", "cc @Bob please review"),
+            make_msg("Charlie", "@Bob and @Dave check this"),
+        ];
+        let summary = summarize_messages(&rows);
+        let bob = summary.mentions.iter().find(|m| m.name == "Bob");
+        assert!(bob.is_some());
+        assert_eq!(bob.unwrap().count, 2);
+    }
+
+    #[test]
+    fn summarize_mention_trims_punctuation() {
+        // trim_matches strips: . , : ; ( ) [ ] { }
+        // Note: @mention must start a whitespace-delimited token
+        let rows = vec![make_msg("Alice", "Hi @Bob, please @Charlie.")];
+        let summary = summarize_messages(&rows);
+        let names: Vec<_> = summary.mentions.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"Bob"));
+        assert!(names.contains(&"Charlie"));
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_messages: key points from bullet lists
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_extracts_bullet_key_points() {
+        let rows = vec![make_msg(
+            "Alice",
+            "- First point\n- Second point\n* Third point",
+        )];
+        let summary = summarize_messages(&rows);
+        assert_eq!(summary.key_points.len(), 3);
+        assert_eq!(summary.key_points[0], "First point");
+    }
+
+    #[test]
+    fn summarize_extracts_ordered_list_key_points() {
+        let rows = vec![make_msg("Alice", "1. First\n2. Second")];
+        let summary = summarize_messages(&rows);
+        assert_eq!(summary.key_points.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_messages: action items
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_detects_open_checkbox() {
+        let rows = vec![make_msg("Alice", "- [ ] Write tests\n- [ ] Review code")];
+        let summary = summarize_messages(&rows);
+        assert_eq!(summary.open_actions, 2);
+        assert_eq!(summary.done_actions, 0);
+    }
+
+    #[test]
+    fn summarize_detects_done_checkbox() {
+        let rows = vec![make_msg("Alice", "- [x] Write tests\n- [X] Review code")];
+        let summary = summarize_messages(&rows);
+        assert_eq!(summary.open_actions, 0);
+        assert_eq!(summary.done_actions, 2);
+    }
+
+    #[test]
+    fn summarize_detects_keyword_action_items() {
+        let rows = vec![make_msg(
+            "Alice",
+            "TODO: fix the bug\nFIXME: handle edge case",
+        )];
+        let summary = summarize_messages(&rows);
+        assert_eq!(summary.action_items.len(), 2);
+    }
+
+    #[test]
+    fn summarize_keyword_case_insensitive() {
+        let rows = vec![make_msg("Alice", "todo handle this\nblocked on review")];
+        let summary = summarize_messages(&rows);
+        assert_eq!(summary.action_items.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_messages: code references
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_extracts_code_references() {
+        let rows = vec![make_msg(
+            "Alice",
+            "Check `src/main.rs` and `docs/README.md`",
+        )];
+        let summary = summarize_messages(&rows);
+        let refs = summary.code_references.unwrap_or_default();
+        assert!(refs.contains(&"src/main.rs".to_string()));
+        assert!(refs.contains(&"docs/README.md".to_string()));
+    }
+
+    #[test]
+    fn summarize_no_code_refs_without_path_indicators() {
+        let rows = vec![make_msg("Alice", "Check `simple_name` and `another`")];
+        let summary = summarize_messages(&rows);
+        assert!(summary.code_references.is_none());
+    }
+
+    #[test]
+    fn summarize_code_ref_requires_backticks() {
+        let rows = vec![make_msg("Alice", "Check src/main.rs without backticks")];
+        let summary = summarize_messages(&rows);
+        assert!(summary.code_references.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_messages: limits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_caps_key_points_at_10() {
+        let body = (1..=15)
+            .map(|i| format!("- Point {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rows = vec![make_msg("Alice", &body)];
+        let summary = summarize_messages(&rows);
+        assert_eq!(summary.key_points.len(), 10);
+    }
+
+    #[test]
+    fn summarize_caps_mentions_at_10() {
+        let body = (1..=15)
+            .map(|i| format!("@user{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rows = vec![make_msg("Alice", &body)];
+        let summary = summarize_messages(&rows);
+        assert!(summary.mentions.len() <= 10);
+    }
+}
