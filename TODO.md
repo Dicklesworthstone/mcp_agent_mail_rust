@@ -3,8 +3,8 @@
 ## 0. Coordination / Meta
 - [x] Read `AGENTS.md` and `README.md` (baseline orientation).
 - [x] Register with MCP Agent Mail and announce to active agents.
-- [ ] Check inbox from other agents at least once per session.
-- [ ] Reserve files before edits (Agent Mail leases) and release on completion.
+- [x] Check inbox from other agents at least once per session.
+- [x] Reserve files before edits (Agent Mail leases) and release on completion.
 - [ ] Keep `FEATURE_PARITY.md` aligned with completed work.
 - [ ] Keep `TODO.md` updated after each batch of changes.
 - [ ] Confirm MCP Agent Mail server stability (health check path, lock handling).
@@ -139,7 +139,7 @@
 - [ ] Integration tests for DB + storage pipelines (archive + SQLite consistency).
 - [ ] E2E tests for MCP tool calls (stdio + HTTP).
 - [ ] Guard tests for conflict detection (pathspec + rename + advisory).
-- [ ] Run full toolchain: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test`.
+- [x] Run full toolchain: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test`.
 
 ## 12. Publishing & Release (Crates.io + CI)
 - [ ] Confirm Cargo metadata (license/readme/repository) for publishable crates.

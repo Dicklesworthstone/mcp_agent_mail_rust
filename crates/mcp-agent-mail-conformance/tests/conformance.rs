@@ -659,6 +659,301 @@ fn run_fixtures_against_rust_server_router() {
         "expected at least one file reservation JSON artifact"
     );
 
+    // -----------------------------------------------------------------------
+    // Enhanced archive artifact assertions (legacy format parity)
+    // -----------------------------------------------------------------------
+
+    // --- Agent profile full schema validation ---
+    // Core fields that both Python and Rust implementations write.
+    // Python also writes "id" and "project_id"; the Rust tools layer currently
+    // omits those (parity gap tracked separately).
+    let required_profile_fields = [
+        "name", "program", "model", "attachments_policy",
+        "inception_ts", "last_active_ts", "task_description",
+    ];
+    for profile_rel in &expected_profiles {
+        let content = std::fs::read_to_string(storage_root.join(profile_rel))
+            .unwrap_or_else(|e| panic!("read {profile_rel}: {e}"));
+        let parsed: Value = serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("parse {profile_rel}: {e}"));
+        let obj = parsed.as_object().unwrap_or_else(|| panic!("{profile_rel} is not a JSON object"));
+        for field in &required_profile_fields {
+            assert!(
+                obj.contains_key(*field),
+                "profile {profile_rel} missing required field: {field}"
+            );
+        }
+        // Validate types: name/program/model must be strings, id/project_id must be numbers
+        assert!(obj["name"].is_string(), "{profile_rel}: name must be string");
+        assert!(obj["program"].is_string(), "{profile_rel}: program must be string");
+        assert!(obj["model"].is_string(), "{profile_rel}: model must be string");
+        assert!(obj["attachments_policy"].is_string(), "{profile_rel}: attachments_policy must be string");
+        // JSON must be pretty-printed (contains newlines + indentation)
+        assert!(
+            content.contains('\n') && content.contains("  "),
+            "{profile_rel}: JSON must be pretty-printed"
+        );
+    }
+
+    // --- Canonical message frontmatter: full schema + format ---
+    let required_fm_fields = [
+        "id", "from", "to", "cc", "bcc", "subject", "importance",
+        "created", "ack_required", "thread_id", "project", "project_slug",
+        "attachments",
+    ];
+    for msg_rel in &message_files {
+        let content = std::fs::read_to_string(storage_root.join(msg_rel))
+            .unwrap_or_else(|e| panic!("read {msg_rel}: {e}"));
+        // Must start with ---json marker
+        assert!(
+            content.trim_start().starts_with("---json"),
+            "message {msg_rel} must start with ---json frontmatter marker"
+        );
+        let fm = parse_frontmatter(&content)
+            .unwrap_or_else(|| panic!("message {msg_rel} has no valid ---json frontmatter"));
+        let fm_obj = fm.as_object()
+            .unwrap_or_else(|| panic!("{msg_rel} frontmatter is not a JSON object"));
+
+        for field in &required_fm_fields {
+            assert!(
+                fm_obj.contains_key(*field),
+                "message {msg_rel} frontmatter missing field: {field}"
+            );
+        }
+
+        // Type assertions
+        assert!(fm_obj["from"].is_string(), "{msg_rel}: from must be string");
+        assert!(fm_obj["to"].is_array(), "{msg_rel}: to must be array");
+        assert!(fm_obj["cc"].is_array(), "{msg_rel}: cc must be array");
+        assert!(fm_obj["bcc"].is_array(), "{msg_rel}: bcc must be array");
+        assert!(fm_obj["subject"].is_string(), "{msg_rel}: subject must be string");
+        assert!(fm_obj["importance"].is_string(), "{msg_rel}: importance must be string");
+        assert!(fm_obj["created"].is_string(), "{msg_rel}: created must be string");
+        assert!(fm_obj["ack_required"].is_boolean(), "{msg_rel}: ack_required must be boolean");
+        assert!(fm_obj["project"].is_string(), "{msg_rel}: project must be string");
+        assert!(fm_obj["project_slug"].is_string(), "{msg_rel}: project_slug must be string");
+        assert!(fm_obj["attachments"].is_array(), "{msg_rel}: attachments must be array");
+
+        // Body content: after the closing --- there should be body text
+        let after_close = content
+            .split("\n---\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{msg_rel}: missing closing --- delimiter"));
+        assert!(
+            !after_close.trim().is_empty(),
+            "message {msg_rel} body should not be empty"
+        );
+
+        // Frontmatter JSON must be pretty-printed
+        let fm_section = &content[content.find("---json").unwrap() + 7..content.find("\n---").unwrap()];
+        assert!(
+            fm_section.contains('\n') && fm_section.contains("  "),
+            "{msg_rel}: frontmatter JSON must be pretty-printed"
+        );
+    }
+
+    // --- Filename pattern validation ---
+    // Message filenames should follow: {ISO-timestamp}__{slug}__{id}.md
+    let filename_re = regex::Regex::new(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__[a-z0-9._-]+__\d+\.md$"
+    ).expect("valid regex");
+    for msg_rel in &message_files {
+        let filename = std::path::Path::new(msg_rel.as_str())
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        assert!(
+            filename_re.is_match(filename),
+            "message filename does not match legacy pattern: {filename}"
+        );
+    }
+
+    // --- Inbox/outbox content must match canonical ---
+    for msg_rel in &message_files {
+        let canonical = std::fs::read_to_string(storage_root.join(msg_rel))
+            .unwrap_or_else(|e| panic!("read canonical {msg_rel}: {e}"));
+        let canonical_fm = parse_frontmatter(&canonical).expect("canonical has frontmatter");
+        let msg_id = canonical_fm.get("id").and_then(Value::as_i64).unwrap_or(-1);
+        let filename = std::path::Path::new(msg_rel.as_str())
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+
+        // Find matching inbox and outbox copies by filename
+        for inbox_rel in &inbox_files {
+            if inbox_rel.ends_with(filename) {
+                let inbox_content = std::fs::read_to_string(storage_root.join(inbox_rel))
+                    .unwrap_or_else(|e| panic!("read inbox {inbox_rel}: {e}"));
+                let inbox_fm = parse_frontmatter(&inbox_content)
+                    .unwrap_or_else(|| panic!("inbox {inbox_rel} has no frontmatter"));
+                let inbox_id = inbox_fm.get("id").and_then(Value::as_i64).unwrap_or(-2);
+                if inbox_id == msg_id {
+                    assert_eq!(
+                        canonical.trim(),
+                        inbox_content.trim(),
+                        "inbox copy {inbox_rel} must match canonical {msg_rel}"
+                    );
+                }
+            }
+        }
+        for outbox_rel in &outbox_files {
+            if outbox_rel.ends_with(filename) {
+                let outbox_content = std::fs::read_to_string(storage_root.join(outbox_rel))
+                    .unwrap_or_else(|e| panic!("read outbox {outbox_rel}: {e}"));
+                let outbox_fm = parse_frontmatter(&outbox_content)
+                    .unwrap_or_else(|| panic!("outbox {outbox_rel} has no frontmatter"));
+                let outbox_id = outbox_fm.get("id").and_then(Value::as_i64).unwrap_or(-2);
+                if outbox_id == msg_id {
+                    assert_eq!(
+                        canonical.trim(),
+                        outbox_content.trim(),
+                        "outbox copy {outbox_rel} must match canonical {msg_rel}"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- File reservation artifact full schema validation ---
+    // Core fields written by the Rust tools layer.
+    // Python also writes "created_ts", "released_ts", "project"; those are
+    // parity gaps tracked separately.
+    let required_res_fields = [
+        "id", "agent", "path_pattern", "exclusive", "reason", "expires_ts",
+    ];
+    let mut has_sha1_named = false;
+    let mut has_id_named = false;
+    for res_rel in &reservation_files {
+        let content = std::fs::read_to_string(storage_root.join(res_rel))
+            .unwrap_or_else(|e| panic!("read {res_rel}: {e}"));
+        let parsed: Value = serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("parse {res_rel}: {e}"));
+        let obj = parsed.as_object()
+            .unwrap_or_else(|| panic!("{res_rel} is not a JSON object"));
+
+        for field in &required_res_fields {
+            assert!(
+                obj.contains_key(*field),
+                "reservation {res_rel} missing required field: {field}"
+            );
+        }
+
+        // Type assertions
+        assert!(obj["agent"].is_string(), "{res_rel}: agent must be string");
+        assert!(obj["path_pattern"].is_string(), "{res_rel}: path_pattern must be string");
+        assert!(obj["exclusive"].is_boolean(), "{res_rel}: exclusive must be boolean");
+
+        // Must NOT have legacy "path" key (only "path_pattern")
+        assert!(
+            !obj.contains_key("path"),
+            "{res_rel}: should use 'path_pattern' not 'path'"
+        );
+
+        // JSON must be pretty-printed
+        assert!(
+            content.contains('\n') && content.contains("  "),
+            "{res_rel}: JSON must be pretty-printed"
+        );
+
+        // Track naming patterns
+        let filename = std::path::Path::new(res_rel.as_str())
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        if filename.starts_with("id-") {
+            has_id_named = true;
+        } else if filename.len() == 45 && filename.ends_with(".json") {
+            // SHA1 hex (40 chars) + .json (5 chars) = 45
+            has_sha1_named = true;
+        }
+    }
+    assert!(has_id_named, "expected at least one id-<N>.json reservation file");
+    assert!(has_sha1_named, "expected at least one SHA1-named reservation file");
+
+    // --- Paired SHA1 + stable-id files: SHA1 file reflects the latest reservation ---
+    let res_dir_prefix = "projects/abs-path-backend/file_reservations/";
+    let res_in_dir: Vec<&str> = reservation_files
+        .iter()
+        .filter(|f| f.starts_with(res_dir_prefix))
+        .map(|f| f.as_str())
+        .collect();
+    let id_files_in_dir: Vec<&str> = res_in_dir.iter().copied().filter(|f| {
+        std::path::Path::new(f)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("id-"))
+    }).collect();
+    // For each id file, verify its SHA1-named sibling exists and has the same path_pattern.
+    for id_file in &id_files_in_dir {
+        let id_content = std::fs::read_to_string(storage_root.join(id_file))
+            .unwrap_or_else(|e| panic!("read {id_file}: {e}"));
+        let id_parsed: Value = serde_json::from_str(&id_content)
+            .unwrap_or_else(|e| panic!("parse {id_file}: {e}"));
+        let path_pattern = id_parsed.get("path_pattern").and_then(Value::as_str).unwrap_or("");
+        if path_pattern.is_empty() {
+            continue;
+        }
+        // Compute SHA1 of path_pattern and verify the SHA1 file exists
+        use sha1::Digest;
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(path_pattern.as_bytes());
+        let sha1_hex = format!("{:x}", hasher.finalize());
+        let sha1_file = format!("{res_dir_prefix}{sha1_hex}.json");
+        assert!(
+            res_in_dir.iter().any(|f| *f == sha1_file),
+            "SHA1 file {sha1_file} must exist for path_pattern '{path_pattern}' (from {id_file})"
+        );
+        // The SHA1 file contains the LATEST reservation for this path_pattern
+        // (may differ from this specific id file if multiple reservations share the pattern).
+        let sha1_content = std::fs::read_to_string(storage_root.join(&sha1_file))
+            .unwrap_or_else(|e| panic!("read {sha1_file}: {e}"));
+        let sha1_parsed: Value = serde_json::from_str(&sha1_content)
+            .unwrap_or_else(|e| panic!("parse {sha1_file}: {e}"));
+        assert_eq!(
+            sha1_parsed.get("path_pattern").and_then(Value::as_str),
+            Some(path_pattern),
+            "SHA1 file {sha1_file} must have same path_pattern as {id_file}"
+        );
+    }
+
+    // --- Thread digest format validation ---
+    let thread_files: Vec<&String> = files
+        .iter()
+        .filter(|f| f.contains("/messages/threads/") && f.ends_with(".md"))
+        .collect();
+    for thread_rel in &thread_files {
+        let content = std::fs::read_to_string(storage_root.join(thread_rel))
+            .unwrap_or_else(|e| panic!("read {thread_rel}: {e}"));
+        // Thread digest must start with "# Thread "
+        assert!(
+            content.starts_with("# Thread "),
+            "thread digest {thread_rel} must start with '# Thread ' header"
+        );
+        // Must contain at least one entry separator
+        assert!(
+            content.contains("---"),
+            "thread digest {thread_rel} must contain --- entry separator"
+        );
+        // Must contain a canonical link
+        assert!(
+            content.contains("[View canonical]"),
+            "thread digest {thread_rel} must contain [View canonical] link"
+        );
+        // Must contain sender→recipient arrow
+        assert!(
+            content.contains('→') || content.contains("→"),
+            "thread digest {thread_rel} must contain sender → recipient arrow"
+        );
+    }
+
+    // --- .gitattributes content ---
+    let gitattrs = std::fs::read_to_string(storage_root.join(".gitattributes"))
+        .unwrap_or_else(|e| panic!("read .gitattributes: {e}"));
+    assert!(
+        gitattrs.contains("*.json") && gitattrs.contains("*.md"),
+        ".gitattributes must declare *.json and *.md as text"
+    );
+
     // --- Notification signal assertions (tool flow) ---
     let notif_tmp = tempfile::TempDir::new().expect("failed to create notifications tempdir");
     let notif_db_path = notif_tmp.path().join("db.sqlite3");

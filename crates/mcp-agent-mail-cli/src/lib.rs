@@ -15,8 +15,8 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
 };
 
 use chrono::{DateTime, Utc};
@@ -112,11 +112,23 @@ pub enum Commands {
     },
     #[command(name = "clear-and-reset-everything")]
     ClearAndResetEverything {
-        #[arg(long, short = 'f')]
+        #[arg(
+            long,
+            short = 'f',
+            help = "Skip the final destructive confirmation prompt (still asks about creating an archive)."
+        )]
         force: bool,
-        #[arg(long, default_value_t = true)]
+        #[arg(
+            long,
+            conflicts_with = "no_archive",
+            help = "Attempt a pre-reset archive before deleting data (default: prompt when interactive)."
+        )]
         archive: bool,
-        #[arg(long = "no-archive", default_value_t = false)]
+        #[arg(
+            long = "no-archive",
+            conflicts_with = "archive",
+            help = "Skip creating a pre-reset archive."
+        )]
         no_archive: bool,
     },
     #[command(name = "config")]
@@ -391,10 +403,14 @@ pub struct AmRunArgs {
     pub agent: Option<String>,
     #[arg(long, default_value_t = 3600)]
     pub ttl_seconds: i64,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "exclusive")]
     pub shared: bool,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, conflicts_with = "shared")]
+    pub exclusive: bool,
+    #[arg(long = "block-on-conflicts", conflicts_with = "no_block_on_conflicts")]
     pub block_on_conflicts: bool,
+    #[arg(long = "no-block-on-conflicts", conflicts_with = "block_on_conflicts")]
+    pub no_block_on_conflicts: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -416,7 +432,7 @@ pub enum ProjectsCommand {
     Adopt {
         source: PathBuf,
         target: PathBuf,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = true)]
         dry_run: bool,
         #[arg(long, default_value_t = false)]
         apply: bool,
@@ -584,7 +600,7 @@ fn execute(cli: Cli) -> CliResult<()> {
             force,
             archive,
             no_archive,
-        } => handle_clear_and_reset(force, archive && !no_archive),
+        } => handle_clear_and_reset(force, archive, no_archive),
         Commands::Config { action } => handle_config(action),
         Commands::Amctl { action } => handle_amctl(action),
         Commands::AmRun(args) => handle_am_run(args),
@@ -1412,38 +1428,209 @@ fn handle_migrate() -> CliResult<()> {
     Ok(())
 }
 
-fn handle_clear_and_reset(force: bool, include_archive: bool) -> CliResult<()> {
-    if !force {
-        ftui_runtime::ftui_eprintln!(
-            "This will delete the database and all data. Pass --force / -f to confirm."
-        );
-        return Err(CliError::ExitCode(1));
-    }
-    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let path = cfg
-        .sqlite_path()
-        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ClearAndResetOutcome {
+    archive_path: Option<PathBuf>,
+    deleted_db_files: Vec<PathBuf>,
+    deleted_storage_entries: Vec<PathBuf>,
+}
 
-    if std::path::Path::new(&path).exists() {
-        std::fs::remove_file(&path)?;
-        ftui_runtime::ftui_println!("Removed database: {path}");
+fn handle_clear_and_reset(force: bool, archive: bool, no_archive: bool) -> CliResult<()> {
+    let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let db_path = match db_cfg.sqlite_path() {
+        Ok(path) => Some(PathBuf::from(path)),
+        Err(err) => {
+            ftui_runtime::ftui_eprintln!(
+                "Warning: failed to parse SQLite database path from DATABASE_URL ({}): {err}",
+                db_cfg.database_url
+            );
+            None
+        }
+    };
+
+    let mut database_files: Vec<PathBuf> = Vec::new();
+    let source_db_for_archive = match db_path.as_deref() {
+        Some(p) if p.to_string_lossy() != ":memory:" => {
+            database_files.push(p.to_path_buf());
+            database_files.push(PathBuf::from(format!("{}-wal", p.display())));
+            database_files.push(PathBuf::from(format!("{}-shm", p.display())));
+            Some(p)
+        }
+        _ => None,
+    };
+
+    let archive_choice = if archive {
+        Some(true)
+    } else if no_archive {
+        Some(false)
     } else {
-        ftui_runtime::ftui_println!("Database not found: {path}");
+        None
+    };
+
+    let config = Config::from_env();
+    let _outcome = clear_and_reset_everything(
+        force,
+        archive_choice,
+        source_db_for_archive,
+        &database_files,
+        &config.storage_root,
+    )?;
+    Ok(())
+}
+
+fn clear_and_reset_everything(
+    force: bool,
+    archive_choice: Option<bool>,
+    source_db_for_archive: Option<&Path>,
+    database_files: &[PathBuf],
+    storage_root: &Path,
+) -> CliResult<ClearAndResetOutcome> {
+    use std::io::IsTerminal;
+
+    if !force {
+        if !std::io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "refusing to prompt on non-interactive stdin; pass --force / -f to apply"
+                    .to_string(),
+            ));
+        }
+
+        ftui_runtime::ftui_println!("This will irreversibly delete:");
+        if database_files.is_empty() {
+            ftui_runtime::ftui_println!("  - (no SQLite files detected)");
+        } else {
+            for path in database_files {
+                ftui_runtime::ftui_println!("  - {}", path.display());
+            }
+        }
+        ftui_runtime::ftui_println!(
+            "  - All contents inside {} (including .git)",
+            storage_root.display()
+        );
+        ftui_runtime::ftui_println!("");
     }
 
-    if include_archive {
-        let config = Config::from_env();
-        let storage_root = &config.storage_root;
-        if storage_root.exists() {
-            std::fs::remove_dir_all(storage_root)?;
-            ftui_runtime::ftui_println!("Removed storage archive: {}", storage_root.display());
+    let mut should_archive = archive_choice;
+    let archive_mandatory = archive_choice == Some(true) || force;
+    if should_archive.is_none() {
+        if force {
+            should_archive = Some(true);
         } else {
-            ftui_runtime::ftui_println!("Storage archive not found: {}", storage_root.display());
+            should_archive = Some(confirm(
+                "Create a mailbox archive before wiping everything?",
+                true,
+            )?);
         }
     }
 
+    let mut archive_path: Option<PathBuf> = None;
+    if should_archive == Some(true) {
+        let label = Some("pre-reset".to_string());
+        let scrub_preset = "archive".to_string();
+        let projects: Vec<String> = Vec::new();
+
+        let archive_result = match source_db_for_archive {
+            Some(source_db) => {
+                archive_save_state(source_db, storage_root, projects, scrub_preset, label)
+            }
+            None => Err(CliError::Other(
+                "SQLite database path is empty or in-memory; cannot create archive".to_string(),
+            )),
+        };
+
+        match archive_result {
+            Ok(path) => {
+                let display_name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<archive>");
+                ftui_runtime::ftui_println!("Saved restore point to: {}", path.display());
+                ftui_runtime::ftui_println!(
+                    "Restore later with: mcp-agent-mail archive restore {display_name}"
+                );
+                archive_path = Some(path);
+            }
+            Err(err) => {
+                ftui_runtime::ftui_eprintln!("Failed to create archive: {err}");
+                if archive_mandatory {
+                    return Err(CliError::ExitCode(1));
+                }
+                if !std::io::stdin().is_terminal() {
+                    return Err(CliError::ExitCode(1));
+                }
+                if !confirm("Archive failed. Continue without a backup?", false)? {
+                    return Err(CliError::ExitCode(1));
+                }
+            }
+        }
+    }
+
+    if !force && !confirm("Proceed with destructive reset?", false)? {
+        return Err(CliError::ExitCode(1));
+    }
+
+    let mut deleted_db_files: Vec<PathBuf> = Vec::new();
+    for path in database_files {
+        match std::fs::remove_file(path) {
+            Ok(()) => deleted_db_files.push(path.clone()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                ftui_runtime::ftui_eprintln!("Failed to delete {}: {err}", path.display());
+            }
+        }
+    }
+
+    let mut deleted_storage_entries: Vec<PathBuf> = Vec::new();
+    if storage_root.exists() {
+        for entry in std::fs::read_dir(storage_root)? {
+            let path = entry?.path();
+            let result = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => deleted_storage_entries.push(path),
+                Err(err) => {
+                    ftui_runtime::ftui_eprintln!("Failed to remove {}: {err}", path.display());
+                }
+            }
+        }
+    } else {
+        ftui_runtime::ftui_println!(
+            "Storage root {} does not exist; nothing to remove.",
+            storage_root.display()
+        );
+    }
+
     ftui_runtime::ftui_println!("Reset complete.");
-    Ok(())
+    if !deleted_db_files.is_empty() {
+        let list = deleted_db_files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ftui_runtime::ftui_println!("Removed database files: {list}");
+    }
+    if !deleted_storage_entries.is_empty() {
+        let list = deleted_storage_entries
+            .iter()
+            .filter_map(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        ftui_runtime::ftui_println!("Cleared storage root entries: {list}");
+    }
+
+    Ok(ClearAndResetOutcome {
+        archive_path,
+        deleted_db_files,
+        deleted_storage_entries,
+    })
 }
 
 fn handle_lint() -> CliResult<()> {
@@ -1716,6 +1903,7 @@ fn handle_amctl(action: AmctlCommand) -> CliResult<()> {
                 .branch
                 .clone()
                 .filter(|b| !b.is_empty())
+                .or_else(|| compute_git_branch(&path))
                 .unwrap_or_else(|| "unknown".to_string());
             let cache_key = format!(
                 "am-cache-{}-{}-{}",
@@ -1778,6 +1966,363 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_clear_and_reset_defaults() {
+        let cli = Cli::try_parse_from(["am", "clear-and-reset-everything"])
+            .expect("failed to parse clear-and-reset-everything");
+        match cli.command {
+            Commands::ClearAndResetEverything {
+                force,
+                archive,
+                no_archive,
+            } => {
+                assert!(!force);
+                assert!(!archive);
+                assert!(!no_archive);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_clear_and_reset_force_no_archive() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "clear-and-reset-everything",
+            "--force",
+            "--no-archive",
+        ])
+        .expect("failed to parse clear-and-reset-everything flags");
+        match cli.command {
+            Commands::ClearAndResetEverything {
+                force,
+                archive,
+                no_archive,
+            } => {
+                assert!(force);
+                assert!(!archive);
+                assert!(no_archive);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_clear_and_reset_archive_flag_conflict() {
+        let err = Cli::try_parse_from([
+            "am",
+            "clear-and-reset-everything",
+            "--archive",
+            "--no-archive",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    // -----------------------------------------------------------------------
+    // Build slot utilities (amctl env, am-run)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clap_parses_amctl_env_defaults() {
+        let cli = Cli::try_parse_from(["am", "amctl", "env"]).expect("failed to parse amctl env");
+        match cli.command {
+            Commands::Amctl {
+                action: AmctlCommand::Env { path, agent },
+            } => {
+                assert_eq!(path, PathBuf::from("."));
+                assert!(agent.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_amctl_env_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "amctl",
+            "env",
+            "--path",
+            "/tmp/repo",
+            "--agent",
+            "BlueLake",
+        ])
+        .expect("failed to parse amctl env flags");
+        match cli.command {
+            Commands::Amctl {
+                action: AmctlCommand::Env { path, agent },
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/repo"));
+                assert_eq!(agent.as_deref(), Some("BlueLake"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn amctl_env_prints_expected_env_for_fixture_path() {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let capture = StdioCapture::install().unwrap();
+        handle_amctl(AmctlCommand::Env {
+            path: PathBuf::from("/tmp/am-fixture"),
+            agent: Some("TestAgent".to_string()),
+        })
+        .unwrap();
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        let text = String::from_utf8_lossy(&sink);
+        let mut vars = std::collections::BTreeMap::<String, String>::new();
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            vars.insert(k.trim().to_string(), v.trim().to_string());
+        }
+
+        assert_eq!(vars.get("SLUG").map(String::as_str), Some("tmp-am-fixture"));
+        assert_eq!(
+            vars.get("PROJECT_UID").map(String::as_str),
+            Some("e0c1eeedd48721247c34")
+        );
+        assert_eq!(vars.get("BRANCH").map(String::as_str), Some("unknown"));
+        assert_eq!(vars.get("AGENT").map(String::as_str), Some("TestAgent"));
+        assert_eq!(
+            vars.get("CACHE_KEY").map(String::as_str),
+            Some("am-cache-e0c1eeedd48721247c34-TestAgent-unknown")
+        );
+        let artifact_dir = vars.get("ARTIFACT_DIR").cloned().unwrap_or_default();
+        assert!(
+            artifact_dir.ends_with("projects/tmp-am-fixture/artifacts/TestAgent/unknown"),
+            "unexpected ARTIFACT_DIR={artifact_dir}"
+        );
+    }
+
+    #[test]
+    fn clap_parses_am_run_defaults() {
+        let cli = Cli::try_parse_from(["am", "am-run", "frontend-build", "echo", "hi"])
+            .expect("failed to parse am-run defaults");
+        match cli.command {
+            Commands::AmRun(args) => {
+                assert_eq!(args.slot, "frontend-build");
+                assert_eq!(args.cmd, vec!["echo".to_string(), "hi".to_string()]);
+                assert_eq!(args.path, PathBuf::from("."));
+                assert!(args.agent.is_none());
+                assert_eq!(args.ttl_seconds, 3600);
+                assert!(!args.shared);
+                assert!(!args.exclusive);
+                assert!(!args.block_on_conflicts);
+                assert!(!args.no_block_on_conflicts);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_am_run_shared_exclusive_conflict() {
+        let err = Cli::try_parse_from([
+            "am",
+            "am-run",
+            "slot",
+            "--shared",
+            "--exclusive",
+            "echo",
+            "hi",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn clap_rejects_am_run_block_flag_conflict() {
+        let err = Cli::try_parse_from([
+            "am",
+            "am-run",
+            "slot",
+            "--block-on-conflicts",
+            "--no-block-on-conflicts",
+            "echo",
+            "hi",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    fn build_slot_artifact_dir(test_name: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let ts = Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string();
+        let dir = root
+            .join("tests")
+            .join("artifacts")
+            .join("cli")
+            .join("build_slots")
+            .join(format!("{ts}-{}", safe_component(test_name)));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn am_run_local_backend_sets_env_and_releases_lease() {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            worktrees_enabled: true,
+            storage_root: temp.path().join("storage_root"),
+            ..Config::default()
+        };
+        let child_env_path = temp.path().join("child_env.txt");
+        let child_env_arg = child_env_path.to_string_lossy().to_string();
+
+        let args = AmRunArgs {
+            slot: "frontend-build".to_string(),
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo AM_SLOT=$AM_SLOT > \"$1\"; echo CACHE_KEY=$CACHE_KEY >> \"$1\"".to_string(),
+                "sh".to_string(),
+                child_env_arg,
+            ],
+            path: PathBuf::from("/tmp/am-run-fixture"),
+            agent: Some("TestAgent".to_string()),
+            ttl_seconds: 60,
+            shared: false,
+            exclusive: false,
+            block_on_conflicts: false,
+            no_block_on_conflicts: false,
+        };
+
+        let capture = StdioCapture::install().unwrap();
+        handle_am_run_with(&config, None, None, args).unwrap();
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        let output = String::from_utf8_lossy(&sink).to_string();
+        let art = build_slot_artifact_dir("am_run_local_backend_sets_env_and_releases_lease");
+        std::fs::write(art.join("output.txt"), &output).unwrap();
+
+        assert!(
+            output.contains("$ sh -c"),
+            "missing command banner: {output}"
+        );
+        let child_env = std::fs::read_to_string(&child_env_path).expect("child env file written");
+        std::fs::write(art.join("child_env.txt"), &child_env).unwrap();
+        assert!(
+            child_env.contains("AM_SLOT=frontend-build"),
+            "missing AM_SLOT in child env file: {child_env}"
+        );
+        assert!(
+            child_env.contains("CACHE_KEY=am-cache-b0ec2290c757b5d59d13-TestAgent-unknown"),
+            "missing CACHE_KEY in child env file: {child_env}"
+        );
+
+        let identity = resolve_project_identity("/tmp/am-run-fixture");
+        let slot_dir = ensure_slot_dir(&config, &identity.slug, "frontend-build").unwrap();
+        let lease_path = lease_path(&slot_dir, "TestAgent", "unknown");
+        let lease_json = std::fs::read_to_string(&lease_path).expect("lease file created");
+        std::fs::write(art.join("lease.json"), &lease_json).unwrap();
+        let lease: LeaseRecord = serde_json::from_str(&lease_json).unwrap();
+        assert!(
+            lease.released_ts.is_some(),
+            "expected released_ts to be set, got: {lease_json}"
+        );
+    }
+
+    #[test]
+    fn am_run_block_on_conflicts_aborts_without_running_child() {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            worktrees_enabled: true,
+            storage_root: temp.path().join("storage_root"),
+            ..Config::default()
+        };
+
+        let identity = resolve_project_identity("/tmp/am-run-fixture");
+        let slot_dir = ensure_slot_dir(&config, &identity.slug, "frontend-build").unwrap();
+        let conflict_path = lease_path(&slot_dir, "OtherAgent", "main");
+        let now = Utc::now();
+        let lease = LeaseRecord {
+            slot: "frontend-build".to_string(),
+            agent: "OtherAgent".to_string(),
+            branch: "main".to_string(),
+            exclusive: true,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: (now + chrono::Duration::seconds(3600)).to_rfc3339(),
+            released_ts: None,
+        };
+        write_lease(&conflict_path, &lease).unwrap();
+
+        let args = AmRunArgs {
+            slot: "frontend-build".to_string(),
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo SHOULD_NOT_RUN".to_string(),
+            ],
+            path: PathBuf::from("/tmp/am-run-fixture"),
+            agent: Some("TestAgent".to_string()),
+            ttl_seconds: 60,
+            shared: false,
+            exclusive: false,
+            block_on_conflicts: true,
+            no_block_on_conflicts: false,
+        };
+
+        let capture = StdioCapture::install().unwrap();
+        let err = handle_am_run_with(&config, None, None, args).unwrap_err();
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        let output = String::from_utf8_lossy(&sink).to_string();
+        let art = build_slot_artifact_dir("am_run_block_on_conflicts_aborts_without_running_child");
+        std::fs::write(art.join("output.txt"), &output).unwrap();
+        std::fs::write(
+            art.join("conflict_lease.json"),
+            serde_json::to_string_pretty(&lease).unwrap(),
+        )
+        .unwrap();
+
+        match err {
+            CliError::ExitCode(1) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            output.contains("--block-on-conflicts"),
+            "missing conflict abort message: {output}"
+        );
+        assert!(
+            !output.contains("$ sh -c"),
+            "did not expect command banner on abort: {output}"
+        );
+        assert!(
+            !output.contains("SHOULD_NOT_RUN"),
+            "child command output should not appear on abort: {output}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2376,7 +2921,9 @@ mod tests {
 
     #[test]
     fn archive_save_list_restore_roundtrip_smoke() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         use std::io::Read;
 
         let root = tempfile::tempdir().unwrap();
@@ -2547,6 +3094,161 @@ mod tests {
             std::fs::read(restore_storage.join(".git/HEAD")).unwrap(),
             b"0123456789abcdef\n"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Clear-and-reset-everything integration-ish tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clear_and_reset_force_archive_creates_archive_and_wipes() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use std::io::Read;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let db_path = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&db_path);
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        std::fs::write(&wal_path, b"wal").unwrap();
+        std::fs::write(&shm_path, b"shm").unwrap();
+        let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
+
+        let outcome = clear_and_reset_everything(
+            true,
+            Some(true),
+            Some(&db_path),
+            &database_files,
+            &storage_root,
+        )
+        .expect("clear-and-reset");
+        assert!(outcome.archive_path.is_some());
+
+        let archive_dir = archive_states_dir(false).unwrap();
+        let mut archives: Vec<PathBuf> = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        archives.sort();
+        assert_eq!(archives.len(), 1, "expected 1 archive zip");
+        let archive_path = &archives[0];
+        assert_eq!(
+            archive_path.extension().and_then(|s| s.to_str()),
+            Some("zip")
+        );
+
+        // Validate label + scrub preset in metadata.
+        let file = std::fs::File::open(archive_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut meta_contents = String::new();
+        zip.by_name(ARCHIVE_METADATA_FILENAME)
+            .unwrap()
+            .read_to_string(&mut meta_contents)
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_contents).unwrap();
+        assert_eq!(meta["label"].as_str(), Some("pre-reset"));
+        assert_eq!(meta["scrub_preset"].as_str(), Some("archive"));
+
+        // DB + WAL/SHM should be removed.
+        assert!(!db_path.exists());
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
+
+        // Storage root should be emptied (directory stays).
+        assert!(storage_root.exists());
+        assert_eq!(std::fs::read_dir(&storage_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn clear_and_reset_force_no_archive_wipes_without_archive() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let db_path = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&db_path);
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        std::fs::write(&wal_path, b"wal").unwrap();
+        std::fs::write(&shm_path, b"shm").unwrap();
+        let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
+
+        clear_and_reset_everything(
+            true,
+            Some(false),
+            Some(&db_path),
+            &database_files,
+            &storage_root,
+        )
+        .expect("clear-and-reset");
+
+        let archive_dir = archive_states_dir(false).unwrap();
+        assert!(
+            !archive_dir.exists(),
+            "archive dir should not be created when --no-archive"
+        );
+        assert!(!db_path.exists());
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
+        assert!(storage_root.exists());
+        assert_eq!(std::fs::read_dir(&storage_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn clear_and_reset_refuses_without_force_on_non_interactive_stdin() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let db_path = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&db_path);
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        std::fs::write(&wal_path, b"wal").unwrap();
+        std::fs::write(&shm_path, b"shm").unwrap();
+        let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
+
+        let err =
+            clear_and_reset_everything(false, None, Some(&db_path), &database_files, &storage_root)
+                .unwrap_err();
+        let msg = match err {
+            CliError::Other(m) => m,
+            other => format!("{other}"),
+        };
+        assert!(
+            msg.contains("refusing to prompt on non-interactive stdin"),
+            "unexpected error: {msg}"
+        );
+
+        // Ensure no changes occurred.
+        assert!(db_path.exists());
+        assert!(wal_path.exists());
+        assert!(shm_path.exists());
+        assert!(storage_root.join("nested/dir/file.txt").exists());
+        assert!(storage_root.join(".git/HEAD").exists());
     }
 
     // -----------------------------------------------------------------------
@@ -2775,7 +3477,9 @@ mod tests {
 
     #[test]
     fn products_local_parity_smoke_json() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         use asupersync::runtime::RuntimeBuilder;
         use mcp_agent_mail_db::sqlmodel::Value;
 
@@ -3089,6 +3793,27 @@ struct LeaseRecord {
 
 fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
     let config = Config::from_env();
+    let server_url = format!(
+        "http://{}:{}{}",
+        config.http_host, config.http_port, config.http_path
+    );
+    handle_am_run_with(
+        &config,
+        Some(server_url.as_str()),
+        config.http_bearer_token.as_deref(),
+        args,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_am_run_with(
+    config: &Config,
+    server_url: Option<&str>,
+    bearer: Option<&str>,
+    args: AmRunArgs,
+) -> CliResult<()> {
+    use std::time::Duration;
+
     let identity = resolve_project_identity(args.path.to_string_lossy().as_ref());
     let agent_name = args
         .agent
@@ -3098,83 +3823,253 @@ fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
         .branch
         .clone()
         .filter(|b| !b.is_empty())
+        .or_else(|| compute_git_branch(&args.path))
         .unwrap_or_else(|| "unknown".to_string());
+
+    let shared = resolve_bool(args.shared, args.exclusive, false);
+    let block_on_conflicts =
+        resolve_bool(args.block_on_conflicts, args.no_block_on_conflicts, false);
 
     let cache_key = format!(
         "am-cache-{}-{}-{}",
         identity.project_uid, agent_name, branch
     );
 
-    let slot_dir = ensure_slot_dir(&config, &identity.slug, &args.slot)?;
-    let lease_path = lease_path(&slot_dir, &agent_name, &branch);
-
+    let ttl_seconds = args.ttl_seconds.max(60);
     let now = Utc::now();
-    let expires = now + chrono::Duration::seconds(args.ttl_seconds.max(60));
+    let expires = now + chrono::Duration::seconds(ttl_seconds);
     let lease = LeaseRecord {
         slot: args.slot.clone(),
         agent: agent_name.clone(),
         branch: branch.clone(),
-        exclusive: !args.shared,
+        exclusive: !shared,
         acquired_ts: now.to_rfc3339(),
         expires_ts: expires.to_rfc3339(),
         released_ts: None,
     };
-    let _ = write_lease(&lease_path, &lease);
 
-    let renew_stop = Arc::new(AtomicBool::new(false));
+    // Ensure local lease path exists upfront so tests can observe it even if server path is used.
+    // This is best-effort (legacy behavior) because server-based build slot leases don't strictly
+    // require local filesystem writes.
+    let mut slot_dir_opt: Option<PathBuf> = None;
+    let mut lease_path_opt: Option<PathBuf> = None;
+    if let Ok(dir) = ensure_slot_dir(config, &identity.slug, &args.slot) {
+        let path = lease_path(&dir, &agent_name, &branch);
+        let _ = write_lease(&path, &lease);
+        slot_dir_opt = Some(dir);
+        lease_path_opt = Some(path);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LeaseBackend {
+        Server,
+        Local,
+        None,
+    }
+
+    let mut backend = LeaseBackend::None;
+    let mut acquired_via_server = false;
+    let mut planned_exit_code: Option<i32> = None;
+
+    let mut stop_tx: Option<std::sync::mpsc::Sender<()>> = None;
     let mut renew_thread: Option<std::thread::JoinHandle<()>> = None;
 
     if config.worktrees_enabled {
-        let conflicts = read_active_leases(&slot_dir, &agent_name, &branch, args.shared);
-        if !conflicts.is_empty() {
-            if guard_mode_warn() {
-                ftui_runtime::ftui_eprintln!(
-                    "warning: build slot conflicts (advisory, proceeding)"
-                );
-                for conflict in &conflicts {
-                    ftui_runtime::ftui_eprintln!(
-                        "  - slot={} agent={} branch={} expires={}",
-                        conflict.slot,
-                        conflict.agent,
-                        conflict.branch,
-                        conflict.expires_ts
-                    );
+        // Prefer server tools when available; fallback to local filesystem leases.
+        let mut server_conflicts: Vec<serde_json::Value> = Vec::new();
+        if let Some(url) = server_url {
+            use asupersync::runtime::RuntimeBuilder;
+
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .map_err(|e| CliError::Other(format!("runtime init failed: {e}")))?;
+
+            let ensure_ok = runtime
+                .block_on(async {
+                    try_call_server_tool(
+                        url,
+                        bearer,
+                        "ensure_project",
+                        serde_json::json!({ "human_key": identity.human_key.clone() }),
+                    )
+                    .await
+                })
+                .is_some();
+
+            if ensure_ok {
+                let acquired = runtime.block_on(async {
+                    try_call_server_tool(
+                        url,
+                        bearer,
+                        "acquire_build_slot",
+                        serde_json::json!({
+                            "project_key": identity.human_key.clone(),
+                            "agent_name": agent_name.clone(),
+                            "slot": args.slot.clone(),
+                            "ttl_seconds": ttl_seconds,
+                            "exclusive": !shared,
+                        }),
+                    )
+                    .await
+                });
+
+                if let Some(result) = acquired.and_then(coerce_tool_result_json) {
+                    backend = LeaseBackend::Server;
+                    acquired_via_server = true;
+                    server_conflicts = result
+                        .get("conflicts")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                 }
-            }
-            if !args.shared && args.block_on_conflicts {
-                return Err(CliError::ExitCode(1));
             }
         }
 
-        let lease_path_clone = lease_path.clone();
-        let slot_key = args.slot.clone();
-        let agent_clone = agent_name.clone();
-        let branch_clone = branch.clone();
-        let shared = args.shared;
-        let ttl = args.ttl_seconds.max(60);
-        let stop_flag = Arc::clone(&renew_stop);
-        renew_thread = Some(std::thread::spawn(move || {
-            let interval = std::cmp::max(60, ttl / 2);
-            while !stop_flag.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_secs(interval as u64));
-                if stop_flag.load(Ordering::SeqCst) {
-                    break;
+        if backend != LeaseBackend::Server {
+            backend = LeaseBackend::Local;
+        }
+
+        if backend == LeaseBackend::Server {
+            if !server_conflicts.is_empty() {
+                if guard_mode_warn() {
+                    ftui_runtime::ftui_eprintln!(
+                        "warning: build slot conflicts (server advisory, proceeding)"
+                    );
+                    for c in &server_conflicts {
+                        let slot = c.get("slot").and_then(|v| v.as_str()).unwrap_or("");
+                        let agent = c.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+                        let branch = c.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+                        let expires_ts = c.get("expires_ts").and_then(|v| v.as_str()).unwrap_or("");
+                        ftui_runtime::ftui_eprintln!(
+                            "  - slot={slot} agent={agent} branch={branch} expires={expires_ts}"
+                        );
+                    }
                 }
-                let now = Utc::now();
-                let expires = now + chrono::Duration::seconds(interval);
-                let mut updated = read_lease(&lease_path_clone).unwrap_or_else(|| LeaseRecord {
-                    slot: slot_key.clone(),
-                    agent: agent_clone.clone(),
-                    branch: branch_clone.clone(),
-                    exclusive: !shared,
-                    acquired_ts: now.to_rfc3339(),
-                    expires_ts: expires.to_rfc3339(),
-                    released_ts: None,
-                });
-                updated.expires_ts = expires.to_rfc3339();
-                let _ = write_lease(&lease_path_clone, &updated);
+                if !shared && block_on_conflicts {
+                    ftui_runtime::ftui_eprintln!(
+                        "error: build slot conflicts detected and --block-on-conflicts set; aborting."
+                    );
+                    planned_exit_code = Some(1);
+                }
             }
-        }));
+        } else {
+            let slot_dir = match slot_dir_opt {
+                Some(dir) => dir,
+                None => ensure_slot_dir(config, &identity.slug, &args.slot)?,
+            };
+            if lease_path_opt.is_none() {
+                let path = lease_path(&slot_dir, &agent_name, &branch);
+                let _ = write_lease(&path, &lease);
+                lease_path_opt = Some(path);
+            }
+
+            let conflicts = read_active_leases(&slot_dir, &agent_name, &branch, shared);
+            if !conflicts.is_empty() {
+                if guard_mode_warn() {
+                    ftui_runtime::ftui_eprintln!(
+                        "warning: build slot conflicts (advisory, proceeding)"
+                    );
+                    for conflict in &conflicts {
+                        ftui_runtime::ftui_eprintln!(
+                            "  - slot={} agent={} branch={} expires={}",
+                            conflict.slot,
+                            conflict.agent,
+                            conflict.branch,
+                            conflict.expires_ts
+                        );
+                    }
+                }
+                if !shared && block_on_conflicts {
+                    ftui_runtime::ftui_eprintln!(
+                        "error: build slot conflicts detected and --block-on-conflicts set; aborting."
+                    );
+                    planned_exit_code = Some(1);
+                }
+            }
+        }
+
+        // Start renewer thread only if we are proceeding with the child command.
+        if planned_exit_code.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            stop_tx = Some(tx);
+
+            let interval = std::cmp::max(60, ttl_seconds / 2);
+            if backend == LeaseBackend::Server {
+                let Some(url) = server_url.map(|s| s.to_string()) else {
+                    return Err(CliError::Other(
+                        "server_url missing while using server backend".to_string(),
+                    ));
+                };
+                let bearer = bearer.map(|s| s.to_string());
+                let project_key = identity.human_key.clone();
+                let agent_name = agent_name.clone();
+                let slot = args.slot.clone();
+
+                renew_thread = Some(std::thread::spawn(move || {
+                    use asupersync::runtime::RuntimeBuilder;
+
+                    let Ok(runtime) = RuntimeBuilder::current_thread().build() else {
+                        return;
+                    };
+                    loop {
+                        match rx.recv_timeout(Duration::from_secs(interval as u64)) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                let _ = runtime.block_on(async {
+                                    try_call_server_tool(
+                                        &url,
+                                        bearer.as_deref(),
+                                        "renew_build_slot",
+                                        serde_json::json!({
+                                            "project_key": project_key,
+                                            "agent_name": agent_name,
+                                            "slot": slot,
+                                            "extend_seconds": interval,
+                                        }),
+                                    )
+                                    .await
+                                });
+                            }
+                        }
+                    }
+                }));
+            } else {
+                let Some(lease_path) = lease_path_opt.clone() else {
+                    return Err(CliError::Other(
+                        "internal error: missing lease path for local build slot backend"
+                            .to_string(),
+                    ));
+                };
+                let slot_key = args.slot.clone();
+                let agent_name = agent_name.clone();
+                let branch = branch.clone();
+                let exclusive = !shared;
+
+                renew_thread = Some(std::thread::spawn(move || {
+                    loop {
+                        match rx.recv_timeout(Duration::from_secs(interval as u64)) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                let now = Utc::now();
+                                let expires = now + chrono::Duration::seconds(interval);
+                                let mut updated =
+                                    read_lease(&lease_path).unwrap_or_else(|| LeaseRecord {
+                                        slot: slot_key.clone(),
+                                        agent: agent_name.clone(),
+                                        branch: branch.clone(),
+                                        exclusive,
+                                        acquired_ts: now.to_rfc3339(),
+                                        expires_ts: expires.to_rfc3339(),
+                                        released_ts: None,
+                                    });
+                                updated.expires_ts = expires.to_rfc3339();
+                                let _ = write_lease(&lease_path, &updated);
+                            }
+                        }
+                    }
+                }));
+            }
+        }
     }
 
     let mut cmd = std::process::Command::new(&args.cmd[0]);
@@ -3188,25 +4083,79 @@ fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
         .env("AGENT", &agent_name)
         .env("CACHE_KEY", &cache_key);
 
-    ftui_runtime::ftui_println!("$ {}  (slot={})", args.cmd.join(" "), args.slot);
+    let exit_code = if let Some(code) = planned_exit_code {
+        code
+    } else {
+        ftui_runtime::ftui_println!("$ {}  (slot={})", args.cmd.join(" "), args.slot);
 
-    let status = cmd.status();
-    let exit_code = match status {
-        Ok(s) => s.code().unwrap_or(1),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 127,
-        Err(_) => 1,
+        let status = cmd.status();
+        match status {
+            Ok(s) => s.code().unwrap_or(1),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 127,
+            Err(_) => 1,
+        }
     };
 
     if config.worktrees_enabled {
-        let now = Utc::now().to_rfc3339();
-        if let Some(mut lease) = read_lease(&lease_path) {
-            lease.released_ts = Some(now.clone());
-            lease.expires_ts = now.clone();
-            let _ = write_lease(&lease_path, &lease);
+        // Stop renewal, then release (server best-effort, local fallback).
+        if let Some(tx) = stop_tx {
+            let _ = tx.send(());
         }
-        renew_stop.store(true, Ordering::SeqCst);
         if let Some(handle) = renew_thread {
             let _ = handle.join();
+        }
+
+        let mut released_locally = false;
+        if backend == LeaseBackend::Server && acquired_via_server {
+            let server_released = if let Some(url) = server_url {
+                use asupersync::runtime::RuntimeBuilder;
+                match RuntimeBuilder::current_thread().build() {
+                    Ok(runtime) => runtime
+                        .block_on(async {
+                            try_call_server_tool(
+                                url,
+                                bearer,
+                                "release_build_slot",
+                                serde_json::json!({
+                                    "project_key": identity.human_key.clone(),
+                                    "agent_name": agent_name.clone(),
+                                    "slot": args.slot.clone(),
+                                }),
+                            )
+                            .await
+                        })
+                        .is_some(),
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+
+            if !server_released {
+                if let Some(path) = lease_path_opt.as_ref() {
+                    let now = Utc::now().to_rfc3339();
+                    if let Some(mut lease) = read_lease(path) {
+                        lease.released_ts = Some(now.clone());
+                        lease.expires_ts = now.clone();
+                        let _ = write_lease(path, &lease);
+                        released_locally = true;
+                    }
+                }
+            }
+        } else {
+            if let Some(path) = lease_path_opt.as_ref() {
+                let now = Utc::now().to_rfc3339();
+                if let Some(mut lease) = read_lease(path) {
+                    lease.released_ts = Some(now.clone());
+                    lease.expires_ts = now.clone();
+                    let _ = write_lease(path, &lease);
+                    released_locally = true;
+                }
+            }
+        }
+
+        if !released_locally && backend == LeaseBackend::Local {
+            // If local lease couldn't be read (should be rare), do not treat as fatal.
         }
     }
 
@@ -3240,6 +4189,24 @@ fn ensure_dir(path: &Path) -> CliResult<()> {
         )));
     }
     Ok(())
+}
+
+fn compute_git_branch(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() || text == "HEAD" {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn ensure_slot_dir(config: &Config, slug: &str, slot: &str) -> CliResult<PathBuf> {

@@ -18,6 +18,14 @@
 | Tool metrics snapshot | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Recent tool usage tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 
+## HTTP Security & Rate Limiting
+| Feature | Status | Evidence |
+| --- | --- | --- |
+| Bearer auth (`HTTP_BEARER_TOKEN`) + localhost bypass | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs` |
+| JWT auth (HS256 secret + JWKS + issuer/audience + role claim) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs` (jwt_* tests) |
+| RBAC enforcement (reader/writer roles, readonly tools) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs` |
+| Rate limit identity prefers JWT `sub` | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs` |
+
 ## Identity & Projects
 | Feature | Status | Evidence |
 | --- | --- | --- |
