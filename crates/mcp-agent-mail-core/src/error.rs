@@ -164,7 +164,8 @@ impl Error {
             Self::DatabasePoolExhausted => "DATABASE_POOL_EXHAUSTED",
             Self::GitIndexLock => "GIT_INDEX_LOCK",
             Self::Git(_) | Self::Internal(_) => "UNHANDLED_EXCEPTION",
-            Self::ArchiveLockTimeout(_) | Self::Timeout(_) | Self::Cancelled => "TIMEOUT",
+            Self::ArchiveLockTimeout(_) => "ARCHIVE_LOCK_TIMEOUT",
+            Self::Timeout(_) | Self::Cancelled => "TIMEOUT",
             Self::Io(_) => "OS_ERROR",
             Self::Connection(_) => "CONNECTION_ERROR",
         }
@@ -212,32 +213,207 @@ impl Error {
 mod tests {
     use super::*;
 
+    /// Exhaustive test: every Error variant maps to the correct `error_type` string.
     #[test]
-    fn test_error_types() {
-        assert_eq!(
-            Error::ProjectNotFound("test".into()).error_type(),
-            "NOT_FOUND"
-        );
-        assert_eq!(
-            Error::InvalidArgument("test".into()).error_type(),
-            "INVALID_ARGUMENT"
-        );
-        assert_eq!(
-            Error::ContactRequired {
-                from: "a".into(),
-                to: "b".into()
-            }
-            .error_type(),
-            "CONTACT_REQUIRED"
-        );
+    fn test_error_type_mapping_exhaustive() {
+        let cases: Vec<(Error, &str)> = vec![
+            // NOT_FOUND
+            (Error::ProjectNotFound("x".into()), "NOT_FOUND"),
+            (Error::AgentNotFound("x".into()), "NOT_FOUND"),
+            (Error::MessageNotFound(1), "NOT_FOUND"),
+            (Error::ThreadNotFound("x".into()), "NOT_FOUND"),
+            (Error::ReservationNotFound(1), "NOT_FOUND"),
+            (Error::ProductNotFound("x".into()), "NOT_FOUND"),
+            // INVALID_ARGUMENT
+            (Error::InvalidArgument("x".into()), "INVALID_ARGUMENT"),
+            (Error::InvalidAgentName("x".into()), "INVALID_ARGUMENT"),
+            (Error::InvalidThreadId("x".into()), "INVALID_ARGUMENT"),
+            (Error::InvalidProjectKey("x".into()), "INVALID_ARGUMENT"),
+            // MISSING_FIELD
+            (Error::MissingField("x".into()), "MISSING_FIELD"),
+            // TYPE_ERROR
+            (Error::TypeError("x".into()), "TYPE_ERROR"),
+            // CONTACT_REQUIRED / CONTACT_BLOCKED
+            (
+                Error::ContactRequired {
+                    from: "a".into(),
+                    to: "b".into(),
+                },
+                "CONTACT_REQUIRED",
+            ),
+            (
+                Error::ContactBlocked {
+                    from: "a".into(),
+                    to: "b".into(),
+                },
+                "CONTACT_BLOCKED",
+            ),
+            // CAPABILITY_DENIED / PERMISSION_ERROR
+            (Error::CapabilityDenied("x".into()), "CAPABILITY_DENIED"),
+            (Error::PermissionDenied("x".into()), "PERMISSION_ERROR"),
+            // RESOURCE_BUSY
+            (
+                Error::ReservationConflict {
+                    pattern: "x".into(),
+                    holders: vec![],
+                },
+                "RESOURCE_BUSY",
+            ),
+            (Error::ResourceBusy("x".into()), "RESOURCE_BUSY"),
+            // RESOURCE_EXHAUSTED
+            (Error::ResourceExhausted("x".into()), "RESOURCE_EXHAUSTED"),
+            // DATABASE_ERROR
+            (Error::Database("x".into()), "DATABASE_ERROR"),
+            (Error::DatabaseLockTimeout, "DATABASE_ERROR"),
+            // DATABASE_POOL_EXHAUSTED
+            (Error::DatabasePoolExhausted, "DATABASE_POOL_EXHAUSTED"),
+            // GIT_INDEX_LOCK
+            (Error::GitIndexLock, "GIT_INDEX_LOCK"),
+            // ARCHIVE_LOCK_TIMEOUT (distinct from TIMEOUT)
+            (
+                Error::ArchiveLockTimeout("x".into()),
+                "ARCHIVE_LOCK_TIMEOUT",
+            ),
+            // UNHANDLED_EXCEPTION
+            (Error::Git("x".into()), "UNHANDLED_EXCEPTION"),
+            (Error::Internal("x".into()), "UNHANDLED_EXCEPTION"),
+            // TIMEOUT
+            (Error::Timeout("x".into()), "TIMEOUT"),
+            (Error::Cancelled, "TIMEOUT"),
+            // OS_ERROR
+            (Error::Io(std::io::Error::other("x")), "OS_ERROR"),
+            // CONNECTION_ERROR
+            (Error::Connection("x".into()), "CONNECTION_ERROR"),
+        ];
+
+        for (err, expected_type) in &cases {
+            assert_eq!(
+                err.error_type(),
+                *expected_type,
+                "Error {err:?} should map to {expected_type}"
+            );
+        }
     }
 
+    /// Exhaustive test: recoverable classification matches legacy Python behavior.
     #[test]
-    fn test_recoverable() {
-        assert!(Error::DatabaseLockTimeout.is_recoverable());
-        assert!(Error::Timeout("test".into()).is_recoverable());
-        assert!(Error::ProjectNotFound("test".into()).is_recoverable());
-        assert!(!Error::CapabilityDenied("no".into()).is_recoverable());
-        assert!(!Error::PermissionDenied("no".into()).is_recoverable());
+    fn test_recoverable_classification_exhaustive() {
+        // Recoverable errors (true)
+        let recoverable = vec![
+            Error::ProjectNotFound("x".into()),
+            Error::AgentNotFound("x".into()),
+            Error::MessageNotFound(1),
+            Error::ThreadNotFound("x".into()),
+            Error::ReservationNotFound(1),
+            Error::ProductNotFound("x".into()),
+            Error::InvalidArgument("x".into()),
+            Error::InvalidAgentName("x".into()),
+            Error::InvalidThreadId("x".into()),
+            Error::InvalidProjectKey("x".into()),
+            Error::MissingField("x".into()),
+            Error::TypeError("x".into()),
+            Error::ContactRequired {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            Error::ContactBlocked {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            Error::Database("x".into()),
+            Error::DatabasePoolExhausted,
+            Error::DatabaseLockTimeout,
+            Error::GitIndexLock,
+            Error::ArchiveLockTimeout("x".into()),
+            Error::ReservationConflict {
+                pattern: "x".into(),
+                holders: vec![],
+            },
+            Error::ResourceBusy("x".into()),
+            Error::ResourceExhausted("x".into()),
+            Error::Timeout("x".into()),
+            Error::Cancelled,
+            Error::Connection("x".into()),
+        ];
+        for err in &recoverable {
+            assert!(err.is_recoverable(), "Error {err:?} should be recoverable");
+        }
+
+        // Non-recoverable errors (false)
+        let non_recoverable = vec![
+            Error::CapabilityDenied("x".into()),
+            Error::PermissionDenied("x".into()),
+            Error::Git("x".into()),
+            Error::Internal("x".into()),
+            Error::Io(std::io::Error::other("x")),
+        ];
+        for err in &non_recoverable {
+            assert!(
+                !err.is_recoverable(),
+                "Error {err:?} should NOT be recoverable"
+            );
+        }
+    }
+
+    /// Verify all error types from the legacy Python codebase are represented.
+    #[test]
+    fn test_all_legacy_error_codes_present() {
+        let expected_codes = [
+            "NOT_FOUND",
+            "INVALID_ARGUMENT",
+            "MISSING_FIELD",
+            "TYPE_ERROR",
+            "CONTACT_REQUIRED",
+            "CONTACT_BLOCKED",
+            "CAPABILITY_DENIED",
+            "PERMISSION_ERROR",
+            "RESOURCE_BUSY",
+            "RESOURCE_EXHAUSTED",
+            "DATABASE_ERROR",
+            "DATABASE_POOL_EXHAUSTED",
+            "GIT_INDEX_LOCK",
+            "ARCHIVE_LOCK_TIMEOUT",
+            "UNHANDLED_EXCEPTION",
+            "TIMEOUT",
+            "OS_ERROR",
+            "CONNECTION_ERROR",
+        ];
+
+        // Collect all error_type strings produced by our variants
+        let produced: Vec<&str> = vec![
+            Error::ProjectNotFound(String::new()).error_type(),
+            Error::InvalidArgument(String::new()).error_type(),
+            Error::MissingField(String::new()).error_type(),
+            Error::TypeError(String::new()).error_type(),
+            Error::ContactRequired {
+                from: String::new(),
+                to: String::new(),
+            }
+            .error_type(),
+            Error::ContactBlocked {
+                from: String::new(),
+                to: String::new(),
+            }
+            .error_type(),
+            Error::CapabilityDenied(String::new()).error_type(),
+            Error::PermissionDenied(String::new()).error_type(),
+            Error::ResourceBusy(String::new()).error_type(),
+            Error::ResourceExhausted(String::new()).error_type(),
+            Error::Database(String::new()).error_type(),
+            Error::DatabasePoolExhausted.error_type(),
+            Error::GitIndexLock.error_type(),
+            Error::ArchiveLockTimeout(String::new()).error_type(),
+            Error::Git(String::new()).error_type(),
+            Error::Timeout(String::new()).error_type(),
+            Error::Io(std::io::Error::other("")).error_type(),
+            Error::Connection(String::new()).error_type(),
+        ];
+
+        for code in &expected_codes {
+            assert!(
+                produced.contains(code),
+                "Legacy error code '{code}' is not produced by any Error variant"
+            );
+        }
     }
 }

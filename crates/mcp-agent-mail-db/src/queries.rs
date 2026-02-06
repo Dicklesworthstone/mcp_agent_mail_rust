@@ -376,7 +376,7 @@ pub async fn ensure_project(
             Outcome::Ok(row)
         }
         Outcome::Ok(None) => {
-            let mut row = ProjectRow::new(slug, human_key.to_string());
+            let mut row = ProjectRow::new(slug.clone(), human_key.to_string());
             let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(id) => {
@@ -384,7 +384,39 @@ pub async fn ensure_project(
                     crate::cache::read_cache().put_project(&row);
                     Outcome::Ok(row)
                 }
-                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Err(e) => {
+                    // Concurrency/race hardening: if another caller created the project after our
+                    // initial SELECT, the INSERT may fail with a UNIQUE constraint violation on
+                    // projects.slug. In that case, re-select and return the existing row.
+                    let is_unique_slug = match &e {
+                        DbError::Sqlite(msg) => {
+                            let msg = msg.to_ascii_lowercase();
+                            msg.contains("unique constraint failed")
+                                && msg.contains("projects.slug")
+                        }
+                        _ => false,
+                    };
+
+                    if !is_unique_slug {
+                        return Outcome::Err(e);
+                    }
+
+                    match map_sql_outcome(
+                        select!(ProjectRow)
+                            .filter(Expr::col("slug").eq(slug.as_str()))
+                            .first(cx, &tracked)
+                            .await,
+                    ) {
+                        Outcome::Ok(Some(row)) => {
+                            crate::cache::read_cache().put_project(&row);
+                            Outcome::Ok(row)
+                        }
+                        Outcome::Ok(None) => Outcome::Err(e),
+                        Outcome::Err(select_err) => Outcome::Err(select_err),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
+                    }
+                }
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
             }

@@ -19,14 +19,19 @@ pub mod error;
 pub mod models;
 pub mod pool;
 pub mod queries;
+pub mod retry;
 pub mod schema;
 pub mod timestamps;
 pub mod tracking;
 
 pub use cache::read_cache;
-pub use error::{DbError, DbResult};
+pub use error::{DbError, DbResult, is_lock_error, is_pool_exhausted_error};
 pub use models::*;
 pub use pool::{DbPool, DbPoolConfig, create_pool, get_or_create_pool};
+pub use retry::{
+    CIRCUIT_BREAKER, CircuitBreaker, CircuitState, DbHealthStatus, RetryConfig, db_health_status,
+    retry_sync,
+};
 pub use timestamps::{iso_to_micros, micros_to_iso, micros_to_naive, naive_to_micros, now_micros};
 pub use tracking::{
     ActiveTrackerGuard, QueryTracker, QueryTrackerSnapshot, SlowQueryEntry, active_tracker,

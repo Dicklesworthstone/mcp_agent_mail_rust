@@ -162,11 +162,11 @@ END;
 
 /// SQL for WAL mode and performance settings.
 ///
-/// Tuned for extreme concurrent load (dozens of agents, thousands of ops/sec):
+/// Per-connection PRAGMAs matching legacy Python `db.py` event listeners.
 ///
 /// - `journal_mode=WAL`: readers never block writers; writers never block readers
 /// - `synchronous=NORMAL`: fsync on commit (not per-statement); safe with WAL
-/// - `busy_timeout=120s`: generous wait under extreme contention before `SQLITE_BUSY`
+/// - `busy_timeout=60s`: 60 second wait for locks (matches Python `PRAGMA busy_timeout=60000`)
 /// - `wal_autocheckpoint=2000`: fewer checkpoints under sustained write bursts
 /// - `cache_size=64MB`: large page cache to avoid disk reads for hot data
 /// - `mmap_size=512MB`: memory-mapped I/O for sequential scan acceleration
@@ -175,7 +175,7 @@ END;
 pub const PRAGMA_SETTINGS_SQL: &str = r"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
-PRAGMA busy_timeout = 120000;
+PRAGMA busy_timeout = 60000;
 PRAGMA wal_autocheckpoint = 2000;
 PRAGMA cache_size = -65536;
 PRAGMA mmap_size = 536870912;

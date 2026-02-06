@@ -248,6 +248,20 @@ pub fn decrypt_with_age(
     identity: Option<&Path>,
     passphrase: Option<&str>,
 ) -> ShareResult<()> {
+    // Legacy parity: identity and passphrase are mutually exclusive, and at least one is required.
+    if identity.is_some() && passphrase.is_some() {
+        return Err(ShareError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "passphrase cannot be combined with identity file",
+        )));
+    }
+    if identity.is_none() && passphrase.is_none() {
+        return Err(ShareError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "either identity or passphrase required for decryption",
+        )));
+    }
+
     check_age_available()?;
 
     let mut cmd = std::process::Command::new("age");
@@ -259,6 +273,7 @@ pub fn decrypt_with_age(
         // age reads passphrase from stdin when -p is used
         cmd.arg("-p");
     } else {
+        // Unreachable because we validated inputs above, but keep a defensive branch.
         return Err(ShareError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "either identity or passphrase required for decryption",

@@ -13,15 +13,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Default pool configuration values.
+/// Default pool configuration values (matching legacy Python `db.py`).
 ///
-/// Tuned for extreme concurrent load: 8 base + 12 overflow = 20 max connections.
-/// With WAL mode, all 20 can read concurrently; writes serialize through the WAL
-/// writer lock but the 120s `busy_timeout` (set in PRAGMAs) prevents `SQLITE_BUSY`.
-pub const DEFAULT_POOL_SIZE: usize = 8;
-pub const DEFAULT_MAX_OVERFLOW: usize = 12;
+/// - `pool_size=3` + `max_overflow=4` = 7 max connections (`SQLite` default).
+/// - WAL mode allows all 7 to read concurrently; writes serialize through the WAL
+///   writer lock but the 60s `busy_timeout` (set in PRAGMAs) prevents `SQLITE_BUSY`.
+/// - Pool recycle every 30 minutes (1800s) to prevent stale connections.
+///
+/// Override via `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` env vars for higher load.
+pub const DEFAULT_POOL_SIZE: usize = 3;
+pub const DEFAULT_MAX_OVERFLOW: usize = 4;
 pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 60_000;
-pub const DEFAULT_POOL_RECYCLE_MS: u64 = 60 * 60 * 1000; // 60 minutes
+pub const DEFAULT_POOL_RECYCLE_MS: u64 = 30 * 60 * 1000; // 30 minutes (legacy: pool_recycle=1800)
 
 /// Pool configuration
 #[derive(Debug, Clone)]
@@ -308,5 +311,43 @@ mod tests {
         assert!(table_names.contains(&"projects".to_string()));
         assert!(table_names.contains(&"agents".to_string()));
         assert!(table_names.contains(&"messages".to_string()));
+    }
+
+    /// Verify pool defaults match legacy Python db.py values exactly.
+    ///
+    /// Legacy Python (`SQLite` mode):
+    /// - `pool_size=3`, `max_overflow=4`, `pool_recycle=1800` (30 min)
+    /// - `busy_timeout=60000` (60s)
+    #[test]
+    fn pool_defaults_match_legacy_python() {
+        assert_eq!(DEFAULT_POOL_SIZE, 3, "legacy pool_size is 3 for SQLite");
+        assert_eq!(
+            DEFAULT_MAX_OVERFLOW, 4,
+            "legacy max_overflow is 4 for SQLite"
+        );
+        assert_eq!(
+            DEFAULT_POOL_RECYCLE_MS,
+            30 * 60 * 1000,
+            "legacy pool_recycle is 1800s (30 min)"
+        );
+
+        let cfg = DbPoolConfig::default();
+        assert_eq!(cfg.min_connections, 3);
+        assert_eq!(cfg.max_connections, 7); // 3 + 4
+        assert_eq!(cfg.max_lifetime_ms, 1_800_000); // 30 min in ms
+    }
+
+    /// Verify PRAGMA settings contain `busy_timeout=60000` matching legacy Python.
+    #[test]
+    fn pragma_busy_timeout_matches_legacy() {
+        let sql = schema::init_schema_sql();
+        assert!(
+            sql.contains("busy_timeout = 60000"),
+            "PRAGMA busy_timeout must be 60000 (60s) to match Python legacy"
+        );
+        assert!(
+            sql.contains("journal_mode = WAL"),
+            "WAL mode is required for concurrent access"
+        );
     }
 }
