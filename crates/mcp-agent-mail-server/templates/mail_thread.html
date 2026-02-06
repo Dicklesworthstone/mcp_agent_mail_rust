@@ -80,7 +80,7 @@
                 <!-- Preview (when collapsed) -->
                 <div x-show="!expanded" class="text-sm text-slate-600 dark:text-slate-400 line-clamp-2">
                   {% if msg.body_md %}
-                    {{ msg.body_md|striptags|truncate(150, killwords=False, end='...') }}
+                    {{ msg.body_md|striptags|truncate(150) }}
                   {% else %}
                     <em class="text-slate-400">No content</em>
                   {% endif %}

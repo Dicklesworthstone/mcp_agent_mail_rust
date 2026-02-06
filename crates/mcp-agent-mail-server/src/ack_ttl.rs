@@ -1,0 +1,455 @@
+//! Background worker for ACK TTL scanning and escalation.
+//!
+//! Mirrors legacy Python `_worker_ack_ttl` in `http.py`:
+//! - Scan unacknowledged `ack_required` messages
+//! - Log warnings for overdue acks
+//! - Optionally escalate via file reservations
+//!
+//! The worker runs on a dedicated OS thread with `std::thread::sleep` between
+//! iterations, matching the pattern in `cleanup.rs`.
+
+#![forbid(unsafe_code)]
+
+use asupersync::{Cx, Outcome};
+use fastmcp_core::block_on;
+use mcp_agent_mail_core::Config;
+use mcp_agent_mail_db::{
+    DbPool, DbPoolConfig, create_pool, now_micros,
+    queries::{self, list_unacknowledged_messages},
+};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{info, warn};
+
+/// Global shutdown flag for the ACK TTL worker.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Worker handle for join-on-shutdown.
+static WORKER: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+
+/// Start the ACK TTL scan worker (if enabled).
+///
+/// Must be called at most once. Subsequent calls are no-ops.
+pub fn start(config: &Config) {
+    if !config.ack_ttl_enabled {
+        return;
+    }
+
+    let config = config.clone();
+    let _ = WORKER.get_or_init(|| {
+        SHUTDOWN.store(false, Ordering::Release);
+        std::thread::Builder::new()
+            .name("ack-ttl-scan".into())
+            .spawn(move || ack_ttl_loop(&config))
+            .expect("failed to spawn ACK TTL scan worker")
+    });
+}
+
+/// Signal the worker to stop.
+pub fn shutdown() {
+    SHUTDOWN.store(true, Ordering::Release);
+}
+
+fn ack_ttl_loop(config: &Config) {
+    let interval = std::time::Duration::from_secs(config.ack_ttl_scan_interval_seconds.max(5));
+
+    let pool_config = DbPoolConfig::from_env();
+    let pool = match create_pool(&pool_config) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "ack TTL worker: failed to create DB pool, exiting");
+            return;
+        }
+    };
+
+    info!(
+        interval_secs = interval.as_secs(),
+        ttl_seconds = config.ack_ttl_seconds,
+        escalation_enabled = config.ack_escalation_enabled,
+        escalation_mode = %config.ack_escalation_mode,
+        "ACK TTL scan worker started"
+    );
+
+    loop {
+        if SHUTDOWN.load(Ordering::Acquire) {
+            info!("ACK TTL scan worker shutting down");
+            return;
+        }
+
+        match run_ack_ttl_cycle(config, &pool) {
+            Ok((scanned, overdue)) => {
+                if overdue > 0 {
+                    info!(
+                        event = "ack_ttl_scan",
+                        scanned, overdue, "ACK TTL scan completed"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "ACK TTL scan cycle failed");
+            }
+        }
+
+        // Sleep in small increments to allow quick shutdown.
+        let mut remaining = interval;
+        while !remaining.is_zero() {
+            if SHUTDOWN.load(Ordering::Acquire) {
+                return;
+            }
+            let chunk = remaining.min(std::time::Duration::from_secs(1));
+            std::thread::sleep(chunk);
+            remaining = remaining.saturating_sub(chunk);
+        }
+    }
+}
+
+/// Run a single ACK TTL scan cycle.
+///
+/// Returns `(scanned, overdue_count)`.
+fn run_ack_ttl_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), String> {
+    let cx = Cx::for_testing();
+    let now = now_micros();
+    let ttl_us = i64::try_from(config.ack_ttl_seconds).unwrap_or(1800) * 1_000_000;
+
+    // Get all unacknowledged messages.
+    let rows = match block_on(async { list_unacknowledged_messages(&cx, pool).await }) {
+        Outcome::Ok(r) => r,
+        other => return Err(format!("failed to list unacked messages: {other:?}")),
+    };
+
+    let scanned = rows.len();
+    let mut overdue = 0usize;
+
+    for row in &rows {
+        let age_micros = now - row.created_ts;
+        if age_micros < ttl_us {
+            continue; // Not yet overdue.
+        }
+
+        overdue += 1;
+        let age_seconds = age_micros / 1_000_000;
+
+        // Log the overdue warning (matches legacy structlog + rich panel).
+        warn!(
+            event = "ack_overdue",
+            message_id = row.message_id,
+            project_id = row.project_id,
+            agent_id = row.agent_id,
+            age_s = age_seconds,
+            ttl_s = config.ack_ttl_seconds,
+            "ACK overdue"
+        );
+
+        // Escalation (best-effort, never crash).
+        if config.ack_escalation_enabled {
+            let _ = escalate(config, pool, &cx, row, now);
+        }
+    }
+
+    Ok((scanned, overdue))
+}
+
+/// Escalate an overdue ACK via the configured escalation mode.
+fn escalate(
+    config: &Config,
+    pool: &DbPool,
+    cx: &Cx,
+    row: &queries::UnackedMessageRow,
+    _now: i64,
+) -> Result<(), String> {
+    let mode = config.ack_escalation_mode.to_lowercase();
+    if mode != "file_reservation" {
+        // "log" mode (or unknown): logging was already done above.
+        return Ok(());
+    }
+
+    // Build the inbox path pattern from the created_ts timestamp.
+    let ts_secs = row.created_ts / 1_000_000;
+    let dt = chrono::DateTime::from_timestamp(ts_secs, 0)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+    let y_dir = dt.format("%Y").to_string();
+    let m_dir = dt.format("%m").to_string();
+
+    // Resolve recipient name.
+    let recipient_name =
+        match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {
+            Outcome::Ok(agent) => agent.name,
+            _ => "*".to_string(),
+        };
+
+    let pattern = if recipient_name == "*" {
+        format!("agents/*/inbox/{y_dir}/{m_dir}/*.md")
+    } else {
+        format!("agents/{recipient_name}/inbox/{y_dir}/{m_dir}/*.md")
+    };
+
+    // Determine holder agent.
+    let holder_name = &config.ack_escalation_claim_holder_name;
+    let holder_agent_id = if holder_name.is_empty() {
+        // Use the recipient agent as the holder.
+        row.agent_id
+    } else {
+        // Look up or create the custom holder agent.
+        match block_on(async {
+            queries::insert_system_agent(
+                cx,
+                pool,
+                row.project_id,
+                holder_name,
+                "ops",
+                "system",
+                "ops-escalation",
+            )
+            .await
+        }) {
+            Outcome::Ok(agent) => agent.id.unwrap_or(row.agent_id),
+            _ => row.agent_id, // Fallback to recipient.
+        }
+    };
+
+    // Create the file reservation.
+    let ttl_s = i64::try_from(config.ack_escalation_claim_ttl_seconds).unwrap_or(3600);
+    match block_on(async {
+        queries::create_file_reservations(
+            cx,
+            pool,
+            row.project_id,
+            holder_agent_id,
+            &[pattern.as_str()],
+            ttl_s,
+            config.ack_escalation_claim_exclusive,
+            "ack-overdue",
+        )
+        .await
+    }) {
+        Outcome::Ok(reservations) => {
+            info!(
+                event = "ack_escalation",
+                message_id = row.message_id,
+                project_id = row.project_id,
+                holder_agent_id,
+                pattern = %pattern,
+                reservations_created = reservations.len(),
+                "ACK escalation: created file reservation"
+            );
+            Ok(())
+        }
+        other => Err(format!(
+            "failed to create escalation reservation: {other:?}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asupersync::{Cx, Outcome};
+    use mcp_agent_mail_db::{DbPoolConfig, create_pool, queries};
+
+    #[test]
+    fn age_threshold_calculation() {
+        // Verify the age threshold calculation matches expectations.
+        let ttl_seconds: u64 = 1800;
+        let ttl_us = i64::try_from(ttl_seconds).unwrap() * 1_000_000;
+        assert_eq!(ttl_us, 1_800_000_000);
+
+        // A message created 1801 seconds ago should be overdue.
+        let now = 2_000_000_000_000i64; // arbitrary "now" in microseconds
+        let created = now - (1801 * 1_000_000);
+        let age = now - created;
+        assert!(age >= ttl_us, "1801s should exceed 1800s TTL");
+
+        // A message created 1799 seconds ago should NOT be overdue.
+        let created_recent = now - (1799 * 1_000_000);
+        let age_recent = now - created_recent;
+        assert!(age_recent < ttl_us, "1799s should not exceed 1800s TTL");
+    }
+
+    #[test]
+    fn inbox_path_pattern_format() {
+        // Verify the path pattern matches legacy format.
+        let name = "GreenCastle";
+        let y = "2026";
+        let m = "02";
+        let pattern = format!("agents/{name}/inbox/{y}/{m}/*.md");
+        assert_eq!(pattern, "agents/GreenCastle/inbox/2026/02/*.md");
+
+        // Wildcard pattern for unknown agents.
+        let pattern_wild = format!("agents/*/inbox/{y}/{m}/*.md");
+        assert_eq!(pattern_wild, "agents/*/inbox/2026/02/*.md");
+    }
+
+    #[test]
+    fn escalation_mode_matching() {
+        let mode = "file_reservation";
+        assert_eq!(mode.to_lowercase(), "file_reservation");
+
+        let mode_log = "log";
+        assert_ne!(mode_log.to_lowercase(), "file_reservation");
+
+        // Case-insensitive check.
+        let mode_upper = "FILE_RESERVATION";
+        assert_eq!(mode_upper.to_lowercase(), "file_reservation");
+    }
+
+    fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
+        let db_path = tmp.path().join("db.sqlite3");
+        let db_url = format!(
+            "sqlite:////{}",
+            db_path.to_string_lossy().trim_start_matches('/')
+        );
+        let pool_config = DbPoolConfig {
+            database_url: db_url,
+            min_connections: 1,
+            max_connections: 1,
+            ..Default::default()
+        };
+        create_pool(&pool_config).expect("create pool")
+    }
+
+    fn seed_unacked_message() -> (tempfile::TempDir, DbPool, Cx, queries::UnackedMessageRow) {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = make_test_pool(&tmp);
+        let cx = Cx::for_testing();
+
+        let project_root = tmp.path().join("project_root");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let human_key = project_root.to_string_lossy().to_string();
+
+        let project =
+            match block_on(async { queries::ensure_project(&cx, &pool, &human_key).await }) {
+                Outcome::Ok(p) => p,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+        let project_id = project.id.expect("project id");
+
+        let sender = match block_on(async {
+            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None)
+                .await
+        }) {
+            Outcome::Ok(a) => a,
+            other => panic!("register_agent(sender) failed: {other:?}"),
+        };
+        let sender_id = sender.id.expect("sender id");
+
+        let recipient = match block_on(async {
+            queries::register_agent(
+                &cx, &pool, project_id, "BlueBear", "test", "test", None, None,
+            )
+            .await
+        }) {
+            Outcome::Ok(a) => a,
+            other => panic!("register_agent(recipient) failed: {other:?}"),
+        };
+        let recipient_id = recipient.id.expect("recipient id");
+
+        let _msg = match block_on(async {
+            queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "[br-1bm.10.6] Ack TTL probe",
+                "Body",
+                Some("br-1bm.10.6"),
+                "normal",
+                true,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+        }) {
+            Outcome::Ok(m) => m,
+            other => panic!("create_message_with_recipients failed: {other:?}"),
+        };
+
+        let unacked =
+            match block_on(async { queries::list_unacknowledged_messages(&cx, &pool).await }) {
+                Outcome::Ok(rows) => {
+                    assert_eq!(rows.len(), 1, "expected exactly 1 unacked row");
+                    rows.into_iter().next().unwrap()
+                }
+                other => panic!("list_unacknowledged_messages failed: {other:?}"),
+            };
+
+        (tmp, pool, cx, unacked)
+    }
+
+    #[test]
+    fn ack_ttl_cycle_marks_overdue_when_ttl_zero() {
+        let (_tmp, pool, _cx, _unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = false;
+
+        let (scanned, overdue) = run_ack_ttl_cycle(&config, &pool).expect("run cycle");
+        assert_eq!(scanned, 1);
+        assert_eq!(overdue, 1);
+    }
+
+    #[test]
+    fn ack_ttl_cycle_respects_ttl_when_large() {
+        let (_tmp, pool, _cx, _unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_ttl_seconds = 10_000;
+        config.ack_escalation_enabled = false;
+
+        let (scanned, overdue) = run_ack_ttl_cycle(&config, &pool).expect("run cycle");
+        assert_eq!(scanned, 1);
+        assert_eq!(overdue, 0);
+    }
+
+    #[test]
+    fn escalation_creates_file_reservation_for_recipient_inbox() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_exclusive = true;
+        config.ack_escalation_claim_holder_name.clear(); // holder = recipient
+
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("escalate");
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 1);
+
+        let ts_secs = unacked.created_ts / 1_000_000;
+        let dt = chrono::DateTime::from_timestamp(ts_secs, 0).unwrap();
+        let y_dir = dt.format("%Y").to_string();
+        let m_dir = dt.format("%m").to_string();
+        let expected_pattern = format!("agents/BlueBear/inbox/{y_dir}/{m_dir}/*.md");
+
+        let r = &reservations[0];
+        assert_eq!(r.agent_id, unacked.agent_id);
+        assert_eq!(r.path_pattern, expected_pattern);
+        assert_eq!(r.exclusive, 1);
+        assert_eq!(r.reason, "ack-overdue");
+    }
+
+    #[test]
+    fn escalation_mode_log_is_noop() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "log".to_string();
+
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("escalate");
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert!(reservations.is_empty());
+    }
+}
