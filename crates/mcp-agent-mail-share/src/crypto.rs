@@ -49,11 +49,11 @@ pub fn sign_manifest(
 
     // Read signing key (32-byte seed or 64-byte expanded — use first 32)
     let key_bytes = std::fs::read(signing_key_path)?;
-    if key_bytes.len() < 32 {
+    if key_bytes.len() != 32 && key_bytes.len() != 64 {
         return Err(ShareError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "signing key must be at least 32 bytes, got {}",
+                "signing key must be 32 or 64 bytes, got {}",
                 key_bytes.len()
             ),
         )));
@@ -327,6 +327,29 @@ fn base64_decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
 mod tests {
     use super::*;
 
+    fn try_generate_age_identity(dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
+        let identity_path = dir.join("age_identity.txt");
+        let output = std::process::Command::new("age-keygen")
+            .arg("-o")
+            .arg(&identity_path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recipient = combined
+            .lines()
+            .find(|line| line.contains("public key:"))
+            .and_then(|line| line.split_whitespace().last())
+            .map(|s| s.to_string())?;
+        Some((identity_path, recipient))
+    }
+
     #[test]
     fn hex_sha256_known_value() {
         let hash = hex_sha256(b"hello");
@@ -466,5 +489,29 @@ mod tests {
         assert!(!result.signature_checked);
         assert!(!result.signature_verified);
         assert!(!result.sri_checked);
+    }
+
+    #[test]
+    fn age_encrypt_decrypt_roundtrip() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let input = dir.path().join("bundle.zip");
+        std::fs::write(&input, b"test bundle data").unwrap();
+
+        let encrypted = encrypt_with_age(&input, &[recipient]).unwrap();
+        let output = dir.path().join("bundle.decrypted.zip");
+        decrypt_with_age(&encrypted, &output, Some(&identity_path), None).unwrap();
+
+        let original = std::fs::read(&input).unwrap();
+        let decrypted = std::fs::read(&output).unwrap();
+        assert_eq!(original, decrypted);
     }
 }

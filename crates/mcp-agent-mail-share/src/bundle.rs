@@ -441,35 +441,65 @@ pub fn write_bundle_scaffolding(
 
 /// Create a deterministic ZIP archive of a directory.
 pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareResult<PathBuf> {
+    use zip::DateTime;
     use zip::write::SimpleFileOptions;
 
-    let file = std::fs::File::create(destination)?;
+    let source = source_dir
+        .canonicalize()
+        .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
+    if !source.is_dir() {
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "ZIP source must be a directory (got {})",
+            source.display()
+        ))));
+    }
+
+    let dest = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(destination)
+    };
+    if dest.exists() {
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "Cannot overwrite existing archive {}",
+            dest.display()
+        ))));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)?;
     let mut zip = zip::ZipWriter::new(file);
+    let fixed_time = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+        .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
     let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
-        .compression_level(Some(9));
+        .compression_level(Some(9))
+        .last_modified_time(fixed_time);
 
     // Collect and sort entries for reproducibility
     let mut entries = Vec::new();
-    collect_entries(source_dir, source_dir, &mut entries)?;
+    collect_entries(&source, &source, &mut entries)?;
     entries.sort();
 
     for relative_path in &entries {
-        let full_path = source_dir.join(relative_path);
-        if full_path.is_dir() {
-            zip.add_directory(format!("{relative_path}/"), options)
-                .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
-        } else {
-            zip.start_file(relative_path.clone(), options)
-                .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
-            let mut f = std::fs::File::open(&full_path)?;
-            std::io::copy(&mut f, &mut zip)?;
-        }
+        let full_path = source.join(relative_path);
+        let mode = file_mode(&full_path);
+        let file_options = options.unix_permissions(mode);
+
+        zip.start_file(relative_path.clone(), file_options)
+            .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
+        let mut f = std::fs::File::open(&full_path)?;
+        std::io::copy(&mut f, &mut zip)?;
     }
 
     zip.finish()
         .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
-    Ok(destination.to_path_buf())
+    Ok(dest)
 }
 
 // === Internal helpers ===
@@ -520,19 +550,31 @@ fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<String>) -> st
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
-        let relative = path
-            .strip_prefix(base)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .to_string();
         if path.is_dir() {
-            entries.push(relative.clone());
             collect_entries(base, &path, entries)?;
         } else {
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
             entries.push(relative);
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o644)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> u32 {
+    0o644
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1404,6 +1446,24 @@ mod tests {
                 assert!(output.join(bp).exists(), "bundle_path should resolve: {bp}");
             }
         }
+    }
+
+    #[test]
+    fn zip_deterministic_across_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(source.join("nested/b.txt"), b"bravo").unwrap();
+
+        let zip1 = dir.path().join("bundle1.zip");
+        let zip2 = dir.path().join("bundle2.zip");
+        package_directory_as_zip(&source, &zip1).unwrap();
+        package_directory_as_zip(&source, &zip2).unwrap();
+
+        let h1 = super::sha256_file(&zip1).unwrap();
+        let h2 = super::sha256_file(&zip2).unwrap();
+        assert_eq!(h1, h2, "zip output should be deterministic");
     }
 
     // === Viewer asset tests ===

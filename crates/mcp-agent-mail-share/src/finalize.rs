@@ -113,6 +113,12 @@ pub fn build_materialized_views(
     let conn = open_conn(snapshot_path)?;
     let mut created = Vec::new();
 
+    // Ensure recipients table exists to satisfy LEFT JOINs in view creation.
+    conn.execute_raw(
+        "CREATE TABLE IF NOT EXISTS message_recipients (message_id INTEGER, agent_id INTEGER)",
+    )
+    .map_err(sql_err)?;
+
     let has_thread_id = column_exists(&conn, "messages", "thread_id")?;
     let has_sender_id = column_exists(&conn, "messages", "sender_id")?;
 
@@ -402,6 +408,10 @@ fn column_exists(
 mod tests {
     use super::*;
 
+    fn file_size(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
     /// Create a test DB with the standard schema.
     fn create_test_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test_finalize.sqlite3");
@@ -571,10 +581,46 @@ mod tests {
         let mode: String = rows[0].get_named("journal_mode").unwrap();
         assert_eq!(mode, "delete");
 
+        // Verify page size
+        let rows = conn.query_sync("PRAGMA page_size", &[]).unwrap();
+        let page_size: i64 = rows[0].get_named("page_size").unwrap();
+        assert_eq!(page_size, 1024);
+
         // Verify integrity
         let rows = conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
         let result: String = rows[0].get_named("integrity_check").unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn finalize_shrinks_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        // Inflate DB then delete to leave free pages.
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let big_body = "x".repeat(10_000);
+        for i in 0..200 {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages VALUES ({}, 1, 1, 'TKT-9', 'Bloat', '{}', \
+                 'normal', 0, '2025-01-02T00:00:00Z', '[]')",
+                1000 + i,
+                big_body
+            ))
+            .unwrap();
+        }
+        conn.execute_raw("DELETE FROM messages WHERE id >= 1000")
+            .unwrap();
+        drop(conn);
+
+        let before = file_size(&db);
+        finalize_snapshot_for_export(&db).unwrap();
+        let after = file_size(&db);
+
+        assert!(
+            after < before,
+            "expected VACUUM to shrink DB (before={before}, after={after})"
+        );
     }
 
     #[test]

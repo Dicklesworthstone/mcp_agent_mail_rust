@@ -122,6 +122,9 @@ pub fn apply_project_scope(
 
     for ident in identifiers {
         let key = ident.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
         match lookup.get(&key) {
             Some(p) => {
                 if seen_ids.insert(p.id) {
@@ -211,9 +214,7 @@ pub fn apply_project_scope(
             let msg_values: Vec<Value> = msg_ids.iter().map(|&id| Value::BigInt(id)).collect();
             exec(
                 &conn,
-                &format!(
-                    "DELETE FROM message_recipients WHERE message_id IN ({msg_placeholders})"
-                ),
+                &format!("DELETE FROM message_recipients WHERE message_id IN ({msg_placeholders})"),
                 &msg_values,
             )?;
         }
@@ -537,6 +538,20 @@ mod tests {
         let db = create_test_db(dir.path());
         let result = apply_project_scope(&db, &["/DATA/PROJECTS/ALPHA".to_string()]).unwrap();
         assert_eq!(result.removed_count, 1);
+        assert_eq!(result.projects[0].slug, "proj-alpha");
+    }
+
+    #[test]
+    fn scope_ignores_empty_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let result = apply_project_scope(
+            &db,
+            &["".to_string(), "   ".to_string(), "proj-alpha".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.removed_count, 1);
+        assert_eq!(result.projects.len(), 1);
         assert_eq!(result.projects[0].slug, "proj-alpha");
     }
 

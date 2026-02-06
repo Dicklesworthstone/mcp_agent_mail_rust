@@ -1,4 +1,4 @@
-//! Step 1: SQLite snapshot creation via WAL checkpoint + VACUUM INTO.
+//! Step 1: SQLite snapshot creation via WAL checkpoint + online backup API.
 //!
 //! Creates an atomic, clean copy of the source database suitable for
 //! offline manipulation (scoping, scrubbing, etc.).
@@ -9,10 +9,10 @@ use crate::ShareError;
 
 /// Create a snapshot of the source SQLite database at `destination`.
 ///
-/// 1. Opens source DB in read-only mode.
+/// 1. Opens source DB.
 /// 2. If `checkpoint` is true, runs `PRAGMA wal_checkpoint(PASSIVE)` to
 ///    flush as much WAL data as possible without blocking writers.
-/// 3. Uses `VACUUM INTO` to atomically create a clean, compacted copy.
+/// 3. Uses SQLite's online backup API to copy the source into the destination.
 ///
 /// Returns the destination path on success.
 ///
@@ -53,29 +53,37 @@ pub fn create_sqlite_snapshot(
         std::fs::create_dir_all(parent)?;
     }
 
-    // Open source connection (read-only is fine for snapshot)
     let source_str = source.display().to_string();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&source_str).map_err(|e| {
-        ShareError::Sqlite {
-            message: format!("cannot open source DB {source_str}: {e}"),
-        }
-    })?;
 
-    // Checkpoint WAL if requested
+    // Checkpoint WAL if requested (requires a read-write connection).
     if checkpoint {
-        conn.execute_raw("PRAGMA wal_checkpoint(PASSIVE)")
+        let checkpoint_conn = sqlmodel_sqlite::SqliteConnection::open(
+            &sqlmodel_sqlite::SqliteConfig::file(&source_str)
+                .flags(sqlmodel_sqlite::OpenFlags::read_write()),
+        )
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("cannot open source DB {source_str}: {e}"),
+        })?;
+        checkpoint_conn
+            .execute_raw("PRAGMA wal_checkpoint(PASSIVE)")
             .map_err(|e| ShareError::Sqlite {
                 message: format!("WAL checkpoint failed: {e}"),
             })?;
     }
 
-    // VACUUM INTO creates an atomic, clean copy of the database.
-    // Available since SQLite 3.27.0 (2019-02-07).
-    // We must quote the path properly for SQL — use single-quote escaping.
-    let dest_sql = dest.display().to_string().replace('\'', "''");
-    conn.execute_raw(&format!("VACUUM INTO '{dest_sql}'"))
+    // Open source connection read-only for backup.
+    let conn = sqlmodel_sqlite::SqliteConnection::open(
+        &sqlmodel_sqlite::SqliteConfig::file(&source_str)
+            .flags(sqlmodel_sqlite::OpenFlags::read_only()),
+    )
+    .map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open source DB {source_str}: {e}"),
+    })?;
+
+    let dest_str = dest.display().to_string();
+    conn.backup_to_path(&dest_str)
         .map_err(|e| ShareError::Sqlite {
-            message: format!("VACUUM INTO failed: {e}"),
+            message: format!("backup failed: {e}"),
         })?;
 
     Ok(dest)
@@ -161,6 +169,11 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let name: String = rows[0].get_named("name").unwrap();
         assert_eq!(name, "hello");
+
+        // Backup API should produce a byte-identical copy.
+        let source_bytes = std::fs::read(&source).unwrap();
+        let dest_bytes = std::fs::read(&dest).unwrap();
+        assert_eq!(source_bytes, dest_bytes);
     }
 
     #[test]

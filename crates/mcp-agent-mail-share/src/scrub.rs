@@ -304,10 +304,9 @@ pub fn scrub_snapshot(
 
     match result {
         Ok(summary) => {
-            conn.execute_raw("COMMIT")
-                .map_err(|e| ShareError::Sqlite {
-                    message: format!("COMMIT failed: {e}"),
-                })?;
+            conn.execute_raw("COMMIT").map_err(|e| ShareError::Sqlite {
+                message: format!("COMMIT failed: {e}"),
+            })?;
             Ok(summary)
         }
         Err(err) => {
@@ -340,6 +339,10 @@ fn parse_attachments_json(value: &str) -> Vec<Value> {
     }
     match serde_json::from_str::<Value>(value) {
         Ok(Value::Array(arr)) => arr,
+        Ok(Value::String(inner)) => match serde_json::from_str::<Value>(&inner) {
+            Ok(Value::Array(arr)) => arr,
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
