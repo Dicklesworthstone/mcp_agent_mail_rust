@@ -328,6 +328,8 @@ mod tests {
             &scrub,
             &att_manifest,
             chunk.as_ref(),
+            crate::DEFAULT_CHUNK_THRESHOLD,
+            crate::DEFAULT_CHUNK_SIZE,
             &hints,
             finalize.fts_enabled,
             "mailbox.sqlite3",

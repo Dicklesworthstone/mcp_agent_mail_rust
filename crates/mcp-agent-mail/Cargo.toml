@@ -28,7 +28,11 @@ fastmcp = { workspace = true }
 fastmcp-core = { workspace = true }
 mcp-agent-mail-conformance = { workspace = true }
 mcp-agent-mail-db = { workspace = true }
+mcp-agent-mail-share = { workspace = true }
 tempfile = { workspace = true }
+sqlmodel-sqlite = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [[bench]]
 name = "benchmarks"

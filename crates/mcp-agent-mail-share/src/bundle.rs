@@ -98,7 +98,10 @@ pub fn bundle_attachments(
 
     let rows = conn
         .query_sync(
-            "SELECT id, attachments FROM messages WHERE attachments != '[]' AND attachments != ''",
+            "SELECT id, attachments \
+             FROM messages \
+             WHERE attachments != '[]' AND attachments != '' \
+             ORDER BY id ASC",
             &[],
         )
         .map_err(|e| ShareError::Sqlite {
@@ -367,6 +370,8 @@ pub fn write_bundle_scaffolding(
     scrub_summary: &ScrubSummary,
     attachment_manifest: &AttachmentManifest,
     chunk_manifest: Option<&ChunkManifest>,
+    chunk_threshold: usize,
+    chunk_size: usize,
     hosting_hints: &[HostingHint],
     fts_enabled: bool,
     db_path_relative: &str,
@@ -381,6 +386,8 @@ pub fn write_bundle_scaffolding(
         scrub_summary,
         attachment_manifest,
         chunk_manifest,
+        chunk_threshold,
+        chunk_size,
         hosting_hints,
         fts_enabled,
         db_path_relative,
@@ -586,6 +593,8 @@ fn build_manifest(
     scrub_summary: &ScrubSummary,
     attachment_manifest: &AttachmentManifest,
     chunk_manifest: Option<&ChunkManifest>,
+    chunk_threshold: usize,
+    chunk_size: usize,
     hosting_hints: &[HostingHint],
     fts_enabled: bool,
     db_path_relative: &str,
@@ -668,6 +677,8 @@ fn build_manifest(
             "scrub_preset": scrub_summary.preset,
             "inline_threshold": attachment_manifest.config.inline_threshold,
             "detach_threshold": attachment_manifest.config.detach_threshold,
+            "chunk_threshold": chunk_threshold,
+            "chunk_size": chunk_size,
         },
     })
 }
@@ -888,7 +899,7 @@ pub fn export_viewer_data(
         .query_sync(
             "SELECT id, subject, created_ts, importance, \
              SUBSTR(body_md, 1, 200) AS snippet \
-             FROM messages ORDER BY created_ts DESC LIMIT ?",
+             FROM messages ORDER BY created_ts DESC, id DESC LIMIT ?",
             &[SqlValue::BigInt(VIEWER_MESSAGE_CACHE_LIMIT as i64)],
         )
         .map_err(|e| ShareError::Sqlite {
@@ -1722,6 +1733,8 @@ mod tests {
             &scrub,
             &att,
             None,
+            crate::DEFAULT_CHUNK_THRESHOLD,
+            crate::DEFAULT_CHUNK_SIZE,
             &[],
             true,
             "mailbox.sqlite3",
@@ -1735,6 +1748,8 @@ mod tests {
             &scrub,
             &att,
             None,
+            crate::DEFAULT_CHUNK_THRESHOLD,
+            crate::DEFAULT_CHUNK_SIZE,
             &[],
             true,
             "mailbox.sqlite3",
@@ -1804,6 +1819,8 @@ mod tests {
             &scrub,
             &att,
             None,
+            crate::DEFAULT_CHUNK_THRESHOLD,
+            crate::DEFAULT_CHUNK_SIZE,
             &[],
             true,
             "db.sqlite3",
@@ -1852,6 +1869,8 @@ mod tests {
             &scrub,
             &att,
             None,
+            crate::DEFAULT_CHUNK_THRESHOLD,
+            crate::DEFAULT_CHUNK_SIZE,
             &[],
             true,
             "db.sqlite3",
@@ -1877,6 +1896,8 @@ mod tests {
             &scrub,
             &att,
             Some(&chunk),
+            chunk.threshold_bytes,
+            chunk.chunk_size,
             &[],
             true,
             "db.sqlite3",
@@ -1919,6 +1940,8 @@ mod tests {
             &scrub,
             &att,
             None,
+            crate::DEFAULT_CHUNK_THRESHOLD,
+            crate::DEFAULT_CHUNK_SIZE,
             &[],
             true,
             "db.sqlite3",
@@ -1953,6 +1976,8 @@ mod tests {
         assert!(ec.get("scrub_preset").is_some());
         assert!(ec.get("inline_threshold").is_some());
         assert!(ec.get("detach_threshold").is_some());
+        assert!(ec.get("chunk_threshold").is_some());
+        assert!(ec.get("chunk_size").is_some());
     }
 
     #[test]
@@ -1984,6 +2009,8 @@ mod tests {
             &scrub,
             &att,
             None,
+            crate::DEFAULT_CHUNK_THRESHOLD,
+            crate::DEFAULT_CHUNK_SIZE,
             &[],
             true,
             "db.sqlite3",
