@@ -222,10 +222,23 @@ fn main() {
             ftui_runtime::ftui_println!("{:#?}", config);
         }
         Some(cmd) => {
-            // TODO: Implement CLI commands
-            ftui_runtime::ftui_eprintln!("Command not yet implemented: {:?}", cmd);
+            let (exit_code, message) = unsupported_command_response(&cmd);
+            ftui_runtime::ftui_eprintln!("{message}");
+            std::process::exit(exit_code);
         }
     }
+}
+
+fn unsupported_command_response(cmd: &Commands) -> (i32, String) {
+    (
+        2,
+        format!(
+            "Command {cmd:?} is not implemented in the `mcp-agent-mail` binary.\n\
+Use the full CLI instead:\n\
+  am <command> ...\n\
+  cargo run -p mcp-agent-mail-cli -- <command> ..."
+        ),
+    )
 }
 
 impl std::fmt::Debug for Commands {
@@ -243,5 +256,27 @@ impl std::fmt::Debug for Commands {
             Self::Doctor { .. } => write!(f, "Doctor"),
             Self::Config => write!(f, "Config"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_command_response_is_nonzero_with_cli_guidance() {
+        let cmd = Commands::Guard {
+            action: GuardAction::Install {
+                project: "my-project".to_string(),
+                code_repo_path: "/tmp/repo".to_string(),
+            },
+        };
+
+        let (exit_code, message) = unsupported_command_response(&cmd);
+
+        assert_eq!(exit_code, 2);
+        assert!(message.contains("not implemented"));
+        assert!(message.contains("mcp-agent-mail-cli"));
+        assert!(message.contains("am <command> ..."));
     }
 }

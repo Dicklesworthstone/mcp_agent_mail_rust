@@ -947,3 +947,116 @@ fn stress_pool_exhaustion_recovery() {
         "all threads should succeed despite pool contention"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Integration test: fetch_unacked_for_agent
+// ---------------------------------------------------------------------------
+
+/// Verifies that `fetch_unacked_for_agent` returns ack-required messages
+/// that have not been acknowledged, and excludes them once acknowledged.
+#[test]
+fn fetch_unacked_returns_pending_and_excludes_acknowledged() {
+    let (pool, _dir) = make_pool();
+
+    block_on(|cx| async move {
+        // Setup: project + two agents
+        let proj = match queries::ensure_project(&cx, &pool, "/data/test-unacked").await {
+            Outcome::Ok(p) => p,
+            _ => panic!("ensure_project failed"),
+        };
+        let pid = proj.id.unwrap();
+
+        let sender =
+            match queries::register_agent(&cx, &pool, pid, "GreenElk", "test", "test", None, None)
+                .await
+            {
+                Outcome::Ok(a) => a,
+                Outcome::Err(e) => panic!("register sender failed: {e:?}"),
+                _ => panic!("register sender: unexpected outcome"),
+            };
+        let receiver =
+            match queries::register_agent(&cx, &pool, pid, "BlueDeer", "test", "test", None, None)
+                .await
+            {
+                Outcome::Ok(a) => a,
+                Outcome::Err(e) => panic!("register receiver failed: {e:?}"),
+                _ => panic!("register receiver: unexpected outcome"),
+            };
+
+        let sender_id = sender.id.unwrap();
+        let receiver_id = receiver.id.unwrap();
+
+        // Create an ack-required message with recipient
+        let msg = match queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            pid,
+            sender_id,
+            "Please ack this",
+            "Test body",
+            None,
+            "normal",
+            true, // ack_required
+            "",
+            &[(receiver_id, "to")],
+        )
+        .await
+        {
+            Outcome::Ok(m) => m,
+            _ => panic!("create_message_with_recipients failed"),
+        };
+        let msg_id = msg.id.unwrap();
+
+        // Also create a non-ack message (should NOT appear)
+        match queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            pid,
+            sender_id,
+            "No ack needed",
+            "Body 2",
+            None,
+            "normal",
+            false, // ack_required = false
+            "",
+            &[(receiver_id, "to")],
+        )
+        .await
+        {
+            Outcome::Ok(_) => {}
+            _ => panic!("create non-ack message failed"),
+        }
+
+        // Fetch unacked: should return exactly the ack-required message
+        let unacked = match queries::fetch_unacked_for_agent(&cx, &pool, pid, receiver_id, 50).await
+        {
+            Outcome::Ok(rows) => rows,
+            _ => panic!("fetch_unacked_for_agent failed"),
+        };
+
+        assert_eq!(unacked.len(), 1, "expected 1 unacked message");
+        assert_eq!(unacked[0].message.id, Some(msg_id));
+        assert_eq!(unacked[0].sender_name, "GreenElk");
+        assert_eq!(unacked[0].kind, "to");
+        assert!(unacked[0].read_ts.is_none());
+
+        // Acknowledge the message
+        match queries::acknowledge_message(&cx, &pool, receiver_id, msg_id).await {
+            Outcome::Ok(_) => {}
+            _ => panic!("acknowledge_message failed"),
+        }
+
+        // Fetch unacked again: should now be empty
+        let unacked_after =
+            match queries::fetch_unacked_for_agent(&cx, &pool, pid, receiver_id, 50).await {
+                Outcome::Ok(rows) => rows,
+                _ => panic!("fetch_unacked_for_agent after ack failed"),
+            };
+
+        assert!(
+            unacked_after.is_empty(),
+            "expected 0 unacked messages after acknowledgement, got {}",
+            unacked_after.len()
+        );
+    });
+}

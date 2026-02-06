@@ -3210,6 +3210,141 @@ pub async fn list_unacknowledged_messages(
     }
 }
 
+/// Row returned by [`fetch_unacked_for_agent`].
+#[derive(Debug, Clone)]
+pub struct UnackedInboxRow {
+    pub message: MessageRow,
+    pub kind: String,
+    pub sender_name: String,
+    pub read_ts: Option<i64>,
+}
+
+/// Fetch ack-required messages for a specific agent that have NOT been acknowledged.
+///
+/// Returns messages ordered by `created_ts` ascending (oldest first), limited to
+/// `limit` rows. Each row includes the recipient `read_ts` so callers can report
+/// whether the message was at least read even if not acked.
+#[allow(clippy::too_many_lines)]
+pub async fn fetch_unacked_for_agent(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    limit: usize,
+) -> Outcome<Vec<UnackedInboxRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+
+    let sql = "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+                      m.importance, m.ack_required, m.created_ts, m.attachments, \
+                      r.kind, s.name AS sender_name, r.read_ts \
+               FROM message_recipients r \
+               JOIN messages m ON m.id = r.message_id \
+               JOIN agents s ON s.id = m.sender_id \
+               WHERE r.agent_id = ? AND m.project_id = ? \
+                 AND m.ack_required = 1 AND r.ack_ts IS NULL \
+               ORDER BY m.created_ts ASC \
+               LIMIT ?";
+
+    let params: Vec<Value> = vec![
+        Value::BigInt(agent_id),
+        Value::BigInt(project_id),
+        Value::BigInt(limit_i64),
+    ];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: i64 = match row.get_named("id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let proj_id: i64 = match row.get_named("project_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let sender_id: i64 = match row.get_named("sender_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let thread_id: Option<String> = match row.get_named("thread_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let subject: String = match row.get_named("subject") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let body_md: String = match row.get_named("body_md") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let importance: String = match row.get_named("importance") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let ack_required: i64 = match row.get_named("ack_required") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let created_ts: i64 = match row.get_named("created_ts") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let attachments: String = match row.get_named("attachments") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let kind: String = match row.get_named("kind") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let sender_name: String = match row.get_named("sender_name") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let read_ts: Option<i64> = match row.get_named("read_ts") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+
+                out.push(UnackedInboxRow {
+                    message: MessageRow {
+                        id: Some(id),
+                        project_id: proj_id,
+                        sender_id,
+                        thread_id,
+                        subject,
+                        body_md,
+                        importance,
+                        ack_required,
+                        created_ts,
+                        attachments,
+                    },
+                    kind,
+                    sender_name,
+                    read_ts,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// Insert a raw agent row without name validation (for ops/system agents).
 ///
 /// Used by the ACK TTL escalation worker to auto-create holder agents.

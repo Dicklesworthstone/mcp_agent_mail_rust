@@ -508,3 +508,261 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
         discovery,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // slugify
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn slugify_simple_path() {
+        assert_eq!(slugify("/data/projects/backend"), "data-projects-backend");
+    }
+
+    #[test]
+    fn slugify_collapses_runs_of_non_alnum() {
+        assert_eq!(
+            slugify("/data///projects///backend"),
+            "data-projects-backend"
+        );
+    }
+
+    #[test]
+    fn slugify_trims_dashes() {
+        assert_eq!(slugify("---hello---"), "hello");
+    }
+
+    #[test]
+    fn slugify_lowercases() {
+        assert_eq!(slugify("MyProject"), "myproject");
+    }
+
+    #[test]
+    fn slugify_empty_returns_project() {
+        assert_eq!(slugify(""), "project");
+    }
+
+    #[test]
+    fn slugify_all_special_chars_returns_project() {
+        assert_eq!(slugify("///---///"), "project");
+    }
+
+    #[test]
+    fn slugify_spaces_become_dashes() {
+        assert_eq!(slugify("  hello  world  "), "hello-world");
+    }
+
+    #[test]
+    fn slugify_mixed_separators() {
+        assert_eq!(slugify("my_project.v2@latest"), "my-project-v2-latest");
+    }
+
+    #[test]
+    fn slugify_unicode_stripped() {
+        assert_eq!(slugify("/data/café/naïve"), "data-caf-na-ve");
+    }
+
+    #[test]
+    fn slugify_preserves_digits() {
+        assert_eq!(slugify("v1.2.3-rc4"), "v1-2-3-rc4");
+    }
+
+    // -----------------------------------------------------------------------
+    // sha1_hex / short_sha1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sha1_hex_known_value() {
+        // SHA-1 of "hello" is well-known
+        assert_eq!(
+            sha1_hex("hello"),
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+        );
+    }
+
+    #[test]
+    fn sha1_hex_empty() {
+        assert_eq!(sha1_hex(""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    #[test]
+    fn short_sha1_truncates() {
+        let full = sha1_hex("hello");
+        let short = short_sha1("hello", 10);
+        assert_eq!(short.len(), 10);
+        assert_eq!(short, &full[..10]);
+    }
+
+    #[test]
+    fn short_sha1_zero_length() {
+        let short = short_sha1("hello", 0);
+        assert!(short.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_remote_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_remote_https() {
+        let (host, path) = parse_remote_url("https://github.com/user/repo.git").unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(path, "user/repo.git");
+    }
+
+    #[test]
+    fn parse_remote_ssh_at_colon() {
+        let (host, path) = parse_remote_url("git@github.com:user/repo.git").unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(path, "user/repo.git");
+    }
+
+    #[test]
+    fn parse_remote_ssh_protocol() {
+        let (host, path) = parse_remote_url("ssh://git@github.com/user/repo.git").unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(path, "user/repo.git");
+    }
+
+    #[test]
+    fn parse_remote_with_port() {
+        let (host, path) = parse_remote_url("https://github.com:443/user/repo.git").unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(path, "user/repo.git");
+    }
+
+    #[test]
+    fn parse_remote_empty_returns_none() {
+        assert!(parse_remote_url("").is_none());
+    }
+
+    #[test]
+    fn parse_remote_whitespace_only_returns_none() {
+        assert!(parse_remote_url("   ").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_remote_first_two
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_remote_first_two_https() {
+        let result = normalize_remote_first_two("https://github.com/user/repo.git").unwrap();
+        assert_eq!(result, "github.com/user/repo");
+    }
+
+    #[test]
+    fn normalize_remote_first_two_ssh() {
+        let result = normalize_remote_first_two("git@github.com:user/repo.git").unwrap();
+        assert_eq!(result, "github.com/user/repo");
+    }
+
+    #[test]
+    fn normalize_remote_first_two_strips_git_suffix() {
+        let with_git = normalize_remote_first_two("https://github.com/user/repo.git").unwrap();
+        let without_git = normalize_remote_first_two("https://github.com/user/repo").unwrap();
+        assert_eq!(with_git, without_git);
+    }
+
+    #[test]
+    fn normalize_remote_first_two_too_few_segments() {
+        // Only one path segment -> None
+        assert!(normalize_remote_first_two("https://github.com/just-one").is_none());
+    }
+
+    #[test]
+    fn normalize_remote_first_two_deep_path() {
+        // Takes only first two segments
+        let result =
+            normalize_remote_first_two("https://gitlab.com/org/sub/deep/repo.git").unwrap();
+        assert_eq!(result, "gitlab.com/org/sub");
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_remote_last_two
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_remote_last_two_https() {
+        let result = normalize_remote_last_two("https://github.com/user/repo.git").unwrap();
+        assert_eq!(result, "github.com/user/repo");
+    }
+
+    #[test]
+    fn normalize_remote_last_two_deep_path() {
+        // Takes last two segments
+        let result = normalize_remote_last_two("https://gitlab.com/org/sub/deep/repo.git").unwrap();
+        assert_eq!(result, "gitlab.com/deep/repo");
+    }
+
+    // -----------------------------------------------------------------------
+    // read_discovery_yaml
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_discovery_yaml_parses_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".agent-mail.yaml"),
+            "project_uid: my-proj-uid\nproduct_uid: my-prod-uid\n",
+        )
+        .expect("write");
+        let info = read_discovery_yaml(tmp.path());
+        assert_eq!(info.project_uid.as_deref(), Some("my-proj-uid"));
+        assert_eq!(info.product_uid.as_deref(), Some("my-prod-uid"));
+    }
+
+    #[test]
+    fn read_discovery_yaml_handles_comments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".agent-mail.yaml"),
+            "# comment\nproject_uid: uid123 # inline\n",
+        )
+        .expect("write");
+        let info = read_discovery_yaml(tmp.path());
+        assert_eq!(info.project_uid.as_deref(), Some("uid123"));
+    }
+
+    #[test]
+    fn read_discovery_yaml_strips_quotes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".agent-mail.yaml"),
+            "project_uid: 'quoted'\nproduct_uid: \"double\"\n",
+        )
+        .expect("write");
+        let info = read_discovery_yaml(tmp.path());
+        assert_eq!(info.project_uid.as_deref(), Some("quoted"));
+        assert_eq!(info.product_uid.as_deref(), Some("double"));
+    }
+
+    #[test]
+    fn read_discovery_yaml_missing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let info = read_discovery_yaml(tmp.path());
+        assert!(info.project_uid.is_none());
+        assert!(info.product_uid.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // mode_to_str
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mode_to_str_covers_all_variants() {
+        assert_eq!(mode_to_str(ProjectIdentityMode::Dir), "dir");
+        assert_eq!(mode_to_str(ProjectIdentityMode::GitRemote), "git-remote");
+        assert_eq!(
+            mode_to_str(ProjectIdentityMode::GitCommonDir),
+            "git-common-dir"
+        );
+        assert_eq!(
+            mode_to_str(ProjectIdentityMode::GitToplevel),
+            "git-toplevel"
+        );
+    }
+}

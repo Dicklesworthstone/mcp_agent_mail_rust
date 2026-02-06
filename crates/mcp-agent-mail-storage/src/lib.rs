@@ -1009,7 +1009,7 @@ impl CommitCoalescer {
         if self.sender.send(msg).is_err() {
             // Worker thread died — fallback to synchronous commit so files
             // that are already on disk still get committed to git.
-            eprintln!("[commit-coalescer] worker unreachable, sync fallback");
+            tracing::warn!("[commit-coalescer] worker unreachable, sync fallback");
             if let Ok(repo) = Repository::open(&repo_root) {
                 let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
                 let _ = commit_paths(&repo, config, &message, &refs);
@@ -1199,7 +1199,7 @@ fn coalescer_commit_batch(
             }
         }
         if let Some(e) = last_err {
-            eprintln!("[commit-coalescer] partial failure in sequential batch: {e}");
+            tracing::warn!("[commit-coalescer] partial failure in sequential batch: {e}");
         }
         Ok(total)
     };
@@ -1228,7 +1228,7 @@ fn coalescer_commit_batch(
             s.avg_batch_size = (avg * 100.0).round() / 100.0;
         }
         Err(e) => {
-            eprintln!("[commit-coalescer] batch commit error: {e}");
+            tracing::warn!("[commit-coalescer] batch commit error: {e}");
             let mut s = stats
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);

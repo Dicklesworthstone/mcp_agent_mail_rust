@@ -157,6 +157,15 @@ fn cli_help_snapshots() {
         ("amctl_env", &["amctl", "env", "--help"]),
         ("am_run", &["am-run", "--help"]),
         ("projects", &["projects", "--help"]),
+        (
+            "projects_mark_identity",
+            &["projects", "mark-identity", "--help"],
+        ),
+        (
+            "projects_discovery_init",
+            &["projects", "discovery-init", "--help"],
+        ),
+        ("projects_adopt", &["projects", "adopt", "--help"]),
     ];
 
     for (case, args) in cases {

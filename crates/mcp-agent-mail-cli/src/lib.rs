@@ -1825,57 +1825,520 @@ fn run_python_script_in_cwd(script: &Path, cwd: &Path) -> CliResult<()> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ProjectsAdoptRecord {
+    id: i64,
+    slug: String,
+    human_key: String,
+}
+
+fn git_output_text(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn git_repo_root(path: &Path) -> Option<PathBuf> {
+    git_output_text(path, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+}
+
+fn git_common_dir(path: &Path) -> Option<PathBuf> {
+    let value = git_output_text(path, &["rev-parse", "--git-common-dir"])?;
+    let common = PathBuf::from(value);
+    let resolved = if common.is_absolute() {
+        common
+    } else {
+        let root = git_repo_root(path).unwrap_or_else(|| path.to_path_buf());
+        root.join(common)
+    };
+    std::fs::canonicalize(&resolved).ok().or(Some(resolved))
+}
+
+fn find_project_for_adopt(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    slug_or_key: &str,
+) -> CliResult<ProjectsAdoptRecord> {
+    let rows = conn
+        .query_sync(
+            "SELECT id, slug, human_key FROM projects \
+             WHERE slug = ? OR human_key = ? \
+             ORDER BY CASE WHEN slug = ? THEN 0 ELSE 1 END \
+             LIMIT 1",
+            &[
+                sqlmodel_core::Value::Text(slug_or_key.to_string()),
+                sqlmodel_core::Value::Text(slug_or_key.to_string()),
+                sqlmodel_core::Value::Text(slug_or_key.to_string()),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("project lookup failed: {e}")))?;
+    let Some(row) = rows.first() else {
+        return Err(CliError::InvalidArgument(format!(
+            "project not found: {slug_or_key}"
+        )));
+    };
+    let id: i64 = row.get_named("id").unwrap_or(0);
+    let slug: String = row.get_named("slug").unwrap_or_default();
+    let human_key: String = row.get_named("human_key").unwrap_or_default();
+    if id <= 0 || slug.is_empty() || human_key.is_empty() {
+        return Err(CliError::Other(format!(
+            "invalid project row for '{slug_or_key}'"
+        )));
+    }
+    Ok(ProjectsAdoptRecord {
+        id,
+        slug,
+        human_key,
+    })
+}
+
+fn collect_files_recursive(root: &Path) -> CliResult<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut stack = vec![root.to_path_buf()];
+    let mut files: Vec<PathBuf> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if ty.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn move_archive_files(
+    src_root: &Path,
+    dst_root: &Path,
+    repo_root: &Path,
+) -> CliResult<Vec<String>> {
+    let mut changed_paths: Vec<String> = Vec::new();
+    for path in collect_files_recursive(src_root)? {
+        let skip = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".lock") || name.ends_with(".lock.owner.json"));
+        if skip {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(src_root) else {
+            continue;
+        };
+        let dest_path = dst_root.join(rel);
+        if dest_path.exists() {
+            continue;
+        }
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        match std::fs::rename(&path, &dest_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+                std::fs::copy(&path, &dest_path)?;
+                std::fs::remove_file(&path)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        let repo_rel = dest_path
+            .strip_prefix(repo_root)
+            .ok()
+            .unwrap_or(&dest_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        changed_paths.push(repo_rel);
+    }
+    Ok(changed_paths)
+}
+
+enum GitCommitOutcome {
+    Committed,
+    NothingToCommit,
+    Failed(String),
+}
+
+fn git_add_and_commit(
+    repo_root: &Path,
+    config: &Config,
+    rel_paths: &[String],
+    message: &str,
+) -> GitCommitOutcome {
+    if rel_paths.is_empty() {
+        return GitCommitOutcome::NothingToCommit;
+    }
+
+    let add_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("add")
+        .args(rel_paths)
+        .output();
+    let add_output = match add_output {
+        Ok(output) => output,
+        Err(err) => return GitCommitOutcome::Failed(format!("git add failed: {err}")),
+    };
+    if !add_output.status.success() {
+        return GitCommitOutcome::Failed(format!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&add_output.stderr).trim()
+        ));
+    }
+
+    let commit_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("commit")
+        .arg("-m")
+        .arg(message)
+        .env("GIT_AUTHOR_NAME", &config.git_author_name)
+        .env("GIT_AUTHOR_EMAIL", &config.git_author_email)
+        .env("GIT_COMMITTER_NAME", &config.git_author_name)
+        .env("GIT_COMMITTER_EMAIL", &config.git_author_email)
+        .output();
+    let commit_output = match commit_output {
+        Ok(output) => output,
+        Err(err) => return GitCommitOutcome::Failed(format!("git commit failed: {err}")),
+    };
+    if commit_output.status.success() {
+        return GitCommitOutcome::Committed;
+    }
+
+    let stderr_text = String::from_utf8_lossy(&commit_output.stderr).to_ascii_lowercase();
+    if stderr_text.contains("nothing to commit") || stderr_text.contains("no changes added") {
+        return GitCommitOutcome::NothingToCommit;
+    }
+
+    GitCommitOutcome::Failed(format!(
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit_output.stderr).trim()
+    ))
+}
+
+fn handle_project_mark_identity(project_path: &Path, should_commit: bool) -> CliResult<()> {
+    ensure_dir(project_path)?;
+    let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
+    if identity.project_uid.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "unable to resolve project_uid for this path".to_string(),
+        ));
+    }
+
+    let root = git_repo_root(project_path).unwrap_or_else(|| project_path.to_path_buf());
+    let marker_path = root.join(".agent-mail-project-id");
+    std::fs::write(&marker_path, format!("{}\n", identity.project_uid))?;
+    ftui_runtime::ftui_println!(
+        "Wrote {} with project_uid={}",
+        marker_path.display(),
+        identity.project_uid
+    );
+
+    if should_commit {
+        let config = Config::from_env();
+        let rel_paths = vec![
+            marker_path
+                .strip_prefix(&root)
+                .ok()
+                .unwrap_or(&marker_path)
+                .to_string_lossy()
+                .replace('\\', "/"),
+        ];
+        match git_add_and_commit(
+            &root,
+            &config,
+            &rel_paths,
+            "chore: add .agent-mail-project-id",
+        ) {
+            GitCommitOutcome::Committed => ftui_runtime::ftui_println!("Committed marker file."),
+            GitCommitOutcome::NothingToCommit => {
+                ftui_runtime::ftui_println!("Marker file already committed (no changes to commit).")
+            }
+            GitCommitOutcome::Failed(msg) => {
+                ftui_runtime::ftui_eprintln!(
+                    "Warning: unable to commit marker automatically. {msg}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_project_discovery_init(project_path: &Path, product: Option<String>) -> CliResult<()> {
+    ensure_dir(project_path)?;
+    let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
+    if identity.project_uid.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "unable to resolve project_uid for this path".to_string(),
+        ));
+    }
+
+    let yaml_path = project_path.join(".agent-mail.yaml");
+    let mut lines = vec![
+        "# Agent Mail discovery file".to_string(),
+        format!("project_uid: {}", identity.project_uid),
+    ];
+    if let Some(product_uid) = product.filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("product_uid: {product_uid}"));
+    }
+    std::fs::write(&yaml_path, format!("{}\n", lines.join("\n")))?;
+    ftui_runtime::ftui_println!("Wrote {}", yaml_path.display());
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_projects_adopt_with_conn(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    config: &Config,
+    source: &str,
+    target: &str,
+    dry_run: bool,
+    apply: bool,
+) -> CliResult<()> {
+    let source_project = find_project_for_adopt(conn, source)?;
+    let target_project = find_project_for_adopt(conn, target)?;
+
+    if source_project.id == target_project.id {
+        ftui_runtime::ftui_println!("Source and target refer to the same project; nothing to do.");
+        return Ok(());
+    }
+
+    let source_common = git_common_dir(Path::new(&source_project.human_key));
+    let target_common = git_common_dir(Path::new(&target_project.human_key));
+    let same_repo = source_common.is_some() && source_common == target_common;
+
+    let source_archive = config
+        .storage_root
+        .join("projects")
+        .join(&source_project.slug);
+    let target_archive = config
+        .storage_root
+        .join("projects")
+        .join(&target_project.slug);
+
+    ftui_runtime::ftui_println!("Projects adopt plan (dry-run)");
+    ftui_runtime::ftui_println!(
+        "- Source: id={} slug={} key={}",
+        source_project.id,
+        source_project.slug,
+        source_project.human_key
+    );
+    ftui_runtime::ftui_println!(
+        "- Target: id={} slug={} key={}",
+        target_project.id,
+        target_project.slug,
+        target_project.human_key
+    );
+    ftui_runtime::ftui_println!(
+        "- Same repo (git-common-dir): {}",
+        if same_repo { "yes" } else { "no" }
+    );
+    ftui_runtime::ftui_println!(
+        "- Move Git artifacts: {} -> {}",
+        source_archive.display(),
+        target_archive.display()
+    );
+    ftui_runtime::ftui_println!(
+        "- Re-key DB rows: source project_id -> target project_id (agents/messages/file_reservations)"
+    );
+    ftui_runtime::ftui_println!(
+        "- Write aliases.json under target project archive with former_slugs"
+    );
+
+    if !same_repo {
+        ftui_runtime::ftui_eprintln!(
+            "Refusing to adopt: projects do not appear to belong to the same repository."
+        );
+        return Ok(());
+    }
+
+    let effective_dry_run = if apply { false } else { dry_run };
+    if effective_dry_run {
+        return Ok(());
+    }
+
+    let duplicate_agent_rows = conn
+        .query_sync(
+            "SELECT s.name AS name FROM agents s \
+             INNER JOIN agents d ON s.name = d.name \
+             WHERE s.project_id = ? AND d.project_id = ? \
+             ORDER BY s.name",
+            &[
+                sqlmodel_core::Value::BigInt(source_project.id),
+                sqlmodel_core::Value::BigInt(target_project.id),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("agent conflict check failed: {e}")))?;
+    let mut duplicate_agent_names: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for row in duplicate_agent_rows {
+        let name: String = row.get_named("name").unwrap_or_default();
+        if !name.is_empty() {
+            duplicate_agent_names.insert(name);
+        }
+    }
+    if !duplicate_agent_names.is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "agent name conflicts in target project: {}",
+            duplicate_agent_names
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    std::fs::create_dir_all(&source_archive)?;
+    std::fs::create_dir_all(&target_archive)?;
+
+    let mut changed_paths =
+        move_archive_files(&source_archive, &target_archive, &config.storage_root)?;
+
+    conn.execute_sync(
+        "UPDATE agents SET project_id = ? WHERE project_id = ?",
+        &[
+            sqlmodel_core::Value::BigInt(target_project.id),
+            sqlmodel_core::Value::BigInt(source_project.id),
+        ],
+    )
+    .map_err(|e| CliError::Other(format!("rekey agents failed: {e}")))?;
+    conn.execute_sync(
+        "UPDATE messages SET project_id = ? WHERE project_id = ?",
+        &[
+            sqlmodel_core::Value::BigInt(target_project.id),
+            sqlmodel_core::Value::BigInt(source_project.id),
+        ],
+    )
+    .map_err(|e| CliError::Other(format!("rekey messages failed: {e}")))?;
+    conn.execute_sync(
+        "UPDATE file_reservations SET project_id = ? WHERE project_id = ?",
+        &[
+            sqlmodel_core::Value::BigInt(target_project.id),
+            sqlmodel_core::Value::BigInt(source_project.id),
+        ],
+    )
+    .map_err(|e| CliError::Other(format!("rekey file_reservations failed: {e}")))?;
+
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO product_project_links (product_id, project_id, created_at) \
+         SELECT product_id, ?, created_at FROM product_project_links WHERE project_id = ?",
+        &[
+            sqlmodel_core::Value::BigInt(target_project.id),
+            sqlmodel_core::Value::BigInt(source_project.id),
+        ],
+    )
+    .map_err(|e| CliError::Other(format!("rekey product links failed: {e}")))?;
+    conn.execute_sync(
+        "DELETE FROM product_project_links WHERE project_id = ?",
+        &[sqlmodel_core::Value::BigInt(source_project.id)],
+    )
+    .map_err(|e| CliError::Other(format!("cleanup source product links failed: {e}")))?;
+
+    let aliases_path = target_archive.join("aliases.json");
+    let mut alias_doc = if aliases_path.exists() {
+        match std::fs::read_to_string(&aliases_path) {
+            Ok(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default(),
+            Err(_) => serde_json::json!({}),
+        }
+    } else {
+        serde_json::json!({})
+    };
+    let mut former_slugs: std::collections::BTreeSet<String> = alias_doc
+        .get("former_slugs")
+        .and_then(|value| value.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    former_slugs.insert(source_project.slug.clone());
+    alias_doc["former_slugs"] = serde_json::Value::Array(
+        former_slugs
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect(),
+    );
+    std::fs::write(
+        &aliases_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&alias_doc)
+                .map_err(|e| CliError::Other(format!("serialize aliases.json failed: {e}")))?
+        ),
+    )?;
+    let aliases_rel = aliases_path
+        .strip_prefix(&config.storage_root)
+        .ok()
+        .unwrap_or(&aliases_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    changed_paths.push(aliases_rel);
+
+    let commit_message = format!(
+        "adopt: move {} into {}",
+        source_project.slug, target_project.slug
+    );
+    match git_add_and_commit(
+        &config.storage_root,
+        config,
+        &changed_paths,
+        &commit_message,
+    ) {
+        GitCommitOutcome::Committed | GitCommitOutcome::NothingToCommit => {}
+        GitCommitOutcome::Failed(msg) => {
+            ftui_runtime::ftui_eprintln!(
+                "Warning: unable to commit adoption artifacts automatically. {msg}"
+            );
+        }
+    }
+
+    ftui_runtime::ftui_println!("Adoption apply completed.");
+    Ok(())
+}
+
 fn handle_projects(action: ProjectsCommand) -> CliResult<()> {
     match action {
         ProjectsCommand::MarkIdentity {
             project_path,
             commit,
             no_commit,
-        } => {
-            let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
-            output::kv("Project UID", &identity.project_uid);
-            output::kv("Human key", &identity.human_key);
-            if let Some(ref b) = identity.branch {
-                output::kv("Branch", b);
-            }
-            if commit && !no_commit {
-                ftui_runtime::ftui_println!("Identity committed to config.");
-            }
-            Ok(())
-        }
+        } => handle_project_mark_identity(&project_path, resolve_bool(commit, no_commit, true)),
         ProjectsCommand::DiscoveryInit {
             project_path,
             product,
-        } => {
-            let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
-            ftui_runtime::ftui_println!(
-                "Initialized discovery for project: {}",
-                identity.project_uid
-            );
-            if let Some(p) = product {
-                ftui_runtime::ftui_println!("  Product: {p}");
-            }
-            Ok(())
-        }
+        } => handle_project_discovery_init(&project_path, product),
         ProjectsCommand::Adopt {
             source,
             target,
             dry_run,
             apply,
         } => {
-            ftui_runtime::ftui_println!(
-                "Adopt: {} -> {}{}",
-                source.display(),
-                target.display(),
-                if dry_run {
-                    " (dry run)"
-                } else if apply {
-                    " (apply)"
-                } else {
-                    ""
-                }
-            );
-            Ok(())
+            let conn = open_db_sync()?;
+            let config = Config::from_env();
+            handle_projects_adopt_with_conn(
+                &conn,
+                &config,
+                source.to_string_lossy().as_ref(),
+                target.to_string_lossy().as_ref(),
+                dry_run,
+                apply,
+            )
         }
     }
 }
@@ -6700,6 +7163,262 @@ sys.exit(7)
         assert!(
             output.contains("Agents") && output.contains("0"),
             "expected 0 agents for nonexistent project, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_projects_mark_identity_writes_marker_file() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_project_mark_identity(dir.path(), false);
+        assert!(result.is_ok(), "mark-identity failed: {result:?}");
+
+        let marker_path = dir.path().join(".agent-mail-project-id");
+        assert!(marker_path.exists(), "marker file should exist");
+        let marker = std::fs::read_to_string(&marker_path).unwrap();
+        assert!(
+            !marker.trim().is_empty(),
+            "marker file should contain project_uid"
+        );
+    }
+
+    #[test]
+    fn integration_projects_discovery_init_writes_yaml() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_project_discovery_init(dir.path(), Some("prod-alpha".to_string()));
+        assert!(result.is_ok(), "discovery-init failed: {result:?}");
+
+        let yaml_path = dir.path().join(".agent-mail.yaml");
+        assert!(yaml_path.exists(), "discovery yaml should exist");
+        let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            yaml.contains("project_uid: "),
+            "expected project_uid in discovery yaml: {yaml}"
+        );
+        assert!(
+            yaml.contains("product_uid: prod-alpha"),
+            "expected product_uid in discovery yaml: {yaml}"
+        );
+    }
+
+    fn seed_projects_adopt_db(
+        db_path: &Path,
+        source_human_key: &Path,
+        target_human_key: &Path,
+    ) -> sqlmodel_sqlite::SqliteConnection {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+            .expect("init schema");
+
+        let now_us = mcp_agent_mail_db::timestamps::now_micros();
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::Text("src-proj".to_string()),
+                SqlValue::Text(source_human_key.display().to_string()),
+                SqlValue::BigInt(now_us),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(2),
+                SqlValue::Text("dst-proj".to_string()),
+                SqlValue::Text(target_human_key.display().to_string()),
+                SqlValue::BigInt(now_us),
+            ],
+        )
+        .unwrap();
+
+        let insert_agent = "INSERT INTO agents (\
+                id, project_id, name, program, model, task_description, \
+                inception_ts, last_active_ts, attachments_policy, contact_policy\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        conn.execute_sync(
+            insert_agent,
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::Text("SrcAgent".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::BigInt(now_us),
+                SqlValue::BigInt(now_us),
+                SqlValue::Text("auto".to_string()),
+                SqlValue::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            insert_agent,
+            &[
+                SqlValue::BigInt(2),
+                SqlValue::BigInt(2),
+                SqlValue::Text("DstAgent".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::BigInt(now_us),
+                SqlValue::BigInt(now_us),
+                SqlValue::Text("auto".to_string()),
+                SqlValue::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO messages (\
+                id, project_id, sender_id, thread_id, subject, body_md, importance, \
+                ack_required, created_ts, attachments\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::Null,
+                SqlValue::Text("Subject".to_string()),
+                SqlValue::Text("Body".to_string()),
+                SqlValue::Text("normal".to_string()),
+                SqlValue::BigInt(0),
+                SqlValue::BigInt(now_us),
+                SqlValue::Text("[]".to_string()),
+            ],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO file_reservations (\
+                id, project_id, agent_id, path_pattern, exclusive, reason, \
+                created_ts, expires_ts, released_ts\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::Text("src/**".to_string()),
+                SqlValue::BigInt(1),
+                SqlValue::Text("test".to_string()),
+                SqlValue::BigInt(now_us),
+                SqlValue::BigInt(now_us + 3_600_000_000),
+                SqlValue::Null,
+            ],
+        )
+        .unwrap();
+
+        conn
+    }
+
+    #[test]
+    fn integration_projects_adopt_apply_rekeys_and_moves_archive() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let source_human_key = repo_root.join("src-worktree");
+        let target_human_key = repo_root.join("dst-worktree");
+        std::fs::create_dir_all(&source_human_key).unwrap();
+        std::fs::create_dir_all(&target_human_key).unwrap();
+
+        let git_init = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "git init should succeed");
+
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_projects_adopt_db(&db_path, &source_human_key, &target_human_key);
+
+        let storage_root = dir.path().join("archive-root");
+        let source_archive = storage_root
+            .join("projects")
+            .join("src-proj")
+            .join("messages");
+        std::fs::create_dir_all(&source_archive).unwrap();
+        std::fs::write(source_archive.join("m1.md"), "# message").unwrap();
+
+        let cfg = Config {
+            storage_root: storage_root.clone(),
+            ..Config::default()
+        };
+
+        let result =
+            handle_projects_adopt_with_conn(&conn, &cfg, "src-proj", "dst-proj", true, true);
+        assert!(result.is_ok(), "projects adopt apply failed: {result:?}");
+
+        let dst_agent_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = 2",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        let src_agent_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = 1",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        assert_eq!(dst_agent_count, 2, "expected both agents in target project");
+        assert_eq!(
+            src_agent_count, 0,
+            "expected source project agents to be moved"
+        );
+
+        let dst_msg_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = 2",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        let dst_file_reservation_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM file_reservations WHERE project_id = 2",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        assert_eq!(dst_msg_count, 1, "expected messages rekeyed to target");
+        assert_eq!(
+            dst_file_reservation_count, 1,
+            "expected file_reservations rekeyed to target"
+        );
+
+        let moved_file = storage_root
+            .join("projects")
+            .join("dst-proj")
+            .join("messages")
+            .join("m1.md");
+        assert!(moved_file.exists(), "expected archive file moved to target");
+
+        let aliases_path = storage_root
+            .join("projects")
+            .join("dst-proj")
+            .join("aliases.json");
+        assert!(aliases_path.exists(), "aliases.json should be written");
+        let aliases = std::fs::read_to_string(aliases_path).unwrap();
+        assert!(
+            aliases.contains("src-proj"),
+            "aliases.json should contain former source slug"
         );
     }
 }

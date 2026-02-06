@@ -2805,6 +2805,24 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+/// Message entry for stale acks view (includes `read_at` and `age_seconds`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleAckMessageEntry {
+    pub id: i64,
+    pub project_id: i64,
+    pub sender_id: i64,
+    pub thread_id: Option<String>,
+    pub subject: String,
+    pub importance: String,
+    pub ack_required: bool,
+    pub created_ts: Option<String>,
+    pub attachments: Vec<String>,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
+    pub age_seconds: i64,
+}
+
 /// Stale acks response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaleAcksResponse {
@@ -2812,10 +2830,13 @@ pub struct StaleAcksResponse {
     pub agent: String,
     pub ttl_seconds: u64,
     pub count: usize,
-    pub messages: Vec<ViewMessageEntry>,
+    pub messages: Vec<StaleAckMessageEntry>,
 }
 
 /// Get stale acknowledgements for an agent.
+///
+/// Returns ack-required messages older than `ttl_seconds` that have not been
+/// acknowledged, matching the legacy Python `acks_stale_view` resource.
 #[resource(
     uri = "resource://views/acks-stale/{agent}",
     description = "Acknowledgements considered stale"
@@ -2827,7 +2848,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
         .get("ttl_seconds")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3600);
-    let _limit: usize = query
+    let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
@@ -2849,14 +2870,66 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
         .find(|p| p.slug == project_key || p.human_key == project_key)
         .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
 
-    // TODO: Actually query for stale acks based on ttl_seconds
-    // For now return empty (matches fixture for fresh data)
+    let project_id = project.id.unwrap_or(0);
+
+    // Find agent
+    let agents = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+    )?;
+    let agent_row = agents
+        .into_iter()
+        .find(|a| a.name == agent_name)
+        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
+    let agent_id = agent_row.id.unwrap_or(0);
+
+    // Fetch unacked ack-required messages (over-fetch, then filter by age)
+    let unacked_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_unacked_for_agent(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            limit * 5,
+        )
+        .await,
+    )?;
+
+    let now_us = mcp_agent_mail_db::now_micros();
+    let ttl_us = i64::try_from(ttl_seconds).unwrap_or(i64::MAX) * 1_000_000;
+
+    let mut messages = Vec::new();
+    for row in unacked_rows {
+        let age_us = now_us.saturating_sub(row.message.created_ts);
+        if age_us >= ttl_us {
+            let age_seconds = age_us / 1_000_000;
+            let msg = &row.message;
+            messages.push(StaleAckMessageEntry {
+                id: msg.id.unwrap_or(0),
+                project_id: msg.project_id,
+                sender_id: msg.sender_id,
+                thread_id: msg.thread_id.clone(),
+                subject: msg.subject.clone(),
+                importance: msg.importance.clone(),
+                ack_required: true,
+                created_ts: None,
+                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                kind: row.kind.clone(),
+                read_at: row.read_ts.map(mcp_agent_mail_db::micros_to_iso),
+                age_seconds,
+            });
+            if messages.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    let count = messages.len();
     let response = StaleAcksResponse {
         project: project.human_key,
         agent: agent_name,
         ttl_seconds,
-        count: 0,
-        messages: vec![],
+        count,
+        messages,
     };
 
     serde_json::to_string(&response)
@@ -2864,6 +2937,9 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
 }
 
 /// Get overdue acknowledgements for an agent.
+///
+/// Returns ack-required messages older than `ttl_minutes` that have not been
+/// acknowledged, matching the legacy Python `ack_overdue_view` resource.
 #[resource(
     uri = "resource://views/ack-overdue/{agent}",
     description = "Acknowledgements overdue"
@@ -2871,11 +2947,11 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
 pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let _limit: usize = query
+    let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    let _ttl_minutes: u64 = query
+    let ttl_minutes: u64 = query
         .get("ttl_minutes")
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
@@ -2897,13 +2973,64 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
         .find(|p| p.slug == project_key || p.human_key == project_key)
         .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
 
-    // TODO: Actually query for overdue acks
-    // For now return empty (matches fixture for fresh data)
+    let project_id = project.id.unwrap_or(0);
+
+    // Find agent
+    let agents = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+    )?;
+    let agent_row = agents
+        .into_iter()
+        .find(|a| a.name == agent_name)
+        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Agent not found"))?;
+    let agent_id = agent_row.id.unwrap_or(0);
+
+    // Compute cutoff: messages older than ttl_minutes are overdue
+    let cutoff_minutes = ttl_minutes.max(1);
+    let now_us = mcp_agent_mail_db::now_micros();
+    let cutoff_us = now_us - i64::try_from(cutoff_minutes).unwrap_or(i64::MAX) * 60 * 1_000_000;
+
+    // Fetch unacked ack-required messages (over-fetch, then filter by cutoff)
+    let unacked_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_unacked_for_agent(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            limit * 5,
+        )
+        .await,
+    )?;
+
+    let mut messages = Vec::new();
+    for row in unacked_rows {
+        if row.message.created_ts <= cutoff_us {
+            let msg = &row.message;
+            messages.push(ViewMessageEntry {
+                id: msg.id.unwrap_or(0),
+                project_id: msg.project_id,
+                sender_id: msg.sender_id,
+                thread_id: msg.thread_id.clone(),
+                subject: msg.subject.clone(),
+                importance: msg.importance.clone(),
+                ack_required: true,
+                created_ts: None,
+                attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                from: None,
+                kind: row.kind.clone(),
+            });
+            if messages.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    let count = messages.len();
     let response = ViewResponse {
         project: project.human_key,
         agent: agent_name,
-        count: 0,
-        messages: vec![],
+        count,
+        messages,
         ttl_seconds: None,
     };
 
@@ -3737,5 +3864,104 @@ mod query_param_tests {
         let input = "Agent?project=%2Fdata%2Fprojects%2Fmy-app";
         let (_agent, query) = split_param_and_query(input);
         assert_eq!(query.get("project").unwrap(), "/data/projects/my-app");
+    }
+}
+
+#[cfg(test)]
+mod redact_and_timestamp_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // redact_database_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redact_with_credentials() {
+        assert_eq!(
+            redact_database_url("postgresql://admin:secret@db.example.com:5432/mydb"),
+            "postgresql://****@db.example.com:5432/mydb"
+        );
+    }
+
+    #[test]
+    fn redact_user_only_no_password() {
+        assert_eq!(
+            redact_database_url("postgresql://admin@db.example.com/mydb"),
+            "postgresql://****@db.example.com/mydb"
+        );
+    }
+
+    #[test]
+    fn redact_no_credentials() {
+        // No @ sign means no credentials to redact.
+        assert_eq!(
+            redact_database_url("sqlite:///data/mail.db"),
+            "sqlite:///data/mail.db"
+        );
+    }
+
+    #[test]
+    fn redact_no_scheme() {
+        // No :// at all -> return as-is.
+        assert_eq!(redact_database_url("/data/mail.db"), "/data/mail.db");
+    }
+
+    #[test]
+    fn redact_empty_string() {
+        assert_eq!(redact_database_url(""), "");
+    }
+
+    #[test]
+    fn redact_complex_password() {
+        assert_eq!(
+            redact_database_url("mysql://root:p%40ss%3Dword@localhost/db"),
+            "mysql://****@localhost/db"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ts_f64_to_rfc3339
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ts_f64_epoch_zero() {
+        let result = ts_f64_to_rfc3339(0.0).unwrap();
+        assert!(result.starts_with("1970-01-01"));
+    }
+
+    #[test]
+    fn ts_f64_known_timestamp() {
+        // 2025-01-01T00:00:00Z = 1735689600.0
+        let result = ts_f64_to_rfc3339(1_735_689_600.0).unwrap();
+        assert!(result.starts_with("2025-01-01"));
+    }
+
+    #[test]
+    fn ts_f64_fractional_seconds() {
+        let result = ts_f64_to_rfc3339(1_735_689_600.5);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn ts_f64_nan_returns_none() {
+        assert!(ts_f64_to_rfc3339(f64::NAN).is_none());
+    }
+
+    #[test]
+    fn ts_f64_infinity_returns_none() {
+        assert!(ts_f64_to_rfc3339(f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn ts_f64_neg_infinity_returns_none() {
+        assert!(ts_f64_to_rfc3339(f64::NEG_INFINITY).is_none());
+    }
+
+    #[test]
+    fn ts_f64_negative_timestamp() {
+        // Before epoch is valid (1969)
+        let result = ts_f64_to_rfc3339(-86400.0);
+        assert!(result.is_some());
+        assert!(result.unwrap().starts_with("1969-12-31"));
     }
 }

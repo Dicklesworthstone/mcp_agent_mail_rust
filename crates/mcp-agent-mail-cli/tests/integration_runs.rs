@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
 fn am_bin() -> PathBuf {
     // Cargo sets this for integration tests.
     PathBuf::from(std::env::var("CARGO_BIN_EXE_am").expect("CARGO_BIN_EXE_am must be set"))
@@ -113,6 +115,75 @@ fn run_am(
     } else {
         cmd.output().expect("spawn am")
     }
+}
+
+fn init_cli_schema(db_path: &Path) {
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        .expect("open sqlite db");
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        .expect("init schema");
+}
+
+fn insert_project(conn: &sqlmodel_sqlite::SqliteConnection, id: i64, slug: &str, human_key: &str) {
+    conn.execute_sync(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+        &[
+            SqlValue::BigInt(id),
+            SqlValue::Text(slug.to_string()),
+            SqlValue::Text(human_key.to_string()),
+            SqlValue::BigInt(1_704_067_200_000_000), // 2024-01-01T00:00:00Z
+        ],
+    )
+    .expect("insert project");
+}
+
+fn init_git_repo(path: &Path) {
+    std::fs::create_dir_all(path).expect("create git repo dir");
+    let out = Command::new("git")
+        .current_dir(path)
+        .args(["init"])
+        .output()
+        .expect("git init");
+    assert!(
+        out.status.success(),
+        "git init failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn seed_projects_for_adopt(env: &TestEnv, same_repo: bool) -> (String, String, String, String) {
+    init_cli_schema(&env.db_path);
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+
+    let source_slug = "source-proj".to_string();
+    let target_slug = "target-proj".to_string();
+
+    let (source_path, target_path) = if same_repo {
+        let repo_root = env.tmp.path().join("workspace");
+        init_git_repo(&repo_root);
+        let src = repo_root.join("source");
+        let dst = repo_root.join("target");
+        std::fs::create_dir_all(&src).expect("create source path");
+        std::fs::create_dir_all(&dst).expect("create target path");
+        (src, dst)
+    } else {
+        let src_repo = env.tmp.path().join("source_repo");
+        let dst_repo = env.tmp.path().join("target_repo");
+        init_git_repo(&src_repo);
+        init_git_repo(&dst_repo);
+        (src_repo, dst_repo)
+    };
+
+    let source_key = source_path.canonicalize().expect("canonical source path");
+    let target_key = target_path.canonicalize().expect("canonical target path");
+    let source_key_str = source_key.display().to_string();
+    let target_key_str = target_key.display().to_string();
+    insert_project(&conn, 1, &source_slug, &source_key_str);
+    insert_project(&conn, 2, &target_slug, &target_key_str);
+
+    (source_slug, target_slug, source_key_str, target_key_str)
 }
 
 fn assert_success(
@@ -327,5 +398,319 @@ fn guard_check_advisory_does_not_exit_1() {
         String::from_utf8_lossy(&out.stderr).contains("CONFLICT: pattern"),
         "expected conflict marker in stderr, got:\n{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn projects_mark_identity_no_commit_writes_marker_file() {
+    let env = TestEnv::new();
+    let project = env.tmp.path().join("proj_mark_identity");
+    std::fs::create_dir_all(&project).expect("create project dir");
+
+    let project_str = project.to_string_lossy().to_string();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["projects", "mark-identity", &project_str, "--no-commit"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "projects_mark_identity_no_commit",
+            &["projects", "mark-identity", &project_str, "--no-commit"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let marker = project.join(".agent-mail-project-id");
+    assert!(
+        marker.exists(),
+        "expected marker file at {}",
+        marker.display()
+    );
+    let marker_body = std::fs::read_to_string(&marker).expect("read marker file");
+    assert!(
+        !marker_body.trim().is_empty(),
+        "expected non-empty project UID marker"
+    );
+}
+
+#[test]
+fn projects_discovery_init_writes_yaml_with_product_uid() {
+    let env = TestEnv::new();
+    let project = env.tmp.path().join("proj_discovery");
+    std::fs::create_dir_all(&project).expect("create project dir");
+
+    let project_str = project.to_string_lossy().to_string();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &[
+            "projects",
+            "discovery-init",
+            &project_str,
+            "--product",
+            "product-xyz",
+        ],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "projects_discovery_init_with_product",
+            &[
+                "projects",
+                "discovery-init",
+                &project_str,
+                "--product",
+                "product-xyz",
+            ],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let yaml = project.join(".agent-mail.yaml");
+    assert!(
+        yaml.exists(),
+        "expected discovery file at {}",
+        yaml.display()
+    );
+    let body = std::fs::read_to_string(&yaml).expect("read discovery file");
+    assert!(
+        body.contains("project_uid:"),
+        "expected project_uid in discovery file:\n{body}"
+    );
+    assert!(
+        body.contains("product_uid: product-xyz"),
+        "expected product_uid in discovery file:\n{body}"
+    );
+}
+
+#[test]
+fn projects_adopt_dry_run_prints_plan_and_leaves_artifacts_unchanged() {
+    let env = TestEnv::new();
+    let (source_slug, target_slug, source_key, target_key) = seed_projects_for_adopt(&env, true);
+    let source_archive_file = env
+        .storage_root
+        .join("projects")
+        .join(&source_slug)
+        .join("messages")
+        .join("source-message.md");
+    std::fs::create_dir_all(source_archive_file.parent().expect("parent")).expect("create dir");
+    std::fs::write(&source_archive_file, "hello").expect("write source archive file");
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["projects", "adopt", &source_key, &target_key],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "projects_adopt_dry_run",
+            &["projects", "adopt", &source_key, &target_key],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Projects adopt plan (dry-run)"),
+        "missing dry-run marker in stdout:\n{}",
+        stdout
+    );
+    assert!(
+        source_archive_file.exists(),
+        "dry-run should not move source artifacts"
+    );
+    let target_archive_file = env
+        .storage_root
+        .join("projects")
+        .join(&target_slug)
+        .join("messages")
+        .join("source-message.md");
+    assert!(
+        !target_archive_file.exists(),
+        "dry-run should not create target artifacts"
+    );
+}
+
+#[test]
+fn projects_adopt_apply_moves_artifacts_and_writes_aliases() {
+    let env = TestEnv::new();
+    let (source_slug, target_slug, source_key, target_key) = seed_projects_for_adopt(&env, true);
+    let source_archive_file = env
+        .storage_root
+        .join("projects")
+        .join(&source_slug)
+        .join("messages")
+        .join("source-message.md");
+    std::fs::create_dir_all(source_archive_file.parent().expect("parent")).expect("create dir");
+    std::fs::write(&source_archive_file, "hello").expect("write source archive file");
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["projects", "adopt", &source_key, &target_key, "--apply"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "projects_adopt_apply",
+            &["projects", "adopt", &source_key, &target_key, "--apply"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Adoption apply completed."),
+        "missing completion marker in stdout:\n{}",
+        stdout
+    );
+    assert!(
+        !source_archive_file.exists(),
+        "expected source artifact to be moved on --apply"
+    );
+    let target_archive_file = env
+        .storage_root
+        .join("projects")
+        .join(&target_slug)
+        .join("messages")
+        .join("source-message.md");
+    assert!(
+        target_archive_file.exists(),
+        "expected target artifact to exist on --apply"
+    );
+
+    let aliases_path = env
+        .storage_root
+        .join("projects")
+        .join(&target_slug)
+        .join("aliases.json");
+    assert!(
+        aliases_path.exists(),
+        "expected aliases.json at {}",
+        aliases_path.display()
+    );
+    let aliases: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&aliases_path).expect("read aliases.json"))
+            .expect("parse aliases.json");
+    let former_slugs = aliases
+        .get("former_slugs")
+        .and_then(serde_json::Value::as_array)
+        .expect("former_slugs array");
+    assert!(
+        former_slugs
+            .iter()
+            .any(|v| v.as_str() == Some(source_slug.as_str())),
+        "expected source slug in former_slugs: {}",
+        serde_json::to_string_pretty(&aliases).unwrap_or_else(|_| aliases.to_string())
+    );
+}
+
+#[test]
+fn projects_adopt_apply_cross_repo_refuses_and_keeps_source_artifacts() {
+    let env = TestEnv::new();
+    let (source_slug, target_slug, source_key, target_key) = seed_projects_for_adopt(&env, false);
+    let source_archive_file = env
+        .storage_root
+        .join("projects")
+        .join(&source_slug)
+        .join("messages")
+        .join("source-message.md");
+    std::fs::create_dir_all(source_archive_file.parent().expect("parent")).expect("create dir");
+    std::fs::write(&source_archive_file, "hello").expect("write source archive file");
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["projects", "adopt", &source_key, &target_key, "--apply"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "projects_adopt_apply_cross_repo_refusal",
+            &["projects", "adopt", &source_key, &target_key, "--apply"],
+            &out,
+        );
+        panic!(
+            "expected success with refusal semantics\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "Refusing to adopt: projects do not appear to belong to the same repository."
+        ),
+        "expected refusal message in stderr:\n{}",
+        stderr
+    );
+    assert!(
+        source_archive_file.exists(),
+        "cross-repo refusal should keep source artifacts in place"
+    );
+    let target_archive_file = env
+        .storage_root
+        .join("projects")
+        .join(&target_slug)
+        .join("messages")
+        .join("source-message.md");
+    assert!(
+        !target_archive_file.exists(),
+        "cross-repo refusal should not create target artifacts"
+    );
+}
+
+#[test]
+fn projects_adopt_missing_source_exits_nonzero() {
+    let env = TestEnv::new();
+    let (_source_slug, _target_slug, _source_key, target_key) = seed_projects_for_adopt(&env, true);
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &[
+            "projects",
+            "adopt",
+            "missing-source-slug",
+            &target_key,
+            "--apply",
+        ],
+        None,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1 for missing project source\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_ascii_lowercase().contains("project not found"),
+        "expected missing project error in stderr:\n{}",
+        stderr
     );
 }
