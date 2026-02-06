@@ -293,6 +293,23 @@ pub fn schema_migrations() -> Vec<Migration> {
         migrations.push(Migration::new(id, desc, stmt.to_string(), String::new()));
     }
 
+    // Drop legacy Python FTS triggers that conflict with the Rust triggers below.
+    // The Python schema created triggers named `fts_messages_ai/ad/au` while the Rust
+    // schema uses `messages_ai/ad/au`. When both exist, every message INSERT fires two
+    // FTS insert triggers, causing constraint failures on the FTS5 rowid.
+    for (suffix, desc) in [
+        ("ai", "drop legacy fts insert trigger"),
+        ("ad", "drop legacy fts delete trigger"),
+        ("au", "drop legacy fts update trigger"),
+    ] {
+        migrations.push(Migration::new(
+            format!("v2_drop_legacy_fts_trigger_{suffix}"),
+            desc.to_string(),
+            format!("DROP TRIGGER IF EXISTS fts_messages_{suffix}"),
+            String::new(),
+        ));
+    }
+
     for stmt in extract_trigger_statements(CREATE_FTS_TRIGGERS_SQL) {
         let Some((id, desc)) = derive_migration_id_and_description(stmt) else {
             continue;
