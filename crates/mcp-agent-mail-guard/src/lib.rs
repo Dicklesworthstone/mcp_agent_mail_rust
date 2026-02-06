@@ -295,11 +295,50 @@ def get_staged_files():
     """Get list of staged files from git."""
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-            capture_output=True, text=True, check=True,
+            ["git", "diff", "--cached", "--name-status", "-M", "-z", "--diff-filter=ACMRDTU"],
+            capture_output=True, check=True,
         )
-        return [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
+        data = result.stdout or b""
+        if not data:
+            return []
+        parts = data.split(b"\0")
+        files = []
+        i = 0
+        while i < len(parts):
+            if not parts[i]:
+                break
+            status = parts[i].decode("utf-8", "ignore")
+            i += 1
+            if status.startswith(("R", "C")):
+                # Rename/Copy: next two entries are old and new path.
+                if i + 1 >= len(parts):
+                    break
+                oldp = parts[i].decode("utf-8", "ignore")
+                newp = parts[i + 1].decode("utf-8", "ignore")
+                i += 2
+                if oldp:
+                    files.append(oldp)
+                if newp:
+                    files.append(newp)
+            else:
+                # Normal entry: next is the path.
+                if i >= len(parts):
+                    break
+                p = parts[i].decode("utf-8", "ignore")
+                i += 1
+                if p:
+                    files.append(p)
+        # De-duplicate while preserving order.
+        seen = set()
+        out = []
+        for f in files:
+            if f not in seen:
+                seen.add(f)
+                out.append(f)
+        return out
     except subprocess.CalledProcessError:
+        return []
+    except Exception:
         return []
 
 def get_active_reservations():
@@ -544,29 +583,8 @@ pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
     })
 }
 
-/// Check if the guard gate is enabled.
-///
-/// The guard is only active if `WORKTREES_ENABLED` or `GIT_IDENTITY_ENABLED` is truthy.
-/// Returns `false` (gate closed = guard inactive) by default.
-#[must_use]
-pub fn is_guard_gated() -> bool {
-    fn is_truthy(var: &str) -> bool {
-        std::env::var(var)
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "t" | "yes" | "y"
-                )
-            })
-            .unwrap_or(false)
-    }
-    is_truthy("WORKTREES_ENABLED") || is_truthy("GIT_IDENTITY_ENABLED")
-}
-
-/// Check if the guard bypass is active (`AGENT_MAIL_BYPASS=1`).
-#[must_use]
-pub fn is_bypass_active() -> bool {
-    std::env::var("AGENT_MAIL_BYPASS")
+fn is_truthy_value(value: Option<&str>) -> bool {
+    value
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -574,6 +592,31 @@ pub fn is_bypass_active() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn is_guard_gated_from_values(
+    worktrees_enabled: Option<&str>,
+    git_identity_enabled: Option<&str>,
+) -> bool {
+    is_truthy_value(worktrees_enabled) || is_truthy_value(git_identity_enabled)
+}
+
+/// Check if the guard gate is enabled.
+///
+/// The guard is only active if `WORKTREES_ENABLED` or `GIT_IDENTITY_ENABLED` is truthy.
+/// Returns `false` (gate closed = guard inactive) by default.
+#[must_use]
+pub fn is_guard_gated() -> bool {
+    is_guard_gated_from_values(
+        std::env::var("WORKTREES_ENABLED").ok().as_deref(),
+        std::env::var("GIT_IDENTITY_ENABLED").ok().as_deref(),
+    )
+}
+
+/// Check if the guard bypass is active (`AGENT_MAIL_BYPASS=1`).
+#[must_use]
+pub fn is_bypass_active() -> bool {
+    is_truthy_value(std::env::var("AGENT_MAIL_BYPASS").ok().as_deref())
 }
 
 /// Full guard check: reads reservations, checks conflicts, respects gate/bypass.
@@ -584,6 +627,7 @@ pub fn is_bypass_active() -> bool {
 /// Returns a `GuardCheckResult` with conflicts and mode info.
 pub fn guard_check_full(archive_root: &Path, paths: &[String]) -> GuardResult<GuardCheckResult> {
     let mode = GuardMode::from_env();
+    let ignorecase = detect_core_ignorecase(archive_root);
 
     // Check bypass
     if is_bypass_active() {
@@ -614,7 +658,7 @@ pub fn guard_check_full(archive_root: &Path, paths: &[String]) -> GuardResult<Gu
     // Read reservations from the archive
     let reservations = read_active_reservations_from_archive(archive_root)?;
 
-    let conflicts = check_path_conflicts(paths, &reservations, &agent_name);
+    let conflicts = check_path_conflicts(paths, &reservations, &agent_name, ignorecase);
 
     Ok(GuardCheckResult {
         conflicts,
@@ -633,6 +677,7 @@ pub fn guard_check(
     paths: &[String],
     _advisory: bool,
 ) -> GuardResult<Vec<GuardConflict>> {
+    let ignorecase = detect_core_ignorecase(archive_root);
     // Get current agent name from env
     let agent_name = std::env::var("AGENT_NAME").unwrap_or_default();
     if agent_name.is_empty() {
@@ -642,7 +687,12 @@ pub fn guard_check(
     // Read reservations from archive JSON files
     let reservations = read_active_reservations_from_archive(archive_root)?;
 
-    Ok(check_path_conflicts(paths, &reservations, &agent_name))
+    Ok(check_path_conflicts(
+        paths,
+        &reservations,
+        &agent_name,
+        ignorecase,
+    ))
 }
 
 /// Core conflict detection: check paths against reservations.
@@ -652,10 +702,11 @@ fn check_path_conflicts(
     paths: &[String],
     reservations: &[FileReservationRecord],
     self_agent: &str,
+    ignorecase: bool,
 ) -> Vec<GuardConflict> {
     let mut conflicts = Vec::new();
     for path in paths {
-        let normalized = normalize_path(path);
+        let normalized = normalize_path(path, ignorecase);
         for res in reservations {
             // Skip our own reservations
             if res.agent_name == self_agent {
@@ -665,7 +716,7 @@ fn check_path_conflicts(
             if !res.exclusive {
                 continue;
             }
-            let pattern_normalized = normalize_path(&res.path_pattern);
+            let pattern_normalized = normalize_path(&res.path_pattern, ignorecase);
             // Symmetric glob matching
             if paths_conflict(&normalized, &pattern_normalized) {
                 conflicts.push(GuardConflict {
@@ -682,8 +733,21 @@ fn check_path_conflicts(
 }
 
 /// Normalize a path for matching: forward slashes, strip leading slash.
-fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/").trim_start_matches('/').to_string()
+fn normalize_path(path: &str, ignorecase: bool) -> String {
+    let normalized = path.replace('\\', "/").trim_start_matches('/').to_string();
+    if ignorecase {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn detect_core_ignorecase(repo_hint: &Path) -> bool {
+    git2::Repository::discover(repo_hint)
+        .ok()
+        .and_then(|repo| repo.config().ok())
+        .and_then(|cfg| cfg.get_bool("core.ignorecase").ok())
+        .unwrap_or(false)
 }
 
 /// Check if a pattern contains glob markers.
@@ -741,7 +805,10 @@ fn paths_conflict(path: &str, pattern: &str) -> bool {
 /// Kept for backward compat; used internally by `paths_conflict`.
 #[allow(dead_code)]
 fn path_matches_pattern(path: &str, pattern: &str) -> bool {
-    paths_conflict(&normalize_path(path), &normalize_path(pattern))
+    paths_conflict(
+        &normalize_path(path, false),
+        &normalize_path(pattern, false),
+    )
 }
 
 /// Simple fnmatch-style glob matching.
@@ -768,9 +835,15 @@ fn fnmatch_simple(name: &str, pattern: &str) -> bool {
                 }
                 // Try matching rest of pattern from every position
                 let remaining: String = name_chars.collect();
-                for i in 0..=remaining.len() {
-                    if !double_star && remaining[..i].contains('/') {
-                        break;
+                let slash_idx = if double_star { None } else { remaining.find('/') };
+                let mut positions: Vec<usize> = remaining.char_indices().map(|(i, _)| i).collect();
+                positions.push(remaining.len());
+
+                for i in positions {
+                    if let Some(slash_idx) = slash_idx {
+                        if i > slash_idx {
+                            break;
+                        }
                     }
                     if fnmatch_simple(&remaining[i..], &rest) {
                         return true;
@@ -933,21 +1006,56 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
         }
 
         let range = if remote_sha.chars().all(|c| c == '0') {
-            // New branch: compare against merge-base with HEAD
             local_sha.to_string()
         } else {
             format!("{remote_sha}..{local_sha}")
         };
 
-        let output = Command::new("git")
+        // Prefer per-commit path enumeration (legacy guard.py parity): this catches paths
+        // that were touched in any pushed commit, even if the net diff ends up empty.
+        let rev_list = Command::new("git")
             .current_dir(repo_root)
-            .args(["diff", "--name-status", "-M", "-z", &range])
+            .args(["rev-list", "--topo-order", &range])
             .output()?;
 
-        if output.status.success() {
-            let paths = parse_name_status_z(&output.stdout)?;
-            all_paths.extend(paths);
-        }
+        if rev_list.status.success() {
+            for sha in String::from_utf8_lossy(&rev_list.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let output = Command::new("git")
+                    .current_dir(repo_root)
+                    .args([
+                        "diff-tree",
+                        "-r",
+                        "--no-commit-id",
+                        "--name-status",
+                        "-M",
+                        "--no-ext-diff",
+                        "--diff-filter=ACMRDTU",
+                        "-z",
+                        sha,
+                    ])
+                    .output()?;
+
+                if output.status.success() {
+                    let paths = parse_name_status_z(&output.stdout)?;
+                    all_paths.extend(paths);
+                }
+            }
+        } else {
+            // Fallback: net diff across the range (less precise, but better than nothing).
+            let output = Command::new("git")
+                .current_dir(repo_root)
+                .args(["diff", "--name-status", "-M", "-z", &range])
+                .output()?;
+
+            if output.status.success() {
+                let paths = parse_name_status_z(&output.stdout)?;
+                all_paths.extend(paths);
+            }
+        };
     }
 
     // Deduplicate
@@ -1029,6 +1137,49 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    fn run_git_stdout(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git must run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truthy_value_parsing_matches_legacy() {
+        assert!(is_truthy_value(Some("1")));
+        assert!(is_truthy_value(Some(" true ")));
+        assert!(is_truthy_value(Some("T")));
+        assert!(is_truthy_value(Some("yes")));
+        assert!(is_truthy_value(Some("Y")));
+
+        assert!(!is_truthy_value(Some("0")));
+        assert!(!is_truthy_value(Some("false")));
+        assert!(!is_truthy_value(Some("no")));
+        assert!(!is_truthy_value(Some("")));
+        assert!(!is_truthy_value(None));
+    }
+
+    #[test]
+    fn guard_gate_from_values_requires_either_flag() {
+        assert!(!is_guard_gated_from_values(None, None));
+        assert!(is_guard_gated_from_values(Some("1"), None));
+        assert!(is_guard_gated_from_values(None, Some("yes")));
+        assert!(!is_guard_gated_from_values(Some("0"), Some("no")));
     }
 
     // -----------------------------------------------------------------------
@@ -1149,10 +1300,16 @@ mod tests {
 
     #[test]
     fn normalize_strips_leading_slash_and_backslashes() {
-        assert_eq!(normalize_path("/app/api/users.py"), "app/api/users.py");
-        assert_eq!(normalize_path("app\\api\\users.py"), "app/api/users.py");
-        assert_eq!(normalize_path("\\app\\api"), "app/api");
-        assert_eq!(normalize_path("already/clean"), "already/clean");
+        assert_eq!(
+            normalize_path("/app/api/users.py", false),
+            "app/api/users.py"
+        );
+        assert_eq!(
+            normalize_path("app\\api\\users.py", false),
+            "app/api/users.py"
+        );
+        assert_eq!(normalize_path("\\app\\api", false), "app/api");
+        assert_eq!(normalize_path("already/clean", false), "already/clean");
     }
 
     // -----------------------------------------------------------------------
@@ -1220,6 +1377,14 @@ mod tests {
         assert!(fnmatch_simple("a/b/c.py", "**/*.py"));
         assert!(fnmatch_simple("a/b/c/d.py", "**/d.py"));
         assert!(!fnmatch_simple("a/b/c.rs", "**/*.py"));
+    }
+
+    #[test]
+    fn fnmatch_unicode_does_not_panic() {
+        // Regression: the '*' backtracking logic must only slice at UTF-8 char boundaries.
+        assert!(fnmatch_simple("a/ß.py", "**/*.py"));
+        assert!(fnmatch_simple("ß.py", "*.py"));
+        assert!(!fnmatch_simple("ß.rs", "*.py"));
     }
 
     #[test]
@@ -1334,7 +1499,7 @@ mod tests {
         let reservations = read_active_reservations_from_archive(&archive).expect("read");
         let paths = vec!["app/api/users.py".to_string()];
 
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent");
+        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].holder, "OtherAgent");
         assert_eq!(conflicts[0].pattern, "app/api/*.py");
@@ -1350,7 +1515,7 @@ mod tests {
         let paths = vec!["my/stuff/file.txt".to_string()];
 
         // "MyAgent" should not conflict with its own reservation
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent");
+        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
         assert!(conflicts.is_empty(), "own reservations should be skipped");
     }
 
@@ -1363,7 +1528,7 @@ mod tests {
         let paths = vec!["shared/README.md".to_string()];
 
         // SharedAgent's non-exclusive reservation should not block
-        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent");
+        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false);
         assert!(
             conflicts.is_empty(),
             "non-exclusive reservations should not conflict"
@@ -1378,7 +1543,7 @@ mod tests {
         let reservations = read_active_reservations_from_archive(&archive).expect("read");
         let paths = vec!["unrelated/file.txt".to_string()];
 
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent");
+        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
         assert!(conflicts.is_empty());
     }
 
@@ -1394,7 +1559,7 @@ mod tests {
             "unrelated.txt".to_string(),
         ];
 
-        let conflicts = check_path_conflicts(&paths, &reservations, "SomeAgent");
+        let conflicts = check_path_conflicts(&paths, &reservations, "SomeAgent", false);
         assert_eq!(conflicts.len(), 2, "two paths should conflict");
         assert!(conflicts.iter().all(|c| c.holder == "OtherAgent"));
     }
@@ -1524,6 +1689,113 @@ mod tests {
 
         let paths = get_staged_paths(&repo_dir).expect("staged paths");
         assert!(paths.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Git integration: pushed paths (pre-push)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn push_paths_includes_touched_files_even_if_net_diff_is_empty() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
+        let file = repo_dir.join("a.txt");
+        std::fs::write(&file, "base\n").expect("write base");
+        run_git(&repo_dir, &["add", "a.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let remote_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        // Commit 1 touches the file.
+        std::fs::write(&file, "one\n").expect("write one");
+        run_git(&repo_dir, &["add", "a.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "touch"]);
+
+        // Commit 2 reverts it so net diff(remote..local) would be empty.
+        std::fs::write(&file, "base\n").expect("write revert");
+        run_git(&repo_dir, &["add", "a.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "revert"]);
+        let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
+        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        assert!(
+            paths.contains(&"a.txt".to_string()),
+            "expected a.txt in push paths, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn push_paths_includes_renames() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
+        std::fs::write(repo_dir.join("old_name.py"), "print('hello')\n").expect("write");
+        run_git(&repo_dir, &["add", "old_name.py"]);
+        run_git(&repo_dir, &["commit", "-qm", "add old_name"]);
+        let remote_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        run_git(&repo_dir, &["mv", "old_name.py", "new_name.py"]);
+        run_git(&repo_dir, &["commit", "-qm", "rename"]);
+        let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
+        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        assert!(
+            paths.contains(&"old_name.py".to_string()),
+            "expected old_name.py in push paths, got: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"new_name.py".to_string()),
+            "expected new_name.py in push paths, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn push_paths_skips_delete_pushes() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        // Delete push: local sha is all zeros. Should not attempt git and should return empty.
+        let stdin_lines = "refs/heads/main 0000000000000000000000000000000000000000 refs/heads/main 1234567890abcdef1234567890abcdef12345678\n";
+        let paths = get_push_paths(&repo_dir, stdin_lines).expect("push paths");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn push_paths_new_branch_remote_zero_still_enumerates_commits() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
+        std::fs::write(repo_dir.join("a.txt"), "one\n").expect("write");
+        run_git(&repo_dir, &["add", "a.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "c1"]);
+
+        std::fs::write(repo_dir.join("b.txt"), "two\n").expect("write");
+        run_git(&repo_dir, &["add", "b.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "c2"]);
+        let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let stdin_lines = format!(
+            "refs/heads/main {local_sha} refs/heads/main 0000000000000000000000000000000000000000\n"
+        );
+        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        assert!(
+            paths.contains(&"b.txt".to_string()),
+            "expected b.txt in push paths, got: {paths:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
