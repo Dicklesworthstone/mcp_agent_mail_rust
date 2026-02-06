@@ -317,6 +317,72 @@ pub fn schema_migrations() -> Vec<Migration> {
         migrations.push(Migration::new(id, desc, stmt.to_string(), String::new()));
     }
 
+    // v3: Convert legacy Python TEXT timestamps to INTEGER (i64 microseconds).
+    // The Python schema used SQLAlchemy DATETIME columns that store ISO-8601 strings
+    // like "2026-02-04 22:13:11.079199", but the Rust port expects i64 microseconds.
+    // The conversion: strftime('%s', text) * 1000000 + fractional_micros
+    let ts_conversion = |col: &str| -> String {
+        format!(
+            "CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
+             CASE WHEN instr({col}, '.') > 0 \
+                  THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
+                  ELSE 0 \
+             END"
+        )
+    };
+
+    // projects.created_at
+    migrations.push(Migration::new(
+        "v3_fix_projects_text_timestamps".to_string(),
+        "convert legacy TEXT created_at to INTEGER microseconds in projects".to_string(),
+        format!(
+            "UPDATE projects SET created_at = ({}) WHERE typeof(created_at) = 'text'",
+            ts_conversion("created_at")
+        ),
+        String::new(),
+    ));
+
+    // agents.inception_ts + last_active_ts
+    migrations.push(Migration::new(
+        "v3_fix_agents_text_timestamps".to_string(),
+        "convert legacy TEXT timestamps to INTEGER microseconds in agents".to_string(),
+        format!(
+            "UPDATE agents SET \
+             inception_ts = CASE WHEN typeof(inception_ts) = 'text' THEN ({}) ELSE inception_ts END, \
+             last_active_ts = CASE WHEN typeof(last_active_ts) = 'text' THEN ({}) ELSE last_active_ts END \
+             WHERE typeof(inception_ts) = 'text' OR typeof(last_active_ts) = 'text'",
+            ts_conversion("inception_ts"),
+            ts_conversion("last_active_ts")
+        ),
+        String::new(),
+    ));
+
+    // messages.created_ts
+    migrations.push(Migration::new(
+        "v3_fix_messages_text_timestamps".to_string(),
+        "convert legacy TEXT created_ts to INTEGER microseconds in messages".to_string(),
+        format!(
+            "UPDATE messages SET created_ts = ({}) WHERE typeof(created_ts) = 'text'",
+            ts_conversion("created_ts")
+        ),
+        String::new(),
+    ));
+
+    // file_reservations.created_ts + expires_ts
+    migrations.push(Migration::new(
+        "v3_fix_file_reservations_text_timestamps".to_string(),
+        "convert legacy TEXT timestamps to INTEGER microseconds in file_reservations".to_string(),
+        format!(
+            "UPDATE file_reservations SET \
+             created_ts = CASE WHEN typeof(created_ts) = 'text' THEN ({}) ELSE created_ts END, \
+             expires_ts = CASE WHEN typeof(expires_ts) = 'text' THEN ({}) ELSE expires_ts END \
+             WHERE typeof(created_ts) = 'text' OR typeof(expires_ts) = 'text'",
+            ts_conversion("created_ts"),
+            ts_conversion("expires_ts")
+        ),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -449,6 +515,127 @@ mod tests {
             rows[0].get_named::<String>("slug").unwrap_or_default(),
             "proj"
         );
+    }
+
+    #[test]
+    fn v3_migration_converts_text_timestamps_to_integer() {
+        use sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v3_text_ts.db");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
+
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+
+        // Simulate a legacy Python database with DATETIME timestamps (NUMERIC affinity).
+        // Python/SQLAlchemy creates columns as DATETIME which stores ISO-8601 text strings.
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+            &[],
+        ).expect("create legacy projects table");
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("legacy-proj".to_string()),
+                Value::Text("/data/legacy".to_string()),
+                Value::Text("2026-02-04 22:13:11.079199".to_string()),
+            ],
+        )
+        .expect("insert legacy project");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', UNIQUE(project_id, name))",
+            &[],
+        ).expect("create legacy agents table");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("claude-code".to_string()),
+                Value::Text("opus".to_string()),
+                Value::Text("2026-02-05 00:06:44.082288".to_string()),
+                Value::Text("2026-02-05 01:30:00.000000".to_string()),
+            ],
+        ).expect("insert legacy agent");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL DEFAULT 'normal', ack_required INTEGER NOT NULL DEFAULT 0, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            &[],
+        ).expect("create legacy messages table");
+        conn.execute_sync(
+            "INSERT INTO messages (project_id, sender_id, subject, body_md, created_ts) VALUES (?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("Hello".to_string()),
+                Value::Text("Test body".to_string()),
+                Value::Text("2026-02-04 22:15:00.500000".to_string()),
+            ],
+        ).expect("insert legacy message");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL DEFAULT 1, reason TEXT NOT NULL DEFAULT '', created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
+            &[],
+        ).expect("create legacy file_reservations table");
+        conn.execute_sync(
+            "INSERT INTO file_reservations (project_id, agent_id, path_pattern, created_ts, expires_ts) VALUES (?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("src/**".to_string()),
+                Value::Text("2026-02-04 22:20:00.123456".to_string()),
+                Value::Text("2026-02-04 23:20:00.654321".to_string()),
+            ],
+        ).expect("insert legacy file_reservation");
+
+        // Run migrations (v3 should convert TEXT timestamps).
+        block_on({
+            let conn = &conn;
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+        });
+
+        // Verify projects.created_at is now INTEGER
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) as t, created_at FROM projects",
+                &[],
+            )
+            .expect("query projects");
+        assert_eq!(rows[0].get_named::<String>("t").unwrap(), "integer");
+        let created_at: i64 = rows[0].get_named("created_at").unwrap();
+        assert!(
+            created_at > 1_700_000_000_000_000,
+            "created_at should be microseconds: {created_at}"
+        );
+
+        // Verify agents timestamps are now INTEGER
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(inception_ts) as t1, typeof(last_active_ts) as t2 FROM agents",
+                &[],
+            )
+            .expect("query agents");
+        assert_eq!(rows[0].get_named::<String>("t1").unwrap(), "integer");
+        assert_eq!(rows[0].get_named::<String>("t2").unwrap(), "integer");
+
+        // Verify messages.created_ts is now INTEGER
+        let rows = conn
+            .query_sync("SELECT typeof(created_ts) as t FROM messages", &[])
+            .expect("query messages");
+        assert_eq!(rows[0].get_named::<String>("t").unwrap(), "integer");
+
+        // Verify file_reservations timestamps are now INTEGER
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_ts) as t1, typeof(expires_ts) as t2 FROM file_reservations",
+                &[],
+            )
+            .expect("query file_reservations");
+        assert_eq!(rows[0].get_named::<String>("t1").unwrap(), "integer");
+        assert_eq!(rows[0].get_named::<String>("t2").unwrap(), "integer");
     }
 
     #[test]
