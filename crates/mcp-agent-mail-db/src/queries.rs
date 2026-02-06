@@ -499,6 +499,35 @@ pub async fn get_project_by_human_key(
     }
 }
 
+/// Look up a project by its primary key.
+pub async fn get_project_by_id(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<ProjectRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    match map_sql_outcome(
+        select!(ProjectRow)
+            .filter(Expr::col("id").eq(project_id))
+            .first(cx, &tracked)
+            .await,
+    ) {
+        Outcome::Ok(Some(row)) => Outcome::Ok(row),
+        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", project_id.to_string())),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// List all projects
 pub async fn list_projects(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
@@ -2955,6 +2984,293 @@ pub async fn list_product_projects(
                 }
             }
             Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+// =============================================================================
+// File Reservation Cleanup Queries
+// =============================================================================
+
+/// List distinct project IDs that have unreleased file reservations.
+///
+/// Used by the cleanup worker to iterate only active projects.
+pub async fn project_ids_with_active_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<Vec<i64>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let sql = "SELECT DISTINCT project_id FROM file_reservations WHERE released_ts IS NULL";
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                if let Ok(pid) = row.get_named::<i64>("project_id") {
+                    out.push(pid);
+                }
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Bulk-release all expired file reservations for a project.
+///
+/// Sets `released_ts = now` for all unreleased reservations whose `expires_ts`
+/// has elapsed. Returns the IDs of released reservations.
+pub async fn release_expired_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<i64>, DbError> {
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    // First, collect the IDs to be released.
+    let select_sql = "SELECT id FROM file_reservations \
+                      WHERE project_id = ? AND released_ts IS NULL AND expires_ts < ?";
+    let params = [Value::BigInt(project_id), Value::BigInt(now)];
+    let ids = match map_sql_outcome(traw_query(cx, &tracked, select_sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut ids = Vec::with_capacity(rows.len());
+            for row in rows {
+                if let Ok(id) = row.get_named::<i64>("id") {
+                    ids.push(id);
+                }
+            }
+            ids
+        }
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    if ids.is_empty() {
+        return Outcome::Ok(ids);
+    }
+
+    // Update them all at once.
+    let update_sql = "UPDATE file_reservations SET released_ts = ? \
+                      WHERE project_id = ? AND released_ts IS NULL AND expires_ts < ?";
+    let update_params = [
+        Value::BigInt(now),
+        Value::BigInt(project_id),
+        Value::BigInt(now),
+    ];
+    match map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await) {
+        Outcome::Ok(_) => Outcome::Ok(ids),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Release specific file reservations by their IDs.
+///
+/// Sets `released_ts = now` for all given IDs that have `released_ts IS NULL`.
+/// Returns the number of rows affected.
+pub async fn release_reservations_by_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    ids: &[i64],
+) -> Outcome<usize, DbError> {
+    if ids.is_empty() {
+        return Outcome::Ok(0);
+    }
+
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    // Build parameterized IN clause.
+    let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+    let sql = format!(
+        "UPDATE file_reservations SET released_ts = ? WHERE id IN ({}) AND released_ts IS NULL",
+        placeholders.join(",")
+    );
+
+    let mut params = Vec::with_capacity(1 + ids.len());
+    params.push(Value::BigInt(now));
+    for &id in ids {
+        params.push(Value::BigInt(id));
+    }
+
+    let out = map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await);
+    match out {
+        Outcome::Ok(n) => usize::try_from(n).map_or_else(
+            |_| {
+                Outcome::Err(DbError::invalid(
+                    "row_count",
+                    "row count exceeds usize::MAX",
+                ))
+            },
+            Outcome::Ok,
+        ),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+// =============================================================================
+// ACK TTL Worker Queries
+// =============================================================================
+
+/// Row returned by [`list_unacknowledged_messages`].
+#[derive(Debug)]
+pub struct UnackedMessageRow {
+    pub message_id: i64,
+    pub project_id: i64,
+    pub created_ts: i64,
+    pub agent_id: i64,
+}
+
+/// List all messages with `ack_required = 1` that have at least one recipient
+/// who has not acknowledged (`ack_ts IS NULL`).
+///
+/// Returns one row per (message, unacked recipient) pair.
+pub async fn list_unacknowledged_messages(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<Vec<UnackedMessageRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let sql = "SELECT m.id, m.project_id, m.created_ts, mr.agent_id \
+               FROM messages m \
+               JOIN message_recipients mr ON mr.message_id = m.id \
+               WHERE m.ack_required = 1 AND mr.ack_ts IS NULL";
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let mid = match r.get(0) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                let pid = match r.get(1) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                let cts = match r.get(2) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                let aid = match r.get(3) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    _ => continue,
+                };
+                out.push(UnackedMessageRow {
+                    message_id: mid,
+                    project_id: pid,
+                    created_ts: cts,
+                    agent_id: aid,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Insert a raw agent row without name validation (for ops/system agents).
+///
+/// Used by the ACK TTL escalation worker to auto-create holder agents.
+pub async fn insert_system_agent(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+    program: &str,
+    model: &str,
+    task_description: &str,
+) -> Outcome<AgentRow, DbError> {
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    // Check if already exists.
+    match map_sql_outcome(
+        select!(AgentRow)
+            .filter(Expr::col("project_id").eq(project_id))
+            .filter(Expr::col("name").eq(name))
+            .first(cx, &tracked)
+            .await,
+    ) {
+        Outcome::Ok(Some(row)) => return Outcome::Ok(row),
+        Outcome::Ok(None) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+
+    let mut row = AgentRow {
+        id: None,
+        project_id,
+        name: name.to_string(),
+        program: program.to_string(),
+        model: model.to_string(),
+        task_description: task_description.to_string(),
+        inception_ts: now,
+        last_active_ts: now,
+        attachments_policy: "auto".to_string(),
+        contact_policy: "auto".to_string(),
+    };
+
+    match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
+        Outcome::Ok(id) => {
+            row.id = Some(id);
+            Outcome::Ok(row)
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),

@@ -35,7 +35,7 @@ pub use retry::{
 pub use timestamps::{iso_to_micros, micros_to_iso, micros_to_naive, naive_to_micros, now_micros};
 pub use tracking::{
     ActiveTrackerGuard, QueryTracker, QueryTrackerSnapshot, SlowQueryEntry, active_tracker,
-    elapsed_us, query_timer, set_active_tracker,
+    elapsed_us, query_timer, record_query, set_active_tracker,
 };
 
 /// Global query tracker instance.

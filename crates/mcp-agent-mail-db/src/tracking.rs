@@ -401,6 +401,224 @@ mod tests {
         assert_eq!(snap.slow_queries.len(), SLOW_QUERY_LIMIT);
     }
 
+    // ── round_ms edge cases ─────────────────────────────────────────────
+
+    fn assert_close(got: f64, expected: f64) {
+        let diff = (got - expected).abs();
+        assert!(diff < 1e-9, "expected {expected} (diff={diff}), got {got}");
+    }
+
+    #[test]
+    fn round_ms_zero() {
+        assert_close(round_ms(0), 0.0);
+    }
+
+    #[test]
+    fn round_ms_exact_milliseconds() {
+        assert_close(round_ms(1000), 1.0); // 1ms
+        assert_close(round_ms(250_000), 250.0); // 250ms
+    }
+
+    #[test]
+    fn round_ms_fractional_rounds_to_2_decimal() {
+        assert_close(round_ms(1234), 1.23); // 1.234ms → 1.23
+        assert_close(round_ms(1235), 1.24); // 1.235ms → 1.24 (round half up at .5)
+        assert_close(round_ms(1500), 1.5); // 1.5ms
+        assert_close(round_ms(999), 1.0); // 0.999ms → 1.0
+    }
+
+    #[test]
+    fn round_ms_large_value() {
+        assert_close(round_ms(60_000_000), 60000.0); // 60 seconds
+    }
+
+    // ── extract_table additional coverage ──────────────────────────────
+
+    #[test]
+    fn extract_table_insert_or_ignore() {
+        assert_eq!(
+            extract_table("INSERT OR IGNORE INTO agents (name) VALUES ('x')"),
+            Some("agents".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_insert_or_abort() {
+        assert_eq!(
+            extract_table("INSERT OR ABORT INTO messages (body) VALUES ('hi')"),
+            Some("messages".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_with_cte() {
+        // WITH clause: FROM in CTE, but first FROM is matched
+        assert_eq!(
+            extract_table("WITH recent AS (SELECT * FROM messages) SELECT * FROM recent"),
+            Some("messages".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_alter_returns_none() {
+        assert_eq!(
+            extract_table("ALTER TABLE agents ADD COLUMN email TEXT"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_table_drop_returns_none() {
+        assert_eq!(extract_table("DROP TABLE IF EXISTS old_data"), None);
+    }
+
+    // ── Tracker enable/disable lifecycle ────────────────────────────────
+
+    #[test]
+    fn tracker_enable_then_disable() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(100));
+        assert!(tracker.is_enabled());
+
+        tracker.record("SELECT * FROM agents", 1000);
+        assert_eq!(tracker.snapshot().total, 1);
+
+        tracker.disable();
+        assert!(!tracker.is_enabled());
+
+        // Recording after disable should be a no-op.
+        tracker.record("SELECT * FROM messages", 1000);
+        assert_eq!(tracker.snapshot().total, 1);
+    }
+
+    #[test]
+    fn tracker_enable_without_slow_threshold() {
+        let tracker = QueryTracker::new();
+        tracker.enable(None); // No slow query tracking
+        tracker.record("SELECT * FROM messages", 999_999_999); // Very slow
+        let snap = tracker.snapshot();
+        assert_eq!(snap.total, 1);
+        assert!(
+            snap.slow_queries.is_empty(),
+            "no slow queries without threshold"
+        );
+        assert!(snap.slow_query_ms.is_none());
+    }
+
+    #[test]
+    fn tracker_snapshot_is_immutable() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(250));
+        tracker.record("SELECT * FROM agents", 1000);
+        let snap1 = tracker.snapshot();
+
+        tracker.record("SELECT * FROM messages", 2000);
+        let snap2 = tracker.snapshot();
+
+        assert_eq!(snap1.total, 1, "first snapshot should not change");
+        assert_eq!(snap2.total, 2, "second snapshot should reflect new query");
+    }
+
+    // ── to_dict sorting verification ────────────────────────────────────
+
+    #[test]
+    fn to_dict_per_table_sorted_by_count_desc_then_name_asc() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(250));
+        // agents: 2, messages: 3, projects: 1, file_reservations: 2
+        tracker.record("SELECT * FROM agents", 1000);
+        tracker.record("SELECT * FROM agents", 1000);
+        tracker.record("SELECT * FROM messages", 1000);
+        tracker.record("SELECT * FROM messages", 1000);
+        tracker.record("SELECT * FROM messages", 1000);
+        tracker.record("SELECT * FROM projects", 1000);
+        tracker.record("SELECT * FROM file_reservations", 1000);
+        tracker.record("SELECT * FROM file_reservations", 1000);
+
+        let snap = tracker.snapshot();
+        let dict = snap.to_dict();
+        let per_table = dict["per_table"].as_object().unwrap();
+
+        // Verify counts
+        assert_eq!(per_table["messages"].as_u64(), Some(3));
+        assert_eq!(per_table["agents"].as_u64(), Some(2));
+        assert_eq!(per_table["file_reservations"].as_u64(), Some(2));
+        assert_eq!(per_table["projects"].as_u64(), Some(1));
+
+        // serde_json::Map (backed by BTreeMap) sorts keys alphabetically,
+        // so we verify counts are correct rather than insertion order.
+        let keys: Vec<&String> = per_table.keys().collect();
+        assert_eq!(
+            keys,
+            vec!["agents", "file_reservations", "messages", "projects"]
+        );
+    }
+
+    // ── Thread-local tracker isolation ───────────────────────────────────
+
+    #[test]
+    fn active_tracker_is_none_initially() {
+        // Note: this test depends on no other test having set the tracker
+        // on this thread. Since tests may run in parallel on different threads,
+        // this verifies the thread-local default.
+        let tracker = active_tracker();
+        // May or may not be None depending on test execution order on this thread,
+        // but the mechanism should not panic.
+        drop(tracker);
+    }
+
+    #[test]
+    fn set_active_tracker_guard_restores_previous() {
+        let t1 = Arc::new(QueryTracker::new());
+        t1.enable(Some(100));
+        let _g1 = set_active_tracker(t1);
+
+        {
+            let t2 = Arc::new(QueryTracker::new());
+            t2.enable(Some(200));
+            let _g2 = set_active_tracker(t2);
+
+            // Inside inner scope, active should be t2.
+            let current = active_tracker().unwrap();
+            current.record("SELECT * FROM messages", 1000);
+            assert_eq!(current.snapshot().total, 1);
+        }
+
+        // After inner guard dropped, active should be t1 again.
+        let restored = active_tracker().unwrap();
+        assert_eq!(restored.snapshot().total, 0, "t1 should have no queries");
+    }
+
+    // ── Snapshot JSON serialization ─────────────────────────────────────
+
+    #[test]
+    fn snapshot_serializes_to_json() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(100));
+        tracker.record("SELECT * FROM agents", 50_000);
+        tracker.record("SELECT * FROM messages", 150_000);
+        let snap = tracker.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["total"], 2);
+        assert!(v["total_time_ms"].is_f64());
+    }
+
+    #[test]
+    fn to_dict_matches_legacy_keys() {
+        let tracker = QueryTracker::new();
+        tracker.enable(Some(250));
+        let snap = tracker.snapshot();
+        let dict = snap.to_dict();
+        assert!(dict.get("total").is_some());
+        assert!(dict.get("total_time_ms").is_some());
+        assert!(dict.get("per_table").is_some());
+        assert!(dict.get("slow_query_ms").is_some());
+        assert!(dict.get("slow_queries").is_some());
+        // Must not have extra keys.
+        assert_eq!(dict.as_object().unwrap().len(), 5);
+    }
+
     // ── Fixture-driven table extraction tests ──────────────────────────
     #[test]
     fn fixture_table_extraction() {

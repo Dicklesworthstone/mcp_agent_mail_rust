@@ -139,13 +139,14 @@ pub struct DbPool {
     pool: Arc<Pool<SqliteConnection>>,
     sqlite_path: String,
     init_sql: Arc<String>,
+    run_migrations: bool,
 }
 
 impl DbPool {
     /// Create a new pool (does not open connections until first acquire).
     pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
         let sqlite_path = config.sqlite_path()?;
-        let init_sql = Arc::new(schema::init_schema_sql());
+        let init_sql = Arc::new(schema::PRAGMA_SETTINGS_SQL.to_string());
 
         let pool_config = PoolConfig::new(config.max_connections)
             .min_connections(config.min_connections)
@@ -159,6 +160,7 @@ impl DbPool {
             pool: Arc::new(Pool::new(pool_config)),
             sqlite_path,
             init_sql,
+            run_migrations: config.run_migrations,
         })
     }
 
@@ -171,11 +173,14 @@ impl DbPool {
     pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<SqliteConnection>, SqlError> {
         let sqlite_path = self.sqlite_path.clone();
         let init_sql = self.init_sql.clone();
+        let run_migrations = self.run_migrations;
+        let cx2 = cx.clone();
 
         self.pool
             .acquire(cx, || {
                 let sqlite_path = sqlite_path.clone();
                 let init_sql = init_sql.clone();
+                let cx2 = cx2.clone();
                 async move {
                     // Ensure parent directory exists for file-backed DBs.
                     if sqlite_path != ":memory:" {
@@ -203,9 +208,21 @@ impl DbPool {
                         }
                     };
 
-                    // Idempotent schema init: PRAGMAs + CREATE TABLE/TRIGGER/FTS IF NOT EXISTS.
+                    // Per-connection PRAGMAs matching legacy Python `db.py` event listeners.
                     if let Err(e) = conn.execute_raw(&init_sql) {
                         return Outcome::Err(e);
+                    }
+
+                    if run_migrations {
+                        // Run migrations on the connection directly.
+                        // SQLite's internal WAL locking prevents concurrent migration
+                        // races — the migration runner already uses BEGIN IMMEDIATE.
+                        match schema::migrate_to_latest(&cx2, &conn).await {
+                            Outcome::Ok(_) => {}
+                            Outcome::Err(e) => return Outcome::Err(e),
+                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                            Outcome::Panicked(p) => return Outcome::Panicked(p),
+                        }
                     }
 
                     Outcome::Ok(conn)
