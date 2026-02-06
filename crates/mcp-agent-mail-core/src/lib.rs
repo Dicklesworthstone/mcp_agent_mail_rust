@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_detect;
 pub mod config;
 pub mod error;
 pub mod identity;
@@ -15,6 +16,10 @@ pub mod models;
 pub mod toon;
 
 // Re-export key types for convenience
+pub use agent_detect::{
+    AgentDetectError, AgentDetectOptions, AgentDetectRootOverride, InstalledAgentDetectionEntry,
+    InstalledAgentDetectionReport, InstalledAgentDetectionSummary, detect_installed_agents,
+};
 pub use config::{
     AgentNameEnforcementMode, AppEnvironment, Config, ProjectIdentityMode, RateLimitBackend,
 };

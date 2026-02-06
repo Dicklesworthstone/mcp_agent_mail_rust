@@ -25,6 +25,7 @@ optional = true
 
 [dev-dependencies]
 criterion.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "toon_bench"

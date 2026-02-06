@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -124,6 +124,9 @@ pub enum WriteOp {
         body_md: String,
         sender: String,
         recipients: Vec<String>,
+        /// Additional repo-root-relative paths to include in the git commit
+        /// (e.g., attachment files/manifests created during message processing).
+        extra_paths: Vec<String>,
     },
     AgentProfile {
         project_slug: String,
@@ -335,6 +338,7 @@ fn wbq_execute_op(op: &WriteOp) -> Result<()> {
             body_md,
             sender,
             recipients,
+            extra_paths,
         } => {
             let archive = ensure_archive(config, project_slug)?;
             write_message_bundle(
@@ -344,7 +348,7 @@ fn wbq_execute_op(op: &WriteOp) -> Result<()> {
                 body_md,
                 sender,
                 recipients,
-                &[],
+                extra_paths,
                 None,
             )
         }
@@ -1670,6 +1674,7 @@ pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) 
         .get("name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
+    let name = validate_archive_component("agent name", name)?;
 
     let profile_dir = archive.root.join("agents").join(name);
     fs::create_dir_all(&profile_dir)?;
@@ -1698,6 +1703,7 @@ pub fn write_agent_profile_with_config(
         .get("name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
+    let name = validate_archive_component("agent name", name)?;
 
     let profile_dir = archive.root.join("agents").join(name);
     fs::create_dir_all(&profile_dir)?;
@@ -1851,6 +1857,71 @@ fn sanitize_thread_id(thread_id: &str) -> String {
     }
 }
 
+fn validate_archive_component<'a>(kind: &str, raw: &'a str) -> Result<&'a str> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(StorageError::InvalidPath(format!("{kind} is empty")));
+    }
+    if s == "." || s == ".." {
+        return Err(StorageError::InvalidPath(format!(
+            "{kind} must not be '.' or '..'"
+        )));
+    }
+    if s.contains('/') || s.contains('\\') {
+        return Err(StorageError::InvalidPath(format!(
+            "{kind} must not contain path separators"
+        )));
+    }
+    if s.contains('\0') {
+        return Err(StorageError::InvalidPath(format!(
+            "{kind} must not contain NUL"
+        )));
+    }
+    Ok(s)
+}
+
+fn validate_repo_relative_path<'a>(kind: &str, raw: &'a str) -> Result<&'a str> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(StorageError::InvalidPath(format!("{kind} is empty")));
+    }
+    if s.contains('\\') {
+        return Err(StorageError::InvalidPath(format!(
+            "{kind} must use forward slashes"
+        )));
+    }
+    if s.contains('\0') {
+        return Err(StorageError::InvalidPath(format!(
+            "{kind} must not contain NUL"
+        )));
+    }
+
+    let p = Path::new(s);
+    if let Some(Component::Normal(first)) = p.components().next() {
+        if first == ".git" {
+            return Err(StorageError::InvalidPath(format!(
+                "{kind} must not reference .git internals"
+            )));
+        }
+    }
+
+    for c in p.components() {
+        match c {
+            Component::Normal(_) => {}
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(StorageError::InvalidPath(format!(
+                    "{kind} must be a repo-root-relative path"
+                )));
+            }
+        }
+    }
+
+    Ok(s)
+}
+
 /// Compute message archive paths for canonical, outbox, and inbox copies.
 pub fn message_paths(
     archive: &ProjectArchive,
@@ -1859,7 +1930,9 @@ pub fn message_paths(
     created: &DateTime<Utc>,
     subject: &str,
     id: i64,
-) -> MessageArchivePaths {
+) -> Result<MessageArchivePaths> {
+    let sender = validate_archive_component("sender", sender)?;
+
     let y = created.format("%Y").to_string();
     let m = created.format("%m").to_string();
     let iso = created.format("%Y-%m-%dT%H-%M-%SZ").to_string();
@@ -1901,9 +1974,10 @@ pub fn message_paths(
         .join(&y)
         .join(&m)
         .join(&filename);
-    let inbox: Vec<PathBuf> = recipients
-        .iter()
-        .map(|r| {
+    let mut inbox: Vec<PathBuf> = Vec::with_capacity(recipients.len());
+    for r in recipients {
+        let r = validate_archive_component("recipient", r)?;
+        inbox.push(
             archive
                 .root
                 .join("agents")
@@ -1911,15 +1985,15 @@ pub fn message_paths(
                 .join("inbox")
                 .join(&y)
                 .join(&m)
-                .join(&filename)
-        })
-        .collect();
+                .join(&filename),
+        );
+    }
 
-    MessageArchivePaths {
+    Ok(MessageArchivePaths {
         canonical,
         outbox,
         inbox,
-    }
+    })
 }
 
 /// Write a message bundle to the archive: canonical, outbox, and inbox copies.
@@ -1953,7 +2027,7 @@ pub fn write_message_bundle(
             .get("id")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0),
-    );
+    )?;
 
     // Build frontmatter content
     let frontmatter = serde_json::to_string_pretty(message)?;
@@ -2010,7 +2084,8 @@ pub fn write_message_bundle(
 
     // Extra paths
     for p in extra_paths {
-        rel_paths.push(p.clone());
+        let p = validate_repo_relative_path("extra_path", p)?;
+        rel_paths.push(p.to_string());
     }
 
     // Build commit message
@@ -2894,12 +2969,14 @@ fn walk_md_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 
 /// Get inbox message files for a specific agent.
 pub fn list_agent_inbox(archive: &ProjectArchive, agent_name: &str) -> Result<Vec<PathBuf>> {
+    let agent_name = validate_archive_component("agent name", agent_name)?;
     let inbox_dir = archive.root.join("agents").join(agent_name).join("inbox");
     list_message_files(&inbox_dir)
 }
 
 /// Get outbox message files for a specific agent.
 pub fn list_agent_outbox(archive: &ProjectArchive, agent_name: &str) -> Result<Vec<PathBuf>> {
+    let agent_name = validate_archive_component("agent name", agent_name)?;
     let outbox_dir = archive.root.join("agents").join(agent_name).join("outbox");
     list_message_files(&outbox_dir)
 }
@@ -2932,6 +3009,7 @@ pub fn read_agent_profile(
     archive: &ProjectArchive,
     agent_name: &str,
 ) -> Result<Option<serde_json::Value>> {
+    let agent_name = validate_archive_component("agent name", agent_name)?;
     let profile_path = archive
         .root
         .join("agents")
@@ -3043,6 +3121,7 @@ fn commit_paths(
     let mut index = repo.index()?;
 
     for path in rel_paths {
+        let path = validate_repo_relative_path("commit path", path)?;
         // git2 expects forward-slash paths on all platforms
         let p = Path::new(path);
         // Only add if the file exists on disk
@@ -3254,6 +3333,23 @@ mod tests {
     }
 
     #[test]
+    fn test_write_agent_profile_rejects_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let agent = serde_json::json!({
+            "name": "../EvilAgent",
+            "program": "test",
+            "model": "test-model",
+        });
+
+        let err =
+            write_agent_profile_with_config(&archive, &config, &agent).expect_err("expected error");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+    }
+
+    #[test]
     fn test_write_file_reservation_record() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -3317,6 +3413,86 @@ mod tests {
         // Check thread digest (sanitize_thread_id lowercases)
         let digest = archive.root.join("messages/threads/tkt-1.md");
         assert!(digest.exists());
+    }
+
+    #[test]
+    fn test_write_message_bundle_rejects_path_traversal_agent_names() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 1,
+            "subject": "Test Message",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-1",
+            "project": "proj",
+        });
+
+        let err = write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "Hello world!",
+            "../SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .expect_err("expected error");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+
+        let err = write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "Hello world!",
+            "SenderAgent",
+            &["../RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .expect_err("expected error");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+    }
+
+    #[test]
+    fn test_write_message_bundle_rejects_unsafe_extra_paths() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 1,
+            "subject": "Test Message",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-1",
+            "project": "proj",
+        });
+
+        let extra = vec!["../oops.txt".to_string()];
+        let err = write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "Hello world!",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &extra,
+            None,
+        )
+        .expect_err("expected error");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+    }
+
+    #[test]
+    fn test_list_agent_inbox_rejects_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let err = list_agent_inbox(&archive, "../bad").expect_err("expected error");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
     }
 
     #[test]
@@ -4279,6 +4455,7 @@ mod tests {
             body_md: "Hello from WBQ".to_string(),
             sender: "Sender".to_string(),
             recipients: vec!["Receiver".to_string()],
+            extra_paths: vec![],
         };
 
         assert!(wbq_enqueue(op));
