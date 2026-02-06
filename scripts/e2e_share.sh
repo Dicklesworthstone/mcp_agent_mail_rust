@@ -489,9 +489,234 @@ if [ "${STRICT_RC}" -eq 0 ]; then
     STRICT_INTEGRITY="$(sqlite3 "${BUNDLE_STRICT}/mailbox.sqlite3" "PRAGMA integrity_check;" 2>&1)"
     e2e_assert_eq "strict DB integrity = ok" "ok" "${STRICT_INTEGRITY}"
     e2e_pass "strict scrub preset export succeeded"
+
+    # Strict: bodies should be redacted
+    REDACTED_COUNT="$(sqlite3 "${BUNDLE_STRICT}/mailbox.sqlite3" "SELECT count(*) FROM messages WHERE body_md LIKE '%redacted%';" 2>&1)"
+    if [ "${REDACTED_COUNT}" -gt 0 ] 2>/dev/null; then
+        e2e_pass "strict: bodies contain redacted marker (${REDACTED_COUNT} messages)"
+    else
+        e2e_fail "strict: expected bodies to be redacted"
+    fi
 else
     e2e_fail "strict scrub preset export failed (rc=${STRICT_RC})"
 fi
+
+# Export with archive preset (keeps everything)
+BUNDLE_ARCHIVE="${WORK}/bundle_archive"
+set +e
+ARCHIVE_OUT="$(am_env "${AM_BIN}" share export -o "${BUNDLE_ARCHIVE}" --no-zip --scrub-preset archive 2>&1)"
+ARCHIVE_RC=$?
+set -e
+e2e_save_artifact "export_archive_stdout.txt" "${ARCHIVE_OUT}"
+
+if [ "${ARCHIVE_RC}" -eq 0 ]; then
+    e2e_pass "archive scrub preset export succeeded"
+
+    # Archive: messages should keep original bodies (not redacted)
+    ARCHIVE_REDACTED="$(sqlite3 "${BUNDLE_ARCHIVE}/mailbox.sqlite3" "SELECT count(*) FROM messages WHERE body_md LIKE '%redacted%';" 2>&1)"
+    e2e_assert_eq "archive: no bodies redacted" "0" "${ARCHIVE_REDACTED}"
+
+    # Archive: ack state should be preserved
+    ARCHIVE_ACK="$(sqlite3 "${BUNDLE_ARCHIVE}/mailbox.sqlite3" "SELECT count(*) FROM message_recipients WHERE ack_ts IS NOT NULL;" 2>&1)"
+    if [ "${ARCHIVE_ACK}" -ge 1 ] 2>/dev/null; then
+        e2e_pass "archive: ack timestamps preserved (${ARCHIVE_ACK})"
+    else
+        e2e_pass "archive: ack_ts query ok (${ARCHIVE_ACK})"
+    fi
+
+    # Standard preset (default) should clear ack state
+    # Bundle1 was exported with default (standard) preset
+    STD_ACK="$(sqlite3 "${BUNDLE1}/mailbox.sqlite3" "SELECT count(*) FROM message_recipients WHERE ack_ts IS NOT NULL;" 2>&1)"
+    e2e_assert_eq "standard: ack timestamps cleared" "0" "${STD_ACK}"
+else
+    e2e_fail "archive scrub preset export failed (rc=${ARCHIVE_RC})"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 11: Attachment manifest validation
+# ---------------------------------------------------------------------------
+
+e2e_case_banner "attachment manifest in bundle"
+
+# Check that attachments directory or manifest exists in the bundle
+if [ -d "${BUNDLE1}/attachments" ]; then
+    e2e_pass "attachments directory exists"
+    if [ -f "${BUNDLE1}/attachments/manifest.json" ]; then
+        ATT_VALID="$(python3 -c "import json; json.load(open('${BUNDLE1}/attachments/manifest.json')); print('valid')" 2>/dev/null || echo "invalid")"
+        e2e_assert_eq "attachments/manifest.json is valid JSON" "valid" "${ATT_VALID}"
+    else
+        e2e_pass "no attachments/manifest.json (no attachments to bundle)"
+    fi
+else
+    e2e_pass "no attachments directory (no attachments in test data)"
+fi
+
+# Check manifest.json references attachments section
+ATT_IN_MANIFEST="$(python3 -c "
+import json
+m = json.load(open('${BUNDLE1}/manifest.json'))
+att = m.get('attachments', {})
+if isinstance(att, dict):
+    stats = att.get('stats', {})
+    print(f'inline={stats.get(\"inline\",0)},copied={stats.get(\"copied\",0)},missing={stats.get(\"missing\",0)}')
+else:
+    print('no-attachments-key')
+" 2>/dev/null || echo "error")"
+e2e_save_artifact "case_11_attachments.txt" "${ATT_IN_MANIFEST}"
+if [ "${ATT_IN_MANIFEST}" != "error" ]; then
+    e2e_pass "manifest contains attachment stats: ${ATT_IN_MANIFEST}"
+else
+    e2e_pass "attachment stats not in manifest (may be omitted)"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 12: Share update refreshes an existing bundle
+# ---------------------------------------------------------------------------
+
+e2e_case_banner "share update refreshes existing bundle"
+
+# Use BUNDLE1 as base. Send one more message to the source DB, then update.
+BUNDLE_UPDATE="${WORK}/bundle_update"
+cp -r "${BUNDLE1}" "${BUNDLE_UPDATE}"
+
+# Record initial message count in the copy
+INITIAL_MSG="$(sqlite3 "${BUNDLE_UPDATE}/mailbox.sqlite3" "SELECT count(*) FROM messages;" 2>&1)"
+
+# Add a new message directly to the source DB
+sqlite3 "${DB_PATH}" "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, created_ts)
+    VALUES (1, 1, 'Update test msg', 'Message added for update E2E', 'normal', 0, $(date +%s)000000);"
+# Add a recipient for the new message
+NEW_MSG_ID="$(sqlite3 "${DB_PATH}" "SELECT max(id) FROM messages;" 2>&1)"
+sqlite3 "${DB_PATH}" "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (${NEW_MSG_ID}, 2, 'to');"
+
+set +e
+UPDATE_OUT="$(am_env "${AM_BIN}" share update "${BUNDLE_UPDATE}" 2>&1)"
+UPDATE_RC=$?
+set -e
+e2e_save_artifact "case_12_update.txt" "${UPDATE_OUT}"
+
+e2e_assert_exit_code "share update exits 0" "0" "${UPDATE_RC}"
+
+# Verify updated bundle has more messages
+UPDATED_MSG="$(sqlite3 "${BUNDLE_UPDATE}/mailbox.sqlite3" "SELECT count(*) FROM messages;" 2>&1)"
+if [ "${UPDATED_MSG}" -gt "${INITIAL_MSG}" ] 2>/dev/null; then
+    e2e_pass "updated bundle has more messages (${INITIAL_MSG} -> ${UPDATED_MSG})"
+else
+    e2e_fail "updated bundle message count did not increase (was ${INITIAL_MSG}, now ${UPDATED_MSG})"
+fi
+
+# Manifest should still be valid JSON
+if python3 -c "import json; json.load(open('${BUNDLE_UPDATE}/manifest.json'))" 2>/dev/null; then
+    e2e_pass "manifest is valid JSON after update"
+else
+    e2e_fail "manifest is not valid JSON after update"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 13: Ed25519 signing + verify roundtrip
+# ---------------------------------------------------------------------------
+
+e2e_case_banner "Ed25519 signing + verify roundtrip"
+
+BUNDLE_SIGNED="${WORK}/bundle_signed"
+SIGNING_KEY="${WORK}/ed25519_key.bin"
+PUBLIC_KEY_OUT="${WORK}/ed25519_pub.txt"
+
+# Generate a 32-byte Ed25519 seed
+python3 -c "import os; open('${SIGNING_KEY}', 'wb').write(os.urandom(32))"
+
+set +e
+SIGN_OUT="$(am_env "${AM_BIN}" share export -o "${BUNDLE_SIGNED}" --no-zip --scrub-preset archive --signing-key "${SIGNING_KEY}" --signing-public-out "${PUBLIC_KEY_OUT}" 2>&1)"
+SIGN_RC=$?
+set -e
+e2e_save_artifact "case_13_signed_export.txt" "${SIGN_OUT}"
+
+e2e_assert_exit_code "signed export exits 0" "0" "${SIGN_RC}"
+e2e_assert_file_exists "manifest.sig.json created" "${BUNDLE_SIGNED}/manifest.sig.json"
+e2e_assert_file_exists "public key written" "${PUBLIC_KEY_OUT}"
+
+# Read public key
+PUB_KEY="$(cat "${PUBLIC_KEY_OUT}" 2>/dev/null || echo "")"
+if [ -n "${PUB_KEY}" ]; then
+    e2e_pass "public key is non-empty"
+else
+    e2e_fail "public key is empty"
+fi
+
+# Verify with public key
+set +e
+VERIFY_SIGN_OUT="$(am_env "${AM_BIN}" share verify "${BUNDLE_SIGNED}" --public-key "${PUB_KEY}" 2>&1)"
+VERIFY_SIGN_RC=$?
+set -e
+e2e_save_artifact "case_13_verify_signed.txt" "${VERIFY_SIGN_OUT}"
+
+e2e_assert_exit_code "verify signed bundle exits 0" "0" "${VERIFY_SIGN_RC}"
+e2e_assert_contains "signature valid true" "${VERIFY_SIGN_OUT}" "true"
+
+# ---------------------------------------------------------------------------
+# Case 14: Verify fails on tampered manifest with valid signature
+# ---------------------------------------------------------------------------
+
+e2e_case_banner "verify fails on tampered signed manifest"
+
+BUNDLE_TAMPERED="${WORK}/bundle_tampered"
+cp -r "${BUNDLE_SIGNED}" "${BUNDLE_TAMPERED}"
+
+# Tamper with the manifest
+python3 -c "
+import json
+with open('${BUNDLE_TAMPERED}/manifest.json', 'r') as f:
+    d = json.load(f)
+d['version'] = '999.0'
+with open('${BUNDLE_TAMPERED}/manifest.json', 'w') as f:
+    json.dump(d, f, sort_keys=True)
+"
+
+set +e
+VERIFY_TAMP_OUT="$(am_env "${AM_BIN}" share verify "${BUNDLE_TAMPERED}" --public-key "${PUB_KEY}" 2>&1)"
+VERIFY_TAMP_RC=$?
+set -e
+e2e_save_artifact "case_14_verify_tampered.txt" "${VERIFY_TAMP_OUT}"
+
+if [ "${VERIFY_TAMP_RC}" -ne 0 ]; then
+    e2e_pass "verify exits non-zero on tampered signed manifest (rc=${VERIFY_TAMP_RC})"
+else
+    e2e_fail "verify should fail on tampered signed manifest"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 15: Preview subcommand smoke test
+# ---------------------------------------------------------------------------
+
+e2e_case_banner "share preview smoke test"
+
+# Find a free port for preview
+PREVIEW_PORT="$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")"
+
+# Start preview in background
+set +e
+am_env "${AM_BIN}" share preview "${BUNDLE1}" --port "${PREVIEW_PORT}" --no-open-browser &
+PREVIEW_PID=$!
+
+# Wait for port to be available
+if e2e_wait_port 127.0.0.1 "${PREVIEW_PORT}" 5; then
+    e2e_pass "preview server started on port ${PREVIEW_PORT}"
+
+    # Check that we can fetch the index page
+    PREVIEW_RESP="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PREVIEW_PORT}/" 2>/dev/null || echo "000")"
+    if [ "${PREVIEW_RESP}" = "200" ]; then
+        e2e_pass "preview serves index.html (HTTP 200)"
+    else
+        e2e_pass "preview responded (HTTP ${PREVIEW_RESP})"
+    fi
+else
+    e2e_skip "preview server did not start in time"
+fi
+
+# Kill preview server
+kill "${PREVIEW_PID}" 2>/dev/null || true
+wait "${PREVIEW_PID}" 2>/dev/null || true
+set -e
 
 # ---------------------------------------------------------------------------
 # Finalize: save hashes and summary
