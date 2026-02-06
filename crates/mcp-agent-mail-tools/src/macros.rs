@@ -10,6 +10,7 @@ use fastmcp::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{AgentResponse, ProjectResponse, WhoisResponse};
+use crate::llm;
 use crate::messaging::InboxMessage;
 use crate::reservations::{ReleaseResult, ReservationResponse};
 use crate::search::{ExampleMessage, ThreadSummary};
@@ -258,7 +259,46 @@ pub async fn macro_prepare_thread(
     )?;
 
     let include_examples = include_examples.unwrap_or(true);
-    let summary = crate::search::summarize_messages(&messages);
+    let use_llm = llm_mode.unwrap_or(true);
+    let total_messages = i64::try_from(messages.len()).unwrap_or(i64::MAX);
+
+    let mut summary = crate::search::summarize_messages(&messages);
+
+    // Optional LLM refinement (legacy parity: same merge semantics as summarize_thread).
+    let config = mcp_agent_mail_core::Config::from_env();
+    if use_llm && config.llm_enabled {
+        let msg_tuples: Vec<(i64, String, String, String)> = messages
+            .iter()
+            .take(llm::MAX_MESSAGES_FOR_LLM)
+            .map(|m| (m.id, m.from.clone(), m.subject.clone(), m.body_md.clone()))
+            .collect();
+
+        let system = llm::single_thread_system_prompt();
+        let user = llm::single_thread_user_prompt(&msg_tuples);
+
+        match llm::complete_system_user(
+            system,
+            &user,
+            llm_model.as_deref(),
+            Some(config.llm_temperature),
+            Some(config.llm_max_tokens),
+        )
+        .await
+        {
+            Ok(output) => {
+                if let Some(parsed) = llm::parse_json_safely(&output.content) {
+                    summary = llm::merge_single_thread_summary(&summary, &parsed);
+                } else {
+                    tracing::debug!(
+                        "macro_prepare_thread.llm_skipped: could not parse LLM response"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!("macro_prepare_thread.llm_skipped: {e}");
+            }
+        }
+    }
     let examples = if include_examples {
         messages
             .iter()
@@ -276,7 +316,7 @@ pub async fn macro_prepare_thread(
 
     let thread = PreparedThread {
         thread_id: thread_id.clone(),
-        total_messages: summary.total_messages,
+        total_messages,
         summary,
         examples,
     };
@@ -309,7 +349,7 @@ pub async fn macro_prepare_thread(
         llm_mode
     );
 
-    if let Some(model) = llm_model {
+    if let Some(model) = llm_model.as_deref() {
         tracing::debug!("LLM model: {}", model);
     }
     if let Some(bodies) = include_inbox_bodies {
@@ -359,7 +399,9 @@ pub async fn macro_file_reservation_cycle(
         ));
     }
 
-    let reservation_json = crate::reservations::file_reservation_paths(
+    // Legacy tooling metrics counts the internal reservation tool calls made by this macro.
+    crate::metrics::record_call("file_reservation_paths");
+    let reservation_json = match crate::reservations::file_reservation_paths(
         ctx,
         project_key.clone(),
         agent_name.clone(),
@@ -372,18 +414,34 @@ pub async fn macro_file_reservation_cycle(
                 .unwrap_or_else(|| "macro-file_reservation".to_string()),
         ),
     )
-    .await?;
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            crate::metrics::record_error("file_reservation_paths");
+            return Err(e);
+        }
+    };
     let file_reservations: ReservationResponse = parse_json(reservation_json, "file_reservations")?;
 
     let released = if should_release {
-        let release_json = crate::reservations::release_file_reservations(
+        // Legacy tooling metrics counts the internal release tool call made by this macro.
+        crate::metrics::record_call("release_file_reservations");
+        let release_json = match crate::reservations::release_file_reservations(
             ctx,
             project_key.clone(),
             agent_name.clone(),
             Some(paths),
             None,
         )
-        .await?;
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                crate::metrics::record_error("release_file_reservations");
+                return Err(e);
+            }
+        };
         Some(parse_json::<ReleaseResult>(release_json, "released")?)
     } else {
         None

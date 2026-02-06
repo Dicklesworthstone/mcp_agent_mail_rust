@@ -26,9 +26,9 @@ use crate::{
 
 fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
     if let Some((base, query)) = input.split_once('?') {
-        (base.to_string(), parse_query(query))
+        (percent_decode_component(base), parse_query(query))
     } else {
-        (input.to_string(), HashMap::new())
+        (percent_decode_component(input), HashMap::new())
     }
 }
 
@@ -293,9 +293,10 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
                WHERE m.project_id = ? AND r.read_ts IS NULL \
                GROUP BY r.agent_id";
     let params = [mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id)];
-    let unread_rows = conn
-        .query_sync(sql, &params)
-        .map_err(|e| McpError::internal_error(e.to_string()))?;
+    let start = mcp_agent_mail_db::query_timer();
+    let unread_rows = conn.query_sync(sql, &params);
+    mcp_agent_mail_db::record_query(sql, mcp_agent_mail_db::elapsed_us(start));
+    let unread_rows = unread_rows.map_err(|e| McpError::internal_error(e.to_string()))?;
 
     let mut unread_counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     for row in unread_rows {
@@ -987,7 +988,7 @@ pub struct ToolSchemasResponse {
     pub generated_at: Option<String>,
     pub global_optional: Vec<String>,
     pub output_formats: OutputFormats,
-    pub tools: std::collections::HashMap<String, ToolSchemaDetails>,
+    pub tools: std::collections::BTreeMap<String, ToolSchemaDetails>,
 }
 
 /// Get tool schemas.
@@ -1011,7 +1012,8 @@ pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
         },
     };
 
-    let mut tools = std::collections::HashMap::new();
+    let mut tools: std::collections::BTreeMap<String, ToolSchemaDetails> =
+        std::collections::BTreeMap::new();
 
     tools.insert(
         "send_message".to_string(),
@@ -1195,35 +1197,46 @@ pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
         .cloned()
         .unwrap_or_default();
 
-    let locks: Vec<ArchiveLock> = raw_locks
+    let mut locks: Vec<ArchiveLock> = raw_locks
         .iter()
-        .map(|l| {
-            let path = l.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            // Extract project slug from path (e.g. ".../projects/<slug>/...")
+        .filter_map(|l| {
+            // Only include well-formed locks. This keeps output deterministic and
+            // avoids "unknown" lock rows when the archive root contains
+            // unrelated or partially-written lock files.
+            let path = l.get("path").and_then(|v| v.as_str())?;
+
+            // Extract project slug from path (e.g. ".../projects/<slug>/...").
             let project_slug = path
                 .split("projects/")
                 .nth(1)
                 .and_then(|s| s.split('/').next())
-                .unwrap_or("unknown")
+                .filter(|s| !s.is_empty())?
                 .to_string();
-            let holder = l
+
+            let pid = l
                 .get("owner")
                 .and_then(|o| o.get("pid"))
-                .and_then(serde_json::Value::as_u64)
-                .map_or_else(|| "unknown".to_string(), |pid| format!("pid:{pid}"));
+                .and_then(serde_json::Value::as_u64)?;
+
             let acquired_ts = l
                 .get("owner")
                 .and_then(|o| o.get("created_ts"))
                 .and_then(serde_json::Value::as_f64)
                 .and_then(ts_f64_to_rfc3339)
                 .unwrap_or_default();
-            ArchiveLock {
+
+            Some(ArchiveLock {
                 project_slug,
-                holder,
+                holder: format!("pid:{pid}"),
                 acquired_ts,
-            }
+            })
         })
         .collect();
+    locks.sort_by(|a, b| {
+        a.project_slug
+            .cmp(&b.project_slug)
+            .then(a.holder.cmp(&b.holder))
+    });
 
     let total = locks.len() as u64;
 
@@ -1366,6 +1379,27 @@ pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<St
             },
             ToolingRecentEntry {
                 timestamp: None,
+                tool: "send_message".to_string(),
+                project: project_name.to_string(),
+                agent: agent_name.to_string(),
+                cluster: "messaging".to_string(),
+            },
+            ToolingRecentEntry {
+                timestamp: None,
+                tool: "send_message".to_string(),
+                project: project_name.to_string(),
+                agent: agent_name.to_string(),
+                cluster: "messaging".to_string(),
+            },
+            ToolingRecentEntry {
+                timestamp: None,
+                tool: "file_reservation_paths".to_string(),
+                project: project_name.to_string(),
+                agent: agent_name.to_string(),
+                cluster: "file_reservations".to_string(),
+            },
+            ToolingRecentEntry {
+                timestamp: None,
                 tool: "file_reservation_paths".to_string(),
                 project: project_name.to_string(),
                 agent: agent_name.to_string(),
@@ -1387,10 +1421,24 @@ pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<St
             },
             ToolingRecentEntry {
                 timestamp: None,
+                tool: "force_release_file_reservation".to_string(),
+                project: project_name.to_string(),
+                agent: agent_name.to_string(),
+                cluster: "file_reservations".to_string(),
+            },
+            ToolingRecentEntry {
+                timestamp: None,
                 tool: "whois".to_string(),
                 project: project_name.to_string(),
                 agent: agent_name.to_string(),
                 cluster: "identity".to_string(),
+            },
+            ToolingRecentEntry {
+                timestamp: None,
+                tool: "macro_prepare_thread".to_string(),
+                project: project_name.to_string(),
+                agent: agent_name.to_string(),
+                cluster: "workflow_macros".to_string(),
             },
             ToolingRecentEntry {
                 timestamp: None,
@@ -1626,9 +1674,10 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
 
         let sql = "SELECT * FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
         let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
-        let rows = conn
-            .query_sync(sql, &params)
-            .map_err(|e| McpError::internal_error(e.to_string()))?;
+        let start = mcp_agent_mail_db::query_timer();
+        let rows = conn.query_sync(sql, &params);
+        mcp_agent_mail_db::record_query(sql, mcp_agent_mail_db::elapsed_us(start));
+        let rows = rows.map_err(|e| McpError::internal_error(e.to_string()))?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
@@ -2454,9 +2503,10 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         )
     };
 
-    let rows = conn
-        .query_sync(&sql, &params)
-        .map_err(|e| McpError::internal_error(e.to_string()))?;
+    let start = mcp_agent_mail_db::query_timer();
+    let rows = conn.query_sync(&sql, &params);
+    mcp_agent_mail_db::record_query(&sql, mcp_agent_mail_db::elapsed_us(start));
+    let rows = rows.map_err(|e| McpError::internal_error(e.to_string()))?;
 
     let mut messages: Vec<OutboxMessageEntry> = Vec::new();
     for row in rows {
@@ -2479,9 +2529,10 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                         JOIN agents a ON a.id = r.agent_id \
                         WHERE r.message_id = ?";
         let recip_params = [Value::BigInt(id)];
-        let recip_rows = conn
-            .query_sync(recip_sql, &recip_params)
-            .map_err(|e| McpError::internal_error(e.to_string()))?;
+        let recip_start = mcp_agent_mail_db::query_timer();
+        let recip_rows = conn.query_sync(recip_sql, &recip_params);
+        mcp_agent_mail_db::record_query(recip_sql, mcp_agent_mail_db::elapsed_us(recip_start));
+        let recip_rows = recip_rows.map_err(|e| McpError::internal_error(e.to_string()))?;
 
         let mut to_list: Vec<String> = Vec::new();
         let mut cc_list: Vec<String> = Vec::new();
@@ -3482,6 +3533,13 @@ mod query_param_tests {
         let (base, params) = split_param_and_query("?key=val");
         assert_eq!(base, "");
         assert_eq!(params.get("key").unwrap(), "val");
+    }
+
+    #[test]
+    fn split_base_percent_decoded() {
+        let (base, params) = split_param_and_query("Green%20Castle?project=/data/proj");
+        assert_eq!(base, "Green Castle");
+        assert_eq!(params.get("project").unwrap(), "/data/proj");
     }
 
     // -----------------------------------------------------------------------

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, OnceLock};
 
-use crate::search::{AggregateSummary, MentionCount, ThreadSummary};
+use crate::search::{AggregateSummary, MentionCount, ThreadEntry, ThreadSummary, TopMention};
 use mcp_agent_mail_core::config::dotenv_value;
 
 // ---------------------------------------------------------------------------
@@ -366,6 +366,15 @@ pub async fn complete_system_user(
 ) -> Result<LlmOutput, LlmError> {
     let resolved = model.map_or_else(|| resolve_model_alias(DEFAULT_MODEL), resolve_model_alias);
 
+    if llm_stub_enabled() {
+        return Ok(LlmOutput {
+            content: stubbed_completion_content(system, user),
+            model: resolved,
+            provider: Some("stub".to_string()),
+            estimated_cost_usd: Some(0.0),
+        });
+    }
+
     match complete_single(&resolved, system, user, temperature, max_tokens).await {
         Ok(output) => Ok(output),
         Err(e) => {
@@ -531,7 +540,7 @@ const KEY_POINTS_CAP: usize = 10;
 ///
 /// Strategy:
 /// - For `key_points`: keep heuristic items containing action keywords,
-///   prepend them, append LLM `key_points`, deduplicate, cap at 10.
+///   append them after LLM `key_points`, deduplicate, cap at 10.
 /// - For other keys: LLM values overlay heuristic values if present.
 pub fn merge_single_thread_summary(heuristic: &ThreadSummary, llm_json: &Value) -> ThreadSummary {
     let mut result = heuristic.clone();
@@ -544,25 +553,29 @@ pub fn merge_single_thread_summary(heuristic: &ThreadSummary, llm_json: &Value) 
             .map(String::from)
             .collect();
 
-        // Keep heuristic items with action keywords
-        let action_points: Vec<String> = heuristic
-            .key_points
-            .iter()
-            .filter(|kp| {
-                let upper = kp.to_ascii_uppercase();
-                ACTION_KEYWORDS.iter().any(|k| upper.contains(k))
-            })
-            .cloned()
-            .collect();
+        // Legacy Python semantics: only override key_points if non-empty, then append heuristic
+        // keyword key_points (TODO/ACTION/etc) after LLM's items.
+        if !llm_points.is_empty() {
+            // Keep heuristic items with action keywords
+            let action_points: Vec<String> = heuristic
+                .key_points
+                .iter()
+                .filter(|kp| {
+                    let upper = kp.to_ascii_uppercase();
+                    ACTION_KEYWORDS.iter().any(|k| upper.contains(k))
+                })
+                .cloned()
+                .collect();
 
-        let mut merged = action_points;
-        for p in llm_points {
-            if !merged.contains(&p) {
-                merged.push(p);
+            let mut merged: Vec<String> = Vec::new();
+            for p in llm_points.into_iter().chain(action_points.into_iter()) {
+                if !merged.contains(&p) {
+                    merged.push(p);
+                }
             }
+            merged.truncate(KEY_POINTS_CAP);
+            result.key_points = merged;
         }
-        merged.truncate(KEY_POINTS_CAP);
-        result.key_points = merged;
     }
 
     // action_items
@@ -617,17 +630,80 @@ pub fn merge_single_thread_summary(heuristic: &ThreadSummary, llm_json: &Value) 
     }
 
     // total_messages, open_actions, done_actions
+    //
+    // Legacy Python overlays only on truthy values; for integers, that means non-zero.
     if let Some(v) = llm_json.get("total_messages").and_then(Value::as_i64) {
-        result.total_messages = v;
+        if v != 0 {
+            result.total_messages = v;
+        }
     }
     if let Some(v) = llm_json.get("open_actions").and_then(Value::as_i64) {
-        result.open_actions = v;
+        if v != 0 {
+            result.open_actions = v;
+        }
     }
     if let Some(v) = llm_json.get("done_actions").and_then(Value::as_i64) {
-        result.done_actions = v;
+        if v != 0 {
+            result.done_actions = v;
+        }
     }
 
     result
+}
+
+/// Apply per-thread LLM revisions in multi-thread mode.
+///
+/// Legacy Python behavior: if LLM returns `threads[]`, replace per-thread `key_points` and
+/// `action_items` when those arrays are present and non-empty.
+pub fn apply_multi_thread_thread_revisions(threads: &mut [ThreadEntry], llm_json: &Value) {
+    let Some(payload_threads) = llm_json.get("threads").and_then(Value::as_array) else {
+        return;
+    };
+
+    let mut mapping: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+    for item in payload_threads {
+        let Some(thread_id) = item.get("thread_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let key_points: Vec<String> = item
+            .get("key_points")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let actions: Vec<String> = item
+            .get("actions")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        mapping.insert(thread_id.to_string(), (key_points, actions));
+    }
+
+    if mapping.is_empty() {
+        return;
+    }
+
+    for entry in threads {
+        let Some((key_points, actions)) = mapping.get(&entry.thread_id) else {
+            continue;
+        };
+        if !key_points.is_empty() {
+            entry.summary.key_points = key_points.clone();
+        }
+        if !actions.is_empty() {
+            entry.summary.action_items = actions.clone();
+        }
+    }
 }
 
 /// Merge LLM refinement into a heuristic `AggregateSummary` (multi-thread mode).
@@ -661,22 +737,17 @@ pub fn merge_multi_thread_aggregate(
             }
         }
         if let Some(tm) = agg.get("top_mentions").and_then(Value::as_array) {
-            // top_mentions can be strings or objects
-            let mentions: Vec<MentionCount> = tm
+            // top_mentions can be strings or objects (legacy Python).
+            let mentions: Vec<TopMention> = tm
                 .iter()
                 .filter_map(|v| {
                     v.as_str().map_or_else(
                         || {
                             let name = v.get("name")?.as_str()?.to_string();
                             let count = v.get("count").and_then(Value::as_i64).unwrap_or(0);
-                            Some(MentionCount { name, count })
+                            Some(TopMention::Count(MentionCount { name, count }))
                         },
-                        |s| {
-                            Some(MentionCount {
-                                name: s.to_string(),
-                                count: 0,
-                            })
-                        },
+                        |s| Some(TopMention::Name(s.to_string())),
                     )
                 })
                 .collect();
@@ -766,6 +837,34 @@ pub fn multi_thread_user_prompt(
         prompt.push('\n');
     }
     prompt
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic stub completions (conformance fixtures)
+// ---------------------------------------------------------------------------
+
+fn llm_stub_enabled() -> bool {
+    let Ok(v) = std::env::var("MCP_AGENT_MAIL_LLM_STUB") else {
+        return false;
+    };
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn stubbed_completion_content(system: &str, user: &str) -> String {
+    let sys = system.to_ascii_lowercase();
+
+    if sys.contains("digest across threads") || user.starts_with("Digest these threads:") {
+        // Intentionally include leading text so JSON parsing exercises brace-slice fallback.
+        return "Ok, here's the digest:\n{\n  \"threads\": [\n    {\n      \"thread_id\": \"T-1\",\n      \"key_points\": [\"API v2 schema finalized\"],\n      \"actions\": [\"Update OpenAPI spec\"]\n    },\n    {\n      \"thread_id\": \"T-2\",\n      \"key_points\": [\"Migration to new DB\"],\n      \"actions\": [\"Run migration script\"]\n    }\n  ],\n  \"aggregate\": {\n    \"top_mentions\": [\"Alice\", \"Bob\"],\n    \"key_points\": [\"API schema and DB migration are the two main workstreams\"],\n    \"action_items\": [\"Update OpenAPI spec\", \"Run migration script\"]\n  }\n}\nDone."
+            .to_string();
+    }
+
+    // Intentionally include fenced JSON so parsing exercises code-fence extraction fallback.
+    "Here is the summary:\n```json\n{\n  \"participants\": [\"BlueLake\", \"GreenCastle\"],\n  \"key_points\": [\n    \"API migration planned for next sprint\",\n    \"Staging deployment needed before review\"\n  ],\n  \"action_items\": [\"Deploy to staging\", \"Update API docs\"],\n  \"mentions\": [{\"name\": \"Carol\", \"count\": 2}],\n  \"code_references\": [\"api/v2/users\"],\n  \"total_messages\": 2,\n  \"open_actions\": 1,\n  \"done_actions\": 0\n}\n```\n"
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -939,8 +1038,11 @@ mod tests {
 
         let merged = merge_single_thread_summary(&heuristic, &llm_json);
 
-        // key_points: heuristic "TODO: deploy to staging" kept (has TODO), then LLM items
-        assert_eq!(merged.key_points[0], "TODO: deploy to staging");
+        // key_points: LLM first, then heuristic keyword points (TODO/ACTION/etc) appended.
+        assert_eq!(
+            merged.key_points[0],
+            "API migration planned for next sprint"
+        );
         assert!(
             merged
                 .key_points
@@ -951,6 +1053,12 @@ mod tests {
                 .key_points
                 .contains(&"Staging deployment needed before review".to_string())
         );
+        assert!(
+            merged
+                .key_points
+                .contains(&"TODO: deploy to staging".to_string())
+        );
+        assert_eq!(merged.key_points[2], "TODO: deploy to staging");
 
         // action_items from LLM
         assert_eq!(
@@ -991,13 +1099,14 @@ mod tests {
 
         let merged = merge_single_thread_summary(&heuristic, &llm_json);
 
-        // FIXME item kept, LLM items appended
-        assert_eq!(merged.key_points[0], "FIXME: broken auth flow");
+        // LLM key_points first, then heuristic keyword points appended.
+        assert_eq!(merged.key_points[0], "Authentication refactor in progress");
         assert!(
             merged
                 .key_points
                 .contains(&"Authentication refactor in progress".to_string())
         );
+        assert_eq!(merged.key_points[2], "FIXME: broken auth flow");
 
         // participants unchanged (not in LLM response)
         assert_eq!(merged.participants, vec!["Alice"]);
@@ -1026,10 +1135,10 @@ mod tests {
     #[test]
     fn merge_multi_thread_refinement() {
         let heuristic = AggregateSummary {
-            top_mentions: vec![MentionCount {
+            top_mentions: vec![TopMention::Count(MentionCount {
                 name: "Alice".into(),
                 count: 3,
-            }],
+            })],
             key_points: vec![
                 "TODO: finalize API schema".into(),
                 "migration timeline discussed".into(),
@@ -1037,10 +1146,53 @@ mod tests {
             action_items: vec!["TODO: finalize API schema".into()],
         };
 
+        let mut threads = vec![
+            ThreadEntry {
+                thread_id: "T-1".to_string(),
+                summary: ThreadSummary {
+                    participants: vec!["Alice".into()],
+                    key_points: vec!["heuristic kp".into()],
+                    action_items: vec!["heuristic action".into()],
+                    total_messages: 2,
+                    open_actions: 0,
+                    done_actions: 0,
+                    mentions: vec![],
+                    code_references: None,
+                },
+            },
+            ThreadEntry {
+                thread_id: "T-2".to_string(),
+                summary: ThreadSummary {
+                    participants: vec!["Bob".into()],
+                    key_points: vec!["heuristic kp 2".into()],
+                    action_items: vec!["heuristic action 2".into()],
+                    total_messages: 1,
+                    open_actions: 0,
+                    done_actions: 0,
+                    mentions: vec![],
+                    code_references: None,
+                },
+            },
+        ];
+
         let llm_json: Value = serde_json::from_str(
             r#"{"threads": [{"thread_id": "T-1", "key_points": ["API v2 schema finalized"], "actions": ["Update OpenAPI spec"]}, {"thread_id": "T-2", "key_points": ["Migration to new DB"], "actions": ["Run migration script"]}], "aggregate": {"top_mentions": ["Alice", "Bob"], "key_points": ["API schema and DB migration are the two main workstreams"], "action_items": ["Update OpenAPI spec", "Run migration script"]}}"#,
         )
         .unwrap();
+
+        apply_multi_thread_thread_revisions(&mut threads, &llm_json);
+        assert_eq!(threads[0].thread_id, "T-1");
+        assert_eq!(
+            threads[0].summary.key_points,
+            vec!["API v2 schema finalized"]
+        );
+        assert_eq!(threads[0].summary.action_items, vec!["Update OpenAPI spec"]);
+        assert_eq!(threads[1].thread_id, "T-2");
+        assert_eq!(threads[1].summary.key_points, vec!["Migration to new DB"]);
+        assert_eq!(
+            threads[1].summary.action_items,
+            vec!["Run migration script"]
+        );
 
         let merged = merge_multi_thread_aggregate(&heuristic, &llm_json);
 
@@ -1052,9 +1204,15 @@ mod tests {
             merged.action_items,
             vec!["Update OpenAPI spec", "Run migration script"]
         );
-        // top_mentions from LLM (string form, count=0)
-        assert_eq!(merged.top_mentions[0].name, "Alice");
-        assert_eq!(merged.top_mentions[1].name, "Bob");
+        // top_mentions from LLM (string form)
+        assert!(matches!(
+            &merged.top_mentions[0],
+            TopMention::Name(name) if name == "Alice"
+        ));
+        assert!(matches!(
+            &merged.top_mentions[1],
+            TopMention::Name(name) if name == "Bob"
+        ));
     }
 
     // -- prompt building tests --

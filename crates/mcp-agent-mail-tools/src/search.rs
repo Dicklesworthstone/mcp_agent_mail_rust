@@ -39,6 +39,17 @@ pub struct MentionCount {
     pub count: i64,
 }
 
+/// Aggregate top mention can be either a plain name string or a {name, count} object.
+///
+/// Legacy Python can emit either shape depending on whether LLM refinement overwrote the
+/// heuristic `{name,count}` objects with a string[] list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TopMention {
+    Name(String),
+    Count(MentionCount),
+}
+
 /// Thread summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadSummary {
@@ -78,7 +89,7 @@ pub struct ThreadEntry {
 /// Aggregate summary across threads
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateSummary {
-    pub top_mentions: Vec<MentionCount>,
+    pub top_mentions: Vec<TopMention>,
     pub key_points: Vec<String>,
     pub action_items: Vec<String>,
 }
@@ -430,7 +441,7 @@ pub async fn summarize_thread(
         let top_mentions = mentions_sorted
             .into_iter()
             .take(10)
-            .map(|(name, count)| MentionCount { name, count })
+            .map(|(name, count)| TopMention::Count(MentionCount { name, count }))
             .collect();
 
         let mut aggregate = AggregateSummary {
@@ -478,6 +489,7 @@ pub async fn summarize_thread(
             {
                 Ok(output) => {
                     if let Some(parsed) = llm::parse_json_safely(&output.content) {
+                        llm::apply_multi_thread_thread_revisions(&mut threads, &parsed);
                         aggregate = llm::merge_multi_thread_aggregate(&aggregate, &parsed);
                     } else {
                         tracing::debug!(

@@ -13,6 +13,7 @@ use mcp_agent_mail_db::{DbPool, ProductRow, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::llm;
 use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, SingleThreadResponse};
 use crate::tool_util::{
@@ -446,8 +447,6 @@ pub async fn summarize_thread_product(
         return Err(worktrees_required());
     }
 
-    let _ = (llm_mode, llm_model); // LLM refinement not implemented yet.
-
     let pool = get_db_pool()?;
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
@@ -483,7 +482,43 @@ pub async fn summarize_thread_product(
     }
 
     rows.sort_by_key(|a| a.created_ts);
-    let summary = crate::search::summarize_messages(&rows);
+    let use_llm = llm_mode.unwrap_or(true);
+    let mut summary = crate::search::summarize_messages(&rows);
+
+    // Optional LLM refinement (legacy parity: same merge semantics as summarize_thread).
+    if use_llm && config.llm_enabled {
+        let msg_tuples: Vec<(i64, String, String, String)> = rows
+            .iter()
+            .take(llm::MAX_MESSAGES_FOR_LLM)
+            .map(|m| (m.id, m.from.clone(), m.subject.clone(), m.body_md.clone()))
+            .collect();
+
+        let system = llm::single_thread_system_prompt();
+        let user = llm::single_thread_user_prompt(&msg_tuples);
+
+        match llm::complete_system_user(
+            system,
+            &user,
+            llm_model.as_deref(),
+            Some(config.llm_temperature),
+            Some(config.llm_max_tokens),
+        )
+        .await
+        {
+            Ok(output) => {
+                if let Some(parsed) = llm::parse_json_safely(&output.content) {
+                    summary = llm::merge_single_thread_summary(&summary, &parsed);
+                } else {
+                    tracing::debug!(
+                        "summarize_thread_product.llm_skipped: could not parse LLM response"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!("summarize_thread_product.llm_skipped: {e}");
+            }
+        }
+    }
 
     let with_examples = include_examples.unwrap_or(false);
     let mut examples = Vec::new();

@@ -39,6 +39,15 @@ pub fn record_error(tool_name: &str) {
     }
 }
 
+/// Clear all tool metrics counters.
+///
+/// Intended for tests that need deterministic snapshots across multiple tool calls.
+pub fn reset_tool_metrics() {
+    if let Ok(mut map) = TOOL_METRICS.lock() {
+        map.clear();
+    }
+}
+
 /// Static metadata for each tool (capabilities, complexity).
 ///
 /// Mirrors legacy Python `TOOL_METADATA` and `_instrument_tool` decorator kwargs.

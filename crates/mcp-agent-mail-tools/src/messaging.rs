@@ -35,6 +35,7 @@ fn try_write_message_archive(
     body_md: &str,
     sender: &str,
     all_recipient_names: &[String],
+    extra_paths: &[String],
 ) {
     let op = mcp_agent_mail_storage::WriteOp::MessageBundle {
         project_slug: project_slug.to_string(),
@@ -43,6 +44,7 @@ fn try_write_message_archive(
         body_md: body_md.to_string(),
         sender: sender.to_string(),
         recipients: all_recipient_names.to_vec(),
+        extra_paths: extra_paths.to_vec(),
     };
     if !mcp_agent_mail_storage::wbq_enqueue(op) {
         // Fallback: synchronous write
@@ -55,7 +57,7 @@ fn try_write_message_archive(
                     body_md,
                     sender,
                     all_recipient_names,
-                    &[],
+                    extra_paths,
                     None,
                 ) {
                     tracing::warn!("Failed to write message bundle to archive: {e}");
@@ -422,13 +424,14 @@ pub async fn send_message(
     // Process attachments and markdown images
     let mut final_body = body_md.clone();
     let mut all_attachment_meta: Vec<serde_json::Value> = Vec::new();
+    let mut all_attachment_rel_paths: Vec<String> = Vec::new();
 
     if do_convert {
         let slug = &project.slug;
         let archive = mcp_agent_mail_storage::ensure_archive(&config, slug);
         if let Ok(archive) = archive {
             // Process inline markdown images
-            if let Ok((updated_body, md_meta, _rel_paths)) =
+            if let Ok((updated_body, md_meta, rel_paths)) =
                 mcp_agent_mail_storage::process_markdown_images(
                     &archive,
                     &config,
@@ -437,6 +440,7 @@ pub async fn send_message(
                 )
             {
                 final_body = updated_body;
+                all_attachment_rel_paths.extend(rel_paths);
                 for m in &md_meta {
                     if let Ok(v) = serde_json::to_value(m) {
                         all_attachment_meta.push(v);
@@ -447,12 +451,13 @@ pub async fn send_message(
             // Process explicit attachment_paths
             if let Some(ref paths) = attachment_paths {
                 if !paths.is_empty() {
-                    if let Ok((att_meta, _rel_paths)) = mcp_agent_mail_storage::process_attachments(
+                    if let Ok((att_meta, rel_paths)) = mcp_agent_mail_storage::process_attachments(
                         &archive,
                         &config,
                         paths,
                         embed_policy,
                     ) {
+                        all_attachment_rel_paths.extend(rel_paths);
                         for m in &att_meta {
                             if let Ok(v) = serde_json::to_value(m) {
                                 all_attachment_meta.push(v);
@@ -793,6 +798,7 @@ pub async fn send_message(
             &message.body_md,
             &sender_name,
             &all_recipient_names,
+            &all_attachment_rel_paths,
         );
     }
 
@@ -1007,6 +1013,7 @@ pub async fn reply_message(
             &reply.body_md,
             &sender_name,
             &all_recipient_names,
+            &[],
         );
     }
 
