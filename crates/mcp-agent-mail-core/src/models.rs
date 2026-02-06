@@ -291,26 +291,173 @@ pub struct ProjectSiblingSuggestion {
 // Agent Name Validation
 // =============================================================================
 
-/// Valid adjectives for agent names (62 total)
+/// Valid adjectives for agent names (62 total).
+///
+/// IMPORTANT: Keep this list in lockstep with legacy Python `mcp_agent_mail.utils.ADJECTIVES`.
 pub const VALID_ADJECTIVES: &[&str] = &[
-    "amber", "azure", "black", "blue", "bold", "bright", "bronze", "brown", "calm", "clear",
-    "cold", "cool", "coral", "cosmic", "crimson", "crystal", "cyan", "dark", "deep", "dusty",
-    "echo", "electric", "emerald", "faint", "fierce", "fiery", "forest", "frosty", "fuchsia",
-    "gentle", "gilded", "gold", "golden", "gray", "green", "grim", "hazy", "icy", "indigo", "iron",
-    "jade", "lavender", "light", "lime", "lunar", "magenta", "marble", "mild", "misty", "neon",
-    "night", "olive", "orange", "pale", "pearl", "pink", "purple", "quiet", "red", "rose", "royal",
+    "red",
+    "orange",
+    "pink",
+    "black",
+    "purple",
+    "blue",
+    "brown",
+    "white",
+    "green",
+    "chartreuse",
+    "lilac",
+    "fuchsia",
+    "azure",
+    "amber",
+    "coral",
+    "crimson",
+    "cyan",
+    "gold",
+    "gray",
+    "indigo",
+    "ivory",
+    "jade",
+    "lavender",
+    "magenta",
+    "maroon",
+    "navy",
+    "olive",
+    "pearl",
+    "rose",
+    "ruby",
+    "sage",
+    "scarlet",
+    "silver",
+    "teal",
+    "topaz",
+    "violet",
+    "cobalt",
+    "copper",
+    "bronze",
+    "emerald",
+    "sapphire",
+    "turquoise",
+    "sunny",
+    "misty",
+    "foggy",
+    "stormy",
+    "windy",
+    "frosty",
+    "dusty",
+    "hazy",
+    "cloudy",
+    "rainy",
+    "swift",
+    "quiet",
+    "bold",
+    "calm",
+    "bright",
+    "dark",
+    "wild",
+    "silent",
+    "gentle",
+    "rustic",
 ];
 
-/// Valid nouns for agent names (69 total)
+/// Valid nouns for agent names (69 total).
+///
+/// IMPORTANT: Keep this list in lockstep with legacy Python `mcp_agent_mail.utils.NOUNS`.
 pub const VALID_NOUNS: &[&str] = &[
-    "anchor", "arrow", "aurora", "beacon", "bear", "bird", "blade", "bloom", "bolt", "breeze",
-    "brook", "castle", "cave", "cedar", "cliff", "cloud", "coral", "crane", "creek", "crystal",
-    "dawn", "delta", "dog", "dove", "drift", "dusk", "eagle", "ember", "falcon", "fern", "field",
-    "fire", "flame", "flower", "forge", "forest", "fox", "frost", "garden", "gate", "glacier",
-    "gorge", "grove", "harbor", "hawk", "haven", "hill", "horizon", "island", "lake", "leaf",
-    "light", "lion", "lotus", "meadow", "moon", "moss", "mountain", "night", "oak", "ocean",
-    "peak", "pine", "pond", "rain", "ridge", "river", "rock", "rose",
+    "stone",
+    "lake",
+    "dog",
+    "creek",
+    "pond",
+    "cat",
+    "bear",
+    "mountain",
+    "hill",
+    "snow",
+    "castle",
+    "river",
+    "forest",
+    "valley",
+    "canyon",
+    "meadow",
+    "prairie",
+    "desert",
+    "island",
+    "cliff",
+    "cave",
+    "glacier",
+    "waterfall",
+    "spring",
+    "stream",
+    "reef",
+    "dune",
+    "ridge",
+    "peak",
+    "gorge",
+    "marsh",
+    "brook",
+    "glen",
+    "grove",
+    "hollow",
+    "basin",
+    "cove",
+    "bay",
+    "harbor",
+    "fox",
+    "wolf",
+    "hawk",
+    "eagle",
+    "owl",
+    "deer",
+    "elk",
+    "moose",
+    "falcon",
+    "raven",
+    "heron",
+    "crane",
+    "otter",
+    "beaver",
+    "badger",
+    "finch",
+    "robin",
+    "sparrow",
+    "lynx",
+    "puma",
+    "tower",
+    "bridge",
+    "forge",
+    "mill",
+    "barn",
+    "gate",
+    "anchor",
+    "lantern",
+    "beacon",
+    "compass",
 ];
+
+/// Normalize a user-provided agent name; return `None` if nothing remains.
+///
+/// Mirrors legacy Python `sanitize_agent_name()`:
+/// - `value.strip()`
+/// - Remove all non `[A-Za-z0-9]` characters
+/// - Truncate to max length 128
+#[must_use]
+pub fn sanitize_agent_name(value: &str) -> Option<String> {
+    let mut cleaned: String = value
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    if cleaned.len() > 128 {
+        cleaned.truncate(128);
+    }
+
+    Some(cleaned)
+}
 
 /// Validates that an agent name follows the adjective+noun pattern.
 ///
@@ -394,5 +541,19 @@ mod tests {
             is_valid_agent_name(&name),
             "Generated name should be valid: {name}"
         );
+    }
+
+    #[test]
+    fn test_sanitize_agent_name() {
+        assert_eq!(
+            sanitize_agent_name("  BlueLake "),
+            Some("BlueLake".to_string())
+        );
+        assert_eq!(
+            sanitize_agent_name("Blue Lake!"),
+            Some("BlueLake".to_string())
+        );
+        assert_eq!(sanitize_agent_name("$$$"), None);
+        assert_eq!(sanitize_agent_name(""), None);
     }
 }

@@ -4,14 +4,15 @@
 //! Uses deterministic stub encoders for offline reproducibility.
 
 use std::collections::HashMap;
+use std::hint::black_box;
 use std::path::PathBuf;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_core::toon::{
-    apply_resource_format, apply_toon_format, apply_tool_format, parse_toon_stats,
-    resolve_encoder, resolve_output_format, run_encoder,
+    apply_resource_format, apply_tool_format, apply_toon_format, parse_toon_stats, resolve_encoder,
+    resolve_output_format, run_encoder,
 };
 
 fn stub_encoder_path() -> String {
@@ -218,7 +219,7 @@ fn bench_tool_and_resource_format(c: &mut Criterion) {
     });
 
     let params: HashMap<String, String> =
-        [("format".to_string(), "toon".to_string())].into_iter().collect();
+        std::iter::once(("format".to_string(), "toon".to_string())).collect();
     group.bench_function("resource_format_toon", |b| {
         b.iter(|| apply_resource_format(black_box(json), &params, &config));
     });

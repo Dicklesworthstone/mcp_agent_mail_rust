@@ -811,8 +811,14 @@ mod tests {
             Some("error: invalid JSON\n".to_string()),
         );
         assert_eq!(env.format, "json");
-        assert_eq!(env.meta.toon_error.as_deref(), Some("TOON encoder exited with 1"));
-        assert_eq!(env.meta.toon_stderr.as_deref(), Some("error: invalid JSON\n"));
+        assert_eq!(
+            env.meta.toon_error.as_deref(),
+            Some("TOON encoder exited with 1")
+        );
+        assert_eq!(
+            env.meta.toon_stderr.as_deref(),
+            Some("error: invalid JSON\n")
+        );
     }
 
     // -- apply_toon_format --
@@ -878,7 +884,10 @@ mod tests {
     fn apply_tool_format_json_passthrough() {
         let config = test_config();
         let json = r#"{"id":1}"#;
-        assert_eq!(apply_tool_format(json, Some("json"), &config).unwrap(), json);
+        assert_eq!(
+            apply_tool_format(json, Some("json"), &config).unwrap(),
+            json
+        );
     }
 
     #[test]
@@ -1044,30 +1053,24 @@ mod tests {
     fn basename_toon_rejected() {
         // "toon" basename should be rejected regardless of path
         let result = looks_like_toon_rust_encoder("toon");
-        match result {
-            Ok(false) => {}
-            Ok(true) => panic!("should reject 'toon' basename"),
-            Err(_) => {} // not found is also acceptable
+        if matches!(result, Ok(true)) {
+            panic!("should reject 'toon' basename");
         }
     }
 
     #[test]
     fn basename_toon_exe_rejected() {
         let result = looks_like_toon_rust_encoder("toon.exe");
-        match result {
-            Ok(false) => {}
-            Ok(true) => panic!("should reject 'toon.exe' basename"),
-            Err(_) => {}
+        if matches!(result, Ok(true)) {
+            panic!("should reject 'toon.exe' basename");
         }
     }
 
     #[test]
     fn basename_toon_in_path_rejected() {
         let result = looks_like_toon_rust_encoder("/usr/local/bin/toon");
-        match result {
-            Ok(false) => {}
-            Ok(true) => panic!("should reject '/usr/local/bin/toon'"),
-            Err(_) => {}
+        if matches!(result, Ok(true)) {
+            panic!("should reject '/usr/local/bin/toon'");
         }
     }
 
@@ -1091,7 +1094,8 @@ mod tests {
 
     #[test]
     fn parse_stats_large_numbers() {
-        let stderr = "Token estimates: ~100000 (JSON) -> ~35000 (TOON)\nSaved ~65000 tokens (-65.0%)\n";
+        let stderr =
+            "Token estimates: ~100000 (JSON) -> ~35000 (TOON)\nSaved ~65000 tokens (-65.0%)\n";
         let stats = parse_toon_stats(stderr).unwrap();
         assert_eq!(stats.json_tokens, 100_000);
         assert_eq!(stats.toon_tokens, 35_000);

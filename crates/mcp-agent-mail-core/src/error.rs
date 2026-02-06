@@ -153,7 +153,7 @@ impl Error {
             | Self::InvalidThreadId(_)
             | Self::InvalidProjectKey(_) => "INVALID_ARGUMENT",
             Self::MissingField(_) => "MISSING_FIELD",
-            Self::TypeError(_) => "TYPE_ERROR",
+            Self::TypeError(_) | Self::Serialization(_) => "TYPE_ERROR",
             Self::ContactRequired { .. } => "CONTACT_REQUIRED",
             Self::ContactBlocked { .. } => "CONTACT_BLOCKED",
             Self::CapabilityDenied(_) => "CAPABILITY_DENIED",
@@ -162,13 +162,11 @@ impl Error {
             Self::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
             Self::Database(_) | Self::DatabaseLockTimeout => "DATABASE_ERROR",
             Self::DatabasePoolExhausted => "DATABASE_POOL_EXHAUSTED",
-            Self::Git(_) | Self::GitIndexLock | Self::ArchiveLockTimeout(_) => "GIT_INDEX_LOCK",
+            Self::GitIndexLock => "GIT_INDEX_LOCK",
+            Self::Git(_) | Self::Internal(_) => "UNHANDLED_EXCEPTION",
+            Self::ArchiveLockTimeout(_) | Self::Timeout(_) | Self::Cancelled => "TIMEOUT",
             Self::Io(_) => "OS_ERROR",
-            Self::Serialization(_) => "SERIALIZATION_ERROR",
-            Self::Timeout(_) => "TIMEOUT",
-            Self::Cancelled => "CANCELLED",
             Self::Connection(_) => "CONNECTION_ERROR",
-            Self::Internal(_) => "UNHANDLED_EXCEPTION",
         }
     }
 
@@ -177,12 +175,34 @@ impl Error {
     pub const fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            Self::DatabaseLockTimeout
+            // User-correctable input issues
+            Self::ProjectNotFound(_)
+                | Self::AgentNotFound(_)
+                | Self::MessageNotFound(_)
+                | Self::ThreadNotFound(_)
+                | Self::ReservationNotFound(_)
+                | Self::ProductNotFound(_)
+                | Self::InvalidArgument(_)
+                | Self::InvalidAgentName(_)
+                | Self::InvalidThreadId(_)
+                | Self::InvalidProjectKey(_)
+                | Self::MissingField(_)
+                | Self::TypeError(_)
+                | Self::Serialization(_)
+                // Coordination / policy
+                | Self::ContactRequired { .. }
+                | Self::ContactBlocked { .. }
+                // Transient / retryable infrastructure
+                | Self::Database(_)
                 | Self::DatabasePoolExhausted
+                | Self::DatabaseLockTimeout
                 | Self::GitIndexLock
                 | Self::ArchiveLockTimeout(_)
+                | Self::ReservationConflict { .. }
                 | Self::ResourceBusy(_)
+                | Self::ResourceExhausted(_)
                 | Self::Timeout(_)
+                | Self::Cancelled
                 | Self::Connection(_)
         )
     }
@@ -216,6 +236,8 @@ mod tests {
     fn test_recoverable() {
         assert!(Error::DatabaseLockTimeout.is_recoverable());
         assert!(Error::Timeout("test".into()).is_recoverable());
-        assert!(!Error::ProjectNotFound("test".into()).is_recoverable());
+        assert!(Error::ProjectNotFound("test".into()).is_recoverable());
+        assert!(!Error::CapabilityDenied("no".into()).is_recoverable());
+        assert!(!Error::PermissionDenied("no".into()).is_recoverable());
     }
 }

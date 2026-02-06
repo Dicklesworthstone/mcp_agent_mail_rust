@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_core::toon::{
-    apply_resource_format, apply_toon_format, apply_tool_format, looks_like_toon_rust_encoder,
+    apply_resource_format, apply_tool_format, apply_toon_format, looks_like_toon_rust_encoder,
     resolve_output_format, run_encoder, validate_encoder,
 };
 
@@ -22,7 +22,11 @@ fn stub_encoder_path() -> String {
     path.pop(); // workspace root
     path.push("scripts");
     path.push("toon_stub_encoder.sh");
-    assert!(path.exists(), "stub encoder not found at {path:?}");
+    assert!(
+        path.exists(),
+        "stub encoder not found at {}",
+        path.display()
+    );
     path.to_string_lossy().to_string()
 }
 
@@ -33,7 +37,11 @@ fn failing_stub_encoder_path() -> String {
     path.pop(); // workspace root
     path.push("scripts");
     path.push("toon_stub_encoder_fail.sh");
-    assert!(path.exists(), "failing stub encoder not found at {path:?}");
+    assert!(
+        path.exists(),
+        "failing stub encoder not found at {}",
+        path.display()
+    );
     path.to_string_lossy().to_string()
 }
 
@@ -63,7 +71,10 @@ fn stub_config_with_stats() -> Config {
 fn stub_encoder_passes_validation() {
     let parts = vec![stub_encoder_path()];
     let result = validate_encoder(&parts);
-    assert!(result.is_ok(), "stub encoder should pass validation: {result:?}");
+    assert!(
+        result.is_ok(),
+        "stub encoder should pass validation: {result:?}"
+    );
 }
 
 #[test]
@@ -91,20 +102,16 @@ fn nonexistent_encoder_fails_validation() {
 fn toon_basename_rejected() {
     // A binary named exactly "toon" should be rejected (Node.js protection)
     let result = looks_like_toon_rust_encoder("toon");
-    match result {
-        Ok(false) => {} // expected: rejected based on basename
-        Ok(true) => panic!("should reject 'toon' basename"),
-        Err(_) => {} // also acceptable: binary not found
+    if matches!(result, Ok(true)) {
+        panic!("should reject 'toon' basename");
     }
 }
 
 #[test]
 fn toon_exe_basename_rejected() {
     let result = looks_like_toon_rust_encoder("toon.exe");
-    match result {
-        Ok(false) => {}
-        Ok(true) => panic!("should reject 'toon.exe' basename"),
-        Err(_) => {}
+    if matches!(result, Ok(true)) {
+        panic!("should reject 'toon.exe' basename");
     }
 }
 
@@ -116,11 +123,21 @@ fn toon_exe_basename_rejected() {
 fn run_encoder_stub_success() {
     let config = stub_config();
     let result = run_encoder(&config, r#"{"id":1,"subject":"Test"}"#);
-    assert!(result.is_ok(), "run_encoder should succeed: {}", result.err().map(|e| e.to_error_string()).unwrap_or_default());
+    assert!(
+        result.is_ok(),
+        "run_encoder should succeed: {}",
+        result
+            .err()
+            .map(|e| e.to_error_string())
+            .unwrap_or_default()
+    );
     let success = result.unwrap();
     assert!(success.encoded.contains("~stub_toon_output"));
     assert!(success.encoded.contains("payload_length:"));
-    assert!(success.stats.is_none(), "stats should be None when not enabled");
+    assert!(
+        success.stats.is_none(),
+        "stats should be None when not enabled"
+    );
     assert!(success.stats_raw.is_none());
 }
 
@@ -149,7 +166,10 @@ fn run_encoder_stub_failure() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     let msg = err.to_error_string();
-    assert!(msg.contains("exited with"), "expected non-zero exit error: {msg}");
+    assert!(
+        msg.contains("exited with"),
+        "expected non-zero exit error: {msg}"
+    );
     assert!(err.stderr().is_some());
     assert!(err.stderr().unwrap().contains("simulated encoder failure"));
 }
@@ -164,7 +184,10 @@ fn run_encoder_nonexistent_binary() {
     let result = run_encoder(&config, r#"{"id":1}"#);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_error_string();
-    assert!(msg.contains("not found") || msg.contains("not look like"), "unexpected error: {msg}");
+    assert!(
+        msg.contains("not found") || msg.contains("not look like"),
+        "unexpected error: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +206,10 @@ fn tool_format_toon_envelope_with_stats() {
         .expect("should return Some for toon format");
 
     assert_eq!(envelope.format, "toon");
-    assert!(envelope.data.is_string(), "toon-encoded data should be a string");
+    assert!(
+        envelope.data.is_string(),
+        "toon-encoded data should be a string"
+    );
 
     assert_eq!(envelope.meta.requested, Some("toon".to_string()));
     assert_eq!(envelope.meta.source, "param");
@@ -523,7 +549,10 @@ fn envelope_data_is_string_on_success() {
     let envelope = apply_toon_format(&payload, Some("toon"), &config)
         .unwrap()
         .unwrap();
-    assert!(envelope.data.is_string(), "encoded data should be a string, not object");
+    assert!(
+        envelope.data.is_string(),
+        "encoded data should be a string, not object"
+    );
 }
 
 #[test]
@@ -536,6 +565,9 @@ fn envelope_data_is_object_on_fallback() {
     let envelope = apply_toon_format(&payload, Some("toon"), &config)
         .unwrap()
         .unwrap();
-    assert!(envelope.data.is_object(), "fallback data should be the original object");
+    assert!(
+        envelope.data.is_object(),
+        "fallback data should be the original object"
+    );
     assert_eq!(envelope.data["nested"]["deep"][1], 2);
 }
