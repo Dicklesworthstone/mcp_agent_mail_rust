@@ -12,9 +12,12 @@ use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::path::Path;
 
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error,
+    resolve_project,
 };
 
 fn redact_database_url(url: &str) -> String {
@@ -134,6 +137,22 @@ pub async fn ensure_project(
     human_key: String,
     identity_mode: Option<String>,
 ) -> McpResult<String> {
+    if !Path::new(&human_key).is_absolute() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Invalid argument value: human_key must be an absolute directory path, got: '{human_key}'. \
+Use the agent's working directory path (e.g., '/data/projects/backend' on Unix or 'C:\\\\projects\\\\backend' on Windows). \
+Check that all parameters have valid values."
+            ),
+            true,
+            json!({
+                "field": "human_key",
+                "error_detail": human_key,
+            }),
+        ));
+    }
+
     let config = Config::from_env();
     let pool = get_db_pool()?;
 
@@ -209,11 +228,18 @@ pub async fn register_agent(
     let agent_name = match name {
         Some(n) => {
             if !is_valid_agent_name(&n) {
-                return Err(McpError::new(
-                    McpErrorCode::InvalidParams,
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
                     format!(
-                        "Invalid agent name '{n}'. Names must be adjective+noun format (e.g., BlueLake)"
+                        "Invalid argument value: Invalid agent name '{n}'. \
+Names must be adjective+noun format (e.g., BlueLake). \
+Check that all parameters have valid values."
                     ),
+                    true,
+                    json!({
+                        "field": "name",
+                        "error_detail": n,
+                    }),
                 ));
             }
             n
@@ -224,9 +250,18 @@ pub async fn register_agent(
     // Validate attachments_policy if provided
     let policy = attachments_policy.unwrap_or_else(|| "auto".to_string());
     if !["auto", "inline", "file", "none"].contains(&policy.as_str()) {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            format!("Invalid attachments_policy '{policy}'. Must be: auto, inline, file, or none"),
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Invalid argument value: Invalid attachments_policy '{policy}'. \
+Must be: auto, inline, file, or none. \
+Check that all parameters have valid values."
+            ),
+            true,
+            json!({
+                "field": "attachments_policy",
+                "error_detail": policy,
+            }),
         ));
     }
 
@@ -308,9 +343,18 @@ pub async fn create_agent_identity(
     let agent_name = match name_hint {
         Some(hint) => {
             if !is_valid_agent_name(&hint) {
-                return Err(McpError::new(
-                    McpErrorCode::InvalidParams,
-                    format!("Invalid name_hint '{hint}'. Must be adjective+noun format"),
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Invalid argument value: Invalid name_hint '{hint}'. \
+Names must be adjective+noun format (e.g., BlueLake). \
+Check that all parameters have valid values."
+                    ),
+                    true,
+                    json!({
+                        "field": "name_hint",
+                        "error_detail": hint,
+                    }),
                 ));
             }
             hint
@@ -321,18 +365,35 @@ pub async fn create_agent_identity(
     // Validate attachments_policy if provided
     let policy = attachments_policy.unwrap_or_else(|| "auto".to_string());
     if !["auto", "inline", "file", "none"].contains(&policy.as_str()) {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            format!("Invalid attachments_policy '{policy}'. Must be: auto, inline, file, or none"),
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Invalid argument value: Invalid attachments_policy '{policy}'. \
+Must be: auto, inline, file, or none. \
+Check that all parameters have valid values."
+            ),
+            true,
+            json!({
+                "field": "attachments_policy",
+                "error_detail": policy,
+            }),
         ));
     }
 
     // Enforce uniqueness: this tool must never update an existing identity.
     match mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, &agent_name).await {
         Outcome::Ok(_) => {
-            return Err(McpError::new(
-                McpErrorCode::InvalidParams,
-                format!("Agent name '{agent_name}' already exists in this project"),
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "Invalid argument value: Agent name '{agent_name}' already exists in this project. \
+Choose a different name (or omit the name to auto-generate one)."
+                ),
+                true,
+                json!({
+                    "field": "name_hint",
+                    "error_detail": agent_name,
+                }),
             ));
         }
         Outcome::Err(e) => match e {

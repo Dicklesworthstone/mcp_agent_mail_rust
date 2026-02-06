@@ -14,15 +14,21 @@ use std::fmt::Write as _;
 use std::sync::{Mutex, OnceLock};
 
 use crate::search::{AggregateSummary, MentionCount, ThreadSummary};
+use mcp_agent_mail_core::config::dotenv_value;
 
 // ---------------------------------------------------------------------------
 // Provider env bridge
 // ---------------------------------------------------------------------------
 
-/// Synonym → canonical env var mappings for LLM providers.
-const ENV_BRIDGE_MAPPINGS: &[(&str, &str)] = &[
-    ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-    ("GROK_API_KEY", "XAI_API_KEY"),
+/// Canonical env keys with supported aliases (including canonical itself).
+const ENV_BRIDGE_MAPPINGS: &[(&str, &[&str])] = &[
+    ("OPENAI_API_KEY", &["OPENAI_API_KEY"]),
+    ("ANTHROPIC_API_KEY", &["ANTHROPIC_API_KEY"]),
+    ("GROQ_API_KEY", &["GROQ_API_KEY"]),
+    ("XAI_API_KEY", &["XAI_API_KEY", "GROK_API_KEY"]),
+    ("GOOGLE_API_KEY", &["GOOGLE_API_KEY", "GEMINI_API_KEY"]),
+    ("OPENROUTER_API_KEY", &["OPENROUTER_API_KEY"]),
+    ("DEEPSEEK_API_KEY", &["DEEPSEEK_API_KEY"]),
 ];
 
 /// In-memory bridged env vars (since `set_var` is unsafe in Rust 2024).
@@ -34,29 +40,88 @@ fn bridged_env() -> &'static Mutex<HashMap<String, String>> {
 }
 
 /// Look up an env var, checking our bridged map first, then real env.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+fn dotenv_nonempty(key: &str) -> Option<String> {
+    dotenv_value(key).filter(|v| !v.is_empty())
+}
+
 fn get_env_var(key: &str) -> Option<String> {
-    // Check real env first (user-set takes priority)
-    if let Ok(val) = std::env::var(key) {
+    if let Some(val) = env_nonempty(key) {
         return Some(val);
     }
-    // Check bridged map
-    bridged_env().lock().ok()?.get(key).cloned()
+    if let Ok(map) = bridged_env().lock() {
+        if let Some(val) = map.get(key) {
+            return Some(val.clone());
+        }
+    }
+    dotenv_nonempty(key)
+}
+
+fn get_from_any(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(val) = env_nonempty(key) {
+            return Some(val);
+        }
+    }
+    for key in keys {
+        if let Some(val) = dotenv_nonempty(key) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn compute_env_bridge(
+    env: &HashMap<String, String>,
+    dotenv: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut bridged = HashMap::new();
+    for &(canonical, aliases) in ENV_BRIDGE_MAPPINGS {
+        if let Some(val) = env.get(canonical).filter(|v| !v.is_empty()) {
+            bridged.insert(canonical.to_string(), val.clone());
+            continue;
+        }
+        let mut selected: Option<String> = None;
+        for alias in aliases {
+            if let Some(val) = env.get(*alias).filter(|v| !v.is_empty()) {
+                selected = Some(val.clone());
+                break;
+            }
+        }
+        if selected.is_none() {
+            for alias in aliases {
+                if let Some(val) = dotenv.get(*alias).filter(|v| !v.is_empty()) {
+                    selected = Some(val.clone());
+                    break;
+                }
+            }
+        }
+        if let Some(val) = selected {
+            bridged.insert(canonical.to_string(), val);
+        }
+    }
+    bridged
 }
 
 /// Bridge synonym env vars to canonical keys.
 ///
-/// For each (synonym, canonical) pair: if the canonical var is NOT already set
-/// (in either real env or bridged map), and the synonym IS set, store the
-/// mapping in the bridged map.
+/// For each canonical key: if it is NOT already set in the real environment
+/// (non-empty), look for aliases in env first, then .env, and store the result
+/// in the bridged map.
 pub fn bridge_provider_env() {
-    for &(synonym, canonical) in ENV_BRIDGE_MAPPINGS {
-        if get_env_var(canonical).is_some() {
-            continue; // canonical already available, don't overwrite
+    let Ok(mut map) = bridged_env().lock() else {
+        return;
+    };
+    for &(canonical, aliases) in ENV_BRIDGE_MAPPINGS {
+        if env_nonempty(canonical).is_some() || map.contains_key(canonical) {
+            continue;
         }
-        if let Some(val) = get_env_var(synonym) {
-            if let Ok(mut map) = bridged_env().lock() {
-                map.insert(canonical.to_string(), val);
-            }
+        if let Some(val) = get_from_any(aliases) {
+            map.insert(canonical.to_string(), val);
         }
     }
 }
@@ -69,10 +134,7 @@ pub fn bridge_provider_env() {
 const MODEL_PRIORITY: &[(&str, &str)] = &[
     ("OPENAI_API_KEY", "gpt-4o-mini"),
     ("GOOGLE_API_KEY", "gemini-1.5-flash"),
-    (
-        "ANTHROPIC_API_KEY",
-        "claude-3-haiku-20240307",
-    ),
+    ("ANTHROPIC_API_KEY", "claude-3-haiku-20240307"),
     ("GROQ_API_KEY", "groq/llama-3.1-8b-instant"),
     ("DEEPSEEK_API_KEY", "deepseek/deepseek-chat"),
     ("XAI_API_KEY", "xai/grok-2-mini"),
@@ -226,8 +288,8 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
             ))
         }
         "groq" => {
-            let key = get_env_var("GROQ_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            let key =
+                get_env_var("GROQ_API_KEY").ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
             // Strip provider prefix for the API
             let api_model = model.strip_prefix("groq/").unwrap_or(model);
             Ok((
@@ -248,8 +310,7 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
         }
         "xai" => {
             let key =
-                get_env_var("XAI_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+                get_env_var("XAI_API_KEY").ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
             let api_model = model.strip_prefix("xai/").unwrap_or(model);
             Ok((
                 "https://api.x.ai/v1/chat/completions".to_string(),
@@ -313,9 +374,7 @@ pub async fn complete_system_user(
             if fallback == resolved {
                 Err(e)
             } else {
-                tracing::warn!(
-                    "LLM call failed with {resolved}, retrying with {fallback}: {e}"
-                );
+                tracing::warn!("LLM call failed with {resolved}, retrying with {fallback}: {e}");
                 complete_single(&fallback, system, user, temperature, max_tokens).await
             }
         }
@@ -343,7 +402,8 @@ async fn complete_single(
         "max_tokens": max_tok
     });
 
-    let body_bytes = serde_json::to_vec(&payload).map_err(|e| LlmError::ParseError(e.to_string()))?;
+    let body_bytes =
+        serde_json::to_vec(&payload).map_err(|e| LlmError::ParseError(e.to_string()))?;
 
     let headers = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
@@ -473,10 +533,7 @@ const KEY_POINTS_CAP: usize = 10;
 /// - For `key_points`: keep heuristic items containing action keywords,
 ///   prepend them, append LLM `key_points`, deduplicate, cap at 10.
 /// - For other keys: LLM values overlay heuristic values if present.
-pub fn merge_single_thread_summary(
-    heuristic: &ThreadSummary,
-    llm_json: &Value,
-) -> ThreadSummary {
+pub fn merge_single_thread_summary(heuristic: &ThreadSummary, llm_json: &Value) -> ThreadSummary {
     let mut result = heuristic.clone();
 
     // key_points: special merge
@@ -718,8 +775,35 @@ pub fn multi_thread_user_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Deserialize)]
+    struct EnvBridgeFixture {
+        cases: Vec<EnvBridgeCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct EnvBridgeCase {
+        name: String,
+        env: HashMap<String, String>,
+        dotenv: HashMap<String, String>,
+        expected_set: HashMap<String, String>,
+    }
 
     // -- bridge_provider_env tests --
+
+    #[test]
+    fn bridge_provider_env_vectors() {
+        let fixture: EnvBridgeFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/llm/env_bridge_vectors.json"
+        ))
+        .expect("fixture JSON parse failed");
+
+        for case in fixture.cases {
+            let got = compute_env_bridge(&case.env, &case.dotenv);
+            assert_eq!(got, case.expected_set, "case: {}", case.name);
+        }
+    }
 
     // Note: env var tests are inherently sequential and may interfere.
     // We use unique prefixes or accept test isolation limitations.
@@ -793,7 +877,8 @@ mod tests {
 
     #[test]
     fn parse_json_multiple_fenced() {
-        let input = "```json\n{\"first\": true}\n```\n\nAnd also:\n```json\n{\"second\": true}\n```";
+        let input =
+            "```json\n{\"first\": true}\n```\n\nAnd also:\n```json\n{\"second\": true}\n```";
         let v = parse_json_safely(input).unwrap();
         assert!(v["first"].as_bool().unwrap());
     }
@@ -835,7 +920,10 @@ mod tests {
     fn merge_single_full_refinement() {
         let heuristic = ThreadSummary {
             participants: vec!["Alice".into(), "Bob".into()],
-            key_points: vec!["TODO: deploy to staging".into(), "discussed API changes".into()],
+            key_points: vec![
+                "TODO: deploy to staging".into(),
+                "discussed API changes".into(),
+            ],
             action_items: vec!["TODO: deploy to staging".into()],
             total_messages: 5,
             open_actions: 1,
@@ -853,13 +941,22 @@ mod tests {
 
         // key_points: heuristic "TODO: deploy to staging" kept (has TODO), then LLM items
         assert_eq!(merged.key_points[0], "TODO: deploy to staging");
-        assert!(merged.key_points.contains(&"API migration planned for next sprint".to_string()));
-        assert!(merged
-            .key_points
-            .contains(&"Staging deployment needed before review".to_string()));
+        assert!(
+            merged
+                .key_points
+                .contains(&"API migration planned for next sprint".to_string())
+        );
+        assert!(
+            merged
+                .key_points
+                .contains(&"Staging deployment needed before review".to_string())
+        );
 
         // action_items from LLM
-        assert_eq!(merged.action_items, vec!["Deploy to staging", "Update API docs"]);
+        assert_eq!(
+            merged.action_items,
+            vec!["Deploy to staging", "Update API docs"]
+        );
 
         // mentions from LLM
         assert_eq!(merged.mentions[0].name, "Carol");
@@ -896,9 +993,11 @@ mod tests {
 
         // FIXME item kept, LLM items appended
         assert_eq!(merged.key_points[0], "FIXME: broken auth flow");
-        assert!(merged
-            .key_points
-            .contains(&"Authentication refactor in progress".to_string()));
+        assert!(
+            merged
+                .key_points
+                .contains(&"Authentication refactor in progress".to_string())
+        );
 
         // participants unchanged (not in LLM response)
         assert_eq!(merged.participants, vec!["Alice"]);
@@ -962,12 +1061,7 @@ mod tests {
 
     #[test]
     fn single_thread_prompt_truncation() {
-        let messages = vec![(
-            1,
-            "Alice".to_string(),
-            "Test".to_string(),
-            "x".repeat(1000),
-        )];
+        let messages = vec![(1, "Alice".to_string(), "Test".to_string(), "x".repeat(1000))];
         let prompt = single_thread_user_prompt(&messages);
         // Should contain truncated body (800 chars)
         assert!(prompt.len() < 1000);

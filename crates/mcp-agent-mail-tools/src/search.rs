@@ -8,10 +8,11 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 use crate::llm;
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_project};
+use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
 
 /// Search result entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,19 +259,30 @@ pub async fn search_messages(
 ) -> McpResult<String> {
     let max_results_raw = limit.unwrap_or(20);
     if max_results_raw < 1 {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "limit must be at least 1",
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: limit must be at least 1. Check that all parameters have valid values.",
+            true,
+            json!({"field":"limit","error_detail":max_results_raw}),
         ));
     }
     let max_results = usize::try_from(max_results_raw)
-        .map_err(|_| McpError::new(McpErrorCode::InvalidParams, "limit exceeds supported range"))?;
+        .map_err(|_| {
+            legacy_tool_error(
+                "INVALID_ARGUMENT",
+                "Invalid argument value: limit exceeds supported range. Check that all parameters have valid values.",
+                true,
+                json!({"field":"limit","error_detail":max_results_raw}),
+            )
+        })?;
 
     // Validate query is not empty
     if query.trim().is_empty() {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "Query cannot be empty",
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: Query cannot be empty. Check that all parameters have valid values.",
+            true,
+            json!({"field":"query","error_detail":"empty"}),
         ));
     }
 
@@ -346,15 +358,19 @@ pub async fn summarize_thread(
     let use_llm = llm_mode.unwrap_or(true);
     let msg_limit_raw = per_thread_limit.unwrap_or(50);
     if msg_limit_raw < 1 {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "per_thread_limit must be at least 1",
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: per_thread_limit must be at least 1. Check that all parameters have valid values.",
+            true,
+            json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
         ));
     }
     let msg_limit = usize::try_from(msg_limit_raw).map_err(|_| {
-        McpError::new(
-            McpErrorCode::InvalidParams,
-            "per_thread_limit exceeds supported range",
+        legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: per_thread_limit exceeds supported range. Check that all parameters have valid values.",
+            true,
+            json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
         )
     })?;
 
@@ -370,9 +386,11 @@ pub async fn summarize_thread(
         .collect();
 
     if thread_ids.is_empty() {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "thread_id cannot be empty",
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: thread_id cannot be empty. Check that all parameters have valid values.",
+            true,
+            json!({"field":"thread_id","error_detail":"empty"}),
         ));
     }
 
@@ -474,10 +492,7 @@ pub async fn summarize_thread(
             }
         }
 
-        let response = MultiThreadResponse {
-            threads,
-            aggregate,
-        };
+        let response = MultiThreadResponse { threads, aggregate };
 
         tracing::debug!(
             "Summarized {} threads in project {} (llm: {}, limit: {})",

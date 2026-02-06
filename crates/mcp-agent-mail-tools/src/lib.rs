@@ -41,22 +41,109 @@ pub(crate) mod tool_util {
     use fastmcp::McpErrorCode;
     use fastmcp::prelude::*;
     use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, get_or_create_pool};
+    use serde_json::json;
+
+    fn legacy_error_payload(
+        error_type: &str,
+        message: &str,
+        recoverable: bool,
+        data: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "error": {
+                "type": error_type,
+                "message": message,
+                "recoverable": recoverable,
+                "data": data,
+            }
+        })
+    }
+
+    pub fn legacy_mcp_error(
+        code: McpErrorCode,
+        error_type: &str,
+        message: impl Into<String>,
+        recoverable: bool,
+        data: serde_json::Value,
+    ) -> McpError {
+        let message = message.into();
+        McpError::with_data(
+            code,
+            message.clone(),
+            legacy_error_payload(error_type, &message, recoverable, data),
+        )
+    }
+
+    pub fn legacy_tool_error(
+        error_type: &str,
+        message: impl Into<String>,
+        recoverable: bool,
+        data: serde_json::Value,
+    ) -> McpError {
+        legacy_mcp_error(
+            McpErrorCode::ToolExecutionError,
+            error_type,
+            message,
+            recoverable,
+            data,
+        )
+    }
 
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
         match e {
-            DbError::InvalidArgument { field, message } => McpError::new(
-                McpErrorCode::InvalidParams,
-                format!("Invalid {field}: {message}"),
+            DbError::InvalidArgument { field, message } => legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "Invalid argument value: {field}: {message}. Check that all parameters have valid values."
+                ),
+                true,
+                json!({
+                    "field": field,
+                    "error_detail": message,
+                }),
             ),
-            DbError::NotFound { entity, identifier } => McpError::new(
-                McpErrorCode::InvalidParams,
+            DbError::NotFound { entity, identifier } => legacy_tool_error(
+                "NOT_FOUND",
                 format!("{entity} not found: {identifier}"),
+                true,
+                json!({
+                    "entity": entity,
+                    "identifier": identifier,
+                }),
             ),
-            DbError::Duplicate { entity, identifier } => McpError::new(
-                McpErrorCode::InvalidParams,
+            DbError::Duplicate { entity, identifier } => legacy_tool_error(
+                "INVALID_ARGUMENT",
                 format!("{entity} already exists: {identifier}"),
+                true,
+                json!({
+                    "entity": entity,
+                    "identifier": identifier,
+                }),
             ),
-            other => McpError::new(McpErrorCode::InternalError, other.to_string()),
+            DbError::Pool(message) => legacy_tool_error(
+                "DATABASE_POOL_EXHAUSTED",
+                "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
+                true,
+                json!({ "error_detail": message }),
+            ),
+            DbError::Sqlite(message) | DbError::Schema(message) => legacy_tool_error(
+                "DATABASE_ERROR",
+                format!("Database error: {message}"),
+                true,
+                json!({ "error_detail": message }),
+            ),
+            DbError::Serialization(message) => legacy_tool_error(
+                "TYPE_ERROR",
+                format!("Argument type mismatch: {message}."),
+                true,
+                json!({ "error_detail": message }),
+            ),
+            DbError::Internal(message) => legacy_tool_error(
+                "UNHANDLED_EXCEPTION",
+                format!("Unexpected error (DbError): {message}"),
+                false,
+                json!({ "error_detail": message }),
+            ),
         }
     }
 
@@ -99,6 +186,108 @@ pub(crate) mod tool_util {
         let out =
             mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await;
         db_outcome_to_mcp_result(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn legacy_tool_error_sets_payload_shape() {
+            let err = legacy_tool_error(
+                "NOT_FOUND",
+                "Project 'x' not found",
+                true,
+                json!({"entity":"Project","identifier":"x"}),
+            );
+            assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+            assert_eq!(err.message, "Project 'x' not found");
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "NOT_FOUND");
+            assert_eq!(data["error"]["message"], "Project 'x' not found");
+            assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(data["error"]["data"]["entity"], "Project");
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_not_found() {
+            let err = db_error_to_mcp_error(DbError::not_found("Agent", "BlueLake"));
+            assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+            assert!(err.message.contains("Agent not found"));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "NOT_FOUND");
+            assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(data["error"]["data"]["entity"], "Agent");
+        }
+    }
+}
+
+/// Fast glob overlap checks used by messaging + file reservations.
+///
+/// This preserves the legacy heuristic:
+/// - Normalize both patterns
+/// - If BOTH compile as globs, check `A matches B` OR `B matches A`
+/// - Otherwise, only exact normalized equality is considered overlapping
+pub(crate) mod pattern_overlap {
+    use globset::{Glob, GlobMatcher};
+
+    fn normalize_pattern(pattern: &str) -> String {
+        let mut normalized = pattern.trim().replace('\\', "/");
+        while normalized.starts_with("./") {
+            normalized = normalized[2..].to_string();
+        }
+        normalized.trim_start_matches('/').to_string()
+    }
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct CompiledPattern {
+        norm: String,
+        matcher: Option<GlobMatcher>,
+    }
+
+    impl CompiledPattern {
+        pub(crate) fn new(raw: &str) -> Self {
+            let norm = normalize_pattern(raw);
+            let matcher = Glob::new(&norm).ok().map(|g| g.compile_matcher());
+            Self { norm, matcher }
+        }
+
+        pub(crate) fn overlaps(&self, other: &Self) -> bool {
+            if self.norm == other.norm {
+                return true;
+            }
+
+            match (&self.matcher, &other.matcher) {
+                (Some(a), Some(b)) => a.is_match(&other.norm) || b.is_match(&self.norm),
+                _ => false,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::CompiledPattern;
+
+        #[test]
+        fn overlaps_is_symmetric_for_equal_norms() {
+            let a = CompiledPattern::new("./src/**");
+            let b = CompiledPattern::new("src/**");
+            assert!(a.overlaps(&b));
+            assert!(b.overlaps(&a));
+        }
+
+        #[test]
+        fn overlaps_falls_back_to_equality_if_any_glob_invalid() {
+            // Glob with an unclosed character class should fail to compile.
+            // In that case we must not attempt matching: only equality counts.
+            let invalid = CompiledPattern::new("[abc");
+            let other = CompiledPattern::new("abc");
+            assert!(!invalid.overlaps(&other));
+            assert!(!other.overlaps(&invalid));
+
+            let invalid_same = CompiledPattern::new(" [abc ");
+            assert!(invalid.overlaps(&invalid_same));
+        }
     }
 }
 

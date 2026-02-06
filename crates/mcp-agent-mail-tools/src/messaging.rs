@@ -10,12 +10,12 @@
 use asupersync::Outcome;
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
-use globset::Glob;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use crate::pattern_overlap::CompiledPattern;
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project,
 };
@@ -23,18 +23,18 @@ use crate::tool_util::{
 /// Write a message bundle to the git archive (best-effort, non-blocking).
 /// Failures are logged but never fail the tool call.
 fn try_write_message_archive(
+    config: &Config,
     project_slug: &str,
     message_json: &serde_json::Value,
     body_md: &str,
     sender: &str,
     all_recipient_names: &[String],
 ) {
-    let config = Config::from_env();
-    match mcp_agent_mail_storage::ensure_archive(&config, project_slug) {
+    match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
         Ok(archive) => {
             if let Err(e) = mcp_agent_mail_storage::write_message_bundle(
                 &archive,
-                &config,
+                config,
                 message_json,
                 body_md,
                 sender,
@@ -49,30 +49,6 @@ fn try_write_message_archive(
             tracing::warn!("Failed to ensure archive for message write: {e}");
         }
     }
-}
-
-fn normalize_pattern(pattern: &str) -> String {
-    let mut normalized = pattern.trim().replace('\\', "/");
-    while normalized.starts_with("./") {
-        normalized = normalized[2..].to_string();
-    }
-    normalized.trim_start_matches('/').to_string()
-}
-
-fn patterns_overlap(a: &str, b: &str) -> bool {
-    let a_norm = normalize_pattern(a);
-    let b_norm = normalize_pattern(b);
-
-    let a_glob = Glob::new(&a_norm).ok().map(|g| g.compile_matcher());
-    let b_glob = Glob::new(&b_norm).ok().map(|g| g.compile_matcher());
-
-    if let (Some(a_matcher), Some(b_matcher)) = (a_glob, b_glob) {
-        let a_matches_b = a_matcher.is_match(&b_norm);
-        let b_matches_a = b_matcher.is_match(&a_norm);
-        return a_matches_b || b_matches_a || a_norm == b_norm;
-    }
-
-    a_norm == b_norm
 }
 
 async fn resolve_or_register_agent(
@@ -481,24 +457,20 @@ pub async fn send_message(
             mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
         )
         .unwrap_or_default();
-        let mut patterns_by_agent: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> = HashMap::new();
         for res in reservations {
             patterns_by_agent
                 .entry(res.agent_id)
                 .or_default()
-                .push(res.path_pattern);
+                .push(CompiledPattern::new(&res.path_pattern));
         }
-        let sender_patterns = patterns_by_agent
-            .get(&sender_id)
-            .cloned()
-            .unwrap_or_default();
-        if !sender_patterns.is_empty() {
+        if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
             for agent in recipient_map.values() {
                 if let Some(rec_id) = agent.id {
                     if let Some(rec_patterns) = patterns_by_agent.get(&rec_id) {
                         let overlaps = sender_patterns
                             .iter()
-                            .any(|a| rec_patterns.iter().any(|b| patterns_overlap(a, b)));
+                            .any(|a| rec_patterns.iter().any(|b| a.overlaps(b)));
                         if overlaps {
                             auto_ok_names.insert(agent.name.clone());
                         }
@@ -731,6 +703,7 @@ pub async fn send_message(
             "attachments": &all_attachment_meta,
         });
         try_write_message_archive(
+            &config,
             &project.slug,
             &msg_json,
             &message.body_md,
@@ -812,6 +785,7 @@ pub async fn reply_message(
     subject_prefix: Option<String>,
 ) -> McpResult<String> {
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
+    let config = Config::from_env();
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -943,6 +917,7 @@ pub async fn reply_message(
             "reply_to": message_id,
         });
         try_write_message_archive(
+            &config,
             &project.slug,
             &msg_json,
             &reply.body_md,

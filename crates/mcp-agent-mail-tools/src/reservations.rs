@@ -10,15 +10,18 @@
 
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
-use globset::Glob;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
+use crate::pattern_overlap::CompiledPattern;
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
+};
 
 /// Granted reservation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,30 +46,6 @@ pub struct ConflictHolder {
     pub agent_name: String,
     pub reservation_id: i64,
     pub expires_ts: String,
-}
-
-fn normalize_pattern(pattern: &str) -> String {
-    let mut normalized = pattern.trim().replace('\\', "/");
-    while normalized.starts_with("./") {
-        normalized = normalized[2..].to_string();
-    }
-    normalized.trim_start_matches('/').to_string()
-}
-
-fn patterns_overlap(a: &str, b: &str) -> bool {
-    let a_norm = normalize_pattern(a);
-    let b_norm = normalize_pattern(b);
-
-    let a_glob = Glob::new(&a_norm).ok().map(|g| g.compile_matcher());
-    let b_glob = Glob::new(&b_norm).ok().map(|g| g.compile_matcher());
-
-    if let (Some(a_matcher), Some(b_matcher)) = (a_glob, b_glob) {
-        let a_matches_b = a_matcher.is_match(&b_norm);
-        let b_matches_a = b_matcher.is_match(&a_norm);
-        return a_matches_b || b_matches_a || a_norm == b_norm;
-    }
-
-    a_norm == b_norm
 }
 
 /// File reservation response
@@ -147,9 +126,14 @@ pub async fn file_reservation_paths(
     reason: Option<String>,
 ) -> McpResult<String> {
     if paths.is_empty() {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "paths list cannot be empty. Provide at least one file path or glob pattern to reserve (e.g., ['src/api/*.py', 'config/settings.yaml']).",
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: paths list cannot be empty. Provide at least one file path or glob pattern to reserve (e.g., ['src/api/*.py', 'config/settings.yaml']). Check that all parameters have valid values.",
+            true,
+            json!({
+                "field": "paths",
+                "error_detail": "empty",
+            }),
         ));
     }
 
@@ -175,51 +159,92 @@ pub async fn file_reservation_paths(
     let active = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
     )?;
-    let agent_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_names: HashMap<i64, String> = agent_rows
-        .into_iter()
-        .filter_map(|row| row.id.map(|id| (id, row.name)))
-        .collect();
 
-    let mut conflicts: Vec<ReservationConflict> = Vec::new();
     let mut paths_to_grant: Vec<&str> = Vec::new();
 
-    for path in &paths {
-        // Check if any active exclusive reservation conflicts with this path
-        let mut path_conflicts: Vec<ConflictHolder> = Vec::new();
+    #[derive(Debug, Clone)]
+    struct PendingConflictHolder {
+        agent_id: i64,
+        reservation_id: i64,
+        expires_ts: String,
+    }
 
-        for res in &active {
-            // Skip our own reservations
-            if res.agent_id == agent_id {
+    #[derive(Debug, Clone)]
+    struct PendingReservationConflict {
+        path: String,
+        holders: Vec<PendingConflictHolder>,
+    }
+
+    let mut pending_conflicts: Vec<PendingReservationConflict> = Vec::new();
+
+    // Precompile requested patterns once; the previous implementation compiled globs
+    // inside the nested loop which is expensive when reservations grow.
+    let requested_compiled: Vec<CompiledPattern> =
+        paths.iter().map(|p| CompiledPattern::new(p)).collect();
+
+    // Only exclusive reservations from other agents can conflict.
+    let active_compiled: Vec<(&mcp_agent_mail_db::FileReservationRow, CompiledPattern)> = active
+        .iter()
+        .filter(|res| res.agent_id != agent_id && res.exclusive != 0)
+        .map(|res| (res, CompiledPattern::new(&res.path_pattern)))
+        .collect();
+
+    for (path, path_pat) in paths.iter().zip(requested_compiled.iter()) {
+        let mut path_conflicts: Vec<PendingConflictHolder> = Vec::new();
+
+        for (res, res_pat) in &active_compiled {
+            if !res_pat.overlaps(path_pat) {
                 continue;
             }
 
-            let is_conflict = res.exclusive != 0 && patterns_overlap(&res.path_pattern, path);
-
-            if is_conflict {
-                let agent_name = agent_names
-                    .get(&res.agent_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("agent_{}", res.agent_id));
-                path_conflicts.push(ConflictHolder {
-                    agent_name,
-                    reservation_id: res.id.unwrap_or(0),
-                    expires_ts: micros_to_iso(res.expires_ts),
-                });
-            }
+            path_conflicts.push(PendingConflictHolder {
+                agent_id: res.agent_id,
+                reservation_id: res.id.unwrap_or(0),
+                expires_ts: micros_to_iso(res.expires_ts),
+            });
         }
 
         if path_conflicts.is_empty() {
             paths_to_grant.push(path);
         } else {
-            conflicts.push(ReservationConflict {
+            pending_conflicts.push(PendingReservationConflict {
                 path: path.clone(),
                 holders: path_conflicts,
             });
         }
     }
+
+    // Only resolve agent names if there were actual conflicts.
+    let conflicts: Vec<ReservationConflict> = if pending_conflicts.is_empty() {
+        Vec::new()
+    } else {
+        let agent_rows = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+        )?;
+        let agent_names: HashMap<i64, String> = agent_rows
+            .into_iter()
+            .filter_map(|row| row.id.map(|id| (id, row.name)))
+            .collect();
+
+        pending_conflicts
+            .into_iter()
+            .map(|c| ReservationConflict {
+                path: c.path,
+                holders: c
+                    .holders
+                    .into_iter()
+                    .map(|h| ConflictHolder {
+                        agent_name: agent_names
+                            .get(&h.agent_id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("agent_{}", h.agent_id)),
+                        reservation_id: h.reservation_id,
+                        expires_ts: h.expires_ts,
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
 
     // Grant non-conflicting reservations
     let granted_rows = if paths_to_grant.is_empty() {
@@ -480,12 +505,17 @@ pub async fn force_release_file_reservation(
         .find(|row| row.id.unwrap_or(0) == file_reservation_id);
 
     let Some(reservation) = reservation else {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
+        return Err(legacy_tool_error(
+            "NOT_FOUND",
             format!(
                 "File reservation id={file_reservation_id} not found for project '{}'.",
                 project.human_key
             ),
+            true,
+            json!({
+                "file_reservation_id": file_reservation_id,
+                "project": project.human_key,
+            }),
         ));
     };
 
