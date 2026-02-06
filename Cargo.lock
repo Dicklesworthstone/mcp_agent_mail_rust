@@ -767,7 +767,7 @@ dependencies = [
  "console 0.16.2",
  "crc32fast",
  "crossbeam-channel",
- "crossterm",
+ "crossterm 0.29.0",
  "dialoguer",
  "directories",
  "dirs",
@@ -1082,6 +1082,22 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossterm"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
+dependencies = [
+ "bitflags 2.10.0",
+ "crossterm_winapi",
+ "mio",
+ "parking_lot",
+ "rustix 0.38.44",
+ "signal-hook 0.3.18",
+ "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
@@ -1092,7 +1108,7 @@ dependencies = [
  "document-features",
  "mio",
  "parking_lot",
- "rustix",
+ "rustix 1.1.3",
  "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
@@ -1988,7 +2004,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
 dependencies = [
- "rustix",
+ "rustix 1.1.3",
  "windows-sys 0.59.0",
 ]
 
@@ -2026,7 +2042,7 @@ name = "ftui-core"
 version = "0.1.1"
 dependencies = [
  "bitflags 2.10.0",
- "crossterm",
+ "crossterm 0.29.0",
  "signal-hook 0.4.3",
  "unicode-display-width",
  "unicode-segmentation",
@@ -2069,7 +2085,7 @@ dependencies = [
 name = "ftui-runtime"
 version = "0.1.1"
 dependencies = [
- "crossterm",
+ "crossterm 0.29.0",
  "ftui-core",
  "ftui-i18n",
  "ftui-layout",
@@ -2629,7 +2645,7 @@ dependencies = [
  "itoa",
  "libc",
  "memmap2",
- "rustix",
+ "rustix 1.1.3",
  "smallvec",
  "thiserror 2.0.18",
 ]
@@ -3889,6 +3905,12 @@ checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
 name = "linux-raw-sys"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+
+[[package]]
+name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
@@ -4064,14 +4086,18 @@ dependencies = [
  "fastmcp-core",
  "fastmcp-rust",
  "ftui-runtime",
+ "hex",
  "mcp-agent-mail-conformance",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
  "mcp-agent-mail-server",
+ "mcp-agent-mail-share",
  "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",
  "serde",
  "serde_json",
+ "sha2",
+ "sqlmodel-sqlite",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -4084,6 +4110,7 @@ dependencies = [
  "asupersync",
  "chrono",
  "clap",
+ "crossterm 0.28.1",
  "ftui",
  "ftui-runtime",
  "hex",
@@ -4095,6 +4122,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "similar",
  "sqlmodel-core",
  "sqlmodel-sqlite",
  "tempfile",
@@ -4135,6 +4163,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "shellexpand",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -5495,7 +5524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "577c9b9f652b4c121fb25c6a391dd06406d3b092ba68827e6d2f09550edc54b3"
 dependencies = [
  "cfg-if",
- "crossterm",
+ "crossterm 0.29.0",
  "instability",
  "ratatui-core",
 ]
@@ -5689,7 +5718,7 @@ name = "rich_rust"
 version = "0.1.1"
 dependencies = [
  "bitflags 2.10.0",
- "crossterm",
+ "crossterm 0.29.0",
  "log",
  "lru 0.16.3",
  "num-rational",
@@ -5830,6 +5859,19 @@ dependencies = [
 
 [[package]]
 name = "rustix"
+version = "0.38.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
+dependencies = [
+ "bitflags 2.10.0",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustix"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "146c9e247ccc180c1f61615433868c99f3de3ae256a30a43b49f67c2d9171f34"
@@ -5837,7 +5879,7 @@ dependencies = [
  "bitflags 2.10.0",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.11.0",
  "windows-sys 0.61.2",
 ]
 
@@ -6724,7 +6766,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.3.4",
  "once_cell",
- "rustix",
+ "rustix 1.1.3",
  "windows-sys 0.61.2",
 ]
 
@@ -6745,7 +6787,7 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60b8cb979cb11c32ce1603f8137b22262a9d131aaa5c37b5678025f22b8becd0"
 dependencies = [
- "rustix",
+ "rustix 1.1.3",
  "windows-sys 0.60.2",
 ]
 
@@ -7733,7 +7775,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fabb953106c3c8eea8306e4393700d7657561cb43122571b172bbfb7c7ba1d"
 dependencies = [
  "env_home",
- "rustix",
+ "rustix 1.1.3",
  "winsafe",
 ]
 

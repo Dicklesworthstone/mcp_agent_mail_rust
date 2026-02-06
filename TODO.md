@@ -31,7 +31,7 @@
 - [x] Notification signal conformance (to/cc signals, bcc excluded, fetch_inbox clears).
 - [ ] Conformance CLI helper to regenerate fixtures (Rust wrapper or script).
 - [ ] CI step for conformance tests (ensure fixtures are current).
-- [ ] Add missing error-case fixtures (invalid params, unknown project/agent, malformed inputs).
+- [x] Add missing error-case fixtures (invalid params, unknown project/agent, malformed inputs).
 - [ ] Add resource query-param fixtures (format/filter params for static resources).
 
 ## 3. DB Layer (sqlmodel_rust) — Models & Schema
@@ -46,7 +46,7 @@
 - [x] Pool config defaults (`pool.rs`).
 - [x] Pool wired to `sqlmodel_pool` + `sqlmodel_sqlite`.
 - [x] Query tracking + slow query logging (per-tool instrumentation).
-- [ ] Verify tracked connection coverage for any direct `query_sync` tool paths.
+- [x] Verify tracked connection coverage for any direct `query_sync` tool paths.
 
 ## 4. Server Layer (fastmcp_rust)
 - [x] All tools registered with correct names and clusters.

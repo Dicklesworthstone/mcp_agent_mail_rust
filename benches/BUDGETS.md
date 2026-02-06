@@ -68,15 +68,45 @@ Budgets are set to ~2x the measured baseline p95 to absorb variance.
 
 ## Share/Export Pipeline Budgets
 
-To be established by br-2ei.7.3.
+Baseline numbers are taken from the bench harness artifacts emitted by:
 
-| Stage | Target | Notes |
-|-------|--------|-------|
-| Snapshot (100 msgs) | TBD | DB → file |
-| Scope filtering | TBD | Path matching |
-| Scrub (PII removal) | TBD | String scanning |
-| Bundle assembly | TBD | ZIP creation |
-| Encryption (1MB) | TBD | AES-256-GCM |
+```bash
+cargo bench -p mcp-agent-mail --bench benchmarks -- share_export
+```
+
+Artifacts (JSON + raw samples) are written under:
+- `tests/artifacts/bench/share/<run_id>/summary.json`
+
+Most recent baseline run (2026-02-06): `tests/artifacts/bench/share/1770390636_3768966/summary.json`.
+
+Budgets are set to ~2x the measured baseline p95/p99 to absorb variance.
+
+### Scenario: `medium_mixed_attachments` (100 kept, 20 dropped)
+
+| Stage | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 | Budget p99 | Notes |
+|-------|--------------|--------------|--------------|------------|------------|-------|
+| Total | ~1.80s | ~1.89s | ~1.92s | < 4.0s | < 4.5s | End-to-end snapshot+scope+scrub+finalize+bundle+zip |
+| Snapshot | ~31ms | ~33ms | ~34ms | < 80ms | < 100ms | SQLite online backup |
+| Scope | ~13ms | ~15ms | ~15ms | < 40ms | < 50ms | Project filter + deletes |
+| Scrub | ~14ms | ~16ms | ~17ms | < 50ms | < 60ms | Token redaction + clears |
+| Finalize | ~312ms | ~322ms | ~424ms | < 700ms | < 900ms | FTS + views + indexes + VACUUM |
+| Bundle | ~1.29s | ~1.35s | ~1.37s | < 2.8s | < 3.0s | Attachments + viewer export + manifest/scaffold |
+| Zip | ~134ms | ~146ms | ~152ms | < 350ms | < 400ms | Deflate (level 9) with fixed timestamps |
+
+Output sizes (baseline):
+- Output dir: ~8.0MB
+- Output zip: ~0.84MB
+
+### Scenario: `chunked_small_threshold` (forced chunking)
+
+This scenario forces chunking by setting a small chunk threshold (128KiB) to exercise chunking overhead.
+
+Baseline (2026-02-06): ~13 chunks; total p95 ~1.88s; zip p95 ~0.16s.
+
+### Encryption
+
+Age encryption (`share::encrypt_with_age`) depends on the external `age` CLI being installed.
+The baseline run above did not include encryption timings (`age` not found).
 
 ## Golden Outputs
 

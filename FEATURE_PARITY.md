@@ -92,14 +92,15 @@
 ## CLI & Ops
 | Feature | Status | Evidence |
 | --- | --- | --- |
-| CLI command parity | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (40+ commands, 75+ tests, only `--interactive` deferred) |
+| CLI command parity | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (40+ commands, 123+ tests, only `--interactive` deferred) |
+| CLI output module (TTY-aware tables, JSON mode) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/output.rs` (CliTable, json_or_table, 33 tests) |
 | Config management (show-port, set-port) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | list-projects (--json, --include-agents) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | file_reservations (list/active/soon) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | acks (pending/remind/overdue) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | list-acks | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | mail status | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
-| migrate | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| migrate | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (10 tests: output parity, idempotent, tables, FTS, negative cases) |
 | clear-and-reset-everything | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | lint / typecheck | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | projects (mark-identity/discovery-init/adopt) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
