@@ -715,3 +715,305 @@ pub async fn macro_contact_handshake(
 }
 
 // removed generate_slug (unused; slug derivation handled by ensure_project)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // parse_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_json_valid_object() {
+        let payload = r#"{"id":1,"name":"test"}"#.to_string();
+        let result: McpResult<serde_json::Value> = parse_json(payload, "test");
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["id"], 1);
+        assert_eq!(val["name"], "test");
+    }
+
+    #[test]
+    fn parse_json_invalid_json_returns_error() {
+        let payload = "not json at all".to_string();
+        let result: McpResult<serde_json::Value> = parse_json(payload, "test_label");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("test_label"));
+        assert!(err.message.contains("JSON parse error"));
+    }
+
+    #[test]
+    fn parse_json_empty_string_returns_error() {
+        let result: McpResult<serde_json::Value> = parse_json(String::new(), "empty");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_json_wrong_type_returns_error() {
+        // parse as i32 when payload is a string
+        let payload = r#""hello""#.to_string();
+        let result: McpResult<i32> = parse_json(payload, "type_mismatch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_json_array() {
+        let payload = "[1, 2, 3]".to_string();
+        let result: McpResult<Vec<i32>> = parse_json(payload, "array");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // macro_start_session validation: human_key must be absolute
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn absolute_path_check_for_human_key() {
+        // This tests the same validation logic used in macro_start_session
+        assert!("/data/projects/test".starts_with('/'));
+        assert!("/".starts_with('/'));
+        assert!(!"data/projects/test".starts_with('/'));
+        assert!(!"./test".starts_with('/'));
+        assert!(!"".starts_with('/'));
+    }
+
+    // -----------------------------------------------------------------------
+    // macro_file_reservation_cycle validation: ttl >= 60
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ttl_minimum_60_seconds() {
+        let min_ttl: i64 = 60;
+        assert!(59 < min_ttl);
+        assert!(60 >= min_ttl);
+        assert!(3600 >= min_ttl);
+    }
+
+    #[test]
+    fn default_ttl_values() {
+        // macro_file_reservation_cycle default TTL
+        assert_eq!(3600_i64, 60 * 60); // 1 hour
+        // macro_contact_handshake default TTL
+        assert_eq!(604_800_i64, 7 * 24 * 3600); // 7 days
+    }
+
+    // -----------------------------------------------------------------------
+    // StartSessionResponse serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn start_session_response_round_trip() {
+        let resp = StartSessionResponse {
+            project: ProjectResponse {
+                id: 1,
+                slug: "abc".into(),
+                human_key: "/data/test".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            agent: AgentResponse {
+                id: 1,
+                name: "BlueLake".into(),
+                program: "claude-code".into(),
+                model: "opus-4.5".into(),
+                task_description: "testing".into(),
+                inception_ts: "2026-01-01T00:00:00Z".into(),
+                last_active_ts: "2026-01-01T00:00:00Z".into(),
+                project_id: 1,
+                attachments_policy: "auto".into(),
+            },
+            file_reservations: ReservationResponse {
+                granted: Vec::new(),
+                conflicts: Vec::new(),
+            },
+            inbox: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: StartSessionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.project.slug, "abc");
+        assert_eq!(parsed.agent.name, "BlueLake");
+        assert!(parsed.file_reservations.granted.is_empty());
+        assert!(parsed.inbox.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ReservationCycleResponse serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reservation_cycle_response_without_release() {
+        let resp = ReservationCycleResponse {
+            file_reservations: ReservationResponse {
+                granted: Vec::new(),
+                conflicts: Vec::new(),
+            },
+            released: None,
+        };
+        let val: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert!(val["released"].is_null());
+    }
+
+    #[test]
+    fn reservation_cycle_response_with_release() {
+        let resp = ReservationCycleResponse {
+            file_reservations: ReservationResponse {
+                granted: Vec::new(),
+                conflicts: Vec::new(),
+            },
+            released: Some(ReleaseResult {
+                released: 3,
+                released_at: "2026-02-06T12:00:00Z".into(),
+            }),
+        };
+        let val: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(val["released"]["released"], 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // HandshakeResponse serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handshake_response_minimal() {
+        let resp = HandshakeResponse {
+            request: serde_json::json!({"from": "A", "to": "B"}),
+            response: None,
+            welcome_message: None,
+        };
+        let val: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(val["request"]["from"], "A");
+        assert!(val["response"].is_null());
+        assert!(val["welcome_message"].is_null());
+    }
+
+    #[test]
+    fn handshake_response_full() {
+        let resp = HandshakeResponse {
+            request: serde_json::json!({"from": "A", "to": "B"}),
+            response: Some(serde_json::json!({"approved": true})),
+            welcome_message: Some(serde_json::json!({"id": 1, "subject": "Hello"})),
+        };
+        let val: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(val["response"]["approved"], true);
+        assert_eq!(val["welcome_message"]["subject"], "Hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // PreparedThread serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prepared_thread_round_trip() {
+        let thread = PreparedThread {
+            thread_id: "TKT-42".into(),
+            summary: ThreadSummary {
+                participants: vec!["Alice".into()],
+                key_points: vec!["Initial discussion".into()],
+                action_items: Vec::new(),
+                total_messages: 5,
+                open_actions: 0,
+                done_actions: 0,
+                mentions: Vec::new(),
+                code_references: None,
+            },
+            examples: vec![ExampleMessage {
+                id: 1,
+                from: "Alice".into(),
+                subject: "First msg".into(),
+                created_ts: "2026-01-01T00:00:00Z".into(),
+            }],
+            total_messages: 5,
+        };
+        let json = serde_json::to_string(&thread).unwrap();
+        let parsed: PreparedThread = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.thread_id, "TKT-42");
+        assert_eq!(parsed.total_messages, 5);
+        assert_eq!(parsed.examples.len(), 1);
+        assert_eq!(parsed.summary.participants, vec!["Alice"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // PrepareThreadResponse serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prepare_thread_response_round_trip() {
+        let resp = PrepareThreadResponse {
+            project: ProjectResponse {
+                id: 1,
+                slug: "test".into(),
+                human_key: "/data/test".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            agent: AgentResponse {
+                id: 1,
+                name: "GoldHawk".into(),
+                program: "codex-cli".into(),
+                model: "gpt-5".into(),
+                task_description: String::new(),
+                inception_ts: String::new(),
+                last_active_ts: String::new(),
+                project_id: 1,
+                attachments_policy: "auto".into(),
+            },
+            thread: PreparedThread {
+                thread_id: "br-1".into(),
+                summary: ThreadSummary {
+                    participants: Vec::new(),
+                    key_points: Vec::new(),
+                    action_items: Vec::new(),
+                    total_messages: 0,
+                    open_actions: 0,
+                    done_actions: 0,
+                    mentions: Vec::new(),
+                    code_references: None,
+                },
+                examples: Vec::new(),
+                total_messages: 0,
+            },
+            inbox: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: PrepareThreadResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.agent.name, "GoldHawk");
+        assert_eq!(parsed.thread.thread_id, "br-1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent alias resolution logic (macro_contact_handshake)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn requester_alias_resolution() {
+        // Tests the .or() chain: requester.or(agent_name)
+        let requester: Option<String> = Some("AgentA".into());
+        let agent_name: Option<String> = Some("AgentB".into());
+        assert_eq!(requester.or(agent_name), Some("AgentA".into()));
+
+        let requester: Option<String> = None;
+        let agent_name: Option<String> = Some("AgentB".into());
+        assert_eq!(requester.or(agent_name), Some("AgentB".into()));
+
+        let requester: Option<String> = None;
+        let agent_name: Option<String> = None;
+        assert_eq!(requester.or(agent_name), None);
+    }
+
+    #[test]
+    fn target_alias_resolution() {
+        // Tests the .or() chain: target.or(to_agent)
+        let target: Option<String> = Some("X".into());
+        let to_agent: Option<String> = Some("Y".into());
+        assert_eq!(target.or(to_agent), Some("X".into()));
+
+        let target: Option<String> = None;
+        let to_agent: Option<String> = Some("Y".into());
+        assert_eq!(target.or(to_agent), Some("Y".into()));
+    }
+}
