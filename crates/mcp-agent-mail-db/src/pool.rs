@@ -56,9 +56,7 @@ pub const DEFAULT_POOL_RECYCLE_MS: u64 = 30 * 60 * 1000; // 30 minutes
 /// is given).
 #[must_use]
 pub fn auto_pool_size() -> (usize, usize) {
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let min = (cpus * 4).clamp(10, 50);
     let max = (cpus * 12).clamp(50, 200);
     (min, max)
@@ -119,21 +117,23 @@ impl DbPoolConfig {
         let explicit_size = pool_size_raw
             .as_deref()
             .and_then(|s| s.parse::<usize>().ok());
-        let explicit_overflow = env_value("DATABASE_MAX_OVERFLOW")
-            .and_then(|s| s.parse::<usize>().ok());
+        let explicit_overflow =
+            env_value("DATABASE_MAX_OVERFLOW").and_then(|s| s.parse::<usize>().ok());
 
         let (min_conn, max_conn) = match (explicit_size, explicit_overflow) {
             // Both explicitly set → honour literally.
             (Some(size), Some(overflow)) => (size, size + overflow),
             // Only size set → derive overflow from size.
-            (Some(size), None) => (size, size.saturating_mul(4).max(size + DEFAULT_MAX_OVERFLOW)),
+            (Some(size), None) => (
+                size,
+                size.saturating_mul(4).max(size + DEFAULT_MAX_OVERFLOW),
+            ),
             // Not set, or explicitly "auto" → detect from hardware.
             (None, maybe_overflow) => {
                 let (auto_min, auto_max) = auto_pool_size();
-                match maybe_overflow {
-                    Some(overflow) => (auto_min, auto_min + overflow),
-                    None => (auto_min, auto_max),
-                }
+                maybe_overflow.map_or((auto_min, auto_max), |overflow| {
+                    (auto_min, auto_min + overflow)
+                })
             }
         };
 
@@ -587,13 +587,17 @@ mod tests {
     fn auto_pool_size_is_reasonable() {
         let (min, max) = auto_pool_size();
         // Must be within configured clamp bounds.
-        assert!(min >= 10 && min <= 50, "auto min={min} should be in [10, 50]");
-        assert!(max >= 50 && max <= 200, "auto max={max} should be in [50, 200]");
+        assert!(
+            (10..=50).contains(&min),
+            "auto min={min} should be in [10, 50]"
+        );
+        assert!(
+            (50..=200).contains(&max),
+            "auto max={max} should be in [50, 200]"
+        );
         assert!(max >= min, "max must be >= min");
         // On a 4-core machine: min=16, max=48→50.  On 16-core: min=50, max=192.
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         assert_eq!(min, (cpus * 4).clamp(10, 50));
         assert_eq!(max, (cpus * 12).clamp(50, 200));
     }
