@@ -278,6 +278,12 @@ normalize_transcript "${E2E_ARTIFACT_DIR}/server_default_rich.typescript" "${NOR
 e2e_assert_file_contains "banner includes Server Configuration" "${NORM1}" "Server Configuration"
 e2e_assert_file_contains "banner includes Database Statistics" "${NORM1}" "Database Statistics"
 e2e_assert_file_contains "banner includes Web UI" "${NORM1}" "Web UI"
+e2e_assert_file_contains "banner includes Console Capabilities" "${NORM1}" "Console Capabilities"
+# Grep-friendly one-liner: assert all keys present (not exact values).
+e2e_assert_file_contains "ConsoleCaps one-liner present" "${NORM1}" "ConsoleCaps:"
+for key in tc= osc8= mouse= sync= kitty= focus= mux=; do
+    e2e_assert_file_contains "ConsoleCaps key ${key} present" "${NORM1}" "${key}"
+done
 
 e2e_case_banner "banner_suppressed_when_rich_disabled"
 WORK2="$(e2e_mktemp "e2e_console_no_rich")"

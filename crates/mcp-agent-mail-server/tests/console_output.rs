@@ -1,7 +1,8 @@
 mod common;
 
 use mcp_agent_mail_server::console::{
-    BannerParams, render_http_request_panel, render_startup_banner, render_tool_call_end,
+    BannerParams, ConsoleEventBuffer, ConsoleEventKind, ConsoleEventSeverity, TIMELINE_MAX_EVENTS,
+    TimelinePane, render_http_request_panel, render_startup_banner, render_tool_call_end,
     render_tool_call_start,
 };
 
@@ -94,4 +95,83 @@ fn http_request_panel_plain_has_no_ansi_escapes() {
     assert!(panel.contains("/mcp"));
     assert!(panel.contains("201"));
     assert!(panel.contains("42ms"));
+}
+
+#[test]
+fn console_event_buffer_eviction_keeps_newest_and_monotonic_ids() {
+    let extra = 10usize;
+    assert!(extra < TIMELINE_MAX_EVENTS);
+
+    let mut buf = ConsoleEventBuffer::new();
+    for i in 0..(TIMELINE_MAX_EVENTS + extra) {
+        buf.push(
+            ConsoleEventKind::HttpRequest,
+            ConsoleEventSeverity::Info,
+            format!("ev {i}"),
+            vec![],
+            None,
+        );
+    }
+
+    assert_eq!(buf.len(), TIMELINE_MAX_EVENTS);
+    let snap = buf.snapshot();
+    assert_eq!(snap.len(), TIMELINE_MAX_EVENTS);
+    assert_eq!(snap.first().expect("first").id, (extra as u64) + 1);
+    assert_eq!(
+        snap.last().expect("last").id,
+        (TIMELINE_MAX_EVENTS + extra) as u64
+    );
+
+    for w in snap.windows(2) {
+        assert!(w[0].id < w[1].id);
+    }
+}
+
+#[test]
+fn timeline_pane_severity_filter_cycles() {
+    let mut pane = TimelinePane::new();
+    assert_eq!(pane.filter_severity(), None);
+
+    pane.cycle_severity_filter();
+    assert_eq!(pane.filter_severity(), Some(ConsoleEventSeverity::Info));
+    pane.cycle_severity_filter();
+    assert_eq!(pane.filter_severity(), Some(ConsoleEventSeverity::Warn));
+    pane.cycle_severity_filter();
+    assert_eq!(pane.filter_severity(), Some(ConsoleEventSeverity::Error));
+    pane.cycle_severity_filter();
+    assert_eq!(pane.filter_severity(), None);
+}
+
+#[test]
+fn timeline_pane_render_smoke_empty_does_not_panic() {
+    use ftui::layout::Rect;
+    use ftui::{Frame, GraphemePool};
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(80, 24, &mut pool);
+
+    let mut pane = TimelinePane::new();
+    pane.render(Rect::new(0, 0, 80, 24), &mut frame, &[]);
+}
+
+#[test]
+fn timeline_pane_render_smoke_single_event_does_not_panic() {
+    use ftui::layout::Rect;
+    use ftui::{Frame, GraphemePool};
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(80, 24, &mut pool);
+
+    let mut buf = ConsoleEventBuffer::new();
+    buf.push(
+        ConsoleEventKind::ToolCallStart,
+        ConsoleEventSeverity::Warn,
+        "hello timeline",
+        vec![("agent".to_string(), "AmberStream".to_string())],
+        Some(serde_json::json!({"ok": true})),
+    );
+    let events = buf.snapshot();
+
+    let mut pane = TimelinePane::new();
+    pane.render(Rect::new(0, 0, 80, 24), &mut frame, &events);
 }

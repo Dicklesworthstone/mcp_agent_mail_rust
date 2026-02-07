@@ -761,6 +761,9 @@ struct StartupDashboard {
     console_caps: console::ConsoleCaps,
     tick_count: AtomicU64,
     prev_db_stats: Mutex<DashboardDbStats>,
+    event_buffer: Mutex<console::ConsoleEventBuffer>,
+    timeline_pane: Mutex<console::TimelinePane>,
+    right_pane_view: Mutex<console::RightPaneView>,
 }
 
 impl StartupDashboard {
@@ -821,7 +824,14 @@ impl StartupDashboard {
             console_caps,
             tick_count: AtomicU64::new(0),
             prev_db_stats: Mutex::new(DashboardDbStats::default()),
+            event_buffer: Mutex::new(console::ConsoleEventBuffer::new()),
+            timeline_pane: Mutex::new(console::TimelinePane::new()),
+            right_pane_view: Mutex::new(console::RightPaneView::Log),
         });
+
+        // Wire capabilities addendum into the LogPane help overlay (br-1m6a.23).
+        lock_mutex(&dashboard.log_pane)
+            .set_caps_addendum(dashboard.console_caps.help_overlay_addendum());
 
         dashboard.refresh_db_stats();
         dashboard.render_now();
@@ -980,9 +990,28 @@ impl StartupDashboard {
             return false;
         }
 
-        // In split mode, route log-pane-specific keys to the LogViewer.
+        // In split mode, route keys to the active right-pane view.
         if lock_mutex(&self.console_layout).is_split_mode() {
-            let handled = self.handle_log_pane_key(key.code, event);
+            // Tab toggles right pane view.
+            if matches!(key.code, ftui::KeyCode::Tab) {
+                let mut view = lock_mutex(&self.right_pane_view);
+                *view = match *view {
+                    console::RightPaneView::Log => console::RightPaneView::Timeline,
+                    console::RightPaneView::Timeline => console::RightPaneView::Log,
+                };
+                drop(view);
+                self.render_now();
+                return false;
+            }
+
+            let view = *lock_mutex(&self.right_pane_view);
+            let handled = match view {
+                console::RightPaneView::Log => self.handle_log_pane_key(key.code, event),
+                console::RightPaneView::Timeline => {
+                    let events = lock_mutex(&self.event_buffer).snapshot();
+                    lock_mutex(&self.timeline_pane).handle_key(key.code, event, &events)
+                }
+            };
             if handled {
                 self.render_now();
                 return false;
@@ -1091,6 +1120,21 @@ impl StartupDashboard {
             }
             aid::PERSIST_NOW => {
                 self.persist_console_settings();
+            }
+            aid::RIGHT_PANE_TOGGLE => {
+                let mut view = lock_mutex(&self.right_pane_view);
+                let label = match *view {
+                    console::RightPaneView::Log => {
+                        *view = console::RightPaneView::Timeline;
+                        "Timeline"
+                    }
+                    console::RightPaneView::Timeline => {
+                        *view = console::RightPaneView::Log;
+                        "Log"
+                    }
+                };
+                drop(view);
+                self.log_line(&format!("Console: right pane switched to {label}"));
             }
 
             // ── Theme ──
@@ -1313,6 +1357,21 @@ impl StartupDashboard {
         }
     }
 
+    /// Push a structured event into the timeline buffer.
+    fn emit_event(
+        &self,
+        kind: console::ConsoleEventKind,
+        severity: console::ConsoleEventSeverity,
+        summary: impl Into<String>,
+        fields: Vec<(String, String)>,
+        json: Option<serde_json::Value>,
+    ) {
+        let mut buf = lock_mutex(&self.event_buffer);
+        let id = buf.push(kind, severity, summary, fields, json);
+        drop(buf);
+        lock_mutex(&self.timeline_pane).on_event_pushed(id);
+    }
+
     fn record_request(
         &self,
         method: &str,
@@ -1345,6 +1404,27 @@ impl StartupDashboard {
             duration_ms,
             client_ip: client_ip.to_string(),
         });
+
+        // Emit structured event for the timeline.
+        let severity = if status >= 500 {
+            console::ConsoleEventSeverity::Error
+        } else if status >= 400 {
+            console::ConsoleEventSeverity::Warn
+        } else {
+            console::ConsoleEventSeverity::Info
+        };
+        self.emit_event(
+            console::ConsoleEventKind::HttpRequest,
+            severity,
+            format!("{method} {path} {status} {duration_ms}ms"),
+            vec![
+                ("client".to_string(), client_ip.to_string()),
+                ("status".to_string(), status.to_string()),
+                ("duration_ms".to_string(), duration_ms.to_string()),
+            ],
+            None,
+        );
+
         self.render_now();
     }
 
@@ -1400,10 +1480,35 @@ impl StartupDashboard {
             frame.links = Some(links);
             let area = Rect::new(0, 0, width, ui_height);
             if is_split {
-                let mut pane = lock_mutex(&self.log_pane);
-                console::render_split_frame(&mut frame, area, split_ratio, &mut pane, |f, a| {
-                    render_dashboard_frame(f, a, &snapshot, phase, changed_rows);
-                });
+                let right_view = *lock_mutex(&self.right_pane_view);
+                match right_view {
+                    console::RightPaneView::Log => {
+                        let mut pane = lock_mutex(&self.log_pane);
+                        console::render_split_frame(
+                            &mut frame,
+                            area,
+                            split_ratio,
+                            &mut pane,
+                            |f, a| {
+                                render_dashboard_frame(f, a, &snapshot, phase, changed_rows);
+                            },
+                        );
+                    }
+                    console::RightPaneView::Timeline => {
+                        let mut tl = lock_mutex(&self.timeline_pane);
+                        let events = lock_mutex(&self.event_buffer).snapshot();
+                        console::render_split_frame_timeline(
+                            &mut frame,
+                            area,
+                            split_ratio,
+                            &mut tl,
+                            &events,
+                            |f, a| {
+                                render_dashboard_frame(f, a, &snapshot, phase, changed_rows);
+                            },
+                        );
+                    }
+                }
             } else {
                 render_dashboard_frame(&mut frame, area, &snapshot, phase, changed_rows);
             }
@@ -1968,6 +2073,18 @@ fn dashboard_write_log(text: &str) -> bool {
         dashboard.log_line(text);
         true
     })
+}
+
+fn dashboard_emit_event(
+    kind: console::ConsoleEventKind,
+    severity: console::ConsoleEventSeverity,
+    summary: impl Into<String>,
+    fields: Vec<(String, String)>,
+    json: Option<serde_json::Value>,
+) {
+    if let Some(dashboard) = dashboard_handle() {
+        dashboard.emit_event(kind, severity, summary, fields, json);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2787,6 +2904,24 @@ impl HttpState {
                     None
                 };
 
+                // Emit structured timeline event for tool call start.
+                {
+                    let mut fields = Vec::new();
+                    if let Some(ref p) = project_hint {
+                        fields.push(("project".to_string(), p.clone()));
+                    }
+                    if let Some(ref a) = agent_hint {
+                        fields.push(("agent".to_string(), a.clone()));
+                    }
+                    dashboard_emit_event(
+                        console::ConsoleEventKind::ToolCallStart,
+                        console::ConsoleEventSeverity::Info,
+                        format!("{tool_name} start"),
+                        fields,
+                        None,
+                    );
+                }
+
                 let tracker_state =
                     if self.config.instrumentation_enabled && active_tracker().is_none() {
                         let tracker = Arc::new(QueryTracker::new());
@@ -2848,6 +2983,13 @@ impl HttpState {
                             if !dashboard_write_log(&panel) {
                                 ftui_runtime::ftui_println!("{panel}");
                             }
+                            dashboard_emit_event(
+                                console::ConsoleEventKind::ToolCallEnd,
+                                console::ConsoleEventSeverity::Error,
+                                format!("{tool_name} error {dur_ms}ms"),
+                                vec![("error".to_string(), format!("{e}"))],
+                                None,
+                            );
                         }
                         return Err(e);
                     }
@@ -2871,6 +3013,16 @@ impl HttpState {
                     if !dashboard_write_log(&panel) {
                         ftui_runtime::ftui_println!("{panel}");
                     }
+                    dashboard_emit_event(
+                        console::ConsoleEventKind::ToolCallEnd,
+                        console::ConsoleEventSeverity::Info,
+                        format!("{tool_name} ok {dur_ms}ms q={queries}"),
+                        vec![
+                            ("duration_ms".to_string(), dur_ms.to_string()),
+                            ("queries".to_string(), queries.to_string()),
+                        ],
+                        None,
+                    );
                 }
                 if let Some(ref fmt) = format_value {
                     apply_toon_to_content(&mut value, "content", fmt, &self.config);

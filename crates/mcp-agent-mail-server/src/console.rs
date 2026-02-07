@@ -1254,6 +1254,21 @@ impl ConsoleCaps {
     }
 }
 
+/// Format a URL as an OSC-8 terminal hyperlink when the terminal supports it,
+/// otherwise return just the plain-text label + URL.
+///
+/// When `osc8` is `true`:  `\x1b]8;;URL\x07LABEL\x1b]8;;\x07`
+/// When `osc8` is `false`: `LABEL (URL)` — always includes the raw URL so it
+/// remains visible and copy-pasteable in terminals that strip sequences.
+#[must_use]
+pub fn format_hyperlink(url: &str, label: &str, osc8: bool) -> String {
+    if osc8 {
+        format!("\x1b]8;;{url}\x07{label}\x1b]8;;\x07")
+    } else {
+        format!("{label} ({url})")
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Log Pane (br-1m6a.20): AltScreen LogViewer wrapper
 // ──────────────────────────────────────────────────────────────────────
@@ -1286,6 +1301,8 @@ pub struct LogPane {
     state: LogViewerState,
     mode: LogPaneMode,
     search_input: TextInput,
+    /// Optional capabilities addendum appended to the `?` help overlay.
+    caps_addendum: String,
 }
 
 impl LogPane {
@@ -1296,7 +1313,13 @@ impl LogPane {
             state: LogViewerState::default(),
             mode: LogPaneMode::Normal,
             search_input: TextInput::new().with_placeholder("Search..."),
+            caps_addendum: String::new(),
         }
+    }
+
+    /// Set the capabilities addendum shown in the `?` help overlay.
+    pub fn set_caps_addendum(&mut self, addendum: String) {
+        self.caps_addendum = addendum;
     }
 
     /// Current input mode.
@@ -1471,7 +1494,7 @@ pub fn split_columns(total_width: u16, ratio_percent: u16) -> Option<(u16, u16)>
     Some((left, right))
 }
 
-/// Help text for the log pane keybindings.
+/// Help text for the log pane keybindings + discoverability hints.
 const LOG_PANE_HELP: &str = "\
  /         Search
  n / N     Next / prev match
@@ -1480,7 +1503,44 @@ const LOG_PANE_HELP: &str = "\
  Up/Down   Scroll 1 line
  PgUp/PgDn Scroll 1 page
  Home/End  Jump to top / bottom
- ?         Toggle this help";
+ ?         Toggle this help
+ Ctrl+P    Command palette
+";
+
+/// Extended help text appended when `ConsoleCaps` is available.
+///
+/// The `caps_help_lines` method on `ConsoleCaps` returns a short
+/// addendum showing which terminal capabilities are active.
+impl ConsoleCaps {
+    /// Render a compact help-overlay addendum showing active capabilities and
+    /// key-discovery hints.
+    ///
+    /// Returns lines suitable for appending below `LOG_PANE_HELP` in the `?`
+    /// overlay.  The output is plain ASCII (no ANSI escapes) so it renders
+    /// cleanly in any terminal.
+    #[must_use]
+    pub fn help_overlay_addendum(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(128);
+        out.push_str(" -- Capabilities --\n");
+        let items: &[(&str, bool)] = &[
+            ("True color", self.true_color),
+            ("OSC-8 links", self.osc8_hyperlinks),
+            ("Mouse (SGR)", self.mouse_sgr),
+            ("Sync output", self.sync_output),
+            ("Kitty kbd", self.kitty_keyboard),
+            ("Focus evts", self.focus_events),
+        ];
+        for (label, enabled) in items {
+            let sym = if *enabled { '+' } else { '-' };
+            let _ = writeln!(out, "  {sym} {label}");
+        }
+        if self.in_mux {
+            let _ = writeln!(out, "  ! In multiplexer");
+        }
+        out
+    }
+}
 
 /// Render a two-pane split frame: HUD on the left, `LogViewer` on the right.
 ///
@@ -1549,16 +1609,20 @@ pub fn render_split_frame(
             }
         }
         LogPaneMode::Help => {
-            // Help overlay: render help text centered within the log pane.
+            // Help overlay: keybindings + capabilities addendum (br-1m6a.23).
             use ftui::widgets::paragraph::Paragraph;
-            let help = Paragraph::new(LOG_PANE_HELP);
+            let mut full_help = String::from(LOG_PANE_HELP);
+            if !log_pane.caps_addendum.is_empty() {
+                full_help.push_str(&log_pane.caps_addendum);
+            }
+            let help = Paragraph::new(full_help.as_str());
             let help_block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .title(" Log Pane Help ");
             let help_widget = help.block(help_block);
             // Center the help box within the inner area.
             #[allow(clippy::cast_possible_truncation)] // help text is always small
-            let h = LOG_PANE_HELP.lines().count() as u16 + 2; // +2 for borders
+            let h = full_help.lines().count() as u16 + 2; // +2 for borders
             let w = 40u16.min(inner.width);
             let x = inner.x + inner.width.saturating_sub(w) / 2;
             let y = inner.y + inner.height.saturating_sub(h) / 2;
@@ -1568,6 +1632,633 @@ pub fn render_split_frame(
             help_widget.render(help_area, frame);
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Event Timeline (br-1m6a.22): structured event stream viewer (AltScreen)
+// ──────────────────────────────────────────────────────────────────────
+
+use std::collections::VecDeque;
+
+use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::table::{Row, Table};
+
+/// Maximum events retained in the timeline ring buffer.
+pub const TIMELINE_MAX_EVENTS: usize = 500;
+
+/// Which view is shown in the right pane of split mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightPaneView {
+    /// Log viewer (default).
+    Log,
+    /// Structured event timeline.
+    Timeline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleEventSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+impl ConsoleEventSeverity {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+
+    fn fg(self) -> ftui::PackedRgba {
+        use ftui_extras::theme as ftui_theme;
+        match self {
+            Self::Info => ftui_theme::fg::PRIMARY.resolve(),
+            Self::Warn => ftui_theme::accent::WARNING.resolve(),
+            Self::Error => ftui_theme::accent::ERROR.resolve(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleEventKind {
+    ToolCallStart,
+    ToolCallEnd,
+    HttpRequest,
+}
+
+impl ConsoleEventKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ToolCallStart => "tool_start",
+            Self::ToolCallEnd => "tool_end",
+            Self::HttpRequest => "http",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsoleEvent {
+    pub id: u64,
+    pub kind: ConsoleEventKind,
+    pub severity: ConsoleEventSeverity,
+    pub summary: String,
+    pub fields: Vec<(String, String)>,
+    pub json: Option<Value>,
+}
+
+/// Bounded ring buffer of structured console events.
+pub struct ConsoleEventBuffer {
+    events: VecDeque<ConsoleEvent>,
+    next_id: u64,
+}
+
+impl ConsoleEventBuffer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            events: VecDeque::with_capacity(TIMELINE_MAX_EVENTS),
+            next_id: 1,
+        }
+    }
+
+    pub fn push(
+        &mut self,
+        kind: ConsoleEventKind,
+        severity: ConsoleEventSeverity,
+        summary: impl Into<String>,
+        fields: Vec<(String, String)>,
+        json: Option<Value>,
+    ) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        if self.events.len() >= TIMELINE_MAX_EVENTS {
+            let _ = self.events.pop_front();
+        }
+        self.events.push_back(ConsoleEvent {
+            id,
+            kind,
+            severity,
+            summary: summary.into(),
+            fields,
+            json,
+        });
+        id
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<ConsoleEvent> {
+        self.events.iter().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+impl Default for ConsoleEventBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Input focus mode for the timeline pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelinePaneMode {
+    Normal,
+    Search,
+    Help,
+}
+
+/// Timeline viewer state (selection, filters, search, follow).
+pub struct TimelinePane {
+    mode: TimelinePaneMode,
+    follow: bool,
+    show_details: bool,
+    selected_id: Option<u64>,
+    scroll_offset: usize,
+    viewport_height: usize,
+    filter_severity: Option<ConsoleEventSeverity>,
+    query: String,
+    search_input: TextInput,
+}
+
+impl TimelinePane {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            mode: TimelinePaneMode::Normal,
+            follow: true,
+            show_details: true,
+            selected_id: None,
+            scroll_offset: 0,
+            viewport_height: 12,
+            filter_severity: None,
+            query: String::new(),
+            search_input: TextInput::new().with_placeholder("Search events..."),
+        }
+    }
+
+    pub const fn mode(&self) -> TimelinePaneMode {
+        self.mode
+    }
+
+    pub const fn follow_enabled(&self) -> bool {
+        self.follow
+    }
+
+    pub const fn filter_severity(&self) -> Option<ConsoleEventSeverity> {
+        self.filter_severity
+    }
+
+    pub const fn on_event_pushed(&mut self, new_id: u64) {
+        if self.follow {
+            self.selected_id = Some(new_id);
+        }
+    }
+
+    pub fn toggle_help(&mut self) {
+        self.mode = if self.mode == TimelinePaneMode::Help {
+            TimelinePaneMode::Normal
+        } else {
+            TimelinePaneMode::Help
+        };
+    }
+
+    pub fn enter_search_mode(&mut self) {
+        self.mode = TimelinePaneMode::Search;
+        self.search_input.clear();
+        self.search_input.set_focused(true);
+    }
+
+    pub fn confirm_search(&mut self) {
+        self.query = self.search_input.value().to_string();
+        self.mode = TimelinePaneMode::Normal;
+        self.search_input.set_focused(false);
+        self.scroll_offset = 0;
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.mode = TimelinePaneMode::Normal;
+        self.search_input.set_focused(false);
+    }
+
+    pub const fn toggle_follow(&mut self) {
+        self.follow = !self.follow;
+    }
+
+    pub const fn toggle_details(&mut self) {
+        self.show_details = !self.show_details;
+    }
+
+    pub const fn cycle_severity_filter(&mut self) {
+        self.filter_severity = match self.filter_severity {
+            None => Some(ConsoleEventSeverity::Info),
+            Some(ConsoleEventSeverity::Info) => Some(ConsoleEventSeverity::Warn),
+            Some(ConsoleEventSeverity::Warn) => Some(ConsoleEventSeverity::Error),
+            Some(ConsoleEventSeverity::Error) => None,
+        };
+        self.scroll_offset = 0;
+    }
+
+    fn matches_event(&self, event: &ConsoleEvent) -> bool {
+        if let Some(sev) = self.filter_severity
+            && event.severity != sev
+        {
+            return false;
+        }
+
+        if !self.query.is_empty() {
+            let q = self.query.to_ascii_lowercase();
+            if !event.summary.to_ascii_lowercase().contains(&q) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn visible_indices(&self, events: &[ConsoleEvent]) -> Vec<usize> {
+        let mut idx = Vec::new();
+        for (i, ev) in events.iter().enumerate() {
+            if self.matches_event(ev) {
+                idx.push(i);
+            }
+        }
+        idx
+    }
+
+    fn resolve_selected_visible_index(
+        &mut self,
+        events: &[ConsoleEvent],
+        visible: &[usize],
+    ) -> Option<usize> {
+        if visible.is_empty() {
+            self.selected_id = None;
+            self.scroll_offset = 0;
+            return None;
+        }
+
+        let mut selected = self
+            .selected_id
+            .and_then(|id| visible.iter().position(|&i| events[i].id == id));
+
+        if selected.is_none() {
+            selected = Some(if self.follow {
+                visible.len().saturating_sub(1)
+            } else {
+                0
+            });
+            self.selected_id = Some(events[visible[selected.unwrap()]].id);
+        }
+
+        selected
+    }
+
+    const fn ensure_selection_visible(&mut self, selected: usize) {
+        if self.viewport_height == 0 {
+            return;
+        }
+        if selected < self.scroll_offset {
+            self.scroll_offset = selected;
+            return;
+        }
+        let end = self
+            .scroll_offset
+            .saturating_add(self.viewport_height.saturating_sub(1));
+        if selected > end {
+            self.scroll_offset = selected.saturating_sub(self.viewport_height.saturating_sub(1));
+        }
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn move_selection(&mut self, delta: i32, events: &[ConsoleEvent], visible: &[usize]) {
+        let Some(selected) = self.resolve_selected_visible_index(events, visible) else {
+            return;
+        };
+
+        let next = if delta.is_negative() {
+            selected.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            selected.saturating_add(delta as usize)
+        }
+        .min(visible.len().saturating_sub(1));
+
+        self.selected_id = Some(events[visible[next]].id);
+        self.ensure_selection_visible(next);
+    }
+
+    /// Handle keybindings for the timeline pane. Returns true if consumed.
+    pub fn handle_key(
+        &mut self,
+        code: ftui::KeyCode,
+        event: &ftui::Event,
+        events: &[ConsoleEvent],
+    ) -> bool {
+        use ftui::KeyCode;
+
+        match self.mode {
+            TimelinePaneMode::Search => match code {
+                KeyCode::Enter => {
+                    self.confirm_search();
+                    true
+                }
+                KeyCode::Escape => {
+                    self.cancel_search();
+                    true
+                }
+                _ => {
+                    self.search_input.handle_event(event);
+                    true
+                }
+            },
+            TimelinePaneMode::Help => {
+                self.toggle_help();
+                true
+            }
+            TimelinePaneMode::Normal => {
+                let visible = self.visible_indices(events);
+                match code {
+                    KeyCode::Char('/') => {
+                        self.enter_search_mode();
+                        true
+                    }
+                    KeyCode::Char('?') => {
+                        self.toggle_help();
+                        true
+                    }
+                    KeyCode::Char('F') => {
+                        self.toggle_follow();
+                        true
+                    }
+                    KeyCode::Char('f') => {
+                        self.cycle_severity_filter();
+                        true
+                    }
+                    KeyCode::Enter => {
+                        self.toggle_details();
+                        true
+                    }
+                    KeyCode::Up => {
+                        self.move_selection(-1, events, &visible);
+                        true
+                    }
+                    KeyCode::Down => {
+                        self.move_selection(1, events, &visible);
+                        true
+                    }
+                    KeyCode::PageUp => {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        let step = self.viewport_height.max(1).min(i32::MAX as usize) as i32;
+                        self.move_selection(-step, events, &visible);
+                        true
+                    }
+                    KeyCode::PageDown => {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        let step = self.viewport_height.max(1).min(i32::MAX as usize) as i32;
+                        self.move_selection(step, events, &visible);
+                        true
+                    }
+                    KeyCode::Home => {
+                        if !visible.is_empty() {
+                            self.selected_id = Some(events[visible[0]].id);
+                            self.scroll_offset = 0;
+                        }
+                        true
+                    }
+                    KeyCode::End => {
+                        if !visible.is_empty() {
+                            let last = visible.len().saturating_sub(1);
+                            self.selected_id = Some(events[visible[last]].id);
+                            self.scroll_offset =
+                                last.saturating_sub(self.viewport_height.saturating_sub(1));
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn render_help_overlay(&self, inner: Rect, frame: &mut ftui::Frame<'_>) {
+        const HELP: &str = "\
+ /        Search\n\
+ f        Cycle severity filter\n\
+ F        Toggle follow\n\
+ Up/Down  Select event\n\
+ PgUp/Dn  Page\n\
+ Home/End Oldest/newest\n\
+ Enter    Toggle details\n\
+ ?        Toggle help\n\
+ Esc      Cancel search / close help";
+        let help_block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(" Timeline Help ");
+        let help_widget = Paragraph::new(HELP).block(help_block);
+        #[allow(clippy::cast_possible_truncation)]
+        let h = HELP.lines().count() as u16 + 2;
+        let w = 48u16.min(inner.width);
+        let x = inner.x + inner.width.saturating_sub(w) / 2;
+        let y = inner.y + inner.height.saturating_sub(h) / 2;
+        let area = Rect::new(x, y, w, h.min(inner.height));
+        help_widget.render(area, frame);
+    }
+
+    /// Render timeline contents (list + details) into the inner area.
+    #[allow(clippy::too_many_lines)]
+    pub fn render(&mut self, inner: Rect, frame: &mut ftui::Frame<'_>, events: &[ConsoleEvent]) {
+        if inner.is_empty() {
+            return;
+        }
+
+        // Track viewport height for paging behavior.
+        self.viewport_height = usize::from(inner.height.saturating_sub(2)).max(1);
+
+        let mut list_area = inner;
+        let mut details_area = Rect::default();
+
+        // In search mode, reserve 1 row for the input bar.
+        let search_bar_row = if self.mode == TimelinePaneMode::Search && inner.height > 2 {
+            let rows = Flex::vertical()
+                .constraints([Constraint::Fill, Constraint::Fixed(1)])
+                .split(inner);
+            list_area = rows[0];
+            rows[1]
+        } else {
+            Rect::default()
+        };
+
+        if self.show_details && list_area.height > 8 {
+            let rows = Flex::vertical()
+                .constraints([Constraint::Percentage(55.0), Constraint::Fill])
+                .split(list_area);
+            list_area = rows[0];
+            details_area = rows[1];
+        }
+
+        let visible = self.visible_indices(events);
+        let selected_visible = self.resolve_selected_visible_index(events, &visible);
+        if let Some(sel) = selected_visible {
+            self.ensure_selection_visible(sel);
+        }
+
+        // Render list table.
+        let header_style = ftui::Style::default()
+            .fg(ftui_extras::theme::fg::SECONDARY.resolve())
+            .bold();
+        let selected_bg = ftui::PackedRgba::rgb(35, 35, 35);
+
+        let mut rows = Vec::new();
+        let max_rows = usize::from(list_area.height.saturating_sub(2)).max(1);
+        let start = self.scroll_offset.min(visible.len());
+        let end = (start + max_rows).min(visible.len());
+        for (pos, idx) in visible[start..end].iter().enumerate() {
+            let ev = &events[*idx];
+            let mut row = Row::new(vec![
+                format!("#{:<4}", ev.id),
+                ev.severity.label().to_string(),
+                ev.kind.label().to_string(),
+                compact_path(&ev.summary, 80),
+            ])
+            .style(ftui::Style::default().fg(ev.severity.fg()));
+
+            if let Some(sel) = selected_visible
+                && (start + pos) == sel
+            {
+                row = row.style(
+                    ftui::Style::default()
+                        .fg(ev.severity.fg())
+                        .bg(selected_bg)
+                        .bold(),
+                );
+            }
+            rows.push(row);
+        }
+
+        let timeline_table = Table::new(
+            rows,
+            [
+                Constraint::Fixed(7),
+                Constraint::Fixed(5),
+                Constraint::Fixed(10),
+                Constraint::Fill,
+            ],
+        )
+        .header(Row::new(vec!["ID", "SEV", "KIND", "SUMMARY"]).style(header_style))
+        .column_spacing(1)
+        .style(ftui::Style::default().fg(ftui_extras::theme::fg::PRIMARY.resolve()));
+        <Table as Widget>::render(&timeline_table, list_area, frame);
+
+        // Render details panel.
+        if self.show_details && !details_area.is_empty() {
+            let details_block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Details ");
+            let details_inner = details_block.inner(details_area);
+            details_block.render(details_area, frame);
+
+            if let Some(sel) = selected_visible {
+                let ev = &events[visible[sel]];
+                let mut lines = Vec::new();
+                lines.push(format!(
+                    "#{}  {}  {}",
+                    ev.id,
+                    ev.severity.label(),
+                    ev.kind.label()
+                ));
+                lines.push(ev.summary.clone());
+                if !ev.fields.is_empty() {
+                    lines.push(String::new());
+                    for (k, v) in &ev.fields {
+                        lines.push(format!("{k}: {v}"));
+                    }
+                }
+                if let Some(ref json) = ev.json {
+                    if let Ok(pretty) = serde_json::to_string_pretty(json) {
+                        lines.push(String::new());
+                        for line in pretty.lines().take(12) {
+                            lines.push(compact_path(line, 120));
+                        }
+                    }
+                }
+                Paragraph::new(lines.join("\n"))
+                    .wrap(ftui::text::WrapMode::Word)
+                    .render(details_inner, frame);
+            } else {
+                Paragraph::new("No events yet.")
+                    .style(ftui::Style::default().fg(ftui_extras::theme::fg::MUTED.resolve()))
+                    .render(details_inner, frame);
+            }
+        }
+
+        // Search bar (if active).
+        if !search_bar_row.is_empty() && self.mode == TimelinePaneMode::Search {
+            self.search_input.render(search_bar_row, frame);
+        }
+
+        // Help overlay (if active).
+        if self.mode == TimelinePaneMode::Help {
+            self.render_help_overlay(inner, frame);
+        }
+    }
+}
+
+impl Default for TimelinePane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Render a two-pane split frame: HUD left, event timeline right.
+pub fn render_split_frame_timeline(
+    frame: &mut ftui::Frame<'_>,
+    area: Rect,
+    ratio_percent: u16,
+    timeline: &mut TimelinePane,
+    events: &[ConsoleEvent],
+    render_hud_fn: impl FnOnce(&mut ftui::Frame<'_>, Rect),
+) {
+    let Some((left_w, _right_w)) = split_columns(area.width, ratio_percent) else {
+        render_hud_fn(frame, area);
+        return;
+    };
+
+    let cols = Flex::horizontal()
+        .constraints([Constraint::Fixed(left_w), Constraint::Fill])
+        .split(area);
+
+    render_hud_fn(frame, cols[0]);
+
+    // Right: timeline with a border and small state indicators.
+    let follow_indicator = if timeline.follow_enabled() {
+        " Follow "
+    } else {
+        " Paused "
+    };
+    let sev = timeline
+        .filter_severity()
+        .map(|s| format!(" sev={} ", s.label()))
+        .unwrap_or_default();
+
+    let title = format!(" Timeline{sev}{follow_indicator}");
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(&title);
+    let inner = block.inner(cols[1]);
+    block.render(cols[1], frame);
+
+    timeline.render(inner, frame, events);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1602,6 +2293,8 @@ pub mod action_ids {
     pub const LOG_TOGGLE_FOLLOW: &str = "logs:toggle_follow";
     pub const LOG_SEARCH: &str = "logs:search";
     pub const LOG_CLEAR: &str = "logs:clear";
+    // Right pane view
+    pub const RIGHT_PANE_TOGGLE: &str = "layout:right_pane_toggle";
     // Tool panel toggles
     pub const TOGGLE_TOOL_CALLS_LOG: &str = "tools:toggle_tool_calls_log";
     pub const TOGGLE_TOOLS_LOG: &str = "tools:toggle_tools_log";
@@ -1661,6 +2354,10 @@ fn build_palette_actions() -> Vec<ActionItem> {
         ActionItem::new(id::PERSIST_NOW, "Save Console Settings")
             .with_description("Persist current CONSOLE_* settings to envfile")
             .with_tags(&["save", "persist"])
+            .with_category("Layout"),
+        ActionItem::new(id::RIGHT_PANE_TOGGLE, "Toggle Right Pane: Log/Timeline")
+            .with_description("Switch right pane between log viewer and event timeline")
+            .with_tags(&["layout", "timeline", "events", "log"])
             .with_category("Layout"),
         // Theme
         ActionItem::new(id::THEME_CYCLE, "Cycle Theme")
@@ -2471,7 +3168,7 @@ mod tests {
     #[test]
     fn command_palette_has_expected_action_count() {
         let palette = ConsoleCommandPalette::new();
-        assert_eq!(palette.action_count(), 25);
+        assert_eq!(palette.action_count(), 26);
     }
 
     #[test]
@@ -2843,5 +3540,427 @@ mod tests {
         assert!(caps.sync_output);
         assert!(!caps.kitty_keyboard);
         assert!(caps.focus_events);
+    }
+
+    // ── help_overlay_addendum tests (br-1m6a.23) ──
+
+    #[test]
+    fn help_overlay_addendum_contains_capabilities_header() {
+        let caps = ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: false,
+            mouse_sgr: false,
+            sync_output: true,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: false,
+        };
+        let addendum = caps.help_overlay_addendum();
+        assert!(
+            addendum.contains("Capabilities"),
+            "addendum should contain capabilities header: {addendum}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_addendum_shows_enabled_and_disabled() {
+        let caps = ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: false,
+            mouse_sgr: true,
+            sync_output: false,
+            kitty_keyboard: false,
+            focus_events: true,
+            in_mux: false,
+        };
+        let addendum = caps.help_overlay_addendum();
+        assert!(
+            addendum.contains("+ True color"),
+            "true_color should show '+': {addendum}"
+        );
+        assert!(
+            addendum.contains("- OSC-8 links"),
+            "osc8 disabled should show '-': {addendum}"
+        );
+        assert!(
+            addendum.contains("+ Mouse (SGR)"),
+            "mouse_sgr should show '+': {addendum}"
+        );
+        assert!(
+            addendum.contains("+ Focus evts"),
+            "focus_events should show '+': {addendum}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_addendum_mux_warning() {
+        let caps = ConsoleCaps {
+            true_color: false,
+            osc8_hyperlinks: false,
+            mouse_sgr: false,
+            sync_output: false,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: true,
+        };
+        let addendum = caps.help_overlay_addendum();
+        assert!(
+            addendum.contains("multiplexer"),
+            "mux flag should show warning: {addendum}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_addendum_is_plain_ascii_except_markers() {
+        let caps = ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: true,
+            mouse_sgr: true,
+            sync_output: true,
+            kitty_keyboard: true,
+            focus_events: true,
+            in_mux: true,
+        };
+        let addendum = caps.help_overlay_addendum();
+        // Should be entirely printable ASCII + newlines (no ANSI escapes).
+        for ch in addendum.chars() {
+            assert!(
+                ch.is_ascii_graphic() || ch == ' ' || ch == '\n',
+                "unexpected character {ch:?} in addendum"
+            );
+        }
+    }
+
+    // ── format_hyperlink tests (br-1m6a.23) ──
+
+    #[test]
+    fn format_hyperlink_osc8_enabled() {
+        let link = format_hyperlink("https://example.com", "Example", true);
+        assert!(link.contains("\x1b]8;;https://example.com\x07"));
+        assert!(link.contains("Example"));
+        assert!(link.ends_with("\x1b]8;;\x07"));
+    }
+
+    #[test]
+    fn format_hyperlink_osc8_disabled() {
+        let link = format_hyperlink("https://example.com", "Example", false);
+        assert_eq!(link, "Example (https://example.com)");
+        // No escape sequences.
+        assert!(!link.contains('\x1b'));
+    }
+
+    // ── LogPane caps_addendum wiring test ──
+
+    #[test]
+    fn log_pane_caps_addendum_initially_empty() {
+        let pane = LogPane::new();
+        assert!(pane.caps_addendum.is_empty());
+    }
+
+    #[test]
+    fn log_pane_set_caps_addendum() {
+        let mut pane = LogPane::new();
+        pane.set_caps_addendum("test addendum".to_string());
+        assert_eq!(pane.caps_addendum, "test addendum");
+    }
+
+    // ── LOG_PANE_HELP includes Ctrl+P hint (br-1m6a.23) ──
+
+    #[test]
+    fn log_pane_help_includes_palette_hint() {
+        assert!(
+            LOG_PANE_HELP.contains("Ctrl+P"),
+            "help text should include Ctrl+P palette hint"
+        );
+        assert!(
+            LOG_PANE_HELP.contains("Command palette"),
+            "help text should mention command palette"
+        );
+    }
+
+    // ── ConsoleEventBuffer tests (br-1m6a.22) ──
+
+    #[test]
+    fn event_buffer_push_and_len() {
+        let mut buf = ConsoleEventBuffer::new();
+        assert!(buf.is_empty());
+        buf.push(
+            ConsoleEventKind::HttpRequest,
+            ConsoleEventSeverity::Info,
+            "GET /health",
+            vec![],
+            None,
+        );
+        assert_eq!(buf.len(), 1);
+    }
+
+    #[test]
+    fn event_buffer_assigns_sequential_ids() {
+        let mut buf = ConsoleEventBuffer::new();
+        let id1 = buf.push(
+            ConsoleEventKind::ToolCallStart,
+            ConsoleEventSeverity::Info,
+            "start",
+            vec![],
+            None,
+        );
+        let id2 = buf.push(
+            ConsoleEventKind::ToolCallEnd,
+            ConsoleEventSeverity::Info,
+            "end",
+            vec![],
+            None,
+        );
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn event_buffer_overflow_evicts_oldest() {
+        let mut buf = ConsoleEventBuffer::new();
+        for i in 0..TIMELINE_MAX_EVENTS + 50 {
+            buf.push(
+                ConsoleEventKind::HttpRequest,
+                ConsoleEventSeverity::Info,
+                format!("req {i}"),
+                vec![],
+                None,
+            );
+        }
+        assert_eq!(buf.len(), TIMELINE_MAX_EVENTS);
+        let snap = buf.snapshot();
+        assert_eq!(snap[0].id, 51);
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_last = (TIMELINE_MAX_EVENTS + 50) as u64;
+        assert_eq!(snap.last().unwrap().id, expected_last);
+    }
+
+    #[test]
+    fn event_buffer_snapshot_is_ordered() {
+        let mut buf = ConsoleEventBuffer::new();
+        for _ in 0..10 {
+            buf.push(
+                ConsoleEventKind::HttpRequest,
+                ConsoleEventSeverity::Info,
+                "x",
+                vec![],
+                None,
+            );
+        }
+        let snap = buf.snapshot();
+        for window in snap.windows(2) {
+            assert!(window[0].id < window[1].id);
+        }
+    }
+
+    #[test]
+    fn event_buffer_default() {
+        let buf = ConsoleEventBuffer::default();
+        assert!(buf.is_empty());
+    }
+
+    // ── TimelinePane tests (br-1m6a.22) ──
+
+    #[test]
+    fn timeline_pane_default_state() {
+        let pane = TimelinePane::new();
+        assert_eq!(pane.mode(), TimelinePaneMode::Normal);
+        assert!(pane.follow_enabled());
+        assert!(pane.filter_severity().is_none());
+    }
+
+    #[test]
+    fn timeline_pane_severity_filter_cycle() {
+        let mut pane = TimelinePane::new();
+        pane.cycle_severity_filter();
+        assert_eq!(pane.filter_severity(), Some(ConsoleEventSeverity::Info));
+        pane.cycle_severity_filter();
+        assert_eq!(pane.filter_severity(), Some(ConsoleEventSeverity::Warn));
+        pane.cycle_severity_filter();
+        assert_eq!(pane.filter_severity(), Some(ConsoleEventSeverity::Error));
+        pane.cycle_severity_filter();
+        assert!(pane.filter_severity().is_none());
+    }
+
+    #[test]
+    fn timeline_pane_filter_matches() {
+        let mut pane = TimelinePane::new();
+        let events = vec![
+            ConsoleEvent {
+                id: 1,
+                kind: ConsoleEventKind::HttpRequest,
+                severity: ConsoleEventSeverity::Info,
+                summary: "GET /health".into(),
+                fields: vec![],
+                json: None,
+            },
+            ConsoleEvent {
+                id: 2,
+                kind: ConsoleEventKind::ToolCallEnd,
+                severity: ConsoleEventSeverity::Error,
+                summary: "send_message failed".into(),
+                fields: vec![],
+                json: None,
+            },
+            ConsoleEvent {
+                id: 3,
+                kind: ConsoleEventKind::HttpRequest,
+                severity: ConsoleEventSeverity::Warn,
+                summary: "POST /mcp 404".into(),
+                fields: vec![],
+                json: None,
+            },
+        ];
+        assert_eq!(pane.visible_indices(&events).len(), 3);
+        pane.filter_severity = Some(ConsoleEventSeverity::Error);
+        let vis = pane.visible_indices(&events);
+        assert_eq!(vis.len(), 1);
+        assert_eq!(events[vis[0]].id, 2);
+        pane.filter_severity = None;
+        pane.query = "POST".to_string();
+        let vis = pane.visible_indices(&events);
+        assert_eq!(vis.len(), 1);
+        assert_eq!(events[vis[0]].id, 3);
+    }
+
+    #[test]
+    fn timeline_pane_follow_tracks_new_events() {
+        let mut pane = TimelinePane::new();
+        pane.on_event_pushed(42);
+        assert_eq!(pane.selected_id, Some(42));
+    }
+
+    #[test]
+    fn timeline_pane_toggle_follow() {
+        let mut pane = TimelinePane::new();
+        pane.toggle_follow();
+        assert!(!pane.follow_enabled());
+        pane.toggle_follow();
+        assert!(pane.follow_enabled());
+    }
+
+    #[test]
+    fn timeline_pane_toggle_help() {
+        let mut pane = TimelinePane::new();
+        pane.toggle_help();
+        assert_eq!(pane.mode(), TimelinePaneMode::Help);
+        pane.toggle_help();
+        assert_eq!(pane.mode(), TimelinePaneMode::Normal);
+    }
+
+    #[test]
+    fn timeline_pane_search_flow() {
+        let mut pane = TimelinePane::new();
+        pane.enter_search_mode();
+        assert_eq!(pane.mode(), TimelinePaneMode::Search);
+        pane.search_input.set_value("test");
+        pane.confirm_search();
+        assert_eq!(pane.mode(), TimelinePaneMode::Normal);
+        assert_eq!(pane.query, "test");
+        pane.enter_search_mode();
+        pane.cancel_search();
+        assert_eq!(pane.mode(), TimelinePaneMode::Normal);
+    }
+
+    #[test]
+    fn timeline_pane_toggle_details() {
+        let mut pane = TimelinePane::new();
+        assert!(pane.show_details);
+        pane.toggle_details();
+        assert!(!pane.show_details);
+    }
+
+    #[test]
+    fn timeline_pane_render_empty_no_panic() {
+        let mut pane = TimelinePane::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        pane.render(Rect::new(0, 0, 80, 30), &mut frame, &[]);
+    }
+
+    #[test]
+    fn timeline_pane_render_with_events_no_panic() {
+        let mut pane = TimelinePane::new();
+        let events = vec![
+            ConsoleEvent {
+                id: 1,
+                kind: ConsoleEventKind::HttpRequest,
+                severity: ConsoleEventSeverity::Info,
+                summary: "GET /health 200 5ms".into(),
+                fields: vec![("client".into(), "127.0.0.1".into())],
+                json: Some(serde_json::json!({"status": 200})),
+            },
+            ConsoleEvent {
+                id: 2,
+                kind: ConsoleEventKind::ToolCallStart,
+                severity: ConsoleEventSeverity::Info,
+                summary: "send_message".into(),
+                fields: vec![("project".into(), "/data/test".into())],
+                json: None,
+            },
+        ];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        pane.render(Rect::new(0, 0, 80, 30), &mut frame, &events);
+    }
+
+    #[test]
+    fn render_split_frame_timeline_no_panic() {
+        let mut pane = TimelinePane::new();
+        let events = vec![ConsoleEvent {
+            id: 1,
+            kind: ConsoleEventKind::HttpRequest,
+            severity: ConsoleEventSeverity::Info,
+            summary: "GET /health".into(),
+            fields: vec![],
+            json: None,
+        }];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        render_split_frame_timeline(
+            &mut frame,
+            Rect::new(0, 0, 120, 40),
+            30,
+            &mut pane,
+            &events,
+            |f, a| {
+                Block::bordered().title(" HUD ").render(a, f);
+            },
+        );
+    }
+
+    #[test]
+    fn render_split_frame_timeline_narrow_falls_back() {
+        let mut pane = TimelinePane::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(50, 20, &mut pool);
+        render_split_frame_timeline(
+            &mut frame,
+            Rect::new(0, 0, 50, 20),
+            30,
+            &mut pane,
+            &[],
+            |_f, _a| {},
+        );
+    }
+
+    #[test]
+    fn right_pane_view_equality() {
+        assert_eq!(RightPaneView::Log, RightPaneView::Log);
+        assert_ne!(RightPaneView::Log, RightPaneView::Timeline);
+    }
+
+    #[test]
+    fn severity_labels() {
+        assert_eq!(ConsoleEventSeverity::Info.label(), "INFO");
+        assert_eq!(ConsoleEventSeverity::Warn.label(), "WARN");
+        assert_eq!(ConsoleEventSeverity::Error.label(), "ERROR");
+    }
+
+    #[test]
+    fn event_kind_labels() {
+        assert_eq!(ConsoleEventKind::ToolCallStart.label(), "tool_start");
+        assert_eq!(ConsoleEventKind::ToolCallEnd.label(), "tool_end");
+        assert_eq!(ConsoleEventKind::HttpRequest.label(), "http");
     }
 }
