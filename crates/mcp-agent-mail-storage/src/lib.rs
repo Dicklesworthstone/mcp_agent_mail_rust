@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha1::Digest as Sha1Digest;
 use thiserror::Error;
 
-use mcp_agent_mail_core::config::Config;
+use mcp_agent_mail_core::{LockLevel, OrderedMutex, config::Config};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -153,10 +153,10 @@ pub enum WriteOp {
 
 #[derive(Debug, Clone, Default)]
 pub struct WbqStats {
-    pub enqueued: usize,
-    pub drained: usize,
-    pub errors: usize,
-    pub fallbacks: usize,
+    pub enqueued: u64,
+    pub drained: u64,
+    pub errors: u64,
+    pub fallbacks: u64,
 }
 
 enum WbqMsg {
@@ -169,8 +169,7 @@ enum WbqMsg {
 
 struct WriteBehindQueue {
     sender: std::sync::mpsc::SyncSender<WbqMsg>,
-    drain_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-    stats: Arc<Mutex<WbqStats>>,
+    drain_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 const WBQ_CHANNEL_CAPACITY: usize = 256;
@@ -183,16 +182,13 @@ static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 pub fn wbq_start() {
     WBQ.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel(WBQ_CHANNEL_CAPACITY);
-        let stats = Arc::new(Mutex::new(WbqStats::default()));
-        let worker_stats = Arc::clone(&stats);
         let handle = std::thread::Builder::new()
             .name("wbq-drain".into())
-            .spawn(move || wbq_drain_loop(rx, worker_stats))
+            .spawn(move || wbq_drain_loop(rx))
             .expect("failed to spawn WBQ drain worker");
         WriteBehindQueue {
             sender: tx,
-            drain_handle: Mutex::new(Some(handle)),
-            stats,
+            drain_handle: OrderedMutex::new(LockLevel::StorageWbqDrainHandle, Some(handle)),
         }
     });
 }
@@ -204,13 +200,17 @@ pub fn wbq_enqueue(op: WriteOp) -> bool {
     let wbq = WBQ.get().expect("WBQ must be initialised");
     match wbq.sender.try_send(WbqMsg::Op(Box::new(op))) {
         Ok(()) => {
-            let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
-            s.enqueued += 1;
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .wbq_enqueued_total
+                .inc();
             true
         }
         Err(_) => {
-            let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
-            s.fallbacks += 1;
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .wbq_fallbacks_total
+                .inc();
             false
         }
     }
@@ -244,7 +244,7 @@ pub fn wbq_shutdown() {
         // guaranteed to be delivered (same rationale as wbq_flush).
         let _ = wbq.sender.send(WbqMsg::Shutdown);
         let handle = {
-            let mut guard = wbq.drain_handle.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = wbq.drain_handle.lock();
             guard.take()
         };
         if let Some(h) = handle {
@@ -255,12 +255,16 @@ pub fn wbq_shutdown() {
 
 /// Snapshot of current WBQ statistics.
 pub fn wbq_stats() -> WbqStats {
-    WBQ.get()
-        .map(|wbq| wbq.stats.lock().unwrap_or_else(|e| e.into_inner()).clone())
-        .unwrap_or_default()
+    let snap = mcp_agent_mail_core::global_metrics().snapshot();
+    WbqStats {
+        enqueued: snap.storage.wbq_enqueued_total,
+        drained: snap.storage.wbq_drained_total,
+        errors: snap.storage.wbq_errors_total,
+        fallbacks: snap.storage.wbq_fallbacks_total,
+    }
 }
 
-fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqStats>>) {
+fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>) {
     let flush_interval = Duration::from_millis(WBQ_FLUSH_INTERVAL_MS);
     let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
     let mut shutting_down = false;
@@ -300,11 +304,15 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqSta
             }
         }
 
-        {
-            let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
-            s.drained += drained;
-            s.errors += errors;
-        }
+        let metrics = mcp_agent_mail_core::global_metrics();
+        metrics
+            .storage
+            .wbq_drained_total
+            .add(u64::try_from(drained).unwrap_or(u64::MAX));
+        metrics
+            .storage
+            .wbq_errors_total
+            .add(u64::try_from(errors).unwrap_or(u64::MAX));
 
         for w in flush_waiters.drain(..) {
             let _ = w.try_send(());
@@ -884,12 +892,13 @@ impl CommitQueue {
 }
 
 /// Global commit queue instance.
-static COMMIT_QUEUE: Mutex<Option<CommitQueue>> = Mutex::new(None);
+static COMMIT_QUEUE: LazyLock<OrderedMutex<Option<CommitQueue>>> =
+    LazyLock::new(|| OrderedMutex::new(LockLevel::StorageCommitQueue, None));
 
 /// Get or create the global commit queue.
-pub fn get_commit_queue() -> &'static Mutex<Option<CommitQueue>> {
+pub fn get_commit_queue() -> &'static OrderedMutex<Option<CommitQueue>> {
     // Ensure initialized
-    let mut guard = COMMIT_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = COMMIT_QUEUE.lock();
     if guard.is_none() {
         *guard = Some(CommitQueue::default());
     }
@@ -1552,15 +1561,16 @@ pub struct HealResult {
 /// Simple LRU-ish repo path cache. We don't cache `Repository` handles across
 /// calls because `git2::Repository` is `!Send` on some platforms, but we cache
 /// the *path* so repeated lookups avoid re-scanning.
-static REPO_CACHE: Mutex<Option<HashMap<PathBuf, bool>>> = Mutex::new(None);
+static REPO_CACHE: LazyLock<OrderedMutex<Option<HashMap<PathBuf, bool>>>> =
+    LazyLock::new(|| OrderedMutex::new(LockLevel::StorageRepoCache, None));
 
 fn repo_cache_contains(root: &Path) -> bool {
-    let guard = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = REPO_CACHE.lock();
     guard.as_ref().is_some_and(|m| m.contains_key(root))
 }
 
 fn repo_cache_insert(root: &Path) {
-    let mut guard = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = REPO_CACHE.lock();
     let map = guard.get_or_insert_with(HashMap::new);
     map.insert(root.to_path_buf(), true);
 }
@@ -2557,10 +2567,11 @@ pub fn process_markdown_images(
 // Notification signals (legacy parity)
 // ---------------------------------------------------------------------------
 
-static SIGNAL_DEBOUNCE: OnceLock<Mutex<HashMap<(String, String), u128>>> = OnceLock::new();
+static SIGNAL_DEBOUNCE: OnceLock<OrderedMutex<HashMap<(String, String), u128>>> = OnceLock::new();
 
-fn signal_debounce() -> &'static Mutex<HashMap<(String, String), u128>> {
-    SIGNAL_DEBOUNCE.get_or_init(|| Mutex::new(HashMap::new()))
+fn signal_debounce() -> &'static OrderedMutex<HashMap<(String, String), u128>> {
+    SIGNAL_DEBOUNCE
+        .get_or_init(|| OrderedMutex::new(LockLevel::StorageSignalDebounce, HashMap::new()))
 }
 
 /// Emit a notification signal file for a project/agent.
@@ -2584,10 +2595,7 @@ pub fn emit_notification_signal(
 
     let key = (project_slug.to_string(), agent_name.to_string());
     {
-        let mut map = match signal_debounce().lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut map = signal_debounce().lock();
         let last = map.get(&key).copied().unwrap_or(0);
         if debounce_ms > 0 && now_ms.saturating_sub(last) < debounce_ms {
             return false;
