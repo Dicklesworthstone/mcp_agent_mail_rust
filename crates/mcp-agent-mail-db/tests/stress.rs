@@ -19,7 +19,9 @@
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::queries;
+use mcp_agent_mail_db::schema;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
+use sqlmodel_schema::MigrationStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
@@ -86,6 +88,82 @@ where
         }
     }
     unreachable!()
+}
+
+// =============================================================================
+// Test: Concurrent pool warmup should not surface SQLITE_BUSY
+// =============================================================================
+
+#[test]
+fn stress_concurrent_pool_warmup_has_no_sqlite_busy() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let db_path = dir
+        .path()
+        .join(format!("pool_warmup_{}.db", unique_suffix()));
+    let config = DbPoolConfig {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        max_connections: 64,
+        min_connections: 0,
+        acquire_timeout_ms: 60_000,
+        max_lifetime_ms: 3_600_000,
+        run_migrations: true,
+    };
+    let pool = DbPool::new(&config).expect("create pool");
+
+    let n_threads = 50;
+    let barrier_start = Arc::new(Barrier::new(n_threads));
+    let barrier_hold = Arc::new(Barrier::new(n_threads));
+
+    let handles: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let pool = pool.clone();
+            let barrier_start = Arc::clone(&barrier_start);
+            let barrier_hold = Arc::clone(&barrier_hold);
+            std::thread::spawn(move || {
+                barrier_start.wait();
+                let conn = match block_on(|cx| async move { pool.acquire(&cx).await }) {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(e) => {
+                        panic!("pool warmup acquire should succeed without SQLITE_BUSY: {e:?}")
+                    }
+                    Outcome::Cancelled(r) => panic!("pool warmup acquire cancelled: {r:?}"),
+                    Outcome::Panicked(p) => panic!("{p}"),
+                };
+                barrier_hold.wait();
+                drop(conn);
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread join");
+    }
+
+    // Verify we end up at a consistent latest schema (no migration races).
+    block_on(|cx| async move {
+        let conn = match pool.acquire(&cx).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => panic!("acquire after warmup should succeed: {e:?}"),
+            Outcome::Cancelled(r) => panic!("acquire after warmup cancelled: {r:?}"),
+            Outcome::Panicked(p) => panic!("{p}"),
+        };
+
+        let statuses = match schema::migration_status(&cx, &*conn).await {
+            Outcome::Ok(s) => s,
+            Outcome::Err(e) => panic!("migration_status should succeed: {e:?}"),
+            Outcome::Cancelled(r) => panic!("migration_status cancelled: {r:?}"),
+            Outcome::Panicked(p) => panic!("{p}"),
+        };
+
+        let expected = schema::schema_migrations().len();
+        assert_eq!(statuses.len(), expected, "all migrations should be tracked");
+        assert!(
+            statuses
+                .iter()
+                .all(|(_id, status)| matches!(status, MigrationStatus::Applied { .. })),
+            "all migrations should be applied after warmup"
+        );
+    });
 }
 
 // =============================================================================

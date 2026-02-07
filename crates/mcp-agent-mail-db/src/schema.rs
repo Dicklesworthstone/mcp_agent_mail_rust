@@ -166,7 +166,12 @@ END;
 
 /// SQL for WAL mode and performance settings.
 ///
-/// Per-connection PRAGMAs matching legacy Python `db.py` event listeners.
+/// Legacy-style PRAGMAs matching the Python `db.py` on-connect behavior.
+///
+/// Note: some PRAGMAs are database-wide (notably `journal_mode`). In the Rust
+/// server we apply `journal_mode=WAL` once per sqlite file during pool warmup
+/// (see `mcp-agent-mail-db/src/pool.rs`) to avoid high-concurrency races where
+/// multiple connections simultaneously attempt WAL/migrations.
 ///
 /// - `journal_mode=WAL`: readers never block writers; writers never block readers
 /// - `synchronous=NORMAL`: fsync on commit (not per-statement); safe with WAL
@@ -177,9 +182,28 @@ END;
 /// - `temp_store=MEMORY`: temp tables and indices stay in RAM (never hit disk)
 /// - `threads=4`: allow `SQLite` to parallelize sorting and other internal work
 pub const PRAGMA_SETTINGS_SQL: &str = r"
+PRAGMA busy_timeout = 60000;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+PRAGMA wal_autocheckpoint = 2000;
+PRAGMA cache_size = -65536;
+PRAGMA mmap_size = 536870912;
+PRAGMA temp_store = MEMORY;
+PRAGMA threads = 4;
+";
+
+/// Database-wide initialization PRAGMAs (applied once per sqlite file).
+pub const PRAGMA_DB_INIT_SQL: &str = r"
+PRAGMA journal_mode = WAL;
+";
+
+/// Per-connection PRAGMAs (safe to run on every new connection).
+///
+/// IMPORTANT: `busy_timeout` must be first so lock waits apply to any
+/// subsequent PRAGMA that may need a write lock.
+pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA busy_timeout = 60000;
+PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;
 PRAGMA cache_size = -65536;
 PRAGMA mmap_size = 536870912;
