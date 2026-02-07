@@ -294,23 +294,14 @@ pub async fn file_reservation_paths(
             .collect();
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
             project_slug: project.slug.clone(),
-            config: config.clone(),
-            reservations: res_jsons.clone(),
+            config,
+            reservations: res_jsons,
         };
         if !mcp_agent_mail_storage::wbq_enqueue(op) {
-            // Fallback: synchronous write
-            match mcp_agent_mail_storage::ensure_archive(&config, &project.slug) {
-                Ok(archive) => {
-                    if let Err(e) = mcp_agent_mail_storage::write_file_reservation_records(
-                        &archive, &config, &res_jsons,
-                    ) {
-                        tracing::warn!("Failed to write reservation artifacts to archive: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to ensure archive for reservation write: {e}");
-                }
-            }
+            tracing::warn!(
+                "WBQ enqueue failed; skipping reservation artifacts archive write project={}",
+                project.slug
+            );
         }
     }
 

@@ -26,8 +26,8 @@ use crate::tool_util::{
 /// Write a message bundle to the git archive (best-effort, non-blocking).
 /// Failures are logged but never fail the tool call.
 ///
-/// Uses the write-behind queue when available; falls back to synchronous
-/// write if the queue is full.
+/// Uses the write-behind queue when available. If the queue is unavailable,
+/// logs a warning and skips the archive write (DB remains the source of truth).
 fn try_write_message_archive(
     config: &Config,
     project_slug: &str,
@@ -47,26 +47,7 @@ fn try_write_message_archive(
         extra_paths: extra_paths.to_vec(),
     };
     if !mcp_agent_mail_storage::wbq_enqueue(op) {
-        // Fallback: synchronous write
-        match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
-            Ok(archive) => {
-                if let Err(e) = mcp_agent_mail_storage::write_message_bundle(
-                    &archive,
-                    config,
-                    message_json,
-                    body_md,
-                    sender,
-                    all_recipient_names,
-                    extra_paths,
-                    None,
-                ) {
-                    tracing::warn!("Failed to write message bundle to archive: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to ensure archive for message write: {e}");
-            }
-        }
+        tracing::warn!("WBQ enqueue failed; skipping message archive write project={project_slug}");
     }
 }
 
@@ -431,11 +412,13 @@ pub async fn send_message(
         let slug = &project.slug;
         let archive = mcp_agent_mail_storage::ensure_archive(&config, slug);
         if let Ok(archive) = archive {
+            let base_dir = std::path::Path::new(&project.human_key);
             // Process inline markdown images
             if let Ok((updated_body, md_meta, rel_paths)) =
                 mcp_agent_mail_storage::process_markdown_images(
                     &archive,
                     &config,
+                    base_dir,
                     &body_md,
                     embed_policy,
                 )
@@ -455,6 +438,7 @@ pub async fn send_message(
                     if let Ok((att_meta, rel_paths)) = mcp_agent_mail_storage::process_attachments(
                         &archive,
                         &config,
+                        base_dir,
                         paths,
                         embed_policy,
                     ) {

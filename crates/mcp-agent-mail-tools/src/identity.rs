@@ -36,8 +36,8 @@ const fn us_to_ms_ceil(us: u64) -> u64 {
 /// Try to write an agent profile to the git archive. Failures are logged
 /// but do not fail the tool call – the DB is the source of truth.
 ///
-/// Uses the write-behind queue when available; falls back to synchronous
-/// write if the queue is full.
+/// Uses the write-behind queue when available. If the queue is unavailable,
+/// logs a warning and skips the archive write.
 fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &serde_json::Value) {
     let op = mcp_agent_mail_storage::WriteOp::AgentProfile {
         project_slug: project_slug.to_string(),
@@ -45,18 +45,9 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
         agent_json: agent_json.clone(),
     };
     if !mcp_agent_mail_storage::wbq_enqueue(op) {
-        match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
-            Ok(archive) => {
-                if let Err(e) = mcp_agent_mail_storage::write_agent_profile_with_config(
-                    &archive, config, agent_json,
-                ) {
-                    tracing::warn!("Failed to write agent profile to archive: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to ensure archive for profile write: {e}");
-            }
-        }
+        tracing::warn!(
+            "WBQ enqueue failed; skipping agent profile archive write project={project_slug}"
+        );
     }
 }
 
@@ -70,6 +61,8 @@ pub struct HealthCheckResponse {
     pub database_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queues: Option<QueuesHealthResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +76,46 @@ pub struct PoolUtilizationResponse {
     pub acquire_p50_ms: u64,
     pub acquire_p95_ms: u64,
     pub acquire_p99_ms: u64,
+    pub over_80_for_s: u64,
+    pub warning: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuesHealthResponse {
+    pub wbq: WbqQueueHealthResponse,
+    pub commit_coalescer: CommitCoalescerHealthResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WbqQueueHealthResponse {
+    pub depth: u64,
+    pub capacity: u64,
+    pub utilization_pct: u64,
+    pub peak_depth: u64,
+    pub enqueued_total: u64,
+    pub drained_total: u64,
+    pub errors_total: u64,
+    pub backpressure_total: u64,
+    pub latency_p50_ms: u64,
+    pub latency_p95_ms: u64,
+    pub latency_p99_ms: u64,
+    pub over_80_for_s: u64,
+    pub warning: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitCoalescerHealthResponse {
+    pub pending_requests: u64,
+    pub soft_cap: u64,
+    pub utilization_pct: u64,
+    pub peak_pending_requests: u64,
+    pub enqueued_total: u64,
+    pub drained_total: u64,
+    pub errors_total: u64,
+    pub sync_fallbacks_total: u64,
+    pub latency_p50_ms: u64,
+    pub latency_p95_ms: u64,
+    pub latency_p99_ms: u64,
     pub over_80_for_s: u64,
     pub warning: bool,
 }
@@ -139,10 +172,15 @@ pub struct CommitInfo {
 ///
 /// Returns basic server configuration and status information.
 #[tool(description = "Return basic readiness information for the Agent Mail server.")]
+#[allow(clippy::too_many_lines)]
 pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let config = Config::from_env();
     let pool = get_db_pool()?;
     pool.sample_pool_stats_now();
+    // Ensure background workers are running so health_check reports stable
+    // queue capacity/soft-cap values even before the first write/commit.
+    mcp_agent_mail_storage::wbq_start();
+    let _ = mcp_agent_mail_storage::get_commit_coalescer();
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
 
     let now_us = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap_or(0);
@@ -172,6 +210,74 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             acquire_p99_ms: us_to_ms_ceil(metrics.db.pool_acquire_latency_us.p99),
             over_80_for_s,
             warning: over_80_for_s >= 300,
+        }),
+        queues: Some({
+            let wbq_over_80_for_s = if metrics.storage.wbq_over_80_since_us == 0 {
+                0
+            } else {
+                now_us
+                    .saturating_sub(metrics.storage.wbq_over_80_since_us)
+                    .saturating_div(1_000_000)
+            };
+            let wbq_utilization_pct = if metrics.storage.wbq_capacity == 0 {
+                0
+            } else {
+                metrics
+                    .storage
+                    .wbq_depth
+                    .saturating_mul(100)
+                    .saturating_div(metrics.storage.wbq_capacity)
+            };
+
+            let commit_over_80_for_s = if metrics.storage.commit_over_80_since_us == 0 {
+                0
+            } else {
+                now_us
+                    .saturating_sub(metrics.storage.commit_over_80_since_us)
+                    .saturating_div(1_000_000)
+            };
+            let commit_utilization_pct = if metrics.storage.commit_soft_cap == 0 {
+                0
+            } else {
+                metrics
+                    .storage
+                    .commit_pending_requests
+                    .saturating_mul(100)
+                    .saturating_div(metrics.storage.commit_soft_cap)
+            };
+
+            QueuesHealthResponse {
+                wbq: WbqQueueHealthResponse {
+                    depth: metrics.storage.wbq_depth,
+                    capacity: metrics.storage.wbq_capacity,
+                    utilization_pct: wbq_utilization_pct,
+                    peak_depth: metrics.storage.wbq_peak_depth,
+                    enqueued_total: metrics.storage.wbq_enqueued_total,
+                    drained_total: metrics.storage.wbq_drained_total,
+                    errors_total: metrics.storage.wbq_errors_total,
+                    backpressure_total: metrics.storage.wbq_fallbacks_total,
+                    latency_p50_ms: us_to_ms_ceil(metrics.storage.wbq_queue_latency_us.p50),
+                    latency_p95_ms: us_to_ms_ceil(metrics.storage.wbq_queue_latency_us.p95),
+                    latency_p99_ms: us_to_ms_ceil(metrics.storage.wbq_queue_latency_us.p99),
+                    over_80_for_s: wbq_over_80_for_s,
+                    warning: wbq_over_80_for_s >= 300,
+                },
+                commit_coalescer: CommitCoalescerHealthResponse {
+                    pending_requests: metrics.storage.commit_pending_requests,
+                    soft_cap: metrics.storage.commit_soft_cap,
+                    utilization_pct: commit_utilization_pct,
+                    peak_pending_requests: metrics.storage.commit_peak_pending_requests,
+                    enqueued_total: metrics.storage.commit_enqueued_total,
+                    drained_total: metrics.storage.commit_drained_total,
+                    errors_total: metrics.storage.commit_errors_total,
+                    sync_fallbacks_total: metrics.storage.commit_sync_fallbacks_total,
+                    latency_p50_ms: us_to_ms_ceil(metrics.storage.commit_queue_latency_us.p50),
+                    latency_p95_ms: us_to_ms_ceil(metrics.storage.commit_queue_latency_us.p95),
+                    latency_p99_ms: us_to_ms_ceil(metrics.storage.commit_queue_latency_us.p99),
+                    over_80_for_s: commit_over_80_for_s,
+                    warning: commit_over_80_for_s >= 300,
+                },
+            }
         }),
     };
 
@@ -748,6 +854,7 @@ mod tests {
             http_port: 8765,
             database_url: "sqlite:///data/test.db".into(),
             pool_utilization: None,
+            queues: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();

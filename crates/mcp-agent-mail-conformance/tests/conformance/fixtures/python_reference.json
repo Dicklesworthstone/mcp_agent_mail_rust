@@ -26,6 +26,38 @@
                 "acquire_p99_ms": 0,
                 "over_80_for_s": 0,
                 "warning": false
+              },
+              "queues": {
+                "wbq": {
+                  "depth": 0,
+                  "capacity": 8192,
+                  "utilization_pct": 0,
+                  "peak_depth": 0,
+                  "enqueued_total": 0,
+                  "drained_total": 0,
+                  "errors_total": 0,
+                  "backpressure_total": 0,
+                  "latency_p50_ms": 0,
+                  "latency_p95_ms": 0,
+                  "latency_p99_ms": 0,
+                  "over_80_for_s": 0,
+                  "warning": false
+                },
+                "commit_coalescer": {
+                  "pending_requests": 0,
+                  "soft_cap": 8192,
+                  "utilization_pct": 0,
+                  "peak_pending_requests": 0,
+                  "enqueued_total": 0,
+                  "drained_total": 0,
+                  "errors_total": 0,
+                  "sync_fallbacks_total": 0,
+                  "latency_p50_ms": 0,
+                  "latency_p95_ms": 0,
+                  "latency_p99_ms": 0,
+                  "over_80_for_s": 0,
+                  "warning": false
+                }
               }
             }
           },
@@ -34,7 +66,31 @@
               "/database_url",
               "/pool_utilization/acquire_p50_ms",
               "/pool_utilization/acquire_p95_ms",
-              "/pool_utilization/acquire_p99_ms"
+              "/pool_utilization/acquire_p99_ms",
+              "/queues/wbq/depth",
+              "/queues/wbq/utilization_pct",
+              "/queues/wbq/peak_depth",
+              "/queues/wbq/enqueued_total",
+              "/queues/wbq/drained_total",
+              "/queues/wbq/errors_total",
+              "/queues/wbq/backpressure_total",
+              "/queues/wbq/latency_p50_ms",
+              "/queues/wbq/latency_p95_ms",
+              "/queues/wbq/latency_p99_ms",
+              "/queues/wbq/over_80_for_s",
+              "/queues/wbq/warning",
+              "/queues/commit_coalescer/pending_requests",
+              "/queues/commit_coalescer/utilization_pct",
+              "/queues/commit_coalescer/peak_pending_requests",
+              "/queues/commit_coalescer/enqueued_total",
+              "/queues/commit_coalescer/drained_total",
+              "/queues/commit_coalescer/errors_total",
+              "/queues/commit_coalescer/sync_fallbacks_total",
+              "/queues/commit_coalescer/latency_p50_ms",
+              "/queues/commit_coalescer/latency_p95_ms",
+              "/queues/commit_coalescer/latency_p99_ms",
+              "/queues/commit_coalescer/over_80_for_s",
+              "/queues/commit_coalescer/warning"
             ]
           }
         }

@@ -583,6 +583,10 @@ fn run_fixtures_against_rust_server_router() {
     // -----------------------------------------------------------------------
     // Archive artifact assertions (run in same test to avoid env var races)
     // -----------------------------------------------------------------------
+    // Reservation/message/profile writes are queued through WBQ and async git
+    // commit coalescing. Flush both layers before asserting on-disk artifacts.
+    mcp_agent_mail_storage::wbq_flush();
+    mcp_agent_mail_storage::flush_async_commits();
     let files = collect_archive_files(&storage_root);
 
     // --- .gitattributes ---
