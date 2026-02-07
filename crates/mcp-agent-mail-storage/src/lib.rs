@@ -3082,7 +3082,7 @@ pub fn process_attachments(
     let mut all_rel_paths = Vec::new();
 
     for path_str in attachment_paths {
-        let resolved = resolve_source_attachment_path(base_dir, config, path_str)?;
+        let resolved = resolve_attachment_source_path(base_dir, config, path_str)?;
         let stored = store_attachment(archive, config, &resolved, embed_policy)?;
         all_meta.push(stored.meta);
         all_rel_paths.extend(stored.rel_paths);
@@ -3165,7 +3165,11 @@ pub fn process_markdown_images(
 /// - Relative paths are resolved relative to `base_dir` (typically the project's `human_key`).
 /// - Absolute paths outside `base_dir` are allowed only when `allow_absolute_attachment_paths=true`.
 /// - Absolute paths inside `base_dir` are always allowed.
-fn resolve_source_attachment_path(base_dir: &Path, config: &Config, raw_path: &str) -> Result<PathBuf> {
+pub fn resolve_attachment_source_path(
+    base_dir: &Path,
+    config: &Config,
+    raw_path: &str,
+) -> Result<PathBuf> {
     let raw = raw_path.trim();
     if raw.is_empty() {
         return Err(StorageError::InvalidPath("Attachment path cannot be empty".to_string()));
@@ -4982,7 +4986,7 @@ mod tests {
 
         let body = "Remote: ![photo](https://example.com/img.png) and local ref.";
         let (new_body, meta, _) =
-            process_markdown_images(&archive, &config, body, EmbedPolicy::File).unwrap();
+            process_markdown_images(&archive, &config, &archive.root, body, EmbedPolicy::File).unwrap();
 
         // URL should be left unchanged
         assert_eq!(new_body, body);

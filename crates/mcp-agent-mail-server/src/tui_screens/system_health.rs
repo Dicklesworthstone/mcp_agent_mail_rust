@@ -290,10 +290,10 @@ impl MailScreen for SystemHealthScreen {
 }
 
 fn diagnostics_worker_loop(
-    state: Arc<TuiSharedState>,
-    snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
-    refresh_requested: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    state: &TuiSharedState,
+    snapshot: &Mutex<DiagnosticsSnapshot>,
+    refresh_requested: &AtomicBool,
+    stop: &AtomicBool,
 ) {
     let mut next_due = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -314,18 +314,16 @@ fn run_diagnostics(state: &TuiSharedState) -> DiagnosticsSnapshot {
     let cfg = state.config_snapshot();
     let env_cfg = Config::from_env();
 
-    let mut out = DiagnosticsSnapshot::default();
-    out.checked_at = Some(Utc::now());
-    out.endpoint = cfg.endpoint.clone();
-    out.web_ui_url = cfg.web_ui_url.clone();
-    out.auth_enabled = cfg.auth_enabled;
-    out.localhost_unauth_allowed = env_cfg.http_allow_localhost_unauthenticated;
-    out.token_present = env_cfg.http_bearer_token.is_some();
-    out.token_len = env_cfg
-        .http_bearer_token
-        .as_deref()
-        .map(str::len)
-        .unwrap_or(0);
+    let mut out = DiagnosticsSnapshot {
+        checked_at: Some(Utc::now()),
+        endpoint: cfg.endpoint.clone(),
+        web_ui_url: cfg.web_ui_url.clone(),
+        auth_enabled: cfg.auth_enabled,
+        localhost_unauth_allowed: env_cfg.http_allow_localhost_unauthenticated,
+        token_present: env_cfg.http_bearer_token.is_some(),
+        token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
+        ..Default::default()
+    };
 
     let parsed = match parse_http_endpoint(&cfg) {
         Ok(p) => p,
@@ -340,9 +338,9 @@ fn run_diagnostics(state: &TuiSharedState) -> DiagnosticsSnapshot {
         }
     };
 
-    out.http_host = parsed.host.clone();
+    out.http_host.clone_from(&parsed.host);
     out.http_port = parsed.port;
-    out.configured_path = parsed.path.clone();
+    out.configured_path.clone_from(&parsed.path);
 
     // TCP reachability
     match tcp_probe(&parsed.host, parsed.port) {
@@ -420,9 +418,7 @@ fn classify_http_probe(snap: &DiagnosticsSnapshot, probe: &PathProbe) -> Level {
                     Level::Ok
                 }
             }
-            401 | 403 => Level::Warn,
-            404 => Level::Fail,
-            500..=599 => Level::Fail,
+            404 | 500..=599 => Level::Fail,
             _ => Level::Warn,
         };
     }
@@ -443,15 +439,13 @@ fn classify_http_probe(snap: &DiagnosticsSnapshot, probe: &PathProbe) -> Level {
                 Level::Ok
             }
         }
-        404 => Level::Fail,
-        405 => Level::Warn,
-        500..=599 => Level::Fail,
+        404 | 500..=599 => Level::Fail,
         _ => Level::Warn,
     }
 }
 
 fn add_base_path_findings(out: &mut DiagnosticsSnapshot) {
-    let configured = out.configured_path.clone();
+    let configured = out.configured_path.as_str();
     let configured_ok = out
         .path_probes
         .iter()
@@ -474,10 +468,7 @@ fn add_base_path_findings(out: &mut DiagnosticsSnapshot) {
         out.lines.push(ProbeLine {
             level: Level::Fail,
             name: "base-path",
-            detail: format!(
-                "Configured HTTP_PATH {} is not reachable, but {good} appears reachable",
-                configured
-            ),
+            detail: format!("Configured HTTP_PATH {configured} is not reachable, but {good} appears reachable"),
             remediation: Some(format!(
                 "Set HTTP_PATH={good} (or run with --path {})",
                 good.trim_matches('/')
@@ -557,7 +548,7 @@ fn tcp_probe(host: &str, port: u16) -> Result<u64, String> {
     let addr = resolve_socket_addr(host, port)?;
     let start = Instant::now();
     let _ = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
-    Ok(start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+    Ok(saturating_duration_ms_u64(start.elapsed()))
 }
 
 fn http_probe_tools_list(
@@ -583,14 +574,14 @@ fn http_probe_tools_list(
 
     let body = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}";
     let mut req = String::new();
-    req.push_str(&format!("POST {path} HTTP/1.1\r\n"));
-    req.push_str(&format!("Host: {host}:{port}\r\n"));
+    let _ = write!(req, "POST {path} HTTP/1.1\r\n");
+    let _ = write!(req, "Host: {host}:{port}\r\n");
     req.push_str("Content-Type: application/json\r\n");
-    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    let _ = write!(req, "Content-Length: {}\r\n", body.len());
     req.push_str("Connection: close\r\n");
     if let Some(token) = bearer_token {
         // Never log token; header is only used for local self-probe.
-        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        let _ = write!(req, "Authorization: Bearer {token}\r\n");
     }
     req.push_str("\r\n");
 
@@ -624,7 +615,7 @@ fn http_probe_tools_list(
     };
     buf.truncate(n);
 
-    probe.latency_ms = Some(start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+    probe.latency_ms = Some(saturating_duration_ms_u64(start.elapsed()));
     probe.status = parse_http_status(&buf);
 
     if let Ok(text) = std::str::from_utf8(&buf) {
@@ -648,6 +639,10 @@ fn parse_http_status(buf: &[u8]) -> Option<u16> {
     let _http = parts.next()?;
     let code = parts.next()?;
     code.parse::<u16>().ok()
+}
+
+fn saturating_duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {

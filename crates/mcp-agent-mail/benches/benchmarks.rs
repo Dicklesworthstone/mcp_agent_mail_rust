@@ -527,7 +527,7 @@ fn run_archive_harness_once() {
                         let body = format!("inline image: ![img]({img_path})\n");
                         let (body2, meta, rel_paths) =
                             mcp_agent_mail_storage::process_markdown_images(
-                                &archive, &config, &body, policy,
+                                &archive, &config, &archive.root, &body, policy,
                             )
                             .expect("process_markdown_images");
 
@@ -754,7 +754,7 @@ fn bench_archive_write(c: &mut Criterion) {
 
                                 let (body2, meta, rel_paths) =
                                     mcp_agent_mail_storage::process_markdown_images(
-                                        &archive, &config, &body, policy,
+                                        &archive, &config, &archive.root, &body, policy,
                                     )
                                     .expect("process_markdown_images");
 
