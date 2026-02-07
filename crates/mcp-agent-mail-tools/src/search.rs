@@ -286,14 +286,12 @@ pub async fn search_messages(
         )
     })?;
 
-    // Validate query is not empty
-    if query.trim().is_empty() {
-        return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "Invalid argument value: Query cannot be empty. Check that all parameters have valid values.",
-            true,
-            json!({"field":"query","error_detail":"empty"}),
-        ));
+    // Legacy parity: empty query returns an empty result set (no DB call).
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        let response = SearchResponse { result: Vec::new() };
+        return serde_json::to_string(&response)
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }
 
     let pool = get_db_pool()?;
@@ -306,7 +304,7 @@ pub async fn search_messages(
             ctx.cx(),
             &pool,
             project_id,
-            &query,
+            trimmed,
             max_results,
         )
         .await,
@@ -328,7 +326,7 @@ pub async fn search_messages(
     tracing::debug!(
         "Searched messages in project {} for '{}' (limit: {}, found: {})",
         project_key,
-        query,
+        trimmed,
         max_results,
         results.len()
     );
@@ -395,13 +393,18 @@ pub async fn summarize_thread(
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Legacy parity: empty thread_id returns an empty multi-thread digest.
     if thread_ids.is_empty() {
-        return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "Invalid argument value: thread_id cannot be empty. Check that all parameters have valid values.",
-            true,
-            json!({"field":"thread_id","error_detail":"empty"}),
-        ));
+        let response = MultiThreadResponse {
+            threads: Vec::new(),
+            aggregate: AggregateSummary {
+                top_mentions: Vec::new(),
+                key_points: Vec::new(),
+                action_items: Vec::new(),
+            },
+        };
+        return serde_json::to_string(&response)
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }
 
     if thread_ids.len() > 1 {

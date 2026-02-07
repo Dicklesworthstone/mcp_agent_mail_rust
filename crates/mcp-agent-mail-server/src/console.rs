@@ -180,325 +180,61 @@ pub struct BannerParams<'a> {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
-    let mut lines = Vec::with_capacity(60);
-
-    // Resolve theme colors once for this render pass.
+    let mut lines = Vec::with_capacity(16);
     let primary = theme::primary_bold();
-    let secondary = theme::secondary();
-    let accent_c = theme::accent();
+    let accent = theme::accent();
     let success = theme::success_bold();
-    let warning = theme::warning_bold();
     let text = theme::text_bold();
 
-    // ── ASCII art logo (HEAVY border, cyan) ──
-    lines.push(String::new());
-    for l in [
-        "\u{250f}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2513}",
-        "\u{2503}                                                                      \u{2503}",
-        "\u{2503}     \u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}     \u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2557}         \u{2503}",
-        "\u{2503}     \u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}    \u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}         \u{2503}",
-        "\u{2503}     \u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}     \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d}    \u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}         \u{2503}",
-        "\u{2503}     \u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2554}\u{255d}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}     \u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{255d}     \u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2554}\u{255d}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}         \u{2503}",
-        "\u{2503}     \u{2588}\u{2588}\u{2551} \u{255a}\u{2550}\u{255d} \u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}         \u{2588}\u{2588}\u{2551} \u{255a}\u{2550}\u{255d} \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}    \u{2503}",
-        "\u{2503}     \u{255a}\u{2550}\u{255d}     \u{255a}\u{2550}\u{255d} \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}         \u{255a}\u{2550}\u{255d}     \u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}  \u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}    \u{2503}",
-        "\u{2503}                                                                      \u{2503}",
-        "\u{2503}               \u{1f4ec}  Agent Coordination via Message Passing  \u{1f4e8}         \u{2503}",
-        "\u{2503}                                                                      \u{2503}",
-        "\u{2517}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{251b}",
-    ] {
-        lines.push(format!("{primary}{l}{RESET}"));
-    }
-    lines.push(String::new());
-
-    // ── Server Configuration table (ROUNDED, blue) ──
-    let auth_val = if params.auth_enabled {
-        format!("{success}ENABLED{RESET}")
+    let auth = if params.auth_enabled {
+        format!("{success}enabled{RESET}")
     } else {
         format!("{DIM}disabled{RESET}")
     };
-    let tool_log_val = if params.tools_log_enabled {
-        format!("{success}ENABLED{RESET}")
+    let tool_log = if params.tools_log_enabled {
+        format!("{success}enabled{RESET}")
     } else {
         format!("{DIM}disabled{RESET}")
     };
-    let tool_calls_val = if params.tool_calls_log_enabled {
-        format!("{success}ENABLED{RESET}")
+    let tool_panels = if params.tool_calls_log_enabled {
+        format!("{success}enabled{RESET}")
     } else {
         format!("{DIM}disabled{RESET}")
     };
     let database_url = sanitize_known_value("database_url", params.database_url)
         .unwrap_or_else(|| params.database_url.to_string());
-    let cfg_rows: &[(&str, String)] = &[
-        (
-            "\u{1f30d} Environment",
-            format!("{success}{}{RESET}", params.app_environment),
-        ),
-        (
-            "\u{1f517} Endpoint",
-            format!("{accent_c}{}{RESET}", params.endpoint),
-        ),
-        (
-            "\u{1f4be} Database",
-            format!("{DIM}{}{RESET}", compact_path(&database_url, 48)),
-        ),
-        (
-            "\u{1f4c1} Storage",
-            format!("{DIM}{}{RESET}", compact_path(params.storage_root, 48)),
-        ),
-        ("\u{1f512} Auth", auth_val),
-        ("\u{1f4dd} Tool Logging", tool_log_val),
-        ("\u{1f527} Tool Call Panels", tool_calls_val),
-        (
-            "\u{1f3a8} Theme",
-            format!("{accent_c}{}{RESET}", params.console_theme),
-        ),
-    ];
 
-    let lw = 18;
-    let rw = 52;
-    let inner = lw + 3 + rw;
-
-    lines.push(format!(
-        "{secondary}  {warning}\u{1f680} Server Configuration{RESET}"
-    ));
-    lines.push(format!(
-        "{secondary}  \u{256d}{:\u{2500}<w$}\u{256e}{RESET}",
-        "",
-        w = inner + 2
-    ));
-    lines.push(format!(
-        "{secondary}  \u{2502} {text}{:<lw$}{RESET}{secondary} \u{2502} {text}{:<rw2$}{RESET}{secondary} \u{2502}{RESET}",
-        "Setting", "Value", lw = lw, rw2 = rw
-    ));
-    lines.push(format!(
-        "{secondary}  \u{251c}{:\u{2500}<w$}\u{2524}{RESET}",
-        "",
-        w = inner + 2
-    ));
-    for (label, value) in cfg_rows {
-        let label_vis = unicode_display_width(label);
-        let label_pad = lw.saturating_sub(label_vis);
-        let val_vis = strip_ansi_len(value);
-        let val_pad = rw.saturating_sub(val_vis);
-        lines.push(format!(
-            "{secondary}  \u{2502} {}{}{secondary} \u{2502} {}{}{secondary} \u{2502}{RESET}",
-            label,
-            " ".repeat(label_pad),
-            value,
-            " ".repeat(val_pad),
-        ));
-    }
-    lines.push(format!(
-        "{secondary}  \u{2570}{:\u{2500}<w$}\u{256f}{RESET}",
-        "",
-        w = inner + 2
-    ));
     lines.push(String::new());
-
-    // ── Database Statistics table (ROUNDED, magenta) ──
-    let stat_rows: &[(&str, u64)] = &[
-        ("\u{1f4e6} Projects", params.projects),
-        ("\u{1f916} Agents", params.agents),
-        ("\u{1f4ec} Messages", params.messages),
-        ("\u{1f510} File Reservations", params.file_reservations),
-        ("\u{1f517} Contact Links", params.contact_links),
-    ];
-
-    let slw = 22;
-    let srw = 10;
-    let sinner = slw + 3 + srw;
-
     lines.push(format!(
-        "{accent_c}  {warning}\u{1f4ca} Database Statistics{RESET}"
+        "{primary}MCP Agent Mail{RESET} {DIM}({}){RESET}",
+        params.app_environment
+    ));
+    lines.push(format!("  {accent}Endpoint:{RESET} {}", params.endpoint));
+    lines.push(format!("  {accent}Web UI:{RESET} {}", params.web_ui_url));
+    lines.push(format!(
+        "  {accent}Database:{RESET} {}",
+        compact_path(&database_url, 60)
     ));
     lines.push(format!(
-        "{accent_c}  \u{256d}{:\u{2500}<w$}\u{256e}{RESET}",
-        "",
-        w = sinner + 2
+        "  {accent}Storage:{RESET} {}",
+        compact_path(params.storage_root, 60)
     ));
+    lines.push(format!("  {accent}Theme:{RESET} {}", params.console_theme));
+    lines.push(format!("  {accent}Auth:{RESET} {auth}"));
+    lines.push(format!("  {accent}Tool logs:{RESET} {tool_log}"));
+    lines.push(format!("  {accent}Tool panels:{RESET} {tool_panels}"));
     lines.push(format!(
-        "{accent_c}  \u{2502} {text}{:<lw$}{RESET}{accent_c} \u{2502} {text}{:>rw2$}{RESET}{accent_c} \u{2502}{RESET}",
-        "Resource", "Count", lw = slw, rw2 = srw
-    ));
-    lines.push(format!(
-        "{accent_c}  \u{251c}{:\u{2500}<w$}\u{2524}{RESET}",
-        "",
-        w = sinner + 2
-    ));
-    for (label, count) in stat_rows {
-        let label_vis = unicode_display_width(label);
-        let label_pad = slw.saturating_sub(label_vis);
-        let count_str = format!("{success}{count}{RESET}");
-        let count_digits = digit_count(*count);
-        let count_pad = srw.saturating_sub(count_digits);
-        lines.push(format!(
-            "{accent_c}  \u{2502} {}{}{accent_c} \u{2502} {}{}{accent_c} \u{2502}{RESET}",
-            label,
-            " ".repeat(label_pad),
-            " ".repeat(count_pad),
-            count_str,
-        ));
-    }
-    lines.push(format!(
-        "{accent_c}  \u{2570}{:\u{2500}<w$}\u{256f}{RESET}",
-        "",
-        w = sinner + 2
-    ));
-    lines.push(String::new());
-
-    // ── Web UI (HEAVY box, blue) ──
-    let ui_w = 68;
-    lines.push(format!(
-        "{secondary}  \u{250f}{:\u{2501}<w$}\u{2513}{RESET}",
-        "",
-        w = ui_w
-    ));
-    {
-        let title = format!("{text}\u{1f310} Web UI{RESET}");
-        let title_vis = 8; // "🌐 Web UI" width guess
-        let pad_l = (ui_w - title_vis) / 2;
-        let pad_r = ui_w - title_vis - pad_l;
-        lines.push(format!(
-            "{secondary}  \u{2503}{}{}{}{secondary}\u{2503}{RESET}",
-            " ".repeat(pad_l),
-            title,
-            " ".repeat(pad_r)
-        ));
-    }
-    lines.push(format!(
-        "{secondary}  \u{2503}{:\u{2501}<w$}\u{2503}{RESET}",
-        "",
-        w = ui_w
-    ));
-    {
-        let msg = format!("{text}Open the Web UI to view all agent messages:{RESET}");
-        let msg_vis = 44;
-        let pad_l = (ui_w - msg_vis) / 2;
-        let pad_r = ui_w - msg_vis - pad_l;
-        lines.push(format!(
-            "{secondary}  \u{2503}{}{}{}{secondary}\u{2503}{RESET}",
-            " ".repeat(pad_l),
-            msg,
-            " ".repeat(pad_r)
-        ));
-    }
-    {
-        let url = params.web_ui_url;
-        let url_line = format!("{primary}{url}{RESET}");
-        let url_vis = url.len();
-        if url_vis < ui_w {
-            let pad_l = (ui_w - url_vis) / 2;
-            let pad_r = ui_w - url_vis - pad_l;
-            lines.push(format!(
-                "{secondary}  \u{2503}{}{}{}{secondary}\u{2503}{RESET}",
-                " ".repeat(pad_l),
-                url_line,
-                " ".repeat(pad_r)
-            ));
-        } else {
-            lines.push(format!(
-                "{secondary}  \u{2503} {url_line} {secondary}\u{2503}{RESET}"
-            ));
-        }
-    }
-    lines.push(format!(
-        "{secondary}  \u{2503}{:<w$}\u{2503}{RESET}",
-        "",
-        w = ui_w
-    ));
-    {
-        let tip = format!(
-            "{DIM}Tip: Per-agent inbox: {accent_c}http://HOST:PORT/mail/{{project}}/inbox/{{agent}}{RESET}"
-        );
-        let tip_vis = 71;
-        let pad = if tip_vis < ui_w { ui_w - tip_vis } else { 1 };
-        lines.push(format!(
-            "{secondary}  \u{2503} {tip}{}{secondary}\u{2503}{RESET}",
-            " ".repeat(pad.saturating_sub(1))
-        ));
-    }
-    lines.push(format!(
-        "{secondary}  \u{2517}{:\u{2501}<w$}\u{251b}{RESET}",
-        "",
-        w = ui_w
-    ));
-    lines.push(String::new());
-
-    // ── JSON Stats showcase (DOUBLE box, green) ──
-    let json_str = format!(
-        "{{\n  \"stats\": {{\n    \"projects\": {},\n    \"agents\": {},\n    \"messages\": {},\n    \"file_reservations\": {},\n    \"contact_links\": {}\n  }}\n}}",
+        "  {text}Stats:{RESET} projects={} agents={} messages={} reservations={} contacts={}",
         params.projects,
         params.agents,
         params.messages,
         params.file_reservations,
         params.contact_links
-    );
-    let json_w = 52;
-    lines.push(format!(
-        "{success}  \u{2554}{:\u{2550}<w$}\u{2557}{RESET}",
-        "",
-        w = json_w
     ));
-    {
-        let title = "Stats Showcase";
-        let pad_l = (json_w - title.len()) / 2;
-        let pad_r = json_w - title.len() - pad_l;
-        lines.push(format!(
-            "{success}  \u{2551}{}{text}{title}{RESET}{success}{}\u{2551}{RESET}",
-            " ".repeat(pad_l),
-            " ".repeat(pad_r)
-        ));
-    }
     lines.push(format!(
-        "{success}  \u{2560}{:\u{2550}<w$}\u{2563}{RESET}",
-        "",
-        w = json_w
-    ));
-    for jline in json_str.lines() {
-        let colored = colorize_json_line(jline);
-        let vis_len = strip_ansi_len(&colored);
-        let pad = json_w.saturating_sub(vis_len + 2);
-        lines.push(format!(
-            "{success}  \u{2551} {colored}{}{success} \u{2551}{RESET}",
-            " ".repeat(pad)
-        ));
-    }
-    lines.push(format!(
-        "{success}  \u{255a}{:\u{2550}<w$}\u{255d}{RESET}",
-        "",
-        w = json_w
+        "  {DIM}Tip: interactive layout keys available via '?'{RESET}"
     ));
     lines.push(String::new());
-
-    // ── Rich Logging ENABLED box (conditional, HEAVY green) ──
-    if params.tools_log_enabled {
-        let msg_w = 74;
-        lines.push(format!(
-            "{success}  \u{250f}{:\u{2501}<w$}\u{2513}{RESET}",
-            "",
-            w = msg_w
-        ));
-        let parts = format!(
-            "{success}\u{2705} {text}Rich Logging ENABLED{RESET} \u{2014} All MCP tool calls will be displayed with {primary}beautiful panels{RESET}, {accent_c}syntax highlighting{RESET}, and {warning}performance metrics{RESET}! \u{1f3a8}\u{2728}"
-        );
-        let vis = 97;
-        let pad = msg_w.saturating_sub(vis + 1);
-        lines.push(format!(
-            "{success}  \u{2503} {parts}{}{success}\u{2503}{RESET}",
-            " ".repeat(pad)
-        ));
-        lines.push(format!(
-            "{success}  \u{2517}{:\u{2501}<w$}\u{251b}{RESET}",
-            "",
-            w = msg_w
-        ));
-        lines.push(String::new());
-    }
-
-    // ── Closing rule ──
-    lines.push(format!("{secondary}  {:\u{2550}<76}{RESET}", ""));
-    lines.push(String::new());
-
     lines
 }
 
@@ -1068,24 +804,6 @@ fn strip_ansi_len(s: &str) -> usize {
         } else {
             count += 1;
         }
-    }
-    count
-}
-
-/// Approximate Unicode display width. Emoji and wide chars count as 2.
-fn unicode_display_width(s: &str) -> usize {
-    s.chars().map(|c| if c > '\u{ff}' { 2 } else { 1 }).sum()
-}
-
-/// Number of decimal digits in a u64.
-const fn digit_count(mut n: u64) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    let mut count = 0;
-    while n > 0 {
-        count += 1;
-        n /= 10;
     }
     count
 }
@@ -2708,36 +2426,32 @@ mod tests {
         };
         let lines = render_startup_banner(&params);
         let joined = lines.join("\n");
-        // Check for key structural elements
-        assert!(joined.contains("MCP"), "banner should contain MCP logo");
         assert!(
-            joined.contains("Server Configuration"),
-            "banner should contain server config section"
+            joined.contains("MCP Agent Mail"),
+            "banner should contain title"
         );
         assert!(
-            joined.contains("Database Statistics"),
-            "banner should contain db stats section"
+            joined.contains("Endpoint:"),
+            "banner should contain endpoint"
+        );
+        assert!(joined.contains("Web UI:"), "banner should contain web ui");
+        assert!(
+            joined.contains("Tool logs:"),
+            "banner should contain tool logging state"
         );
         assert!(
-            joined.contains("Web UI"),
-            "banner should contain web UI section"
+            joined.contains("Tool panels:"),
+            "banner should contain tool panel state"
         );
         assert!(
-            joined.contains("Stats Showcase"),
-            "banner should contain stats showcase"
-        );
-        assert!(
-            joined.contains("Rich Logging ENABLED"),
-            "banner should contain rich logging notice"
+            joined.contains("Stats:"),
+            "banner should contain stats summary"
         );
         assert!(
             joined.contains("Cyberpunk Aurora"),
             "banner should display active theme name"
         );
-        assert!(
-            joined.contains("Theme"),
-            "banner should contain theme config row"
-        );
+        assert!(joined.contains("Theme:"), "banner should contain theme row");
     }
 
     #[test]
@@ -2760,6 +2474,8 @@ mod tests {
         };
         let lines = render_startup_banner(&params);
         let joined = lines.join("\n");
+        assert!(joined.contains("Tool logs:"));
+        assert!(joined.contains("Tool panels:"));
         assert!(!joined.contains("Rich Logging ENABLED"));
     }
 
@@ -2956,14 +2672,6 @@ mod tests {
             compact_path("/very/long/path/to/something", 15),
             "...to/something"
         );
-    }
-
-    #[test]
-    fn test_digit_count() {
-        assert_eq!(digit_count(0), 1);
-        assert_eq!(digit_count(1), 1);
-        assert_eq!(digit_count(42), 2);
-        assert_eq!(digit_count(1000), 4);
     }
 
     #[test]

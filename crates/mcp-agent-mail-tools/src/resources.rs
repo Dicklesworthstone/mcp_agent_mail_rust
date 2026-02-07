@@ -91,6 +91,21 @@ fn percent_decode_component(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+fn workspace_root_from(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let cargo_toml = dir.join("Cargo.toml");
+        if !cargo_toml.exists() {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
+            if content.contains("[workspace]") {
+                return Some(dir.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
 fn tool_filter_allows(config: &Config, tool_name: &str) -> bool {
     tool_cluster(tool_name).is_none_or(|cluster| config.should_expose_tool(tool_name, cluster))
 }
@@ -170,41 +185,27 @@ pub fn config_environment_query(ctx: &McpContext, query: String) -> McpResult<St
 // Identity Resources
 // ============================================================================
 
-/// Git identity information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitIdentity {
-    pub project_slug: String,
-    pub git_remote: Option<String>,
-    pub git_toplevel: Option<String>,
-    pub git_common_dir: Option<String>,
-}
-
 /// Get Git identity resolution for a project.
 #[resource(
     uri = "resource://identity/{project}",
     description = "Git identity resolution for a project"
 )]
 pub fn identity_project(_ctx: &McpContext, project: String) -> McpResult<String> {
-    let (project_slug, _query) = split_param_and_query(&project);
-
-    // Try to resolve git information from the archive
-    let config = mcp_agent_mail_core::Config::from_env();
-    let (git_toplevel, git_common_dir) =
-        match mcp_agent_mail_storage::ensure_archive(&config, &project_slug) {
-            Ok(archive) => {
-                let toplevel = archive.repo_root.to_string_lossy().to_string();
-                let common_dir = archive.repo_root.join(".git").to_string_lossy().to_string();
-                (Some(toplevel), Some(common_dir))
-            }
-            Err(_) => (None, None),
-        };
-
-    let identity = GitIdentity {
-        project_slug,
-        git_remote: None,
-        git_toplevel,
-        git_common_dir,
+    let (project_ref, _query) = split_param_and_query(&project);
+    // Legacy parity: resolve relative refs against current directory first so
+    // slug/project_uid are derived from a stable absolute path.
+    let resolved_human_key = {
+        let path = std::path::PathBuf::from(&project_ref);
+        if path.is_absolute() {
+            path
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let base = workspace_root_from(&cwd).unwrap_or(cwd);
+            base.join(path)
+        }
     };
+    let resolved = resolved_human_key.to_string_lossy().to_string();
+    let identity = mcp_agent_mail_core::resolve_project_identity(&resolved);
 
     serde_json::to_string(&identity)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
@@ -1414,6 +1415,13 @@ pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<St
             },
             ToolingRecentEntry {
                 timestamp: None,
+                tool: "renew_file_reservations".to_string(),
+                project: project_name.to_string(),
+                agent: agent_name.to_string(),
+                cluster: "file_reservations".to_string(),
+            },
+            ToolingRecentEntry {
+                timestamp: None,
                 tool: "release_file_reservations".to_string(),
                 project: project_name.to_string(),
                 agent: agent_name.to_string(),
@@ -2081,7 +2089,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                     deletions: 0,
                     diff_summary: DiffSummary { excerpt, hunks: 1 },
                     hexsha: None,
-                    insertions: 21,
+                    insertions: 21 + i64::from(msg.thread_id.is_some()),
                     summary: commit_summary,
                 },
             }
@@ -2362,7 +2370,7 @@ pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<
                         hunks: 1,
                     },
                     hexsha: None,
-                    insertions: 21,
+                    insertions: 21 + i64::from(msg.thread_id.is_some()),
                     summary,
                 },
             }
@@ -2551,6 +2559,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         // Build summary - find first "to" recipient
         let first_to = to_list.first().cloned().unwrap_or_default();
         let summary = format!("mail: {agent_name} -> {first_to} | {subject}");
+        let has_thread_id = thread_id.is_some();
 
         messages.push(OutboxMessageEntry {
             id,
@@ -2575,7 +2584,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                     hunks: 1,
                 },
                 hexsha: None,
-                insertions: 21,
+                insertions: 21 + i64::from(has_thread_id),
                 summary,
             },
         });
@@ -3628,6 +3637,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 #[cfg(test)]
 mod query_param_tests {
     use super::*;
+    use std::fs;
 
     // -----------------------------------------------------------------------
     // split_param_and_query
@@ -3864,6 +3874,41 @@ mod query_param_tests {
         let input = "Agent?project=%2Fdata%2Fprojects%2Fmy-app";
         let (_agent, query) = split_param_and_query(input);
         assert_eq!(query.get("project").unwrap(), "/data/projects/my-app");
+    }
+
+    #[test]
+    fn workspace_root_prefers_workspace_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        let nested = root.join("crates").join("pkg");
+        fs::create_dir_all(&nested).expect("mkdirs");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .expect("write root manifest");
+        fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname=\"pkg\"\nversion=\"0.1.0\"\n",
+        )
+        .expect("write pkg manifest");
+
+        let found = workspace_root_from(&nested).expect("workspace root");
+        assert_eq!(found, root);
+    }
+
+    #[test]
+    fn workspace_root_none_without_workspace_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("a").join("b");
+        fs::create_dir_all(&nested).expect("mkdirs");
+        fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname=\"only_pkg\"\nversion=\"0.1.0\"\n",
+        )
+        .expect("write pkg manifest");
+
+        assert!(workspace_root_from(&nested).is_none());
     }
 }
 

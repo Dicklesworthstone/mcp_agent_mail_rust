@@ -27,10 +27,12 @@ fn startup_banner_sections_present_after_normalization() {
     let lines = render_startup_banner(&params);
     let joined = common::normalize_console_text(&lines.join("\n"));
 
-    assert!(joined.contains("Server Configuration"));
-    assert!(joined.contains("Database Statistics"));
-    assert!(joined.contains("Web UI"));
-    assert!(joined.contains("Stats Showcase"));
+    assert!(joined.contains("MCP Agent Mail"));
+    assert!(joined.contains("Endpoint:"));
+    assert!(joined.contains("Web UI:"));
+    assert!(joined.contains("Tool logs:"));
+    assert!(joined.contains("Tool panels:"));
+    assert!(joined.contains("Stats:"));
 
     // Ensure banner sanitization is applied (userinfo password redaction).
     assert!(joined.contains("postgres://user:<redacted>@localhost/db"));

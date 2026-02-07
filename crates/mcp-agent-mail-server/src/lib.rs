@@ -2205,7 +2205,7 @@ impl HttpState {
         if let Some(dashboard) = dashboard.as_ref() {
             dashboard.record_request(method.as_str(), &path, resp.status, dur_ms, &client_ip);
         }
-        if self.config.http_request_log_enabled || dashboard.is_some() {
+        if self.config.http_request_log_enabled {
             self.emit_http_request_log(method.as_str(), &path, resp.status, dur_ms, &client_ip);
         }
         resp
@@ -2245,16 +2245,17 @@ impl HttpState {
         }
 
         let base_no_slash = normalize_base_path(&self.config.http_path);
+        let canonical_path = canonicalize_mcp_path_for_handler(&path, &base_no_slash);
         maybe_inject_localhost_authorization_for_base_passthrough(
             &self.config,
             &mut req,
-            &path,
+            &canonical_path,
             &base_no_slash,
         );
 
         // Legacy parity: direct POST handler for `/base` forwards to the mounted `/base/` app.
-        let effective_path = if base_no_slash == "/" || path != base_no_slash {
-            path.clone()
+        let effective_path = if base_no_slash == "/" || canonical_path != base_no_slash {
+            canonical_path
         } else {
             format!("{base_no_slash}/")
         };
@@ -3621,7 +3622,6 @@ fn mcp_base_alias_no_slash(base_no_slash: &str) -> Option<&'static str> {
     }
 }
 
-#[allow(dead_code)] // Prepared for future MCP path alias support
 fn canonicalize_mcp_path_for_handler(path: &str, base_no_slash: &str) -> String {
     let Some(alias_no_slash) = mcp_base_alias_no_slash(base_no_slash) else {
         return path.to_string();
@@ -4962,6 +4962,55 @@ mod tests {
                 .and_then(serde_json::Value::as_array)
                 .is_some(),
             "expected tools list result"
+        );
+    }
+
+    #[test]
+    fn http_post_roundtrip_accepts_mcp_alias_when_base_is_api() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let mut req = make_request(Http1Method::Post, "/mcp", &[]);
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 11_i64);
+        req.body = serde_json::to_vec(&json_rpc).expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 11);
+        assert!(
+            body.get("result")
+                .and_then(|v| v.get("tools"))
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "expected tools list result on /mcp alias"
+        );
+    }
+
+    #[test]
+    fn http_post_roundtrip_accepts_api_alias_when_base_is_mcp() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/mcp/".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let mut req = make_request(Http1Method::Post, "/api", &[]);
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 12_i64);
+        req.body = serde_json::to_vec(&json_rpc).expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 12);
+        assert!(
+            body.get("result")
+                .and_then(|v| v.get("tools"))
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "expected tools list result on /api alias"
         );
     }
 
@@ -7207,6 +7256,91 @@ mod tests {
         assert!(state.path_allowed("/api/mcp/sub"));
         assert!(!state.path_allowed("/api"));
         assert!(!state.path_allowed("/api/"));
+    }
+
+    #[test]
+    fn path_allowed_api_base_accepts_mcp_alias() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/api".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        assert!(state.path_allowed("/mcp"));
+        assert!(state.path_allowed("/mcp/"));
+        assert!(state.path_allowed("/mcp/tools"));
+    }
+
+    #[test]
+    fn path_allowed_mcp_base_accepts_api_alias() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/mcp".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        assert!(state.path_allowed("/api"));
+        assert!(state.path_allowed("/api/"));
+        assert!(state.path_allowed("/api/resources"));
+    }
+
+    #[test]
+    fn canonicalize_mcp_path_alias_maps_to_configured_base() {
+        assert_eq!(canonicalize_mcp_path_for_handler("/mcp", "/api"), "/api");
+        assert_eq!(
+            canonicalize_mcp_path_for_handler("/mcp/tools/list", "/api"),
+            "/api/tools/list"
+        );
+        assert_eq!(canonicalize_mcp_path_for_handler("/api", "/mcp"), "/mcp");
+        assert_eq!(
+            canonicalize_mcp_path_for_handler("/api/prompts/get", "/mcp"),
+            "/mcp/prompts/get"
+        );
+    }
+
+    #[test]
+    fn canonicalize_mcp_path_alias_ignores_nested_base() {
+        assert_eq!(
+            canonicalize_mcp_path_for_handler("/api/mcp", "/api/mcp"),
+            "/api/mcp"
+        );
+        assert_eq!(
+            canonicalize_mcp_path_for_handler("/mcp", "/api/mcp"),
+            "/mcp"
+        );
+    }
+
+    #[test]
+    fn mcp_base_alias_no_slash_returns_symmetric_alias() {
+        assert_eq!(mcp_base_alias_no_slash("/api"), Some("/mcp"));
+        assert_eq!(mcp_base_alias_no_slash("/mcp"), Some("/api"));
+        assert_eq!(mcp_base_alias_no_slash("/foo"), None);
+        assert_eq!(mcp_base_alias_no_slash("/api/mcp"), None);
+        assert_eq!(mcp_base_alias_no_slash(""), None);
+    }
+
+    #[test]
+    fn path_matches_base_exact_and_subpath() {
+        assert!(path_matches_base("/api", "/api"));
+        assert!(path_matches_base("/api/", "/api"));
+        assert!(path_matches_base("/api/tools/list", "/api"));
+        assert!(!path_matches_base("/apifoo", "/api"));
+        assert!(!path_matches_base("/mcp", "/api"));
+        assert!(!path_matches_base("/", "/api"));
+    }
+
+    #[test]
+    fn canonicalize_mcp_path_trailing_slash_and_noop() {
+        // Trailing-slash variants
+        assert_eq!(canonicalize_mcp_path_for_handler("/mcp/", "/api"), "/api/");
+        assert_eq!(canonicalize_mcp_path_for_handler("/api/", "/api"), "/api/");
+        // Non-aliased base passes through unchanged
+        assert_eq!(
+            canonicalize_mcp_path_for_handler("/other/", "/other"),
+            "/other/"
+        );
+        assert_eq!(
+            canonicalize_mcp_path_for_handler("/other/foo", "/other"),
+            "/other/foo"
+        );
     }
 
     // ── Header normalization tests (br-1bm.4.2) ──────────────────────────

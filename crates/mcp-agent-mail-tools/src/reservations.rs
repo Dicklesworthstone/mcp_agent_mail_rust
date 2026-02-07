@@ -407,15 +407,8 @@ pub async fn renew_file_reservations(
     paths: Option<Vec<String>>,
     file_reservation_ids: Option<Vec<i64>>,
 ) -> McpResult<String> {
-    let extend = extend_seconds.unwrap_or(1800);
-
-    // Validate extension >= 60 seconds
-    if extend < 60 {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "extend_seconds must be at least 60 seconds",
-        ));
-    }
+    // Legacy parity: clamp too-small values up to 60 seconds.
+    let extend = std::cmp::max(extend_seconds.unwrap_or(1800), 60);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;

@@ -52,7 +52,8 @@
           "normalize": {
             "ignore_json_pointers": [
               "/canonical_path",
-              "/created_at"
+              "/created_at",
+              "/git_common_dir"
             ]
           }
         },
@@ -457,6 +458,23 @@
           }
         },
         {
+          "name": "nonexistent_sender_error",
+          "input": {
+            "project_key": "abs-path-backend",
+            "sender_name": "NonExistentAgent",
+            "to": [
+              "GreenCastle"
+            ],
+            "subject": "Should fail",
+            "body_md": "This should fail because sender doesn't exist."
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          }
+        },
+        {
           "name": "llm_thread_t1_root",
           "input": {
             "project_key": "abs-path-backend",
@@ -474,7 +492,7 @@
                 {
                   "project": "/abs/path/backend",
                   "payload": {
-                    "id": 4,
+                    "id": 3,
                     "project_id": 1,
                     "sender_id": 1,
                     "thread_id": "T-1",
@@ -521,7 +539,7 @@
                 {
                   "project": "/abs/path/backend",
                   "payload": {
-                    "id": 6,
+                    "id": 4,
                     "project_id": 1,
                     "sender_id": 1,
                     "thread_id": "T-2",
@@ -549,23 +567,6 @@
               "/deliveries/0/payload/created_ts"
             ]
           }
-        },
-        {
-          "name": "nonexistent_sender_error",
-          "input": {
-            "project_key": "abs-path-backend",
-            "sender_name": "NonExistentAgent",
-            "to": [
-              "GreenCastle"
-            ],
-            "subject": "Should fail",
-            "body_md": "This should fail because sender doesn't exist."
-          },
-          "expect": {
-            "err": {
-              "message_contains": "not found"
-            }
-          }
         }
       ]
     },
@@ -581,7 +582,7 @@
           },
           "expect": {
             "ok": {
-              "id": 3,
+              "id": 5,
               "project_id": 1,
               "sender_id": 2,
               "thread_id": "2",
@@ -602,7 +603,7 @@
                 {
                   "project": "/abs/path/backend",
                   "payload": {
-                    "id": 3,
+                    "id": 5,
                     "project_id": 1,
                     "sender_id": 2,
                     "thread_id": "2",
@@ -641,7 +642,7 @@
           },
           "expect": {
             "ok": {
-              "id": 5,
+              "id": 6,
               "project_id": 1,
               "sender_id": 2,
               "thread_id": "T-1",
@@ -657,12 +658,12 @@
               ],
               "cc": [],
               "bcc": [],
-              "reply_to": 4,
+              "reply_to": 3,
               "deliveries": [
                 {
                   "project": "/abs/path/backend",
                   "payload": {
-                    "id": 5,
+                    "id": 6,
                     "project_id": 1,
                     "sender_id": 2,
                     "thread_id": "T-1",
@@ -717,7 +718,7 @@
               ],
               "cc": [],
               "bcc": [],
-              "reply_to": 6,
+              "reply_to": 4,
               "deliveries": [
                 {
                   "project": "/abs/path/backend",
@@ -766,7 +767,7 @@
           "expect": {
             "ok": [
               {
-                "id": 6,
+                "id": 4,
                 "project_id": 1,
                 "sender_id": 1,
                 "thread_id": "T-2",
@@ -780,7 +781,7 @@
                 "kind": "to"
               },
               {
-                "id": 4,
+                "id": 3,
                 "project_id": 1,
                 "sender_id": 1,
                 "thread_id": "T-1",
@@ -826,8 +827,7 @@
           "normalize": {
             "ignore_json_pointers": [
               "/0/created_ts",
-              "/1/created_ts"
-              ,
+              "/1/created_ts",
               "/2/created_ts",
               "/3/created_ts"
             ]
@@ -907,7 +907,7 @@
                   "from": "BlueLake"
                 },
                 {
-                  "id": 3,
+                  "id": 5,
                   "subject": "Re: Hello",
                   "importance": "urgent",
                   "ack_required": 1,
@@ -926,14 +926,28 @@
           }
         },
         {
-          "name": "empty_query_error",
+          "name": "empty_query_returns_empty",
           "input": {
             "project_key": "abs-path-backend",
-            "query": ""
+            "query": "",
+            "limit": 10
+          },
+          "expect": {
+            "ok": {
+              "result": []
+            }
+          }
+        },
+        {
+          "name": "project_not_found_error",
+          "input": {
+            "project_key": "ZzzNonExistentProject",
+            "query": "Hello",
+            "limit": 10
           },
           "expect": {
             "err": {
-              "message_contains": "empty"
+              "message_contains": "not found"
             }
           }
         }
@@ -972,7 +986,7 @@
                   "created_ts": null
                 },
                 {
-                  "id": 3,
+                  "id": 5,
                   "subject": "Re: Hello",
                   "from": "GreenCastle",
                   "created_ts": null
@@ -988,14 +1002,35 @@
           }
         },
         {
-          "name": "empty_thread_id_error",
+          "name": "empty_thread_id_returns_empty_digest",
           "input": {
             "project_key": "abs-path-backend",
-            "thread_id": ""
+            "thread_id": "",
+            "include_examples": true,
+            "llm_mode": false
+          },
+          "expect": {
+            "ok": {
+              "threads": [],
+              "aggregate": {
+                "top_mentions": [],
+                "action_items": [],
+                "key_points": []
+              }
+            }
+          }
+        },
+        {
+          "name": "project_not_found_error",
+          "input": {
+            "project_key": "ZzzNonExistentProject",
+            "thread_id": "2",
+            "include_examples": true,
+            "llm_mode": false
           },
           "expect": {
             "err": {
-              "message_contains": "empty"
+              "message_contains": "not found"
             }
           }
         },
@@ -1040,13 +1075,13 @@
               },
               "examples": [
                 {
-                  "id": 4,
+                  "id": 3,
                   "subject": "LLM Thread T-1",
                   "from": "BlueLake",
                   "created_ts": null
                 },
                 {
-                  "id": 5,
+                  "id": 6,
                   "subject": "Re: LLM Thread T-1",
                   "from": "GreenCastle",
                   "created_ts": null
@@ -1159,7 +1194,7 @@
                   "project_id": 1
                 },
                 {
-                  "id": 3,
+                  "id": 5,
                   "subject": "Re: Hello",
                   "importance": "urgent",
                   "ack_required": 1,
@@ -1193,7 +1228,7 @@
           "expect": {
             "ok": [
               {
-                "id": 6,
+                "id": 4,
                 "project_id": 1,
                 "sender_id": 1,
                 "thread_id": "T-2",
@@ -1207,7 +1242,7 @@
                 "kind": "to"
               },
               {
-                "id": 4,
+                "id": 3,
                 "project_id": 1,
                 "sender_id": 1,
                 "thread_id": "T-1",
@@ -1294,7 +1329,7 @@
                   "created_ts": null
                 },
                 {
-                  "id": 3,
+                  "id": 5,
                   "subject": "Re: Hello",
                   "from": "GreenCastle",
                   "created_ts": null
@@ -1350,13 +1385,13 @@
               },
               "examples": [
                 {
-                  "id": 4,
+                  "id": 3,
                   "subject": "LLM Thread T-1",
                   "from": "BlueLake",
                   "created_ts": null
                 },
                 {
-                  "id": 5,
+                  "id": 6,
                   "subject": "Re: LLM Thread T-1",
                   "from": "GreenCastle",
                   "created_ts": null
@@ -1452,15 +1487,42 @@
           }
         },
         {
-          "name": "insufficient_extend_seconds_error",
+          "name": "extend_seconds_clamped_to_60",
           "input": {
             "project_key": "abs-path-backend",
             "agent_name": "BlueLake",
             "extend_seconds": 5
           },
           "expect": {
+            "ok": {
+              "renewed": 1,
+              "file_reservations": [
+                {
+                  "id": 1,
+                  "path_pattern": "src/**",
+                  "old_expires_ts": null,
+                  "new_expires_ts": null
+                }
+              ]
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/file_reservations/0/new_expires_ts",
+              "/file_reservations/0/old_expires_ts"
+            ]
+          }
+        },
+        {
+          "name": "agent_not_found_error",
+          "input": {
+            "project_key": "abs-path-backend",
+            "agent_name": "ZzzNonExistentAgent",
+            "extend_seconds": 600
+          },
+          "expect": {
             "err": {
-              "message_contains": "60"
+              "message_contains": "not found"
             }
           }
         }
@@ -1686,7 +1748,7 @@
                     "created_ts": null
                   },
                   {
-                    "id": 3,
+                    "id": 5,
                     "subject": "Re: Hello",
                     "from": "GreenCastle",
                     "created_ts": null
@@ -1709,7 +1771,7 @@
                   "kind": "to"
                 },
                 {
-                  "id": 5,
+                  "id": 6,
                   "project_id": 1,
                   "sender_id": 2,
                   "thread_id": "T-1",
@@ -1722,7 +1784,7 @@
                   "kind": "to"
                 },
                 {
-                  "id": 3,
+                  "id": 5,
                   "project_id": 1,
                   "sender_id": 2,
                   "thread_id": "2",
@@ -1812,13 +1874,13 @@
                 },
                 "examples": [
                   {
-                    "id": 4,
+                    "id": 3,
                     "subject": "LLM Thread T-1",
                     "from": "BlueLake",
                     "created_ts": null
                   },
                   {
-                    "id": 5,
+                    "id": 6,
                     "subject": "Re: LLM Thread T-1",
                     "from": "GreenCastle",
                     "created_ts": null
@@ -1841,7 +1903,7 @@
                   "kind": "to"
                 },
                 {
-                  "id": 5,
+                  "id": 6,
                   "project_id": 1,
                   "sender_id": 2,
                   "thread_id": "T-1",
@@ -1854,7 +1916,7 @@
                   "kind": "to"
                 },
                 {
-                  "id": 3,
+                  "id": 5,
                   "project_id": 1,
                   "sender_id": 2,
                   "thread_id": "2",
@@ -1995,10 +2057,64 @@
         }
       ]
     },
+    "resource://config/environment?format=json": {
+      "cases": [
+        {
+          "name": "default_format_json",
+          "input": {},
+          "expect": {
+            "ok": {
+              "environment": "development",
+              "database_url": null,
+              "http": {
+                "host": "127.0.0.1",
+                "port": 8765,
+                "path": "/api/"
+              }
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/database_url"
+            ]
+          }
+        }
+      ]
+    },
     "resource://projects": {
       "cases": [
         {
           "name": "all_projects",
+          "input": {},
+          "expect": {
+            "ok": [
+              {
+                "id": 1,
+                "slug": "abs-path-backend",
+                "human_key": "/abs/path/backend",
+                "created_at": null
+              },
+              {
+                "id": 2,
+                "slug": "abs-path-macro-session",
+                "human_key": "/abs/path/macro-session",
+                "created_at": null
+              }
+            ]
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/0/created_at",
+              "/1/created_at"
+            ]
+          }
+        }
+      ]
+    },
+    "resource://projects?format=json": {
+      "cases": [
+        {
+          "name": "all_projects_format_json",
           "input": {},
           "expect": {
             "ok": [
@@ -2094,15 +2210,23 @@
           "input": {},
           "expect": {
             "ok": {
-              "project_slug": "abs-path-backend",
-              "git_remote": null,
-              "git_toplevel": null,
-              "git_common_dir": null
+              "slug": "data-projects-mcp-agent-mail-rust-abs-path-backend",
+              "identity_mode_used": "dir",
+              "canonical_path": null,
+              "human_key": "/data/projects/mcp_agent_mail_rust/abs-path-backend",
+              "repo_root": null,
+              "git_common_dir": null,
+              "branch": null,
+              "worktree_name": null,
+              "core_ignorecase": null,
+              "normalized_remote": null,
+              "project_uid": "82562053b4cd5b32e5a4",
+              "discovery": null
             }
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/git_toplevel",
+              "/canonical_path",
               "/git_common_dir"
             ]
           }
@@ -2215,7 +2339,7 @@
               "count": 4,
               "messages": [
                 {
-                  "id": 6,
+                  "id": 4,
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": "T-2",
@@ -2231,7 +2355,7 @@
                     "hexsha": null,
                     "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-2",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 22,
                     "deletions": 0,
                     "diff_summary": {
                       "hunks": 1,
@@ -2240,7 +2364,7 @@
                   }
                 },
                 {
-                  "id": 4,
+                  "id": 3,
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": "T-1",
@@ -2256,7 +2380,7 @@
                     "hexsha": null,
                     "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-1",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 22,
                     "deletions": 0,
                     "diff_summary": {
                       "hunks": 1,
@@ -2392,7 +2516,7 @@
                   "from": "BlueLake"
                 },
                 {
-                  "id": 3,
+                  "id": 5,
                   "project_id": 1,
                   "sender_id": 2,
                   "thread_id": "2",
@@ -3230,10 +3354,841 @@
         }
       ]
     },
+    "resource://tooling/directory?format=json": {
+      "cases": [
+        {
+          "name": "tooling_directory_format_json",
+          "input": {},
+          "expect": {
+            "ok": {
+              "generated_at": null,
+              "metrics_uri": "resource://tooling/metrics",
+              "output_formats": {
+                "default": "json",
+                "tool_param": "format",
+                "resource_query": "format",
+                "values": [
+                  "json",
+                  "toon"
+                ],
+                "toon_envelope": {
+                  "format": "toon",
+                  "data": "<TOON>",
+                  "meta": {
+                    "requested": "toon"
+                  }
+                }
+              },
+              "clusters": [
+                {
+                  "name": "Infrastructure & Workspace Setup",
+                  "purpose": "Bootstrap coordination and guardrails before agents begin editing.",
+                  "tools": [
+                    {
+                      "name": "health_check",
+                      "summary": "Report environment and HTTP wiring so orchestrators confirm connectivity.",
+                      "use_when": "Beginning a session or during incident response triage.",
+                      "related": [
+                        "ensure_project"
+                      ],
+                      "expected_frequency": "Once per agent session or when connectivity is in doubt.",
+                      "required_capabilities": [
+                        "infrastructure"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Pre-flight",
+                          "sample": "health_check()"
+                        }
+                      ],
+                      "capabilities": [
+                        "infrastructure"
+                      ],
+                      "complexity": "low"
+                    },
+                    {
+                      "name": "ensure_project",
+                      "summary": "Ensure project slug, schema, and archive exist for a shared repo identifier.",
+                      "use_when": "First call against a repo or when switching projects.",
+                      "related": [
+                        "register_agent",
+                        "file_reservation_paths"
+                      ],
+                      "expected_frequency": "Whenever a new repo/path is encountered.",
+                      "required_capabilities": [
+                        "infrastructure",
+                        "storage"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "First action",
+                          "sample": "ensure_project(human_key='/abs/path/backend')"
+                        }
+                      ],
+                      "capabilities": [
+                        "infrastructure",
+                        "storage"
+                      ],
+                      "complexity": "low"
+                    },
+                    {
+                      "name": "install_precommit_guard",
+                      "summary": "Install Git pre-commit hook that enforces advisory file_reservations locally.",
+                      "use_when": "Onboarding a repository into coordinated mode.",
+                      "related": [
+                        "file_reservation_paths",
+                        "uninstall_precommit_guard"
+                      ],
+                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "required_capabilities": [
+                        "infrastructure",
+                        "repository"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Onboard",
+                          "sample": "install_precommit_guard(project_key='backend', code_repo_path='~/repo')"
+                        }
+                      ],
+                      "capabilities": [
+                        "infrastructure",
+                        "repository"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "uninstall_precommit_guard",
+                      "summary": "Remove the advisory pre-commit hook from a repo.",
+                      "use_when": "Decommissioning or debugging the guard hook.",
+                      "related": [
+                        "install_precommit_guard"
+                      ],
+                      "expected_frequency": "Rare; only when disabling guard enforcement.",
+                      "required_capabilities": [
+                        "infrastructure",
+                        "repository"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Cleanup",
+                          "sample": "uninstall_precommit_guard(code_repo_path='~/repo')"
+                        }
+                      ],
+                      "capabilities": [
+                        "infrastructure",
+                        "repository"
+                      ],
+                      "complexity": "medium"
+                    }
+                  ]
+                },
+                {
+                  "name": "Identity & Directory",
+                  "purpose": "Register agents, mint unique identities, and inspect directory metadata.",
+                  "tools": [
+                    {
+                      "name": "register_agent",
+                      "summary": "Upsert an agent profile and refresh last_active_ts for a known persona.",
+                      "use_when": "Resuming an identity or updating program/model/task metadata.",
+                      "related": [
+                        "create_agent_identity",
+                        "whois"
+                      ],
+                      "expected_frequency": "At the start of each automated work session.",
+                      "required_capabilities": [
+                        "identity"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Resume persona",
+                          "sample": "register_agent(project_key='/abs/path/backend', program='codex', model='gpt5')"
+                        }
+                      ],
+                      "capabilities": [
+                        "identity"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "create_agent_identity",
+                      "summary": "Always create a new unique agent name (optionally using a sanitized hint).",
+                      "use_when": "Spawning a brand-new helper that should not overwrite existing profiles.",
+                      "related": [
+                        "register_agent"
+                      ],
+                      "expected_frequency": "When minting fresh, short-lived identities.",
+                      "required_capabilities": [
+                        "identity"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "New helper",
+                          "sample": "create_agent_identity(project_key='backend', name_hint='GreenCastle', program='codex', model='gpt5')"
+                        }
+                      ],
+                      "capabilities": [
+                        "identity"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "whois",
+                      "summary": "Return enriched profile info plus recent archive commits for an agent.",
+                      "use_when": "Dashboarding, routing coordination messages, or auditing activity.",
+                      "related": [
+                        "register_agent"
+                      ],
+                      "expected_frequency": "Ad hoc when context about an agent is required.",
+                      "required_capabilities": [
+                        "audit",
+                        "identity"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Directory lookup",
+                          "sample": "whois(project_key='backend', agent_name='BlueLake')"
+                        }
+                      ],
+                      "capabilities": [
+                        "audit",
+                        "identity"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "set_contact_policy",
+                      "summary": "Set inbound contact policy (open, auto, contacts_only, block_all).",
+                      "use_when": "Adjusting how permissive an agent is about unsolicited messages.",
+                      "related": [
+                        "request_contact",
+                        "respond_contact"
+                      ],
+                      "expected_frequency": "Occasional configuration change.",
+                      "required_capabilities": [
+                        "configure",
+                        "contact"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Restrict inbox",
+                          "sample": "set_contact_policy(project_key='backend', agent_name='BlueLake', policy='contacts_only')"
+                        }
+                      ],
+                      "capabilities": [
+                        "configure",
+                        "contact"
+                      ],
+                      "complexity": "medium"
+                    }
+                  ]
+                },
+                {
+                  "name": "Messaging Lifecycle",
+                  "purpose": "Send, receive, and acknowledge threaded Markdown mail.",
+                  "tools": [
+                    {
+                      "name": "send_message",
+                      "summary": "Deliver a new message with attachments, WebP conversion, and policy enforcement.",
+                      "use_when": "Starting new threads or broadcasting plans across projects.",
+                      "related": [
+                        "reply_message",
+                        "request_contact"
+                      ],
+                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "required_capabilities": [
+                        "messaging",
+                        "write"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "New plan",
+                          "sample": "send_message(project_key='backend', sender_name='GreenCastle', to=['BlueLake'], subject='Plan', body_md='...')"
+                        }
+                      ],
+                      "capabilities": [
+                        "messaging",
+                        "write"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "reply_message",
+                      "summary": "Reply within an existing thread, inheriting flags and default recipients.",
+                      "use_when": "Continuing discussions or acknowledging decisions.",
+                      "related": [
+                        "send_message"
+                      ],
+                      "expected_frequency": "Frequent when collaborating inside a thread.",
+                      "required_capabilities": [
+                        "messaging",
+                        "write"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Thread reply",
+                          "sample": "reply_message(project_key='backend', message_id=42, sender_name='BlueLake', body_md='Got it!')"
+                        }
+                      ],
+                      "capabilities": [
+                        "messaging",
+                        "write"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "fetch_inbox",
+                      "summary": "Poll recent messages for an agent with filters (urgent_only, since_ts).",
+                      "use_when": "After each work unit to ingest coordination updates.",
+                      "related": [
+                        "mark_message_read",
+                        "acknowledge_message"
+                      ],
+                      "expected_frequency": "Frequent polling in agent loops.",
+                      "required_capabilities": [
+                        "messaging",
+                        "read"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Poll",
+                          "sample": "fetch_inbox(project_key='backend', agent_name='BlueLake', since_ts='2025-10-24T00:00:00Z')"
+                        }
+                      ],
+                      "capabilities": [
+                        "messaging",
+                        "read"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "mark_message_read",
+                      "summary": "Record read_ts for FYI messages without sending acknowledgements.",
+                      "use_when": "Clearing inbox notifications once reviewed.",
+                      "related": [
+                        "acknowledge_message"
+                      ],
+                      "expected_frequency": "Whenever FYI mail is processed.",
+                      "required_capabilities": [
+                        "messaging",
+                        "read"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Read receipt",
+                          "sample": "mark_message_read(project_key='backend', agent_name='BlueLake', message_id=42)"
+                        }
+                      ],
+                      "capabilities": [
+                        "messaging",
+                        "read"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "acknowledge_message",
+                      "summary": "Set read_ts and ack_ts so senders know action items landed.",
+                      "use_when": "Responding to ack_required messages.",
+                      "related": [
+                        "mark_message_read"
+                      ],
+                      "expected_frequency": "Each time a message requests acknowledgement.",
+                      "required_capabilities": [
+                        "ack",
+                        "messaging"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Ack",
+                          "sample": "acknowledge_message(project_key='backend', agent_name='BlueLake', message_id=42)"
+                        }
+                      ],
+                      "capabilities": [
+                        "ack",
+                        "messaging"
+                      ],
+                      "complexity": "medium"
+                    }
+                  ]
+                },
+                {
+                  "name": "Contact Governance",
+                  "purpose": "Manage messaging permissions when policies are not open by default.",
+                  "tools": [
+                    {
+                      "name": "request_contact",
+                      "summary": "Create or refresh a pending AgentLink and notify the target with ack_required intro.",
+                      "use_when": "Requesting permission before messaging another agent.",
+                      "related": [
+                        "respond_contact",
+                        "set_contact_policy"
+                      ],
+                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "required_capabilities": [
+                        "contact"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Ask permission",
+                          "sample": "request_contact(project_key='backend', from_agent='OpsBot', to_agent='BlueLake')"
+                        }
+                      ],
+                      "capabilities": [
+                        "contact"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "respond_contact",
+                      "summary": "Approve or block a pending contact request, optionally setting expiry.",
+                      "use_when": "Granting or revoking messaging permissions.",
+                      "related": [
+                        "request_contact"
+                      ],
+                      "expected_frequency": "As often as requests arrive.",
+                      "required_capabilities": [
+                        "contact"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Approve",
+                          "sample": "respond_contact(project_key='backend', to_agent='BlueLake', from_agent='OpsBot', accept=True)"
+                        }
+                      ],
+                      "capabilities": [
+                        "contact"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "list_contacts",
+                      "summary": "List outbound contact links, statuses, and expirations for an agent.",
+                      "use_when": "Auditing who an agent may message or rotating expiring approvals.",
+                      "related": [
+                        "request_contact",
+                        "respond_contact"
+                      ],
+                      "expected_frequency": "Periodic audits or dashboards.",
+                      "required_capabilities": [
+                        "audit",
+                        "contact"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Audit",
+                          "sample": "list_contacts(project_key='backend', agent_name='BlueLake')"
+                        }
+                      ],
+                      "capabilities": [
+                        "audit",
+                        "contact"
+                      ],
+                      "complexity": "medium"
+                    }
+                  ]
+                },
+                {
+                  "name": "Search & Summaries",
+                  "purpose": "Surface signal from large mailboxes and compress long threads.",
+                  "tools": [
+                    {
+                      "name": "search_messages",
+                      "summary": "Run FTS5 queries across subject/body text to locate relevant threads.",
+                      "use_when": "Triage or gathering context before editing.",
+                      "related": [
+                        "fetch_inbox",
+                        "summarize_thread"
+                      ],
+                      "expected_frequency": "Regular during investigation phases.",
+                      "required_capabilities": [
+                        "search"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "FTS",
+                          "sample": "search_messages(project_key='backend', query='\"build plan\" AND users', limit=20)"
+                        }
+                      ],
+                      "capabilities": [
+                        "search"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "summarize_thread",
+                      "summary": "Extract participants, key points, and action items for one or more threads.",
+                      "use_when": "Briefing new agents on long discussions, closing loops, or producing digests.",
+                      "related": [
+                        "search_messages"
+                      ],
+                      "expected_frequency": "When threads exceed quick skim length or at cadence checkpoints.",
+                      "required_capabilities": [
+                        "search",
+                        "summarization"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Single thread",
+                          "sample": "summarize_thread(project_key='backend', thread_id='TKT-123', include_examples=True)"
+                        },
+                        {
+                          "hint": "Multi-thread digest",
+                          "sample": "summarize_thread(project_key='backend', thread_id='TKT-123,UX-42,BUG-99')"
+                        }
+                      ],
+                      "capabilities": [
+                        "search",
+                        "summarization"
+                      ],
+                      "complexity": "medium"
+                    }
+                  ]
+                },
+                {
+                  "name": "File Reservations & Workspace Guardrails",
+                  "purpose": "Coordinate file/glob ownership to avoid overwriting concurrent work.",
+                  "tools": [
+                    {
+                      "name": "file_reservation_paths",
+                      "summary": "Issue advisory file_reservations with overlap detection and Git artifacts.",
+                      "use_when": "Before touching high-traffic surfaces or long-lived refactors.",
+                      "related": [
+                        "release_file_reservations",
+                        "renew_file_reservations"
+                      ],
+                      "expected_frequency": "Whenever starting work on contested surfaces.",
+                      "required_capabilities": [
+                        "file_reservations",
+                        "repository"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Lock file",
+                          "sample": "file_reservation_paths(project_key='backend', agent_name='BlueLake', paths=['src/app.py'], ttl_seconds=7200)"
+                        }
+                      ],
+                      "capabilities": [
+                        "file_reservations",
+                        "repository"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "release_file_reservations",
+                      "summary": "Release active file_reservations (fully or by subset) and stamp released_ts.",
+                      "use_when": "Finishing work so surfaces become available again.",
+                      "related": [
+                        "file_reservation_paths",
+                        "renew_file_reservations"
+                      ],
+                      "expected_frequency": "Each time work on a surface completes.",
+                      "required_capabilities": [
+                        "file_reservations"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Unlock",
+                          "sample": "release_file_reservations(project_key='backend', agent_name='BlueLake', paths=['src/app.py'])"
+                        }
+                      ],
+                      "capabilities": [
+                        "file_reservations"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "renew_file_reservations",
+                      "summary": "Extend file_reservation expiry windows without allocating new file_reservation IDs.",
+                      "use_when": "Long-running work needs more time but should retain ownership.",
+                      "related": [
+                        "file_reservation_paths",
+                        "release_file_reservations"
+                      ],
+                      "expected_frequency": "Periodically during multi-hour work items.",
+                      "required_capabilities": [
+                        "file_reservations"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Extend",
+                          "sample": "renew_file_reservations(project_key='backend', agent_name='BlueLake', extend_seconds=1800)"
+                        }
+                      ],
+                      "capabilities": [
+                        "file_reservations"
+                      ],
+                      "complexity": "medium"
+                    }
+                  ]
+                },
+                {
+                  "name": "Workflow Macros",
+                  "purpose": "Opinionated orchestrations that compose multiple primitives for smaller agents.",
+                  "tools": [
+                    {
+                      "name": "macro_start_session",
+                      "summary": "Ensure project, register/update agent, optionally file_reservation surfaces, and return inbox context.",
+                      "use_when": "Kickstarting a focused work session with one call.",
+                      "related": [
+                        "ensure_project",
+                        "register_agent",
+                        "file_reservation_paths",
+                        "fetch_inbox"
+                      ],
+                      "expected_frequency": "At the beginning of each autonomous session.",
+                      "required_capabilities": [
+                        "file_reservations",
+                        "identity",
+                        "messaging",
+                        "workflow"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Bootstrap",
+                          "sample": "macro_start_session(human_key='/abs/path/backend', program='codex', model='gpt5', file_reservation_paths=['src/api/*.py'])"
+                        }
+                      ],
+                      "capabilities": [
+                        "file_reservations",
+                        "identity",
+                        "messaging",
+                        "workflow"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "macro_prepare_thread",
+                      "summary": "Register or refresh an agent, summarise a thread, and fetch inbox context in one call.",
+                      "use_when": "Briefing a helper before joining an ongoing discussion.",
+                      "related": [
+                        "register_agent",
+                        "summarize_thread",
+                        "fetch_inbox"
+                      ],
+                      "expected_frequency": "Whenever onboarding a new contributor to an active thread.",
+                      "required_capabilities": [
+                        "messaging",
+                        "summarization",
+                        "workflow"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Join thread",
+                          "sample": "macro_prepare_thread(project_key='backend', thread_id='TKT-123', program='codex', model='gpt5', agent_name='ThreadHelper')"
+                        }
+                      ],
+                      "capabilities": [
+                        "messaging",
+                        "summarization",
+                        "workflow"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "macro_file_reservation_cycle",
+                      "summary": "FileReservation a set of paths and optionally release them once work is complete.",
+                      "use_when": "Wrapping a focused edit cycle that needs advisory locks.",
+                      "related": [
+                        "file_reservation_paths",
+                        "release_file_reservations",
+                        "renew_file_reservations"
+                      ],
+                      "expected_frequency": "Per guarded work block.",
+                      "required_capabilities": [
+                        "file_reservations",
+                        "repository",
+                        "workflow"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "FileReservation & release",
+                          "sample": "macro_file_reservation_cycle(project_key='backend', agent_name='BlueLake', paths=['src/app.py'], auto_release=true)"
+                        }
+                      ],
+                      "capabilities": [
+                        "file_reservations",
+                        "repository",
+                        "workflow"
+                      ],
+                      "complexity": "medium"
+                    },
+                    {
+                      "name": "macro_contact_handshake",
+                      "summary": "Request contact approval, optionally auto-accept, and send a welcome message.",
+                      "use_when": "Spinning up collaboration between two agents who lack permissions.",
+                      "related": [
+                        "request_contact",
+                        "respond_contact",
+                        "send_message"
+                      ],
+                      "expected_frequency": "When onboarding new agent pairs.",
+                      "required_capabilities": [
+                        "contact",
+                        "messaging",
+                        "workflow"
+                      ],
+                      "usage_examples": [
+                        {
+                          "hint": "Automated handshake",
+                          "sample": "macro_contact_handshake(project_key='backend', requester='OpsBot', target='BlueLake', auto_accept=true, welcome_subject='Hello', welcome_body='Excited to collaborate!')"
+                        }
+                      ],
+                      "capabilities": [
+                        "contact",
+                        "messaging",
+                        "workflow"
+                      ],
+                      "complexity": "medium"
+                    }
+                  ]
+                }
+              ],
+              "playbooks": [
+                {
+                  "workflow": "Kick off new agent session (macro)",
+                  "sequence": [
+                    "health_check",
+                    "macro_start_session",
+                    "summarize_thread"
+                  ]
+                },
+                {
+                  "workflow": "Kick off new agent session (manual)",
+                  "sequence": [
+                    "health_check",
+                    "ensure_project",
+                    "register_agent",
+                    "fetch_inbox"
+                  ]
+                },
+                {
+                  "workflow": "Start focused refactor",
+                  "sequence": [
+                    "ensure_project",
+                    "file_reservation_paths",
+                    "send_message",
+                    "fetch_inbox",
+                    "acknowledge_message"
+                  ]
+                },
+                {
+                  "workflow": "Join existing discussion",
+                  "sequence": [
+                    "macro_prepare_thread",
+                    "reply_message",
+                    "acknowledge_message"
+                  ]
+                },
+                {
+                  "workflow": "Manage contact approvals",
+                  "sequence": [
+                    "set_contact_policy",
+                    "request_contact",
+                    "respond_contact",
+                    "send_message"
+                  ]
+                }
+              ]
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/generated_at"
+            ]
+          }
+        }
+      ]
+    },
     "resource://tooling/schemas": {
       "cases": [
         {
           "name": "tooling_schemas",
+          "input": {},
+          "expect": {
+            "ok": {
+              "generated_at": null,
+              "global_optional": [
+                "format"
+              ],
+              "output_formats": {
+                "default": "json",
+                "tool_param": "format",
+                "resource_query": "format",
+                "values": [
+                  "json",
+                  "toon"
+                ],
+                "toon_envelope": {
+                  "format": "toon",
+                  "data": "<TOON>",
+                  "meta": {
+                    "requested": "toon"
+                  }
+                }
+              },
+              "tools": {
+                "send_message": {
+                  "required": [
+                    "project_key",
+                    "sender_name",
+                    "to",
+                    "subject",
+                    "body_md"
+                  ],
+                  "optional": [
+                    "cc",
+                    "bcc",
+                    "attachment_paths",
+                    "convert_images",
+                    "importance",
+                    "ack_required",
+                    "thread_id",
+                    "auto_contact_if_blocked"
+                  ],
+                  "shapes": {
+                    "to": "list[str]",
+                    "cc": "list[str] | str",
+                    "bcc": "list[str] | str",
+                    "importance": "low|normal|high|urgent",
+                    "auto_contact_if_blocked": "bool"
+                  }
+                },
+                "macro_contact_handshake": {
+                  "required": [
+                    "project_key",
+                    "requester|agent_name",
+                    "target|to_agent"
+                  ],
+                  "optional": [
+                    "reason",
+                    "ttl_seconds",
+                    "auto_accept",
+                    "welcome_subject",
+                    "welcome_body"
+                  ],
+                  "aliases": {
+                    "requester": [
+                      "agent_name"
+                    ],
+                    "target": [
+                      "to_agent"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/generated_at"
+            ]
+          }
+        }
+      ]
+    },
+    "resource://tooling/schemas?format=json": {
+      "cases": [
+        {
+          "name": "tooling_schemas_format_json",
           "input": {},
           "expect": {
             "ok": {
@@ -3566,7 +4521,7 @@
                 },
                 {
                   "name": "renew_file_reservations",
-                  "calls": 2,
+                  "calls": 3,
                   "errors": 1,
                   "cluster": "file_reservations",
                   "capabilities": [
@@ -3607,7 +4562,7 @@
                 },
                 {
                   "name": "search_messages",
-                  "calls": 2,
+                  "calls": 3,
                   "errors": 1,
                   "cluster": "search",
                   "capabilities": [
@@ -3649,7 +4604,392 @@
                 },
                 {
                   "name": "summarize_thread",
+                  "calls": 5,
+                  "errors": 1,
+                  "cluster": "search",
+                  "capabilities": [
+                    "search",
+                    "summarization"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "summarize_thread_product",
+                  "calls": 2,
+                  "errors": 0,
+                  "cluster": "product_bus",
+                  "capabilities": [
+                    "search",
+                    "summarization"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "uninstall_precommit_guard",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "infrastructure",
+                  "capabilities": [
+                    "infrastructure",
+                    "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "whois",
+                  "calls": 2,
+                  "errors": 1,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "audit",
+                    "identity"
+                  ],
+                  "complexity": "medium"
+                }
+              ]
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/generated_at"
+            ]
+          }
+        }
+      ]
+    },
+    "resource://tooling/metrics?format=json": {
+      "cases": [
+        {
+          "name": "tooling_metrics_format_json",
+          "input": {},
+          "expect": {
+            "ok": {
+              "generated_at": null,
+              "tools": [
+                {
+                  "name": "acknowledge_message",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "messaging",
+                  "capabilities": [
+                    "ack",
+                    "messaging"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "acquire_build_slot",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "build_slots",
+                  "capabilities": [
+                    "build"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "create_agent_identity",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "ensure_product",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "product_bus",
+                  "capabilities": [
+                    "product"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "ensure_project",
+                  "calls": 2,
+                  "errors": 1,
+                  "cluster": "infrastructure",
+                  "capabilities": [
+                    "infrastructure",
+                    "storage"
+                  ],
+                  "complexity": "low"
+                },
+                {
+                  "name": "fetch_inbox",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "messaging",
+                  "capabilities": [
+                    "messaging",
+                    "read"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "fetch_inbox_product",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "product_bus",
+                  "capabilities": [
+                    "messaging",
+                    "read"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "file_reservation_paths",
+                  "calls": 3,
+                  "errors": 1,
+                  "cluster": "file_reservations",
+                  "capabilities": [
+                    "file_reservations",
+                    "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "force_release_file_reservation",
+                  "calls": 1,
+                  "errors": 1,
+                  "cluster": "file_reservations",
+                  "capabilities": [
+                    "file_reservations",
+                    "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "health_check",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "infrastructure",
+                  "capabilities": [
+                    "infrastructure"
+                  ],
+                  "complexity": "low"
+                },
+                {
+                  "name": "install_precommit_guard",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "infrastructure",
+                  "capabilities": [
+                    "infrastructure",
+                    "repository"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "list_contacts",
+                  "calls": 2,
+                  "errors": 0,
+                  "cluster": "contact",
+                  "capabilities": [
+                    "audit",
+                    "contact"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "macro_contact_handshake",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "workflow_macros",
+                  "capabilities": [
+                    "contact",
+                    "messaging",
+                    "workflow"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "macro_file_reservation_cycle",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "workflow_macros",
+                  "capabilities": [
+                    "file_reservations",
+                    "repository",
+                    "workflow"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "macro_prepare_thread",
+                  "calls": 2,
+                  "errors": 0,
+                  "cluster": "workflow_macros",
+                  "capabilities": [
+                    "messaging",
+                    "summarization",
+                    "workflow"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "macro_start_session",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "workflow_macros",
+                  "capabilities": [
+                    "file_reservations",
+                    "identity",
+                    "messaging",
+                    "workflow"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "mark_message_read",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "messaging",
+                  "capabilities": [
+                    "messaging",
+                    "read"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "products_link",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "product_bus",
+                  "capabilities": [
+                    "product"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "register_agent",
+                  "calls": 2,
+                  "errors": 0,
+                  "cluster": "identity",
+                  "capabilities": [
+                    "identity"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "release_build_slot",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "build_slots",
+                  "capabilities": [
+                    "build"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "release_file_reservations",
+                  "calls": 2,
+                  "errors": 0,
+                  "cluster": "file_reservations",
+                  "capabilities": [
+                    "file_reservations"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "renew_build_slot",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "build_slots",
+                  "capabilities": [
+                    "build"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "renew_file_reservations",
+                  "calls": 3,
+                  "errors": 1,
+                  "cluster": "file_reservations",
+                  "capabilities": [
+                    "file_reservations"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "reply_message",
+                  "calls": 3,
+                  "errors": 0,
+                  "cluster": "messaging",
+                  "capabilities": [
+                    "messaging",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "request_contact",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "contact",
+                  "capabilities": [
+                    "contact"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "respond_contact",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "contact",
+                  "capabilities": [
+                    "contact"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "search_messages",
+                  "calls": 3,
+                  "errors": 1,
+                  "cluster": "search",
+                  "capabilities": [
+                    "search"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "search_messages_product",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "product_bus",
+                  "capabilities": [
+                    "search"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "send_message",
                   "calls": 4,
+                  "errors": 1,
+                  "cluster": "messaging",
+                  "capabilities": [
+                    "messaging",
+                    "write"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "set_contact_policy",
+                  "calls": 1,
+                  "errors": 0,
+                  "cluster": "contact",
+                  "capabilities": [
+                    "configure",
+                    "contact"
+                  ],
+                  "complexity": "medium"
+                },
+                {
+                  "name": "summarize_thread",
+                  "calls": 5,
                   "errors": 1,
                   "cluster": "search",
                   "capabilities": [
@@ -3721,6 +5061,25 @@
         }
       ]
     },
+    "resource://tooling/locks?format=json": {
+      "cases": [
+        {
+          "name": "tooling_locks_format_json",
+          "input": {},
+          "expect": {
+            "ok": {
+              "locks": [],
+              "summary": {
+                "total": 0,
+                "active": 0,
+                "stale": 0,
+                "metadata_missing": 0
+              }
+            }
+          }
+        }
+      ]
+    },
     "resource://tooling/capabilities/BlueLake?project=abs-path-backend": {
       "cases": [
         {
@@ -3751,7 +5110,7 @@
             "ok": {
               "generated_at": null,
               "window_seconds": 60,
-              "count": 21,
+              "count": 22,
               "entries": [
                 {
                   "timestamp": null,
@@ -3826,6 +5185,13 @@
                 {
                   "timestamp": null,
                   "tool": "file_reservation_paths",
+                  "project": "abs-path-backend",
+                  "agent": "BlueLake",
+                  "cluster": "file_reservations"
+                },
+                {
+                  "timestamp": null,
+                  "tool": "renew_file_reservations",
                   "project": "abs-path-backend",
                   "agent": "BlueLake",
                   "cluster": "file_reservations"
@@ -3919,6 +5285,7 @@
               "/entries/19/timestamp",
               "/entries/2/timestamp",
               "/entries/20/timestamp",
+              "/entries/21/timestamp",
               "/entries/3/timestamp",
               "/entries/4/timestamp",
               "/entries/5/timestamp",
@@ -4046,7 +5413,7 @@
               "count": 4,
               "messages": [
                 {
-                  "id": 6,
+                  "id": 4,
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": "T-2",
@@ -4063,7 +5430,7 @@
                   }
                 },
                 {
-                  "id": 4,
+                  "id": 3,
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": "T-1",
@@ -4143,7 +5510,7 @@
               "count": 4,
               "messages": [
                 {
-                  "id": 6,
+                  "id": 4,
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": "T-2",
@@ -4158,7 +5525,7 @@
                     "hexsha": null,
                     "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-2",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 22,
                     "deletions": 0,
                     "diff_summary": {
                       "hunks": 1,
@@ -4167,7 +5534,7 @@
                   }
                 },
                 {
-                  "id": 4,
+                  "id": 3,
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": "T-1",
@@ -4182,7 +5549,7 @@
                     "hexsha": null,
                     "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-1",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 22,
                     "deletions": 0,
                     "diff_summary": {
                       "hunks": 1,
@@ -4276,7 +5643,7 @@
               "count": 4,
               "messages": [
                 {
-                  "id": 6,
+                  "id": 4,
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": "T-2",
@@ -4296,7 +5663,7 @@
                     "hexsha": null,
                     "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-2",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 22,
                     "deletions": 0,
                     "diff_summary": {
                       "hunks": 1,
@@ -4305,7 +5672,7 @@
                   }
                 },
                 {
-                  "id": 4,
+                  "id": 3,
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": "T-1",
@@ -4325,7 +5692,7 @@
                     "hexsha": null,
                     "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-1",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 22,
                     "deletions": 0,
                     "diff_summary": {
                       "hunks": 1,

@@ -6,6 +6,18 @@ SQLite indexing.
 
 ## Quick Start
 
+### Easiest Local Run (`am`)
+```bash
+cd /data/projects/mcp_agent_mail_rust
+alias am='/data/projects/mcp_agent_mail_rust/scripts/am'
+am serve
+```
+
+What `am serve` does by default:
+- sets `HTTP_PATH=/mcp/`
+- sets `LOG_RICH_ENABLED=true`
+- auto-loads `HTTP_BEARER_TOKEN` from `~/mcp_agent_mail/.env` if not already set
+
 ### Run MCP Server (stdio)
 ```bash
 cargo run -p mcp-agent-mail
@@ -15,6 +27,10 @@ cargo run -p mcp-agent-mail
 ```bash
 cargo run -p mcp-agent-mail -- serve --host 127.0.0.1 --port 8765
 ```
+
+Notes:
+- The server now accepts both `/mcp/` and `/api/` as MCP HTTP base-path aliases for local/dev compatibility.
+- `scripts/am` options: `--path mcp|api`, `--host`, `--port`, `--env-file`, `--no-auth`.
 
 ### Run CLI
 ```bash

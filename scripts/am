@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+Usage: am [serve] [options] [-- <extra args for `mcp-agent-mail serve`>]
+
+Convenience runner for local MCP Agent Mail development.
+Defaults:
+- HTTP_PATH=/mcp/
+- LOG_RICH_ENABLED=true
+- host=127.0.0.1, port=8765
+- loads HTTP_BEARER_TOKEN from ~/mcp_agent_mail/.env if not set
+
+Options:
+  --host <host>          Server host (default: 127.0.0.1)
+  --port <port>          Server port (default: 8765)
+  --path <mcp|api|/x/>   Base path (default: mcp)
+  --env-file <path>      Env file for HTTP_BEARER_TOKEN (default: ~/mcp_agent_mail/.env)
+  --no-auth              Unset HTTP_BEARER_TOKEN for this run
+  -h, --help             Show help
+
+Examples:
+  scripts/am serve
+  scripts/am --path api
+  scripts/am --host 0.0.0.0 --port 9000
+EOF
+}
+
+normalize_http_path() {
+  local value="$1"
+  case "$value" in
+    mcp|/mcp|/mcp/) echo "/mcp/" ;;
+    api|/api|/api/) echo "/api/" ;;
+    *)
+      if [[ "$value" != /* ]]; then
+        value="/$value"
+      fi
+      if [[ "$value" != */ ]]; then
+        value="$value/"
+      fi
+      echo "$value"
+      ;;
+  esac
+}
+
+read_env_value() {
+  local file="$1"
+  local key="$2"
+  if [[ ! -f "$file" ]]; then
+    return 1
+  fi
+  command grep -E "^[[:space:]]*${key}=" "$file" | tail -n1 | cut -d= -f2-
+}
+
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    serve) shift ;;
+    help|-h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+fi
+
+host="127.0.0.1"
+port="8765"
+path_mode="mcp"
+env_file="${HOME}/mcp_agent_mail/.env"
+no_auth=0
+extra_args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host)
+      host="${2:-}"
+      shift 2
+      ;;
+    --port)
+      port="${2:-}"
+      shift 2
+      ;;
+    --path)
+      path_mode="${2:-}"
+      shift 2
+      ;;
+    --env-file)
+      env_file="${2:-}"
+      shift 2
+      ;;
+    --no-auth)
+      no_auth=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      extra_args=("$@")
+      break
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+export HTTP_PATH="$(normalize_http_path "$path_mode")"
+export LOG_RICH_ENABLED="${LOG_RICH_ENABLED:-true}"
+
+if [[ "$no_auth" -eq 1 ]]; then
+  unset HTTP_BEARER_TOKEN
+else
+  if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
+    if token="$(read_env_value "$env_file" "HTTP_BEARER_TOKEN" 2>/dev/null)"; then
+      token="$(printf '%s' "$token" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      token="$(printf '%s' "$token" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+      if [[ -n "$token" ]]; then
+        export HTTP_BEARER_TOKEN="$token"
+      fi
+    fi
+  fi
+fi
+
+cd "$repo_root"
+echo "am: host=${host} port=${port} path=${HTTP_PATH} rich=${LOG_RICH_ENABLED}" >&2
+
+exec cargo run -p mcp-agent-mail -- serve --host "$host" --port "$port" "${extra_args[@]}"
