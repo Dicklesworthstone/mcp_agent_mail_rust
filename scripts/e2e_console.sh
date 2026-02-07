@@ -25,7 +25,7 @@ e2e_banner "Console (PTY) E2E Test Suite"
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
 
-for cmd in script timeout python3; do
+for cmd in script timeout python3 curl; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
         e2e_log "${cmd} not found; skipping suite"
         e2e_skip "${cmd} required"
@@ -48,6 +48,131 @@ s = socket.socket()
 s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()
+PY
+}
+
+e2e_assert_file_contains() {
+    local label="$1"
+    local path="$2"
+    local needle="$3"
+    if grep -Fq -- "${needle}" "${path}"; then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label}"
+        e2e_log "missing needle: ${needle}"
+        e2e_log "in file: ${path}"
+        e2e_log "tail (last 120 lines):"
+        tail -n 120 "${path}" 2>/dev/null || true
+    fi
+}
+
+e2e_assert_file_not_contains() {
+    local label="$1"
+    local path="$2"
+    local needle="$3"
+    if grep -Fq -- "${needle}" "${path}"; then
+        e2e_fail "${label}"
+        e2e_log "unexpected needle: ${needle}"
+        e2e_log "in file: ${path}"
+        e2e_log "matches:"
+        grep -Fn -- "${needle}" "${path}" | head -n 20 || true
+    else
+        e2e_pass "${label}"
+    fi
+}
+
+http_request() {
+    local case_id="$1"
+    local method="$2"
+    local url="$3"
+    shift 3
+
+    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    local args=(
+        -sS
+        -D "${headers_file}"
+        -o "${body_file}"
+        -w "%{http_code}"
+        -X "${method}"
+        "${url}"
+    )
+    for h in "$@"; do
+        args+=(-H "$h")
+    done
+
+    e2e_save_artifact "${case_id}_curl_args.txt" "$(printf "curl -X %q %q %s\n" "${method}" "${url}" "$(printf "%q " "$@")")"
+
+    set +e
+    local status
+    status="$(curl "${args[@]}" 2>"${curl_stderr_file}")"
+    local rc=$?
+    set -e
+
+    echo "${status}" > "${status_file}"
+    if [ "$rc" -ne 0 ]; then
+        e2e_fatal "${case_id}: curl failed rc=${rc}"
+    fi
+}
+
+http_post_json() {
+    local case_id="$1"
+    local url="$2"
+    local payload="$3"
+    shift 3
+
+    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    e2e_save_artifact "${case_id}_request.json" "${payload}"
+
+    local args=(
+        -sS
+        -D "${headers_file}"
+        -o "${body_file}"
+        -w "%{http_code}"
+        -X POST
+        "${url}"
+        -H "content-type: application/json"
+        --data "${payload}"
+    )
+    for h in "$@"; do
+        args+=(-H "$h")
+    done
+
+    set +e
+    local status
+    status="$(curl "${args[@]}" 2>"${curl_stderr_file}")"
+    local rc=$?
+    set -e
+
+    echo "${status}" > "${status_file}"
+    if [ "$rc" -ne 0 ]; then
+        e2e_fatal "${case_id}: curl failed rc=${rc}"
+    fi
+}
+
+jsonrpc_tools_call_payload() {
+    local tool_name="$1"
+    local args_json="${2-}"
+    if [ -z "${args_json}" ]; then
+        args_json="{}"
+    fi
+    python3 - <<'PY' "$tool_name" "$args_json"
+import json, sys
+tool = sys.argv[1]
+args = json.loads(sys.argv[2])
+print(json.dumps({
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 1,
+  "params": { "name": tool, "arguments": args },
+}, separators=(",", ":")))
 PY
 }
 
@@ -150,10 +275,9 @@ sleep 0.3
 
 NORM1="${E2E_ARTIFACT_DIR}/server_default_rich.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_default_rich.typescript" "${NORM1}"
-OUT1="$(cat "${NORM1}")"
-e2e_assert_contains "banner includes Server Configuration" "${OUT1}" "Server Configuration"
-e2e_assert_contains "banner includes Database Statistics" "${OUT1}" "Database Statistics"
-e2e_assert_contains "banner includes Web UI" "${OUT1}" "Web UI"
+e2e_assert_file_contains "banner includes Server Configuration" "${NORM1}" "Server Configuration"
+e2e_assert_file_contains "banner includes Database Statistics" "${NORM1}" "Database Statistics"
+e2e_assert_file_contains "banner includes Web UI" "${NORM1}" "Web UI"
 
 e2e_case_banner "banner_suppressed_when_rich_disabled"
 WORK2="$(e2e_mktemp "e2e_console_no_rich")"
@@ -173,8 +297,7 @@ sleep 0.3
 
 NORM2="${E2E_ARTIFACT_DIR}/server_no_rich.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_no_rich.typescript" "${NORM2}"
-OUT2="$(cat "${NORM2}")"
-e2e_assert_not_contains "banner marker absent when rich disabled" "${OUT2}" "Server Configuration"
+e2e_assert_file_not_contains "banner marker absent when rich disabled" "${NORM2}" "Server Configuration"
 
 e2e_case_banner "persisted_console_settings_are_loaded"
 WORK3="$(e2e_mktemp "e2e_console_persist")"
@@ -201,9 +324,113 @@ sleep 0.3
 
 NORM3="${E2E_ARTIFACT_DIR}/server_persisted.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_persisted.typescript" "${NORM3}"
-OUT3="$(cat "${NORM3}")"
-e2e_assert_contains "banner includes console layout line" "${OUT3}" "Console:"
-e2e_assert_contains "console layout reflects persisted percent" "${OUT3}" "50%"
+e2e_assert_file_contains "banner includes console layout line" "${NORM3}" "Console:"
+e2e_assert_file_contains "console layout reflects persisted percent" "${NORM3}" "50%"
+e2e_assert_file_contains "banner reflects persisted theme" "${NORM3}" "Darcula"
+
+e2e_case_banner "tool_call_panels_respect_gates"
+WORK_T="$(e2e_mktemp "e2e_console_tool_calls")"
+DBT="${WORK_T}/db.sqlite3"
+STORAGET="${WORK_T}/storage"
+mkdir -p "${STORAGET}"
+PORTT="$(pick_port)"
+URLT_BASE="http://127.0.0.1:${PORTT}"
+API_URLT="${URLT_BASE}/api/"
+TOKEN_T="e2e-token"
+AUTHZ_T="Authorization: Bearer ${TOKEN_T}"
+
+PIDT1="$(start_server_pty "tool_calls_on" "${PORTT}" "${DBT}" "${STORAGET}" "${BIN}" \
+    "HTTP_BEARER_TOKEN=${TOKEN_T}" \
+    "TOOLS_LOG_ENABLED=true" \
+    "LOG_TOOL_CALLS_ENABLED=true" \
+)"
+if ! e2e_wait_port 127.0.0.1 "${PORTT}" 10; then
+    stop_server_pty "${PIDT1}"
+    e2e_fatal "server failed to start (port not open)"
+fi
+PAYLOAD_HC="$(jsonrpc_tools_call_payload "health_check" "{}")"
+http_post_json "tool_calls_on_health_check" "${API_URLT}" "${PAYLOAD_HC}" "${AUTHZ_T}"
+e2e_assert_file_contains "health_check call returns 200" "${E2E_ARTIFACT_DIR}/tool_calls_on_health_check_status.txt" "200"
+sleep 0.6
+stop_server_pty "${PIDT1}"
+sleep 0.3
+
+NORM_T1="${E2E_ARTIFACT_DIR}/server_tool_calls_on.normalized.txt"
+normalize_transcript "${E2E_ARTIFACT_DIR}/server_tool_calls_on.typescript" "${NORM_T1}"
+e2e_assert_file_contains "TOOL CALL panel present when enabled" "${NORM_T1}" "TOOL CALL"
+e2e_assert_file_contains "TOOL CALL includes tool name" "${NORM_T1}" "health_check"
+
+PORTT2="$(pick_port)"
+URLT2_BASE="http://127.0.0.1:${PORTT2}"
+API_URLT2="${URLT2_BASE}/api/"
+PIDT2="$(start_server_pty "tool_calls_off" "${PORTT2}" "${DBT}" "${STORAGET}" "${BIN}" \
+    "HTTP_BEARER_TOKEN=${TOKEN_T}" \
+    "TOOLS_LOG_ENABLED=true" \
+    "LOG_TOOL_CALLS_ENABLED=false" \
+)"
+if ! e2e_wait_port 127.0.0.1 "${PORTT2}" 10; then
+    stop_server_pty "${PIDT2}"
+    e2e_fatal "server failed to start (port not open)"
+fi
+PAYLOAD_HC2="$(jsonrpc_tools_call_payload "health_check" "{}")"
+http_post_json "tool_calls_off_health_check" "${API_URLT2}" "${PAYLOAD_HC2}" "${AUTHZ_T}"
+e2e_assert_file_contains "health_check call returns 200 (tool call panels off)" "${E2E_ARTIFACT_DIR}/tool_calls_off_health_check_status.txt" "200"
+sleep 0.6
+stop_server_pty "${PIDT2}"
+sleep 0.3
+
+NORM_T2="${E2E_ARTIFACT_DIR}/server_tool_calls_off.normalized.txt"
+normalize_transcript "${E2E_ARTIFACT_DIR}/server_tool_calls_off.typescript" "${NORM_T2}"
+e2e_assert_file_not_contains "TOOL CALL panel absent when disabled" "${NORM_T2}" "TOOL CALL"
+
+e2e_case_banner "request_panel_logged"
+WORK_R="$(e2e_mktemp "e2e_console_request_panel")"
+DBR="${WORK_R}/db.sqlite3"
+STORAGER="${WORK_R}/storage"
+mkdir -p "${STORAGER}"
+PORTR="$(pick_port)"
+URLR_BASE="http://127.0.0.1:${PORTR}"
+
+PIDR="$(start_server_pty "request_panel" "${PORTR}" "${DBR}" "${STORAGER}" "${BIN}" \
+    "HTTP_REQUEST_LOG_ENABLED=true" \
+)"
+if ! e2e_wait_port 127.0.0.1 "${PORTR}" 10; then
+    stop_server_pty "${PIDR}"
+    e2e_fatal "server failed to start (port not open)"
+fi
+http_request "request_panel_health_liveness" "GET" "${URLR_BASE}/health/liveness"
+e2e_assert_file_contains "GET /health/liveness returns 200" "${E2E_ARTIFACT_DIR}/request_panel_health_liveness_status.txt" "200"
+sleep 0.6
+stop_server_pty "${PIDR}"
+sleep 0.3
+
+NORM_R="${E2E_ARTIFACT_DIR}/server_request_panel.normalized.txt"
+normalize_transcript "${E2E_ARTIFACT_DIR}/server_request_panel.typescript" "${NORM_R}"
+e2e_assert_file_contains "request panel contains path" "${NORM_R}" "/health/liveness"
+e2e_assert_file_contains "request panel contains method+status snippet" "${NORM_R}" "GET  /health/liveness  200"
+
+e2e_case_banner "left_split_mode_engages"
+WORK_S="$(e2e_mktemp "e2e_console_left_split")"
+DBS="${WORK_S}/db.sqlite3"
+STORAGES="${WORK_S}/storage"
+mkdir -p "${STORAGES}"
+PORTS="$(pick_port)"
+
+PIDS="$(start_server_pty "left_split" "${PORTS}" "${DBS}" "${STORAGES}" "${BIN}" \
+    "CONSOLE_SPLIT_MODE=left" \
+    "CONSOLE_SPLIT_RATIO_PERCENT=30" \
+)"
+if ! e2e_wait_port 127.0.0.1 "${PORTS}" 10; then
+    stop_server_pty "${PIDS}"
+    e2e_fatal "server failed to start (port not open)"
+fi
+sleep 0.8
+stop_server_pty "${PIDS}"
+sleep 0.3
+
+NORM_S="${E2E_ARTIFACT_DIR}/server_left_split.normalized.txt"
+normalize_transcript "${E2E_ARTIFACT_DIR}/server_left_split.typescript" "${NORM_S}"
+e2e_assert_file_contains "console summary reflects left split request" "${NORM_S}" "split: left 30% requested"
 
 e2e_case_banner "interactive_change_persists (optional)"
 if [ "${AM_E2E_INTERACTIVE:-0}" = "1" ] || [ "${AM_E2E_INTERACTIVE:-}" = "true" ]; then

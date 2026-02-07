@@ -6,6 +6,7 @@
 //! with a cohesive look.
 
 use ftui_extras::theme::{self, ColorToken, ThemeId};
+use mcp_agent_mail_core::config::ConsoleThemeId;
 
 // ──────────────────────────────────────────────────────────────────────
 // CONSOLE_THEME parsing
@@ -42,6 +43,24 @@ pub fn init_console_theme() -> ThemeId {
         ThemeId::CyberpunkAurora
     } else {
         parse_console_theme(&value)
+    };
+    theme::set_theme(id);
+    id
+}
+
+/// Initialize the console theme from the already-parsed config value.
+///
+/// This is the preferred server integration path because `Config` may load
+/// console settings from the persisted user envfile (and those values are not
+/// guaranteed to exist in the process environment).
+#[must_use]
+pub fn init_console_theme_from_config(theme_id: ConsoleThemeId) -> ThemeId {
+    let id = match theme_id {
+        ConsoleThemeId::CyberpunkAurora => ThemeId::CyberpunkAurora,
+        ConsoleThemeId::Darcula => ThemeId::Darcula,
+        ConsoleThemeId::LumenLight => ThemeId::LumenLight,
+        ConsoleThemeId::NordicFrost => ThemeId::NordicFrost,
+        ConsoleThemeId::HighContrast => ThemeId::HighContrast,
     };
     theme::set_theme(id);
     id

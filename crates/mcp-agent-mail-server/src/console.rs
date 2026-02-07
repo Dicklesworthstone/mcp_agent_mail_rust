@@ -1136,6 +1136,125 @@ fn colorize_json_line(line: &str) -> String {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Console Capabilities (br-1m6a.23)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Snapshot of terminal capabilities relevant to the MCP Agent Mail console.
+///
+/// Computed once at startup from `ftui::TerminalCapabilities::detect()`.
+/// Provides a stable, grep-friendly one-liner for debugging and E2E tests.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone)]
+pub struct ConsoleCaps {
+    pub true_color: bool,
+    pub osc8_hyperlinks: bool,
+    pub mouse_sgr: bool,
+    pub sync_output: bool,
+    pub kitty_keyboard: bool,
+    pub focus_events: bool,
+    pub in_mux: bool,
+}
+
+impl ConsoleCaps {
+    /// Build from detected `TerminalCapabilities`.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn from_capabilities(caps: &ftui::TerminalCapabilities) -> Self {
+        Self {
+            true_color: caps.true_color,
+            osc8_hyperlinks: caps.osc8_hyperlinks,
+            mouse_sgr: caps.mouse_sgr,
+            sync_output: caps.sync_output,
+            kitty_keyboard: caps.kitty_keyboard,
+            focus_events: caps.focus_events,
+            in_mux: caps.in_any_mux(),
+        }
+    }
+
+    /// Stable, grep-friendly one-liner for tests and debugging.
+    ///
+    /// Format: `ConsoleCaps: tc=1 osc8=1 mouse=0 sync=1 kitty=0 focus=0 mux=0`
+    #[must_use]
+    pub fn one_liner(&self) -> String {
+        format!(
+            "ConsoleCaps: tc={} osc8={} mouse={} sync={} kitty={} focus={} mux={}",
+            u8::from(self.true_color),
+            u8::from(self.osc8_hyperlinks),
+            u8::from(self.mouse_sgr),
+            u8::from(self.sync_output),
+            u8::from(self.kitty_keyboard),
+            u8::from(self.focus_events),
+            u8::from(self.in_mux),
+        )
+    }
+
+    /// Render a styled "Console Capabilities" section for the startup banner.
+    ///
+    /// Returns a list of lines (with ANSI color) for inclusion in the banner.
+    #[must_use]
+    pub fn banner_lines(&self) -> Vec<String> {
+        let pri = theme::primary_bold();
+        let ok = theme::success_bold();
+        let warn = theme::warning_bold();
+        let mut lines = Vec::with_capacity(10);
+        lines.push(format!("{pri}Console Capabilities{RESET}"));
+
+        let check = |enabled: bool| -> (&str, &str) {
+            if enabled {
+                ("\u{2713}", ok.as_str())
+            } else {
+                ("\u{2717}", warn.as_str())
+            }
+        };
+
+        let items: &[(&str, bool)] = &[
+            ("True color", self.true_color),
+            ("OSC-8 hyperlinks", self.osc8_hyperlinks),
+            ("Mouse (SGR)", self.mouse_sgr),
+            ("Sync output", self.sync_output),
+            ("Kitty keyboard", self.kitty_keyboard),
+            ("Focus events", self.focus_events),
+        ];
+
+        for (label, enabled) in items {
+            let (sym, color) = check(*enabled);
+            lines.push(format!("  {color}{sym}{RESET} {label}"));
+        }
+
+        if self.in_mux {
+            lines.push(format!(
+                "  {warn}\u{26a0}{RESET} Running inside a multiplexer"
+            ));
+        }
+
+        lines
+    }
+
+    /// Short capabilities hint for the help overlay.
+    #[must_use]
+    pub fn help_hint(&self) -> String {
+        let caps: Vec<&str> = [
+            ("tc", self.true_color),
+            ("osc8", self.osc8_hyperlinks),
+            ("mouse", self.mouse_sgr),
+            ("sync", self.sync_output),
+            ("kitty", self.kitty_keyboard),
+            ("focus", self.focus_events),
+        ]
+        .iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(name, _)| *name)
+        .collect();
+
+        if caps.is_empty() {
+            "Caps: none".to_string()
+        } else {
+            format!("Caps: {}", caps.join(", "))
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Log Pane (br-1m6a.20): AltScreen LogViewer wrapper
 // ──────────────────────────────────────────────────────────────────────
 

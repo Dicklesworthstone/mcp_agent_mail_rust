@@ -417,8 +417,8 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
 }
 
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
-    // Initialize console theme (reads CONSOLE_THEME env var).
-    let _ = theme::init_console_theme();
+    // Initialize console theme from parsed config (includes persisted envfile values).
+    let _ = theme::init_console_theme_from_config(config.console_theme);
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -429,8 +429,8 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
-    // Initialize console theme (reads CONSOLE_THEME env var).
-    let _ = theme::init_console_theme();
+    // Initialize console theme from parsed config (includes persisted envfile values).
+    let _ = theme::init_console_theme_from_config(config.console_theme);
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -755,12 +755,10 @@ struct StartupDashboard {
     last_request: Mutex<Option<DashboardLastRequest>>,
     sparkline: console::SparklineBuffer,
     log_pane: Mutex<console::LogPane>,
-    #[allow(dead_code)]
     command_palette: Mutex<console::ConsoleCommandPalette>,
-    #[allow(dead_code)]
     tool_calls_log_enabled: AtomicBool,
-    #[allow(dead_code)]
     tools_log_enabled: AtomicBool,
+    console_caps: console::ConsoleCaps,
     tick_count: AtomicU64,
     prev_db_stats: Mutex<DashboardDbStats>,
 }
@@ -775,12 +773,18 @@ impl StartupDashboard {
         let term_height = parse_env_u16("LINES", 36).max(20);
         let console_layout = ConsoleLayoutState::from_config(config);
         let (screen_mode, ui_anchor) = console_layout.compute_writer_settings(term_height);
-        let mut writer = ftui::TerminalWriter::new(
-            std::io::stdout(),
-            screen_mode,
-            ui_anchor,
-            ftui::TerminalCapabilities::detect(),
-        );
+        let term_caps = ftui::TerminalCapabilities::detect();
+        let console_caps = console::ConsoleCaps::from_capabilities(&term_caps);
+
+        // Emit a grep-friendly console summary before engaging AltScreen so PTY capture and
+        // terminal scrollback have stable, plain-text breadcrumbs (E2E + debugging).
+        if console_layout.is_split_mode() {
+            eprintln!("Console: {}", console_layout.summary_line());
+            eprintln!("{}", console_caps.one_liner());
+        }
+
+        let mut writer =
+            ftui::TerminalWriter::new(std::io::stdout(), screen_mode, ui_anchor, term_caps);
         writer.set_size(term_width, term_height);
 
         let endpoint = format!(
@@ -814,6 +818,7 @@ impl StartupDashboard {
             command_palette: Mutex::new(console::ConsoleCommandPalette::new()),
             tool_calls_log_enabled: AtomicBool::new(config.log_tool_calls_enabled),
             tools_log_enabled: AtomicBool::new(config.tools_log_enabled),
+            console_caps,
             tick_count: AtomicU64::new(0),
             prev_db_stats: Mutex::new(DashboardDbStats::default()),
         });
@@ -850,6 +855,13 @@ impl StartupDashboard {
         }
         let summary = lock_mutex(&self.console_layout).summary_line();
         self.log_line(&format!("Console: {summary}"));
+        self.log_line(&self.console_caps.one_liner());
+
+        // In AltScreen split mode, `log_line()` appends to the LogPane buffer; force an immediate
+        // render so the startup banner/summary is visible without waiting for the next tick.
+        if lock_mutex(&self.console_layout).is_split_mode() {
+            self.render_now();
+        }
     }
 
     fn spawn_refresh_worker(self: &Arc<Self>) {
