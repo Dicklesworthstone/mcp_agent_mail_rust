@@ -57,6 +57,37 @@
 - Incoming tool call -> validate -> archive write -> SQLite index update -> response.
 - Resource read -> SQLite index (fast path) -> archive fallback (slow path).
 
+## Concurrency: Lock Ordering (Deadlock Guard)
+
+At 1000+ concurrent agents, a single inconsistent lock acquisition order can deadlock the
+entire process. We therefore define a **global lock hierarchy** in
+`crates/mcp-agent-mail-core/src/lock_order.rs` and (in `debug_assertions` builds) enforce it
+at runtime.
+
+### Global Lock Hierarchy (Outer → Inner)
+
+Lock ranks must be acquired strictly in ascending order when nested:
+
+1. `DbPoolCache`
+2. `DbReadCache*` (projects/agents caches + deferred touches)
+3. `DbQueryTrackerInner`
+4. `StorageRepoCache`
+5. `StorageSignalDebounce`
+6. `StorageWbqDrainHandle`
+7. `StorageWbqStats`
+8. `StorageCommitQueue`
+9. `ToolsBridgedEnv`
+10. `ToolsToolMetrics`
+
+### Rules
+
+- Never hold these locks across blocking IO or `.await`.
+- Keep critical sections tiny (copy/clone what you need, then drop the guard).
+- If you add a new process-global lock:
+  - Assign it a unique `LockLevel` rank.
+  - Use `OrderedMutex` / `OrderedRwLock` so debug builds panic on ordering violations.
+  - Add a focused unit test that would have caught the ordering bug.
+
 ## Conformance Harness
 - Fixture-based tests comparing Rust outputs to Python reference.
 - Separate Python fixture generator living under `tests/conformance/python_reference/`.
