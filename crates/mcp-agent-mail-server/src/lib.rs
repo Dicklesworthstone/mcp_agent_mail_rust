@@ -10,6 +10,7 @@ mod static_files;
 mod templates;
 pub mod theme;
 mod tool_metrics;
+pub mod tui_bridge;
 pub mod tui_events;
 
 use asupersync::http::h1::HttpClient;
@@ -3419,7 +3420,9 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     // server automatically scales to the available hardware.
     let (auto_min, auto_max) = mcp_agent_mail_db::pool::auto_pool_size();
     let pool_size = config.database_pool_size.unwrap_or(auto_min);
-    let max_overflow = config.database_max_overflow.unwrap_or(auto_max.saturating_sub(auto_min));
+    let max_overflow = config
+        .database_max_overflow
+        .unwrap_or_else(|| auto_max.saturating_sub(auto_min));
     let pool_timeout_ms = config
         .database_pool_timeout
         .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
