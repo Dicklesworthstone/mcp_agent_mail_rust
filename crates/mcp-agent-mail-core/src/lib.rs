@@ -12,6 +12,8 @@ pub mod agent_detect;
 pub mod config;
 pub mod error;
 pub mod identity;
+pub mod lock_order;
+pub mod metrics;
 pub mod models;
 pub mod toon;
 
@@ -25,6 +27,12 @@ pub use config::{
 };
 pub use error::{Error as MailError, Result as MailResult};
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
+pub use lock_order::{LockLevel, OrderedMutex, OrderedRwLock};
+pub use metrics::{
+    Counter, DbMetricsSnapshot, GaugeI64, GaugeU64, GlobalMetricsSnapshot, HistogramSnapshot,
+    HttpMetricsSnapshot, Log2Histogram, StorageMetricsSnapshot, ToolsMetricsSnapshot,
+    global_metrics,
+};
 pub use models::{
     Agent, AgentLink, FileReservation, Message, MessageRecipient, Product, ProductProjectLink,
     Project, ProjectSiblingSuggestion, VALID_ADJECTIVES, VALID_NOUNS, generate_agent_name,
