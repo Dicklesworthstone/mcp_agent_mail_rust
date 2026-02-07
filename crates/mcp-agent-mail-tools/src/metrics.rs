@@ -9,33 +9,61 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{TOOL_CLUSTER_MAP, tool_cluster};
+use crate::TOOL_CLUSTER_MAP;
 
-/// Per-tool call and error counters.
-#[derive(Debug, Default)]
-struct ToolCounters {
-    calls: u64,
-    errors: u64,
+const TOOL_COUNT: usize = TOOL_CLUSTER_MAP.len();
+
+static TOOL_CALLS: LazyLock<[AtomicU64; TOOL_COUNT]> =
+    LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+static TOOL_ERRORS: LazyLock<[AtomicU64; TOOL_COUNT]> =
+    LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+
+/// Convert tool name -> stable index into the pre-allocated counter arrays.
+///
+/// The index corresponds to the tool's position in `TOOL_CLUSTER_MAP`.
+#[must_use]
+pub fn tool_index(tool_name: &str) -> Option<usize> {
+    TOOL_CLUSTER_MAP
+        .iter()
+        .position(|(name, _cluster)| *name == tool_name)
 }
 
-/// Global tool metrics registry.
-static TOOL_METRICS: std::sync::LazyLock<Mutex<HashMap<String, ToolCounters>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[inline]
+pub fn record_call_idx(tool_index: usize) {
+    debug_assert!(tool_index < TOOL_COUNT);
+    TOOL_CALLS[tool_index].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_error_idx(tool_index: usize) {
+    debug_assert!(tool_index < TOOL_COUNT);
+    TOOL_ERRORS[tool_index].fetch_add(1, Ordering::Relaxed);
+}
 
 /// Record a successful tool call.
 pub fn record_call(tool_name: &str) {
-    if let Ok(mut map) = TOOL_METRICS.lock() {
-        map.entry(tool_name.to_string()).or_default().calls += 1;
+    if let Some(idx) = tool_index(tool_name) {
+        record_call_idx(idx);
+    } else {
+        debug_assert!(
+            false,
+            "record_call called with unknown tool name: {tool_name}"
+        );
     }
 }
 
 /// Record a tool error.
 pub fn record_error(tool_name: &str) {
-    if let Ok(mut map) = TOOL_METRICS.lock() {
-        map.entry(tool_name.to_string()).or_default().errors += 1;
+    if let Some(idx) = tool_index(tool_name) {
+        record_error_idx(idx);
+    } else {
+        debug_assert!(
+            false,
+            "record_error called with unknown tool name: {tool_name}"
+        );
     }
 }
 
@@ -43,8 +71,11 @@ pub fn record_error(tool_name: &str) {
 ///
 /// Intended for tests that need deterministic snapshots across multiple tool calls.
 pub fn reset_tool_metrics() {
-    if let Ok(mut map) = TOOL_METRICS.lock() {
-        map.clear();
+    for c in TOOL_CALLS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    for e in TOOL_ERRORS.iter() {
+        e.store(0, Ordering::Relaxed);
     }
 }
 
@@ -340,25 +371,27 @@ pub struct MetricsSnapshotEntry {
 /// - Enriched with cluster, capabilities, complexity from metadata
 #[must_use]
 pub fn tool_metrics_snapshot() -> Vec<MetricsSnapshotEntry> {
-    let Ok(map) = TOOL_METRICS.lock() else {
-        return Vec::new();
-    };
-
-    let mut entries: Vec<MetricsSnapshotEntry> = map
+    let mut entries: Vec<MetricsSnapshotEntry> = TOOL_CLUSTER_MAP
         .iter()
-        .map(|(name, counters)| {
+        .enumerate()
+        .filter_map(|(idx, (name, cluster))| {
+            let calls = TOOL_CALLS[idx].load(Ordering::Relaxed);
+            if calls == 0 {
+                return None;
+            }
+
+            let errors = TOOL_ERRORS[idx].load(Ordering::Relaxed);
             let meta = tool_meta(name);
-            let cluster = tool_cluster(name).unwrap_or("unclassified");
-            MetricsSnapshotEntry {
-                name: name.clone(),
-                calls: counters.calls,
-                errors: counters.errors,
-                cluster: cluster.to_string(),
+            Some(MetricsSnapshotEntry {
+                name: (*name).to_string(),
+                calls,
+                errors,
+                cluster: (*cluster).to_string(),
                 capabilities: meta
                     .map(|m| m.capabilities.iter().map(|s| (*s).to_string()).collect())
                     .unwrap_or_default(),
                 complexity: meta.map_or("unknown", |m| m.complexity).to_string(),
-            }
+            })
         })
         .collect();
 
@@ -371,19 +404,15 @@ pub fn tool_metrics_snapshot() -> Vec<MetricsSnapshotEntry> {
 /// Used by the tooling metrics resource to always show the full catalogue.
 #[must_use]
 pub fn tool_metrics_snapshot_full() -> Vec<MetricsSnapshotEntry> {
-    let Ok(map) = TOOL_METRICS.lock() else {
-        return Vec::new();
-    };
-
     let mut entries: Vec<MetricsSnapshotEntry> = TOOL_CLUSTER_MAP
         .iter()
-        .map(|(name, cluster)| {
-            let counters = map.get(*name);
+        .enumerate()
+        .map(|(idx, (name, cluster))| {
             let meta = tool_meta(name);
             MetricsSnapshotEntry {
                 name: (*name).to_string(),
-                calls: counters.map_or(0, |c| c.calls),
-                errors: counters.map_or(0, |c| c.errors),
+                calls: TOOL_CALLS[idx].load(Ordering::Relaxed),
+                errors: TOOL_ERRORS[idx].load(Ordering::Relaxed),
                 cluster: (*cluster).to_string(),
                 capabilities: meta
                     .map(|m| m.capabilities.iter().map(|s| (*s).to_string()).collect())

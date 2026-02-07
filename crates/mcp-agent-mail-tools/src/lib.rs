@@ -34,8 +34,8 @@ pub use identity::*;
 pub use macros::*;
 pub use messaging::*;
 pub use metrics::{
-    MetricsSnapshotEntry, record_call, record_error, reset_tool_metrics, tool_meta,
-    tool_metrics_snapshot, tool_metrics_snapshot_full,
+    MetricsSnapshotEntry, record_call, record_call_idx, record_error, record_error_idx,
+    reset_tool_metrics, tool_index, tool_meta, tool_metrics_snapshot, tool_metrics_snapshot_full,
 };
 pub use products::*;
 pub use reservations::*;

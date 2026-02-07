@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use crate::search::{AggregateSummary, MentionCount, ThreadEntry, ThreadSummary, TopMention};
-use mcp_agent_mail_core::config::dotenv_value;
+use mcp_agent_mail_core::{LockLevel, OrderedMutex, config::dotenv_value};
 
 // ---------------------------------------------------------------------------
 // Provider env bridge
@@ -33,10 +33,10 @@ const ENV_BRIDGE_MAPPINGS: &[(&str, &[&str])] = &[
 
 /// In-memory bridged env vars (since `set_var` is unsafe in Rust 2024).
 /// Maps canonical key → value when bridged from a synonym.
-static BRIDGED_ENV: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static BRIDGED_ENV: OnceLock<OrderedMutex<HashMap<String, String>>> = OnceLock::new();
 
-fn bridged_env() -> &'static Mutex<HashMap<String, String>> {
-    BRIDGED_ENV.get_or_init(|| Mutex::new(HashMap::new()))
+fn bridged_env() -> &'static OrderedMutex<HashMap<String, String>> {
+    BRIDGED_ENV.get_or_init(|| OrderedMutex::new(LockLevel::ToolsBridgedEnv, HashMap::new()))
 }
 
 /// Look up an env var, checking our bridged map first, then real env.
@@ -52,10 +52,11 @@ fn get_env_var(key: &str) -> Option<String> {
     if let Some(val) = env_nonempty(key) {
         return Some(val);
     }
-    if let Ok(map) = bridged_env().lock() {
-        if let Some(val) = map.get(key) {
-            return Some(val.clone());
-        }
+    if let Some(val) = {
+        let map = bridged_env().lock();
+        map.get(key).cloned()
+    } {
+        return Some(val);
     }
     dotenv_nonempty(key)
 }
@@ -113,9 +114,7 @@ fn compute_env_bridge(
 /// (non-empty), look for aliases in env first, then .env, and store the result
 /// in the bridged map.
 pub fn bridge_provider_env() {
-    let Ok(mut map) = bridged_env().lock() else {
-        return;
-    };
+    let mut map = bridged_env().lock();
     for &(canonical, aliases) in ENV_BRIDGE_MAPPINGS {
         if env_nonempty(canonical).is_some() || map.contains_key(canonical) {
             continue;
