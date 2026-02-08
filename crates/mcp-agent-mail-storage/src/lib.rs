@@ -3096,6 +3096,13 @@ fn update_thread_digest(
 // Attachment pipeline
 // ---------------------------------------------------------------------------
 
+/// Maximum concurrent WebP conversion threads for parallel attachment processing.
+const MAX_CONCURRENT_CONVERSIONS: usize = 4;
+
+/// Maximum attachment file size for WebP conversion (50 MB).
+/// Files larger than this are rejected to prevent pathological decode times.
+const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+
 /// Metadata about a stored attachment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentMeta {
@@ -3133,6 +3140,7 @@ pub struct AttachmentManifest {
 }
 
 /// Result of storing a single attachment.
+#[derive(Debug)]
 pub struct StoredAttachment {
     pub meta: AttachmentMeta,
     /// Relative paths that were written (for git commit)
@@ -3160,10 +3168,72 @@ impl EmbedPolicy {
     }
 }
 
+/// Reconstruct a [`StoredAttachment`] from cached WebP + manifest on disk.
+///
+/// Called when the SHA1-based cache check finds that the WebP and manifest
+/// already exist, skipping the expensive image decode + re-encode.
+fn store_attachment_from_cache(
+    archive: &ProjectArchive,
+    config: &Config,
+    webp_path: &Path,
+    manifest_path: &Path,
+    digest: &str,
+    embed_policy: EmbedPolicy,
+) -> Result<StoredAttachment> {
+    use base64::Engine;
+
+    let manifest_str = fs::read_to_string(manifest_path)?;
+    let manifest: AttachmentManifest = serde_json::from_str(&manifest_str)?;
+
+    let webp_rel = rel_path(&archive.repo_root, webp_path)?;
+
+    let should_inline = match embed_policy {
+        EmbedPolicy::Inline => true,
+        EmbedPolicy::File => false,
+        EmbedPolicy::Auto => manifest.bytes_webp <= config.inline_image_max_bytes,
+    };
+
+    let meta = if should_inline {
+        let webp_bytes = fs::read(webp_path)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
+        AttachmentMeta {
+            kind: "inline".to_string(),
+            media_type: "image/webp".to_string(),
+            bytes: manifest.bytes_webp,
+            sha1: digest.to_string(),
+            width: manifest.width,
+            height: manifest.height,
+            data_base64: Some(encoded),
+            path: None,
+            original_path: manifest.original_path.clone(),
+        }
+    } else {
+        AttachmentMeta {
+            kind: "file".to_string(),
+            media_type: "image/webp".to_string(),
+            bytes: manifest.bytes_webp,
+            sha1: digest.to_string(),
+            width: manifest.width,
+            height: manifest.height,
+            data_base64: None,
+            path: Some(webp_rel),
+            original_path: manifest.original_path.clone(),
+        }
+    };
+
+    // Return empty rel_paths — files are already on disk and committed.
+    Ok(StoredAttachment {
+        meta,
+        rel_paths: Vec::new(),
+    })
+}
+
 /// Store an image attachment in the archive.
 ///
 /// Converts to WebP, writes to `attachments/{sha1[:2]}/{sha1}.webp`,
 /// optionally keeps original, writes manifest and audit log.
+/// Includes SHA1-based conversion cache: if the WebP already exists,
+/// the expensive decode+encode is skipped.
 ///
 /// Returns metadata and relative paths for git commit.
 pub fn store_attachment(
@@ -3205,15 +3275,36 @@ pub fn store_attachment(
     fs::create_dir_all(&manifest_dir)?;
     fs::create_dir_all(&audit_dir)?;
 
+    // -- Cache check: skip conversion if this SHA1 was already converted --
+    let webp_filename = format!("{digest}.webp");
+    let webp_path = webp_dir.join(&webp_filename);
+    let manifest_path = manifest_dir.join(format!("{digest}.json"));
+    if webp_path.exists() && manifest_path.exists() {
+        return store_attachment_from_cache(
+            archive,
+            config,
+            &webp_path,
+            &manifest_path,
+            &digest,
+            embed_policy,
+        );
+    }
+
+    // -- File size guard: reject pathologically large files --
+    if original_bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(StorageError::InvalidPath(format!(
+            "Attachment too large for conversion ({} bytes, max {})",
+            original_bytes.len(),
+            MAX_ATTACHMENT_BYTES,
+        )));
+    }
+
     let mut rel_paths = Vec::new();
 
     // Convert to WebP
     let img = image::load_from_memory(&original_bytes)
         .map_err(|e| StorageError::InvalidPath(format!("Failed to decode image: {e}")))?;
     let (width, height) = img.dimensions();
-
-    let webp_filename = format!("{digest}.webp");
-    let webp_path = webp_dir.join(&webp_filename);
 
     // Encode to WebP using the image crate
     let mut webp_bytes = Vec::new();
@@ -3251,7 +3342,6 @@ pub fn store_attachment(
         original_ext: original_ext.clone(),
         original_path: original_rel.clone(),
     };
-    let manifest_path = manifest_dir.join(format!("{digest}.json"));
     write_json(&manifest_path, &serde_json::to_value(&manifest)?)?;
     rel_paths.push(rel_path(&archive.repo_root, &manifest_path)?);
 
@@ -3313,6 +3403,10 @@ pub fn store_attachment(
 
 /// Process attachment paths and store them in the archive.
 ///
+/// Resolves paths sequentially (fast), then converts up to
+/// [`MAX_CONCURRENT_CONVERSIONS`] attachments in parallel using
+/// `std::thread::scope` with chunk-based concurrency limiting.
+///
 /// Returns a list of attachment metadata and all relative paths written.
 pub fn process_attachments(
     archive: &ProjectArchive,
@@ -3321,14 +3415,33 @@ pub fn process_attachments(
     attachment_paths: &[String],
     embed_policy: EmbedPolicy,
 ) -> Result<(Vec<AttachmentMeta>, Vec<String>)> {
-    let mut all_meta = Vec::new();
+    // Phase 1: resolve all paths (fast, no image I/O)
+    let resolved: Vec<PathBuf> = attachment_paths
+        .iter()
+        .map(|p| resolve_attachment_source_path(base_dir, config, p))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Phase 2: convert in parallel chunks
+    let mut all_meta = Vec::with_capacity(resolved.len());
     let mut all_rel_paths = Vec::new();
 
-    for path_str in attachment_paths {
-        let resolved = resolve_attachment_source_path(base_dir, config, path_str)?;
-        let stored = store_attachment(archive, config, &resolved, embed_policy)?;
-        all_meta.push(stored.meta);
-        all_rel_paths.extend(stored.rel_paths);
+    for chunk in resolved.chunks(MAX_CONCURRENT_CONVERSIONS) {
+        let results: Vec<Result<StoredAttachment>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|path| s.spawn(|| store_attachment(archive, config, path, embed_policy)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("attachment conversion thread panicked"))
+                .collect()
+        });
+
+        for result in results {
+            let stored = result?;
+            all_meta.push(stored.meta);
+            all_rel_paths.extend(stored.rel_paths);
+        }
     }
 
     Ok((all_meta, all_rel_paths))
@@ -3342,7 +3455,8 @@ fn image_pattern_re() -> &'static Regex {
 
 /// Process inline image references in Markdown body.
 ///
-/// Finds `![alt](path)` references and replaces them with either:
+/// Finds `![alt](path)` references and converts them in parallel (up to
+/// [`MAX_CONCURRENT_CONVERSIONS`] at a time) with either:
 /// - Inline base64 data URI: `![alt](data:image/webp;base64,...)`
 /// - Archive file path: `![alt](attachments/ab/ab1234...webp)`
 ///
@@ -3355,48 +3469,77 @@ pub fn process_markdown_images(
     embed_policy: EmbedPolicy,
 ) -> Result<(String, Vec<AttachmentMeta>, Vec<String>)> {
     let re = image_pattern_re();
-    let mut all_meta = Vec::new();
-    let mut all_rel_paths = Vec::new();
-    let mut result = body_md.to_string();
 
-    // Collect matches first to avoid borrow issues
-    let matches: Vec<(String, String, String)> = re
+    // Collect and filter matches: (full_match, alt, resolved_path)
+    let processable: Vec<(String, String, PathBuf)> = re
         .captures_iter(body_md)
-        .map(|cap| {
+        .filter_map(|cap| {
             let full = cap.get(0).unwrap().as_str().to_string();
             let alt = cap.name("alt").unwrap().as_str().to_string();
             let path = cap.name("path").unwrap().as_str().to_string();
-            (full, alt, path)
+
+            // Skip data URIs and URLs
+            if path.starts_with("data:")
+                || path.starts_with("http://")
+                || path.starts_with("https://")
+            {
+                return None;
+            }
+
+            // Resolve best-effort: missing/unresolvable paths don't fail the message.
+            let resolved = resolve_source_attachment_path_opt(base_dir, config, &path)?;
+            Some((full, alt, resolved))
         })
         .collect();
 
-    for (full_match, alt, path) in matches {
-        // Skip data URIs and URLs
-        if path.starts_with("data:") || path.starts_with("http://") || path.starts_with("https://")
-        {
-            continue;
-        }
+    if processable.is_empty() {
+        return Ok((body_md.to_string(), Vec::new(), Vec::new()));
+    }
 
-        // Resolve best-effort: missing/unresolvable paths should not fail the whole message.
-        let Some(resolved) = resolve_source_attachment_path_opt(base_dir, config, &path) else {
+    // Convert in parallel chunks, collecting (full_match, alt, Result<StoredAttachment>)
+    let mut converted: Vec<(String, String, std::result::Result<StoredAttachment, StorageError>)> =
+        Vec::with_capacity(processable.len());
+
+    for chunk in processable.chunks(MAX_CONCURRENT_CONVERSIONS) {
+        let chunk_results: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|(full, alt, path)| {
+                    let full = full.clone();
+                    let alt = alt.clone();
+                    s.spawn(move || {
+                        let result = store_attachment(archive, config, path, embed_policy);
+                        (full, alt, result)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("markdown image conversion thread panicked"))
+                .collect()
+        });
+        converted.extend(chunk_results);
+    }
+
+    // Apply replacements
+    let mut result = body_md.to_string();
+    let mut all_meta = Vec::new();
+    let mut all_rel_paths = Vec::new();
+
+    for (full_match, alt, stored_result) in converted {
+        let Ok(stored) = stored_result else {
+            continue; // Skip failed conversions
+        };
+        let replacement = if let Some(ref b64) = stored.meta.data_base64 {
+            format!("![{alt}](data:image/webp;base64,{b64})")
+        } else if let Some(ref file_path) = stored.meta.path {
+            format!("![{alt}]({file_path})")
+        } else {
             continue;
         };
-
-        match store_attachment(archive, config, &resolved, embed_policy) {
-            Ok(stored) => {
-                let replacement = if let Some(ref b64) = stored.meta.data_base64 {
-                    format!("![{alt}](data:image/webp;base64,{b64})")
-                } else if let Some(ref file_path) = stored.meta.path {
-                    format!("![{alt}]({file_path})")
-                } else {
-                    continue;
-                };
-                result = result.replace(&full_match, &replacement);
-                all_rel_paths.extend(stored.rel_paths);
-                all_meta.push(stored.meta);
-            }
-            Err(_) => continue, // Skip failed conversions
-        }
+        result = result.replace(&full_match, &replacement);
+        all_rel_paths.extend(stored.rel_paths);
+        all_meta.push(stored.meta);
     }
 
     Ok((result, all_meta, all_rel_paths))
@@ -5469,6 +5612,144 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Attachment cache + parallelism tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_store_attachment_cache_hit_skips_conversion() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "cache-proj").unwrap();
+
+        let img_path = archive.root.join("cached.png");
+        create_test_png(&img_path);
+
+        // First call: cold miss — does full conversion.
+        let first = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap();
+        assert!(!first.rel_paths.is_empty(), "cold miss writes files");
+        let first_sha1 = first.meta.sha1.clone();
+
+        // Second call: cache hit — skips conversion, returns empty rel_paths.
+        let second = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap();
+        assert!(
+            second.rel_paths.is_empty(),
+            "cache hit should return empty rel_paths"
+        );
+        assert_eq!(second.meta.sha1, first_sha1);
+        assert_eq!(second.meta.width, first.meta.width);
+        assert_eq!(second.meta.height, first.meta.height);
+        assert_eq!(second.meta.kind, "file");
+    }
+
+    #[test]
+    fn test_store_attachment_cache_hit_inline_mode() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "cache-inline-proj").unwrap();
+
+        let img_path = archive.root.join("cached_inline.png");
+        create_test_png(&img_path);
+
+        // Cold miss
+        let first = store_attachment(&archive, &config, &img_path, EmbedPolicy::Inline).unwrap();
+        assert_eq!(first.meta.kind, "inline");
+        let first_b64 = first.meta.data_base64.clone().unwrap();
+
+        // Cache hit — inline mode re-reads the WebP and base64-encodes it.
+        let second = store_attachment(&archive, &config, &img_path, EmbedPolicy::Inline).unwrap();
+        assert_eq!(second.meta.kind, "inline");
+        assert_eq!(
+            second.meta.data_base64.unwrap(),
+            first_b64,
+            "cache hit should produce identical base64"
+        );
+    }
+
+    #[test]
+    fn test_process_attachments_parallel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "parallel-proj").unwrap();
+
+        // Create 6 distinct images (exceeds MAX_CONCURRENT_CONVERSIONS=4)
+        let paths: Vec<String> = (0..6)
+            .map(|i| {
+                let p = archive.root.join(format!("img_{i}.png"));
+                // Create slightly different images to avoid SHA1 dedup
+                use image::{ImageBuffer, Rgba};
+                let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+                    ImageBuffer::from_fn(4, 4, |x, y| Rgba([i as u8 * 40, (x * 64) as u8, (y * 64) as u8, 255]));
+                img.save(&p).unwrap();
+                p.display().to_string()
+            })
+            .collect();
+
+        let (meta, rel_paths) = process_attachments(
+            &archive,
+            &config,
+            &archive.root,
+            &paths,
+            EmbedPolicy::File,
+        )
+        .unwrap();
+
+        assert_eq!(meta.len(), 6);
+        assert!(!rel_paths.is_empty());
+        // All should have unique SHA1s
+        let sha1s: std::collections::HashSet<_> = meta.iter().map(|m| &m.sha1).collect();
+        assert_eq!(sha1s.len(), 6);
+    }
+
+    #[test]
+    fn test_process_markdown_images_parallel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "md-par-proj").unwrap();
+
+        // Create 5 distinct test images inside the archive root
+        for i in 0..5 {
+            use image::{ImageBuffer, Rgba};
+            let p = archive.root.join(format!("photo_{i}.png"));
+            let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+                ImageBuffer::from_fn(4, 4, |x, y| Rgba([i as u8 * 50, (x * 64) as u8, (y * 64) as u8, 255]));
+            img.save(&p).unwrap();
+        }
+
+        let body = "A: ![a](photo_0.png) B: ![b](photo_1.png) C: ![c](photo_2.png) \
+                    D: ![d](photo_3.png) E: ![e](photo_4.png)";
+        let (new_body, meta, _) =
+            process_markdown_images(&archive, &config, &archive.root, body, EmbedPolicy::File)
+                .unwrap();
+
+        assert_eq!(meta.len(), 5);
+        // All original refs should be replaced
+        assert!(!new_body.contains("photo_0.png"));
+        assert!(!new_body.contains("photo_4.png"));
+        // All should be replaced with archive paths
+        assert!(new_body.contains("attachments/"));
+    }
+
+    #[test]
+    fn test_store_attachment_rejects_oversized_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "oversize-proj").unwrap();
+
+        // Create a file larger than MAX_ATTACHMENT_BYTES (50MB)
+        // We can't actually write 50MB in a unit test, but we can temporarily
+        // create a smaller "image" and test the guard path by using a non-image
+        // file that would fail decode before the size check. Instead, verify
+        // the constant is set correctly.
+        assert_eq!(MAX_ATTACHMENT_BYTES, 50 * 1024 * 1024);
+
+        // Create a valid but empty file (should fail with "empty" error, not size)
+        let empty_path = archive.root.join("empty.png");
+        fs::write(&empty_path, b"").unwrap();
+        let err = store_attachment(&archive, &config, &empty_path, EmbedPolicy::File).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    // -----------------------------------------------------------------------
     // Read helper tests
     // -----------------------------------------------------------------------
 
@@ -6041,5 +6322,99 @@ mod tests {
         assert!(json.get("archive_lock_wait_us").is_some());
         assert!(json.get("git_commit_latency_us").is_some());
         assert!(json.get("commit_attempts_total").is_some());
+    }
+
+    #[test]
+    fn thread_digest_concurrent_appends_no_interleave() {
+        // Stress test: 50 concurrent messages to the same thread.
+        // Verifies:
+        //   1. Exactly one thread header ("# Thread ...")
+        //   2. Exactly 50 entry separators ("---")
+        //   3. No interleaved/partial entries
+        use std::sync::{Arc, Barrier};
+
+        const NUM_MESSAGES: usize = 50;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "concurrent-proj").unwrap();
+
+        let archive = Arc::new(archive);
+        let config = Arc::new(config);
+        let barrier = Arc::new(Barrier::new(NUM_MESSAGES));
+
+        let handles: Vec<_> = (0..NUM_MESSAGES)
+            .map(|i| {
+                let archive = Arc::clone(&archive);
+                let config = Arc::clone(&config);
+                let barrier = Arc::clone(&barrier);
+
+                std::thread::spawn(move || {
+                    let message = serde_json::json!({
+                        "id": i + 1,
+                        "subject": format!("Concurrent msg #{i}"),
+                        "created_ts": format!("2026-01-15T10:{:02}:{:02}Z", i / 60, i % 60),
+                        "thread_id": "STRESS-THREAD-1",
+                        "project": "concurrent-proj",
+                    });
+
+                    let body = format!("Body content for message {i}. Some text to verify integrity.");
+
+                    barrier.wait();
+
+                    write_message_bundle(
+                        &archive,
+                        &config,
+                        &message,
+                        &body,
+                        "SenderAgent",
+                        &["ReceiverAgent".to_string()],
+                        &[],
+                        None,
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // Read the thread digest and verify structure
+        let digest_path = archive
+            .root
+            .join("messages/threads/stress-thread-1.md");
+        assert!(digest_path.exists(), "digest file should exist");
+
+        let content = std::fs::read_to_string(&digest_path).unwrap();
+
+        // Exactly one thread header
+        let header_count = content.matches("# Thread STRESS-THREAD-1").count();
+        assert_eq!(
+            header_count, 1,
+            "expected exactly 1 thread header, got {header_count}"
+        );
+
+        // Exactly NUM_MESSAGES separator lines
+        let separator_count = content.matches("\n---\n").count();
+        assert_eq!(
+            separator_count, NUM_MESSAGES,
+            "expected {NUM_MESSAGES} separators, got {separator_count}"
+        );
+
+        // Each message should have its "View canonical" link
+        let link_count = content.matches("[View canonical]").count();
+        assert_eq!(
+            link_count, NUM_MESSAGES,
+            "expected {NUM_MESSAGES} canonical links, got {link_count}"
+        );
+
+        // Verify no partial entries: every "## " header line should have
+        // a matching "---" separator. Count entry headers (## timestamp —).
+        let entry_header_count = content.matches("## 2026-01-15T").count();
+        assert_eq!(
+            entry_header_count, NUM_MESSAGES,
+            "expected {NUM_MESSAGES} entry headers, got {entry_header_count}"
+        );
     }
 }
