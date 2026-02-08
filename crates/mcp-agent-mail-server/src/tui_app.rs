@@ -74,6 +74,8 @@ pub struct MailAppModel {
     screens: HashMap<MailScreenId, Box<dyn MailScreen>>,
     help_visible: bool,
     command_palette: CommandPalette,
+    notifications: NotificationQueue,
+    last_toast_seq: u64,
     tick_count: u64,
     accessibility: crate::tui_persist::AccessibilitySettings,
 }
@@ -108,6 +110,8 @@ impl MailAppModel {
             screens,
             help_visible: false,
             command_palette,
+            notifications: NotificationQueue::new(QueueConfig::default()),
+            last_toast_seq: 0,
             tick_count: 0,
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
         }
@@ -336,6 +340,19 @@ impl Model for MailAppModel {
                 for screen in self.screens.values_mut() {
                     screen.tick(self.tick_count, &self.state);
                 }
+
+                // Generate toasts from new high-priority events
+                let new_events = self.state.events_since(self.last_toast_seq);
+                for event in &new_events {
+                    self.last_toast_seq = event.seq().max(self.last_toast_seq);
+                    if let Some(toast) = toast_for_event(event) {
+                        self.notifications.notify(toast);
+                    }
+                }
+
+                // Advance notification timers
+                self.notifications.tick(TICK_INTERVAL);
+
                 Cmd::tick(TICK_INTERVAL)
             }
 
@@ -467,12 +484,17 @@ impl Model for MailAppModel {
             chrome.status_line,
         );
 
-        // 4. Command palette (z=4, modal)
+        // 4. Toast notifications (z=4, overlay)
+        NotificationStack::new(&self.notifications)
+            .margin(1)
+            .render(area, frame);
+
+        // 5. Command palette (z=5, modal)
         if self.command_palette.is_visible() {
             self.command_palette.render(area, frame);
         }
 
-        // 5. Help overlay (z=5, topmost)
+        // 6. Help overlay (z=6, topmost)
         if self.help_visible {
             let bindings = self
                 .screens
@@ -731,6 +753,47 @@ fn build_palette_actions(state: &TuiSharedState) -> Vec<ActionItem> {
     }
 
     out
+}
+
+/// Generate a toast notification for high-priority events.
+///
+/// Returns `None` for routine events that shouldn't produce toasts.
+fn toast_for_event(event: &MailEvent) -> Option<Toast> {
+    match event {
+        MailEvent::MessageSent { from, to, .. } => {
+            let recipients = if to.len() > 2 {
+                format!("{} +{}", to[0], to.len() - 1)
+            } else {
+                to.join(", ")
+            };
+            Some(
+                Toast::new(format!("{from} → {recipients}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(4)),
+            )
+        }
+        MailEvent::AgentRegistered { name, program, .. } => Some(
+            Toast::new(format!("{name} ({program})"))
+                .icon(ToastIcon::Success)
+                .duration(Duration::from_secs(4)),
+        ),
+        MailEvent::HttpRequest { status, path, .. } if *status >= 500 => Some(
+            Toast::new(format!("HTTP {status} on {path}"))
+                .icon(ToastIcon::Error)
+                .duration(Duration::from_secs(6)),
+        ),
+        MailEvent::ServerShutdown { .. } => Some(
+            Toast::new("Server shutting down")
+                .icon(ToastIcon::Warning)
+                .duration(Duration::from_secs(8)),
+        ),
+        MailEvent::ServerStarted { endpoint, .. } => Some(
+            Toast::new(format!("Server started at {endpoint}"))
+                .icon(ToastIcon::Success)
+                .duration(Duration::from_secs(5)),
+        ),
+        _ => None,
+    }
 }
 
 fn extract_tool_name(event: &MailEvent) -> Option<&str> {
