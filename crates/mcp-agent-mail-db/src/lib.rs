@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod coalesce;
 pub mod error;
 pub mod integrity;
 pub mod models;
@@ -26,11 +27,12 @@ pub mod timestamps;
 pub mod tracking;
 
 pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
+pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
+pub use error::{DbError, DbResult, is_lock_error, is_pool_exhausted_error};
 pub use integrity::{
     CheckKind, IntegrityCheckResult, IntegrityMetrics, attempt_vacuum_recovery, full_check,
     incremental_check, integrity_metrics, is_full_check_due, quick_check,
 };
-pub use error::{DbError, DbResult, is_lock_error, is_pool_exhausted_error};
 pub use models::*;
 pub use pool::{DbPool, DbPoolConfig, auto_pool_size, create_pool, get_or_create_pool};
 pub use retry::{
