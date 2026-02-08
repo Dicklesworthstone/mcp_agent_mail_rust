@@ -10,10 +10,12 @@
           "expect": {
             "ok": {
               "status": "ok",
+              "health_level": "green",
               "environment": "development",
               "http_host": "127.0.0.1",
               "http_port": 8765,
               "database_url": null,
+              "disk": null,
               "pool_utilization": {
                 "active": 0,
                 "idle": 0,
@@ -64,6 +66,8 @@
           "normalize": {
             "ignore_json_pointers": [
               "/database_url",
+              "/disk",
+              "/health_level",
               "/pool_utilization/acquire_p50_ms",
               "/pool_utilization/acquire_p95_ms",
               "/pool_utilization/acquire_p99_ms",
@@ -4352,6 +4356,7 @@
           "expect": {
             "ok": {
               "generated_at": null,
+              "health_level": "green",
               "tools": [
                 {
                   "name": "acknowledge_message",
@@ -4723,7 +4728,8 @@
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/generated_at"
+              "/generated_at",
+              "/health_level"
             ]
           }
         }
@@ -4737,6 +4743,7 @@
           "expect": {
             "ok": {
               "generated_at": null,
+              "health_level": "green",
               "tools": [
                 {
                   "name": "acknowledge_message",
@@ -5108,7 +5115,8 @@
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/generated_at"
+              "/generated_at",
+              "/health_level"
             ]
           }
         }

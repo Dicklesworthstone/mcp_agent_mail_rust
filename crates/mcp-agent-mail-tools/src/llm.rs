@@ -796,7 +796,12 @@ pub fn single_thread_user_prompt(
     let mut prompt = String::from("Summarize this thread:\n\n");
     for (id, from, subject, body) in messages.iter().take(MAX_MESSAGES_FOR_LLM) {
         let truncated_body = if body.len() > MESSAGE_TRUNCATION_CHARS {
-            &body[..MESSAGE_TRUNCATION_CHARS]
+            // Find a valid UTF-8 char boundary at or before the limit.
+            let mut end = MESSAGE_TRUNCATION_CHARS;
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            &body[..end]
         } else {
             body.as_str()
         };

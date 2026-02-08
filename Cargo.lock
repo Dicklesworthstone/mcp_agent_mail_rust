@@ -4186,6 +4186,7 @@ dependencies = [
  "coding-agent-search",
  "criterion",
  "dirs",
+ "fs2",
  "regex",
  "serde",
  "serde_json",
@@ -4201,6 +4202,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "chrono",
+ "indexmap",
  "mcp-agent-mail-core",
  "regex",
  "serde",

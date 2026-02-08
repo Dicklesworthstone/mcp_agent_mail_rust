@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 
 use ftui::layout::Rect;
+use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
@@ -417,7 +418,15 @@ fn format_ctx(project: Option<&str>, agent: Option<&str>) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        return s;
+    }
+    // Find a valid UTF-8 char boundary at or before `max`.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -514,18 +523,20 @@ fn render_event_log(
     let end = (start + visible_height).min(total);
     let viewport = &entries[start..end];
 
-    // Build text lines with severity badge
-    let mut lines = Vec::with_capacity(viewport.len());
+    // Build styled text lines with colored severity badges
+    let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len());
     for entry in viewport {
-        lines.push(format!(
-            "{} {} {} {}",
-            entry.timestamp,
-            entry.severity.badge(),
-            entry.icon,
-            entry.summary,
-        ));
+        let sev = entry.severity;
+        let line = Line::from_spans([
+            Span::raw(format!("{} ", entry.timestamp)),
+            sev.styled_badge(),
+            Span::raw(" "),
+            Span::styled(format!("{}", entry.icon), sev.style()),
+            Span::raw(format!(" {}", entry.summary)),
+        ]);
+        text_lines.push(line);
     }
-    let text = lines.join("\n");
+    let text = Text::from_lines(text_lines);
 
     let follow_indicator = if auto_follow { " [FOLLOW]" } else { "" };
     let verbosity_indicator = format!(" [{}]", verbosity.label());
@@ -561,8 +572,22 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         .checked_div(counters.total)
         .unwrap_or(0);
 
+    let total_drops = ring_stats.total_drops();
+    let drop_detail = if total_drops == 0 {
+        "Drops:0".to_string()
+    } else {
+        format!(
+            "Drops:{} (ovf:{} ctn:{} smp:{})",
+            total_drops,
+            ring_stats.dropped_overflow,
+            ring_stats.contention_drops,
+            ring_stats.sampled_drops,
+        )
+    };
+    let fill = ring_stats.fill_pct();
+    let bp_indicator = if fill >= 80 { " [BP]" } else { "" };
     let footer = format!(
-        " Req:{} Avg:{}ms 2xx:{} 4xx:{} 5xx:{} | Events:{}/{} Drops:{}",
+        " Req:{} Avg:{}ms 2xx:{} 4xx:{} 5xx:{} | Events:{}/{} ({}%) {} {}",
         counters.total,
         avg_ms,
         counters.status_2xx,
@@ -570,7 +595,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         counters.status_5xx,
         ring_stats.len,
         ring_stats.capacity,
-        ring_stats.dropped_overflow,
+        fill,
+        drop_detail,
+        bp_indicator,
     );
 
     let p = Paragraph::new(footer);
@@ -736,6 +763,16 @@ mod tests {
     fn truncate_short_string() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world!", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8() {
+        // "café" — 'é' is 2 bytes (0xC3 0xA9); byte offsets: c=0, a=1, f=2, é=3..4
+        assert_eq!(truncate("café", 4), "caf"); // byte 4 is mid-'é', backs up to 3
+        assert_eq!(truncate("café", 5), "café"); // all 5 bytes fit
+        // Emoji: '🎉' is 4 bytes; "hi🎉bye" = h(0) i(1) 🎉(2..5) b(6) y(7) e(8)
+        assert_eq!(truncate("hi🎉bye", 3), "hi"); // byte 3 mid-emoji, backs up to 2
+        assert_eq!(truncate("hi🎉bye", 6), "hi🎉"); // byte 6 = start of 'b'
     }
 
     #[test]
@@ -1029,5 +1066,271 @@ mod tests {
             let icon = event_icon(kind);
             assert_ne!(icon, '\0');
         }
+    }
+
+    // ── Dashboard state-machine edge cases ───────────────────────
+
+    #[test]
+    fn scroll_up_disables_auto_follow() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        assert!(screen.auto_follow);
+
+        let up = Event::Key(ftui::KeyEvent::new(KeyCode::Char('k')));
+        screen.update(&up, &state);
+        assert!(!screen.auto_follow);
+        assert_eq!(screen.scroll_offset, 1);
+    }
+
+    #[test]
+    fn scroll_down_to_bottom_re_enables_follow() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.auto_follow = false;
+        screen.scroll_offset = 1;
+
+        let down = Event::Key(ftui::KeyEvent::new(KeyCode::Char('j')));
+        screen.update(&down, &state);
+        assert_eq!(screen.scroll_offset, 0);
+        assert!(screen.auto_follow);
+    }
+
+    #[test]
+    fn g_jumps_to_top() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.verbosity = VerbosityTier::All;
+
+        // Add some events
+        for _ in 0..20 {
+            screen.event_log.push(EventEntry {
+                kind: MailEventKind::HttpRequest,
+                severity: EventSeverity::Debug,
+                timestamp: "00:00:00.000".to_string(),
+                icon: '↔',
+                summary: "GET /".to_string(),
+            });
+        }
+
+        let g = Event::Key(ftui::KeyEvent::new(KeyCode::Char('g')));
+        screen.update(&g, &state);
+        assert!(!screen.auto_follow);
+        assert!(screen.scroll_offset > 0);
+    }
+
+    #[test]
+    fn g_upper_jumps_to_bottom() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.auto_follow = false;
+        screen.scroll_offset = 10;
+
+        let g = Event::Key(ftui::KeyEvent::new(KeyCode::Char('G')));
+        screen.update(&g, &state);
+        assert!(screen.auto_follow);
+        assert_eq!(screen.scroll_offset, 0);
+    }
+
+    #[test]
+    fn f_key_toggles_follow() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        assert!(screen.auto_follow);
+
+        let f = Event::Key(ftui::KeyEvent::new(KeyCode::Char('f')));
+        screen.update(&f, &state);
+        assert!(!screen.auto_follow);
+
+        screen.update(&f, &state);
+        assert!(screen.auto_follow);
+        assert_eq!(screen.scroll_offset, 0);
+    }
+
+    #[test]
+    fn type_filter_cycles_through_states() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        let t = Event::Key(ftui::KeyEvent::new(KeyCode::Char('t')));
+
+        // empty -> ToolCallEnd
+        screen.update(&t, &state);
+        assert!(screen.type_filter.contains(&MailEventKind::ToolCallEnd));
+
+        // ToolCallEnd -> MessageSent
+        screen.update(&t, &state);
+        assert!(screen.type_filter.contains(&MailEventKind::MessageSent));
+
+        // MessageSent -> HttpRequest
+        screen.update(&t, &state);
+        assert!(screen.type_filter.contains(&MailEventKind::HttpRequest));
+
+        // HttpRequest -> clear
+        screen.update(&t, &state);
+        assert!(screen.type_filter.is_empty());
+    }
+
+    #[test]
+    fn ingest_events_trims_to_capacity() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        // Push more than EVENT_LOG_CAPACITY events
+        for i in 0..(EVENT_LOG_CAPACITY + 500) {
+            let _ = state.push_event(MailEvent::http_request(
+                "GET",
+                format!("/{i}"),
+                200,
+                1,
+                "127.0.0.1",
+            ));
+        }
+        screen.ingest_events(&state);
+        assert!(screen.event_log.len() <= EVENT_LOG_CAPACITY);
+    }
+
+    #[test]
+    fn format_event_message_with_many_recipients() {
+        let event = MailEvent::message_sent(
+            1,
+            "GoldFox",
+            vec![
+                "SilverWolf".to_string(),
+                "BluePeak".to_string(),
+                "RedLake".to_string(),
+            ],
+            "Hello",
+            "t",
+            "p",
+        );
+        let entry = format_event(&event);
+        // 3 recipients -> should use "+N" format
+        assert!(entry.summary.contains("+1"));
+    }
+
+    #[test]
+    fn format_event_reservation_with_many_paths() {
+        let event = MailEvent::reservation_granted(
+            "BlueFox",
+            vec![
+                "src/**".to_string(),
+                "tests/**".to_string(),
+                "docs/**".to_string(),
+            ],
+            false,
+            3600,
+            "proj",
+        );
+        let entry = format_event(&event);
+        assert!(entry.summary.contains("+2"));
+        assert!(!entry.summary.contains("(excl)"));
+    }
+
+    #[test]
+    fn format_event_reservation_released_with_many_paths() {
+        let event = MailEvent::reservation_released(
+            "BlueFox",
+            vec!["a/**".to_string(), "b/**".to_string(), "c/**".to_string()],
+            "proj",
+        );
+        let entry = format_event(&event);
+        assert!(entry.summary.contains("released"));
+        assert!(entry.summary.contains("+2"));
+    }
+
+    #[test]
+    fn format_event_health_pulse() {
+        let event = MailEvent::health_pulse(DbStatSnapshot {
+            projects: 3,
+            agents: 7,
+            messages: 42,
+            ..Default::default()
+        });
+        let entry = format_event(&event);
+        assert!(entry.summary.contains("p=3"));
+        assert!(entry.summary.contains("a=7"));
+        assert!(entry.summary.contains("m=42"));
+    }
+
+    #[test]
+    fn format_event_message_received() {
+        let event = MailEvent::message_received(
+            99,
+            "SilverWolf",
+            vec!["GoldFox".to_string()],
+            "Status update",
+            "thread-1",
+            "proj",
+        );
+        let entry = format_event(&event);
+        assert!(entry.summary.contains("#99"));
+        assert!(entry.summary.contains("SilverWolf"));
+        assert!(entry.summary.contains("Status update"));
+    }
+
+    #[test]
+    fn format_event_tool_call_start() {
+        let event = MailEvent::tool_call_start(
+            "fetch_inbox",
+            serde_json::Value::Null,
+            Some("p".into()),
+            Some("A".into()),
+        );
+        let entry = format_event(&event);
+        assert!(entry.summary.contains("→ fetch_inbox"));
+        assert!(entry.summary.contains("[A@p]"));
+    }
+
+    #[test]
+    fn render_sparkline_width_larger_than_data() {
+        let data = vec![1.0, 4.0];
+        let spark = render_sparkline(&data, 10);
+        // Should only produce chars for available data points (2)
+        assert_eq!(spark.chars().count(), 2);
+    }
+
+    #[test]
+    fn render_sparkline_single_value() {
+        let data = vec![5.0];
+        let spark = render_sparkline(&data, 5);
+        assert_eq!(spark.chars().count(), 1);
+        assert_eq!(spark.chars().next(), Some('█'));
+    }
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(0)), "0s");
+    }
+
+    #[test]
+    fn dashboard_title_and_label() {
+        let screen = DashboardScreen::new();
+        assert_eq!(screen.title(), "Dashboard");
+        assert_eq!(screen.tab_label(), "Dash");
+    }
+
+    #[test]
+    fn dashboard_default_impl() {
+        let screen = DashboardScreen::default();
+        assert!(screen.event_log.is_empty());
+        assert!(screen.auto_follow);
+        assert_eq!(screen.scroll_offset, 0);
+    }
+
+    #[test]
+    fn dashboard_renders_at_zero_height_without_panic() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let screen = DashboardScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 1, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 80, 1), &state);
     }
 }

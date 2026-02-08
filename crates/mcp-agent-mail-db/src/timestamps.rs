@@ -149,8 +149,8 @@ mod tests {
         // These extreme values are outside chrono's representable range.
         // Before the fix, this would panic with "valid timestamp".
         // After the fix, it returns Unix epoch as a safe fallback.
-        let epoch = NaiveDateTime::parse_from_str("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
-            .unwrap();
+        let epoch =
+            NaiveDateTime::parse_from_str("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
 
         let dt = micros_to_naive(i64::MAX);
         assert_eq!(dt, epoch);

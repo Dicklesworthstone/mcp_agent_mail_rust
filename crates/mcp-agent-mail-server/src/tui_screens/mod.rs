@@ -132,12 +132,36 @@ pub trait MailScreen {
         false
     }
 
+    /// Return the currently focused/selected event, if any.
+    ///
+    /// Used by the command palette to inject context-aware quick actions
+    /// based on the focused entity (agent, thread, tool, etc.).
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        None
+    }
+
     /// Title shown in the help overlay header.
     fn title(&self) -> &'static str;
 
     /// Short label for tab bar display (max ~12 chars).
     fn tab_label(&self) -> &'static str {
         self.title()
+    }
+
+    /// Reset the layout to factory defaults. Returns `true` if supported.
+    fn reset_layout(&mut self) -> bool {
+        false
+    }
+
+    /// Export the current layout as JSON to the standard export path.
+    /// Returns the path on success.
+    fn export_layout(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Import a layout from the standard export path. Returns `true` on success.
+    fn import_layout(&mut self) -> bool {
+        false
     }
 }
 
@@ -153,7 +177,7 @@ pub enum MailScreenMsg {
 }
 
 /// Context for deep-link navigation between screens.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeepLinkTarget {
     /// Jump to a specific timestamp in the Timeline screen.
     TimelineAtTime(i64),
@@ -161,6 +185,12 @@ pub enum DeepLinkTarget {
     MessageById(i64),
     /// Jump to a specific thread in the Thread Explorer.
     ThreadById(String),
+    /// Jump to an agent in the Agent Roster screen.
+    AgentByName(String),
+    /// Jump to a tool in the Tool Metrics screen.
+    ToolByName(String),
+    /// Jump to a project in the Dashboard screen.
+    ProjectBySlug(String),
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -375,5 +405,110 @@ mod tests {
             screen_meta(MailScreenId::SystemHealth).category,
             ScreenCategory::System
         );
+    }
+
+    // ── Screen ID edge cases ────────────────────────────────────
+
+    #[test]
+    fn next_cycles_full_loop() {
+        let mut id = MailScreenId::Dashboard;
+        let mut visited = vec![id];
+        for _ in 0..ALL_SCREEN_IDS.len() {
+            id = id.next();
+            visited.push(id);
+        }
+        // Should wrap back to start
+        assert_eq!(visited[0], visited[ALL_SCREEN_IDS.len()]);
+    }
+
+    #[test]
+    fn prev_cycles_full_loop() {
+        let mut id = MailScreenId::Dashboard;
+        let mut visited = vec![id];
+        for _ in 0..ALL_SCREEN_IDS.len() {
+            id = id.prev();
+            visited.push(id);
+        }
+        assert_eq!(visited[0], visited[ALL_SCREEN_IDS.len()]);
+    }
+
+    #[test]
+    fn from_number_covers_all_screens() {
+        for i in 1..=ALL_SCREEN_IDS.len() {
+            let id = MailScreenId::from_number(i).expect("valid index");
+            assert_eq!(id, ALL_SCREEN_IDS[i - 1]);
+        }
+    }
+
+    #[test]
+    fn registry_descriptions_are_nonempty() {
+        for meta in MAIL_SCREEN_REGISTRY {
+            assert!(
+                !meta.description.is_empty(),
+                "{:?} has empty description",
+                meta.id
+            );
+        }
+    }
+
+    #[test]
+    fn screen_ids_returns_all_screen_ids() {
+        assert_eq!(screen_ids().len(), ALL_SCREEN_IDS.len());
+        assert_eq!(screen_ids(), ALL_SCREEN_IDS);
+    }
+
+    #[test]
+    fn placeholder_screen_title_matches_meta() {
+        for &id in &[
+            MailScreenId::Agents,
+            MailScreenId::Reservations,
+            MailScreenId::ToolMetrics,
+        ] {
+            let screen = PlaceholderScreen::new(id);
+            let meta = screen_meta(id);
+            assert_eq!(screen.title(), meta.title);
+            assert_eq!(screen.tab_label(), meta.short_label);
+        }
+    }
+
+    #[test]
+    fn placeholder_screen_update_is_noop() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = PlaceholderScreen::new(MailScreenId::Agents);
+        let event = Event::Key(ftui::KeyEvent::new(ftui::KeyCode::Char('q')));
+        let cmd = screen.update(&event, &state);
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn placeholder_screen_renders_without_panic() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let screen = PlaceholderScreen::new(MailScreenId::Agents);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        screen.view(&mut frame, ftui::layout::Rect::new(0, 0, 80, 24), &state);
+    }
+
+    #[test]
+    fn deep_link_target_variants_exist() {
+        // Ensure all variants can be constructed
+        let _ = DeepLinkTarget::TimelineAtTime(0);
+        let _ = DeepLinkTarget::MessageById(0);
+        let _ = DeepLinkTarget::ThreadById(String::new());
+        let _ = DeepLinkTarget::AgentByName(String::new());
+        let _ = DeepLinkTarget::ToolByName(String::new());
+        let _ = DeepLinkTarget::ProjectBySlug(String::new());
+    }
+
+    #[test]
+    fn default_keybindings_and_deep_link_trait_defaults() {
+        let config = mcp_agent_mail_core::Config::default();
+        let _state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = PlaceholderScreen::new(MailScreenId::Agents);
+        assert!(screen.keybindings().is_empty());
+        assert!(!screen.receive_deep_link(&DeepLinkTarget::MessageById(1)));
+        assert!(!screen.consumes_text_input());
     }
 }

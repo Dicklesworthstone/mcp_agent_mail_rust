@@ -3,6 +3,7 @@
 mod ack_ttl;
 mod cleanup;
 pub mod console;
+mod disk_monitor;
 mod mail_ui;
 mod markdown;
 mod retention;
@@ -15,6 +16,9 @@ pub mod tui_app;
 pub mod tui_bridge;
 pub mod tui_chrome;
 pub mod tui_events;
+pub mod tui_keymap;
+pub mod tui_layout;
+pub mod tui_persist;
 pub mod tui_poller;
 pub mod tui_screens;
 
@@ -126,6 +130,18 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        // Backpressure gate: reject shedable tools under Red
+        let bp_level = mcp_agent_mail_core::cached_health_level();
+        if bp_level.should_shed(mcp_agent_mail_core::is_shedable_tool(self.tool_name)) {
+            return Err(McpError::new(
+                McpErrorCode::InternalError,
+                format!(
+                    "Server overloaded (health_level=red). Tool '{}' temporarily unavailable. Retry after load subsides.",
+                    self.tool_name,
+                ),
+            ));
+        }
+
         mcp_agent_mail_tools::record_call_idx(self.tool_index);
 
         // Emit ToolCallStart with masked params
@@ -177,6 +193,20 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         ctx: &'a McpContext,
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        // Backpressure gate: reject shedable tools under Red
+        let bp_level = mcp_agent_mail_core::cached_health_level();
+        if bp_level.should_shed(mcp_agent_mail_core::is_shedable_tool(self.tool_name)) {
+            return Box::pin(std::future::ready(fastmcp_core::Outcome::Err(
+                McpError::new(
+                    McpErrorCode::InternalError,
+                    format!(
+                        "Server overloaded (health_level=red). Tool '{}' temporarily unavailable. Retry after load subsides.",
+                        self.tool_name,
+                    ),
+                ),
+            )));
+        }
+
         mcp_agent_mail_tools::record_call_idx(self.tool_index);
 
         // Emit ToolCallStart with masked params
@@ -245,16 +275,24 @@ fn extract_project_agent(args: &serde_json::Value) -> (Option<String>, Option<St
     (project, agent)
 }
 
+/// Truncate a UTF-8 string to at most `max_bytes`, backing off to a valid char boundary.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx = idx.saturating_sub(1);
+    }
+    &s[..idx]
+}
+
 /// Build a masked preview string (max 200 chars) from tool result contents.
 fn result_preview_from_contents(contents: &[Content]) -> Option<String> {
     let Content::Text { text: raw } = contents.first()? else {
         return None;
     };
-    let preview = if raw.len() > 200 {
-        &raw[..200]
-    } else {
-        raw.as_str()
-    };
+    let preview = truncate_utf8(raw, 200);
     // Mask if it looks like JSON
     Some(
         serde_json::from_str::<serde_json::Value>(preview).map_or_else(
@@ -604,6 +642,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
+    disk_monitor::start(config);
     mcp_agent_mail_storage::wbq_start();
     build_server(config).run_stdio();
     // run_stdio() does not return; WBQ drain thread exits with the process.
@@ -628,6 +667,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    disk_monitor::start(config);
     let dashboard = StartupDashboard::maybe_start(config);
     set_dashboard_handle(dashboard.clone());
 
@@ -636,6 +676,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     let server_capabilities = server.capabilities().clone();
     let router = Arc::new(server.into_router());
 
+    let addr = format!("{}:{}", config.http_host, config.http_port);
     let state = Arc::new(HttpState::new(
         router,
         server_info,
@@ -643,7 +684,6 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
         config.clone(),
     ));
 
-    let addr = format!("{}:{}", config.http_host, config.http_port);
     let runtime = RuntimeBuilder::new()
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
@@ -665,6 +705,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     tool_metrics::shutdown();
     ack_ttl::shutdown();
     cleanup::shutdown();
+    disk_monitor::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     if let Some(dashboard) = dashboard.as_ref() {
         dashboard.shutdown();
@@ -702,42 +743,39 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    disk_monitor::start(config);
 
     // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
     let tui_state = tui_bridge::TuiSharedState::new(config);
     set_tui_state_handle(Some(Arc::clone(&tui_state)));
-    let _ = tui_state.push_event(tui_events::MailEvent::server_started(
-        format!(
-            "http://{}:{}{}",
-            config.http_host, config.http_port, config.http_path
-        ),
-        format!("tui=on auth={}", config.http_bearer_token.is_some()),
-    ));
 
     // ── 4. DB poller on dedicated thread ────────────────────────────
     let mut db_poller =
         tui_poller::DbPoller::new(Arc::clone(&tui_state), config.database_url.clone()).start();
 
-    // ── 5. HTTP server on background thread ─────────────────────────
+    // ── 5. HTTP server supervisor thread (supports mode switching) ──
+    let (server_ctl_tx, server_ctl_rx) = std::sync::mpsc::channel::<tui_bridge::ServerControlMsg>();
+    tui_state.set_server_control_sender(server_ctl_tx.clone());
     let server_config = config.clone();
-    let server_tui_state = Arc::clone(&tui_state);
-    let server_thread = std::thread::Builder::new()
-        .name("mcp-http-server".into())
-        .spawn(move || run_http_server_thread(&server_config, &server_tui_state))
-        .expect("spawn HTTP server thread");
+    let supervisor_state = Arc::clone(&tui_state);
+    let supervisor_thread = std::thread::Builder::new()
+        .name("mcp-http-supervisor".into())
+        .spawn(move || {
+            run_http_server_supervisor_thread(server_config, &supervisor_state, &server_ctl_rx)
+        })
+        .expect("spawn HTTP supervisor thread");
 
     // ── 6. TUI on main thread ───────────────────────────────────────
-    let tui_result = run_tui_main_thread(&tui_state);
+    let tui_result = run_tui_main_thread(&tui_state, config);
 
     // ── 7. Graceful shutdown ────────────────────────────────────────
     tui_state.request_shutdown();
-    let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+    let _ = server_ctl_tx.send(tui_bridge::ServerControlMsg::Shutdown);
     db_poller.stop();
 
-    // Wait for the server thread (with timeout)
-    let server_result = server_thread
+    let supervisor_result = supervisor_thread
         .join()
-        .map_err(|_| std::io::Error::other("server thread panicked"))?;
+        .map_err(|_| std::io::Error::other("HTTP supervisor thread panicked"))?;
 
     // Shutdown background workers
     set_tui_state_handle(None);
@@ -745,66 +783,260 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     tool_metrics::shutdown();
     ack_ttl::shutdown();
     cleanup::shutdown();
+    disk_monitor::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
 
     // Return first error encountered
-    tui_result.and(server_result)
+    tui_result.and(supervisor_result)
 }
 
-/// Run the HTTP server inside a background thread.
-///
-/// Blocks until the listener exits or the TUI requests shutdown.
+struct HttpServerInstance {
+    join: std::thread::JoinHandle<std::io::Result<()>>,
+    shutdown: asupersync::server::shutdown::ShutdownSignal,
+}
+
+struct HttpServerReady {
+    shutdown: asupersync::server::shutdown::ShutdownSignal,
+    local_addr: std::net::SocketAddr,
+}
+
+/// Run the HTTP server inside a dedicated thread and send the bound `ShutdownSignal`
+/// back to the supervisor so it can trigger graceful shutdown/restarts.
 fn run_http_server_thread(
-    config: &mcp_agent_mail_core::Config,
-    tui_state: &Arc<tui_bridge::TuiSharedState>,
+    config: mcp_agent_mail_core::Config,
+    ready_tx: std::sync::mpsc::Sender<std::io::Result<HttpServerReady>>,
 ) -> std::io::Result<()> {
-    let server = build_server(config);
+    let server = build_server(&config);
     let server_info = server.info().clone();
     let server_capabilities = server.capabilities().clone();
     let router = Arc::new(server.into_router());
 
+    let addr = format!("{}:{}", config.http_host, config.http_port);
     let state = Arc::new(HttpState::new(
         router,
         server_info,
         server_capabilities,
-        config.clone(),
+        config,
     ));
 
-    let addr = format!("{}:{}", config.http_host, config.http_port);
     let runtime = RuntimeBuilder::new()
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 
     let handle = runtime.handle();
-    let tui_shutdown = Arc::clone(tui_state);
     runtime.block_on(async move {
         let handler_state = Arc::clone(&state);
         let listener = Http1Listener::bind(addr, move |req| {
             let inner = Arc::clone(&handler_state);
             async move { inner.handle(req).await }
         })
-        .await?;
+        .await;
 
-        // Poll for TUI shutdown while running the listener
-        // The listener.run() blocks, but the runtime will be shut down when
-        // the thread is interrupted or we could use a select-like pattern.
-        // For simplicity, we rely on the OS closing the socket when the
-        // process exits after the TUI thread requests shutdown.
-        let _ = &tui_shutdown;
-        listener.run(&handle).await?;
+        let listener = match listener {
+            Ok(l) => l,
+            Err(err) => {
+                // Propagate the original error to the supervisor thread while preserving the
+                // original error for this thread's return path.
+                let send_err = std::io::Error::new(err.kind(), err.to_string());
+                let _ = ready_tx.send(Err(send_err));
+                return Err(err);
+            }
+        };
+
+        let local_addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(err) => {
+                // Avoid moving `err` into the channel send; we still want to return it.
+                let send_err = std::io::Error::new(err.kind(), err.to_string());
+                let _ = ready_tx.send(Err(send_err));
+                return Err(err);
+            }
+        };
+        let shutdown = listener.shutdown_signal();
+        let _ = ready_tx.send(Ok(HttpServerReady {
+            shutdown: shutdown.clone(),
+            local_addr,
+        }));
+
+        let _stats = listener.run(&handle).await?;
         Ok::<(), std::io::Error>(())
     })
 }
 
+fn spawn_http_server_instance(
+    config: mcp_agent_mail_core::Config,
+) -> std::io::Result<(mcp_agent_mail_core::Config, HttpServerInstance)> {
+    let config_for_thread = config.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<HttpServerReady>>();
+    let join = std::thread::Builder::new()
+        .name("mcp-http-server".into())
+        .spawn(move || run_http_server_thread(config_for_thread, ready_tx))
+        .expect("spawn HTTP server thread");
+
+    let ready = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| std::io::Error::other("server bind handshake timed out"))??;
+
+    let mut updated_config = config;
+    if updated_config.http_port == 0 {
+        updated_config.http_port = ready.local_addr.port();
+    }
+
+    Ok((
+        updated_config,
+        HttpServerInstance {
+            join,
+            shutdown: ready.shutdown,
+        },
+    ))
+}
+
+fn stop_http_server_instance(instance: HttpServerInstance) -> std::io::Result<()> {
+    let _ = instance.shutdown.begin_drain(Duration::from_secs(2));
+    instance
+        .join
+        .join()
+        .map_err(|_| std::io::Error::other("server thread panicked"))?
+}
+
+fn run_http_server_supervisor_thread(
+    mut config: mcp_agent_mail_core::Config,
+    tui_state: &tui_bridge::TuiSharedState,
+    control_rx: &std::sync::mpsc::Receiver<tui_bridge::ServerControlMsg>,
+) -> std::io::Result<()> {
+    let (updated_config, mut instance) = spawn_http_server_instance(config.clone())?;
+    config = updated_config;
+
+    // Ensure the TUI state reflects the bound runtime port (port=0 in tests).
+    tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(&config));
+    let _ = tui_state.push_event(tui_events::MailEvent::server_started(
+        format!(
+            "http://{}:{}{}",
+            config.http_host, config.http_port, config.http_path
+        ),
+        format!(
+            "tui=on auth={} mode={}",
+            config.http_bearer_token.is_some(),
+            tui_bridge::TransportBase::from_http_path(&config.http_path)
+                .map_or("custom", tui_bridge::TransportBase::as_str)
+        ),
+    ));
+
+    let mut last_restart_sleep_ms: u64 = 0;
+
+    loop {
+        if tui_state.is_shutdown_requested() {
+            let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+            return stop_http_server_instance(instance);
+        }
+
+        if instance.join.is_finished() {
+            let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+            let _ = stop_http_server_instance(instance);
+
+            // Backoff on crash loops (bounded).
+            last_restart_sleep_ms = if last_restart_sleep_ms == 0 {
+                200
+            } else {
+                (last_restart_sleep_ms * 2).min(5_000)
+            };
+            std::thread::sleep(Duration::from_millis(last_restart_sleep_ms));
+
+            let (new_cfg, new_instance) = spawn_http_server_instance(config.clone())?;
+            config = new_cfg;
+            instance = new_instance;
+            tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(&config));
+            let _ = tui_state.push_event(tui_events::MailEvent::server_started(
+                format!(
+                    "http://{}:{}{}",
+                    config.http_host, config.http_port, config.http_path
+                ),
+                "auto-restarted after unexpected exit".to_string(),
+            ));
+            continue;
+        }
+
+        match control_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(tui_bridge::ServerControlMsg::ToggleTransportBase) => {
+                let current = tui_bridge::TransportBase::from_http_path(&config.http_path)
+                    .unwrap_or(tui_bridge::TransportBase::Mcp);
+                let desired = current.toggle();
+                instance = handle_transport_switch(&mut config, tui_state, instance, desired)?;
+                last_restart_sleep_ms = 0;
+            }
+            Ok(tui_bridge::ServerControlMsg::SetTransportBase(desired)) => {
+                instance = handle_transport_switch(&mut config, tui_state, instance, desired)?;
+                last_restart_sleep_ms = 0;
+            }
+            Ok(tui_bridge::ServerControlMsg::Shutdown)
+            | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+                return stop_http_server_instance(instance);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn handle_transport_switch(
+    config: &mut mcp_agent_mail_core::Config,
+    tui_state: &tui_bridge::TuiSharedState,
+    instance: HttpServerInstance,
+    desired: tui_bridge::TransportBase,
+) -> std::io::Result<HttpServerInstance> {
+    if tui_bridge::TransportBase::from_http_path(&config.http_path) == Some(desired) {
+        return Ok(instance);
+    }
+
+    let prev_path = config.http_path.clone();
+    let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+    let _ = stop_http_server_instance(instance);
+
+    config.http_path = desired.http_path().to_string();
+    let start = spawn_http_server_instance(config.clone());
+    match start {
+        Ok((new_cfg, new_instance)) => {
+            *config = new_cfg;
+            tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(config));
+            let _ = tui_state.push_event(tui_events::MailEvent::server_started(
+                format!(
+                    "http://{}:{}{}",
+                    config.http_host, config.http_port, config.http_path
+                ),
+                format!("mode switched to {}", desired.as_str()),
+            ));
+            Ok(new_instance)
+        }
+        Err(err) => {
+            // Roll back to previous path to preserve availability.
+            config.http_path = prev_path;
+            let (rollback_cfg, rollback_instance) = spawn_http_server_instance(config.clone())?;
+            *config = rollback_cfg;
+            tui_state.update_config_snapshot(tui_bridge::ConfigSnapshot::from_config(config));
+            let _ = tui_state.push_event(tui_events::MailEvent::server_started(
+                format!(
+                    "http://{}:{}{}",
+                    config.http_host, config.http_port, config.http_path
+                ),
+                format!("mode switch failed; rolled back ({err})"),
+            ));
+            Ok(rollback_instance)
+        }
+    }
+}
+
 /// Run the TUI application on the main thread.
-fn run_tui_main_thread(tui_state: &Arc<tui_bridge::TuiSharedState>) -> std::io::Result<()> {
+fn run_tui_main_thread(
+    tui_state: &Arc<tui_bridge::TuiSharedState>,
+    config: &mcp_agent_mail_core::Config,
+) -> std::io::Result<()> {
     use ftui_runtime::program::Program;
 
-    let model = tui_app::MailAppModel::new(Arc::clone(tui_state));
+    let model = tui_app::MailAppModel::with_config(Arc::clone(tui_state), config);
 
     let tui_config = ftui_runtime::program::ProgramConfig {
         screen_mode: ftui_runtime::terminal_writer::ScreenMode::AltScreen,
-        mouse: false,
+        mouse: true,
         ..ftui_runtime::program::ProgramConfig::default()
     };
 
@@ -841,6 +1073,10 @@ fn emit_tui_event(event: tui_events::MailEvent) {
 /// Whether the TUI is currently active (console output should be suppressed).
 fn is_tui_active() -> bool {
     tui_state_handle().is_some()
+}
+
+const fn should_emit_structured_request_line(use_ansi: bool, log_json_enabled: bool) -> bool {
+    !use_ansi || log_json_enabled
 }
 
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -2212,6 +2448,14 @@ fn parse_env_u16(key: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
+fn request_panel_width_from_columns(columns: u16) -> usize {
+    usize::from(columns.clamp(60, 140))
+}
+
+fn request_panel_width() -> usize {
+    request_panel_width_from_columns(parse_env_u16("COLUMNS", 120))
+}
+
 fn pretty_num(value: u64) -> String {
     let s = value.to_string();
     let mut out = String::with_capacity(s.len() + (s.len() / 3));
@@ -2728,13 +2972,17 @@ impl HttpState {
             // When TUI is active, suppress duplicate console output
             // (the TUI event pipeline renders these events instead).
             if !is_tui_active() {
-                ftui_runtime::ftui_eprintln!("{line}");
+                // In rich TTY mode, the request panel is the primary operator-facing output.
+                // Suppress the duplicate key/value line unless JSON logging is explicitly requested.
+                let use_ansi = self.config.log_rich_enabled && std::io::stdout().is_terminal();
+                if should_emit_structured_request_line(use_ansi, self.config.log_json_enabled) {
+                    ftui_runtime::ftui_eprintln!("{line}");
+                }
 
                 // Rich-ish panel output (stdout), fallback to legacy plain-text line on any error.
                 // Gate: only render ANSI panel when rich output is enabled AND stdout is a TTY.
-                let use_ansi = self.config.log_rich_enabled && std::io::stdout().is_terminal();
                 if let Some(panel) = console::render_http_request_panel(
-                    100,
+                    request_panel_width(),
                     method,
                     path,
                     status,
@@ -3788,6 +4036,7 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
         acquire_timeout_ms: pool_timeout_ms,
         max_lifetime_ms: mcp_agent_mail_db::pool::DEFAULT_POOL_RECYCLE_MS,
         run_migrations: true,
+        warmup_connections: 0,
     };
     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
     let cx = Cx::for_testing();
@@ -4498,6 +4747,16 @@ mod tests {
 
     static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn result_preview_truncates_utf8_safely() {
+        // Ensure we never panic on non-ASCII tool output when truncating previews.
+        let text = "€".repeat(300);
+        let contents = vec![Content::Text { text }];
+        let preview = result_preview_from_contents(&contents).expect("preview");
+        assert!(preview.len() <= 200);
+        assert!(preview.chars().all(|c| c == '€'));
+    }
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -7186,6 +7445,22 @@ mod tests {
         let fmt = envelope["format"].as_str().unwrap();
         assert!(fmt == "toon" || fmt == "json");
         assert_eq!(envelope["meta"]["requested"], "toon");
+    }
+
+    #[test]
+    fn request_log_line_policy_suppresses_duplicate_kv_in_rich_tty_mode() {
+        assert!(should_emit_structured_request_line(false, false));
+        assert!(should_emit_structured_request_line(false, true));
+        assert!(!should_emit_structured_request_line(true, false));
+        assert!(should_emit_structured_request_line(true, true));
+    }
+
+    #[test]
+    fn request_panel_width_from_columns_clamps_bounds() {
+        assert_eq!(request_panel_width_from_columns(1), 60);
+        assert_eq!(request_panel_width_from_columns(60), 60);
+        assert_eq!(request_panel_width_from_columns(100), 100);
+        assert_eq!(request_panel_width_from_columns(200), 140);
     }
 
     #[test]

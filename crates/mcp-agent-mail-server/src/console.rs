@@ -1657,12 +1657,13 @@ impl TimelinePane {
             .and_then(|id| visible.iter().position(|&i| events[i].id == id));
 
         if selected.is_none() {
-            selected = Some(if self.follow {
+            let idx = if self.follow {
                 visible.len().saturating_sub(1)
             } else {
                 0
-            });
-            self.selected_id = Some(events[visible[selected.unwrap()]].id);
+            };
+            selected = Some(idx);
+            self.selected_id = Some(events[visible[idx]].id);
         }
 
         selected

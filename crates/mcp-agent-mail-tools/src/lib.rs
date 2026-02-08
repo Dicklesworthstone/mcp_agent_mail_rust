@@ -94,6 +94,7 @@ pub(crate) mod tool_util {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
         match e {
             DbError::InvalidArgument { field, message } => legacy_tool_error(
@@ -184,6 +185,18 @@ pub(crate) mod tool_util {
                     "error_detail": message,
                     "failures": failures,
                     "reset_after_secs": reset_after_secs,
+                }),
+            ),
+            DbError::IntegrityCorruption { message, details } => legacy_tool_error(
+                "DATABASE_CORRUPTION",
+                format!(
+                    "Database integrity check failed: {message}. \
+                     The database may be corrupted; consider restoring from backup."
+                ),
+                false,
+                json!({
+                    "error_detail": message,
+                    "corruption_details": details,
                 }),
             ),
         }

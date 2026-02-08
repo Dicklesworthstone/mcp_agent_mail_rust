@@ -103,8 +103,10 @@ struct RetentionReport {
 
 /// Run a single retention/quota report cycle.
 fn run_retention_cycle(config: &Config) -> Result<RetentionReport, String> {
-    let storage = &config.storage_root;
-    if !storage.is_dir() {
+    // Mailbox archive layout is `{storage_root}/projects/{project_slug}/...`.
+    // Retention/quota logic should operate on per-project directories under `projects/`.
+    let projects_root = config.storage_root.join("projects");
+    if !projects_root.is_dir() {
         return Ok(RetentionReport {
             projects_scanned: 0,
             total_attachment_bytes: 0,
@@ -120,15 +122,23 @@ fn run_retention_cycle(config: &Config) -> Result<RetentionReport, String> {
         warnings: 0,
     };
 
-    // Walk project directories under storage_root.
-    let entries =
-        std::fs::read_dir(storage).map_err(|e| format!("failed to read storage_root: {e}"))?;
+    // Walk project directories under `{storage_root}/projects`.
+    let entries = std::fs::read_dir(&projects_root).map_err(|e| {
+        format!(
+            "failed to read projects dir: {} ({e})",
+            projects_root.display()
+        )
+    })?;
 
     for entry in entries {
         let Ok(entry) = entry else { continue };
 
         let path = entry.path();
-        if !path.is_dir() {
+        // Skip anything that isn't a real directory (avoid following symlinks).
+        if entry
+            .file_type()
+            .is_ok_and(|ft| !ft.is_dir() || ft.is_symlink())
+        {
             continue;
         }
 
@@ -230,10 +240,17 @@ fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+
             let p = entry.path();
-            if p.is_file() {
+            if ft.is_file() {
                 total += p.metadata().map_or(0, |m| m.len());
-            } else if p.is_dir() {
+            } else if ft.is_dir() {
                 total += dir_size(&p);
             }
         }
@@ -264,10 +281,17 @@ fn count_md_files_recursive(dir: &Path) -> u64 {
     let mut count = 0u64;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+
             let p = entry.path();
-            if p.is_file() && p.extension().is_some_and(|e| e == "md") {
+            if ft.is_file() && p.extension().is_some_and(|e| e == "md") {
                 count += 1;
-            } else if p.is_dir() {
+            } else if ft.is_dir() {
                 count += count_md_files_recursive(&p);
             }
         }
@@ -301,8 +325,15 @@ fn count_old_files_recursive(dir: &Path, cutoff: std::time::SystemTime) -> u64 {
     let mut count = 0u64;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+
             let p = entry.path();
-            if p.is_file() {
+            if ft.is_file() {
                 if let Ok(metadata) = p.metadata() {
                     if let Ok(modified) = metadata.modified() {
                         if modified < cutoff {
@@ -310,7 +341,7 @@ fn count_old_files_recursive(dir: &Path, cutoff: std::time::SystemTime) -> u64 {
                         }
                     }
                 }
-            } else if p.is_dir() {
+            } else if ft.is_dir() {
                 count += count_old_files_recursive(&p, cutoff);
             }
         }
@@ -393,7 +424,7 @@ mod tests {
     #[test]
     fn retention_cycle_with_project() {
         let tmp = tempfile::tempdir().unwrap();
-        let project = tmp.path().join("my-project");
+        let project = tmp.path().join("projects").join("my-project");
         let attach = project.join("attachments");
         let agents = project
             .join("agents")

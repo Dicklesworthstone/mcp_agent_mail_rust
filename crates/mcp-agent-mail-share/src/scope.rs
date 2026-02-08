@@ -337,8 +337,23 @@ fn count_remaining(
 }
 
 fn count_table(conn: &sqlmodel_sqlite::SqliteConnection, table: &str) -> Result<i64, ShareError> {
-    let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
-    let rows = conn.query_sync(&sql, &[]).map_err(|e| ShareError::Sqlite {
+    // Table names cannot be bound parameters; keep a strict allowlist to avoid
+    // accidental SQL injection if this helper is ever reused.
+    let sql = match table {
+        "projects" => "SELECT COUNT(*) AS cnt FROM projects",
+        "agents" => "SELECT COUNT(*) AS cnt FROM agents",
+        "messages" => "SELECT COUNT(*) AS cnt FROM messages",
+        "message_recipients" => "SELECT COUNT(*) AS cnt FROM message_recipients",
+        "file_reservations" => "SELECT COUNT(*) AS cnt FROM file_reservations",
+        "agent_links" => "SELECT COUNT(*) AS cnt FROM agent_links",
+        "project_sibling_suggestions" => "SELECT COUNT(*) AS cnt FROM project_sibling_suggestions",
+        other => {
+            return Err(ShareError::Sqlite {
+                message: format!("unsupported table for COUNT(*): {other}"),
+            });
+        }
+    };
+    let rows = conn.query_sync(sql, &[]).map_err(|e| ShareError::Sqlite {
         message: format!("COUNT(*) from {table} failed: {e}"),
     })?;
     Ok(rows
@@ -564,6 +579,15 @@ mod tests {
             result,
             Err(ShareError::ScopeIdentifierNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn count_table_rejects_unknown_table_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let result = count_table(&conn, "unknown_table");
+        assert!(matches!(result, Err(ShareError::Sqlite { .. })));
     }
 
     /// Conformance test: scope against the fixture `needs_scrub.sqlite3` and

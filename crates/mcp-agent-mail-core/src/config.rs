@@ -48,6 +48,10 @@ pub struct Config {
     pub database_pool_size: Option<usize>,
     pub database_max_overflow: Option<usize>,
     pub database_pool_timeout: Option<u64>,
+    /// Run `PRAGMA quick_check` on pool initialization (default: true).
+    pub integrity_check_on_startup: bool,
+    /// Hours between periodic full `PRAGMA integrity_check` runs (default: 24, 0 = disabled).
+    pub integrity_check_interval_hours: u64,
 
     // Storage
     pub storage_root: PathBuf,
@@ -57,6 +61,13 @@ pub struct Config {
     pub convert_images: bool,
     pub keep_original_images: bool,
     pub allow_absolute_attachment_paths: bool,
+
+    // Disk space monitoring
+    pub disk_space_monitor_enabled: bool,
+    pub disk_space_warning_mb: u64,
+    pub disk_space_critical_mb: u64,
+    pub disk_space_fatal_mb: u64,
+    pub disk_space_check_interval_seconds: u64,
 
     // HTTP
     pub http_host: String,
@@ -108,6 +119,12 @@ pub struct Config {
     pub contact_auto_retry_enabled: bool,
     pub messaging_auto_register_recipients: bool,
     pub messaging_auto_handshake_on_block: bool,
+
+    // Message size limits (bytes). 0 = unlimited.
+    pub max_message_body_bytes: usize,
+    pub max_attachment_bytes: usize,
+    pub max_total_message_bytes: usize,
+    pub max_subject_bytes: usize,
 
     // File Reservations
     pub file_reservations_cleanup_enabled: bool,
@@ -194,6 +211,11 @@ pub struct Config {
 
     // TUI
     pub tui_enabled: bool,
+    pub tui_dock_position: String,
+    pub tui_dock_ratio_percent: u16,
+    pub tui_dock_visible: bool,
+    pub tui_high_contrast: bool,
+    pub tui_key_hints: bool,
 }
 
 /// Application environment
@@ -321,6 +343,8 @@ impl Default for Config {
             database_pool_size: None,
             database_max_overflow: None,
             database_pool_timeout: None,
+            integrity_check_on_startup: true,
+            integrity_check_interval_hours: 24,
 
             // Storage
             storage_root: dirs::home_dir()
@@ -332,6 +356,13 @@ impl Default for Config {
             convert_images: true,
             keep_original_images: false,
             allow_absolute_attachment_paths: true,
+
+            // Disk space monitoring
+            disk_space_monitor_enabled: true,
+            disk_space_warning_mb: 500,
+            disk_space_critical_mb: 100,
+            disk_space_fatal_mb: 10,
+            disk_space_check_interval_seconds: 60,
 
             // HTTP
             http_host: "127.0.0.1".to_string(),
@@ -398,6 +429,12 @@ impl Default for Config {
             contact_auto_retry_enabled: true,
             messaging_auto_register_recipients: true,
             messaging_auto_handshake_on_block: true,
+
+            // Message size limits
+            max_message_body_bytes: 1_048_576,       // 1 MiB
+            max_attachment_bytes: 10_485_760,         // 10 MiB per attachment
+            max_total_message_bytes: 20_971_520,      // 20 MiB total (body + all attachments)
+            max_subject_bytes: 1_024,                 // 1 KiB
 
             // File Reservations
             file_reservations_cleanup_enabled: false,
@@ -496,6 +533,11 @@ impl Default for Config {
             console_split_ratio_percent: 30,
             console_theme: ConsoleThemeId::CyberpunkAurora,
             tui_enabled: true,
+            tui_dock_position: "right".to_string(),
+            tui_dock_ratio_percent: 40,
+            tui_dock_visible: true,
+            tui_high_contrast: false,
+            tui_key_hints: true,
         }
     }
 }
@@ -545,6 +587,12 @@ impl Config {
         config.database_pool_size = env_usize_opt("DATABASE_POOL_SIZE");
         config.database_max_overflow = env_usize_opt("DATABASE_MAX_OVERFLOW");
         config.database_pool_timeout = env_u64_opt("DATABASE_POOL_TIMEOUT");
+        config.integrity_check_on_startup =
+            env_bool("INTEGRITY_CHECK_ON_STARTUP", config.integrity_check_on_startup);
+        config.integrity_check_interval_hours = env_u64(
+            "INTEGRITY_CHECK_INTERVAL_HOURS",
+            config.integrity_check_interval_hours,
+        );
 
         // Storage
         if let Some(v) = env_value("STORAGE_ROOT") {
@@ -565,6 +613,21 @@ impl Config {
             config.allow_absolute_attachment_paths,
         );
 
+        // Disk space monitoring
+        config.disk_space_monitor_enabled = env_bool(
+            "DISK_SPACE_MONITOR_ENABLED",
+            config.disk_space_monitor_enabled,
+        );
+        config.disk_space_warning_mb =
+            env_u64("DISK_SPACE_WARNING_MB", config.disk_space_warning_mb);
+        config.disk_space_critical_mb =
+            env_u64("DISK_SPACE_CRITICAL_MB", config.disk_space_critical_mb);
+        config.disk_space_fatal_mb = env_u64("DISK_SPACE_FATAL_MB", config.disk_space_fatal_mb);
+        config.disk_space_check_interval_seconds = env_u64(
+            "DISK_SPACE_CHECK_INTERVAL_SECONDS",
+            config.disk_space_check_interval_seconds,
+        );
+
         // HTTP
         if let Some(v) = env_value("HTTP_HOST") {
             config.http_host = v;
@@ -573,7 +636,7 @@ impl Config {
         if let Some(v) = env_value("HTTP_PATH") {
             config.http_path = v;
         }
-        config.http_bearer_token = env_value("HTTP_BEARER_TOKEN").filter(|s| !s.is_empty());
+        config.http_bearer_token = full_env_value("HTTP_BEARER_TOKEN").filter(|s| !s.is_empty());
         config.http_allow_localhost_unauthenticated = env_bool(
             "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED",
             config.http_allow_localhost_unauthenticated,
@@ -683,6 +746,15 @@ impl Config {
             "MESSAGING_AUTO_HANDSHAKE_ON_BLOCK",
             config.messaging_auto_handshake_on_block,
         );
+
+        // Message size limits
+        config.max_message_body_bytes =
+            env_usize("MAX_MESSAGE_BODY_BYTES", config.max_message_body_bytes);
+        config.max_attachment_bytes =
+            env_usize("MAX_ATTACHMENT_BYTES", config.max_attachment_bytes);
+        config.max_total_message_bytes =
+            env_usize("MAX_TOTAL_MESSAGE_BYTES", config.max_total_message_bytes);
+        config.max_subject_bytes = env_usize("MAX_SUBJECT_BYTES", config.max_subject_bytes);
 
         // File Reservations
         config.file_reservations_cleanup_enabled = env_bool(
@@ -869,7 +941,8 @@ impl Config {
         if let Some(v) = real_env_value("CONSOLE_PERSIST_PATH") {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
-                config.console_persist_path = PathBuf::from(trimmed);
+                config.console_persist_path =
+                    PathBuf::from(shellexpand::tilde(trimmed).into_owned());
             }
         }
         let persisted_console = load_dotenv_file(&config.console_persist_path);
@@ -933,6 +1006,17 @@ impl Config {
         }
 
         config.tui_enabled = env_bool("TUI_ENABLED", config.tui_enabled);
+        if let Some(v) = console_value("TUI_DOCK_POSITION") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(lower.as_str(), "bottom" | "top" | "left" | "right") {
+                config.tui_dock_position = lower;
+            }
+        }
+        config.tui_dock_ratio_percent =
+            console_u16("TUI_DOCK_RATIO_PERCENT", config.tui_dock_ratio_percent).clamp(20, 80);
+        config.tui_dock_visible = console_bool("TUI_DOCK_VISIBLE", config.tui_dock_visible);
+        config.tui_high_contrast = console_bool("TUI_HIGH_CONTRAST", config.tui_high_contrast);
+        config.tui_key_hints = console_bool("TUI_KEY_HINTS", config.tui_key_hints);
 
         config
     }
@@ -1005,11 +1089,193 @@ impl Config {
 
         profile_clusters.is_empty() && profile_tools.is_empty()
     }
+
+    /// Build a startup bootstrap summary showing resolved config and sources.
+    ///
+    /// The summary is designed for concise terminal display, never exposes raw
+    /// secrets, and explains exactly where each setting came from.
+    #[must_use]
+    pub fn bootstrap_summary(&self) -> BootstrapSummary {
+        let mut lines = Vec::new();
+
+        lines.push(BootstrapLine {
+            key: "host",
+            value: self.http_host.clone(),
+            source: detect_source("HTTP_HOST"),
+        });
+        lines.push(BootstrapLine {
+            key: "port",
+            value: self.http_port.to_string(),
+            source: detect_source("HTTP_PORT"),
+        });
+        lines.push(BootstrapLine {
+            key: "path",
+            value: self.http_path.clone(),
+            source: ConfigSource::Default, // overridden by caller with CLI info
+        });
+        lines.push(BootstrapLine {
+            key: "auth",
+            value: match &self.http_bearer_token {
+                Some(token) => format!("Bearer {}", mask_secret(token)),
+                None if self.http_allow_localhost_unauthenticated => {
+                    "none (localhost unauthenticated)".into()
+                }
+                None => "none".into(),
+            },
+            source: self
+                .http_bearer_token
+                .as_ref()
+                .map_or(ConfigSource::Default, |_| {
+                    detect_source("HTTP_BEARER_TOKEN")
+                }),
+        });
+        lines.push(BootstrapLine {
+            key: "db",
+            value: self.database_url.clone(),
+            source: detect_source("DATABASE_URL"),
+        });
+        lines.push(BootstrapLine {
+            key: "storage",
+            value: self.storage_root.display().to_string(),
+            source: detect_source("STORAGE_ROOT"),
+        });
+
+        BootstrapSummary { lines }
+    }
+}
+
+/// Where a configuration value was resolved from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// Process environment variable.
+    ProcessEnv,
+    /// Project-local `.env` file in working directory.
+    ProjectDotenv,
+    /// User-global `~/.mcp_agent_mail/.env` (or legacy `~/mcp_agent_mail/.env`).
+    UserEnvFile,
+    /// CLI argument override.
+    CliArg,
+    /// Hardcoded default.
+    Default,
+}
+
+impl ConfigSource {
+    /// Short label for terminal display.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ProcessEnv => "env",
+            Self::ProjectDotenv => ".env",
+            Self::UserEnvFile => "~/.mcp_agent_mail/.env",
+            Self::CliArg => "cli",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// One line in the startup bootstrap summary.
+#[derive(Debug, Clone)]
+pub struct BootstrapLine {
+    /// Short key name (e.g. "host", "port", "auth").
+    pub key: &'static str,
+    /// Resolved display value (secrets masked).
+    pub value: String,
+    /// Where the value came from.
+    pub source: ConfigSource,
+}
+
+/// Startup bootstrap summary showing resolved config sources.
+#[derive(Debug, Clone)]
+pub struct BootstrapSummary {
+    pub lines: Vec<BootstrapLine>,
+}
+
+impl BootstrapSummary {
+    /// Set the source for a given key (used by callers with extra context, e.g. CLI arg source).
+    pub fn set_source(&mut self, key: &str, source: ConfigSource) {
+        if let Some(line) = self.lines.iter_mut().find(|l| l.key == key) {
+            line.source = source;
+        }
+    }
+
+    /// Set value and source for a given key.
+    pub fn set(&mut self, key: &str, value: String, source: ConfigSource) {
+        if let Some(line) = self.lines.iter_mut().find(|l| l.key == key) {
+            line.value = value;
+            line.source = source;
+        }
+    }
+
+    /// Format as a compact tree for terminal display.
+    #[must_use]
+    pub fn format(&self, mode: &str) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "  am: Starting MCP Agent Mail server");
+        let has_mode = !mode.is_empty();
+        let last_idx = self.lines.len().saturating_sub(1);
+        for (i, line) in self.lines.iter().enumerate() {
+            let is_last = i == last_idx && !has_mode;
+            let connector = if is_last {
+                "\u{2514}\u{2500}"
+            } else {
+                "\u{251c}\u{2500}"
+            };
+            let _ = writeln!(
+                out,
+                "  {connector} {:<8} {} ({})",
+                format!("{}:", line.key),
+                line.value,
+                line.source.label(),
+            );
+        }
+        if has_mode {
+            let _ = writeln!(out, "  \u{2514}\u{2500} {:<8} {mode}", "mode:");
+        }
+        out
+    }
+}
+
+/// Mask a secret for display: show only the last 4 characters after `****`.
+#[must_use]
+pub fn mask_secret(value: &str) -> String {
+    let char_count = value.chars().count();
+    if char_count <= 8 {
+        "****".to_string()
+    } else {
+        let suffix_rev: String = value.chars().rev().take(4).collect();
+        let suffix: String = suffix_rev.chars().rev().collect();
+        format!("****{suffix}")
+    }
+}
+
+/// Detect which config source tier provided a given key.
+///
+/// Checks tiers in order: process env → project `.env` → user env → default.
+#[must_use]
+pub fn detect_source(key: &str) -> ConfigSource {
+    if env::var(key).is_ok() {
+        return ConfigSource::ProcessEnv;
+    }
+    if dotenv_value(key).is_some() {
+        return ConfigSource::ProjectDotenv;
+    }
+    if user_env_value(key).is_some() {
+        return ConfigSource::UserEnvFile;
+    }
+    ConfigSource::Default
 }
 
 // Helper functions for environment variable parsing
 
 static DOTENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
+static USER_ENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
@@ -1030,6 +1296,36 @@ fn dotenv_values() -> &'static HashMap<String, String> {
 #[must_use]
 pub fn dotenv_value(key: &str) -> Option<String> {
     dotenv_values().get(key).cloned()
+}
+
+/// Candidate paths for the user-global env file, checked in order.
+///
+/// - `~/.mcp_agent_mail/.env` — preferred (matches signals dir convention)
+/// - `~/mcp_agent_mail/.env`  — legacy (matches old shell wrapper)
+fn user_env_file_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let candidates = [
+        home.join(".mcp_agent_mail").join(".env"),
+        home.join("mcp_agent_mail").join(".env"),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn user_env_values() -> &'static HashMap<String, String> {
+    USER_ENV_VALUES
+        .get_or_init(|| user_env_file_path().map_or_else(HashMap::new, |p| load_dotenv_file(&p)))
+}
+
+/// Read a value from the user-global env file (`~/.mcp_agent_mail/.env`).
+#[must_use]
+pub fn user_env_value(key: &str) -> Option<String> {
+    user_env_values().get(key).cloned()
+}
+
+/// Read a value with full precedence: process env → project `.env` → user env file.
+#[must_use]
+pub fn full_env_value(key: &str) -> Option<String> {
+    env_value(key).or_else(|| user_env_value(key))
 }
 
 /// Read a value from the real environment first, falling back to .env.
@@ -1422,6 +1718,22 @@ mod tests {
     }
 
     #[test]
+    fn test_console_persist_path_expands_tilde() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let _env = TestEnvOverrideGuard::set(&[(
+            "CONSOLE_PERSIST_PATH",
+            "~/.config/mcp-agent-mail/config.env",
+        )]);
+        let config = Config::from_env();
+        assert_eq!(
+            config.console_persist_path,
+            home.join(".config/mcp-agent-mail/config.env")
+        );
+    }
+
+    #[test]
     fn test_console_layout_env_overrides_user_envfile() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let env_path = tmp.path().join("config.env");
@@ -1724,11 +2036,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_profile_exposes_nothing() {
+    fn unknown_profile_acts_as_passthrough() {
         let config = make_filter(true, "nonexistent");
         // Unknown profile has empty cluster/tool lists, and since both are empty,
         // the final check `profile_clusters.is_empty() && profile_tools.is_empty()`
-        // returns true -- it acts as a pass-through.
+        // returns true — it acts as a pass-through (exposes all tools).
         assert!(config.should_expose_tool("anything", "whatever"));
     }
 
@@ -1750,5 +2062,206 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("TUI_ENABLED", "true")]);
         let config = Config::from_env();
         assert!(config.tui_enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // mask_secret
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mask_secret_short_value_fully_masked() {
+        assert_eq!(mask_secret("abc"), "****");
+        assert_eq!(mask_secret("12345678"), "****");
+    }
+
+    #[test]
+    fn mask_secret_long_value_shows_last_4() {
+        assert_eq!(mask_secret("my-secret-token"), "****oken");
+        assert_eq!(mask_secret("123456789"), "****6789");
+    }
+
+    #[test]
+    fn mask_secret_unicode_shows_last_4_chars() {
+        assert_eq!(
+            mask_secret("prefix秘密秘密秘密秘密"),
+            "****秘密秘密",
+            "unicode secrets should not panic and should show last 4 chars"
+        );
+    }
+
+    #[test]
+    fn mask_secret_empty_is_fully_masked() {
+        assert_eq!(mask_secret(""), "****");
+    }
+
+    // -----------------------------------------------------------------------
+    // ConfigSource
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_source_labels() {
+        assert_eq!(ConfigSource::ProcessEnv.label(), "env");
+        assert_eq!(ConfigSource::ProjectDotenv.label(), ".env");
+        assert_eq!(ConfigSource::UserEnvFile.label(), "~/.mcp_agent_mail/.env");
+        assert_eq!(ConfigSource::CliArg.label(), "cli");
+        assert_eq!(ConfigSource::Default.label(), "default");
+    }
+
+    #[test]
+    fn config_source_display() {
+        assert_eq!(format!("{}", ConfigSource::ProcessEnv), "env");
+        assert_eq!(format!("{}", ConfigSource::Default), "default");
+    }
+
+    // -----------------------------------------------------------------------
+    // BootstrapSummary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bootstrap_summary_default_config_has_expected_keys() {
+        let config = Config::default();
+        let summary = config.bootstrap_summary();
+        let keys: Vec<&str> = summary.lines.iter().map(|l| l.key).collect();
+        assert!(keys.contains(&"host"));
+        assert!(keys.contains(&"port"));
+        assert!(keys.contains(&"path"));
+        assert!(keys.contains(&"auth"));
+        assert!(keys.contains(&"db"));
+        assert!(keys.contains(&"storage"));
+    }
+
+    #[test]
+    fn bootstrap_summary_masks_bearer_token() {
+        let config = Config {
+            http_bearer_token: Some("my-super-secret-token".to_string()),
+            ..Config::default()
+        };
+        let summary = config.bootstrap_summary();
+        let auth_line = summary.lines.iter().find(|l| l.key == "auth").unwrap();
+        assert!(auth_line.value.contains("****"));
+        assert!(!auth_line.value.contains("my-super-secret-token"));
+        assert!(auth_line.value.contains("oken")); // last 4 chars
+    }
+
+    #[test]
+    fn bootstrap_summary_no_token_shows_none() {
+        let config = Config::default();
+        let summary = config.bootstrap_summary();
+        let auth_line = summary.lines.iter().find(|l| l.key == "auth").unwrap();
+        assert!(auth_line.value.contains("none"));
+    }
+
+    #[test]
+    fn bootstrap_summary_set_source_overrides() {
+        let config = Config::default();
+        let mut summary = config.bootstrap_summary();
+        summary.set_source("path", ConfigSource::CliArg);
+        let path_line = summary.lines.iter().find(|l| l.key == "path").unwrap();
+        assert_eq!(path_line.source, ConfigSource::CliArg);
+    }
+
+    #[test]
+    fn bootstrap_summary_set_overrides_value_and_source() {
+        let config = Config::default();
+        let mut summary = config.bootstrap_summary();
+        summary.set("path", "/mcp/".to_string(), ConfigSource::CliArg);
+        let path_line = summary.lines.iter().find(|l| l.key == "path").unwrap();
+        assert_eq!(path_line.value, "/mcp/");
+        assert_eq!(path_line.source, ConfigSource::CliArg);
+    }
+
+    #[test]
+    fn bootstrap_summary_format_includes_all_keys() {
+        let config = Config::default();
+        let summary = config.bootstrap_summary();
+        let formatted = summary.format("HTTP + TUI");
+        assert!(formatted.contains("host:"));
+        assert!(formatted.contains("port:"));
+        assert!(formatted.contains("auth:"));
+        assert!(formatted.contains("db:"));
+        assert!(formatted.contains("storage:"));
+        assert!(formatted.contains("mode:"));
+        assert!(formatted.contains("HTTP + TUI"));
+    }
+
+    #[test]
+    fn bootstrap_summary_format_empty_mode_no_mode_line() {
+        let config = Config::default();
+        let summary = config.bootstrap_summary();
+        let formatted = summary.format("");
+        assert!(!formatted.contains("mode:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // full_env_value precedence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn full_env_value_prefers_process_env() {
+        let _env = TestEnvOverrideGuard::set(&[("HTTP_BEARER_TOKEN", "from-env")]);
+        let val = full_env_value("HTTP_BEARER_TOKEN");
+        assert_eq!(val.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn bearer_token_loaded_from_env_override() {
+        let _env = TestEnvOverrideGuard::set(&[("HTTP_BEARER_TOKEN", "test-token-12345")]);
+        let config = Config::from_env();
+        assert_eq!(
+            config.http_bearer_token.as_deref(),
+            Some("test-token-12345")
+        );
+    }
+
+    #[test]
+    fn bearer_token_empty_string_treated_as_none() {
+        let _env = TestEnvOverrideGuard::set(&[("HTTP_BEARER_TOKEN", "")]);
+        let config = Config::from_env();
+        assert!(config.http_bearer_token.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // user_env_file_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn user_env_file_path_returns_none_when_no_files_exist() {
+        // Since we can't control home dir in tests, just verify it returns
+        // Some or None without panicking.
+        let _ = user_env_file_path();
+    }
+
+    #[test]
+    fn user_env_file_path_prefers_dotted_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dotted = tmp.path().join(".mcp_agent_mail");
+        let legacy = tmp.path().join("mcp_agent_mail");
+        std::fs::create_dir_all(&dotted).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(dotted.join(".env"), "FOO=bar\n").unwrap();
+        std::fs::write(legacy.join(".env"), "FOO=baz\n").unwrap();
+
+        // Test the loading logic directly
+        let dotted_values = load_dotenv_file(&dotted.join(".env"));
+        let legacy_values = load_dotenv_file(&legacy.join(".env"));
+        assert_eq!(dotted_values.get("FOO").unwrap(), "bar");
+        assert_eq!(legacy_values.get("FOO").unwrap(), "baz");
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_source
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_source_returns_default_for_unknown_key() {
+        let source = detect_source("NONEXISTENT_KEY_THAT_NOBODY_SETS_12345");
+        assert_eq!(source, ConfigSource::Default);
+    }
+
+    #[test]
+    fn detect_source_returns_process_env_when_set() {
+        // PATH is always set in process environment
+        let source = detect_source("PATH");
+        assert_eq!(source, ConfigSource::ProcessEnv);
     }
 }

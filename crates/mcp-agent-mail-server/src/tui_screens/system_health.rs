@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -166,10 +166,8 @@ impl Drop for SystemHealthScreen {
 impl MailScreen for SystemHealthScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                if key.code == KeyCode::Char('r') {
-                    self.request_refresh();
-                }
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('r') {
+                self.request_refresh();
             }
         }
         Cmd::None
@@ -468,7 +466,9 @@ fn add_base_path_findings(out: &mut DiagnosticsSnapshot) {
         out.lines.push(ProbeLine {
             level: Level::Fail,
             name: "base-path",
-            detail: format!("Configured HTTP_PATH {configured} is not reachable, but {good} appears reachable"),
+            detail: format!(
+                "Configured HTTP_PATH {configured} is not reachable, but {good} appears reachable"
+            ),
             remediation: Some(format!(
                 "Set HTTP_PATH={good} (or run with --path {})",
                 good.trim_matches('/')
@@ -547,7 +547,8 @@ fn add_auth_findings(out: &mut DiagnosticsSnapshot) {
 fn tcp_probe(host: &str, port: u16) -> Result<u64, String> {
     let addr = resolve_socket_addr(host, port)?;
     let start = Instant::now();
-    let _ = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+    let _ = stream.shutdown(Shutdown::Both);
     Ok(saturating_duration_ms_u64(start.elapsed()))
 }
 
@@ -624,6 +625,7 @@ fn http_probe_tools_list(
             probe.body_has_tools = Some(text.contains("\"tools\""));
         }
     }
+    let _ = stream.shutdown(Shutdown::Both);
 
     probe
 }
@@ -721,6 +723,7 @@ mod tests {
     fn parse_http_endpoint_ipv4() {
         let cfg = ConfigSnapshot {
             endpoint: "http://127.0.0.1:8766/api/".into(),
+            http_path: "/api/".into(),
             web_ui_url: "http://127.0.0.1:8766/mail".into(),
             app_environment: "development".into(),
             auth_enabled: false,
@@ -739,6 +742,7 @@ mod tests {
     fn parse_http_endpoint_ipv6_bracketed() {
         let cfg = ConfigSnapshot {
             endpoint: "http://[::1]:8766/mcp/".into(),
+            http_path: "/mcp/".into(),
             web_ui_url: "http://[::1]:8766/mail".into(),
             app_environment: "development".into(),
             auth_enabled: true,

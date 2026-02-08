@@ -176,6 +176,17 @@ impl Log2Histogram {
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Reset all counters to their initial state.
+    pub fn reset(&self) {
+        for bucket in &self.buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+        self.count.store(0, Ordering::Relaxed);
+        self.sum.store(0, Ordering::Relaxed);
+        self.min.store(u64::MAX, Ordering::Relaxed);
+        self.max.store(0, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> HistogramSnapshot {
         let count = self.count.load(Ordering::Relaxed);
@@ -455,6 +466,9 @@ pub struct StorageMetrics {
     pub commit_peak_pending_requests: GaugeU64,
     pub commit_over_80_since_us: GaugeU64,
     pub commit_queue_latency_us: Log2Histogram,
+
+    /// Count of DB rows missing corresponding archive files (set at startup).
+    pub needs_reindex_total: Counter,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -478,6 +492,55 @@ pub struct StorageMetricsSnapshot {
     pub commit_peak_pending_requests: u64,
     pub commit_over_80_since_us: u64,
     pub commit_queue_latency_us: HistogramSnapshot,
+
+    pub needs_reindex_total: u64,
+}
+
+#[derive(Debug)]
+pub struct SystemMetrics {
+    pub disk_storage_free_bytes: GaugeU64,
+    pub disk_db_free_bytes: GaugeU64,
+    pub disk_effective_free_bytes: GaugeU64,
+    pub disk_pressure_level: GaugeU64,
+    pub disk_last_sample_us: GaugeU64,
+    pub disk_sample_errors_total: Counter,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemMetricsSnapshot {
+    pub disk_storage_free_bytes: u64,
+    pub disk_db_free_bytes: u64,
+    pub disk_effective_free_bytes: u64,
+    pub disk_pressure_level: u64,
+    pub disk_last_sample_us: u64,
+    pub disk_sample_errors_total: u64,
+}
+
+impl Default for SystemMetrics {
+    fn default() -> Self {
+        Self {
+            disk_storage_free_bytes: GaugeU64::new(),
+            disk_db_free_bytes: GaugeU64::new(),
+            disk_effective_free_bytes: GaugeU64::new(),
+            disk_pressure_level: GaugeU64::new(),
+            disk_last_sample_us: GaugeU64::new(),
+            disk_sample_errors_total: Counter::new(),
+        }
+    }
+}
+
+impl SystemMetrics {
+    #[must_use]
+    pub fn snapshot(&self) -> SystemMetricsSnapshot {
+        SystemMetricsSnapshot {
+            disk_storage_free_bytes: self.disk_storage_free_bytes.load(),
+            disk_db_free_bytes: self.disk_db_free_bytes.load(),
+            disk_effective_free_bytes: self.disk_effective_free_bytes.load(),
+            disk_pressure_level: self.disk_pressure_level.load(),
+            disk_last_sample_us: self.disk_last_sample_us.load(),
+            disk_sample_errors_total: self.disk_sample_errors_total.load(),
+        }
+    }
 }
 
 impl Default for StorageMetrics {
@@ -502,6 +565,8 @@ impl Default for StorageMetrics {
             commit_peak_pending_requests: GaugeU64::new(),
             commit_over_80_since_us: GaugeU64::new(),
             commit_queue_latency_us: Log2Histogram::new(),
+
+            needs_reindex_total: Counter::new(),
         }
     }
 }
@@ -529,6 +594,8 @@ impl StorageMetrics {
             commit_peak_pending_requests: self.commit_peak_pending_requests.load(),
             commit_over_80_since_us: self.commit_over_80_since_us.load(),
             commit_queue_latency_us: self.commit_queue_latency_us.snapshot(),
+
+            needs_reindex_total: self.needs_reindex_total.load(),
         }
     }
 }
@@ -539,6 +606,7 @@ pub struct GlobalMetrics {
     pub tools: ToolsMetrics,
     pub db: DbMetrics,
     pub storage: StorageMetrics,
+    pub system: SystemMetrics,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -547,6 +615,7 @@ pub struct GlobalMetricsSnapshot {
     pub tools: ToolsMetricsSnapshot,
     pub db: DbMetricsSnapshot,
     pub storage: StorageMetricsSnapshot,
+    pub system: SystemMetricsSnapshot,
 }
 
 impl GlobalMetrics {
@@ -557,6 +626,7 @@ impl GlobalMetrics {
             tools: self.tools.snapshot(),
             db: self.db.snapshot(),
             storage: self.storage.snapshot(),
+            system: self.system.snapshot(),
         }
     }
 }

@@ -36,14 +36,14 @@ impl WebRoot {
         // Directory index: try appending /index.html.
         if relative.is_empty() || relative.ends_with('/') {
             let index = self.root.join(relative).join("index.html");
-            if index.is_file() {
+            if index.is_file() && is_safe_path(&self.root, &index) {
                 return Self::read_file(&index);
             }
         }
 
         // SPA fallback: return index.html for any path that isn't a file.
         let index = self.root.join("index.html");
-        if index.is_file() {
+        if index.is_file() && is_safe_path(&self.root, &index) {
             return Self::read_file(&index);
         }
 
@@ -167,9 +167,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_web_root_returns_none_when_missing() {
-        // No web/ directory in the test environment.
-        assert!(resolve_web_root().is_none() || resolve_web_root().is_some());
+    fn resolve_web_root_does_not_panic() {
+        let _ = resolve_web_root();
     }
 
     #[test]
@@ -214,6 +213,39 @@ mod tests {
         if let Some((_ct, body)) = result {
             assert_ne!(body, b"classified");
         }
+    }
+
+    #[test]
+    fn web_root_blocks_directory_index_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let web = dir.path().join("web");
+        std::fs::create_dir(&web).unwrap();
+        std::fs::write(web.join("index.html"), "inside").unwrap();
+
+        // Write an index.html outside the web root to confirm we never serve it.
+        std::fs::write(dir.path().join("index.html"), "outside").unwrap();
+
+        let root = WebRoot { root: web };
+        let (ct, body) = root.serve("/../").unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+        assert_eq!(body, b"inside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn web_root_blocks_spa_fallback_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let web = dir.path().join("web");
+        std::fs::create_dir(&web).unwrap();
+
+        let outside = dir.path().join("outside-secret.txt");
+        std::fs::write(&outside, "outside-secret").unwrap();
+        symlink(&outside, web.join("index.html")).unwrap();
+
+        let root = WebRoot { root: web };
+        assert!(root.serve("/unknown/spa/route").is_none());
     }
 
     #[test]

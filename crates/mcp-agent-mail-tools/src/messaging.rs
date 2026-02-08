@@ -46,8 +46,16 @@ fn try_write_message_archive(
         recipients: all_recipient_names.to_vec(),
         extra_paths: extra_paths.to_vec(),
     };
-    if !mcp_agent_mail_storage::wbq_enqueue(op) {
-        tracing::warn!("WBQ enqueue failed; skipping message archive write project={project_slug}");
+    match mcp_agent_mail_storage::wbq_enqueue(op) {
+        mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+        | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
+            // Disk pressure guard: archive writes may be disabled; DB remains authoritative.
+        }
+        mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+            tracing::warn!(
+                "WBQ enqueue failed; skipping message archive write project={project_slug}"
+            );
+        }
     }
 }
 
@@ -100,6 +108,124 @@ fn is_valid_thread_id(tid: &str) -> bool {
     }
     tid.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// Validate per-message size limits before any DB/archive operations.
+///
+/// Enforces `max_subject_bytes`, `max_message_body_bytes`, `max_attachment_bytes`,
+/// and `max_total_message_bytes` from config. A limit of 0 means unlimited.
+fn validate_message_size_limits(
+    config: &Config,
+    subject: &str,
+    body_md: &str,
+    attachment_paths: Option<&[String]>,
+) -> McpResult<()> {
+    // Subject size
+    if config.max_subject_bytes > 0 && subject.len() > config.max_subject_bytes {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Subject exceeds size limit: {} bytes > {} byte limit. Shorten the subject.",
+                subject.len(),
+                config.max_subject_bytes,
+            ),
+            true,
+            json!({
+                "field": "subject",
+                "size_bytes": subject.len(),
+                "limit_bytes": config.max_subject_bytes,
+            }),
+        ));
+    }
+
+    // Body size
+    if config.max_message_body_bytes > 0 && body_md.len() > config.max_message_body_bytes {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Message body exceeds size limit: {} bytes > {} byte limit. \
+                 Split into multiple messages or reduce content.",
+                body_md.len(),
+                config.max_message_body_bytes,
+            ),
+            true,
+            json!({
+                "field": "body_md",
+                "size_bytes": body_md.len(),
+                "limit_bytes": config.max_message_body_bytes,
+            }),
+        ));
+    }
+
+    // Per-attachment size (check file paths if provided)
+    let mut total_size = subject.len() + body_md.len();
+    if let Some(paths) = attachment_paths {
+        for path in paths {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let file_size = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+                if config.max_attachment_bytes > 0 && file_size > config.max_attachment_bytes {
+                    return Err(legacy_tool_error(
+                        "INVALID_ARGUMENT",
+                        format!(
+                            "Attachment exceeds size limit: {path} is {} bytes > {} byte limit.",
+                            file_size, config.max_attachment_bytes,
+                        ),
+                        true,
+                        json!({
+                            "field": "attachment_paths",
+                            "path": path,
+                            "size_bytes": file_size,
+                            "limit_bytes": config.max_attachment_bytes,
+                        }),
+                    ));
+                }
+                total_size += file_size;
+            }
+            // If file doesn't exist, let downstream handle the error.
+        }
+    }
+
+    // Total message size
+    if config.max_total_message_bytes > 0 && total_size > config.max_total_message_bytes {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Total message size exceeds limit: {} bytes > {} byte limit. \
+                 Reduce body or attachment sizes.",
+                total_size, config.max_total_message_bytes,
+            ),
+            true,
+            json!({
+                "field": "total",
+                "size_bytes": total_size,
+                "limit_bytes": config.max_total_message_bytes,
+            }),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate body-only size limit for `reply_message` (no attachments, subject comes later).
+fn validate_reply_body_limit(config: &Config, body_md: &str) -> McpResult<()> {
+    if config.max_message_body_bytes > 0 && body_md.len() > config.max_message_body_bytes {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Reply body exceeds size limit: {} bytes > {} byte limit. \
+                 Split into multiple messages or reduce content.",
+                body_md.len(),
+                config.max_message_body_bytes,
+            ),
+            true,
+            json!({
+                "field": "body_md",
+                "size_bytes": body_md.len(),
+                "limit_bytes": config.max_message_body_bytes,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -326,6 +452,39 @@ pub async fn send_message(
 
     let config = Config::from_env();
 
+    // ── Per-message size limits (fail fast before any DB/archive work) ──
+    validate_message_size_limits(&config, &subject, &body_md, attachment_paths.as_deref())?;
+
+    if config.disk_space_monitor_enabled {
+        let pressure = mcp_agent_mail_core::disk::DiskPressure::from_u64(
+            mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level
+                .load(),
+        );
+        if pressure == mcp_agent_mail_core::disk::DiskPressure::Fatal {
+            let free = mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_effective_free_bytes
+                .load();
+            return Err(legacy_tool_error(
+                "DISK_FULL",
+                format!(
+                    "Disk space critically low (pressure=fatal). Refusing to accept new messages until space recovers. \
+effective_free_bytes={free}"
+                ),
+                true,
+                json!({
+                    "pressure": pressure.label(),
+                    "effective_free_bytes": free,
+                    "fatal_threshold_mb": config.disk_space_fatal_mb,
+                    "critical_threshold_mb": config.disk_space_critical_mb,
+                    "warning_threshold_mb": config.disk_space_warning_mb,
+                }),
+            ));
+        }
+    }
+
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -407,41 +566,52 @@ pub async fn send_message(
     let mut final_body = body_md.clone();
     let mut all_attachment_meta: Vec<serde_json::Value> = Vec::new();
     let mut all_attachment_rel_paths: Vec<String> = Vec::new();
+    let base_dir = std::path::Path::new(&project.human_key);
 
     if do_convert {
         let slug = &project.slug;
-        let archive = mcp_agent_mail_storage::ensure_archive(&config, slug);
-        if let Ok(archive) = archive {
-            let base_dir = std::path::Path::new(&project.human_key);
-            // Process inline markdown images
-            if let Ok((updated_body, md_meta, rel_paths)) =
-                mcp_agent_mail_storage::process_markdown_images(
-                    &archive,
-                    &config,
-                    base_dir,
-                    &body_md,
-                    embed_policy,
-                )
-            {
-                final_body = updated_body;
-                all_attachment_rel_paths.extend(rel_paths);
-                for m in &md_meta {
-                    if let Ok(v) = serde_json::to_value(m) {
-                        all_attachment_meta.push(v);
-                    }
-                }
-            }
-
-            // Process explicit attachment_paths
-            if let Some(ref paths) = attachment_paths {
-                if !paths.is_empty() {
-                    if let Ok((att_meta, rel_paths)) = mcp_agent_mail_storage::process_attachments(
+        match mcp_agent_mail_storage::ensure_archive(&config, slug) {
+            Ok(archive) => {
+                // Process inline markdown images
+                if let Ok((updated_body, md_meta, rel_paths)) =
+                    mcp_agent_mail_storage::process_markdown_images(
                         &archive,
                         &config,
                         base_dir,
-                        paths,
+                        &body_md,
                         embed_policy,
-                    ) {
+                    )
+                {
+                    final_body = updated_body;
+                    all_attachment_rel_paths.extend(rel_paths);
+                    for m in &md_meta {
+                        if let Ok(v) = serde_json::to_value(m) {
+                            all_attachment_meta.push(v);
+                        }
+                    }
+                }
+
+                // Process explicit attachment_paths
+                if let Some(ref paths) = attachment_paths {
+                    if !paths.is_empty() {
+                        let (att_meta, rel_paths) = mcp_agent_mail_storage::process_attachments(
+                            &archive,
+                            &config,
+                            base_dir,
+                            paths,
+                            embed_policy,
+                        )
+                        .map_err(|e| {
+                            legacy_tool_error(
+                                "INVALID_ARGUMENT",
+                                format!("Invalid attachment_paths: {e}"),
+                                true,
+                                json!({
+                                    "field": "attachment_paths",
+                                    "provided": paths,
+                                }),
+                            )
+                        })?;
                         all_attachment_rel_paths.extend(rel_paths);
                         for m in &att_meta {
                             if let Ok(v) = serde_json::to_value(m) {
@@ -451,13 +621,42 @@ pub async fn send_message(
                     }
                 }
             }
+            Err(e) => {
+                if attachment_paths.as_ref().is_some_and(|p| !p.is_empty()) {
+                    // If explicit attachments were provided, fail loudly rather than silently dropping them.
+                    return Err(legacy_tool_error(
+                        "ARCHIVE_ERROR",
+                        format!(
+                            "Failed to initialize git archive for project '{slug}'. This prevents storing attachments: {e}"
+                        ),
+                        true,
+                        json!({
+                            "project_slug": slug,
+                            "project_root": project.human_key,
+                        }),
+                    ));
+                }
+            }
         }
     } else if let Some(ref paths) = attachment_paths {
-        // No conversion: store raw path references
+        // No conversion: validate source paths and store canonical references.
         for p in paths {
+            let resolved =
+                mcp_agent_mail_storage::resolve_attachment_source_path(base_dir, &config, p)
+                    .map_err(|e| {
+                        legacy_tool_error(
+                            "INVALID_ARGUMENT",
+                            format!("Invalid attachment path: {e}"),
+                            true,
+                            json!({
+                                "field": "attachment_paths",
+                                "provided": p,
+                            }),
+                        )
+                    })?;
             all_attachment_meta.push(serde_json::json!({
                 "type": "file",
-                "path": p,
+                "path": resolved.to_string_lossy(),
                 "media_type": "application/octet-stream",
             }));
         }
@@ -861,6 +1060,41 @@ pub async fn reply_message(
 ) -> McpResult<String> {
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
     let config = Config::from_env();
+
+    // ── Per-message size limits (fail fast before any DB/archive work) ──
+    // Reply has no subject yet (inherited below) and no attachment_paths, so
+    // validate body only here; subject is checked after construction.
+    validate_reply_body_limit(&config, &body_md)?;
+
+    if config.disk_space_monitor_enabled {
+        let pressure = mcp_agent_mail_core::disk::DiskPressure::from_u64(
+            mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level
+                .load(),
+        );
+        if pressure == mcp_agent_mail_core::disk::DiskPressure::Fatal {
+            let free = mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_effective_free_bytes
+                .load();
+            return Err(legacy_tool_error(
+                "DISK_FULL",
+                format!(
+                    "Disk space critically low (pressure=fatal). Refusing to accept new messages until space recovers. \
+effective_free_bytes={free}"
+                ),
+                true,
+                json!({
+                    "pressure": pressure.label(),
+                    "effective_free_bytes": free,
+                    "fatal_threshold_mb": config.disk_space_fatal_mb,
+                    "critical_threshold_mb": config.disk_space_critical_mb,
+                    "warning_threshold_mb": config.disk_space_warning_mb,
+                }),
+            ));
+        }
+    }
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -1635,5 +1869,142 @@ mod tests {
         assert_eq!(deserialized.id, 5);
         assert_eq!(deserialized.reply_to, 3);
         assert_eq!(deserialized.subject, "Re: Hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_message_size_limits
+    // -----------------------------------------------------------------------
+
+    fn config_with_limits(body: usize, attachment: usize, total: usize, subject: usize) -> Config {
+        Config {
+            max_message_body_bytes: body,
+            max_attachment_bytes: attachment,
+            max_total_message_bytes: total,
+            max_subject_bytes: subject,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn size_limits_pass_when_under() {
+        let cfg = config_with_limits(1024, 1024, 2048, 256);
+        let result = validate_message_size_limits(&cfg, "Hello", "Body text", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_limits_pass_when_zero_unlimited() {
+        let cfg = config_with_limits(0, 0, 0, 0);
+        let big = "x".repeat(10_000_000);
+        let result = validate_message_size_limits(&cfg, &big, &big, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_limits_reject_oversized_subject() {
+        let cfg = config_with_limits(0, 0, 0, 10);
+        let subject = "A".repeat(11);
+        let result = validate_message_size_limits(&cfg, &subject, "", None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("subject") || err.to_string().contains("Subject"));
+    }
+
+    #[test]
+    fn size_limits_accept_exact_subject() {
+        let cfg = config_with_limits(0, 0, 0, 10);
+        let subject = "A".repeat(10);
+        let result = validate_message_size_limits(&cfg, &subject, "", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_limits_reject_oversized_body() {
+        let cfg = config_with_limits(100, 0, 0, 0);
+        let body = "B".repeat(101);
+        let result = validate_message_size_limits(&cfg, "", &body, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn size_limits_accept_exact_body() {
+        let cfg = config_with_limits(100, 0, 0, 0);
+        let body = "B".repeat(100);
+        let result = validate_message_size_limits(&cfg, "", &body, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_limits_reject_total_overflow() {
+        // Subject + body exceed total even though each is within individual limits
+        let cfg = config_with_limits(100, 0, 50, 100);
+        let result = validate_message_size_limits(&cfg, "sub", &"x".repeat(50), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn size_limits_reject_oversized_attachment() {
+        let cfg = config_with_limits(0, 10, 0, 0);
+        // Create a temp file larger than 10 bytes
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        std::fs::write(&path, "x".repeat(20)).unwrap();
+        let paths = vec![path.to_string_lossy().to_string()];
+        let result = validate_message_size_limits(&cfg, "", "", Some(&paths));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn size_limits_accept_small_attachment() {
+        let cfg = config_with_limits(0, 100, 0, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "hello").unwrap();
+        let paths = vec![path.to_string_lossy().to_string()];
+        let result = validate_message_size_limits(&cfg, "", "", Some(&paths));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_limits_attachment_contributes_to_total() {
+        let cfg = config_with_limits(0, 0, 50, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medium.txt");
+        std::fs::write(&path, "x".repeat(45)).unwrap();
+        let paths = vec![path.to_string_lossy().to_string()];
+        // body (10) + attachment (45) = 55 > total limit of 50
+        let result = validate_message_size_limits(&cfg, "", &"y".repeat(10), Some(&paths));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn size_limits_nonexistent_attachment_skipped() {
+        let cfg = config_with_limits(0, 10, 0, 0);
+        let paths = vec!["/nonexistent/file.txt".to_string()];
+        // Non-existent files are skipped (downstream handles the error)
+        let result = validate_message_size_limits(&cfg, "", "", Some(&paths));
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_reply_body_limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reply_body_limit_pass() {
+        let cfg = config_with_limits(100, 0, 0, 0);
+        assert!(validate_reply_body_limit(&cfg, &"r".repeat(100)).is_ok());
+    }
+
+    #[test]
+    fn reply_body_limit_reject() {
+        let cfg = config_with_limits(100, 0, 0, 0);
+        assert!(validate_reply_body_limit(&cfg, &"r".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn reply_body_limit_unlimited() {
+        let cfg = config_with_limits(0, 0, 0, 0);
+        assert!(validate_reply_body_limit(&cfg, &"r".repeat(10_000_000)).is_ok());
     }
 }

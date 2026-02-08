@@ -78,7 +78,7 @@ fn extract_query_str(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == key && !v.is_empty() {
-                return Some(urlencoding_decode(v));
+                return Some(percent_decode_component(v));
             }
         }
     }
@@ -91,31 +91,67 @@ fn extract_query_int(query: &str, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Minimal percent-decoding (covers the common cases for query params).
-fn urlencoding_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        match b {
-            b'+' => out.push(' '),
-            b'%' => {
-                let hi = chars.next().unwrap_or(b'0');
-                let lo = chars.next().unwrap_or(b'0');
-                let val = hex_val(hi) * 16 + hex_val(lo);
-                out.push(char::from(val));
+/// Percent-decode a single URL query component.
+///
+/// This is intentionally minimal (no `;` separators, no nested decoding), but:
+/// - preserves invalid/truncated `%` escapes verbatim
+/// - decodes bytes and then interprets them as UTF-8 (lossy), so non-ASCII works
+fn percent_decode_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
             }
-            _ => out.push(char::from(b)),
+            b'%' if i + 2 < bytes.len() => {
+                let hi = bytes[i + 1];
+                let lo = bytes[i + 2];
+                let hex = [hi, lo];
+                if let Ok(hex_str) = std::str::from_utf8(&hex) {
+                    if let Ok(value) = u8::from_str_radix(hex_str, 16) {
+                        out.push(value);
+                        i += 3;
+                        continue;
+                    }
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
         }
     }
-    out
+    String::from_utf8_lossy(&out).to_string()
 }
 
-const fn hex_val(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
+#[cfg(test)]
+mod query_decode_tests {
+    use super::percent_decode_component;
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode_component("hello"), "hello");
+        assert_eq!(percent_decode_component("hello+world"), "hello world");
+        assert_eq!(percent_decode_component("hello%20world"), "hello world");
+        assert_eq!(percent_decode_component("%40user"), "@user");
+        assert_eq!(percent_decode_component("key%3Dvalue"), "key=value");
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex_is_preserved() {
+        assert_eq!(percent_decode_component("%ZZ"), "%ZZ");
+        assert_eq!(percent_decode_component("abc%2"), "abc%2");
+    }
+
+    #[test]
+    fn percent_decode_utf8_multibyte() {
+        // "€" U+20AC is UTF-8 bytes E2 82 AC.
+        assert_eq!(percent_decode_component("%E2%82%AC"), "€");
     }
 }
 

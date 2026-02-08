@@ -4,9 +4,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::IsTerminal;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_core::config::env_value;
+use mcp_agent_mail_core::config::{ConfigSource, env_value};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -26,12 +28,12 @@ enum Commands {
     /// Start the MCP server (default)
     Serve {
         /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[arg(long)]
+        host: Option<String>,
 
         /// Port to bind to
-        #[arg(long, default_value = "8765")]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
 
         /// Explicit MCP base path (`mcp`, `api`, `/custom/`).
         ///
@@ -228,6 +230,7 @@ enum HttpPathSource {
 }
 
 impl HttpPathSource {
+    #[cfg(test)]
     const fn as_str(self) -> &'static str {
         match self {
             Self::CliPath => "--path",
@@ -330,22 +333,45 @@ fn main() {
             transport,
             no_tui,
         }) => {
-            // Start MCP server in HTTP mode (Streamable HTTP)
-            tracing::info!("Starting MCP Agent Mail server (HTTP mode)");
             let mut config = config;
-            config.http_host = host;
-            config.http_port = port;
+            let host_cli = host.is_some();
+            let port_cli = port.is_some();
+            if let Some(host) = host {
+                config.http_host = host;
+            }
+            if let Some(port) = port {
+                config.http_port = port;
+            }
             if no_tui {
                 config.tui_enabled = false;
             }
             let resolved_path =
                 resolve_serve_http_path(path.as_deref(), transport, env_value("HTTP_PATH"));
             config.http_path = resolved_path.path;
-            tracing::info!(
-                http_path = %config.http_path,
-                source = resolved_path.source.as_str(),
-                "Resolved MCP HTTP base path",
-            );
+
+            // Build and display startup diagnostics
+            let mut summary = config.bootstrap_summary();
+
+            // CLI args override the auto-detected source for host/port/path.
+            if host_cli {
+                summary.set_source("host", ConfigSource::CliArg);
+            }
+            if port_cli {
+                summary.set_source("port", ConfigSource::CliArg);
+            }
+            let path_source = match resolved_path.source {
+                HttpPathSource::CliPath | HttpPathSource::CliTransport => ConfigSource::CliArg,
+                HttpPathSource::EnvHttpPath => ConfigSource::ProcessEnv,
+                HttpPathSource::ServeDefault => ConfigSource::Default,
+            };
+            summary.set("path", config.http_path.clone(), path_source);
+            let mode = if config.tui_enabled && std::io::stdout().is_terminal() {
+                "HTTP + TUI"
+            } else {
+                "HTTP (headless)"
+            };
+            eprintln!("{}", summary.format(mode));
+
             if let Err(err) = mcp_agent_mail_server::run_http_with_tui(&config) {
                 tracing::error!("HTTP server failed: {err}");
                 std::process::exit(1);
@@ -386,7 +412,7 @@ impl std::fmt::Debug for Commands {
                 no_tui,
             } => write!(
                 f,
-                "Serve {{ host: {host}, port: {port}, path: {path:?}, transport: {transport:?}, no_tui: {no_tui} }}"
+                "Serve {{ host: {host:?}, port: {port:?}, path: {path:?}, transport: {transport:?}, no_tui: {no_tui} }}"
             ),
             Self::Guard { .. } => write!(f, "Guard"),
             Self::FileReservations { .. } => write!(f, "FileReservations"),
@@ -475,7 +501,7 @@ mod tests {
         match cli.command {
             Some(Commands::Serve { no_tui, host, .. }) => {
                 assert!(no_tui);
-                assert_eq!(host, "0.0.0.0");
+                assert_eq!(host.as_deref(), Some("0.0.0.0"));
             }
             other => panic!("expected Serve, got {other:?}"),
         }

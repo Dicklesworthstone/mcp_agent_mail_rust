@@ -11,6 +11,7 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{Frame, PackedRgba, Style};
 
 use crate::tui_bridge::TuiSharedState;
+use crate::tui_persist::AccessibilitySettings;
 use crate::tui_screens::{HelpEntry, MAIL_SCREEN_REGISTRY, MailScreenId, screen_meta};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -34,6 +35,20 @@ const HELP_FG: PackedRgba = PackedRgba::rgb(200, 210, 230);
 const HELP_KEY_FG: PackedRgba = PackedRgba::rgb(100, 180, 255);
 const HELP_BORDER_FG: PackedRgba = PackedRgba::rgb(80, 100, 140);
 const HELP_CATEGORY_FG: PackedRgba = PackedRgba::rgb(180, 140, 255);
+
+// High-contrast palette — brighter foreground, darker background
+const HC_TAB_ACTIVE_BG: PackedRgba = PackedRgba::rgb(0, 50, 120);
+const HC_TAB_ACTIVE_FG: PackedRgba = PackedRgba::rgb(255, 255, 255);
+const HC_TAB_INACTIVE_FG: PackedRgba = PackedRgba::rgb(200, 210, 230);
+const HC_TAB_KEY_FG: PackedRgba = PackedRgba::rgb(80, 200, 255);
+const HC_STATUS_FG: PackedRgba = PackedRgba::rgb(220, 230, 240);
+const HC_STATUS_ACCENT: PackedRgba = PackedRgba::rgb(100, 220, 255);
+const HC_STATUS_GOOD: PackedRgba = PackedRgba::rgb(80, 255, 140);
+const HC_STATUS_WARN: PackedRgba = PackedRgba::rgb(255, 160, 80);
+const HC_HELP_FG: PackedRgba = PackedRgba::rgb(240, 245, 255);
+const HC_HELP_KEY_FG: PackedRgba = PackedRgba::rgb(80, 220, 255);
+const HC_HELP_BORDER_FG: PackedRgba = PackedRgba::rgb(120, 150, 200);
+const HC_HELP_CATEGORY_FG: PackedRgba = PackedRgba::rgb(220, 180, 255);
 
 // ──────────────────────────────────────────────────────────────────────
 // Chrome layout
@@ -142,6 +157,7 @@ pub fn render_status_line(
     let counters = state.request_counters();
     let uptime = state.uptime();
     let meta = screen_meta(active);
+    let transport_mode = state.config_snapshot().transport_mode();
 
     // Build left section
     let uptime_secs = uptime.as_secs();
@@ -166,7 +182,9 @@ pub fn render_status_line(
 
     // Calculate widths
     let title = meta.title;
-    let left_len = u16::try_from(1 + title.len() + 6 + uptime_str.len() + 1).unwrap_or(u16::MAX);
+    let left_len =
+        u16::try_from(1 + title.len() + 12 + transport_mode.len() + uptime_str.len() + 1)
+            .unwrap_or(u16::MAX);
     let center_len = u16::try_from(center_str.len()).unwrap_or(u16::MAX);
     let right_len = u16::try_from(1 + help_hint.len() + 1).unwrap_or(u16::MAX);
     let total_len = left_len
@@ -184,7 +202,7 @@ pub fn render_status_line(
         Style::default().fg(STATUS_ACCENT).bg(STATUS_BG).bold(),
     ));
     spans.push(Span::styled(
-        format!(" | up:{uptime_str} "),
+        format!(" | mode:{transport_mode} up:{uptime_str} "),
         Style::default().fg(STATUS_FG).bg(STATUS_BG),
     ));
 
@@ -240,6 +258,7 @@ const GLOBAL_KEYBINDINGS: &[(&str, &str)] = &[
     ("1-7", "Jump to screen"),
     ("Tab", "Next screen"),
     ("Shift+Tab", "Previous screen"),
+    ("m", "Toggle MCP/API mode"),
     ("Ctrl+P / :", "Command palette"),
     ("?", "Toggle help"),
     ("q", "Quit"),
@@ -369,6 +388,153 @@ fn render_keybinding_line(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// ChromePalette — accessibility-aware color set
+// ──────────────────────────────────────────────────────────────────────
+
+/// Resolved color palette respecting accessibility settings.
+#[derive(Debug, Clone, Copy)]
+pub struct ChromePalette {
+    pub tab_active_bg: PackedRgba,
+    pub tab_active_fg: PackedRgba,
+    pub tab_inactive_fg: PackedRgba,
+    pub tab_key_fg: PackedRgba,
+    pub status_fg: PackedRgba,
+    pub status_accent: PackedRgba,
+    pub status_good: PackedRgba,
+    pub status_warn: PackedRgba,
+    pub help_fg: PackedRgba,
+    pub help_key_fg: PackedRgba,
+    pub help_border_fg: PackedRgba,
+    pub help_category_fg: PackedRgba,
+}
+
+impl ChromePalette {
+    /// Resolve the palette from accessibility settings.
+    #[must_use]
+    pub const fn from_settings(settings: &AccessibilitySettings) -> Self {
+        if settings.high_contrast {
+            Self {
+                tab_active_bg: HC_TAB_ACTIVE_BG,
+                tab_active_fg: HC_TAB_ACTIVE_FG,
+                tab_inactive_fg: HC_TAB_INACTIVE_FG,
+                tab_key_fg: HC_TAB_KEY_FG,
+                status_fg: HC_STATUS_FG,
+                status_accent: HC_STATUS_ACCENT,
+                status_good: HC_STATUS_GOOD,
+                status_warn: HC_STATUS_WARN,
+                help_fg: HC_HELP_FG,
+                help_key_fg: HC_HELP_KEY_FG,
+                help_border_fg: HC_HELP_BORDER_FG,
+                help_category_fg: HC_HELP_CATEGORY_FG,
+            }
+        } else {
+            Self::standard()
+        }
+    }
+
+    /// Standard (non-high-contrast) palette.
+    #[must_use]
+    pub const fn standard() -> Self {
+        Self {
+            tab_active_bg: TAB_ACTIVE_BG,
+            tab_active_fg: TAB_ACTIVE_FG,
+            tab_inactive_fg: TAB_INACTIVE_FG,
+            tab_key_fg: TAB_KEY_FG,
+            status_fg: STATUS_FG,
+            status_accent: STATUS_ACCENT,
+            status_good: STATUS_GOOD,
+            status_warn: STATUS_WARN,
+            help_fg: HELP_FG,
+            help_key_fg: HELP_KEY_FG,
+            help_border_fg: HELP_BORDER_FG,
+            help_category_fg: HELP_CATEGORY_FG,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Key hint bar — context-sensitive shortcut hints
+// ──────────────────────────────────────────────────────────────────────
+
+/// Build a compact key hint string from the most important screen bindings.
+///
+/// Selects up to `max_hints` entries that fit within `max_width` characters,
+/// formatted as `[key] action  [key] action  ...`.
+#[must_use]
+pub fn build_key_hints(
+    screen_bindings: &[HelpEntry],
+    max_hints: usize,
+    max_width: usize,
+) -> String {
+    let mut hints = String::new();
+
+    for (count, entry) in screen_bindings.iter().enumerate() {
+        if count >= max_hints {
+            break;
+        }
+        let segment = format!("[{}] {} ", entry.key, entry.action);
+        if hints.len() + segment.len() > max_width {
+            break;
+        }
+        hints.push_str(&segment);
+    }
+
+    // Trim trailing space
+    let trimmed = hints.trim_end();
+    trimmed.to_string()
+}
+
+/// Render a key hint bar into a 1-row area, showing context-sensitive shortcuts.
+pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, area: Rect) {
+    use ftui::text::{Line, Span, Text};
+
+    if area.width < 20 || screen_bindings.is_empty() {
+        return;
+    }
+
+    let max_width = (area.width as usize).saturating_sub(4); // padding
+    let hints = build_key_hints(screen_bindings, 6, max_width);
+    if hints.is_empty() {
+        return;
+    }
+
+    // Parse the hint string into styled spans: keys in accent, text in dim
+    let mut spans = Vec::new();
+    spans.push(Span::styled(" ", Style::default().bg(STATUS_BG)));
+
+    let mut rest = hints.as_str();
+    while let Some(open) = rest.find('[') {
+        // Text before bracket
+        if open > 0 {
+            spans.push(Span::styled(
+                &rest[..open],
+                Style::default().fg(STATUS_FG).bg(STATUS_BG),
+            ));
+        }
+        rest = &rest[open..];
+        if let Some(close) = rest.find(']') {
+            // Key portion: [key]
+            spans.push(Span::styled(
+                &rest[..=close],
+                Style::default().fg(TAB_KEY_FG).bg(STATUS_BG),
+            ));
+            rest = &rest[close + 1..];
+        } else {
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(
+            rest,
+            Style::default().fg(STATUS_FG).bg(STATUS_BG),
+        ));
+    }
+
+    let line = Line::from_spans(spans);
+    Paragraph::new(Text::from_lines([line])).render(area, frame);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
@@ -376,6 +542,173 @@ fn render_keybinding_line(
 mod tests {
     use super::*;
     use crate::tui_screens::ALL_SCREEN_IDS;
+
+    // ── Key hints tests ─────────────────────────────────────────
+
+    #[test]
+    fn build_key_hints_empty_bindings() {
+        let hints = build_key_hints(&[], 6, 80);
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn build_key_hints_single_entry() {
+        let bindings = [HelpEntry {
+            key: "j",
+            action: "Down",
+        }];
+        let hints = build_key_hints(&bindings, 6, 80);
+        assert_eq!(hints, "[j] Down");
+    }
+
+    #[test]
+    fn build_key_hints_multiple_entries() {
+        let bindings = [
+            HelpEntry {
+                key: "j",
+                action: "Down",
+            },
+            HelpEntry {
+                key: "k",
+                action: "Up",
+            },
+            HelpEntry {
+                key: "q",
+                action: "Quit",
+            },
+        ];
+        let hints = build_key_hints(&bindings, 6, 80);
+        assert!(hints.contains("[j] Down"));
+        assert!(hints.contains("[k] Up"));
+        assert!(hints.contains("[q] Quit"));
+    }
+
+    #[test]
+    fn build_key_hints_respects_max_hints() {
+        let bindings = [
+            HelpEntry {
+                key: "a",
+                action: "A",
+            },
+            HelpEntry {
+                key: "b",
+                action: "B",
+            },
+            HelpEntry {
+                key: "c",
+                action: "C",
+            },
+        ];
+        let hints = build_key_hints(&bindings, 2, 80);
+        assert!(hints.contains("[a] A"));
+        assert!(hints.contains("[b] B"));
+        assert!(!hints.contains("[c] C"));
+    }
+
+    #[test]
+    fn build_key_hints_respects_max_width() {
+        let bindings = [
+            HelpEntry {
+                key: "j",
+                action: "Navigate down",
+            },
+            HelpEntry {
+                key: "k",
+                action: "Navigate up",
+            },
+        ];
+        // Width too narrow for both
+        let hints = build_key_hints(&bindings, 6, 20);
+        assert!(hints.contains("[j] Navigate down"));
+        assert!(!hints.contains("[k]"));
+    }
+
+    // ── ChromePalette tests ─────────────────────────────────────
+
+    #[test]
+    fn palette_standard_uses_normal_colors() {
+        let p = ChromePalette::standard();
+        assert_eq!(p.tab_active_bg, TAB_ACTIVE_BG);
+        assert_eq!(p.help_fg, HELP_FG);
+    }
+
+    #[test]
+    fn palette_high_contrast_uses_hc_colors() {
+        let settings = AccessibilitySettings {
+            high_contrast: true,
+            key_hints: true,
+        };
+        let p = ChromePalette::from_settings(&settings);
+        assert_eq!(p.tab_active_bg, HC_TAB_ACTIVE_BG);
+        assert_eq!(p.help_fg, HC_HELP_FG);
+        assert_eq!(p.status_accent, HC_STATUS_ACCENT);
+    }
+
+    #[test]
+    fn palette_non_high_contrast_uses_standard() {
+        let settings = AccessibilitySettings {
+            high_contrast: false,
+            key_hints: true,
+        };
+        let p = ChromePalette::from_settings(&settings);
+        assert_eq!(p.tab_active_bg, TAB_ACTIVE_BG);
+        assert_eq!(p.help_fg, HELP_FG);
+    }
+
+    #[test]
+    fn hc_colors_are_brighter_than_standard() {
+        // High-contrast FG colors should have higher brightness (sum of RGB)
+        let hc_fg_sum = u32::from(HC_TAB_INACTIVE_FG.r())
+            + u32::from(HC_TAB_INACTIVE_FG.g())
+            + u32::from(HC_TAB_INACTIVE_FG.b());
+        let std_fg_sum = u32::from(TAB_INACTIVE_FG.r())
+            + u32::from(TAB_INACTIVE_FG.g())
+            + u32::from(TAB_INACTIVE_FG.b());
+        assert!(
+            hc_fg_sum > std_fg_sum,
+            "HC inactive FG ({hc_fg_sum}) should be brighter than standard ({std_fg_sum})"
+        );
+    }
+
+    // ── Render key hint bar tests ───────────────────────────────
+
+    #[test]
+    fn render_key_hint_bar_narrow_terminal_skipped() {
+        let bindings = [HelpEntry {
+            key: "j",
+            action: "Down",
+        }];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(15, 1, &mut pool);
+        // Should not panic on narrow terminal (< 20 cols)
+        render_key_hint_bar(&bindings, &mut frame, Rect::new(0, 0, 15, 1));
+    }
+
+    #[test]
+    fn render_key_hint_bar_renders_without_panic() {
+        let bindings = [
+            HelpEntry {
+                key: "j",
+                action: "Down",
+            },
+            HelpEntry {
+                key: "k",
+                action: "Up",
+            },
+        ];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 1, &mut pool);
+        render_key_hint_bar(&bindings, &mut frame, Rect::new(0, 0, 80, 1));
+    }
+
+    #[test]
+    fn render_key_hint_bar_empty_bindings_noop() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 1, &mut pool);
+        render_key_hint_bar(&[], &mut frame, Rect::new(0, 0, 80, 1));
+    }
+
+    // ── Existing tests ──────────────────────────────────────────
 
     #[test]
     fn chrome_layout_splits_correctly() {

@@ -110,13 +110,22 @@ fn tool_filter_allows(config: &Config, tool_name: &str) -> bool {
     tool_cluster(tool_name).is_none_or(|cluster| config.should_expose_tool(tool_name, cluster))
 }
 
+// Float -> int casts saturate, but we treat out-of-range values as invalid timestamps.
+// Use numeric literals to avoid clippy cast_precision_loss warnings.
+const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+const I64_MAX_F64: f64 = 9_223_372_036_854_775_807.0;
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn ts_f64_to_rfc3339(t: f64) -> Option<String> {
     if !t.is_finite() {
         return None;
     }
-    let secs = t.trunc() as i64;
-    let nanos = (t.fract().abs() * 1e9) as u32;
+    let trunc = t.trunc();
+    if !(I64_MIN_F64..=I64_MAX_F64).contains(&trunc) {
+        return None;
+    }
+    let secs = trunc as i64;
+    let nanos = ((t.fract().abs() * 1e9) as u32).min(999_999_999);
     chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
 }
 
@@ -1110,6 +1119,7 @@ pub struct ToolMetricsEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolMetricsResponse {
     pub generated_at: Option<String>,
+    pub health_level: String,
     pub tools: Vec<ToolMetricsEntry>,
 }
 
@@ -1142,6 +1152,7 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
 
     let response = ToolMetricsResponse {
         generated_at: None,
+        health_level: mcp_agent_mail_core::cached_health_level().to_string(),
         tools,
     };
 
@@ -1163,6 +1174,7 @@ pub fn tooling_metrics_query(ctx: &McpContext, query: String) -> McpResult<Strin
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolingMetricsCoreResponse {
     pub generated_at: Option<String>,
+    pub health_level: String,
     pub metrics: mcp_agent_mail_core::GlobalMetricsSnapshot,
 }
 
@@ -1174,6 +1186,7 @@ pub struct ToolingMetricsCoreResponse {
 pub fn tooling_metrics_core(_ctx: &McpContext) -> McpResult<String> {
     let response = ToolingMetricsCoreResponse {
         generated_at: None,
+        health_level: mcp_agent_mail_core::cached_health_level().to_string(),
         metrics: mcp_agent_mail_core::global_metrics().snapshot(),
     };
 

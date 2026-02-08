@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha1::Digest as Sha1Digest;
 use thiserror::Error;
 
-use mcp_agent_mail_core::{LockLevel, OrderedMutex, config::Config};
+use mcp_agent_mail_core::{LockLevel, OrderedMutex, OrderedRwLock, config::Config};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -152,6 +152,13 @@ pub enum WriteOp {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WbqEnqueueResult {
+    Enqueued,
+    QueueUnavailable,
+    SkippedDiskCritical,
+}
+
 #[inline]
 fn now_micros_u64() -> u64 {
     u64::try_from(
@@ -245,9 +252,19 @@ fn wbq_record_enqueue_success(wbq: &WriteBehindQueue) {
     }
 }
 
-/// Enqueue a write op. Returns `false` only if the queue is unavailable
-/// (timed out or worker disconnected).
-pub fn wbq_enqueue(op: WriteOp) -> bool {
+/// Enqueue a write op to the background drain thread.
+///
+/// The DB remains the source of truth; archive writes are best-effort.
+pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
+    // Under critical disk pressure, disable archive writes (DB remains authoritative).
+    let disk_pressure = mcp_agent_mail_core::global_metrics()
+        .system
+        .disk_pressure_level
+        .load();
+    if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        return WbqEnqueueResult::SkippedDiskCritical;
+    }
+
     wbq_start();
     let wbq = WBQ.get().expect("WBQ must be initialised");
     let envelope = WbqOpEnvelope {
@@ -259,9 +276,9 @@ pub fn wbq_enqueue(op: WriteOp) -> bool {
     match wbq.sender.try_send(msg) {
         Ok(()) => {
             wbq_record_enqueue_success(wbq);
-            true
+            WbqEnqueueResult::Enqueued
         }
-        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => WbqEnqueueResult::QueueUnavailable,
         Err(std::sync::mpsc::TrySendError::Full(msg)) => {
             // Backpressure: queue is temporarily full. Block briefly to avoid
             // synchronous IO fallback on the tool hot path.
@@ -277,14 +294,14 @@ pub fn wbq_enqueue(op: WriteOp) -> bool {
                 match wbq.sender.try_send(cur) {
                     Ok(()) => {
                         wbq_record_enqueue_success(wbq);
-                        break true;
+                        break WbqEnqueueResult::Enqueued;
                     }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        break false;
+                        break WbqEnqueueResult::QueueUnavailable;
                     }
                     Err(std::sync::mpsc::TrySendError::Full(returned)) => {
                         if Instant::now() >= deadline {
-                            break false;
+                            break WbqEnqueueResult::QueueUnavailable;
                         }
                         std::thread::sleep(Duration::from_millis(1));
                         cur = returned;
@@ -398,7 +415,15 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
 
         let mut errors = 0usize;
         for envelope in batch {
-            let r = wbq_execute_op(&envelope.op);
+            let disk_pressure = mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level
+                .load();
+            let r = if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+                Ok(())
+            } else {
+                wbq_execute_op(&envelope.op)
+            };
             let latency_us = u64::try_from(
                 envelope
                     .enqueued_at
@@ -451,7 +476,17 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
                     metrics.storage.wbq_over_80_since_us.set(0);
                 }
 
-                let r = wbq_execute_op(&envelope.op);
+                let disk_pressure = mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load();
+                let r = if disk_pressure
+                    >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64()
+                {
+                    Ok(())
+                } else {
+                    wbq_execute_op(&envelope.op)
+                };
                 let latency_us = u64::try_from(
                     envelope
                         .enqueued_at
@@ -531,6 +566,83 @@ fn wbq_execute_op(op: &WriteOp) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// In-process per-project archive lock (two-level locking)
+// ---------------------------------------------------------------------------
+
+/// In-process per-project mutex map.
+///
+/// Threads within the same server process acquire this mutex *before* the
+/// filesystem advisory lock.  This eliminates syscall-heavy file-lock retries
+/// for intra-process contention (the dominant case under load).
+///
+/// The outer `RwLock` is read-locked for lookup (hot path, concurrent) and
+/// write-locked only when creating a new project entry (cold path, once).
+static ARCHIVE_LOCK_MAP: OnceLock<OrderedRwLock<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn archive_process_lock(project_slug: &str) -> Arc<Mutex<()>> {
+    let map = ARCHIVE_LOCK_MAP.get_or_init(|| {
+        OrderedRwLock::new(LockLevel::StorageArchiveLockMap, HashMap::new())
+    });
+
+    // Fast path: read lock for existing entry.
+    {
+        let guard = map.read();
+        if let Some(lock) = guard.get(project_slug) {
+            return Arc::clone(lock);
+        }
+    }
+
+    // Slow path: write lock to insert.
+    let mut guard = map.write();
+    if let Some(lock) = guard.get(project_slug) {
+        return Arc::clone(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    guard.insert(project_slug.to_string(), Arc::clone(&lock));
+    lock
+}
+
+// ---------------------------------------------------------------------------
+// Thread-local jitter PRNG (replaces PID-based jitter)
+// ---------------------------------------------------------------------------
+
+/// Simple xorshift64 PRNG for lock-retry jitter.
+///
+/// Seeded per-thread from thread ID + timestamp so concurrent threads in the
+/// same process produce distinct jitter sequences (avoiding thundering herd).
+fn thread_jitter_ms(range: u64) -> u64 {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new({
+            let tid = std::thread::current().id();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            // Mix thread-id hash with timestamp; ensure non-zero.
+            let mut seed = now ^ (format!("{tid:?}").len() as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+            if seed == 0 { seed = 1; }
+            seed
+        });
+    }
+
+    if range == 0 {
+        return 0;
+    }
+
+    STATE.with(|cell| {
+        let mut s = cell.get();
+        // xorshift64
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        cell.set(s);
+        s % range
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -638,16 +750,17 @@ impl FileLock {
                         break;
                     }
 
-                    // Exponential backoff with jitter
+                    // Exponential backoff with per-thread jitter.
+                    // Uses thread-local xorshift instead of PID so threads in
+                    // the same process don't synchronize their retry delays.
                     let base_ms = if attempt == 0 {
                         50
                     } else {
                         50 * (1u64 << attempt.min(4))
                     };
-                    let jitter = (base_ms / 4) as i64;
-                    let sleep_ms =
-                        base_ms as i64 + (std::process::id() as i64 % (2 * jitter + 1)) - jitter;
-                    let sleep_ms = sleep_ms.max(10) as u64;
+                    let jitter_range = base_ms / 2 + 1; // ±25% of base
+                    let jitter = thread_jitter_ms(jitter_range);
+                    let sleep_ms = base_ms.saturating_add(jitter).max(10);
                     std::thread::sleep(Duration::from_millis(sleep_ms));
                 }
             }
@@ -748,10 +861,20 @@ impl Drop for FileLock {
 }
 
 /// Execute a closure while holding the project advisory lock.
+///
+/// Uses two-level locking for efficient intra-process coordination:
+/// 1. In-process per-project mutex (fast, no syscalls) — serializes threads.
+/// 2. Filesystem advisory lock (`.archive.lock`) — serializes processes.
+///
+/// The in-process mutex is acquired first.  This means most contention
+/// is resolved cheaply (OS futex) without filesystem retry storms.
 pub fn with_project_lock<F, T>(archive: &ProjectArchive, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
+    let process_lock = archive_process_lock(&archive.slug);
+    let _guard = process_lock.lock().expect("archive process lock poisoned");
+
     let mut lock = FileLock::new(archive.lock_path.clone());
     lock.acquire()?;
     let result = f();
@@ -2106,10 +2229,15 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                // Avoid recursing into symlink loops or scanning outside the archive root.
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 walk_for_locks(&path, result)?;
-            } else if path.extension().is_some_and(|e| e == "lock") {
+            } else if file_type.is_file() && path.extension().is_some_and(|e| e == "lock") {
                 result.locks_scanned += 1;
 
                 // Check if stale using zero-timeout lock
@@ -2131,10 +2259,15 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                // Avoid recursing into symlink loops or scanning outside the archive root.
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 walk_for_orphaned_meta(&path, result)?;
-            } else {
+            } else if file_type.is_file() {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 if name.ends_with(".lock.owner.json") {
                     let lock_name = &name[..name.len() - ".owner.json".len()];
@@ -2473,6 +2606,17 @@ fn sanitize_thread_id(thread_id: &str) -> String {
     } else {
         truncated
     }
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx = idx.saturating_sub(1);
+    }
+    &s[..idx]
 }
 
 fn validate_archive_component<'a>(kind: &str, raw: &'a str) -> Result<&'a str> {
@@ -2819,7 +2963,8 @@ fn update_thread_digest(
     // Truncate body preview
     let preview = body_md.trim();
     let preview = if preview.len() > 1200 {
-        format!("{}\n...", &preview[..1200].trim_end())
+        let truncated = truncate_utf8(preview, 1200);
+        format!("{}\n...", truncated.trim_end())
     } else {
         preview.to_string()
     };
@@ -3172,7 +3317,9 @@ pub fn resolve_attachment_source_path(
 ) -> Result<PathBuf> {
     let raw = raw_path.trim();
     if raw.is_empty() {
-        return Err(StorageError::InvalidPath("Attachment path cannot be empty".to_string()));
+        return Err(StorageError::InvalidPath(
+            "Attachment path cannot be empty".to_string(),
+        ));
     }
 
     // Canonicalize base dir so prefix checks cannot be bypassed via symlinks.
@@ -3184,7 +3331,8 @@ pub fn resolve_attachment_source_path(
     })?;
 
     let input = PathBuf::from(raw);
-    let candidate = if input.is_absolute() {
+    let input_is_absolute = input.is_absolute();
+    let candidate = if input_is_absolute {
         input
     } else {
         base.join(input)
@@ -3204,10 +3352,19 @@ pub fn resolve_attachment_source_path(
         ))
     })?;
 
+    // Relative paths must never escape the project directory.
+    if !input_is_absolute && !resolved.starts_with(&base) {
+        return Err(StorageError::InvalidPath(format!(
+            "Attachment path escapes the project directory: {}",
+            resolved.display()
+        )));
+    }
+
     if resolved.starts_with(&base) {
         return Ok(resolved);
     }
 
+    // Only absolute paths may be used outside the project directory, and only when enabled.
     if config.allow_absolute_attachment_paths {
         return Ok(resolved);
     }
@@ -3231,7 +3388,8 @@ fn resolve_source_attachment_path_opt(
 
     let base = base_dir.canonicalize().ok()?;
     let input = PathBuf::from(raw);
-    let candidate = if input.is_absolute() {
+    let input_is_absolute = input.is_absolute();
+    let candidate = if input_is_absolute {
         input
     } else {
         base.join(input)
@@ -3241,12 +3399,19 @@ fn resolve_source_attachment_path_opt(
     }
     let resolved = candidate.canonicalize().ok()?;
 
+    // Relative paths must never escape the project directory.
+    if !input_is_absolute && !resolved.starts_with(&base) {
+        return None;
+    }
+
     if resolved.starts_with(&base) {
         return Some(resolved);
     }
+
     if config.allow_absolute_attachment_paths {
         return Some(resolved);
     }
+
     None
 }
 
@@ -4061,6 +4226,118 @@ pub fn now_iso() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Consistency: archive-DB divergence detection
+// ---------------------------------------------------------------------------
+
+// Re-export consistency types from core (shared with db crate)
+pub use mcp_agent_mail_core::{ConsistencyMessageRef, ConsistencyReport};
+
+/// Check recent DB messages against the archive to detect divergence.
+///
+/// For each message ref, computes the expected canonical archive path and
+/// checks if the file exists on disk. Returns a report summarising how many
+/// are present vs missing.
+///
+/// This is intentionally cheap (filesystem stat, no git open) and runs at
+/// startup or on-demand.
+pub fn check_archive_consistency(
+    storage_root: &Path,
+    messages: &[ConsistencyMessageRef],
+) -> ConsistencyReport {
+    let mut found = 0usize;
+    let mut missing = 0usize;
+    let mut missing_ids: Vec<i64> = Vec::new();
+
+    for msg in messages {
+        // Build the expected canonical path:
+        // {storage_root}/projects/{slug}/messages/{YYYY}/{MM}/{iso}__{slug}__{id}.md
+        let project_dir = storage_root.join("projects").join(&msg.project_slug);
+        let archive_root = project_dir.join("archive");
+
+        // Parse the ISO timestamp to extract year/month
+        let (year, month) = match parse_year_month(&msg.created_ts_iso) {
+            Some(ym) => ym,
+            None => {
+                // Can't determine path; count as missing
+                missing += 1;
+                if missing_ids.len() < 20 {
+                    missing_ids.push(msg.message_id);
+                }
+                continue;
+            }
+        };
+
+        let iso_filename = msg
+            .created_ts_iso
+            .replace(':', "-")
+            .replace('+', "");
+        // Truncate to seconds-level precision for filename matching
+        let iso_prefix = if iso_filename.len() >= 19 {
+            &iso_filename[..19]
+        } else {
+            &iso_filename
+        };
+
+        let messages_dir = archive_root.join("messages").join(&year).join(&month);
+
+        // Look for a file matching the pattern: {iso}__{slug}__{id}.md
+        // We check both the computed path and do a directory scan fallback
+        // because the subject slug can vary.
+        let found_file = if messages_dir.is_dir() {
+            let id_suffix = format!("__{}.md", msg.message_id);
+            match std::fs::read_dir(&messages_dir) {
+                Ok(entries) => entries.flatten().any(|entry| {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    name_str.starts_with(iso_prefix) && name_str.ends_with(&id_suffix)
+                }),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        if found_file {
+            found += 1;
+        } else {
+            missing += 1;
+            if missing_ids.len() < 20 {
+                missing_ids.push(msg.message_id);
+            }
+        }
+    }
+
+    // Update global metrics
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .needs_reindex_total
+        .store(missing as u64);
+
+    ConsistencyReport {
+        sampled: messages.len(),
+        found,
+        missing,
+        missing_ids,
+    }
+}
+
+/// Parse year and month from an ISO 8601 timestamp string.
+fn parse_year_month(iso: &str) -> Option<(String, String)> {
+    // Expected format: "2026-02-08T03:29:30..." or similar
+    if iso.len() < 7 {
+        return None;
+    }
+    let year = iso.get(..4)?;
+    let month = iso.get(5..7)?;
+    // Validate they're numeric
+    if year.chars().all(|c| c.is_ascii_digit()) && month.chars().all(|c| c.is_ascii_digit()) {
+        Some((year.to_string(), month.to_string()))
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4204,6 +4481,44 @@ mod tests {
     }
 
     #[test]
+    fn thread_digest_truncation_is_utf8_safe() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 1,
+            "subject": "Unicode Body",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-UNICODE",
+            "project": "proj",
+        });
+
+        // Each '€' is 3 bytes, so this is > 1200 bytes and exercises the truncation path.
+        let body = "€".repeat(600);
+
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            &body,
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let digest = archive.root.join("messages/threads/tkt-unicode.md");
+        assert!(digest.exists());
+        let contents = std::fs::read_to_string(&digest).unwrap();
+        assert!(
+            contents.contains("\n..."),
+            "expected truncated preview marker"
+        );
+    }
+
+    #[test]
     fn test_write_message_bundle_rejects_path_traversal_agent_names() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -4306,8 +4621,7 @@ mod tests {
         assert!(resolve_archive_relative_path(&archive, "a/b/../../../etc/shadow").is_err());
 
         // Non-existent file within archive should succeed (returns joined path)
-        let resolved =
-            resolve_archive_relative_path(&archive, "subdir/newfile.txt").unwrap();
+        let resolved = resolve_archive_relative_path(&archive, "subdir/newfile.txt").unwrap();
         assert!(resolved.starts_with(&archive.root));
 
         // Backslash normalization
@@ -4958,6 +5272,61 @@ mod tests {
     }
 
     #[test]
+    fn resolve_attachment_source_path_rejects_relative_escape_even_when_allow_absolute_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let base_dir = tmp.path().join("project-root");
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.allow_absolute_attachment_paths = true;
+
+        let err = resolve_attachment_source_path(&base_dir, &config, "../outside.txt").unwrap_err();
+        assert!(err.to_string().contains("escapes the project directory"));
+    }
+
+    #[test]
+    fn resolve_attachment_source_path_allows_absolute_outside_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let base_dir = tmp.path().join("project-root");
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.allow_absolute_attachment_paths = true;
+
+        let resolved =
+            resolve_attachment_source_path(&base_dir, &config, &outside.display().to_string())
+                .unwrap();
+        assert_eq!(resolved, outside.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_attachment_source_path_rejects_absolute_outside_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let base_dir = tmp.path().join("project-root");
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.allow_absolute_attachment_paths = false;
+
+        let err =
+            resolve_attachment_source_path(&base_dir, &config, &outside.display().to_string())
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Absolute attachment paths outside the project are not allowed")
+        );
+    }
+
+    #[test]
     fn test_process_markdown_images() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -4969,7 +5338,8 @@ mod tests {
 
         let body = "Check this: ![diagram](diagram.png) and text.";
         let (new_body, meta, rel_paths) =
-            process_markdown_images(&archive, &config, &archive.root, body, EmbedPolicy::Inline).unwrap();
+            process_markdown_images(&archive, &config, &archive.root, body, EmbedPolicy::Inline)
+                .unwrap();
 
         assert_eq!(meta.len(), 1);
         assert!(!rel_paths.is_empty());
@@ -4986,7 +5356,8 @@ mod tests {
 
         let body = "Remote: ![photo](https://example.com/img.png) and local ref.";
         let (new_body, meta, _) =
-            process_markdown_images(&archive, &config, &archive.root, body, EmbedPolicy::File).unwrap();
+            process_markdown_images(&archive, &config, &archive.root, body, EmbedPolicy::File)
+                .unwrap();
 
         // URL should be left unchanged
         assert_eq!(new_body, body);
@@ -5148,8 +5519,9 @@ mod tests {
             agent_name: "TestAgent".to_string(),
         };
         let accepted = wbq_enqueue(op);
-        assert!(
+        assert_eq!(
             accepted,
+            WbqEnqueueResult::Enqueued,
             "wbq_enqueue should accept ops when worker is running"
         );
     }
@@ -5205,7 +5577,7 @@ mod tests {
         };
 
         let accepted = wbq_enqueue(op);
-        assert!(accepted);
+        assert_eq!(accepted, WbqEnqueueResult::Enqueued);
 
         // Flush to ensure the write completes
         wbq_flush();
@@ -5259,7 +5631,7 @@ mod tests {
             extra_paths: vec![],
         };
 
-        assert!(wbq_enqueue(op));
+        assert_eq!(wbq_enqueue(op), WbqEnqueueResult::Enqueued);
         wbq_flush();
         flush_async_commits();
 
@@ -5293,7 +5665,7 @@ mod tests {
             reservations: vec![res_json],
         };
 
-        assert!(wbq_enqueue(op));
+        assert_eq!(wbq_enqueue(op), WbqEnqueueResult::Enqueued);
         wbq_flush();
         flush_async_commits();
 
@@ -5327,7 +5699,7 @@ mod tests {
             metadata: Some(metadata),
         };
 
-        assert!(wbq_enqueue(op));
+        assert_eq!(wbq_enqueue(op), WbqEnqueueResult::Enqueued);
         wbq_flush();
 
         let signal_path = config
@@ -5410,5 +5782,133 @@ mod tests {
         let owner = &locks[0]["owner"];
         assert_eq!(owner["agent"].as_str().unwrap(), "BlueLake");
         assert_eq!(owner["pid"].as_u64().unwrap(), 1234);
+    }
+
+    // -----------------------------------------------------------------------
+    // Consistency checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn consistency_empty_messages_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = check_archive_consistency(dir.path(), &[]);
+        assert_eq!(report.sampled, 0);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing, 0);
+        assert!(report.missing_ids.is_empty());
+    }
+
+    #[test]
+    fn consistency_missing_archive_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: "test-project".into(),
+            message_id: 42,
+            sender_name: "BlueLake".into(),
+            subject: "hello world".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![42]);
+    }
+
+    #[test]
+    fn consistency_found_when_archive_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = "test-project";
+        // Create the expected archive file structure:
+        // {root}/projects/{slug}/archive/messages/2026/02/{iso}__hello-world__42.md
+        let msg_dir = dir
+            .path()
+            .join("projects")
+            .join(slug)
+            .join("archive")
+            .join("messages")
+            .join("2026")
+            .join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+        fs::write(
+            msg_dir.join("2026-02-08T03-29-30+00-00__hello-world__42.md"),
+            "test content",
+        )
+        .unwrap();
+
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: slug.into(),
+            message_id: 42,
+            sender_name: "BlueLake".into(),
+            subject: "hello world".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 1);
+        assert_eq!(report.missing, 0);
+        assert!(report.missing_ids.is_empty());
+    }
+
+    #[test]
+    fn consistency_mixed_found_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = "test-project";
+        let msg_dir = dir
+            .path()
+            .join("projects")
+            .join(slug)
+            .join("archive")
+            .join("messages")
+            .join("2026")
+            .join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+        // Only create archive for message 42, not 99
+        fs::write(
+            msg_dir.join("2026-02-08T03-29-30+00-00__hello__42.md"),
+            "content",
+        )
+        .unwrap();
+
+        let refs = vec![
+            ConsistencyMessageRef {
+                project_slug: slug.into(),
+                message_id: 42,
+                sender_name: "BlueLake".into(),
+                subject: "hello".into(),
+                created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+            },
+            ConsistencyMessageRef {
+                project_slug: slug.into(),
+                message_id: 99,
+                sender_name: "RedFox".into(),
+                subject: "missing".into(),
+                created_ts_iso: "2026-02-08T04:00:00+00:00".into(),
+            },
+        ];
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 2);
+        assert_eq!(report.found, 1);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![99]);
+    }
+
+    #[test]
+    fn parse_year_month_valid() {
+        assert_eq!(
+            parse_year_month("2026-02-08T03:29:30+00:00"),
+            Some(("2026".into(), "02".into()))
+        );
+        assert_eq!(
+            parse_year_month("2025-12-31"),
+            Some(("2025".into(), "12".into()))
+        );
+    }
+
+    #[test]
+    fn parse_year_month_invalid() {
+        assert_eq!(parse_year_month("abc"), None);
+        assert_eq!(parse_year_month(""), None);
+        assert_eq!(parse_year_month("20"), None);
     }
 }

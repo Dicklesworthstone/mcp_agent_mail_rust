@@ -6,18 +6,22 @@
 //! and exposes cursor position so a parent screen can render an
 //! inspector detail panel alongside.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 
 use ftui::layout::Rect;
+use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, MouseButton, MouseEventKind, Style};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
+use crate::tui_layout::{DockLayout, DockPreset};
+use crate::tui_persist::{PreferencePersister, TuiPreferences};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 // Re-use dashboard formatting helpers.
@@ -269,22 +273,62 @@ impl Default for TimelinePane {
 // TimelineScreen — wraps TimelinePane as a full MailScreen
 // ──────────────────────────────────────────────────────────────────────
 
+/// Drag state for interactive dock resizing via mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockDragState {
+    /// No drag in progress.
+    Idle,
+    /// Actively dragging the dock border.
+    Dragging,
+}
+
 /// A full TUI screen backed by [`TimelinePane`].
 ///
 /// This provides the "Messages" tab experience: a scrollable
 /// timeline with cursor-based selection and an inspector detail pane.
 pub struct TimelineScreen {
     pane: TimelinePane,
-    /// Whether the inspector panel is visible (toggled with Enter/i).
-    inspector_visible: bool,
+    /// Dock layout controlling inspector panel position and size.
+    dock: DockLayout,
+    /// Current mouse drag state for dock resizing.
+    dock_drag: DockDragState,
+    /// Last known content area (updated each view call) for mouse hit-testing.
+    /// Uses `Cell` for interior mutability since `view()` takes `&self`.
+    last_area: Cell<Rect>,
+    /// Debounced preference persister (auto-saves dock layout to envfile).
+    persister: Option<PreferencePersister>,
 }
 
 impl TimelineScreen {
+    /// Create with default layout (no persistence).
     #[must_use]
     pub fn new() -> Self {
         Self {
             pane: TimelinePane::new(),
-            inspector_visible: true,
+            dock: DockLayout::right_40(),
+            dock_drag: DockDragState::Idle,
+            last_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            persister: None,
+        }
+    }
+
+    /// Create with layout loaded from config and auto-persistence.
+    #[must_use]
+    pub fn with_config(config: &mcp_agent_mail_core::Config) -> Self {
+        let prefs = TuiPreferences::from_config(config);
+        Self {
+            pane: TimelinePane::new(),
+            dock: prefs.dock,
+            dock_drag: DockDragState::Idle,
+            last_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            persister: Some(PreferencePersister::new(config)),
+        }
+    }
+
+    /// Mark dock layout as changed (triggers debounced auto-save).
+    fn dock_changed(&mut self) {
+        if let Some(ref mut p) = self.persister {
+            p.mark_dirty();
         }
     }
 }
@@ -297,8 +341,9 @@ impl Default for TimelineScreen {
 
 impl MailScreen for TimelineScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
+        let dock_before = self.dock;
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
                 match key.code {
                     // Cursor navigation
                     KeyCode::Char('j') | KeyCode::Down => self.pane.cursor_down(1),
@@ -336,27 +381,89 @@ impl MailScreen for TimelineScreen {
                     // Clear all filters
                     KeyCode::Char('c') => self.pane.clear_filters(),
 
-                    // Toggle inspector panel
+                    // Toggle inspector panel (dock)
                     KeyCode::Char('i') | KeyCode::Enter => {
-                        self.inspector_visible = !self.inspector_visible;
+                        self.dock.toggle_visible();
+                    }
+
+                    // Dock layout controls
+                    KeyCode::Char(']') => self.dock.grow_dock(),
+                    KeyCode::Char('[') => self.dock.shrink_dock(),
+                    KeyCode::Char('}') => self.dock.cycle_position(),
+                    KeyCode::Char('{') => self.dock.cycle_position_prev(),
+
+                    // Dock ratio presets (p cycles through presets)
+                    KeyCode::Char('p') => {
+                        self.dock
+                            .apply_preset(preset_for_ratio(self.dock.ratio).next());
+                        self.dock.visible = true;
+                    }
+
+                    // Correlation link navigation (1-9 when dock is visible)
+                    KeyCode::Char(c @ '1'..='9') if self.dock.visible => {
+                        if let Some(event) = self.pane.selected_event() {
+                            let idx = (c as u8 - b'0') as usize;
+                            if let Some(target) = super::inspector::resolve_link(event, idx) {
+                                // Auto-save if needed before navigating away.
+                                if self.dock != dock_before {
+                                    self.dock_changed();
+                                }
+                                return Cmd::Msg(MailScreenMsg::DeepLink(target));
+                            }
+                        }
                     }
 
                     _ => {}
                 }
             }
+
+            // ── Mouse events for dock border drag ──────────────────
+            Event::Mouse(mouse) => {
+                let area = self.last_area.get();
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if self.dock.hit_test_border(area, mouse.x, mouse.y) {
+                            self.dock_drag = DockDragState::Dragging;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if self.dock_drag == DockDragState::Dragging {
+                            self.dock.drag_to(area, mouse.x, mouse.y);
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        self.dock_drag = DockDragState::Idle;
+                    }
+                    _ => {}
+                }
+            }
+
+            _ => {}
+        }
+        // Auto-save dock layout when it changes.
+        if self.dock != dock_before {
+            self.dock_changed();
         }
         Cmd::None
     }
 
     fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
         self.pane.ingest(state);
+        // Flush debounced preference save.
+        if let Some(ref mut p) = self.persister {
+            let prefs = TuiPreferences {
+                dock: self.dock,
+                ..Default::default()
+            };
+            p.flush_if_due(&prefs);
+        }
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         match target {
             DeepLinkTarget::TimelineAtTime(micros) => {
                 self.pane.jump_to_time(*micros);
-                self.inspector_visible = true;
+                self.dock.visible = true;
                 true
             }
             _ => false,
@@ -364,20 +471,11 @@ impl MailScreen for TimelineScreen {
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
-        if self.inspector_visible && area.width >= 60 {
-            // Split: 60% timeline, 40% inspector.
-            let split = area.width * 3 / 5;
-            let timeline_area = Rect::new(area.x, area.y, split, area.height);
-            let inspector_area = Rect::new(
-                area.x + split,
-                area.y,
-                area.width.saturating_sub(split),
-                area.height,
-            );
-            render_timeline(frame, timeline_area, &self.pane);
-            super::inspector::render_inspector(frame, inspector_area, self.pane.selected_event());
-        } else {
-            render_timeline(frame, area, &self.pane);
+        self.last_area.set(area);
+        let split = self.dock.split(area);
+        render_timeline(frame, split.primary, &self.pane, self.dock);
+        if let Some(dock_area) = split.dock {
+            super::inspector::render_inspector(frame, dock_area, self.pane.selected_event());
         }
     }
 
@@ -419,6 +517,22 @@ impl MailScreen for TimelineScreen {
                 key: "i/Enter",
                 action: "Toggle inspector",
             },
+            HelpEntry {
+                key: "[/]",
+                action: "Shrink/grow dock",
+            },
+            HelpEntry {
+                key: "{/}",
+                action: "Cycle dock position",
+            },
+            HelpEntry {
+                key: "p",
+                action: "Cycle dock preset",
+            },
+            HelpEntry {
+                key: "1-9",
+                action: "Navigate to correlation link",
+            },
         ]
     }
 
@@ -428,6 +542,43 @@ impl MailScreen for TimelineScreen {
 
     fn tab_label(&self) -> &'static str {
         "Timeline"
+    }
+
+    fn reset_layout(&mut self) -> bool {
+        let defaults = TuiPreferences::default();
+        self.dock = defaults.dock;
+        if let Some(ref mut p) = self.persister {
+            p.save_now(&defaults);
+        }
+        true
+    }
+
+    fn export_layout(&self) -> Option<std::path::PathBuf> {
+        let prefs = TuiPreferences {
+            dock: self.dock,
+            ..Default::default()
+        };
+        self.persister
+            .as_ref()
+            .and_then(|p| p.export_json(&prefs).ok())
+    }
+
+    fn import_layout(&mut self) -> bool {
+        let Some(ref p) = self.persister else {
+            return false;
+        };
+        match p.import_json() {
+            Ok(prefs) => {
+                self.dock = prefs.dock;
+                self.dock_changed();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.pane.selected_event()
     }
 }
 
@@ -478,6 +629,27 @@ fn cycle_source_filter(filter: &mut HashSet<EventSource>) {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
+/// Find the closest preset for a given ratio (used when cycling presets).
+fn preset_for_ratio(ratio: f32) -> DockPreset {
+    let presets = [
+        DockPreset::Compact,
+        DockPreset::Third,
+        DockPreset::Balanced,
+        DockPreset::Half,
+        DockPreset::Wide,
+    ];
+    let mut best = DockPreset::Balanced;
+    let mut best_diff = f32::MAX;
+    for p in presets {
+        let diff = (p.ratio() - ratio).abs();
+        if diff < best_diff {
+            best = p;
+            best_diff = diff;
+        }
+    }
+    best
+}
+
 /// Source badge abbreviation.
 const fn source_badge(src: EventSource) -> &'static str {
     match src {
@@ -492,7 +664,7 @@ const fn source_badge(src: EventSource) -> &'static str {
 }
 
 /// Render the timeline pane into the given area.
-fn render_timeline(frame: &mut Frame<'_>, area: Rect, pane: &TimelinePane) {
+fn render_timeline(frame: &mut Frame<'_>, area: Rect, pane: &TimelinePane, dock: DockLayout) {
     let inner_height = area.height.saturating_sub(2) as usize; // borders
     if inner_height == 0 {
         return;
@@ -506,19 +678,32 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, pane: &TimelinePane) {
     let (start, end) = viewport_range(total, inner_height, cursor);
     let viewport = &filtered[start..end];
 
-    // Build text lines with severity badge.
-    let mut lines = Vec::with_capacity(viewport.len());
+    // Build styled text lines with colored severity badges.
+    let cursor_style = Style::default().bold().reverse();
+    let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len());
     for (view_idx, entry) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
-        let marker = if abs_idx == cursor { '>' } else { ' ' };
+        let is_cursor = abs_idx == cursor;
+        let marker = if is_cursor { '>' } else { ' ' };
         let src_badge = source_badge(entry.source);
-        let sev_badge = entry.severity.badge();
-        lines.push(format!(
-            "{marker} {:>6} {} {sev_badge} [{src_badge}] {} {}",
-            entry.seq, entry.display.timestamp, entry.display.icon, entry.display.summary,
-        ));
+        let sev = entry.severity;
+
+        let mut line = Line::from_spans([
+            Span::raw(format!(
+                "{marker} {:>6} {} ",
+                entry.seq, entry.display.timestamp
+            )),
+            sev.styled_badge(),
+            Span::raw(format!(" [{src_badge}] ")),
+            Span::styled(format!("{}", entry.display.icon), sev.style()),
+            Span::raw(format!(" {}", entry.display.summary)),
+        ]);
+        if is_cursor {
+            line.apply_base_style(cursor_style);
+        }
+        text_lines.push(line);
     }
-    let text = lines.join("\n");
+    let text = Text::from_lines(text_lines);
 
     // Title with position info.
     let pos = if total == 0 {
@@ -529,7 +714,12 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, pane: &TimelinePane) {
     let follow_tag = if pane.follow { " [FOLLOW]" } else { "" };
     let verbosity_tag = format!(" [{}]", pane.verbosity.label());
     let filter_tag = build_filter_tag(&pane.kind_filter, &pane.source_filter);
-    let title = format!("Timeline ({pos}){follow_tag}{verbosity_tag}{filter_tag}");
+    let dock_tag = if dock.visible {
+        format!(" [{}]", dock.state_label())
+    } else {
+        String::new()
+    };
+    let title = format!("Timeline ({pos}){follow_tag}{verbosity_tag}{filter_tag}{dock_tag}");
 
     let block = Block::default()
         .title(&title)
@@ -579,6 +769,7 @@ fn build_filter_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui_layout::DockPosition;
 
     fn make_event(_seq: u64) -> MailEvent {
         MailEvent::http_request("GET", "/test", 200, 10, "127.0.0.1")
@@ -870,9 +1061,10 @@ mod tests {
     #[test]
     fn render_timeline_no_panic_empty() {
         let pane = TimelinePane::new();
+        let dock = DockLayout::right_40();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_timeline(&mut frame, Rect::new(0, 0, 80, 24), &pane);
+        render_timeline(&mut frame, Rect::new(0, 0, 80, 24), &pane, dock);
     }
 
     #[test]
@@ -892,17 +1084,19 @@ mod tests {
         }
         pane.cursor = 25;
 
+        let dock = DockLayout::right_40();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(120, 30, &mut pool);
-        render_timeline(&mut frame, Rect::new(0, 0, 120, 30), &pane);
+        render_timeline(&mut frame, Rect::new(0, 0, 120, 30), &pane, dock);
     }
 
     #[test]
     fn render_timeline_minimum_size() {
         let pane = TimelinePane::new();
+        let dock = DockLayout::right_40();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(40, 5, &mut pool);
-        render_timeline(&mut frame, Rect::new(0, 0, 40, 5), &pane);
+        render_timeline(&mut frame, Rect::new(0, 0, 40, 5), &pane, dock);
     }
 
     #[test]
@@ -999,7 +1193,7 @@ mod tests {
         let handled = screen.receive_deep_link(&target);
         assert!(handled);
         assert_eq!(screen.pane.cursor, 50);
-        assert!(screen.inspector_visible);
+        assert!(screen.dock.visible);
     }
 
     #[test]
@@ -1170,5 +1364,591 @@ mod tests {
         pane.verbosity = VerbosityTier::Verbose;
         pane.kind_filter.insert(MailEventKind::HttpRequest);
         assert_eq!(pane.filtered_len(), 1);
+    }
+
+    // ── Dock layout integration tests ────────────────────────────────
+
+    #[test]
+    fn dock_toggle_via_i_key() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        assert!(screen.dock.visible);
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('i')));
+        screen.update(&key, &state);
+        assert!(!screen.dock.visible);
+
+        screen.update(&key, &state);
+        assert!(screen.dock.visible);
+    }
+
+    #[test]
+    fn dock_grow_shrink_via_brackets() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let initial_ratio = screen.dock.ratio;
+
+        let grow = Event::Key(ftui::KeyEvent::new(KeyCode::Char(']')));
+        screen.update(&grow, &state);
+        assert!(screen.dock.ratio > initial_ratio);
+
+        let shrink = Event::Key(ftui::KeyEvent::new(KeyCode::Char('[')));
+        screen.update(&shrink, &state);
+        screen.update(&shrink, &state);
+        assert!(screen.dock.ratio < initial_ratio);
+    }
+
+    #[test]
+    fn dock_cycle_position_via_braces() {
+        use crate::tui_layout::DockPosition;
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        assert_eq!(screen.dock.position, DockPosition::Right);
+
+        let next = Event::Key(ftui::KeyEvent::new(KeyCode::Char('}')));
+        screen.update(&next, &state);
+        assert_eq!(screen.dock.position, DockPosition::Top);
+
+        let prev = Event::Key(ftui::KeyEvent::new(KeyCode::Char('{')));
+        screen.update(&prev, &state);
+        assert_eq!(screen.dock.position, DockPosition::Right);
+    }
+
+    #[test]
+    fn dock_split_used_in_view() {
+        let screen = TimelineScreen::new();
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 40, &mut pool);
+        // Should not panic with dock visible
+        screen.view(&mut frame, Rect::new(0, 0, 120, 40), &state);
+        // Verify last_area was cached
+        assert_eq!(screen.last_area.get().width, 120);
+
+        // Should not panic with dock hidden
+        let mut screen2 = TimelineScreen::new();
+        screen2.dock.visible = false;
+        let mut pool2 = ftui::GraphemePool::new();
+        let mut frame2 = Frame::new(120, 40, &mut pool2);
+        screen2.view(&mut frame2, Rect::new(0, 0, 120, 40), &state);
+    }
+
+    // ── Mouse drag tests ────────────────────────────────────────────
+
+    #[test]
+    fn mouse_down_on_border_starts_drag() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        // Set last_area so hit_test_border works
+        screen.last_area.set(Rect::new(0, 0, 100, 40));
+
+        // For Right dock at 40%, the border is at x=60
+        let split = screen.dock.split(screen.last_area.get());
+        let border_x = split.dock.unwrap().x;
+
+        let mouse_down = Event::Mouse(ftui::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            border_x,
+            20,
+        ));
+        screen.update(&mouse_down, &state);
+        assert_eq!(screen.dock_drag, DockDragState::Dragging);
+
+        // Mouse up ends drag
+        let mouse_up = Event::Mouse(ftui::MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            border_x,
+            20,
+        ));
+        screen.update(&mouse_up, &state);
+        assert_eq!(screen.dock_drag, DockDragState::Idle);
+    }
+
+    #[test]
+    fn mouse_drag_resizes_dock() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.last_area.set(Rect::new(0, 0, 100, 40));
+
+        let initial_ratio = screen.dock.ratio;
+
+        // Start drag on the border
+        let split = screen.dock.split(screen.last_area.get());
+        let border_x = split.dock.unwrap().x;
+        let mouse_down = Event::Mouse(ftui::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            border_x,
+            20,
+        ));
+        screen.update(&mouse_down, &state);
+
+        // Drag to x=40 (makes dock bigger: 100-40=60 → 60%)
+        let mouse_drag = Event::Mouse(ftui::MouseEvent::new(
+            MouseEventKind::Drag(MouseButton::Left),
+            40,
+            20,
+        ));
+        screen.update(&mouse_drag, &state);
+        assert!(screen.dock.ratio > initial_ratio);
+
+        // Release
+        let mouse_up = Event::Mouse(ftui::MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            40,
+            20,
+        ));
+        screen.update(&mouse_up, &state);
+        assert_eq!(screen.dock_drag, DockDragState::Idle);
+    }
+
+    #[test]
+    fn mouse_down_away_from_border_no_drag() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.last_area.set(Rect::new(0, 0, 100, 40));
+
+        // Click far from border
+        let mouse_down = Event::Mouse(ftui::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            10,
+            20,
+        ));
+        screen.update(&mouse_down, &state);
+        assert_eq!(screen.dock_drag, DockDragState::Idle);
+    }
+
+    // ── Preset cycling ──────────────────────────────────────────────
+
+    #[test]
+    fn preset_cycling_via_p_key() {
+        use crate::tui_layout::DockPreset;
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        // Default is 0.4 (Balanced). Pressing p should cycle to next: Half (0.5)
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('p')));
+        screen.update(&key, &state);
+        assert!((screen.dock.ratio - DockPreset::Half.ratio()).abs() < f32::EPSILON);
+        assert!(screen.dock.visible);
+
+        // Next: Wide (0.6)
+        screen.update(&key, &state);
+        assert!((screen.dock.ratio - DockPreset::Wide.ratio()).abs() < f32::EPSILON);
+
+        // Next: Compact (0.2)
+        screen.update(&key, &state);
+        assert!((screen.dock.ratio - DockPreset::Compact.ratio()).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn preset_for_ratio_finds_closest() {
+        assert_eq!(preset_for_ratio(0.4), DockPreset::Balanced);
+        assert_eq!(preset_for_ratio(0.19), DockPreset::Compact);
+        assert_eq!(preset_for_ratio(0.51), DockPreset::Half);
+        assert_eq!(preset_for_ratio(0.61), DockPreset::Wide);
+        assert_eq!(preset_for_ratio(0.34), DockPreset::Third);
+    }
+
+    // ── Timeline state-machine edge cases ────────────────────────
+
+    #[test]
+    fn cursor_after_trim_is_clamped() {
+        let mut pane = test_pane();
+        // Fill to capacity + extra
+        for i in 0..(TIMELINE_CAPACITY + 200) {
+            let seq = u64::try_from(i).expect("test index fits u64");
+            let ts = i64::try_from(i).expect("test index fits i64");
+            pane.entries.push(TimelineEntry {
+                display: format_event(&make_event(seq)),
+                seq,
+                timestamp_micros: ts * 1_000_000,
+                source: EventSource::Http,
+                severity: EventSeverity::Debug,
+                raw: make_event(seq),
+            });
+        }
+        // Set cursor to middle of data
+        pane.cursor = TIMELINE_CAPACITY + 100;
+
+        // Simulate trim
+        let excess = pane.entries.len() - TIMELINE_CAPACITY;
+        pane.entries.drain(..excess);
+        pane.cursor = pane.cursor.saturating_sub(excess);
+
+        // Cursor should be within range
+        assert!(pane.cursor < pane.entries.len());
+    }
+
+    #[test]
+    fn cursor_after_filter_toggle_is_clamped() {
+        let mut pane = test_pane();
+        // Add 5 HTTP entries and 5 Mail entries
+        for i in 0_u64..5 {
+            let i_i64 = i64::try_from(i).expect("test index fits i64");
+            pane.entries.push(TimelineEntry {
+                display: EventEntry {
+                    kind: MailEventKind::HttpRequest,
+                    severity: EventSeverity::Debug,
+                    timestamp: format!("00:00:0{i}.000"),
+                    icon: '↔',
+                    summary: format!("GET /{i}"),
+                },
+                seq: i,
+                timestamp_micros: i_i64 * 1_000_000,
+                source: EventSource::Http,
+                severity: EventSeverity::Debug,
+                raw: make_event(i),
+            });
+        }
+        for i in 5_u64..10 {
+            let i_i64 = i64::try_from(i).expect("test index fits i64");
+            pane.entries.push(TimelineEntry {
+                display: EventEntry {
+                    kind: MailEventKind::MessageSent,
+                    severity: EventSeverity::Info,
+                    timestamp: format!("00:00:0{i}.000"),
+                    icon: '✉',
+                    summary: format!("msg {i}"),
+                },
+                seq: i,
+                timestamp_micros: i_i64 * 1_000_000,
+                source: EventSource::Mail,
+                severity: EventSeverity::Info,
+                raw: MailEvent::message_sent(i_i64, "A", vec![], "s", "t", "p"),
+            });
+        }
+
+        // All 10 visible, set cursor to index 8
+        assert_eq!(pane.filtered_len(), 10);
+        pane.cursor = 8;
+
+        // Enable kind filter for HTTP only (5 items)
+        pane.toggle_kind_filter(MailEventKind::HttpRequest);
+        assert_eq!(pane.filtered_len(), 5);
+        // Cursor should be clamped to max valid index (4)
+        assert!(pane.cursor <= 4);
+    }
+
+    #[test]
+    fn multiple_filters_combined_kind_source_verbosity() {
+        let mut pane = test_pane();
+        // HTTP Debug from Http source
+        pane.entries.push(TimelineEntry {
+            display: EventEntry {
+                kind: MailEventKind::HttpRequest,
+                severity: EventSeverity::Debug,
+                timestamp: "00:00:00.000".to_string(),
+                icon: '↔',
+                summary: "GET /".to_string(),
+            },
+            seq: 1,
+            timestamp_micros: 1_000_000,
+            source: EventSource::Http,
+            severity: EventSeverity::Debug,
+            raw: make_event(1),
+        });
+        // Tool Debug from Tooling source
+        pane.entries.push(TimelineEntry {
+            display: EventEntry {
+                kind: MailEventKind::ToolCallEnd,
+                severity: EventSeverity::Debug,
+                timestamp: "00:00:00.001".to_string(),
+                icon: '⚙',
+                summary: "tool done".to_string(),
+            },
+            seq: 2,
+            timestamp_micros: 2_000_000,
+            source: EventSource::Tooling,
+            severity: EventSeverity::Debug,
+            raw: make_event(2),
+        });
+        // Message Info from Mail source
+        pane.entries.push(TimelineEntry {
+            display: EventEntry {
+                kind: MailEventKind::MessageSent,
+                severity: EventSeverity::Info,
+                timestamp: "00:00:00.002".to_string(),
+                icon: '✉',
+                summary: "msg".to_string(),
+            },
+            seq: 3,
+            timestamp_micros: 3_000_000,
+            source: EventSource::Mail,
+            severity: EventSeverity::Info,
+            raw: MailEvent::message_sent(1, "A", vec![], "s", "t", "p"),
+        });
+
+        // All verbosity, no filters: all 3 visible
+        assert_eq!(pane.filtered_len(), 3);
+
+        // Kind filter: only HttpRequest
+        pane.toggle_kind_filter(MailEventKind::HttpRequest);
+        assert_eq!(pane.filtered_len(), 1);
+
+        // Remove kind filter, add source filter: only Tooling
+        pane.toggle_kind_filter(MailEventKind::HttpRequest);
+        pane.toggle_source_filter(EventSource::Tooling);
+        assert_eq!(pane.filtered_len(), 1);
+
+        // Combine: source=Tooling + verbosity=Standard (hides Debug)
+        pane.verbosity = VerbosityTier::Standard;
+        assert_eq!(pane.filtered_len(), 0); // Tooling entry is Debug, hidden by Standard
+    }
+
+    #[test]
+    fn empty_filter_results_cursor_stays_at_zero() {
+        let mut pane = test_pane();
+        pane.entries.push(TimelineEntry {
+            display: EventEntry {
+                kind: MailEventKind::HttpRequest,
+                severity: EventSeverity::Debug,
+                timestamp: "00:00:00.000".to_string(),
+                icon: '↔',
+                summary: "GET /".to_string(),
+            },
+            seq: 1,
+            timestamp_micros: 1_000_000,
+            source: EventSource::Http,
+            severity: EventSeverity::Debug,
+            raw: make_event(1),
+        });
+
+        pane.cursor = 0;
+        // Filter to something that matches nothing
+        pane.toggle_kind_filter(MailEventKind::MessageSent);
+        assert_eq!(pane.filtered_len(), 0);
+        assert_eq!(pane.cursor, 0);
+        assert!(pane.selected_event().is_none());
+    }
+
+    #[test]
+    fn follow_mode_plus_filter_toggle() {
+        let mut pane = test_pane();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        // Push 5 HTTP + 5 tool events
+        for _ in 0..5 {
+            let _ = state.push_event(MailEvent::http_request("GET", "/x", 200, 1, "127.0.0.1"));
+        }
+        for _ in 0..5 {
+            let _ = state.push_event(MailEvent::tool_call_end(
+                "t",
+                1,
+                None,
+                0,
+                0.0,
+                vec![],
+                None,
+                None,
+            ));
+        }
+
+        pane.follow = true;
+        pane.ingest(&state);
+
+        // Follow should be at the end
+        assert_eq!(pane.cursor, pane.filtered_len() - 1);
+
+        // Now toggle kind filter to only show HttpRequest
+        pane.toggle_kind_filter(MailEventKind::HttpRequest);
+        // Cursor should be clamped to the new filtered view
+        assert!(pane.cursor < pane.filtered_len());
+    }
+
+    #[test]
+    fn jump_to_time_empty_pane() {
+        let mut pane = test_pane();
+        // Should not panic on empty data
+        pane.jump_to_time(50_000_000);
+        assert_eq!(pane.cursor, 0);
+    }
+
+    #[test]
+    fn jump_to_time_before_first_entry() {
+        let mut pane = test_pane();
+        for i in 10..20u64 {
+            let i_i64 = i64::try_from(i).expect("test index fits i64");
+            pane.entries.push(TimelineEntry {
+                display: format_event(&make_event(i)),
+                seq: i,
+                timestamp_micros: i_i64 * 1_000_000,
+                source: EventSource::Http,
+                severity: EventSeverity::Debug,
+                raw: make_event(i),
+            });
+        }
+        pane.jump_to_time(0);
+        assert_eq!(pane.cursor, 0);
+    }
+
+    #[test]
+    fn toggle_follow_jumps_to_end() {
+        let mut pane = test_pane();
+        for i in 0_u64..10 {
+            let i_i64 = i64::try_from(i).expect("test index fits i64");
+            pane.entries.push(TimelineEntry {
+                display: format_event(&make_event(i)),
+                seq: i,
+                timestamp_micros: i_i64 * 1_000_000,
+                source: EventSource::Http,
+                severity: EventSeverity::Debug,
+                raw: make_event(i),
+            });
+        }
+        pane.cursor = 0;
+        assert!(!pane.follow);
+
+        pane.toggle_follow();
+        assert!(pane.follow);
+        assert_eq!(pane.cursor, 9);
+
+        pane.toggle_follow();
+        assert!(!pane.follow);
+    }
+
+    #[test]
+    fn cursor_up_disables_follow() {
+        let mut pane = test_pane();
+        pane.follow = true;
+        for i in 0_u64..5 {
+            let i_i64 = i64::try_from(i).expect("test index fits i64");
+            pane.entries.push(TimelineEntry {
+                display: format_event(&make_event(i)),
+                seq: i,
+                timestamp_micros: i_i64 * 1_000_000,
+                source: EventSource::Http,
+                severity: EventSeverity::Debug,
+                raw: make_event(i),
+            });
+        }
+        pane.cursor = 4;
+        pane.cursor_up(1);
+        assert!(!pane.follow);
+        assert_eq!(pane.cursor, 3);
+    }
+
+    #[test]
+    fn render_timeline_at_extreme_width() {
+        let pane = TimelinePane::new();
+        let dock = DockLayout::right_40();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(10, 5, &mut pool);
+        // Should not panic at very narrow width
+        render_timeline(&mut frame, Rect::new(0, 0, 10, 5), &pane, dock);
+    }
+
+    #[test]
+    fn render_timeline_height_one() {
+        let pane = TimelinePane::new();
+        let dock = DockLayout::right_40();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 1, &mut pool);
+        // Should not panic at minimum height
+        render_timeline(&mut frame, Rect::new(0, 0, 80, 1), &pane, dock);
+    }
+
+    #[test]
+    fn deep_link_thread_by_id_returns_false() {
+        let mut screen = TimelineScreen::new();
+        // ThreadById is not handled by Timeline (it handles TimelineAtTime)
+        let target = DeepLinkTarget::ThreadById("test-thread".to_string());
+        assert!(!screen.receive_deep_link(&target));
+    }
+
+    #[test]
+    fn total_ingested_tracks_all_events() {
+        let mut pane = test_pane();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        for _ in 0..10 {
+            let _ = state.push_event(MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1"));
+        }
+        pane.ingest(&state);
+        assert_eq!(pane.total_ingested, 10);
+    }
+
+    // ── Layout operations ──────────────────────────────────────────
+
+    #[test]
+    fn reset_layout_restores_defaults() {
+        let mut screen = TimelineScreen::new();
+        screen.dock = DockLayout::new(DockPosition::Left, 0.6).with_visible(false);
+        assert!(screen.reset_layout());
+        assert_eq!(screen.dock, DockLayout::default());
+    }
+
+    #[test]
+    fn reset_layout_with_config_restores_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = mcp_agent_mail_core::Config {
+            console_persist_path: dir.path().join("config.env"),
+            console_auto_save: true,
+            tui_dock_position: "left".to_string(),
+            tui_dock_ratio_percent: 60,
+            tui_dock_visible: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let mut screen = TimelineScreen::with_config(&config);
+        assert_eq!(screen.dock.position, DockPosition::Left);
+        assert!(!screen.dock.visible);
+
+        assert!(screen.reset_layout());
+        assert_eq!(screen.dock.position, DockPosition::Right);
+        assert!(screen.dock.visible);
+    }
+
+    #[test]
+    fn export_layout_returns_none_without_persister() {
+        let screen = TimelineScreen::new();
+        assert!(screen.export_layout().is_none());
+    }
+
+    #[test]
+    fn import_layout_returns_false_without_persister() {
+        let mut screen = TimelineScreen::new();
+        assert!(!screen.import_layout());
+    }
+
+    #[test]
+    fn export_import_layout_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = mcp_agent_mail_core::Config {
+            console_persist_path: dir.path().join("config.env"),
+            console_auto_save: true,
+            tui_dock_position: "left".to_string(),
+            tui_dock_ratio_percent: 55,
+            tui_dock_visible: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
+
+        // Export from screen with custom layout
+        let screen = TimelineScreen::with_config(&config);
+        let original_dock = screen.dock;
+        let path = screen.export_layout().unwrap();
+        assert!(path.exists());
+        assert!(path.to_str().unwrap().ends_with("layout.json"));
+
+        // Import into a fresh screen with defaults
+        let config2 = mcp_agent_mail_core::Config {
+            console_persist_path: dir.path().join("config.env"),
+            console_auto_save: true,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let mut screen2 = TimelineScreen::with_config(&config2);
+        assert_ne!(screen2.dock, original_dock);
+        assert!(screen2.import_layout());
+        assert_eq!(screen2.dock, original_dock);
+    }
+
+    #[test]
+    fn import_layout_fails_with_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = mcp_agent_mail_core::Config {
+            console_persist_path: dir.path().join("config.env"),
+            console_auto_save: true,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let mut screen = TimelineScreen::with_config(&config);
+        assert!(!screen.import_layout());
     }
 }

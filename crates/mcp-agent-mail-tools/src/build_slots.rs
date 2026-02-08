@@ -48,7 +48,8 @@ fn safe_component(value: &str) -> String {
     for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '] {
         safe = safe.replace(ch, "_");
     }
-    if safe.is_empty() {
+    // Prevent path traversal via special components.
+    if safe.is_empty() || safe == "." || safe == ".." {
         "unknown".to_string()
     } else {
         safe
@@ -349,6 +350,16 @@ mod tests {
     #[test]
     fn safe_component_trims_whitespace() {
         assert_eq!(safe_component("  hello  "), "hello");
+    }
+
+    #[test]
+    fn safe_component_dot_is_rejected() {
+        assert_eq!(safe_component("."), "unknown");
+    }
+
+    #[test]
+    fn safe_component_dotdot_is_rejected() {
+        assert_eq!(safe_component(".."), "unknown");
     }
 
     #[test]

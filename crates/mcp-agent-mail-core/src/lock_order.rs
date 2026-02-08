@@ -46,6 +46,7 @@ pub enum LockLevel {
     // ---------------------------------------------------------------------
     // Storage/archive layer
     // ---------------------------------------------------------------------
+    StorageArchiveLockMap,
     StorageRepoCache,
     StorageSignalDebounce,
     StorageWbqDrainHandle,
@@ -81,6 +82,7 @@ impl LockLevel {
             Self::DbQueryTrackerInner => 30,
 
             // Storage
+            Self::StorageArchiveLockMap => 39,
             Self::StorageRepoCache => 40,
             Self::StorageSignalDebounce => 41,
             Self::StorageWbqDrainHandle => 50,

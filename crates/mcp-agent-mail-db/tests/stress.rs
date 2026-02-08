@@ -41,6 +41,7 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
         acquire_timeout_ms: 60_000,
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
+        warmup_connections: 0,
     };
     let pool = DbPool::new(&config).expect("create pool");
     (pool, dir)
@@ -107,6 +108,7 @@ fn stress_concurrent_pool_warmup_has_no_sqlite_busy() {
         acquire_timeout_ms: 60_000,
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
+        warmup_connections: 0,
     };
     let pool = DbPool::new(&config).expect("create pool");
 
@@ -973,6 +975,7 @@ fn stress_pool_exhaustion_recovery() {
         acquire_timeout_ms: 30_000,
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
+        warmup_connections: 0,
     };
     let pool = DbPool::new(&config).expect("create pool");
     std::mem::forget(dir);
@@ -1023,6 +1026,460 @@ fn stress_pool_exhaustion_recovery() {
         success_count.load(Ordering::Relaxed),
         n_threads as u64,
         "all threads should succeed despite pool contention"
+    );
+}
+
+// =============================================================================
+// Test: 1000-agent concurrent workload (br-15dv.9.1)
+//
+// Spawns 50 projects × 20 agents = 1000 agents performing 16,000 operations:
+//   1,000 registrations + 5,000 sends + 5,000 fetches + 5,000 acks
+//
+// Run explicitly: cargo test --test stress stress_1000_agent -- --ignored
+// =============================================================================
+
+fn cap(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or_else(String::new, |f| {
+        let mut out: String = f.to_uppercase().collect();
+        out.extend(c);
+        out
+    })
+}
+
+#[test]
+#[ignore = "heavy load test: 1000 agents, 16K operations"]
+fn stress_1000_agent_concurrent_workload() {
+    use mcp_agent_mail_core::models::{VALID_ADJECTIVES, VALID_NOUNS};
+    use std::time::Instant;
+
+    let start = Instant::now();
+
+    // Pool with enough connections for 50 concurrent threads
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let db_path = dir
+        .path()
+        .join(format!("stress_1k_{}.db", unique_suffix()));
+    let config = DbPoolConfig {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        max_connections: 100,
+        min_connections: 10,
+        acquire_timeout_ms: 120_000,
+        max_lifetime_ms: 3_600_000,
+        run_migrations: true,
+        warmup_connections: 0,
+    };
+    let pool = DbPool::new(&config).expect("create pool");
+    std::mem::forget(dir); // prevent cleanup while threads are running
+
+    // Generate 1000 unique agent names from adjective×noun cross product
+    let mut all_names: Vec<String> = Vec::with_capacity(1000);
+    'name_gen: for adj in VALID_ADJECTIVES {
+        for noun in VALID_NOUNS {
+            all_names.push(format!("{}{}", cap(adj), cap(noun)));
+            if all_names.len() >= 1000 {
+                break 'name_gen;
+            }
+        }
+    }
+    assert_eq!(all_names.len(), 1000, "need 1000 unique agent names");
+
+    let n_projects: usize = 50;
+    let agents_per_project: usize = 20;
+    let msgs_per_agent: usize = 5;
+
+    // Counters
+    let registration_count = Arc::new(AtomicU64::new(0));
+    let send_count = Arc::new(AtomicU64::new(0));
+    let fetch_count = Arc::new(AtomicU64::new(0));
+    let ack_count = Arc::new(AtomicU64::new(0));
+    let error_count = Arc::new(AtomicU64::new(0));
+
+    // All 50 threads start simultaneously
+    let barrier = Arc::new(Barrier::new(n_projects));
+
+    let handles: Vec<_> = (0..n_projects)
+        .map(|p| {
+            let pool = pool.clone();
+            let barrier = Arc::clone(&barrier);
+            let names: Vec<String> =
+                all_names[p * agents_per_project..(p + 1) * agents_per_project].to_vec();
+            let reg_c = Arc::clone(&registration_count);
+            let snd_c = Arc::clone(&send_count);
+            let ftc_c = Arc::clone(&fetch_count);
+            let ack_c = Arc::clone(&ack_count);
+            let err_c = Arc::clone(&error_count);
+
+            std::thread::spawn(move || {
+                barrier.wait();
+
+                let human_key = format!("/data/stress/1k_p{p}_{}", unique_suffix());
+
+                // ── Phase 1: ensure project + register agents ──
+                let project_id = block_on_with_retry(5, |cx| {
+                    let pp = pool.clone();
+                    let k = human_key.clone();
+                    async move { queries::ensure_project(&cx, &pp, &k).await }
+                })
+                .id
+                .unwrap();
+
+                let mut agent_ids: Vec<i64> = Vec::with_capacity(agents_per_project);
+                for name in &names {
+                    let aid = block_on_with_retry(5, |cx| {
+                        let pp = pool.clone();
+                        let n = name.clone();
+                        async move {
+                            queries::register_agent(
+                                &cx, &pp, project_id, &n, "stress", "stress-model", None, None,
+                            )
+                            .await
+                        }
+                    });
+                    agent_ids.push(aid.id.unwrap());
+                    reg_c.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // ── Phase 2: each agent sends msgs_per_agent messages ──
+                // Agent a sends to agents (a+1)%N, (a+2)%N, ..., (a+5)%N
+                for (a, &sender_id) in agent_ids.iter().enumerate() {
+                    for m in 0..msgs_per_agent {
+                        let receiver_idx = (a + m + 1) % agents_per_project;
+                        let receiver_id = agent_ids[receiver_idx];
+                        let pp = pool.clone();
+                        match block_on(|cx| {
+                            let pp2 = pp.clone();
+                            async move {
+                                queries::create_message_with_recipients(
+                                    &cx,
+                                    &pp2,
+                                    project_id,
+                                    sender_id,
+                                    &format!("p{p}a{a}m{m}"),
+                                    &format!("body {a}-{m}"),
+                                    None,
+                                    "normal",
+                                    true,
+                                    "",
+                                    &[(receiver_id, "to")],
+                                )
+                                .await
+                            }
+                        }) {
+                            Outcome::Ok(_) => {
+                                snd_c.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Outcome::Err(e) => {
+                                eprintln!("send error p{p} a{a} m{m}: {e:?}");
+                                err_c.fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ => {
+                                err_c.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+
+                // ── Phase 3: each agent fetches inbox + acks up to 5 ──
+                for (a, &agent_id) in agent_ids.iter().enumerate() {
+                    let pp = pool.clone();
+                    match block_on(|cx| {
+                        let pp2 = pp.clone();
+                        async move {
+                            queries::fetch_inbox(
+                                &cx, &pp2, project_id, agent_id, false, None, 50,
+                            )
+                            .await
+                        }
+                    }) {
+                        Outcome::Ok(msgs) => {
+                            ftc_c.fetch_add(1, Ordering::Relaxed);
+                            for msg in msgs.iter().take(msgs_per_agent) {
+                                let mid = msg.message.id.unwrap();
+                                let pp3 = pool.clone();
+                                match block_on(|cx| {
+                                    let pp4 = pp3.clone();
+                                    async move {
+                                        queries::acknowledge_message(&cx, &pp4, agent_id, mid)
+                                            .await
+                                    }
+                                }) {
+                                    Outcome::Ok(_) => {
+                                        ack_c.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Outcome::Err(e) => {
+                                        eprintln!("ack error p{p} a{a} mid{mid}: {e:?}");
+                                        err_c.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    _ => {
+                                        err_c.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        Outcome::Err(e) => {
+                            eprintln!("fetch error p{p} a{a}: {e:?}");
+                            err_c.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            err_c.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread should not panic");
+    }
+
+    let elapsed = start.elapsed();
+    let regs = registration_count.load(Ordering::Relaxed);
+    let sends = send_count.load(Ordering::Relaxed);
+    let fetches = fetch_count.load(Ordering::Relaxed);
+    let acks = ack_count.load(Ordering::Relaxed);
+    let errors = error_count.load(Ordering::Relaxed);
+
+    eprintln!(
+        "1000-agent stress: {} regs, {} sends, {} fetches, {} acks, {} errors in {:.2}s",
+        regs,
+        sends,
+        fetches,
+        acks,
+        errors,
+        elapsed.as_secs_f64()
+    );
+
+    assert_eq!(errors, 0, "expected zero errors, got {errors}");
+    assert_eq!(regs, 1000, "expected 1000 registrations");
+    assert_eq!(sends, 5000, "expected 5000 sends");
+    assert_eq!(fetches, 1000, "expected 1000 fetches");
+    // Each agent should receive ~5 messages (deterministic ring pattern),
+    // so acks should be close to 5000.
+    assert!(
+        acks >= 4000,
+        "expected >= 4000 acks (got {acks}; some timing variation possible)"
+    );
+    assert!(
+        elapsed.as_secs() < 120,
+        "expected < 120s, took {:.1}s",
+        elapsed.as_secs_f64()
+    );
+}
+
+// =============================================================================
+// Test: 200-concurrent burst acquire+release+SELECT (br-15dv.1.1.3)
+//
+// Proves the pool handles burst contention without SQLITE_BUSY or timeouts.
+// =============================================================================
+
+#[test]
+fn stress_burst_200_concurrent_acquire_release() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let db_path = dir
+        .path()
+        .join(format!("burst200_{}.db", unique_suffix()));
+    let config = DbPoolConfig {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        max_connections: 50,
+        min_connections: 10,
+        acquire_timeout_ms: 30_000,
+        max_lifetime_ms: 3_600_000,
+        run_migrations: true,
+        warmup_connections: 0,
+    };
+    let pool = DbPool::new(&config).expect("create pool");
+    std::mem::forget(dir);
+
+    // Seed a project so SELECT has data to hit
+    let human_key = format!("/data/stress/burst200_{}", unique_suffix());
+    {
+        let p = pool.clone();
+        let k = human_key.clone();
+        block_on(|cx| async move {
+            let _ = queries::ensure_project(&cx, &p, &k).await;
+        });
+    }
+
+    let n_threads: usize = 200;
+    let barrier = Arc::new(Barrier::new(n_threads));
+    let error_count = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let pool = pool.clone();
+            let barrier = Arc::clone(&barrier);
+            let errors = Arc::clone(&error_count);
+            let key = human_key.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                // Each thread: acquire → run a SELECT → release
+                block_on(|cx| async move {
+                    match pool.acquire(&cx).await {
+                        Outcome::Ok(conn) => {
+                            // Run a lightweight read to exercise the connection
+                            let result = conn.query_sync(
+                                "SELECT count(*) AS cnt FROM projects WHERE human_key = ?",
+                                &[sqlmodel_core::Value::Text(key)],
+                            );
+                            if result.is_err() {
+                                errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            drop(conn);
+                        }
+                        Outcome::Err(e) => {
+                            eprintln!("burst200 acquire error: {e:?}");
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread join");
+    }
+
+    let errs = error_count.load(Ordering::Relaxed);
+    assert_eq!(
+        errs, 0,
+        "expected 0 errors from 200 concurrent acquire+SELECT, got {errs}"
+    );
+}
+
+// =============================================================================
+// Test: Pool acquire latency budget (br-15dv.1.1.3)
+//
+// Measures p95 acquire latency under moderate contention (after warmup)
+// and asserts it stays below the Yellow SLO threshold (50ms).
+// On failure, prints full histogram stats for diagnosis.
+// =============================================================================
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn stress_pool_acquire_latency_budget() {
+    use mcp_agent_mail_core::slo;
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let db_path = dir
+        .path()
+        .join(format!("latency_budget_{}.db", unique_suffix()));
+    let config = DbPoolConfig {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        max_connections: 50,
+        min_connections: 10,
+        acquire_timeout_ms: 30_000,
+        max_lifetime_ms: 3_600_000,
+        run_migrations: true,
+        warmup_connections: 10,
+    };
+    let pool = DbPool::new(&config).expect("create pool");
+    std::mem::forget(dir);
+
+    // Warmup phase: pre-open connections so first-acquire cost is excluded
+    block_on(|cx| {
+        let p = pool.clone();
+        async move {
+            let _ = p.warmup(&cx, 10, std::time::Duration::from_secs(10)).await;
+        }
+    });
+
+    // Seed a project
+    let human_key = format!("/data/stress/latency_{}", unique_suffix());
+    {
+        let p = pool.clone();
+        let k = human_key.clone();
+        block_on(|cx| async move {
+            let _ = queries::ensure_project(&cx, &p, &k).await;
+        });
+    }
+
+    // Reset metrics so warmup acquires don't skew the histogram
+    let metrics = mcp_agent_mail_core::global_metrics();
+    metrics.db.pool_acquire_latency_us.reset();
+
+    // Moderate contention: 50 threads, 20 acquire+release cycles each = 1000 samples
+    let n_threads: usize = 50;
+    let cycles_per_thread: usize = 20;
+    let barrier = Arc::new(Barrier::new(n_threads));
+    let error_count = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let pool = pool.clone();
+            let barrier = Arc::clone(&barrier);
+            let errors = Arc::clone(&error_count);
+            let key = human_key.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..cycles_per_thread {
+                    let pp = pool.clone();
+                    let k = key.clone();
+                    let errs = Arc::clone(&errors);
+                    block_on(|cx| async move {
+                        match pp.acquire(&cx).await {
+                            Outcome::Ok(conn) => {
+                                // Lightweight read
+                                let _ = conn.query_sync(
+                                    "SELECT 1 AS ok WHERE EXISTS (SELECT 1 FROM projects WHERE human_key = ?)",
+                                    &[sqlmodel_core::Value::Text(k)],
+                                );
+                                drop(conn);
+                            }
+                            _ => {
+                                errs.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread join");
+    }
+
+    let errs = error_count.load(Ordering::Relaxed);
+    assert_eq!(errs, 0, "expected 0 errors during latency measurement, got {errs}");
+
+    // Check the histogram
+    let snap = metrics.db.pool_acquire_latency_us.snapshot();
+
+    eprintln!(
+        "pool acquire latency: count={}, min={}μs, p50={}μs, p95={}μs, p99={}μs, max={}μs",
+        snap.count, snap.min, snap.p50, snap.p95, snap.p99, snap.max
+    );
+
+    // SLO: p95 must stay in Green or Yellow zone (≤ 50ms = 50,000μs)
+    #[allow(clippy::cast_precision_loss)]
+    let p95_ms = snap.p95 as f64 / 1000.0;
+    assert!(
+        snap.p95 <= slo::POOL_ACQUIRE_YELLOW_US,
+        "pool acquire p95 ({p95}μs = {p95_ms:.1}ms) exceeds Yellow SLO ({yellow}μs = {yellow_ms}ms).\n\
+         Histogram: count={count}, min={min}μs, p50={p50}μs, p99={p99}μs, max={max}μs",
+        p95 = snap.p95,
+        p95_ms = p95_ms,
+        yellow = slo::POOL_ACQUIRE_YELLOW_US,
+        yellow_ms = slo::POOL_ACQUIRE_YELLOW_US / 1000,
+        count = snap.count,
+        min = snap.min,
+        p50 = snap.p50,
+        p99 = snap.p99,
+        max = snap.max,
+    );
+
+    // Bonus: verify enough samples collected
+    let expected_samples = (n_threads * cycles_per_thread) as u64;
+    assert!(
+        snap.count >= expected_samples,
+        "expected at least {expected_samples} samples (warmup excluded), got {}",
+        snap.count
     );
 }
 

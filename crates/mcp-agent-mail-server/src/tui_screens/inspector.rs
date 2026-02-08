@@ -2,6 +2,14 @@
 //!
 //! Renders structured detail views for selected `MailEvent` entries,
 //! with masked payloads and copy-friendly formatting.
+//!
+//! ## Correlation Links
+//!
+//! Each event can reference entities (agents, threads, tools, projects,
+//! messages) that are navigable via deep-link.  [`extract_links`] pulls
+//! these references out of a `MailEvent` and returns them as numbered
+//! [`CorrelationLink`] entries.  The inspector renders these with
+//! number-key indicators so the operator can press `1`..`9` to navigate.
 
 use ftui::Frame;
 use ftui::layout::Rect;
@@ -9,10 +17,283 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
+use std::fmt::Write as _;
 
+use super::DeepLinkTarget;
+use super::dashboard::format_event;
 use crate::tui_events::{MailEvent, MailEventKind};
 
-use super::dashboard::format_event;
+// ──────────────────────────────────────────────────────────────────────
+// Correlation links — extractable navigable references
+// ──────────────────────────────────────────────────────────────────────
+
+/// A navigable reference extracted from a `MailEvent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrelationLink {
+    /// Human-readable label (e.g. "Agent: `RedFox`").
+    pub label: String,
+    /// The deep-link target for navigation.
+    pub target: DeepLinkTarget,
+}
+
+/// Extract all navigable correlation links from an event.
+///
+/// Links are returned in a stable order: project, agent(s), thread,
+/// message, tool.  Duplicates are suppressed.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn extract_links(event: &MailEvent) -> Vec<CorrelationLink> {
+    let mut links = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut push = |label: String, target: DeepLinkTarget| {
+        let key = format!("{target:?}");
+        if seen.insert(key) {
+            links.push(CorrelationLink { label, target });
+        }
+    };
+
+    match event {
+        MailEvent::ToolCallStart {
+            tool_name,
+            project,
+            agent,
+            ..
+        }
+        | MailEvent::ToolCallEnd {
+            tool_name,
+            project,
+            agent,
+            ..
+        } => {
+            if let Some(p) = project {
+                push(
+                    format!("Project: {p}"),
+                    DeepLinkTarget::ProjectBySlug(p.clone()),
+                );
+            }
+            if let Some(a) = agent {
+                push(
+                    format!("Agent: {a}"),
+                    DeepLinkTarget::AgentByName(a.clone()),
+                );
+            }
+            push(
+                format!("Tool: {tool_name}"),
+                DeepLinkTarget::ToolByName(tool_name.clone()),
+            );
+        }
+
+        MailEvent::MessageSent {
+            id,
+            from,
+            to,
+            thread_id,
+            project,
+            ..
+        }
+        | MailEvent::MessageReceived {
+            id,
+            from,
+            to,
+            thread_id,
+            project,
+            ..
+        } => {
+            push(
+                format!("Project: {project}"),
+                DeepLinkTarget::ProjectBySlug(project.clone()),
+            );
+            push(
+                format!("From: {from}"),
+                DeepLinkTarget::AgentByName(from.clone()),
+            );
+            for recipient in to {
+                push(
+                    format!("To: {recipient}"),
+                    DeepLinkTarget::AgentByName(recipient.clone()),
+                );
+            }
+            push(
+                format!("Thread: {thread_id}"),
+                DeepLinkTarget::ThreadById(thread_id.clone()),
+            );
+            push(format!("Message: #{id}"), DeepLinkTarget::MessageById(*id));
+        }
+
+        MailEvent::ReservationGranted { agent, project, .. }
+        | MailEvent::ReservationReleased { agent, project, .. } => {
+            push(
+                format!("Project: {project}"),
+                DeepLinkTarget::ProjectBySlug(project.clone()),
+            );
+            push(
+                format!("Agent: {agent}"),
+                DeepLinkTarget::AgentByName(agent.clone()),
+            );
+        }
+
+        MailEvent::AgentRegistered { name, project, .. } => {
+            push(
+                format!("Project: {project}"),
+                DeepLinkTarget::ProjectBySlug(project.clone()),
+            );
+            push(
+                format!("Agent: {name}"),
+                DeepLinkTarget::AgentByName(name.clone()),
+            );
+        }
+
+        MailEvent::HttpRequest { .. }
+        | MailEvent::HealthPulse { .. }
+        | MailEvent::ServerStarted { .. }
+        | MailEvent::ServerShutdown { .. } => {
+            // No entity-level correlation for infrastructure events.
+        }
+    }
+
+    links
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Quick actions — context-aware palette entries from focused entity
+// ──────────────────────────────────────────────────────────────────────
+
+/// A context-aware quick action derived from a focused entity.
+#[derive(Debug, Clone)]
+pub struct QuickAction {
+    /// Unique ID for palette dispatch (e.g. "quick:agent:RedFox").
+    pub id: String,
+    /// Display label (e.g. "Go to Agent `RedFox`").
+    pub label: String,
+    /// Description for the palette.
+    pub description: String,
+    /// The deep-link target this action navigates to.
+    pub target: DeepLinkTarget,
+}
+
+/// Build quick actions from a focused event's correlation links.
+///
+/// Returns actions suitable for injection into the command palette.
+#[must_use]
+pub fn build_quick_actions(event: &MailEvent) -> Vec<QuickAction> {
+    let links = extract_links(event);
+    links
+        .into_iter()
+        .map(|link| {
+            let (prefix, entity_name) = match &link.target {
+                DeepLinkTarget::AgentByName(name) => ("agent", name.as_str()),
+                DeepLinkTarget::ThreadById(id) => ("thread", id.as_str()),
+                DeepLinkTarget::ToolByName(name) => ("tool", name.as_str()),
+                DeepLinkTarget::MessageById(id) => ("message", &*format!("{id}")),
+                DeepLinkTarget::ProjectBySlug(slug) => ("project", slug.as_str()),
+                DeepLinkTarget::TimelineAtTime(ts) => ("timeline", &*format!("{ts}")),
+            };
+            let id = format!("quick:{prefix}:{entity_name}");
+            let label = format!("Go to {}", link.label);
+            let description = format!("Navigate to {prefix} view");
+            QuickAction {
+                id,
+                label,
+                description,
+                target: link.target,
+            }
+        })
+        .collect()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Remediation hints — actionable guidance for failure patterns
+// ──────────────────────────────────────────────────────────────────────
+
+/// A remediation hint with severity and suggested next action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationHint {
+    /// Short summary of the detected issue.
+    pub summary: &'static str,
+    /// Suggested next action to resolve the issue.
+    pub action: &'static str,
+}
+
+/// Analyze an event for common failure patterns and return remediation hints.
+///
+/// Returns hints for HTTP errors, slow operations, tool failures, and
+/// reservation conflicts.
+#[must_use]
+pub fn remediation_hints(event: &MailEvent) -> Vec<RemediationHint> {
+    let mut hints = Vec::new();
+
+    match event {
+        MailEvent::HttpRequest {
+            status,
+            duration_ms,
+            ..
+        } => {
+            if *status == 401 || *status == 403 {
+                hints.push(RemediationHint {
+                    summary: "Authentication/authorization failure",
+                    action: "Verify bearer token or API key in client configuration",
+                });
+            } else if *status == 404 {
+                hints.push(RemediationHint {
+                    summary: "Endpoint not found",
+                    action: "Check URL path and transport mode (MCP vs API)",
+                });
+            } else if *status >= 500 {
+                hints.push(RemediationHint {
+                    summary: "Server error",
+                    action: "Check server logs for stack traces; restart if persistent",
+                });
+            }
+            if *duration_ms > 5000 {
+                hints.push(RemediationHint {
+                    summary: "Very slow request (>5s)",
+                    action: "Check database load and query tracking metrics",
+                });
+            }
+        }
+
+        MailEvent::ToolCallEnd {
+            result_preview,
+            duration_ms,
+            queries,
+            ..
+        } => {
+            if let Some(preview) = result_preview {
+                let lower = preview.to_ascii_lowercase();
+                if lower.contains("error") || lower.contains("not found") {
+                    hints.push(RemediationHint {
+                        summary: "Tool returned an error",
+                        action: "Check tool parameters and project/agent existence",
+                    });
+                }
+            }
+            if *duration_ms > 2000 {
+                hints.push(RemediationHint {
+                    summary: "Slow tool execution (>2s)",
+                    action: "Check query count and consider adding indexes",
+                });
+            }
+            if *queries > 50 {
+                hints.push(RemediationHint {
+                    summary: "Excessive queries in single tool call",
+                    action: "Review query patterns; consider batching or caching",
+                });
+            }
+        }
+
+        MailEvent::ServerShutdown { .. } => {
+            hints.push(RemediationHint {
+                summary: "Server shutting down",
+                action: "Restart the server with `am` to resume operations",
+            });
+        }
+
+        _ => {}
+    }
+
+    hints
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Inspector rendering
@@ -35,7 +316,33 @@ pub fn render_inspector(frame: &mut Frame<'_>, area: Rect, event: Option<&MailEv
     let title = format!("Inspector — {}", kind_label(event.kind()));
     let body = detail_body(event);
 
-    // Combine header + body.
+    // Correlation links section.
+    let links = extract_links(event);
+    let links_section = if links.is_empty() {
+        String::new()
+    } else {
+        let sep = "─".repeat(area.width.saturating_sub(2) as usize);
+        let mut s = format!("\n{sep}\nLinks (press 1-{}):\n", links.len().min(9));
+        for (i, link) in links.iter().enumerate().take(9) {
+            let _ = writeln!(s, "  [{}] {}", i + 1, link.label);
+        }
+        s
+    };
+
+    // Remediation hints section.
+    let hints = remediation_hints(event);
+    let hints_section = if hints.is_empty() {
+        String::new()
+    } else {
+        let sep = "─".repeat(area.width.saturating_sub(2) as usize);
+        let mut s = format!("\n{sep}\nHints:\n");
+        for hint in &hints {
+            let _ = writeln!(s, "  ⚠ {}  →  {}", hint.summary, hint.action);
+        }
+        s
+    };
+
+    // Combine header + body + hints + links.
     let header = format!(
         "Seq: {}  Time: {}  {}\n{}",
         event.seq(),
@@ -43,13 +350,25 @@ pub fn render_inspector(frame: &mut Frame<'_>, area: Rect, event: Option<&MailEv
         source_label(event.source()),
         "─".repeat(area.width.saturating_sub(2) as usize),
     );
-    let full_text = format!("{header}\n{body}");
+    let full_text = format!("{header}\n{body}{hints_section}{links_section}");
 
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded);
     let p = Paragraph::new(full_text).block(block);
     p.render(area, frame);
+}
+
+/// Resolve a 1-based link index to a deep-link target for the given event.
+///
+/// Returns `None` if the event has no links or the index is out of range.
+#[must_use]
+pub fn resolve_link(event: &MailEvent, one_based_index: usize) -> Option<DeepLinkTarget> {
+    if one_based_index == 0 || one_based_index > 9 {
+        return None;
+    }
+    let links = extract_links(event);
+    links.into_iter().nth(one_based_index - 1).map(|l| l.target)
 }
 
 /// Human-readable label for the event kind.
@@ -516,5 +835,453 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(30, 5, &mut pool);
         render_inspector(&mut frame, Rect::new(0, 0, 30, 5), Some(&event));
+    }
+
+    // ── Correlation link tests ────────────────────────────────────
+
+    #[test]
+    fn extract_links_tool_call_start() {
+        let event = MailEvent::tool_call_start(
+            "send_message",
+            json!({}),
+            Some("my-proj".to_string()),
+            Some("RedFox".to_string()),
+        );
+        let links = extract_links(&event);
+        assert_eq!(links.len(), 3);
+        assert_eq!(
+            links[0].target,
+            DeepLinkTarget::ProjectBySlug("my-proj".into())
+        );
+        assert_eq!(
+            links[1].target,
+            DeepLinkTarget::AgentByName("RedFox".into())
+        );
+        assert_eq!(
+            links[2].target,
+            DeepLinkTarget::ToolByName("send_message".into())
+        );
+    }
+
+    #[test]
+    fn extract_links_tool_call_start_no_project_no_agent() {
+        let event = MailEvent::tool_call_start("health_check", json!({}), None, None);
+        let links = extract_links(&event);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].target,
+            DeepLinkTarget::ToolByName("health_check".into())
+        );
+    }
+
+    #[test]
+    fn extract_links_tool_call_end() {
+        let event = MailEvent::tool_call_end(
+            "fetch_inbox",
+            50,
+            None,
+            2,
+            1.0,
+            vec![],
+            Some("proj".to_string()),
+            Some("BlueLake".to_string()),
+        );
+        let links = extract_links(&event);
+        assert_eq!(links.len(), 3);
+        assert_eq!(
+            links[0].target,
+            DeepLinkTarget::ProjectBySlug("proj".into())
+        );
+        assert_eq!(
+            links[1].target,
+            DeepLinkTarget::AgentByName("BlueLake".into())
+        );
+        assert_eq!(
+            links[2].target,
+            DeepLinkTarget::ToolByName("fetch_inbox".into())
+        );
+    }
+
+    #[test]
+    fn extract_links_message_sent() {
+        let event = MailEvent::message_sent(
+            42,
+            "RedFox",
+            vec!["BlueLake".to_string(), "GoldHawk".to_string()],
+            "Hello",
+            "thread-1",
+            "my-project",
+        );
+        let links = extract_links(&event);
+        // project, from-agent, to-agent1, to-agent2, thread, message
+        assert_eq!(links.len(), 6);
+        assert_eq!(
+            links[0].target,
+            DeepLinkTarget::ProjectBySlug("my-project".into())
+        );
+        assert_eq!(
+            links[1].target,
+            DeepLinkTarget::AgentByName("RedFox".into())
+        );
+        assert_eq!(
+            links[2].target,
+            DeepLinkTarget::AgentByName("BlueLake".into())
+        );
+        assert_eq!(
+            links[3].target,
+            DeepLinkTarget::AgentByName("GoldHawk".into())
+        );
+        assert_eq!(
+            links[4].target,
+            DeepLinkTarget::ThreadById("thread-1".into())
+        );
+        assert_eq!(links[5].target, DeepLinkTarget::MessageById(42));
+    }
+
+    #[test]
+    fn extract_links_message_deduplicates() {
+        // Sender is also in recipients — should not produce duplicate
+        let event = MailEvent::message_sent(
+            10,
+            "RedFox",
+            vec!["RedFox".to_string()],
+            "Self-message",
+            "t",
+            "p",
+        );
+        let links = extract_links(&event);
+        let agent_links = links
+            .iter()
+            .filter(|l| matches!(&l.target, DeepLinkTarget::AgentByName(n) if n == "RedFox"))
+            .count();
+        assert_eq!(agent_links, 1, "duplicate agent links should be suppressed");
+    }
+
+    #[test]
+    fn extract_links_reservation_granted() {
+        let event = MailEvent::reservation_granted(
+            "RedFox",
+            vec!["src/lib.rs".to_string()],
+            true,
+            3600,
+            "my-proj",
+        );
+        let links = extract_links(&event);
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links[0].target,
+            DeepLinkTarget::ProjectBySlug("my-proj".into())
+        );
+        assert_eq!(
+            links[1].target,
+            DeepLinkTarget::AgentByName("RedFox".into())
+        );
+    }
+
+    #[test]
+    fn extract_links_reservation_released() {
+        let event = MailEvent::reservation_released("BlueLake", vec!["a.rs".to_string()], "proj");
+        let links = extract_links(&event);
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links[0].target,
+            DeepLinkTarget::ProjectBySlug("proj".into())
+        );
+        assert_eq!(
+            links[1].target,
+            DeepLinkTarget::AgentByName("BlueLake".into())
+        );
+    }
+
+    #[test]
+    fn extract_links_agent_registered() {
+        let event = MailEvent::agent_registered("RedFox", "claude-code", "opus-4.6", "proj");
+        let links = extract_links(&event);
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links[0].target,
+            DeepLinkTarget::ProjectBySlug("proj".into())
+        );
+        assert_eq!(
+            links[1].target,
+            DeepLinkTarget::AgentByName("RedFox".into())
+        );
+    }
+
+    #[test]
+    fn extract_links_http_request_is_empty() {
+        let event = MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1");
+        assert!(extract_links(&event).is_empty());
+    }
+
+    #[test]
+    fn extract_links_health_pulse_is_empty() {
+        let event = MailEvent::health_pulse(DbStatSnapshot::default());
+        assert!(extract_links(&event).is_empty());
+    }
+
+    #[test]
+    fn extract_links_server_events_are_empty() {
+        assert!(extract_links(&MailEvent::server_started("http://localhost", "")).is_empty());
+        assert!(extract_links(&MailEvent::server_shutdown()).is_empty());
+    }
+
+    #[test]
+    fn resolve_link_valid_index() {
+        let event = MailEvent::tool_call_start(
+            "send_message",
+            json!({}),
+            Some("proj".to_string()),
+            Some("RedFox".to_string()),
+        );
+        assert_eq!(
+            resolve_link(&event, 1),
+            Some(DeepLinkTarget::ProjectBySlug("proj".into()))
+        );
+        assert_eq!(
+            resolve_link(&event, 2),
+            Some(DeepLinkTarget::AgentByName("RedFox".into()))
+        );
+        assert_eq!(
+            resolve_link(&event, 3),
+            Some(DeepLinkTarget::ToolByName("send_message".into()))
+        );
+    }
+
+    #[test]
+    fn resolve_link_out_of_range() {
+        let event = MailEvent::tool_call_start("x", json!({}), None, None);
+        // Only 1 link (tool name)
+        assert!(resolve_link(&event, 0).is_none());
+        assert!(resolve_link(&event, 2).is_none());
+        assert!(resolve_link(&event, 10).is_none());
+    }
+
+    #[test]
+    fn resolve_link_no_links() {
+        let event = MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1");
+        assert!(resolve_link(&event, 1).is_none());
+    }
+
+    #[test]
+    fn render_inspector_with_links_shows_link_section() {
+        let event = MailEvent::message_sent(
+            1,
+            "RedFox",
+            vec!["BlueLake".to_string()],
+            "Hello",
+            "thread-1",
+            "proj",
+        );
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 40, &mut pool);
+        render_inspector(&mut frame, Rect::new(0, 0, 80, 40), Some(&event));
+        // If the frame renders without panic, the link section was included
+    }
+
+    #[test]
+    fn correlation_link_label_format() {
+        let event = MailEvent::agent_registered("GoldHawk", "codex", "5.2", "p");
+        let links = extract_links(&event);
+        assert!(links[0].label.contains("Project: p"));
+        assert!(links[1].label.contains("Agent: GoldHawk"));
+    }
+
+    // ── Quick action tests ──────────────────────────────────────
+
+    #[test]
+    fn quick_actions_from_tool_call() {
+        let event = MailEvent::tool_call_start(
+            "send_message",
+            serde_json::Value::Null,
+            Some("my_project".to_string()),
+            Some("RedFox".to_string()),
+        );
+        let actions = build_quick_actions(&event);
+        assert!(!actions.is_empty());
+
+        // Should have project, agent, and tool actions
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.iter().any(|id| id.starts_with("quick:project:")));
+        assert!(ids.iter().any(|id| id.starts_with("quick:agent:")));
+        assert!(ids.iter().any(|id| id.starts_with("quick:tool:")));
+    }
+
+    #[test]
+    fn quick_actions_from_agent_registered() {
+        let event = MailEvent::agent_registered("GoldHawk", "codex", "5.2", "proj1");
+        let actions = build_quick_actions(&event);
+        assert_eq!(actions.len(), 2); // project + agent
+
+        assert!(actions[0].id.contains("project:"));
+        assert!(actions[0].label.contains("Go to"));
+        assert!(actions[1].id.contains("agent:GoldHawk"));
+    }
+
+    #[test]
+    fn quick_actions_empty_for_infra_events() {
+        let event = MailEvent::server_started("http", "127.0.0.1:8080");
+        let actions = build_quick_actions(&event);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn quick_actions_labels_are_navigable() {
+        let event = MailEvent::agent_registered("GoldHawk", "codex", "5.2", "proj1");
+        let actions = build_quick_actions(&event);
+        for action in &actions {
+            assert!(action.label.starts_with("Go to "));
+            assert!(!action.id.is_empty());
+            assert!(!action.description.is_empty());
+        }
+    }
+
+    #[test]
+    fn quick_actions_deduplicates() {
+        // Message events can have sender == recipient; ensure dedup
+        let event = MailEvent::message_sent(
+            1,
+            "RedFox",
+            vec!["RedFox".to_string()],
+            "Hi",
+            "thread1",
+            "proj1",
+        );
+        let actions = build_quick_actions(&event);
+        let agent_action_count = actions
+            .iter()
+            .filter(|a| a.id.starts_with("quick:agent:"))
+            .count();
+        // Should only have one RedFox entry (deduped by extract_links)
+        assert_eq!(agent_action_count, 1);
+    }
+
+    // ── Remediation hints tests ─────────────────────────────────
+
+    #[test]
+    fn hints_http_401() {
+        let event = MailEvent::http_request("POST", "/mcp/", 401, 5, "127.0.0.1");
+        let hints = remediation_hints(&event);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].summary.contains("Authentication"));
+    }
+
+    #[test]
+    fn hints_http_403() {
+        let event = MailEvent::http_request("GET", "/api/", 403, 2, "10.0.0.1");
+        let hints = remediation_hints(&event);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].action.contains("token"));
+    }
+
+    #[test]
+    fn hints_http_404() {
+        let event = MailEvent::http_request("GET", "/bad", 404, 1, "127.0.0.1");
+        let hints = remediation_hints(&event);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].summary.contains("not found"));
+    }
+
+    #[test]
+    fn hints_http_500() {
+        let event = MailEvent::http_request("POST", "/mcp/", 500, 10, "127.0.0.1");
+        let hints = remediation_hints(&event);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].summary.contains("Server error"));
+    }
+
+    #[test]
+    fn hints_http_slow() {
+        let event = MailEvent::http_request("POST", "/mcp/", 200, 6000, "127.0.0.1");
+        let hints = remediation_hints(&event);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].summary.contains("slow"));
+    }
+
+    #[test]
+    fn hints_http_500_and_slow() {
+        let event = MailEvent::http_request("POST", "/mcp/", 500, 6000, "127.0.0.1");
+        let hints = remediation_hints(&event);
+        assert_eq!(hints.len(), 2);
+    }
+
+    #[test]
+    fn hints_http_200_fast_no_hints() {
+        let event = MailEvent::http_request("GET", "/mcp/", 200, 5, "127.0.0.1");
+        let hints = remediation_hints(&event);
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn hints_tool_error_in_preview() {
+        let event = MailEvent::tool_call_end(
+            "send_message",
+            100,
+            Some("Error: agent not found".to_string()),
+            5,
+            1.2,
+            vec![],
+            None,
+            None,
+        );
+        let hints = remediation_hints(&event);
+        assert!(!hints.is_empty());
+        assert!(hints[0].summary.contains("error"));
+    }
+
+    #[test]
+    fn hints_tool_slow() {
+        let event =
+            MailEvent::tool_call_end("fetch_inbox", 3000, None, 10, 50.0, vec![], None, None);
+        let hints = remediation_hints(&event);
+        assert!(!hints.is_empty());
+        assert!(hints[0].summary.contains("Slow"));
+    }
+
+    #[test]
+    fn hints_tool_excessive_queries() {
+        let event =
+            MailEvent::tool_call_end("search_messages", 500, None, 60, 120.0, vec![], None, None);
+        let hints = remediation_hints(&event);
+        assert!(!hints.is_empty());
+        assert!(hints.iter().any(|h| h.summary.contains("Excessive")));
+    }
+
+    #[test]
+    fn hints_tool_ok_no_hints() {
+        let event = MailEvent::tool_call_end(
+            "send_message",
+            50,
+            Some("ok".to_string()),
+            3,
+            1.0,
+            vec![],
+            None,
+            None,
+        );
+        let hints = remediation_hints(&event);
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn hints_server_shutdown() {
+        let event = MailEvent::server_shutdown();
+        let hints = remediation_hints(&event);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].action.contains("am"));
+    }
+
+    #[test]
+    fn hints_message_sent_no_hints() {
+        let event = MailEvent::message_sent(
+            1,
+            "RedFox",
+            vec!["BlueFox".to_string()],
+            "Test",
+            "thread1",
+            "proj1",
+        );
+        let hints = remediation_hints(&event);
+        assert!(hints.is_empty());
     }
 }

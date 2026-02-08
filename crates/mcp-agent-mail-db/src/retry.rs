@@ -336,10 +336,10 @@ where
         match op() {
             Ok(val) => {
                 if let Some(cb) = cb {
-                    if attempt > 0 {
-                        // Successful retry — reset circuit breaker.
-                        cb.record_success();
-                    }
+                    // Reset circuit breaker on any success, including
+                    // first attempt. Stale failures must not accumulate
+                    // across successful calls.
+                    cb.record_success();
                 }
                 return Ok(val);
             }

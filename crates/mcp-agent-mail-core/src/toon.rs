@@ -457,7 +457,11 @@ fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        s[..max].to_string()
+        let mut end = max.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
     }
 }
 
@@ -970,6 +974,13 @@ mod tests {
     #[test]
     fn truncate_long() {
         assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_unicode_at_char_boundary() {
+        let s = "h\u{00E9}llo"; // h + 'é' + llo
+        assert_eq!(truncate_str(s, 2), "h");
+        assert_eq!(truncate_str(s, 3), "h\u{00E9}");
     }
 
     // -- Envelope serialization --

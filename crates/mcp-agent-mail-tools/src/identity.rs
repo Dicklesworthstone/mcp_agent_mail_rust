@@ -44,10 +44,16 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
         config: config.clone(),
         agent_json: agent_json.clone(),
     };
-    if !mcp_agent_mail_storage::wbq_enqueue(op) {
-        tracing::warn!(
-            "WBQ enqueue failed; skipping agent profile archive write project={project_slug}"
-        );
+    match mcp_agent_mail_storage::wbq_enqueue(op) {
+        mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+        | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
+            // Disk pressure guard: archive writes may be disabled; DB remains authoritative.
+        }
+        mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+            tracing::warn!(
+                "WBQ enqueue failed; skipping agent profile archive write project={project_slug}"
+            );
+        }
     }
 }
 
@@ -55,6 +61,7 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckResponse {
     pub status: String,
+    pub health_level: String,
     pub environment: String,
     pub http_host: String,
     pub http_port: u16,
@@ -63,6 +70,39 @@ pub struct HealthCheckResponse {
     pub pool_utilization: Option<PoolUtilizationResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queues: Option<QueuesHealthResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskHealthResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<IntegrityHealthResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityHealthResponse {
+    pub last_ok_ts: i64,
+    pub last_check_ts: i64,
+    pub checks_total: u64,
+    pub failures_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskHealthResponse {
+    pub storage_root: String,
+    pub storage_probe_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_probe_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_free_bytes: Option<u64>,
+    pub pressure: String,
+    pub archive_writes_disabled: bool,
+    pub warning_threshold_mb: u64,
+    pub critical_threshold_mb: u64,
+    pub fatal_threshold_mb: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +222,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     mcp_agent_mail_storage::wbq_start();
     let _ = mcp_agent_mail_storage::get_commit_coalescer();
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
+    let disk_sample = if config.disk_space_monitor_enabled {
+        Some(mcp_agent_mail_core::disk::sample_and_record(&config))
+    } else {
+        None
+    };
 
     let now_us = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap_or(0);
     let over_80_for_s = if metrics.db.pool_over_80_since_us == 0 {
@@ -192,8 +237,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             .saturating_div(1_000_000)
     };
 
+    // Refresh the cached health level from live metrics
+    let (health_level, _changed) = mcp_agent_mail_core::refresh_health_level();
+
     let response = HealthCheckResponse {
         status: "ok".to_string(),
+        health_level: health_level.to_string(),
         environment: config.app_environment.to_string(),
         http_host: config.http_host,
         http_port: config.http_port,
@@ -279,6 +328,37 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                 },
             }
         }),
+        disk: disk_sample.as_ref().map(|s| DiskHealthResponse {
+            storage_root: config.storage_root.display().to_string(),
+            storage_probe_path: s.storage_probe_path.display().to_string(),
+            db_probe_path: s.db_probe_path.as_ref().map(|p| p.display().to_string()),
+            storage_free_bytes: s.storage_free_bytes,
+            db_free_bytes: s.db_free_bytes,
+            effective_free_bytes: s.effective_free_bytes,
+            pressure: s.pressure.label().to_string(),
+            archive_writes_disabled: matches!(
+                s.pressure,
+                mcp_agent_mail_core::disk::DiskPressure::Critical
+                    | mcp_agent_mail_core::disk::DiskPressure::Fatal
+            ),
+            warning_threshold_mb: config.disk_space_warning_mb,
+            critical_threshold_mb: config.disk_space_critical_mb,
+            fatal_threshold_mb: config.disk_space_fatal_mb,
+            errors: s.errors.clone(),
+        }),
+        integrity: {
+            let im = mcp_agent_mail_db::integrity_metrics();
+            if im.checks_total > 0 {
+                Some(IntegrityHealthResponse {
+                    last_ok_ts: im.last_ok_ts,
+                    last_check_ts: im.last_check_ts,
+                    checks_total: im.checks_total,
+                    failures_total: im.failures_total,
+                })
+            } else {
+                None
+            }
+        },
     };
 
     serde_json::to_string(&response)
@@ -849,12 +929,15 @@ mod tests {
     fn health_check_response_serializes() {
         let r = HealthCheckResponse {
             status: "ok".into(),
+            health_level: "green".into(),
             environment: "development".into(),
             http_host: "0.0.0.0".into(),
             http_port: 8765,
             database_url: "sqlite:///data/test.db".into(),
             pool_utilization: None,
             queues: None,
+            disk: None,
+            integrity: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();

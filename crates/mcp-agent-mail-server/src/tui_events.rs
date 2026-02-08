@@ -1,8 +1,10 @@
 #![allow(clippy::module_name_repetitions)]
 
+use ftui::{PackedRgba, Style};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const DEFAULT_EVENT_RING_CAPACITY: usize = 10_000;
@@ -55,6 +57,23 @@ pub enum EventSeverity {
     Error,
 }
 
+// ── Severity visual design tokens ─────────────────────────────────
+//
+// Centralised color palette so every screen renders severity badges
+// identically.  The palette is tuned for dark terminals (light-on-dark)
+// and degrades gracefully on terminals without true-color support.
+
+/// Trace — dim gray; background noise, nearly invisible.
+pub const SEV_TRACE_FG: PackedRgba = PackedRgba::rgb(100, 105, 120);
+/// Debug — cyan; routine detail, visible but subdued.
+pub const SEV_DEBUG_FG: PackedRgba = PackedRgba::rgb(100, 200, 230);
+/// Info — green; noteworthy business events, clearly visible.
+pub const SEV_INFO_FG: PackedRgba = PackedRgba::rgb(120, 220, 150);
+/// Warn — amber/yellow; abnormal conditions, draws attention.
+pub const SEV_WARN_FG: PackedRgba = PackedRgba::rgb(255, 184, 108);
+/// Error — red; failures requiring immediate triage.
+pub const SEV_ERROR_FG: PackedRgba = PackedRgba::rgb(255, 100, 100);
+
 impl EventSeverity {
     /// Short badge label for rendering.
     #[must_use]
@@ -66,6 +85,62 @@ impl EventSeverity {
             Self::Warn => "WRN",
             Self::Error => "ERR",
         }
+    }
+
+    /// Foreground color for this severity level.
+    #[must_use]
+    pub const fn color(self) -> PackedRgba {
+        match self {
+            Self::Trace => SEV_TRACE_FG,
+            Self::Debug => SEV_DEBUG_FG,
+            Self::Info => SEV_INFO_FG,
+            Self::Warn => SEV_WARN_FG,
+            Self::Error => SEV_ERROR_FG,
+        }
+    }
+
+    /// Full style for the severity badge text.
+    ///
+    /// Warn and Error are bold for rapid triage; Trace is dim to
+    /// push noise into the background.
+    #[must_use]
+    pub fn style(self) -> Style {
+        match self {
+            Self::Trace => Style::default().fg(SEV_TRACE_FG).dim(),
+            Self::Debug => Style::default().fg(SEV_DEBUG_FG),
+            Self::Info => Style::default().fg(SEV_INFO_FG),
+            Self::Warn => Style::default().fg(SEV_WARN_FG).bold(),
+            Self::Error => Style::default().fg(SEV_ERROR_FG).bold(),
+        }
+    }
+
+    /// A styled [`ftui::text::Span`] rendering the severity badge
+    /// (e.g. bold red `ERR`).
+    ///
+    /// This is the canonical way to render a severity indicator in
+    /// any TUI pane.
+    #[must_use]
+    pub fn styled_badge(self) -> ftui::text::Span<'static> {
+        ftui::text::Span::styled(self.badge(), self.style())
+    }
+
+    /// Unicode indicator symbol for this severity level.
+    #[must_use]
+    pub const fn symbol(self) -> char {
+        match self {
+            Self::Trace => '·',
+            Self::Debug => '○',
+            Self::Info => '●',
+            Self::Warn => '▲',
+            Self::Error => '✖',
+        }
+    }
+
+    /// A styled span with the severity symbol (e.g. bold red `✖`).
+    #[must_use]
+    pub fn styled_symbol(self) -> ftui::text::Span<'static> {
+        let s: String = self.symbol().into();
+        ftui::text::Span::styled(s, self.style())
     }
 }
 
@@ -677,12 +752,73 @@ pub struct EventRingStats {
     pub len: usize,
     pub total_pushed: u64,
     pub dropped_overflow: u64,
+    /// Events lost because `try_push` could not acquire the lock.
+    pub contention_drops: u64,
+    /// Events dropped by the severity-based sampling policy.
+    pub sampled_drops: u64,
     pub next_seq: u64,
+}
+
+impl EventRingStats {
+    /// Total events lost from all causes (overflow + contention + sampling).
+    #[must_use]
+    pub const fn total_drops(&self) -> u64 {
+        self.dropped_overflow
+            .saturating_add(self.contention_drops)
+            .saturating_add(self.sampled_drops)
+    }
+
+    /// Whether any drops have occurred, indicating reduced fidelity.
+    #[must_use]
+    pub const fn has_drops(&self) -> bool {
+        self.contention_drops > 0 || self.sampled_drops > 0 || self.dropped_overflow > 0
+    }
+
+    /// Fill ratio as a percentage (0..=100).
+    #[must_use]
+    pub fn fill_pct(&self) -> u8 {
+        if self.capacity == 0 {
+            return 100;
+        }
+        let pct = self
+            .len
+            .saturating_mul(100)
+            .checked_div(self.capacity)
+            .unwrap_or(100)
+            .min(100);
+        u8::try_from(pct).unwrap_or(100)
+    }
+}
+
+/// Severity-based sampling policy for backpressure.
+///
+/// When the ring buffer fill ratio exceeds the threshold, low-severity
+/// events (Trace, Debug) are sampled at `1:sample_rate` to reduce load
+/// while preserving important events (Info and above) at full fidelity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackpressurePolicy {
+    /// Fill ratio (0..=100) at which sampling activates.
+    pub threshold_pct: u8,
+    /// Keep 1 out of N low-severity events when sampling is active.
+    pub sample_rate: u64,
+}
+
+impl Default for BackpressurePolicy {
+    fn default() -> Self {
+        Self {
+            threshold_pct: 80,
+            sample_rate: 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EventRingBuffer {
     inner: Arc<Mutex<EventRingBufferInner>>,
+    contention_drops: Arc<AtomicU64>,
+    sampled_drops: Arc<AtomicU64>,
+    sample_counter: Arc<AtomicU64>,
+    policy: BackpressurePolicy,
 }
 
 #[derive(Debug)]
@@ -701,7 +837,16 @@ impl EventRingBuffer {
 
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_policy(capacity, BackpressurePolicy::default())
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_policy(capacity: usize, policy: BackpressurePolicy) -> Self {
         let bounded_capacity = capacity.max(1);
+        let normalized_policy = BackpressurePolicy {
+            threshold_pct: policy.threshold_pct.min(100),
+            sample_rate: policy.sample_rate.max(1),
+        };
         let inner = EventRingBufferInner {
             events: VecDeque::with_capacity(bounded_capacity),
             capacity: bounded_capacity,
@@ -710,25 +855,73 @@ impl EventRingBuffer {
         };
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            contention_drops: Arc::new(AtomicU64::new(0)),
+            sampled_drops: Arc::new(AtomicU64::new(0)),
+            sample_counter: Arc::new(AtomicU64::new(0)),
+            policy: normalized_policy,
         }
     }
 
     #[must_use]
-    pub fn push(&self, mut event: MailEvent) -> u64 {
+    pub fn push(&self, event: MailEvent) -> u64 {
         let mut inner = self.lock_inner();
-        Self::push_inner(&mut inner, &mut event)
+        Self::push_inner(&mut inner, event)
     }
 
-    /// Non-blocking push.  Returns `Some(seq)` on success, `None` if the
-    /// lock is contended.  This is the preferred path for the server
-    /// thread where blocking on the TUI reader is unacceptable.
+    /// Non-blocking push with backpressure policy.
+    ///
+    /// Returns `Some(seq)` on success, `None` if the lock is contended
+    /// or the event was dropped by the sampling policy.  This is the
+    /// preferred path for the server thread where blocking on the TUI
+    /// reader is unacceptable.
     #[must_use]
-    pub fn try_push(&self, mut event: MailEvent) -> Option<u64> {
-        let mut inner = self.inner.try_lock().ok()?;
-        Some(Self::push_inner(&mut inner, &mut event))
+    pub fn try_push(&self, event: MailEvent) -> Option<u64> {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            self.contention_drops.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+
+        // Apply sampling policy when buffer is filling up.
+        if self.should_sample(&inner, &event) {
+            self.sampled_drops.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        Some(Self::push_inner(&mut inner, event))
     }
 
-    fn push_inner(inner: &mut EventRingBufferInner, event: &mut MailEvent) -> u64 {
+    /// Check whether the event should be dropped by the sampling policy.
+    ///
+    /// Low-severity events (Trace, Debug) are sampled at `1:sample_rate`
+    /// when the fill ratio exceeds the policy threshold.
+    fn should_sample(&self, inner: &EventRingBufferInner, event: &MailEvent) -> bool {
+        let fill_pct = u8::try_from(
+            inner
+                .events
+                .len()
+                .saturating_mul(100)
+                .checked_div(inner.capacity)
+                .unwrap_or(100)
+                .min(100),
+        )
+        .unwrap_or(100);
+
+        if fill_pct < self.policy.threshold_pct {
+            return false;
+        }
+
+        // Only downsample low-severity events.
+        let severity = event.severity();
+        if severity >= EventSeverity::Info {
+            return false; // always keep Info, Warn, Error
+        }
+
+        // Sample: keep 1 out of every N.
+        let counter = self.sample_counter.fetch_add(1, Ordering::Relaxed);
+        counter % self.policy.sample_rate != 0
+    }
+
+    fn push_inner(inner: &mut EventRingBufferInner, mut event: MailEvent) -> u64 {
         let seq = inner.next_seq;
         inner.next_seq = inner.next_seq.saturating_add(1);
         event.set_seq(seq);
@@ -736,7 +929,7 @@ impl EventRingBuffer {
         if inner.events.len() >= inner.capacity {
             let _ = inner.events.pop_front();
         }
-        inner.events.push_back(event.clone());
+        inner.events.push_back(event);
         inner.total_pushed = inner.total_pushed.saturating_add(1);
         seq
     }
@@ -850,8 +1043,16 @@ impl EventRingBuffer {
             len: inner.events.len(),
             total_pushed: inner.total_pushed,
             dropped_overflow: inner.total_pushed.saturating_sub(inner.events.len() as u64),
+            contention_drops: self.contention_drops.load(Ordering::Relaxed),
+            sampled_drops: self.sampled_drops.load(Ordering::Relaxed),
             next_seq: inner.next_seq,
         }
+    }
+
+    /// Current backpressure policy.
+    #[must_use]
+    pub const fn policy(&self) -> BackpressurePolicy {
+        self.policy
     }
 
     #[must_use]
@@ -1437,5 +1638,815 @@ mod tests {
             let round: EventSeverity = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(round, sev);
         }
+    }
+
+    // ── Severity design system tests ─────────────────────────────────
+
+    #[test]
+    fn severity_colors_are_distinct() {
+        let colors: Vec<PackedRgba> = [
+            EventSeverity::Trace,
+            EventSeverity::Debug,
+            EventSeverity::Info,
+            EventSeverity::Warn,
+            EventSeverity::Error,
+        ]
+        .iter()
+        .map(|s| s.color())
+        .collect();
+
+        // All 5 must be different from each other.
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(colors[i], colors[j], "colors at {i} and {j} must differ");
+            }
+        }
+    }
+
+    #[test]
+    fn severity_colors_match_constants() {
+        assert_eq!(EventSeverity::Trace.color(), SEV_TRACE_FG);
+        assert_eq!(EventSeverity::Debug.color(), SEV_DEBUG_FG);
+        assert_eq!(EventSeverity::Info.color(), SEV_INFO_FG);
+        assert_eq!(EventSeverity::Warn.color(), SEV_WARN_FG);
+        assert_eq!(EventSeverity::Error.color(), SEV_ERROR_FG);
+    }
+
+    #[test]
+    fn severity_style_has_foreground() {
+        for sev in [
+            EventSeverity::Trace,
+            EventSeverity::Debug,
+            EventSeverity::Info,
+            EventSeverity::Warn,
+            EventSeverity::Error,
+        ] {
+            let style = sev.style();
+            assert!(style.fg.is_some(), "{sev:?} style must have fg");
+        }
+    }
+
+    #[test]
+    fn severity_warn_and_error_are_bold() {
+        use ftui::style::StyleFlags;
+        let warn_style = EventSeverity::Warn.style();
+        let err_style = EventSeverity::Error.style();
+        assert!(
+            warn_style
+                .attrs
+                .unwrap_or(StyleFlags(0))
+                .contains(StyleFlags::BOLD),
+            "Warn must be bold"
+        );
+        assert!(
+            err_style
+                .attrs
+                .unwrap_or(StyleFlags(0))
+                .contains(StyleFlags::BOLD),
+            "Error must be bold"
+        );
+    }
+
+    #[test]
+    fn severity_trace_is_dim() {
+        use ftui::style::StyleFlags;
+        let trace_style = EventSeverity::Trace.style();
+        assert!(
+            trace_style
+                .attrs
+                .unwrap_or(StyleFlags(0))
+                .contains(StyleFlags::DIM),
+            "Trace must be dim"
+        );
+    }
+
+    #[test]
+    fn severity_styled_badge_contains_badge_text() {
+        for sev in [
+            EventSeverity::Trace,
+            EventSeverity::Debug,
+            EventSeverity::Info,
+            EventSeverity::Warn,
+            EventSeverity::Error,
+        ] {
+            let span = sev.styled_badge();
+            assert_eq!(span.as_str(), sev.badge());
+            assert!(span.style.is_some(), "{sev:?} styled_badge must have style");
+        }
+    }
+
+    #[test]
+    fn severity_symbols_are_distinct() {
+        let symbols: Vec<char> = [
+            EventSeverity::Trace,
+            EventSeverity::Debug,
+            EventSeverity::Info,
+            EventSeverity::Warn,
+            EventSeverity::Error,
+        ]
+        .iter()
+        .map(|s| s.symbol())
+        .collect();
+
+        for i in 0..symbols.len() {
+            for j in (i + 1)..symbols.len() {
+                assert_ne!(symbols[i], symbols[j], "symbols at {i} and {j} must differ");
+            }
+        }
+    }
+
+    #[test]
+    fn severity_styled_symbol_has_style() {
+        for sev in [
+            EventSeverity::Trace,
+            EventSeverity::Debug,
+            EventSeverity::Info,
+            EventSeverity::Warn,
+            EventSeverity::Error,
+        ] {
+            let span = sev.styled_symbol();
+            assert!(!span.as_str().is_empty());
+            assert!(
+                span.style.is_some(),
+                "{sev:?} styled_symbol must have style"
+            );
+        }
+    }
+
+    // ── Ring buffer edge-case tests ──────────────────────────────
+
+    #[test]
+    fn ring_buffer_capacity_one() {
+        let ring = EventRingBuffer::with_capacity(1);
+        assert_eq!(ring.push(sample_http("/a", 200)), 1);
+        assert_eq!(ring.push(sample_http("/b", 200)), 2);
+        assert_eq!(ring.len(), 1);
+        let events = ring.iter_recent(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq(), 2);
+
+        let stats = ring.stats();
+        assert_eq!(stats.capacity, 1);
+        assert_eq!(stats.len, 1);
+        assert_eq!(stats.total_pushed, 2);
+        assert_eq!(stats.dropped_overflow, 1);
+    }
+
+    #[test]
+    fn ring_buffer_capacity_zero_is_bounded_to_one() {
+        let ring = EventRingBuffer::with_capacity(0);
+        let stats = ring.stats();
+        assert_eq!(stats.capacity, 1);
+    }
+
+    #[test]
+    fn ring_buffer_seq_starts_at_one_and_is_monotonic() {
+        let ring = EventRingBuffer::with_capacity(100);
+        for i in 0_u64..50 {
+            let seq = ring.push(sample_http(&format!("/{i}"), 200));
+            assert_eq!(seq, i + 1);
+        }
+    }
+
+    #[test]
+    fn ring_buffer_set_timestamp_if_unset_preserves_existing() {
+        let ring = EventRingBuffer::with_capacity(4);
+        let event = MailEvent::ToolCallStart {
+            seq: 0,
+            timestamp_micros: 42_000_000,
+            source: EventSource::Tooling,
+            redacted: false,
+            tool_name: "test".into(),
+            params_json: Value::Null,
+            project: None,
+            agent: None,
+        };
+        // Push overwrites seq but should preserve non-zero timestamp
+        let _ = ring.push(event);
+        let events = ring.iter_recent(1);
+        assert_eq!(events[0].timestamp_micros(), 42_000_000);
+    }
+
+    #[test]
+    fn replay_range_single_element() {
+        let ring = EventRingBuffer::with_capacity(10);
+        let _ = ring.push(sample_http("/x", 200));
+        let replay = ring.replay_range(1, 1);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].seq(), 1);
+    }
+
+    #[test]
+    fn replay_range_after_overflow_misses_evicted() {
+        let ring = EventRingBuffer::with_capacity(3);
+        for i in 0..6 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+        // Seqs 1,2,3 are evicted. Only 4,5,6 remain.
+        let replay = ring.replay_range(1, 6);
+        let seqs: Vec<u64> = replay.iter().map(MailEvent::seq).collect();
+        assert_eq!(seqs, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn filter_by_kind_empty_ring() {
+        let ring = EventRingBuffer::with_capacity(10);
+        let results = ring.filter_by_kind(MailEventKind::HttpRequest);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn since_timestamp_empty_ring() {
+        let ring = EventRingBuffer::with_capacity(10);
+        let results = ring.since_timestamp(0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn iter_recent_more_than_available() {
+        let ring = EventRingBuffer::with_capacity(10);
+        let _ = ring.push(sample_http("/a", 200));
+        let _ = ring.push(sample_http("/b", 200));
+        let events = ring.iter_recent(100);
+        assert_eq!(events.len(), 2);
+        // Verify order is preserved (oldest first)
+        assert!(events[0].seq() < events[1].seq());
+    }
+
+    #[test]
+    fn concurrent_push_at_capacity_boundary() {
+        let ring = EventRingBuffer::with_capacity(4);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let ring = ring.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let _ = ring.push(sample_http("/concurrent", 200));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        // Buffer should be at capacity
+        assert!(ring.len() <= 4);
+        let stats = ring.stats();
+        assert_eq!(stats.total_pushed, 400);
+        assert!(stats.dropped_overflow >= 396); // 400 - 4
+    }
+
+    // ── Severity edge cases ─────────────────────────────────────
+
+    #[test]
+    fn http_status_boundary_values() {
+        // 399 is Debug (< 400)
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 399, 1, "127.0.0.1").severity(),
+            EventSeverity::Debug
+        );
+        // 400 is Warn
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 400, 1, "127.0.0.1").severity(),
+            EventSeverity::Warn
+        );
+        // 499 is Warn
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 499, 1, "127.0.0.1").severity(),
+            EventSeverity::Warn
+        );
+        // 500 is Error
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 500, 1, "127.0.0.1").severity(),
+            EventSeverity::Error
+        );
+        // 100 is Debug
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 100, 1, "127.0.0.1").severity(),
+            EventSeverity::Debug
+        );
+    }
+
+    #[test]
+    fn event_source_serde_roundtrip() {
+        for source in [
+            EventSource::Tooling,
+            EventSource::Http,
+            EventSource::Mail,
+            EventSource::Reservations,
+            EventSource::Lifecycle,
+            EventSource::Database,
+            EventSource::Unknown,
+        ] {
+            let json = serde_json::to_string(&source).expect("serialize");
+            let round: EventSource = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round, source);
+        }
+    }
+
+    #[test]
+    fn mail_event_kind_serde_roundtrip() {
+        for kind in [
+            MailEventKind::ToolCallStart,
+            MailEventKind::ToolCallEnd,
+            MailEventKind::MessageSent,
+            MailEventKind::MessageReceived,
+            MailEventKind::ReservationGranted,
+            MailEventKind::ReservationReleased,
+            MailEventKind::AgentRegistered,
+            MailEventKind::HttpRequest,
+            MailEventKind::HealthPulse,
+            MailEventKind::ServerStarted,
+            MailEventKind::ServerShutdown,
+        ] {
+            let json = serde_json::to_string(&kind).expect("serialize");
+            let round: MailEventKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round, kind);
+        }
+    }
+
+    #[test]
+    fn reservation_released_event_severity() {
+        assert_eq!(
+            MailEvent::reservation_released("a", vec![], "p").severity(),
+            EventSeverity::Info
+        );
+    }
+
+    // ── Backpressure / drop accounting tests ──────────────────────
+
+    #[test]
+    fn contention_drops_tracked() {
+        let ring = EventRingBuffer::with_capacity(8);
+        // Hold the lock to force contention
+        let guard = ring.inner.lock().expect("lock");
+        let ring2 = ring.clone();
+        assert!(ring2.try_push(sample_http("/blocked", 500)).is_none());
+        assert!(ring2.try_push(sample_http("/blocked2", 500)).is_none());
+        // Can't read stats with lock held, drop first
+        drop(guard);
+        let stats = ring.stats();
+        assert_eq!(stats.contention_drops, 2);
+    }
+
+    #[test]
+    fn sampling_policy_activates_at_threshold() {
+        // Capacity 10, threshold 80% = activates at 8 events
+        let policy = BackpressurePolicy {
+            threshold_pct: 80,
+            sample_rate: 2, // Keep 1 in 2
+        };
+        let ring = EventRingBuffer::with_capacity_and_policy(10, policy);
+
+        // Fill to 7 (under threshold) — all events should be accepted
+        for i in 0..7 {
+            let seq = ring.try_push(sample_http(&format!("/{i}"), 200));
+            assert!(
+                seq.is_some(),
+                "event {i} should be accepted under threshold"
+            );
+        }
+        assert_eq!(ring.stats().sampled_drops, 0);
+
+        // Fill to 8+ (at threshold) — Trace/Debug events get sampled
+        // HTTP 200 events are Debug severity, so they'll be sampled
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for _ in 0..10 {
+            match ring.try_push(sample_http("/sampled", 200)) {
+                Some(_) => accepted += 1,
+                None => rejected += 1,
+            }
+        }
+        // With sample_rate=2, roughly half should be accepted
+        assert!(accepted > 0, "some events should be accepted");
+        assert!(rejected > 0, "some events should be sampled/dropped");
+        assert!(ring.stats().sampled_drops > 0);
+    }
+
+    #[test]
+    fn sampling_preserves_high_severity_events() {
+        let policy = BackpressurePolicy {
+            threshold_pct: 50,
+            sample_rate: 100, // Very aggressive sampling
+        };
+        let ring = EventRingBuffer::with_capacity_and_policy(10, policy);
+
+        // Fill to threshold
+        for i in 0..6 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        // Info-level events should always be accepted
+        // message_sent is Info severity
+        for _ in 0..10 {
+            let event = MailEvent::message_sent(1, "A", vec![], "s", "t", "p");
+            let result = ring.try_push(event);
+            assert!(result.is_some(), "Info events should never be sampled");
+        }
+        assert_eq!(ring.stats().sampled_drops, 0);
+    }
+
+    #[test]
+    fn sampling_preserves_error_events() {
+        let policy = BackpressurePolicy {
+            threshold_pct: 50,
+            sample_rate: 100,
+        };
+        let ring = EventRingBuffer::with_capacity_and_policy(10, policy);
+
+        // Fill to threshold
+        for i in 0..6 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        // Error events (HTTP 500) should always be accepted
+        for _ in 0..10 {
+            let event = MailEvent::http_request("GET", "/err", 500, 1, "127.0.0.1");
+            let result = ring.try_push(event);
+            assert!(result.is_some(), "Error events should never be sampled");
+        }
+    }
+
+    #[test]
+    fn stats_total_drops_aggregates() {
+        let stats = EventRingStats {
+            capacity: 100,
+            len: 50,
+            total_pushed: 60,
+            dropped_overflow: 10,
+            contention_drops: 5,
+            sampled_drops: 3,
+            next_seq: 61,
+        };
+        assert_eq!(stats.total_drops(), 18);
+        assert!(stats.has_drops());
+    }
+
+    #[test]
+    fn stats_no_drops() {
+        let stats = EventRingStats {
+            capacity: 100,
+            len: 50,
+            total_pushed: 50,
+            dropped_overflow: 0,
+            contention_drops: 0,
+            sampled_drops: 0,
+            next_seq: 51,
+        };
+        assert_eq!(stats.total_drops(), 0);
+        assert!(!stats.has_drops());
+    }
+
+    #[test]
+    fn stats_fill_pct() {
+        let stats = EventRingStats {
+            capacity: 100,
+            len: 80,
+            total_pushed: 80,
+            dropped_overflow: 0,
+            contention_drops: 0,
+            sampled_drops: 0,
+            next_seq: 81,
+        };
+        assert_eq!(stats.fill_pct(), 80);
+    }
+
+    #[test]
+    fn stats_fill_pct_empty() {
+        let stats = EventRingStats {
+            capacity: 100,
+            len: 0,
+            total_pushed: 0,
+            dropped_overflow: 0,
+            contention_drops: 0,
+            sampled_drops: 0,
+            next_seq: 1,
+        };
+        assert_eq!(stats.fill_pct(), 0);
+    }
+
+    #[test]
+    fn stats_fill_pct_full() {
+        let stats = EventRingStats {
+            capacity: 100,
+            len: 100,
+            total_pushed: 200,
+            dropped_overflow: 100,
+            contention_drops: 0,
+            sampled_drops: 0,
+            next_seq: 201,
+        };
+        assert_eq!(stats.fill_pct(), 100);
+    }
+
+    #[test]
+    fn stats_fill_pct_zero_capacity() {
+        let stats = EventRingStats {
+            capacity: 0,
+            len: 0,
+            total_pushed: 0,
+            dropped_overflow: 0,
+            contention_drops: 0,
+            sampled_drops: 0,
+            next_seq: 1,
+        };
+        assert_eq!(stats.fill_pct(), 100);
+    }
+
+    #[test]
+    fn backpressure_policy_default() {
+        let policy = BackpressurePolicy::default();
+        assert_eq!(policy.threshold_pct, 80);
+        assert_eq!(policy.sample_rate, 4);
+    }
+
+    #[test]
+    fn ring_exposes_policy() {
+        let policy = BackpressurePolicy {
+            threshold_pct: 50,
+            sample_rate: 8,
+        };
+        let ring = EventRingBuffer::with_capacity_and_policy(10, policy);
+        assert_eq!(ring.policy(), policy);
+    }
+
+    #[test]
+    fn invalid_backpressure_policy_is_normalized() {
+        let ring = EventRingBuffer::with_capacity_and_policy(
+            10,
+            BackpressurePolicy {
+                threshold_pct: u8::MAX,
+                sample_rate: 0,
+            },
+        );
+        let policy = ring.policy();
+        assert_eq!(policy.threshold_pct, 100);
+        assert_eq!(policy.sample_rate, 1);
+        assert_eq!(ring.try_push(sample_tool_start("normalize")), Some(1));
+    }
+
+    #[test]
+    fn no_sampling_below_threshold() {
+        let policy = BackpressurePolicy {
+            threshold_pct: 90,
+            sample_rate: 100,
+        };
+        let ring = EventRingBuffer::with_capacity_and_policy(100, policy);
+
+        // Fill to 50% (well below threshold)
+        for i in 0..50 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        // All try_push should succeed (below threshold)
+        for _ in 0..20 {
+            let result = ring.try_push(sample_http("/ok", 200));
+            assert!(result.is_some());
+        }
+        assert_eq!(ring.stats().sampled_drops, 0);
+    }
+
+    // ── Performance regression harness (br-10wc.13.4) ─────────────
+
+    /// Budget: 10k events pushed in under 50ms on typical hardware.
+    #[test]
+    fn perf_push_throughput_10k() {
+        let ring = EventRingBuffer::with_capacity(10_000);
+        let start = std::time::Instant::now();
+        for i in 0..10_000u64 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+        let elapsed = start.elapsed();
+        let stats = ring.stats();
+        assert_eq!(stats.total_pushed, 10_000);
+        assert_eq!(stats.len, 10_000);
+        // Budget: under 50ms (generous — usually < 5ms).
+        assert!(
+            elapsed.as_millis() < 50,
+            "push throughput regression: 10k events took {elapsed:?}"
+        );
+    }
+
+    /// Budget: 50k events with overflow in under 200ms.
+    #[test]
+    fn perf_push_throughput_50k_with_overflow() {
+        let ring = EventRingBuffer::with_capacity(5_000);
+        let start = std::time::Instant::now();
+        for i in 0..50_000u64 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+        let elapsed = start.elapsed();
+        let stats = ring.stats();
+        assert_eq!(stats.total_pushed, 50_000);
+        assert_eq!(stats.len, 5_000); // bounded
+        assert_eq!(stats.dropped_overflow, 45_000);
+        assert!(
+            elapsed.as_millis() < 200,
+            "push throughput regression: 50k events took {elapsed:?}"
+        );
+    }
+
+    /// Budget: `iter_recent(1000)` from a full 10k ring under 10ms.
+    #[test]
+    fn perf_iter_recent_from_full_ring() {
+        let ring = EventRingBuffer::with_capacity(10_000);
+        for i in 0..10_000u64 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        let start = std::time::Instant::now();
+        let events = ring.iter_recent(1_000);
+        let elapsed = start.elapsed();
+
+        assert_eq!(events.len(), 1_000);
+        assert!(
+            elapsed.as_millis() < 10,
+            "iter_recent regression: 1000 from 10k took {elapsed:?}"
+        );
+    }
+
+    /// Budget: `events_since_seq` scan of full ring under 10ms.
+    #[test]
+    fn perf_events_since_seq_scan() {
+        let ring = EventRingBuffer::with_capacity(10_000);
+        for i in 0..10_000u64 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        let start = std::time::Instant::now();
+        let events = ring.events_since_seq(9_500);
+        let elapsed = start.elapsed();
+
+        assert_eq!(events.len(), 500);
+        assert!(
+            elapsed.as_millis() < 10,
+            "events_since_seq regression: scan took {elapsed:?}"
+        );
+    }
+
+    /// Memory bound: ring never exceeds capacity even under sustained load.
+    #[test]
+    fn perf_memory_bound_sustained_load() {
+        let cap = 1_000;
+        let ring = EventRingBuffer::with_capacity(cap);
+
+        // Push 100x capacity
+        for i in 0..100_000u64 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        let stats = ring.stats();
+        assert_eq!(stats.len, cap);
+        assert_eq!(stats.total_pushed, 100_000);
+        assert_eq!(stats.dropped_overflow, 99_000);
+    }
+
+    /// Backpressure activates within a tight window at threshold.
+    #[test]
+    fn perf_backpressure_activation_timing() {
+        let policy = BackpressurePolicy {
+            threshold_pct: 80,
+            sample_rate: 4,
+        };
+        let ring = EventRingBuffer::with_capacity_and_policy(100, policy);
+
+        // Fill to 79% — no sampling
+        for i in 0..79 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+        assert_eq!(ring.stats().sampled_drops, 0);
+
+        // Push 1 more to reach 80% (threshold) — Trace events may now be sampled
+        let _ = ring.push(sample_http("/threshold", 200));
+
+        // Push 20 Trace-level events via try_push (HttpRequest with 200 is Debug).
+        // We need events that are Trace-level. HealthPulse is Trace.
+        let mut sampled = 0u64;
+        for _ in 0..20 {
+            let event = MailEvent::health_pulse(DbStatSnapshot::default());
+            if ring.try_push(event).is_none() {
+                sampled += 1;
+            }
+        }
+        // With sample_rate=4, roughly 3/4 should be dropped
+        assert!(sampled > 0, "backpressure should have activated at 80%");
+        assert_eq!(ring.stats().sampled_drops, sampled);
+    }
+
+    /// Concurrent push throughput: multiple threads pushing simultaneously.
+    #[test]
+    fn perf_concurrent_push_throughput() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(10_000));
+        let thread_count = 4;
+        let events_per_thread = 5_000;
+
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = (0..thread_count)
+            .map(|t| {
+                let ring = Arc::clone(&ring);
+                std::thread::spawn(move || {
+                    for i in 0..events_per_thread {
+                        let _ = ring.push(sample_http(&format!("/t{t}/{i}"), 200));
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        let stats = ring.stats();
+        assert_eq!(stats.total_pushed, thread_count * events_per_thread);
+        assert!(
+            elapsed.as_millis() < 500,
+            "concurrent push regression: {thread_count}x{events_per_thread} took {elapsed:?}"
+        );
+    }
+
+    /// `try_push` contention tracking under concurrent access.
+    #[test]
+    fn perf_try_push_contention_tracking() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(10_000));
+        let thread_count: usize = 4;
+        let events_per_thread: usize = 2_000;
+
+        // Spawn all threads first to preserve concurrent contention.
+        let mut handles = Vec::with_capacity(thread_count);
+        for t in 0..thread_count {
+            let ring = Arc::clone(&ring);
+            handles.push(std::thread::spawn(move || {
+                let mut pushed = 0u64;
+                for i in 0..events_per_thread {
+                    if ring
+                        .try_push(sample_http(&format!("/t{t}/{i}"), 200))
+                        .is_some()
+                    {
+                        pushed += 1;
+                    }
+                }
+                pushed
+            }));
+        }
+
+        let total_pushed: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        let stats = ring.stats();
+
+        // Some may have been dropped due to contention
+        let total_attempted =
+            u64::try_from(thread_count).unwrap() * u64::try_from(events_per_thread).unwrap();
+        let contention_drops = stats.contention_drops;
+        assert_eq!(total_pushed + contention_drops, total_attempted);
+    }
+
+    /// Filter-by-kind performance on a full ring.
+    #[test]
+    fn perf_filter_by_kind_full_ring() {
+        let ring = EventRingBuffer::with_capacity(10_000);
+        // Mix of events
+        for i in 0..10_000u64 {
+            if i % 3 == 0 {
+                let _ = ring.push(MailEvent::tool_call_start(
+                    "test",
+                    serde_json::Value::Null,
+                    Some("p".to_string()),
+                    Some("a".to_string()),
+                ));
+            } else {
+                let _ = ring.push(sample_http(&format!("/{i}"), 200));
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let tool_events = ring.filter_by_kind(MailEventKind::ToolCallStart);
+        let elapsed = start.elapsed();
+
+        assert!(tool_events.len() > 3000); // ~1/3 of 10k
+        assert!(
+            elapsed.as_millis() < 10,
+            "filter_by_kind regression: took {elapsed:?}"
+        );
+    }
+
+    /// Stats computation is O(1) on a full ring.
+    #[test]
+    fn perf_stats_is_constant_time() {
+        let ring = EventRingBuffer::with_capacity(10_000);
+        for i in 0..10_000u64 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            let _ = ring.stats();
+        }
+        let elapsed = start.elapsed();
+
+        // 10k stats calls on a full ring should be under 10ms
+        assert!(
+            elapsed.as_millis() < 10,
+            "stats() is not constant time: 10k calls took {elapsed:?}"
+        );
     }
 }

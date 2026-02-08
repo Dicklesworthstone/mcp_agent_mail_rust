@@ -15,10 +15,10 @@ use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
 use ftui::{Event, KeyCode, KeyEventKind, Modifiers};
 use ftui_runtime::program::{Cmd, Model};
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{
-    ALL_SCREEN_IDS, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
+    ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
     PlaceholderScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen, screen_meta,
     system_health::SystemHealthScreen, timeline::TimelineScreen,
 };
@@ -72,10 +72,11 @@ pub struct MailAppModel {
     help_visible: bool,
     command_palette: CommandPalette,
     tick_count: u64,
+    accessibility: crate::tui_persist::AccessibilitySettings,
 }
 
 impl MailAppModel {
-    /// Create a new application model with placeholder screens.
+    /// Create a new application model with placeholder screens (no persistence).
     #[must_use]
     pub fn new(state: Arc<TuiSharedState>) -> Self {
         let mut screens: HashMap<MailScreenId, Box<dyn MailScreen>> = HashMap::new();
@@ -101,7 +102,25 @@ impl MailAppModel {
             help_visible: false,
             command_palette,
             tick_count: 0,
+            accessibility: crate::tui_persist::AccessibilitySettings::default(),
         }
+    }
+
+    /// Create the model with config-driven preferences and auto-persistence.
+    #[must_use]
+    pub fn with_config(state: Arc<TuiSharedState>, config: &mcp_agent_mail_core::Config) -> Self {
+        let mut model = Self::new(state);
+        // Replace the TimelineScreen with one that loads/saves dock preferences.
+        model.screens.insert(
+            MailScreenId::Threads,
+            Box::new(TimelineScreen::with_config(config)),
+        );
+        // Load accessibility settings from config.
+        model.accessibility = crate::tui_persist::AccessibilitySettings {
+            high_contrast: config.tui_high_contrast,
+            key_hints: config.tui_key_hints,
+        };
+        model
     }
 
     /// Replace a screen implementation (used when real screens are ready).
@@ -121,6 +140,12 @@ impl MailAppModel {
         self.help_visible
     }
 
+    /// Current accessibility settings.
+    #[must_use]
+    pub const fn accessibility(&self) -> &crate::tui_persist::AccessibilitySettings {
+        &self.accessibility
+    }
+
     /// Whether the active screen is consuming text input.
     fn consumes_text_input(&self) -> bool {
         if self.command_palette.is_visible() {
@@ -133,11 +158,29 @@ impl MailAppModel {
 
     fn open_palette(&mut self) {
         self.help_visible = false;
-        self.command_palette
-            .replace_actions(build_palette_actions(&self.state));
+        let mut actions = build_palette_actions(&self.state);
+
+        // Inject context-aware quick actions from the focused entity.
+        if let Some(screen) = self.screens.get(&self.active_screen) {
+            if let Some(event) = screen.focused_event() {
+                let quick = crate::tui_screens::inspector::build_quick_actions(event);
+                for qa in quick.into_iter().rev() {
+                    actions.insert(
+                        0,
+                        ActionItem::new(qa.id, qa.label)
+                            .with_description(&qa.description)
+                            .with_tags(&["quick", "context"])
+                            .with_category("Quick Actions"),
+                    );
+                }
+            }
+        }
+
+        self.command_palette.replace_actions(actions);
         self.command_palette.open();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn dispatch_palette_action(&mut self, id: &str) -> Cmd<MailMsg> {
         // ── App controls ───────────────────────────────────────────
         match id {
@@ -148,6 +191,54 @@ impl MailAppModel {
             palette_action_ids::APP_QUIT => {
                 self.state.request_shutdown();
                 return Cmd::quit();
+            }
+            palette_action_ids::TRANSPORT_TOGGLE => {
+                let _ = self
+                    .state
+                    .try_send_server_control(ServerControlMsg::ToggleTransportBase);
+                return Cmd::none();
+            }
+            palette_action_ids::TRANSPORT_SET_MCP => {
+                let _ = self
+                    .state
+                    .try_send_server_control(ServerControlMsg::SetTransportBase(
+                        TransportBase::Mcp,
+                    ));
+                return Cmd::none();
+            }
+            palette_action_ids::TRANSPORT_SET_API => {
+                let _ = self
+                    .state
+                    .try_send_server_control(ServerControlMsg::SetTransportBase(
+                        TransportBase::Api,
+                    ));
+                return Cmd::none();
+            }
+            palette_action_ids::LAYOUT_RESET => {
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
+                    screen.reset_layout();
+                }
+                return Cmd::none();
+            }
+            palette_action_ids::LAYOUT_EXPORT => {
+                if let Some(screen) = self.screens.get(&MailScreenId::Threads) {
+                    screen.export_layout();
+                }
+                return Cmd::none();
+            }
+            palette_action_ids::LAYOUT_IMPORT => {
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
+                    screen.import_layout();
+                }
+                return Cmd::none();
+            }
+            palette_action_ids::A11Y_TOGGLE_HC => {
+                self.accessibility.high_contrast = !self.accessibility.high_contrast;
+                return Cmd::none();
+            }
+            palette_action_ids::A11Y_TOGGLE_HINTS => {
+                self.accessibility.key_hints = !self.accessibility.key_hints;
+                return Cmd::none();
             }
             _ => {}
         }
@@ -172,6 +263,52 @@ impl MailAppModel {
             return Cmd::none();
         }
 
+        // ── Quick actions (context-aware from focused entity) ────
+        if let Some(rest) = id.strip_prefix("quick:") {
+            if let Some(name) = rest.strip_prefix("agent:") {
+                let target = DeepLinkTarget::AgentByName(name.to_string());
+                self.active_screen = MailScreenId::Agents;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Agents) {
+                    screen.receive_deep_link(&target);
+                }
+                return Cmd::none();
+            }
+            if let Some(id_str) = rest.strip_prefix("thread:") {
+                let target = DeepLinkTarget::ThreadById(id_str.to_string());
+                self.active_screen = MailScreenId::Threads;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
+                    screen.receive_deep_link(&target);
+                }
+                return Cmd::none();
+            }
+            if let Some(name) = rest.strip_prefix("tool:") {
+                let target = DeepLinkTarget::ToolByName(name.to_string());
+                self.active_screen = MailScreenId::ToolMetrics;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::ToolMetrics) {
+                    screen.receive_deep_link(&target);
+                }
+                return Cmd::none();
+            }
+            if let Some(id_str) = rest.strip_prefix("message:") {
+                if let Ok(msg_id) = id_str.parse::<i64>() {
+                    let target = DeepLinkTarget::MessageById(msg_id);
+                    self.active_screen = MailScreenId::Messages;
+                    if let Some(screen) = self.screens.get_mut(&MailScreenId::Messages) {
+                        screen.receive_deep_link(&target);
+                    }
+                }
+                return Cmd::none();
+            }
+            if let Some(slug) = rest.strip_prefix("project:") {
+                let target = DeepLinkTarget::ProjectBySlug(slug.to_string());
+                self.active_screen = MailScreenId::Dashboard;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Dashboard) {
+                    screen.receive_deep_link(&target);
+                }
+                return Cmd::none();
+            }
+        }
+
         Cmd::none()
     }
 }
@@ -180,9 +317,10 @@ impl Model for MailAppModel {
     type Message = MailMsg;
 
     fn init(&mut self) -> Cmd<Self::Message> {
-        Cmd::tick(TICK_INTERVAL)
+        Cmd::batch(vec![Cmd::tick(TICK_INTERVAL), Cmd::set_mouse_capture(true)])
     }
 
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, msg: Self::Message) -> Cmd<Self::Message> {
         match msg {
             // ── Tick ────────────────────────────────────────────────
@@ -224,6 +362,12 @@ impl Model for MailAppModel {
                             }
                             KeyCode::Char('?') if !text_mode => {
                                 self.help_visible = !self.help_visible;
+                                return Cmd::none();
+                            }
+                            KeyCode::Char('m') if !text_mode => {
+                                let _ = self
+                                    .state
+                                    .try_send_server_control(ServerControlMsg::ToggleTransportBase);
                                 return Cmd::none();
                             }
                             KeyCode::Tab => {
@@ -272,6 +416,9 @@ impl Model for MailAppModel {
                         MailScreenId::Threads
                     }
                     DeepLinkTarget::MessageById(_) => MailScreenId::Messages,
+                    DeepLinkTarget::AgentByName(_) => MailScreenId::Agents,
+                    DeepLinkTarget::ToolByName(_) => MailScreenId::ToolMetrics,
+                    DeepLinkTarget::ProjectBySlug(_) => MailScreenId::Dashboard,
                 };
                 self.active_screen = target_screen;
                 if let Some(screen) = self.screens.get_mut(&target_screen) {
@@ -359,6 +506,17 @@ mod palette_action_ids {
     pub const APP_TOGGLE_HELP: &str = "app:toggle_help";
     pub const APP_QUIT: &str = "app:quit";
 
+    pub const TRANSPORT_TOGGLE: &str = "transport:toggle";
+    pub const TRANSPORT_SET_MCP: &str = "transport:set_mcp";
+    pub const TRANSPORT_SET_API: &str = "transport:set_api";
+
+    pub const LAYOUT_RESET: &str = "layout:reset";
+    pub const LAYOUT_EXPORT: &str = "layout:export";
+    pub const LAYOUT_IMPORT: &str = "layout:import";
+
+    pub const A11Y_TOGGLE_HC: &str = "a11y:toggle_high_contrast";
+    pub const A11Y_TOGGLE_HINTS: &str = "a11y:toggle_key_hints";
+
     pub const AGENT_PREFIX: &str = "agent:";
     pub const THREAD_PREFIX: &str = "thread:";
     pub const TOOL_PREFIX: &str = "tool:";
@@ -421,6 +579,57 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
             .with_category(screen_palette_category(meta.id)),
         );
     }
+
+    out.push(
+        ActionItem::new(palette_action_ids::TRANSPORT_TOGGLE, "Toggle MCP/API Mode")
+            .with_description("Restart server to switch between /mcp/ and /api/ base paths")
+            .with_tags(&["transport", "mode", "mcp", "api"])
+            .with_category("Transport"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::TRANSPORT_SET_MCP, "Switch to MCP Mode")
+            .with_description("Restart server with /mcp/ base path")
+            .with_tags(&["transport", "mcp"])
+            .with_category("Transport"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::TRANSPORT_SET_API, "Switch to API Mode")
+            .with_description("Restart server with /api/ base path")
+            .with_tags(&["transport", "api"])
+            .with_category("Transport"),
+    );
+
+    out.push(
+        ActionItem::new(palette_action_ids::LAYOUT_RESET, "Reset Layout")
+            .with_description("Reset dock layout to factory defaults (Right 40%)")
+            .with_tags(&["layout", "reset", "defaults", "dock"])
+            .with_category("Layout"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::LAYOUT_EXPORT, "Export Layout")
+            .with_description("Save current dock layout to layout.json")
+            .with_tags(&["layout", "export", "save", "json"])
+            .with_category("Layout"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::LAYOUT_IMPORT, "Import Layout")
+            .with_description("Load dock layout from layout.json")
+            .with_tags(&["layout", "import", "load", "json"])
+            .with_category("Layout"),
+    );
+
+    out.push(
+        ActionItem::new(palette_action_ids::A11Y_TOGGLE_HC, "Toggle High Contrast")
+            .with_description("Switch between standard and high-contrast color palette")
+            .with_tags(&["accessibility", "contrast", "colors", "a11y"])
+            .with_category("Accessibility"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::A11Y_TOGGLE_HINTS, "Toggle Key Hints")
+            .with_description("Show/hide context-sensitive key hints in the status area")
+            .with_tags(&["accessibility", "hints", "keys", "a11y"])
+            .with_category("Accessibility"),
+    );
 
     out.push(
         ActionItem::new(palette_action_ids::APP_TOGGLE_HELP, "Toggle Help Overlay")
@@ -650,10 +859,11 @@ mod tests {
     }
 
     #[test]
-    fn init_returns_tick() {
+    fn init_returns_batch_with_tick_and_mouse() {
         let mut model = test_model();
         let cmd = model.init();
-        assert!(matches!(cmd, Cmd::Tick(_)));
+        // init() now returns Batch([Tick, SetMouseCapture(true)])
+        assert!(matches!(cmd, Cmd::Batch(_)));
     }
 
     #[test]
@@ -720,5 +930,484 @@ mod tests {
             DeepLinkTarget::MessageById(42),
         )));
         assert_eq!(model.active_screen(), MailScreenId::Messages);
+    }
+
+    #[test]
+    fn global_m_key_sends_transport_toggle() {
+        use std::sync::mpsc;
+
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let (tx, rx) = mpsc::channel::<ServerControlMsg>();
+        state.set_server_control_sender(tx);
+
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        let event = Event::Key(ftui::KeyEvent::new(KeyCode::Char('m')));
+        let _ = model.update(MailMsg::Terminal(event));
+
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(ServerControlMsg::ToggleTransportBase)
+        );
+    }
+
+    // ── Reducer edge-case tests ──────────────────────────────────
+
+    #[test]
+    fn tab_cycles_through_all_screens_forward() {
+        let mut model = test_model();
+        let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
+        let mut visited = vec![model.active_screen()];
+        for _ in 0..ALL_SCREEN_IDS.len() {
+            model.update(MailMsg::Terminal(tab.clone()));
+            visited.push(model.active_screen());
+        }
+        // After N tabs, should be back to start
+        assert_eq!(visited.first(), visited.last());
+        // All screens visited
+        for &id in ALL_SCREEN_IDS {
+            assert!(visited.contains(&id), "screen {id:?} not visited");
+        }
+    }
+
+    #[test]
+    fn backtab_cycles_through_all_screens_backward() {
+        let mut model = test_model();
+        let backtab = Event::Key(ftui::KeyEvent::new(KeyCode::BackTab));
+        let mut visited = vec![model.active_screen()];
+        for _ in 0..ALL_SCREEN_IDS.len() {
+            model.update(MailMsg::Terminal(backtab.clone()));
+            visited.push(model.active_screen());
+        }
+        assert_eq!(visited.first(), visited.last());
+        for &id in ALL_SCREEN_IDS {
+            assert!(
+                visited.contains(&id),
+                "screen {id:?} not visited in reverse"
+            );
+        }
+    }
+
+    #[test]
+    fn number_keys_switch_screens() {
+        let mut model = test_model();
+        for (i, &expected_id) in ALL_SCREEN_IDS.iter().enumerate() {
+            let n = u32::try_from(i + 1).expect("screen index should fit in u32");
+            let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char(
+                char::from_digit(n, 10).unwrap(),
+            )));
+            model.update(MailMsg::Terminal(key));
+            assert_eq!(
+                model.active_screen(),
+                expected_id,
+                "key {n} -> {expected_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn number_key_zero_does_not_switch() {
+        let mut model = test_model();
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('0')));
+        model.update(MailMsg::Terminal(key));
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+    }
+
+    #[test]
+    fn number_key_out_of_range_does_not_switch() {
+        let mut model = test_model();
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('9')));
+        model.update(MailMsg::Terminal(key));
+        // 9 > 7 screens, so should stay on Dashboard
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+    }
+
+    #[test]
+    fn help_and_palette_mutual_exclusivity() {
+        let mut model = test_model();
+
+        // Open help
+        model.update(MailMsg::ToggleHelp);
+        assert!(model.help_visible());
+
+        // Opening palette should close help
+        let ctrl_p = Event::Key(
+            ftui::KeyEvent::new(KeyCode::Char('p')).with_modifiers(ftui::Modifiers::CTRL),
+        );
+        model.update(MailMsg::Terminal(ctrl_p));
+        assert!(!model.help_visible());
+        assert!(model.command_palette.is_visible());
+    }
+
+    #[test]
+    fn escape_closes_help_overlay() {
+        let mut model = test_model();
+        model.update(MailMsg::ToggleHelp);
+        assert!(model.help_visible());
+
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        model.update(MailMsg::Terminal(esc));
+        assert!(!model.help_visible());
+    }
+
+    #[test]
+    fn q_key_triggers_quit() {
+        let mut model = test_model();
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('q')));
+        let cmd = model.update(MailMsg::Terminal(key));
+        assert!(model.state.is_shutdown_requested());
+        assert!(matches!(cmd, Cmd::Quit));
+    }
+
+    #[test]
+    fn question_mark_toggles_help() {
+        let mut model = test_model();
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('?')));
+        model.update(MailMsg::Terminal(key.clone()));
+        assert!(model.help_visible());
+        model.update(MailMsg::Terminal(key));
+        assert!(!model.help_visible());
+    }
+
+    #[test]
+    fn tick_increments_and_returns_tick_cmd() {
+        let mut model = test_model();
+        let cmd = model.update(MailMsg::Terminal(Event::Tick));
+        assert_eq!(model.tick_count, 1);
+        assert!(matches!(cmd, Cmd::Tick(_)));
+    }
+
+    #[test]
+    fn deep_link_thread_by_id_switches_to_threads() {
+        use crate::tui_screens::DeepLinkTarget;
+        let mut model = test_model();
+        model.update(MailMsg::Screen(MailScreenMsg::DeepLink(
+            DeepLinkTarget::ThreadById("br-10wc".to_string()),
+        )));
+        assert_eq!(model.active_screen(), MailScreenId::Threads);
+    }
+
+    #[test]
+    fn deep_link_agent_switches_to_agents() {
+        use crate::tui_screens::DeepLinkTarget;
+        let mut model = test_model();
+        model.update(MailMsg::Screen(MailScreenMsg::DeepLink(
+            DeepLinkTarget::AgentByName("RedFox".to_string()),
+        )));
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+    }
+
+    #[test]
+    fn deep_link_tool_switches_to_tool_metrics() {
+        use crate::tui_screens::DeepLinkTarget;
+        let mut model = test_model();
+        model.update(MailMsg::Screen(MailScreenMsg::DeepLink(
+            DeepLinkTarget::ToolByName("send_message".to_string()),
+        )));
+        assert_eq!(model.active_screen(), MailScreenId::ToolMetrics);
+    }
+
+    #[test]
+    fn deep_link_project_switches_to_dashboard() {
+        use crate::tui_screens::DeepLinkTarget;
+        let mut model = test_model();
+        model.update(MailMsg::Screen(MailScreenMsg::DeepLink(
+            DeepLinkTarget::ProjectBySlug("my-proj".to_string()),
+        )));
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+    }
+
+    #[test]
+    fn screen_navigation_msg_and_switch_screen_are_equivalent() {
+        let mut model1 = test_model();
+        let mut model2 = test_model();
+
+        model1.update(MailMsg::Screen(MailScreenMsg::Navigate(
+            MailScreenId::Agents,
+        )));
+        model2.update(MailMsg::SwitchScreen(MailScreenId::Agents));
+
+        assert_eq!(model1.active_screen(), model2.active_screen());
+    }
+
+    #[test]
+    fn colon_opens_palette() {
+        let mut model = test_model();
+        let colon = Event::Key(ftui::KeyEvent::new(KeyCode::Char(':')));
+        model.update(MailMsg::Terminal(colon));
+        assert!(model.command_palette.is_visible());
+    }
+
+    #[test]
+    fn palette_blocks_global_shortcuts() {
+        let mut model = test_model();
+
+        // Open palette
+        let ctrl_p = Event::Key(
+            ftui::KeyEvent::new(KeyCode::Char('p')).with_modifiers(ftui::Modifiers::CTRL),
+        );
+        model.update(MailMsg::Terminal(ctrl_p));
+        assert!(model.command_palette.is_visible());
+
+        // 'q' while palette is open should NOT quit
+        let q = Event::Key(ftui::KeyEvent::new(KeyCode::Char('q')));
+        let cmd = model.update(MailMsg::Terminal(q));
+        assert!(!model.state.is_shutdown_requested());
+        assert!(!matches!(cmd, Cmd::Quit));
+    }
+
+    #[test]
+    fn with_config_preserves_state() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let model = MailAppModel::with_config(Arc::clone(&state), &config);
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        assert!(!model.help_visible());
+        // Should have all screens
+        for &id in ALL_SCREEN_IDS {
+            assert!(model.screens.contains_key(&id));
+        }
+    }
+
+    #[test]
+    fn palette_action_ids_cover_all_screens() {
+        for &id in ALL_SCREEN_IDS {
+            let action_id = screen_palette_action_id(id);
+            let round_tripped = screen_from_palette_action_id(action_id);
+            assert_eq!(round_tripped, Some(id), "round-trip failed for {id:?}");
+        }
+    }
+
+    #[test]
+    fn palette_action_ids_unknown_returns_none() {
+        assert_eq!(screen_from_palette_action_id("screen:unknown"), None);
+        assert_eq!(screen_from_palette_action_id(""), None);
+    }
+
+    #[test]
+    fn build_palette_actions_static_has_screens_and_app_controls() {
+        let actions = build_palette_actions_static();
+        // Should have one action per screen + transport actions + app controls
+        assert!(actions.len() >= ALL_SCREEN_IDS.len() + 2);
+        // Check that screen actions are present
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+        for &screen_id in ALL_SCREEN_IDS {
+            let action_id = screen_palette_action_id(screen_id);
+            assert!(
+                ids.contains(&action_id),
+                "missing palette action for {screen_id:?}"
+            );
+        }
+        assert!(ids.contains(&palette_action_ids::APP_QUIT));
+        assert!(ids.contains(&palette_action_ids::APP_TOGGLE_HELP));
+    }
+
+    #[test]
+    fn map_screen_cmd_maps_all_variants() {
+        // Tick
+        let cmd = map_screen_cmd(Cmd::Tick(std::time::Duration::from_millis(100)));
+        assert!(matches!(cmd, Cmd::Tick(_)));
+
+        // Log
+        let cmd = map_screen_cmd(Cmd::Log("test".into()));
+        assert!(matches!(cmd, Cmd::Log(_)));
+
+        // Batch
+        let cmd = map_screen_cmd(Cmd::Batch(vec![Cmd::None, Cmd::Quit]));
+        assert!(matches!(cmd, Cmd::Batch(_)));
+
+        // Sequence (must have 2+ elements; single-element collapses)
+        let cmd = map_screen_cmd(Cmd::Sequence(vec![Cmd::None, Cmd::Quit]));
+        assert!(matches!(cmd, Cmd::Sequence(_) | Cmd::Batch(_)));
+
+        // SaveState / RestoreState
+        assert!(matches!(map_screen_cmd(Cmd::SaveState), Cmd::SaveState));
+        assert!(matches!(
+            map_screen_cmd(Cmd::RestoreState),
+            Cmd::RestoreState
+        ));
+
+        // SetMouseCapture
+        assert!(matches!(
+            map_screen_cmd(Cmd::SetMouseCapture(true)),
+            Cmd::SetMouseCapture(true)
+        ));
+    }
+
+    #[test]
+    fn dispatch_palette_help_toggles_help() {
+        let mut model = test_model();
+        assert!(!model.help_visible());
+        model.dispatch_palette_action(palette_action_ids::APP_TOGGLE_HELP);
+        assert!(model.help_visible());
+    }
+
+    #[test]
+    fn dispatch_palette_quit_requests_shutdown() {
+        let mut model = test_model();
+        let cmd = model.dispatch_palette_action(palette_action_ids::APP_QUIT);
+        assert!(model.state.is_shutdown_requested());
+        assert!(matches!(cmd, Cmd::Quit));
+    }
+
+    #[test]
+    fn dispatch_palette_screen_navigation() {
+        let mut model = test_model();
+        model.dispatch_palette_action(palette_action_ids::SCREEN_MESSAGES);
+        assert_eq!(model.active_screen(), MailScreenId::Messages);
+    }
+
+    #[test]
+    fn dispatch_palette_agent_prefix_goes_to_agents() {
+        let mut model = test_model();
+        model.dispatch_palette_action("agent:GoldFox");
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+    }
+
+    #[test]
+    fn dispatch_palette_thread_prefix_goes_to_threads() {
+        let mut model = test_model();
+        model.dispatch_palette_action("thread:br-10wc");
+        assert_eq!(model.active_screen(), MailScreenId::Threads);
+    }
+
+    #[test]
+    fn dispatch_palette_tool_prefix_goes_to_tool_metrics() {
+        let mut model = test_model();
+        model.dispatch_palette_action("tool:fetch_inbox");
+        assert_eq!(model.active_screen(), MailScreenId::ToolMetrics);
+    }
+
+    #[test]
+    fn dispatch_palette_unknown_id_is_noop() {
+        let mut model = test_model();
+        let prev = model.active_screen();
+        let cmd = model.dispatch_palette_action("unknown:foo");
+        assert_eq!(model.active_screen(), prev);
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn dispatch_palette_layout_reset_returns_none() {
+        let mut model = test_model();
+        let cmd = model.dispatch_palette_action(palette_action_ids::LAYOUT_RESET);
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn dispatch_palette_layout_export_returns_none() {
+        let mut model = test_model();
+        let cmd = model.dispatch_palette_action(palette_action_ids::LAYOUT_EXPORT);
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn dispatch_palette_layout_import_returns_none() {
+        let mut model = test_model();
+        let cmd = model.dispatch_palette_action(palette_action_ids::LAYOUT_IMPORT);
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn palette_static_actions_include_layout_controls() {
+        let actions = build_palette_actions_static();
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&palette_action_ids::LAYOUT_RESET));
+        assert!(ids.contains(&palette_action_ids::LAYOUT_EXPORT));
+        assert!(ids.contains(&palette_action_ids::LAYOUT_IMPORT));
+    }
+
+    // ── Accessibility tests ─────────────────────────────────────
+
+    #[test]
+    fn default_accessibility_settings() {
+        let model = test_model();
+        assert!(!model.accessibility().high_contrast);
+        assert!(model.accessibility().key_hints);
+    }
+
+    #[test]
+    fn toggle_high_contrast_via_palette() {
+        let mut model = test_model();
+        assert!(!model.accessibility().high_contrast);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_HC);
+        assert!(model.accessibility().high_contrast);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_HC);
+        assert!(!model.accessibility().high_contrast);
+    }
+
+    #[test]
+    fn toggle_key_hints_via_palette() {
+        let mut model = test_model();
+        assert!(model.accessibility().key_hints);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_HINTS);
+        assert!(!model.accessibility().key_hints);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_HINTS);
+        assert!(model.accessibility().key_hints);
+    }
+
+    #[test]
+    fn palette_static_actions_include_accessibility_controls() {
+        let actions = build_palette_actions_static();
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&palette_action_ids::A11Y_TOGGLE_HC));
+        assert!(ids.contains(&palette_action_ids::A11Y_TOGGLE_HINTS));
+    }
+
+    #[test]
+    fn with_config_loads_accessibility_settings() {
+        let config = mcp_agent_mail_core::Config {
+            tui_high_contrast: true,
+            tui_key_hints: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let model = MailAppModel::with_config(Arc::clone(&state), &config);
+        assert!(model.accessibility().high_contrast);
+        assert!(!model.accessibility().key_hints);
+    }
+
+    // ── Quick action dispatch tests ─────────────────────────────
+
+    #[test]
+    fn dispatch_quick_agent_navigates_to_agents() {
+        let mut model = test_model();
+        model.dispatch_palette_action("quick:agent:RedFox");
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+    }
+
+    #[test]
+    fn dispatch_quick_thread_navigates_to_threads() {
+        let mut model = test_model();
+        model.dispatch_palette_action("quick:thread:abc123");
+        assert_eq!(model.active_screen(), MailScreenId::Threads);
+    }
+
+    #[test]
+    fn dispatch_quick_tool_navigates_to_tool_metrics() {
+        let mut model = test_model();
+        model.dispatch_palette_action("quick:tool:send_message");
+        assert_eq!(model.active_screen(), MailScreenId::ToolMetrics);
+    }
+
+    #[test]
+    fn dispatch_quick_message_navigates_to_messages() {
+        let mut model = test_model();
+        model.dispatch_palette_action("quick:message:42");
+        assert_eq!(model.active_screen(), MailScreenId::Messages);
+    }
+
+    #[test]
+    fn dispatch_quick_project_navigates_to_dashboard() {
+        let mut model = test_model();
+        model.dispatch_palette_action("quick:project:my_proj");
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+    }
+
+    #[test]
+    fn dispatch_unknown_quick_action_is_noop() {
+        let mut model = test_model();
+        model.dispatch_palette_action("quick:unknown:foo");
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
     }
 }

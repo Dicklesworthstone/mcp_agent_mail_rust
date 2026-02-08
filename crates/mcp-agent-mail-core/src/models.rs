@@ -288,6 +288,36 @@ pub struct ProjectSiblingSuggestion {
 }
 
 // =============================================================================
+// Consistency
+// =============================================================================
+
+/// Lightweight descriptor of a message for archive-DB consistency checking.
+///
+/// Populated from a DB query (in `DbPool::sample_recent_message_refs`) and
+/// consumed by `mcp_agent_mail_storage::check_archive_consistency`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsistencyMessageRef {
+    pub project_slug: String,
+    pub message_id: i64,
+    pub sender_name: String,
+    pub subject: String,
+    pub created_ts_iso: String,
+}
+
+/// Result of a startup consistency probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsistencyReport {
+    /// Total messages sampled from DB.
+    pub sampled: usize,
+    /// Messages whose canonical archive file was found.
+    pub found: usize,
+    /// Messages whose canonical archive file is missing.
+    pub missing: usize,
+    /// IDs of missing messages (capped at 20 for log brevity).
+    pub missing_ids: Vec<i64>,
+}
+
+// =============================================================================
 // Agent Name Validation
 // =============================================================================
 
@@ -483,6 +513,16 @@ pub fn is_valid_agent_name(name: &str) -> bool {
     false
 }
 
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out: String = first.to_uppercase().collect();
+    out.push_str(chars.as_str());
+    out
+}
+
 /// Generates a random valid agent name.
 #[must_use]
 pub fn generate_agent_name() -> String {
@@ -505,9 +545,9 @@ pub fn generate_agent_name() -> String {
     let adj = VALID_ADJECTIVES[adj_idx];
     let noun = VALID_NOUNS[noun_idx];
 
-    // Capitalize first letter of each
-    let adj_cap = adj[..1].to_uppercase() + &adj[1..];
-    let noun_cap = noun[..1].to_uppercase() + &noun[1..];
+    // Capitalize first letter of each (UTF-8 safe).
+    let adj_cap = capitalize_first(adj);
+    let noun_cap = capitalize_first(noun);
 
     format!("{adj_cap}{noun_cap}")
 }

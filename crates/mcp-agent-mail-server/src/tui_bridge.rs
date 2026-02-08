@@ -5,14 +5,67 @@ use crate::tui_events::{DbStatSnapshot, EventRingBuffer, EventRingStats, MailEve
 use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const REQUEST_SPARKLINE_CAPACITY: usize = 60;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportBase {
+    Mcp,
+    Api,
+}
+
+impl TransportBase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Api => "api",
+        }
+    }
+
+    #[must_use]
+    pub const fn http_path(self) -> &'static str {
+        match self {
+            Self::Mcp => "/mcp/",
+            Self::Api => "/api/",
+        }
+    }
+
+    #[must_use]
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::Mcp => Self::Api,
+            Self::Api => Self::Mcp,
+        }
+    }
+
+    #[must_use]
+    pub fn from_http_path(path: &str) -> Option<Self> {
+        let trimmed = path.trim().trim_end_matches('/');
+        if trimmed.eq_ignore_ascii_case("mcp") || trimmed.eq_ignore_ascii_case("/mcp") {
+            return Some(Self::Mcp);
+        }
+        if trimmed.eq_ignore_ascii_case("api") || trimmed.eq_ignore_ascii_case("/api") {
+            return Some(Self::Api);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerControlMsg {
+    Shutdown,
+    ToggleTransportBase,
+    SetTransportBase(TransportBase),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigSnapshot {
     pub endpoint: String,
+    pub http_path: String,
     pub web_ui_url: String,
     pub app_environment: String,
     pub auth_enabled: bool,
@@ -35,6 +88,7 @@ impl ConfigSnapshot {
 
         Self {
             endpoint,
+            http_path: config.http_path.clone(),
             web_ui_url,
             app_environment: config.app_environment.to_string(),
             auth_enabled: config.http_bearer_token.is_some(),
@@ -43,6 +97,11 @@ impl ConfigSnapshot {
             console_theme: format!("{:?}", config.console_theme),
             tool_filter_profile: config.tool_filter.profile.clone(),
         }
+    }
+
+    #[must_use]
+    pub fn transport_mode(&self) -> &'static str {
+        TransportBase::from_http_path(&self.http_path).map_or("custom", TransportBase::as_str)
     }
 }
 
@@ -65,9 +124,10 @@ pub struct TuiSharedState {
     latency_total_ms: AtomicU64,
     started_at: Instant,
     shutdown: AtomicBool,
-    config_snapshot: ConfigSnapshot,
+    config_snapshot: Mutex<ConfigSnapshot>,
     db_stats: Mutex<DbStatSnapshot>,
     sparkline_data: Mutex<VecDeque<f64>>,
+    server_control_tx: Mutex<Option<Sender<ServerControlMsg>>>,
 }
 
 impl TuiSharedState {
@@ -87,9 +147,10 @@ impl TuiSharedState {
             latency_total_ms: AtomicU64::new(0),
             started_at: Instant::now(),
             shutdown: AtomicBool::new(false),
-            config_snapshot: ConfigSnapshot::from_config(config),
+            config_snapshot: Mutex::new(ConfigSnapshot::from_config(config)),
             db_stats: Mutex::new(DbStatSnapshot::default()),
             sparkline_data: Mutex::new(VecDeque::with_capacity(REQUEST_SPARKLINE_CAPACITY)),
+            server_control_tx: Mutex::new(None),
         })
     }
 
@@ -161,7 +222,31 @@ impl TuiSharedState {
 
     #[must_use]
     pub fn config_snapshot(&self) -> ConfigSnapshot {
-        self.config_snapshot.clone()
+        self.config_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn update_config_snapshot(&self, snapshot: ConfigSnapshot) {
+        if let Ok(mut guard) = self.config_snapshot.lock() {
+            *guard = snapshot;
+        }
+    }
+
+    pub fn set_server_control_sender(&self, tx: Sender<ServerControlMsg>) {
+        if let Ok(mut guard) = self.server_control_tx.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    #[must_use]
+    pub fn try_send_server_control(&self, msg: ServerControlMsg) -> bool {
+        self.server_control_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .is_some_and(|tx| tx.send(msg).is_ok())
     }
 
     #[must_use]
@@ -310,5 +395,232 @@ mod tests {
     fn shared_state_types_are_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TuiSharedState>();
+    }
+
+    // ── Bridge edge-case tests ──────────────────────────────────
+
+    #[test]
+    fn avg_latency_zero_when_no_requests() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert_eq!(state.avg_latency_ms(), 0);
+    }
+
+    #[test]
+    fn request_counter_status_ranges() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        // 1xx - no specific counter
+        state.record_request(100, 1);
+        // 3xx - no specific counter
+        state.record_request(301, 1);
+        let counters = state.request_counters();
+        assert_eq!(counters.total, 2);
+        assert_eq!(counters.status_2xx, 0);
+        assert_eq!(counters.status_4xx, 0);
+        assert_eq!(counters.status_5xx, 0);
+    }
+
+    #[test]
+    fn sparkline_starts_empty() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(state.sparkline_snapshot().is_empty());
+    }
+
+    #[test]
+    fn sparkline_single_data_point() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        state.record_request(200, 42);
+        let sparkline = state.sparkline_snapshot();
+        assert_eq!(sparkline.len(), 1);
+        assert!((sparkline[0] - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_snapshot_transport_mode_custom_path() {
+        let snap = ConfigSnapshot {
+            endpoint: "http://127.0.0.1:8765/custom/v1/".into(),
+            http_path: "/custom/v1/".into(),
+            web_ui_url: "http://127.0.0.1:8765/mail".into(),
+            app_environment: "development".into(),
+            auth_enabled: false,
+            database_url: "sqlite:///./storage.sqlite3".into(),
+            storage_root: "/tmp/am".into(),
+            console_theme: "cyberpunk_aurora".into(),
+            tool_filter_profile: "default".into(),
+        };
+        assert_eq!(snap.transport_mode(), "custom");
+    }
+
+    #[test]
+    fn config_snapshot_transport_mode_mcp() {
+        let snap = ConfigSnapshot {
+            http_path: "/mcp/".into(),
+            ..ConfigSnapshot {
+                endpoint: String::new(),
+                http_path: String::new(),
+                web_ui_url: String::new(),
+                app_environment: String::new(),
+                auth_enabled: false,
+                database_url: String::new(),
+                storage_root: String::new(),
+                console_theme: String::new(),
+                tool_filter_profile: String::new(),
+            }
+        };
+        assert_eq!(snap.transport_mode(), "mcp");
+    }
+
+    #[test]
+    fn config_snapshot_transport_mode_api() {
+        let snap = ConfigSnapshot {
+            http_path: "/api/".into(),
+            ..ConfigSnapshot {
+                endpoint: String::new(),
+                http_path: String::new(),
+                web_ui_url: String::new(),
+                app_environment: String::new(),
+                auth_enabled: false,
+                database_url: String::new(),
+                storage_root: String::new(),
+                console_theme: String::new(),
+                tool_filter_profile: String::new(),
+            }
+        };
+        assert_eq!(snap.transport_mode(), "api");
+    }
+
+    #[test]
+    fn transport_base_toggle() {
+        assert_eq!(TransportBase::Mcp.toggle(), TransportBase::Api);
+        assert_eq!(TransportBase::Api.toggle(), TransportBase::Mcp);
+    }
+
+    #[test]
+    fn transport_base_from_http_path_variants() {
+        assert_eq!(
+            TransportBase::from_http_path("/mcp/"),
+            Some(TransportBase::Mcp)
+        );
+        assert_eq!(
+            TransportBase::from_http_path("/MCP/"),
+            Some(TransportBase::Mcp)
+        );
+        assert_eq!(
+            TransportBase::from_http_path("mcp"),
+            Some(TransportBase::Mcp)
+        );
+        assert_eq!(
+            TransportBase::from_http_path("/api/"),
+            Some(TransportBase::Api)
+        );
+        assert_eq!(
+            TransportBase::from_http_path("/API"),
+            Some(TransportBase::Api)
+        );
+        assert_eq!(
+            TransportBase::from_http_path("api"),
+            Some(TransportBase::Api)
+        );
+        assert_eq!(TransportBase::from_http_path("/custom/"), None);
+        assert_eq!(TransportBase::from_http_path(""), None);
+    }
+
+    #[test]
+    fn transport_base_str_and_path() {
+        assert_eq!(TransportBase::Mcp.as_str(), "mcp");
+        assert_eq!(TransportBase::Api.as_str(), "api");
+        assert_eq!(TransportBase::Mcp.http_path(), "/mcp/");
+        assert_eq!(TransportBase::Api.http_path(), "/api/");
+    }
+
+    #[test]
+    fn update_config_snapshot_replaces_previous() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let snap1 = state.config_snapshot();
+
+        let new_snap = ConfigSnapshot {
+            endpoint: "http://127.0.0.1:9999/api/".into(),
+            http_path: "/api/".into(),
+            web_ui_url: "http://127.0.0.1:9999/mail".into(),
+            app_environment: "production".into(),
+            auth_enabled: true,
+            database_url: "sqlite:///./new.sqlite3".into(),
+            storage_root: "/tmp/new".into(),
+            console_theme: "default".into(),
+            tool_filter_profile: "minimal".into(),
+        };
+        state.update_config_snapshot(new_snap);
+        let snap2 = state.config_snapshot();
+        assert_eq!(snap2.endpoint, "http://127.0.0.1:9999/api/");
+        assert!(snap2.auth_enabled);
+        assert_ne!(snap1.endpoint, snap2.endpoint);
+    }
+
+    #[test]
+    fn update_db_stats_and_snapshot() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        let snap = state.db_stats_snapshot().unwrap();
+        assert_eq!(snap.projects, 0);
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 5,
+            agents: 10,
+            messages: 100,
+            ..Default::default()
+        });
+
+        let snap = state.db_stats_snapshot().unwrap();
+        assert_eq!(snap.projects, 5);
+        assert_eq!(snap.agents, 10);
+        assert_eq!(snap.messages, 100);
+    }
+
+    #[test]
+    fn server_control_without_sender_returns_false() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        // No sender set, should return false
+        assert!(!state.try_send_server_control(ServerControlMsg::Shutdown));
+    }
+
+    #[test]
+    fn server_control_with_dropped_receiver_returns_false() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_server_control_sender(tx);
+        drop(rx); // Drop receiver
+        assert!(!state.try_send_server_control(ServerControlMsg::Shutdown));
+    }
+
+    #[test]
+    fn uptime_is_positive() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(state.uptime().as_nanos() > 0);
+    }
+
+    #[test]
+    fn with_event_capacity_customizes_ring() {
+        let config = Config::default();
+        let state = TuiSharedState::with_event_capacity(&config, 5);
+        for i in 0..10 {
+            let _ = state.push_event(crate::tui_events::MailEvent::http_request(
+                "GET",
+                format!("/{i}"),
+                200,
+                1,
+                "127.0.0.1",
+            ));
+        }
+        let ring_stats = state.event_ring_stats();
+        assert_eq!(ring_stats.capacity, 5);
+        assert_eq!(ring_stats.len, 5);
     }
 }

@@ -14,6 +14,7 @@ regex.workspace = true
 dirs = "6"
 shellexpand = "3"
 sha1.workspace = true
+fs2.workspace = true
 
 [features]
 # Placeholder feature for optional agent detection integration

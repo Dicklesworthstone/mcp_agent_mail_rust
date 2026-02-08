@@ -13,7 +13,10 @@ Defaults:
 - MCP transport path (`/mcp/`)
 - LOG_RICH_ENABLED=true
 - host=127.0.0.1, port=8765
-- loads HTTP_BEARER_TOKEN from ~/mcp_agent_mail/.env if not set
+
+Note: The Rust binary auto-discovers HTTP_BEARER_TOKEN from
+~/.mcp_agent_mail/.env (fallback: ~/mcp_agent_mail/.env). This wrapper
+is optional; `mcp-agent-mail serve` works without it.
 
 Options:
   --host <host>          Server host (default: 127.0.0.1)
@@ -21,7 +24,7 @@ Options:
   --path <mcp|api|/x/>   Base path (default: mcp)
   --mcp                  Shortcut for --path mcp
   --api                  Shortcut for --path api
-  --env-file <path>      Env file for HTTP_BEARER_TOKEN (default: ~/mcp_agent_mail/.env)
+  --env-file <path>      Env file for HTTP_BEARER_TOKEN (default: ~/.mcp_agent_mail/.env, fallback: ~/mcp_agent_mail/.env)
   --no-auth              Unset HTTP_BEARER_TOKEN for this run
   --no-tui               Disable interactive TUI (headless mode)
   -h, --help             Show help
@@ -61,6 +64,18 @@ read_env_value() {
   command grep -E "^[[:space:]]*${key}=" "$file" | tail -n1 | cut -d= -f2-
 }
 
+default_env_file() {
+  local preferred="${HOME}/.mcp_agent_mail/.env"
+  local legacy="${HOME}/mcp_agent_mail/.env"
+  if [[ -f "$preferred" ]]; then
+    echo "$preferred"
+  elif [[ -f "$legacy" ]]; then
+    echo "$legacy"
+  else
+    echo "$preferred"
+  fi
+}
+
 if [[ $# -gt 0 ]]; then
   case "$1" in
     serve) shift ;;
@@ -74,7 +89,7 @@ fi
 host="127.0.0.1"
 port="8765"
 path_mode="mcp"
-env_file="${HOME}/mcp_agent_mail/.env"
+env_file="$(default_env_file)"
 no_auth=0
 no_tui=0
 extra_args=()

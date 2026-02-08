@@ -580,7 +580,11 @@ mod tests {
     #[test]
     fn fetch_stats_returns_default_on_bad_url() {
         let stats = fetch_db_stats("sqlite:///nonexistent_path_xyz.db");
-        assert_eq!(stats, DbStatSnapshot::default());
+        let expected = DbStatSnapshot {
+            timestamp_micros: stats.timestamp_micros,
+            ..DbStatSnapshot::default()
+        };
+        assert_eq!(stats, expected);
     }
 
     #[test]

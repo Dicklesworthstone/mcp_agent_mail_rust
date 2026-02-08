@@ -4683,6 +4683,7 @@ sys.exit(7)
             acquire_timeout_ms: 5_000,
             max_lifetime_ms: 60_000,
             run_migrations: true,
+            warmup_connections: 0,
         };
         let pool = mcp_agent_mail_db::DbPool::new(&pool_cfg).unwrap();
         let cx = asupersync::Cx::for_request();
@@ -4964,6 +4965,8 @@ sys.exit(7)
     #[test]
     fn safe_component_sanitizes_special_chars() {
         assert_eq!(safe_component("foo/bar:baz"), "foo_bar_baz");
+        assert_eq!(safe_component("."), "unknown");
+        assert_eq!(safe_component(".."), "unknown");
         assert_eq!(safe_component(""), "unknown");
         assert_eq!(safe_component("  "), "unknown");
     }
@@ -7875,7 +7878,8 @@ fn safe_component(value: &str) -> String {
     for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '] {
         out = out.replace(ch, "_");
     }
-    if out.is_empty() {
+    // Prevent path traversal via special components.
+    if out.is_empty() || out == "." || out == ".." {
         "unknown".to_string()
     } else {
         out

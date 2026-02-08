@@ -3,10 +3,15 @@
 //! Uses `sqlmodel_pool` for efficient connection management.
 
 use crate::error::{DbError, DbResult};
+use crate::integrity;
 use crate::schema;
 use asupersync::sync::OnceCell;
 use asupersync::{Cx, Outcome};
-use mcp_agent_mail_core::{LockLevel, OrderedMutex, config::env_value};
+use mcp_agent_mail_core::{
+    ConsistencyMessageRef, LockLevel, OrderedRwLock,
+    config::env_value,
+    disk::{is_sqlite_memory_database_url, sqlite_file_path_from_database_url},
+};
 use sqlmodel_core::Error as SqlError;
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
 use sqlmodel_sqlite::SqliteConnection;
@@ -77,6 +82,9 @@ pub struct DbPoolConfig {
     pub max_lifetime_ms: u64,
     /// Run migrations on init
     pub run_migrations: bool,
+    /// Number of connections to eagerly open on startup (0 = disabled).
+    /// Capped at `min_connections`. Warmup is bounded by `acquire_timeout_ms`.
+    pub warmup_connections: usize,
 }
 
 impl Default for DbPoolConfig {
@@ -88,6 +96,7 @@ impl Default for DbPoolConfig {
             acquire_timeout_ms: DEFAULT_POOL_TIMEOUT_MS,
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
+            warmup_connections: 0,
         }
     }
 }
@@ -137,6 +146,11 @@ impl DbPoolConfig {
             }
         };
 
+        let warmup = env_value("DATABASE_POOL_WARMUP")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(min_conn);
+
         Self {
             database_url,
             min_connections: min_conn,
@@ -144,50 +158,27 @@ impl DbPoolConfig {
             acquire_timeout_ms: pool_timeout,
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
+            warmup_connections: warmup,
         }
     }
 
     /// Parse `SQLite` path from database URL
     pub fn sqlite_path(&self) -> DbResult<String> {
-        // Handle various URL formats:
-        // - sqlite:///./path.db
-        // - sqlite:////absolute/path.db
-        // - sqlite+aiosqlite:///./path.db (Python format)
-        // - sqlite:///:memory: (in-memory)
-        let url = self
-            .database_url
-            .trim_start_matches("sqlite+aiosqlite://")
-            .trim_start_matches("sqlite://");
-
-        if url.is_empty() {
-            return Err(DbError::InvalidArgument {
-                field: "database_url",
-                message: "Empty database path".to_string(),
-            });
-        }
-
-        // Special case for in-memory database
-        if url == "/:memory:" {
+        if is_sqlite_memory_database_url(&self.database_url) {
             return Ok(":memory:".to_string());
         }
 
-        // After stripping "sqlite://", the URL is like:
-        // - /./path.db (relative) -> ./path.db
-        // - //absolute/path.db (absolute) -> /absolute/path.db
-        // - /path.db (might be relative or absolute) -> /path.db
+        let Some(path) = sqlite_file_path_from_database_url(&self.database_url) else {
+            return Err(DbError::InvalidArgument {
+                field: "database_url",
+                message: format!(
+                    "Invalid SQLite database URL: {} (expected sqlite:///path/to/db.sqlite3)",
+                    self.database_url
+                ),
+            });
+        };
 
-        // Handle relative paths: /./path -> ./path
-        if url.starts_with("/./") {
-            return Ok(url[1..].to_string());
-        }
-
-        // Handle absolute paths: //path -> /path (double slash after sqlite://)
-        if url.starts_with("//") {
-            return Ok(url[1..].to_string());
-        }
-
-        // Single leading slash or bare path
-        Ok(url.to_string())
+        Ok(path.to_string_lossy().into_owned())
     }
 }
 
@@ -445,16 +436,193 @@ impl DbPool {
 
         out
     }
+
+    /// Eagerly open up to `n` connections to avoid first-burst latency.
+    ///
+    /// Connections are acquired and immediately returned to the pool idle set.
+    /// Bounded: stops after `timeout` elapses or on first acquire error.
+    /// Returns the number of connections successfully warmed up.
+    pub async fn warmup(
+        &self,
+        cx: &Cx,
+        n: usize,
+        timeout: std::time::Duration,
+    ) -> usize {
+        let deadline = Instant::now() + timeout;
+        let mut opened = 0usize;
+        // Acquire connections in batches; hold them briefly then release.
+        let mut batch: Vec<PooledConnection<SqliteConnection>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match self.acquire(cx).await {
+                Outcome::Ok(conn) => {
+                    batch.push(conn);
+                    opened += 1;
+                }
+                _ => break, // stop on any error (timeout, cancelled, etc.)
+            }
+        }
+        // Drop all connections back to idle pool
+        drop(batch);
+        opened
+    }
+
+    /// Run a `PRAGMA quick_check` on a fresh connection to validate database
+    /// integrity at startup. Returns `Ok(result)` if healthy, or
+    /// `Err(IntegrityCorruption)` if corruption is detected.
+    ///
+    /// This opens a dedicated connection (outside the pool) so the check
+    /// doesn't consume a pooled slot.
+    pub fn run_startup_integrity_check(&self) -> DbResult<integrity::IntegrityCheckResult> {
+        if self.sqlite_path == ":memory:" {
+            // In-memory databases cannot be corrupt on startup.
+            return Ok(integrity::IntegrityCheckResult {
+                ok: true,
+                details: vec!["ok".to_string()],
+                duration_us: 0,
+                kind: integrity::CheckKind::Quick,
+            });
+        }
+
+        // Check if the file exists first; a missing file is not corruption.
+        if !Path::new(&self.sqlite_path).exists() {
+            return Ok(integrity::IntegrityCheckResult {
+                ok: true,
+                details: vec!["ok".to_string()],
+                duration_us: 0,
+                kind: integrity::CheckKind::Quick,
+            });
+        }
+
+        let conn = SqliteConnection::open_file(&self.sqlite_path)
+            .map_err(|e| DbError::Sqlite(format!("startup integrity check: open failed: {e}")))?;
+
+        integrity::quick_check(&conn)
+    }
+
+    /// Run a full `PRAGMA integrity_check` on a dedicated connection.
+    ///
+    /// This can take seconds on large databases. Should be called from a
+    /// background task, not from the request hot path.
+    pub fn run_full_integrity_check(&self) -> DbResult<integrity::IntegrityCheckResult> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(integrity::IntegrityCheckResult {
+                ok: true,
+                details: vec!["ok".to_string()],
+                duration_us: 0,
+                kind: integrity::CheckKind::Full,
+            });
+        }
+
+        if !Path::new(&self.sqlite_path).exists() {
+            return Ok(integrity::IntegrityCheckResult {
+                ok: true,
+                details: vec!["ok".to_string()],
+                duration_us: 0,
+                kind: integrity::CheckKind::Full,
+            });
+        }
+
+        let conn = SqliteConnection::open_file(&self.sqlite_path)
+            .map_err(|e| DbError::Sqlite(format!("full integrity check: open failed: {e}")))?;
+
+        integrity::full_check(&conn)
+    }
+
+    /// Sample the N most recent messages from the DB for consistency checking.
+    ///
+    /// Returns lightweight refs that the storage layer can use to verify
+    /// archive file presence. Opens a dedicated connection (outside the pool)
+    /// so this works even if the pool isn't fully started yet.
+    pub fn sample_recent_message_refs(
+        &self,
+        limit: i64,
+    ) -> DbResult<Vec<ConsistencyMessageRef>> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(Vec::new());
+        }
+        if !Path::new(&self.sqlite_path).exists() {
+            return Ok(Vec::new());
+        }
+
+        let conn = SqliteConnection::open_file(&self.sqlite_path)
+            .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
+
+        // Query recent messages joined with projects and agents to get
+        // the slug, sender name, subject, and created timestamp.
+        let sql = "\
+            SELECT m.id, p.slug, a.name AS sender_name, m.subject, m.created_ts \
+            FROM messages m \
+            JOIN projects p ON m.project_id = p.id \
+            JOIN agents a ON m.sender_id = a.id \
+            ORDER BY m.id DESC \
+            LIMIT ?";
+
+        let rows = conn
+            .query_sync(sql, &[sqlmodel_core::Value::BigInt(limit)])
+            .map_err(|e| DbError::Sqlite(format!("consistency probe query: {e}")))?;
+
+        let mut refs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id = match row.get_by_name("id") {
+                Some(sqlmodel_core::Value::BigInt(n)) => *n,
+                Some(sqlmodel_core::Value::Int(n)) => i64::from(*n),
+                _ => continue,
+            };
+            let slug = match row.get_by_name("slug") {
+                Some(sqlmodel_core::Value::Text(s)) => s.clone(),
+                _ => continue,
+            };
+            let sender = match row.get_by_name("sender_name") {
+                Some(sqlmodel_core::Value::Text(s)) => s.clone(),
+                _ => continue,
+            };
+            let subject = match row.get_by_name("subject") {
+                Some(sqlmodel_core::Value::Text(s)) => s.clone(),
+                _ => continue,
+            };
+            let created_ts = match row.get_by_name("created_ts") {
+                Some(sqlmodel_core::Value::BigInt(us)) => {
+                    crate::micros_to_iso(*us)
+                }
+                Some(sqlmodel_core::Value::Text(s)) => s.clone(),
+                _ => continue,
+            };
+
+            refs.push(ConsistencyMessageRef {
+                project_slug: slug,
+                message_id: id,
+                sender_name: sender,
+                subject,
+                created_ts_iso: created_ts,
+            });
+        }
+
+        Ok(refs)
+    }
 }
 
-static SQLITE_INIT_GATES: OnceLock<OrderedMutex<HashMap<String, Arc<OnceCell<()>>>>> =
+static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<OnceCell<()>>>>> =
     OnceLock::new();
-static POOL_CACHE: OnceLock<OrderedMutex<HashMap<String, DbPool>>> = OnceLock::new();
+static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<String, DbPool>>> = OnceLock::new();
 
 fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
     let gates = SQLITE_INIT_GATES
-        .get_or_init(|| OrderedMutex::new(LockLevel::DbSqliteInitGates, HashMap::new()));
-    let mut guard = gates.lock();
+        .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
+
+    // Fast path: read lock for existing gate (concurrent readers).
+    {
+        let guard = gates.read();
+        if let Some(gate) = guard.get(sqlite_path) {
+            return Arc::clone(gate);
+        }
+    }
+
+    // Slow path: write lock to create a new gate (rare, once per SQLite file).
+    let mut guard = gates.write();
+    // Double-check after acquiring write lock.
     if let Some(gate) = guard.get(sqlite_path) {
         return Arc::clone(gate);
     }
@@ -464,11 +632,26 @@ fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
 }
 
 /// Get (or create) a cached pool for the given config.
+///
+/// Uses a read-first / write-on-miss pattern so concurrent callers sharing
+/// the same database URL only take a shared read lock (zero contention on
+/// the hot path).  The write lock is only held briefly when creating a new
+/// pool — typically once per unique URL during startup.
 pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     let cache =
-        POOL_CACHE.get_or_init(|| OrderedMutex::new(LockLevel::DbPoolCache, HashMap::new()));
-    let mut guard = cache.lock();
+        POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
 
+    // Fast path: shared read lock for existing pool (concurrent readers).
+    {
+        let guard = cache.read();
+        if let Some(pool) = guard.get(&config.database_url) {
+            return Ok(pool.clone());
+        }
+    }
+
+    // Slow path: exclusive write lock to create a new pool (rare).
+    let mut guard = cache.write();
+    // Double-check after acquiring write lock — another thread may have won the race.
     if let Some(pool) = guard.get(&config.database_url) {
         return Ok(pool.clone());
     }
@@ -515,6 +698,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.sqlite_path().unwrap(), ":memory:");
+
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:?cache=shared".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.sqlite_path().unwrap(), ":memory:");
+
+        let config = DbPoolConfig {
+            database_url: "sqlite:///relative/path.db".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.sqlite_path().unwrap(), "relative/path.db");
+
+        let config = DbPoolConfig {
+            database_url: "sqlite:///storage.sqlite3?mode=rwc".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.sqlite_path().unwrap(), "storage.sqlite3");
+
+        let config = DbPoolConfig {
+            database_url: "sqlite:///storage.sqlite3#v1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.sqlite_path().unwrap(), "storage.sqlite3");
+
+        let config = DbPoolConfig {
+            database_url: "postgres://localhost/db".to_string(),
+            ..Default::default()
+        };
+        assert!(config.sqlite_path().is_err());
     }
 
     #[test]
@@ -623,6 +836,69 @@ mod tests {
         assert!(
             sql.contains("journal_mode = WAL"),
             "WAL mode is required for concurrent access"
+        );
+    }
+
+    /// Verify warmup opens the requested number of connections.
+    #[test]
+    fn pool_warmup_opens_connections() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warmup_test.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 10,
+            max_connections: 20,
+            warmup_connections: 5,
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let opened = rt.block_on(pool.warmup(&cx, 5, std::time::Duration::from_secs(10)));
+        assert_eq!(opened, 5, "warmup should open exactly 5 connections");
+
+        // Pool stats should reflect the warmed-up connections.
+        let stats = pool.pool.stats();
+        assert!(
+            stats.total_connections >= 5,
+            "pool should have at least 5 total connections after warmup, got {}",
+            stats.total_connections
+        );
+    }
+
+    /// Verify warmup with n=0 is a no-op.
+    #[test]
+    fn pool_warmup_zero_is_noop() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warmup_zero.db");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let opened = rt.block_on(pool.warmup(&cx, 0, std::time::Duration::from_secs(1)));
+        assert_eq!(opened, 0, "warmup with n=0 should open no connections");
+    }
+
+    /// Verify default config includes `warmup_connections`: 0.
+    #[test]
+    fn default_warmup_is_disabled() {
+        let cfg = DbPoolConfig::default();
+        assert_eq!(
+            cfg.warmup_connections, 0,
+            "warmup should be disabled by default"
         );
     }
 }

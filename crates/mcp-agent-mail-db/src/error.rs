@@ -68,6 +68,14 @@ pub enum DbError {
     #[error("Serialization error: {0}")]
     Serialization(String),
 
+    /// `SQLite` integrity check detected corruption.
+    #[error("Integrity check failed: {message}")]
+    IntegrityCorruption {
+        message: String,
+        /// The raw output from `PRAGMA integrity_check` / `PRAGMA quick_check`.
+        details: Vec<String>,
+    },
+
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
@@ -120,6 +128,7 @@ impl DbError {
             Self::NotFound { .. } => "NOT_FOUND",
             Self::Duplicate { .. } => "DUPLICATE",
             Self::InvalidArgument { .. } => "INVALID_ARGUMENT",
+            Self::IntegrityCorruption { .. } => "INTEGRITY_CORRUPTION",
             _ => "INTERNAL_ERROR",
         }
     }

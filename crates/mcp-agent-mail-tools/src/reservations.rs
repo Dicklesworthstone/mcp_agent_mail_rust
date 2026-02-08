@@ -297,11 +297,17 @@ pub async fn file_reservation_paths(
             config,
             reservations: res_jsons,
         };
-        if !mcp_agent_mail_storage::wbq_enqueue(op) {
-            tracing::warn!(
-                "WBQ enqueue failed; skipping reservation artifacts archive write project={}",
-                project.slug
-            );
+        match mcp_agent_mail_storage::wbq_enqueue(op) {
+            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+            | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
+                // Disk pressure guard: archive writes may be disabled; DB remains authoritative.
+            }
+            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                tracing::warn!(
+                    "WBQ enqueue failed; skipping reservation artifacts archive write project={}",
+                    project.slug
+                );
+            }
         }
     }
 

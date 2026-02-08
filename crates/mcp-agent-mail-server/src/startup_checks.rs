@@ -4,10 +4,13 @@
 //! a [`ProbeResult`] with a human-friendly error message and remediation
 //! hints when something is wrong.
 
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{
+    Config,
+    disk::{is_sqlite_memory_database_url, sqlite_file_path_from_database_url},
+};
+use mcp_agent_mail_db::DbPoolConfig;
 use std::fmt;
 use std::net::TcpListener;
-use std::path::Path;
 
 // ──────────────────────────────────────────────────────────────────────
 // Probe result types
@@ -224,30 +227,86 @@ fn probe_database(config: &Config) -> ProbeResult {
         });
     }
 
-    // For SQLite URLs, check parent directory exists
-    if url.contains("sqlite") {
-        let db_path = url
-            .replace("sqlite+aiosqlite:///", "")
-            .replace("sqlite:///", "")
-            .replace("sqlite://", "");
-        if !db_path.is_empty() && db_path != ":memory:" {
-            let path = Path::new(&db_path);
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() && !parent.exists() {
-                    return ProbeResult::Fail(ProbeFailure {
-                        name: "database",
-                        problem: format!(
-                            "Database parent directory does not exist: {}",
-                            parent.display()
-                        ),
-                        fix: format!("Create it: mkdir -p {}", parent.display()),
-                    });
-                }
+    // For SQLite URLs, check parent directory exists.
+    if url.starts_with("sqlite://") || url.starts_with("sqlite+aiosqlite://") {
+        if is_sqlite_memory_database_url(url) {
+            return ProbeResult::Ok { name: "database" };
+        }
+        let Some(path) = sqlite_file_path_from_database_url(url) else {
+            return ProbeResult::Fail(ProbeFailure {
+                name: "database",
+                problem: format!("Invalid SQLite database URL: {url}"),
+                fix: "Use a valid SQLite URL like 'sqlite:///./storage.sqlite3'".into(),
+            });
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                return ProbeResult::Fail(ProbeFailure {
+                    name: "database",
+                    problem: format!(
+                        "Database parent directory does not exist: {}",
+                        parent.display()
+                    ),
+                    fix: format!("Create it: mkdir -p {}", parent.display()),
+                });
             }
         }
     }
 
     ProbeResult::Ok { name: "database" }
+}
+
+/// Run `PRAGMA quick_check` on the database to detect corruption.
+///
+/// Skipped when `INTEGRITY_CHECK_ON_STARTUP=false` or for in-memory databases.
+fn probe_integrity(config: &Config) -> ProbeResult {
+    if !config.integrity_check_on_startup {
+        return ProbeResult::Ok { name: "integrity" };
+    }
+
+    if is_sqlite_memory_database_url(&config.database_url) {
+        return ProbeResult::Ok { name: "integrity" };
+    }
+
+    let pool_config = DbPoolConfig {
+        database_url: config.database_url.clone(),
+        run_migrations: false,
+        ..DbPoolConfig::default()
+    };
+
+    let pool = match mcp_agent_mail_db::DbPool::new(&pool_config) {
+        Ok(p) => p,
+        Err(e) => {
+            return ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem: format!("Cannot create pool for integrity check: {e}"),
+                fix: "Check DATABASE_URL or set INTEGRITY_CHECK_ON_STARTUP=false to skip".into(),
+            });
+        }
+    };
+
+    match pool.run_startup_integrity_check() {
+        Ok(_) => ProbeResult::Ok { name: "integrity" },
+        Err(mcp_agent_mail_db::DbError::IntegrityCorruption { message, details }) => {
+            let detail_str = if details.len() > 5 {
+                format!("{} (and {} more)", details[..5].join("; "), details.len() - 5)
+            } else {
+                details.join("; ")
+            };
+            ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem: format!("SQLite corruption detected: {message}"),
+                fix: format!(
+                    "Back up the database, then try VACUUM INTO to recover. Details: {detail_str}"
+                ),
+            })
+        }
+        Err(e) => ProbeResult::Fail(ProbeFailure {
+            name: "integrity",
+            problem: format!("Integrity check failed: {e}"),
+            fix: "Check database file permissions and disk health".into(),
+        }),
+    }
 }
 
 /// Check auth configuration consistency.
@@ -280,6 +339,62 @@ fn probe_auth(config: &Config) -> ProbeResult {
 // Main entry point
 // ──────────────────────────────────────────────────────────────────────
 
+/// Run a lightweight archive-DB consistency check on recent messages.
+///
+/// Samples the last `limit` messages from the DB and verifies that their
+/// canonical archive files exist on disk. Reports count of missing files
+/// but does NOT block startup (warnings only).
+fn probe_consistency(config: &Config) -> ProbeResult {
+    let pool_config = DbPoolConfig {
+        database_url: config.database_url.clone(),
+        run_migrations: false,
+        ..DbPoolConfig::default()
+    };
+
+    let Ok(pool) = mcp_agent_mail_db::DbPool::new(&pool_config) else {
+        // If we can't open DB, skip consistency check (integrity probe
+        // will catch the root cause).
+        return ProbeResult::Ok {
+            name: "consistency",
+        };
+    };
+
+    // Sample last 100 messages for consistency check
+    let limit = 100i64;
+    let Ok(refs) = pool.sample_recent_message_refs(limit) else {
+        // DB query failed; skip silently (other probes will catch DB issues).
+        return ProbeResult::Ok {
+            name: "consistency",
+        };
+    };
+
+    if refs.is_empty() {
+        return ProbeResult::Ok {
+            name: "consistency",
+        };
+    }
+
+    let report =
+        mcp_agent_mail_storage::check_archive_consistency(&config.storage_root, &refs);
+
+    if report.missing > 0 {
+        tracing::warn!(
+            sampled = report.sampled,
+            found = report.found,
+            missing = report.missing,
+            missing_ids = ?report.missing_ids,
+            "Archive-DB consistency: {} of {} sampled messages missing archive files",
+            report.missing,
+            report.sampled,
+        );
+    }
+
+    // Consistency is advisory; never block startup
+    ProbeResult::Ok {
+        name: "consistency",
+    }
+}
+
 /// Run all startup probes and return a report.
 ///
 /// The probes are ordered from fastest to slowest, and all probes run
@@ -290,8 +405,10 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
         probe_http_path(config),
         probe_auth(config),
         probe_database(config),
+        probe_integrity(config),
         probe_storage_root(config),
         probe_port(config),
+        probe_consistency(config),
     ];
     StartupReport { results }
 }
@@ -386,6 +503,26 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_memory_url_with_query_passes() {
+        let mut config = default_config();
+        config.database_url = "sqlite:///:memory:?cache=shared".into();
+        let result = probe_database(&config);
+        assert!(matches!(result, ProbeResult::Ok { .. }));
+    }
+
+    #[test]
+    fn sqlite_url_with_missing_parent_and_query_fails() {
+        let mut config = default_config();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        config.database_url = format!("sqlite:///am-startup-missing-{nonce}/db.sqlite3?mode=rwc");
+        let result = probe_database(&config);
+        assert!(matches!(result, ProbeResult::Fail(_)));
+    }
+
+    #[test]
     fn writable_storage_root_passes() {
         let tmp = std::env::temp_dir().join("am_test_startup_probe");
         let _ = std::fs::create_dir_all(&tmp);
@@ -454,8 +591,8 @@ mod tests {
     fn run_startup_probes_returns_results() {
         let config = default_config();
         let report = run_startup_probes(&config);
-        // Should have 5 probes
-        assert_eq!(report.results.len(), 5);
+        // Should have 7 probes (http, auth, db, integrity, storage, port, consistency)
+        assert_eq!(report.results.len(), 7);
     }
 
     #[test]
