@@ -204,15 +204,6 @@ impl MailScreen for AgentsScreen {
                         self.sort_asc = !self.sort_asc;
                         self.rebuild_from_state(state);
                     }
-                    KeyCode::Enter => {
-                        if let Some(sel) = self.table_state.selected {
-                            if let Some(agent) = self.agents.get(sel) {
-                                return Cmd::msg(MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::AgentByName(agent.name.clone()),
-                                ));
-                            }
-                        }
-                    }
                     KeyCode::Escape => {
                         if !self.filter.is_empty() {
                             self.filter.clear();
@@ -341,10 +332,6 @@ impl MailScreen for AgentsScreen {
             HelpEntry {
                 key: "S",
                 action: "Toggle sort order",
-            },
-            HelpEntry {
-                key: "Enter",
-                action: "View agent timeline",
             },
             HelpEntry {
                 key: "Esc",

@@ -239,15 +239,6 @@ impl MailScreen for ToolMetricsScreen {
                         self.sort_asc = !self.sort_asc;
                         self.rebuild_sorted();
                     }
-                    KeyCode::Enter => {
-                        if let Some(sel) = self.table_state.selected {
-                            if let Some(name) = self.sorted_tools.get(sel) {
-                                return Cmd::msg(MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::ToolByName(name.clone()),
-                                ));
-                            }
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -366,10 +357,6 @@ impl MailScreen for ToolMetricsScreen {
             HelpEntry {
                 key: "S",
                 action: "Toggle sort order",
-            },
-            HelpEntry {
-                key: "Enter",
-                action: "Deep-link to timeline",
             },
         ]
     }
