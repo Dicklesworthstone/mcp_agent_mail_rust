@@ -2008,6 +2008,7 @@ name = "ftui-core"
 version = "0.1.1"
 dependencies = [
  "bitflags 2.10.0",
+ "crossterm 0.29.0",
  "signal-hook 0.4.3",
  "unicode-display-width",
  "unicode-segmentation",
@@ -2060,7 +2061,6 @@ dependencies = [
 name = "ftui-harness"
 version = "0.1.1"
 dependencies = [
- "crossterm 0.29.0",
  "ftui-core 0.1.1",
  "ftui-extras 0.1.1",
  "ftui-layout 0.1.1",
@@ -2129,7 +2129,6 @@ dependencies = [
 name = "ftui-runtime"
 version = "0.1.1"
 dependencies = [
- "crossterm 0.29.0",
  "ftui-backend",
  "ftui-core 0.1.1",
  "ftui-i18n 0.1.1",

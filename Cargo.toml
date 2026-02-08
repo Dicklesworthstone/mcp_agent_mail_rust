@@ -37,8 +37,8 @@ sqlmodel-session = { path = "../sqlmodel_rust/crates/sqlmodel-session" }
 sqlmodel-pool = { path = "../sqlmodel_rust/crates/sqlmodel-pool" }
 sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
 
-ftui = { path = "../frankentui/crates/ftui" }
-ftui-runtime = { path = "../frankentui/crates/ftui-runtime" }
+ftui = { path = "../frankentui/crates/ftui", features = ["crossterm"] }
+ftui-runtime = { path = "../frankentui/crates/ftui-runtime", features = ["crossterm-compat"] }
 ftui-extras = { path = "../frankentui/crates/ftui-extras", features = ["theme", "syntax", "export"] }
 ftui-widgets = { path = "../frankentui/crates/ftui-widgets" }
 ftui-harness = { path = "../frankentui/crates/ftui-harness" }
