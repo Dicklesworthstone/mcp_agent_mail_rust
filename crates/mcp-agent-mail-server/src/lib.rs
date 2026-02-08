@@ -7366,6 +7366,395 @@ mod tests {
         });
     }
 
+    // ── br-1i11.4.5: JWKS bootstrap/failure edge-case unit tests ──────────
+
+    fn make_test_jwks_bytes() -> Vec<u8> {
+        use base64::Engine as _;
+        let k =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-secret-for-jwks-unit");
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "oct",
+                "alg": "HS256",
+                "kid": "unit-kid",
+                "k": k,
+            }]
+        });
+        serde_json::to_vec(&jwks).expect("jwks json")
+    }
+
+    fn make_test_jwks_set() -> Arc<JwkSet> {
+        let bytes = make_test_jwks_bytes();
+        Arc::new(serde_json::from_slice(&bytes).expect("parse jwks"))
+    }
+
+    fn build_jwt_state_with_url(url: &str) -> HttpState {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_algorithms: vec!["HS256".to_string()],
+            http_jwt_secret: None,
+            http_jwt_jwks_url: Some(url.to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        build_state(config)
+    }
+
+    /// Mini TCP server returning a configurable HTTP status code.
+    fn with_status_server<F>(status: u16, body: &[u8], f: F)
+    where
+        F: FnOnce(String),
+    {
+        use std::io::{Read as IoRead, Write as IoWrite};
+        use std::net::TcpListener;
+        use std::time::Instant as StdInstant;
+
+        std::thread::scope(|s| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let body2 = body.to_vec();
+            let done = Arc::new(AtomicBool::new(false));
+            let done2 = Arc::clone(&done);
+
+            s.spawn(move || {
+                let deadline = StdInstant::now() + Duration::from_secs(5);
+                while !done2.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                            let mut buf = [0u8; 512];
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(_) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                            let reason = if status == 200 { "OK" } else { "Error" };
+                            let hdr = format!(
+                                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body2.len()
+                            );
+                            let _ = stream.write_all(hdr.as_bytes());
+                            let _ = stream.write_all(&body2);
+                            let _ = stream.flush();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if StdInstant::now() > deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+
+            let url = format!("http://{addr}/jwks");
+            f(url);
+            done.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn jwks_bootstrap_empty_cache_populates_on_first_fetch() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let jwks_bytes = make_test_jwks_bytes();
+
+        with_jwks_server(&jwks_bytes, 1, |jwks_url| {
+            let state = build_jwt_state_with_url(&jwks_url);
+
+            // Cache starts empty.
+            assert!(state.jwks_cache.lock().unwrap().is_none());
+
+            runtime.block_on(async {
+                let result = state.fetch_jwks(&jwks_url, false).await;
+                assert!(result.is_ok(), "bootstrap fetch must succeed");
+            });
+
+            // Cache should now be populated.
+            let cached = state.jwks_cache.lock().unwrap();
+            assert!(cached.is_some(), "cache must be populated after bootstrap");
+            assert!(!cached.as_ref().unwrap().jwks.keys.is_empty());
+        });
+    }
+
+    #[test]
+    fn jwks_fresh_cache_returns_cached_without_network() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let jwks = make_test_jwks_set();
+
+        // Unreachable URL: if the code tries to fetch it will fail.
+        let state = build_jwt_state_with_url("http://127.0.0.1:1/unreachable");
+
+        // Pre-populate with a FRESH entry.
+        {
+            let mut cache = state.jwks_cache.lock().unwrap();
+            *cache = Some(JwksCacheEntry {
+                fetched_at: Instant::now(),
+                jwks: Arc::clone(&jwks),
+            });
+        }
+
+        runtime.block_on(async {
+            let result = state
+                .fetch_jwks("http://127.0.0.1:1/unreachable", false)
+                .await;
+            assert!(result.is_ok(), "fresh cache must return Ok without network");
+            assert!(
+                Arc::ptr_eq(&result.unwrap(), &jwks),
+                "must return the exact cached Arc"
+            );
+        });
+    }
+
+    #[test]
+    fn jwks_stale_while_revalidate_returns_stale_when_refreshing() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let jwks = make_test_jwks_set();
+
+        let state = build_jwt_state_with_url("http://127.0.0.1:1/unreachable");
+
+        // Pre-populate with a STALE entry (2 min old > 60s TTL).
+        {
+            let mut cache = state.jwks_cache.lock().unwrap();
+            *cache = Some(JwksCacheEntry {
+                fetched_at: Instant::now() - Duration::from_secs(120),
+                jwks: Arc::clone(&jwks),
+            });
+        }
+
+        // Simulate another task already refreshing.
+        state.jwks_refreshing.store(true, Ordering::Release);
+
+        runtime.block_on(async {
+            let result = state
+                .fetch_jwks("http://127.0.0.1:1/unreachable", false)
+                .await;
+            assert!(result.is_ok(), "stale-while-revalidate must return Ok");
+            assert!(
+                Arc::ptr_eq(&result.unwrap(), &jwks),
+                "must return the stale cached Arc"
+            );
+        });
+
+        // Guard should still be true (we didn't acquire it; the "other task" holds it).
+        assert!(
+            state.jwks_refreshing.load(Ordering::Acquire),
+            "guard must remain set when another task holds it"
+        );
+    }
+
+    #[test]
+    fn jwks_stale_cache_triggers_refresh_when_not_refreshing() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let jwks_bytes = make_test_jwks_bytes();
+        let old_jwks = make_test_jwks_set();
+
+        with_jwks_server(&jwks_bytes, 1, |jwks_url| {
+            let state = build_jwt_state_with_url(&jwks_url);
+
+            // Pre-populate with a STALE entry.
+            {
+                let mut cache = state.jwks_cache.lock().unwrap();
+                *cache = Some(JwksCacheEntry {
+                    fetched_at: Instant::now() - Duration::from_secs(120),
+                    jwks: Arc::clone(&old_jwks),
+                });
+            }
+
+            runtime.block_on(async {
+                let result = state.fetch_jwks(&jwks_url, false).await;
+                assert!(result.is_ok(), "stale refresh must succeed");
+                // Should get a NEW Arc (from the fetch), not the old one.
+                assert!(
+                    !Arc::ptr_eq(&result.unwrap(), &old_jwks),
+                    "must return fresh data, not the stale Arc"
+                );
+            });
+
+            // Guard must be released after refresh.
+            assert!(
+                !state.jwks_refreshing.load(Ordering::Acquire),
+                "guard must be released after refresh"
+            );
+        });
+    }
+
+    #[test]
+    fn jwks_force_bypasses_fresh_cache() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let jwks_bytes = make_test_jwks_bytes();
+        let cached_jwks = make_test_jwks_set();
+
+        with_jwks_server(&jwks_bytes, 1, |jwks_url| {
+            let state = build_jwt_state_with_url(&jwks_url);
+
+            // Pre-populate with a FRESH entry.
+            {
+                let mut cache = state.jwks_cache.lock().unwrap();
+                *cache = Some(JwksCacheEntry {
+                    fetched_at: Instant::now(),
+                    jwks: Arc::clone(&cached_jwks),
+                });
+            }
+
+            runtime.block_on(async {
+                let result = state.fetch_jwks(&jwks_url, true).await;
+                assert!(result.is_ok(), "force fetch must succeed");
+                // Should get a NEW Arc from the network, not the cached one.
+                assert!(
+                    !Arc::ptr_eq(&result.unwrap(), &cached_jwks),
+                    "force must bypass fresh cache"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn jwks_fetch_failure_empty_cache_resets_guard() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+
+        // Bind then drop → connection refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let url = format!("http://{addr}/jwks");
+        let state = build_jwt_state_with_url(&url);
+
+        runtime.block_on(async {
+            let result = state.fetch_jwks(&url, false).await;
+            assert!(result.is_err(), "fetch to closed port must fail");
+        });
+
+        assert!(
+            !state.jwks_refreshing.load(Ordering::Acquire),
+            "guard must be reset after failure with empty cache"
+        );
+        // Cache must remain empty.
+        assert!(state.jwks_cache.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn jwks_force_failure_resets_guard() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cached_jwks = make_test_jwks_set();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let url = format!("http://{addr}/jwks");
+        let state = build_jwt_state_with_url(&url);
+
+        // Pre-populate cache; force=true should still attempt network.
+        {
+            let mut cache = state.jwks_cache.lock().unwrap();
+            *cache = Some(JwksCacheEntry {
+                fetched_at: Instant::now(),
+                jwks: Arc::clone(&cached_jwks),
+            });
+        }
+
+        runtime.block_on(async {
+            let result = state.fetch_jwks(&url, true).await;
+            assert!(result.is_err(), "force fetch to closed port must fail");
+        });
+
+        assert!(
+            !state.jwks_refreshing.load(Ordering::Acquire),
+            "guard must be reset after force failure"
+        );
+    }
+
+    #[test]
+    fn jwks_recovery_succeeds_after_failure() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let jwks_bytes = make_test_jwks_bytes();
+
+        // Phase 1: fail against closed port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let closed_addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let bad_url = format!("http://{closed_addr}/jwks");
+        let state = build_jwt_state_with_url(&bad_url);
+
+        runtime.block_on(async {
+            let fail = state.fetch_jwks(&bad_url, false).await;
+            assert!(fail.is_err(), "phase 1 must fail");
+        });
+        assert!(!state.jwks_refreshing.load(Ordering::Acquire));
+
+        // Phase 2: succeed with a real server.
+        with_jwks_server(&jwks_bytes, 1, |good_url| {
+            runtime.block_on(async {
+                let ok = state.fetch_jwks(&good_url, false).await;
+                assert!(ok.is_ok(), "phase 2 retry must succeed after guard reset");
+            });
+        });
+
+        // Cache should be populated after recovery.
+        assert!(state.jwks_cache.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn jwks_non_200_response_returns_err() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+
+        with_status_server(500, b"{}", |url| {
+            let state = build_jwt_state_with_url(&url);
+
+            runtime.block_on(async {
+                let result = state.fetch_jwks(&url, false).await;
+                assert!(result.is_err(), "non-200 must return Err");
+            });
+
+            assert!(
+                !state.jwks_refreshing.load(Ordering::Acquire),
+                "guard must be reset after non-200"
+            );
+        });
+    }
+
+    #[test]
+    fn jwks_empty_keys_array_is_valid() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let empty_jwks = serde_json::to_vec(&serde_json::json!({"keys": []})).unwrap();
+
+        with_jwks_server(&empty_jwks, 1, |jwks_url| {
+            let state = build_jwt_state_with_url(&jwks_url);
+
+            runtime.block_on(async {
+                let result = state.fetch_jwks(&jwks_url, false).await;
+                assert!(result.is_ok(), "empty keys array is valid JWKS");
+                assert!(result.unwrap().keys.is_empty());
+            });
+        });
+    }
+
     // -- TOON wrapping tests --
 
     #[test]
@@ -9398,5 +9787,383 @@ mod tests {
         set_tui_state_handle(None);
         // Should not panic
         emit_tui_event(tui_events::MailEvent::server_shutdown());
+    }
+
+    // -----------------------------------------------------------------------
+    // JWKS stampede protection tests (br-1i11.4.2)
+    // -----------------------------------------------------------------------
+
+    /// Helper: JWKS server with configurable response delay and external
+    /// request counter.  The counter is incremented for every accepted
+    /// connection, and the server adds `response_delay` before replying.
+    fn with_counted_delayed_jwks_server<F>(
+        jwks_body: &[u8],
+        max_requests: usize,
+        response_delay: Duration,
+        request_counter: &std::sync::atomic::AtomicUsize,
+        f: F,
+    ) where
+        F: FnOnce(String),
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        std::thread::scope(|s| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let body = jwks_body.to_vec();
+
+            s.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    if request_counter.load(Ordering::SeqCst) >= max_requests {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            request_counter.fetch_add(1, Ordering::SeqCst);
+                            // Drain the request.
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                            let mut buf = [0u8; 512];
+                            let mut seen = Vec::new();
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        seen.extend_from_slice(&buf[..n]);
+                                        if seen.windows(4).any(|w| w == b"\r\n\r\n")
+                                            || seen.len() > 8192
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                                    {
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            // Configurable delay before responding.
+                            if !response_delay.is_zero() {
+                                std::thread::sleep(response_delay);
+                            }
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(hdr.as_bytes());
+                            let _ = stream.write_all(&body);
+                            let _ = stream.flush();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() > deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+
+            let url = format!("http://{addr}/jwks");
+            f(url);
+        });
+    }
+
+    /// Build test JWKS bytes and a parsed JwkSet for cache seeding.
+    fn test_jwks_material() -> (Vec<u8>, jsonwebtoken::jwk::JwkSet) {
+        use base64::Engine as _;
+        let k =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"stampede-test-secret-key");
+        let jwks_json = serde_json::json!({
+            "keys": [{
+                "kty": "oct",
+                "alg": "HS256",
+                "kid": "stampede-kid-1",
+                "k": k,
+            }]
+        });
+        let bytes = serde_json::to_vec(&jwks_json).expect("jwks json");
+        let set: jsonwebtoken::jwk::JwkSet = serde_json::from_value(jwks_json).expect("parse");
+        (bytes, set)
+    }
+
+    /// Seed the JWKS cache on an HttpState with the given JwkSet and an
+    /// already-expired timestamp so the next fetch sees stale data.
+    fn seed_expired_cache(state: &HttpState, jwks: &jsonwebtoken::jwk::JwkSet) {
+        let mut cache = state
+            .jwks_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cache = Some(JwksCacheEntry {
+            // 2 minutes in the past — well beyond the 60s TTL.
+            fetched_at: Instant::now() - Duration::from_secs(120),
+            jwks: Arc::new(jwks.clone()),
+        });
+    }
+
+    /// When the JWKS cache is stale and multiple threads call fetch_jwks
+    /// concurrently, only ONE should actually hit the remote endpoint.
+    /// The rest should immediately return the stale cached value.
+    #[test]
+    fn jwks_stampede_concurrent_expired_single_refresh() {
+        let (jwks_bytes, jwks_set) = test_jwks_material();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+
+        // Allow up to 20 requests (but expect only 1).
+        with_counted_delayed_jwks_server(&jwks_bytes, 20, Duration::ZERO, &counter, |url| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_jwks_url: Some(url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+            seed_expired_cache(&state, &jwks_set);
+
+            // Spawn 10 threads, each doing a non-forced fetch.
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..10)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let rt = RuntimeBuilder::current_thread()
+                                .build()
+                                .expect("runtime");
+                            rt.block_on(state.fetch_jwks(&url, false))
+                        })
+                    })
+                    .collect();
+
+                let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                let ok_count = results.iter().filter(|r| r.is_ok()).count();
+                assert_eq!(ok_count, 10, "all 10 fetches should succeed");
+            });
+
+            let requests = counter.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                requests, 1,
+                "only 1 HTTP request should reach the mock server (got {requests})"
+            );
+        });
+    }
+
+    /// When the JWKS cache is stale and a slow refresh is in-flight,
+    /// concurrent callers should receive stale data instantly — not block
+    /// waiting for the refresh to complete.
+    #[test]
+    fn jwks_stampede_stale_served_fast() {
+        let (jwks_bytes, jwks_set) = test_jwks_material();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+
+        // Server responds with a 500ms delay to simulate slow network.
+        with_counted_delayed_jwks_server(
+            &jwks_bytes,
+            20,
+            Duration::from_millis(500),
+            &counter,
+            |url| {
+                let config = mcp_agent_mail_core::Config {
+                    http_jwt_enabled: true,
+                    http_jwt_algorithms: vec!["HS256".to_string()],
+                    http_jwt_jwks_url: Some(url.clone()),
+                    http_rbac_enabled: false,
+                    ..Default::default()
+                };
+                let state = build_state(config);
+                seed_expired_cache(&state, &jwks_set);
+
+                let timings = std::sync::Mutex::new(Vec::new());
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..10)
+                        .map(|_| {
+                            s.spawn(|| {
+                                let rt = RuntimeBuilder::current_thread()
+                                    .build()
+                                    .expect("runtime");
+                                let start = Instant::now();
+                                let result = rt.block_on(state.fetch_jwks(&url, false));
+                                let elapsed = start.elapsed();
+                                timings.lock().unwrap().push(elapsed);
+                                result
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        assert!(h.join().unwrap().is_ok());
+                    }
+                });
+
+                let timings = timings.into_inner().unwrap();
+                // At least 8 of 10 threads should have completed in under
+                // 250ms — they served stale data without waiting for the
+                // slow refresh.
+                let fast_count = timings.iter().filter(|t| t.as_millis() < 250).count();
+                assert!(
+                    fast_count >= 8,
+                    "expected >= 8 fast (stale-serving) threads, got {fast_count}; \
+                     timings: {timings:?}"
+                );
+            },
+        );
+    }
+
+    /// `force=true` always hits the remote endpoint even when the cache is
+    /// still fresh.
+    #[test]
+    fn jwks_force_refresh_bypasses_fresh_cache() {
+        let (jwks_bytes, jwks_set) = test_jwks_material();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+
+        with_counted_delayed_jwks_server(&jwks_bytes, 5, Duration::ZERO, &counter, |url| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_jwks_url: Some(url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+
+            // Seed fresh cache (not expired).
+            {
+                let mut cache = state
+                    .jwks_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *cache = Some(JwksCacheEntry {
+                    fetched_at: Instant::now(),
+                    jwks: Arc::new(jwks_set.clone()),
+                });
+            }
+
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+
+            // Non-forced fetch should use cache (0 requests).
+            let r = rt.block_on(state.fetch_jwks(&url, false));
+            assert!(r.is_ok());
+            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            // Forced fetch should hit the remote endpoint.
+            let r = rt.block_on(state.fetch_jwks(&url, true));
+            assert!(r.is_ok());
+            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    /// On cold start (no cached JWKS), all concurrent callers should
+    /// eventually get valid data.  Multiple HTTP requests are acceptable
+    /// because there is no stale data to serve as fallback.
+    #[test]
+    fn jwks_cold_start_concurrent() {
+        let (jwks_bytes, _) = test_jwks_material();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+
+        with_counted_delayed_jwks_server(&jwks_bytes, 20, Duration::ZERO, &counter, |url| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_jwks_url: Some(url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+            // No cache seeding — cold start.
+
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..5)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let rt = RuntimeBuilder::current_thread()
+                                .build()
+                                .expect("runtime");
+                            rt.block_on(state.fetch_jwks(&url, false))
+                        })
+                    })
+                    .collect();
+
+                let ok_count = handles
+                    .into_iter()
+                    .filter_map(|h| h.join().unwrap().ok())
+                    .count();
+                // All or most should succeed (depends on timing, but at
+                // least 1 must succeed since the server is available).
+                assert!(
+                    ok_count >= 1,
+                    "at least 1 cold-start fetch should succeed"
+                );
+            });
+
+            // Multiple HTTP requests are expected (no stale to serve).
+            let requests = counter.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                requests >= 1,
+                "cold start should make at least 1 HTTP request (got {requests})"
+            );
+        });
+    }
+
+    /// The CAS lock is always released after a refresh, even if the HTTP
+    /// request fails.  Subsequent callers must still be able to acquire
+    /// the lock and refresh successfully.
+    #[test]
+    fn jwks_stampede_lock_released_after_failure() {
+        let (jwks_bytes, jwks_set) = test_jwks_material();
+
+        // Phase 1: server that rejects (bad body) to force a failure.
+        let counter1 = std::sync::atomic::AtomicUsize::new(0);
+        let bad_body = b"not valid json";
+        with_counted_delayed_jwks_server(bad_body, 5, Duration::ZERO, &counter1, |url| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_jwks_url: Some(url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+            seed_expired_cache(&state, &jwks_set);
+
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+
+            // This fetch should fail (bad JSON) but release the lock.
+            let r = rt.block_on(state.fetch_jwks(&url, false));
+            assert!(r.is_err(), "bad JSON should cause fetch_jwks to fail");
+
+            // The refreshing flag must be cleared.
+            assert!(
+                !state
+                    .jwks_refreshing
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "refreshing flag must be false after failed fetch"
+            );
+        });
+
+        // Phase 2: verify a fresh state with a working server succeeds.
+        let counter2 = std::sync::atomic::AtomicUsize::new(0);
+        with_counted_delayed_jwks_server(&jwks_bytes, 5, Duration::ZERO, &counter2, |url| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_jwks_url: Some(url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+            seed_expired_cache(&state, &jwks_set);
+
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            let r = rt.block_on(state.fetch_jwks(&url, false));
+            assert!(r.is_ok(), "fetch should succeed after prior failure");
+            assert_eq!(counter2.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
     }
 }
