@@ -186,14 +186,8 @@ impl MailScreen for DashboardScreen {
             }
         }
 
-        // Sample sparkline data from request counters
-        let counters = state.request_counters();
-        if self.sparkline_data.len() >= 60 {
-            self.sparkline_data.remove(0);
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let val = counters.latency_total_ms as f64;
-        self.sparkline_data.push(val);
+        // Refresh sparkline from per-request latency samples
+        self.sparkline_data = state.sparkline_snapshot();
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {

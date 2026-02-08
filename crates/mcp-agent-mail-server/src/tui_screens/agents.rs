@@ -46,6 +46,8 @@ pub struct AgentsScreen {
     last_seq: u64,
     /// Per-agent message counts from events.
     msg_counts: HashMap<String, u64>,
+    /// Per-agent model names from `AgentRegistered` events.
+    model_names: HashMap<String, String>,
 }
 
 impl AgentsScreen {
@@ -60,6 +62,7 @@ impl AgentsScreen {
             filter_active: false,
             last_seq: 0,
             msg_counts: HashMap::new(),
+            model_names: HashMap::new(),
         }
     }
 
@@ -71,7 +74,7 @@ impl AgentsScreen {
             .map(|a| AgentRow {
                 name: a.name.clone(),
                 program: a.program.clone(),
-                model: String::new(), // Not in AgentSummary, populated from events
+                model: self.model_names.get(&a.name).cloned().unwrap_or_default(),
                 last_active_ts: a.last_active_ts,
                 message_count: self.msg_counts.get(&a.name).copied().unwrap_or(0),
             })
@@ -125,12 +128,7 @@ impl AgentsScreen {
                 MailEvent::AgentRegistered {
                     name, model_name, ..
                 } => {
-                    // Update model info for agents we know about
-                    for agent in &mut self.agents {
-                        if agent.name == *name {
-                            agent.model.clone_from(model_name);
-                        }
-                    }
+                    self.model_names.insert(name.clone(), model_name.clone());
                 }
                 _ => {}
             }

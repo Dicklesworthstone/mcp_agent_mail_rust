@@ -10,6 +10,7 @@ pub mod inspector;
 pub mod messages;
 pub mod reservations;
 pub mod system_health;
+pub mod threads;
 pub mod timeline;
 pub mod tool_metrics;
 

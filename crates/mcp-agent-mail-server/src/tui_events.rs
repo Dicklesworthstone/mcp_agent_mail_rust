@@ -2457,4 +2457,420 @@ mod tests {
             "stats() is not constant time: 10k calls took {elapsed:?}"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Event factory normalization tests (br-10wc.12.2)
+    // ────────────────────────────────────────────────────────────────
+
+    /// All factory constructors produce seq=0, timestamp=0 (assigned on push).
+    #[test]
+    fn factory_events_have_zero_seq_and_timestamp() {
+        let events = vec![
+            MailEvent::tool_call_start("t", Value::Null, None, None),
+            MailEvent::tool_call_end("t", 0, None, 0, 0.0, vec![], None, None),
+            MailEvent::message_sent(1, "A", vec![], "sub", "tid", "proj"),
+            MailEvent::message_received(1, "A", vec![], "sub", "tid", "proj"),
+            MailEvent::reservation_granted("A", vec![], true, 60, "proj"),
+            MailEvent::reservation_released("A", vec![], "proj"),
+            MailEvent::agent_registered("A", "cc", "opus", "proj"),
+            MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1"),
+            MailEvent::server_started("http://127.0.0.1:8080", "test"),
+        ];
+        for event in &events {
+            assert_eq!(event.seq(), 0, "seq should be 0 for {:?}", event.kind());
+            assert_eq!(
+                event.timestamp_micros(),
+                0,
+                "timestamp should be 0 for {:?}",
+                event.kind()
+            );
+        }
+    }
+
+    /// All factory constructors produce `redacted: false`.
+    #[test]
+    fn factory_events_are_not_redacted() {
+        let events = vec![
+            MailEvent::tool_call_start("t", Value::Null, None, None),
+            MailEvent::tool_call_end("t", 0, None, 0, 0.0, vec![], None, None),
+            MailEvent::message_sent(1, "A", vec![], "sub", "tid", "proj"),
+            MailEvent::agent_registered("A", "cc", "opus", "proj"),
+            MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1"),
+        ];
+        for event in &events {
+            assert!(!event.redacted(), "factory event should not be redacted: {:?}", event.kind());
+        }
+    }
+
+    /// `EventSource` is correctly assigned for each factory.
+    #[test]
+    fn factory_events_have_correct_source() {
+        assert_eq!(
+            MailEvent::tool_call_start("t", Value::Null, None, None).source(),
+            EventSource::Tooling
+        );
+        assert_eq!(
+            MailEvent::tool_call_end("t", 0, None, 0, 0.0, vec![], None, None).source(),
+            EventSource::Tooling
+        );
+        assert_eq!(
+            MailEvent::message_sent(1, "A", vec![], "s", "t", "p").source(),
+            EventSource::Mail
+        );
+        assert_eq!(
+            MailEvent::message_received(1, "A", vec![], "s", "t", "p").source(),
+            EventSource::Mail
+        );
+        assert_eq!(
+            MailEvent::reservation_granted("A", vec![], true, 60, "p").source(),
+            EventSource::Reservations
+        );
+        assert_eq!(
+            MailEvent::reservation_released("A", vec![], "p").source(),
+            EventSource::Reservations
+        );
+        assert_eq!(
+            MailEvent::agent_registered("A", "cc", "opus", "p").source(),
+            EventSource::Lifecycle
+        );
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1").source(),
+            EventSource::Http
+        );
+        assert_eq!(
+            MailEvent::server_started("http://127.0.0.1", "test").source(),
+            EventSource::Lifecycle
+        );
+    }
+
+    /// Push assigns monotonically increasing seq numbers.
+    #[test]
+    fn push_assigns_monotonic_seq() {
+        let ring = EventRingBuffer::with_capacity(100);
+        let seq1 = ring.push(sample_tool_start("a"));
+        let seq2 = ring.push(sample_tool_start("b"));
+        let seq3 = ring.push(sample_tool_start("c"));
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_eq!(seq3, 3);
+    }
+
+    /// Push assigns non-zero timestamps to events with timestamp=0.
+    #[test]
+    fn push_fills_timestamp_when_zero() {
+        let ring = EventRingBuffer::with_capacity(100);
+        ring.push(sample_tool_start("t"));
+        let events = ring.events_since_seq(0);
+        assert!(!events.is_empty());
+        let ts = events[0].timestamp_micros();
+        // Should be a reasonable recent timestamp (after 2020)
+        assert!(
+            ts > 1_577_836_800_000_000,
+            "timestamp {ts} should be after 2020"
+        );
+    }
+
+    /// `MailEventKind` is correctly mapped for every variant.
+    #[test]
+    fn kind_maps_correctly() {
+        assert_eq!(
+            MailEvent::tool_call_start("t", Value::Null, None, None).kind(),
+            MailEventKind::ToolCallStart
+        );
+        assert_eq!(
+            MailEvent::tool_call_end("t", 0, None, 0, 0.0, vec![], None, None).kind(),
+            MailEventKind::ToolCallEnd
+        );
+        assert_eq!(
+            MailEvent::message_sent(1, "A", vec![], "s", "t", "p").kind(),
+            MailEventKind::MessageSent
+        );
+        assert_eq!(
+            MailEvent::message_received(1, "A", vec![], "s", "t", "p").kind(),
+            MailEventKind::MessageReceived
+        );
+        assert_eq!(
+            MailEvent::reservation_granted("A", vec![], true, 60, "p").kind(),
+            MailEventKind::ReservationGranted
+        );
+        assert_eq!(
+            MailEvent::reservation_released("A", vec![], "p").kind(),
+            MailEventKind::ReservationReleased
+        );
+        assert_eq!(
+            MailEvent::agent_registered("A", "cc", "opus", "p").kind(),
+            MailEventKind::AgentRegistered
+        );
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1").kind(),
+            MailEventKind::HttpRequest
+        );
+        assert_eq!(
+            MailEvent::server_started("http://127.0.0.1", "test").kind(),
+            MailEventKind::ServerStarted
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Masking/redaction integration tests (br-10wc.12.2)
+    // ────────────────────────────────────────────────────────────────
+
+    /// `mask_json` redacts sensitive keys in tool params.
+    #[test]
+    fn mask_json_redacts_token_in_params() {
+        let params = serde_json::json!({
+            "project_key": "/data/proj",
+            "auth_token": "secret-12345",
+            "agent_name": "GoldFox"
+        });
+        let masked = crate::console::mask_json(&params);
+        let obj = masked.as_object().unwrap();
+        // project_key is allowlisted
+        assert_eq!(obj["project_key"], "/data/proj");
+        // auth_token contains "token" => redacted
+        assert_eq!(obj["auth_token"], "<redacted>");
+        // agent_name is safe
+        assert_eq!(obj["agent_name"], "GoldFox");
+    }
+
+    /// `mask_json` handles nested objects.
+    #[test]
+    fn mask_json_handles_nested_secrets() {
+        let params = serde_json::json!({
+            "config": {
+                "api_key": "key-xxx",
+                "host": "example.com"
+            }
+        });
+        let masked = crate::console::mask_json(&params);
+        let config = masked["config"].as_object().unwrap();
+        assert_eq!(config["api_key"], "<redacted>");
+        assert_eq!(config["host"], "example.com");
+    }
+
+    /// `mask_json` sanitizes database URLs.
+    #[test]
+    fn mask_json_sanitizes_database_url() {
+        let params = serde_json::json!({
+            "database_url": "postgres://admin:s3cret@db.example.com/mydb"
+        });
+        let masked = crate::console::mask_json(&params);
+        let url = masked["database_url"].as_str().unwrap();
+        assert!(url.contains("admin"), "username should be preserved");
+        assert!(url.contains("<redacted>"), "password should be masked");
+        assert!(!url.contains("s3cret"), "original password should be gone");
+    }
+
+    /// `mask_json` preserves arrays of non-sensitive values.
+    #[test]
+    fn mask_json_preserves_safe_arrays() {
+        let params = serde_json::json!({
+            "to": ["GoldFox", "SilverWolf"],
+            "paths": ["src/**", "tests/**"]
+        });
+        let masked = crate::console::mask_json(&params);
+        assert_eq!(masked["to"], serde_json::json!(["GoldFox", "SilverWolf"]));
+        assert_eq!(masked["paths"], serde_json::json!(["src/**", "tests/**"]));
+    }
+
+    /// `mask_json` handles mixed arrays with nested objects.
+    #[test]
+    fn mask_json_handles_array_with_objects() {
+        let params = serde_json::json!([
+            {"name": "ok", "secret": "hide-me"},
+            {"name": "also_ok"}
+        ]);
+        let masked = crate::console::mask_json(&params);
+        let arr = masked.as_array().unwrap();
+        assert_eq!(arr[0]["name"], "ok");
+        assert_eq!(arr[0]["secret"], "<redacted>");
+        assert_eq!(arr[1]["name"], "also_ok");
+    }
+
+    /// `is_sensitive_key` correctly identifies common secret patterns.
+    #[test]
+    fn sensitive_key_detection() {
+        // Positive cases
+        assert!(crate::console::is_sensitive_key("auth_token"));
+        assert!(crate::console::is_sensitive_key("AUTH_TOKEN"));
+        assert!(crate::console::is_sensitive_key("api_key"));
+        assert!(crate::console::is_sensitive_key("my_secret"));
+        assert!(crate::console::is_sensitive_key("password"));
+        assert!(crate::console::is_sensitive_key("bearer"));
+        assert!(crate::console::is_sensitive_key("jwt_token"));
+        assert!(crate::console::is_sensitive_key("private_key"));
+        assert!(crate::console::is_sensitive_key("credential"));
+        assert!(crate::console::is_sensitive_key("authorization"));
+        assert!(crate::console::is_sensitive_key("auth_header"));
+
+        // Negative cases - safe keys
+        assert!(!crate::console::is_sensitive_key("project_key"));
+        assert!(!crate::console::is_sensitive_key("storage_root"));
+        assert!(!crate::console::is_sensitive_key("agent_name"));
+        assert!(!crate::console::is_sensitive_key("tool_name"));
+        assert!(!crate::console::is_sensitive_key("subject"));
+    }
+
+    /// URL sanitization preserves scheme, user, and host but masks password.
+    #[test]
+    fn url_sanitization_variants() {
+        let cases = vec![
+            (
+                "database_url",
+                "postgres://user:pass@host/db",
+                true,
+                "user",
+                "<redacted>",
+            ),
+            (
+                "redis_url",
+                "redis://admin:secret@redis.local:6379/0",
+                true,
+                "admin",
+                "<redacted>",
+            ),
+            (
+                "database_url",
+                "sqlite:///path/to/db.sqlite3",
+                false,
+                "",
+                "",
+            ), // No userinfo
+            (
+                "other_key",
+                "postgres://user:pass@host/db",
+                false,
+                "",
+                "",
+            ), // Key not recognized
+        ];
+        for (key, url, should_sanitize, expected_user, expected_mask) in cases {
+            let result = crate::console::sanitize_known_value(key, url);
+            if should_sanitize {
+                let sanitized = result.expect(&format!("should sanitize {key}={url}"));
+                assert!(
+                    sanitized.contains(expected_user),
+                    "user should be preserved in {sanitized}"
+                );
+                assert!(
+                    sanitized.contains(expected_mask),
+                    "mask should appear in {sanitized}"
+                );
+            } else {
+                assert!(
+                    result.is_none(),
+                    "should not sanitize {key}={url}, got: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// Events pushed through ring buffer preserve their fields intact.
+    #[test]
+    fn ring_buffer_preserves_event_fields() {
+        let ring = EventRingBuffer::with_capacity(100);
+
+        let msg_event = MailEvent::message_sent(
+            42,
+            "GoldFox",
+            vec!["SilverWolf".to_string()],
+            "Test Subject",
+            "thread-1",
+            "my-project",
+        );
+        let _ = ring.push(msg_event);
+
+        let events = ring.events_since_seq(0);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+
+        assert_eq!(e.kind(), MailEventKind::MessageSent);
+        assert_eq!(e.source(), EventSource::Mail);
+        assert!(!e.redacted());
+        assert_eq!(e.seq(), 1);
+        assert!(e.timestamp_micros() > 0);
+
+        // Verify inner fields via Debug representation
+        let debug = format!("{e:?}");
+        assert!(debug.contains("GoldFox"));
+        assert!(debug.contains("SilverWolf"));
+        assert!(debug.contains("Test Subject"));
+        assert!(debug.contains("thread-1"));
+    }
+
+    /// Masked params should persist through the event creation pipeline.
+    #[test]
+    fn masked_params_in_tool_call_start() {
+        let raw_params = serde_json::json!({
+            "project_key": "/safe/path",
+            "auth_token": "my-secret-token-123"
+        });
+        let masked = crate::console::mask_json(&raw_params);
+        let event = MailEvent::tool_call_start("register_agent", masked, None, None);
+
+        // Verify through Debug that secret is masked
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("my-secret-token-123"), "raw secret should not appear");
+        assert!(debug.contains("<redacted>"), "redaction marker should appear");
+        assert!(debug.contains("/safe/path"), "safe value should be preserved");
+    }
+
+    /// `HealthPulse` events carry `DbStatSnapshot` data.
+    #[test]
+    fn health_pulse_carries_db_stats() {
+        let ring = EventRingBuffer::with_capacity(100);
+        let stats = DbStatSnapshot::default();
+        let event = MailEvent::HealthPulse {
+            seq: 0,
+            timestamp_micros: 0,
+            source: EventSource::Database,
+            redacted: false,
+            db_stats: stats,
+        };
+        let _ = ring.push(event);
+
+        let events = ring.events_since_seq(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind(), MailEventKind::HealthPulse);
+        assert_eq!(events[0].source(), EventSource::Database);
+    }
+
+    /// `HttpRequest` severity classification by status code.
+    #[test]
+    fn http_severity_by_status_code() {
+        let ok = MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1");
+        let redirect = MailEvent::http_request("GET", "/", 301, 5, "127.0.0.1");
+        let not_found = MailEvent::http_request("GET", "/", 404, 5, "127.0.0.1");
+        let server_err = MailEvent::http_request("GET", "/", 500, 5, "127.0.0.1");
+
+        assert_eq!(ok.severity(), EventSeverity::Debug);
+        assert_eq!(redirect.severity(), EventSeverity::Debug);
+        assert_eq!(not_found.severity(), EventSeverity::Warn);
+        assert_eq!(server_err.severity(), EventSeverity::Error);
+    }
+
+    /// Event severity classifications for non-HTTP variants.
+    #[test]
+    fn event_severity_classification() {
+        assert_eq!(
+            MailEvent::tool_call_start("t", Value::Null, None, None).severity(),
+            EventSeverity::Trace
+        );
+        assert_eq!(
+            MailEvent::tool_call_end("t", 0, None, 0, 0.0, vec![], None, None).severity(),
+            EventSeverity::Debug
+        );
+        assert_eq!(
+            MailEvent::message_sent(1, "A", vec![], "s", "t", "p").severity(),
+            EventSeverity::Info
+        );
+        assert_eq!(
+            MailEvent::agent_registered("A", "cc", "opus", "p").severity(),
+            EventSeverity::Info
+        );
+        assert_eq!(
+            MailEvent::server_started("http://x", "y").severity(),
+            EventSeverity::Info
+        );
+    }
 }

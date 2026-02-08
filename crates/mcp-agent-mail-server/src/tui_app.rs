@@ -23,7 +23,7 @@ use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
     agents::AgentsScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen,
     reservations::ReservationsScreen, screen_meta, system_health::SystemHealthScreen,
-    timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+    threads::ThreadExplorerScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -91,7 +91,7 @@ impl MailAppModel {
             } else if id == MailScreenId::Messages {
                 screens.insert(id, Box::new(MessageBrowserScreen::new()));
             } else if id == MailScreenId::Threads {
-                screens.insert(id, Box::new(TimelineScreen::new()));
+                screens.insert(id, Box::new(ThreadExplorerScreen::new()));
             } else if id == MailScreenId::SystemHealth {
                 screens.insert(id, Box::new(SystemHealthScreen::new(Arc::clone(&state))));
             } else if id == MailScreenId::Agents {
@@ -121,11 +121,6 @@ impl MailAppModel {
     #[must_use]
     pub fn with_config(state: Arc<TuiSharedState>, config: &mcp_agent_mail_core::Config) -> Self {
         let mut model = Self::new(state);
-        // Replace the TimelineScreen with one that loads/saves dock preferences.
-        model.screens.insert(
-            MailScreenId::Threads,
-            Box::new(TimelineScreen::with_config(config)),
-        );
         // Load accessibility settings from config.
         model.accessibility = crate::tui_persist::AccessibilitySettings {
             high_contrast: config.tui_high_contrast,

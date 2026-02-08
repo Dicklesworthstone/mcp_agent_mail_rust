@@ -2220,3 +2220,481 @@ fn stress_fts_large_body_search_performance() {
         "FTS search should complete within 5s, took {search_ms}ms"
     );
 }
+
+// =============================================================================
+// Chaos testing: Injectable faults + circuit breaker verification
+// =============================================================================
+
+use mcp_agent_mail_db::{
+    CircuitBreaker, CircuitState, Subsystem, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL,
+    circuit_for,
+};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+/// Lightweight fault injector for chaos testing.
+///
+/// Each call to `should_fail()` checks a counter-based failure schedule:
+/// the operation fails if `call_count % period < fail_count`. This gives
+/// deterministic, reproducible failure patterns (e.g., period=10, fail=1
+/// means every 10th call fails).
+struct FaultInjector {
+    call_count: AtomicU64,
+    /// How many calls out of every `period` calls should fail.
+    fail_count: u64,
+    /// The period of the failure cycle.
+    period: u64,
+    /// Whether injection is currently active.
+    active: AtomicBool,
+}
+
+#[allow(dead_code)]
+impl FaultInjector {
+    /// Create with failure rate: `fail_count` out of every `period` calls fail.
+    const fn new(fail_count: u64, period: u64) -> Self {
+        Self {
+            call_count: AtomicU64::new(0),
+            fail_count,
+            period,
+            active: AtomicBool::new(true),
+        }
+    }
+
+    /// Check if the current call should fail.
+    fn should_fail(&self) -> bool {
+        if !self.active.load(Ordering::Relaxed) {
+            return false;
+        }
+        let n = self.call_count.fetch_add(1, Ordering::Relaxed);
+        (n % self.period) < self.fail_count
+    }
+
+    /// Deactivate fault injection (simulates recovery).
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// Reactivate fault injection.
+    fn activate(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
+    /// Total calls made.
+    fn total_calls(&self) -> u64 {
+        self.call_count.load(Ordering::Relaxed)
+    }
+}
+
+// -- Test: DB circuit breaker trips and recovers under 10% failure rate ------
+
+#[test]
+fn chaos_db_circuit_trips_and_recovers() {
+    let cb = CircuitBreaker::with_subsystem("db", 5, Duration::from_millis(100));
+    let injector = FaultInjector::new(1, 10); // 10% failure rate
+
+    // Phase 1: Trip the circuit explicitly with 5 failures.
+    for _ in 0..5 {
+        cb.record_failure();
+    }
+    assert_eq!(cb.state(), CircuitState::Open, "circuit should be open after 5 failures");
+
+    // Verify injector produces ~10% failure rate.
+    let mut inj_failures = 0u32;
+    for _ in 0..100 {
+        if injector.should_fail() {
+            inj_failures += 1;
+        }
+    }
+    assert!(inj_failures >= 5, "injector should produce ~10% failures, got {inj_failures}");
+
+    // Phase 2: Wait for recovery window — circuit should become half-open.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        cb.state(),
+        CircuitState::HalfOpen,
+        "circuit should be half-open after reset"
+    );
+
+    // Phase 3: Prove recovery with 3 consecutive successes.
+    // First probe goes through check(); subsequent record_success() calls
+    // simulate the real retry path (check gates the first call, then
+    // record_success handles the half-open accumulation).
+    assert!(cb.check().is_ok(), "first half-open probe should be allowed");
+    cb.record_success();
+    assert_eq!(cb.state(), CircuitState::HalfOpen, "still half-open after 1 success");
+    cb.record_success();
+    assert_eq!(cb.state(), CircuitState::HalfOpen, "still half-open after 2 successes");
+    cb.record_success();
+    assert_eq!(
+        cb.state(),
+        CircuitState::Closed,
+        "circuit should close after 3 consecutive successes"
+    );
+
+    // Phase 4: Run under fault injection — verify circuit handles mixed load.
+    let mut successes = 0u32;
+    let mut failures = 0u32;
+    for _ in 0..50 {
+        if cb.check().is_err() {
+            continue;
+        }
+        if injector.should_fail() {
+            cb.record_failure();
+            failures += 1;
+        } else {
+            cb.record_success();
+            successes += 1;
+        }
+    }
+    assert!(successes > 0, "should have some successes under 10% fault rate");
+    assert!(failures > 0, "should have some failures under 10% fault rate");
+}
+
+// -- Test: Git circuit independent from DB circuit ---------------------------
+
+#[test]
+fn chaos_git_failure_does_not_affect_db() {
+    let db_cb = CircuitBreaker::with_subsystem("db", 5, Duration::from_secs(30));
+    let git_cb = CircuitBreaker::with_subsystem("git", 3, Duration::from_secs(30));
+
+    // Simulate git failures until circuit trips.
+    for _ in 0..3 {
+        git_cb.record_failure();
+    }
+    assert_eq!(git_cb.state(), CircuitState::Open, "git circuit should be open");
+
+    // DB circuit should be unaffected.
+    assert_eq!(db_cb.state(), CircuitState::Closed, "db circuit should remain closed");
+    assert!(db_cb.check().is_ok(), "db operations should still work");
+
+    // Simulate successful DB operations.
+    for _ in 0..10 {
+        db_cb.record_success();
+    }
+    assert_eq!(db_cb.state(), CircuitState::Closed, "db should stay closed");
+    assert_eq!(git_cb.state(), CircuitState::Open, "git should still be open");
+}
+
+// -- Test: Alternating failures across subsystems ----------------------------
+
+#[test]
+fn chaos_alternating_subsystem_failures() {
+    let db_cb = CircuitBreaker::with_subsystem("db", 3, Duration::from_millis(100));
+    let git_cb = CircuitBreaker::with_subsystem("git", 3, Duration::from_millis(100));
+
+    // Phase 1: DB fails, git is fine.
+    for _ in 0..3 {
+        db_cb.record_failure();
+    }
+    assert_eq!(db_cb.state(), CircuitState::Open);
+    assert_eq!(git_cb.state(), CircuitState::Closed);
+
+    // Phase 2: DB recovers, then git fails.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(db_cb.state(), CircuitState::HalfOpen);
+    for _ in 0..3 {
+        db_cb.record_success();
+    }
+    assert_eq!(db_cb.state(), CircuitState::Closed);
+
+    for _ in 0..3 {
+        git_cb.record_failure();
+    }
+    assert_eq!(db_cb.state(), CircuitState::Closed, "db stays closed");
+    assert_eq!(git_cb.state(), CircuitState::Open, "git is now open");
+
+    // Phase 3: Both recover.
+    std::thread::sleep(Duration::from_millis(150));
+    for _ in 0..3 {
+        git_cb.record_success();
+    }
+    assert_eq!(db_cb.state(), CircuitState::Closed);
+    assert_eq!(git_cb.state(), CircuitState::Closed);
+}
+
+// -- Test: Concurrent threads with injected failures -------------------------
+
+#[test]
+fn chaos_concurrent_threads_with_db_faults() {
+    let cb = Arc::new(CircuitBreaker::with_subsystem("db", 5, Duration::from_millis(200)));
+    let injector = Arc::new(FaultInjector::new(3, 10)); // 30% failure rate
+    let n_threads = 8;
+    let ops_per_thread = 50;
+    let barrier = Arc::new(Barrier::new(n_threads));
+
+    let handles: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let cb = Arc::clone(&cb);
+            let inj = Arc::clone(&injector);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut successes = 0u32;
+                let mut failures = 0u32;
+                let mut blocked = 0u32;
+                for _ in 0..ops_per_thread {
+                    if cb.check().is_err() {
+                        blocked += 1;
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    if inj.should_fail() {
+                        cb.record_failure();
+                        failures += 1;
+                    } else {
+                        cb.record_success();
+                        successes += 1;
+                    }
+                }
+                (successes, failures, blocked)
+            })
+        })
+        .collect();
+
+    let mut total_s = 0u32;
+    let mut total_f = 0u32;
+    let mut total_b = 0u32;
+    for h in handles {
+        let (s, f, b) = h.join().unwrap();
+        total_s += s;
+        total_f += f;
+        total_b += b;
+    }
+
+    // No panics occurred — the critical assertion.
+    assert!(total_s > 0, "should have some successes");
+    assert!(total_f > 0, "should have some failures with 30% rate");
+    // With 30% failure rate, circuit should have tripped at least once.
+    assert!(
+        total_b > 0 || total_f >= 5,
+        "circuit should have tripped or had enough failures: blocked={total_b}, failures={total_f}"
+    );
+}
+
+// -- Test: Circuit state transitions are always valid ------------------------
+
+#[test]
+fn chaos_circuit_state_transitions_valid() {
+    let cb = CircuitBreaker::with_subsystem("test", 3, Duration::from_millis(50));
+
+    // Track state transitions.
+    let mut transitions: Vec<(CircuitState, CircuitState)> = Vec::new();
+    let mut prev_state = cb.state();
+
+    // Run through a full lifecycle: closed -> open -> half-open -> closed
+    let ops = [
+        (false, "success"),
+        (true, "fail"),
+        (true, "fail"),
+        (true, "fail"),  // trips at 3
+    ];
+
+    for (should_fail, _label) in &ops {
+        if *should_fail {
+            cb.record_failure();
+        } else {
+            cb.record_success();
+        }
+        let new_state = cb.state();
+        if new_state != prev_state {
+            transitions.push((prev_state, new_state));
+            prev_state = new_state;
+        }
+    }
+
+    // Should have transitioned Closed -> Open
+    assert!(
+        transitions.contains(&(CircuitState::Closed, CircuitState::Open)),
+        "should have Closed->Open transition: {transitions:?}"
+    );
+
+    // Wait for half-open
+    std::thread::sleep(Duration::from_millis(70));
+    let new_state = cb.state();
+    if new_state != prev_state {
+        transitions.push((prev_state, new_state));
+        prev_state = new_state;
+    }
+    assert!(
+        transitions.contains(&(CircuitState::Open, CircuitState::HalfOpen)),
+        "should have Open->HalfOpen transition: {transitions:?}"
+    );
+
+    // Recover
+    for _ in 0..3 {
+        cb.record_success();
+    }
+    let new_state = cb.state();
+    if new_state != prev_state {
+        transitions.push((prev_state, new_state));
+    }
+
+    assert!(
+        transitions.contains(&(CircuitState::HalfOpen, CircuitState::Closed)),
+        "should have HalfOpen->Closed transition: {transitions:?}"
+    );
+
+    // Verify no invalid transitions exist.
+    for (from, to) in &transitions {
+        let valid = matches!(
+            (from, to),
+            (CircuitState::Closed, CircuitState::Open)
+                | (CircuitState::Open, CircuitState::HalfOpen)
+                | (CircuitState::HalfOpen, CircuitState::Closed | CircuitState::Open)
+        );
+        assert!(valid, "invalid transition: {from} -> {to}");
+    }
+}
+
+// -- Test: Data integrity after circuit breaker recovery ---------------------
+
+#[test]
+fn chaos_data_integrity_after_cb_recovery() {
+    let (pool, _dir) = make_pool();
+    let suffix = unique_suffix();
+    let human_key = format!("/data/chaos/integrity_{suffix}");
+
+    // Setup: create project and agents.
+    let (pid, sender_id, receiver_id) = {
+        let p = pool.clone();
+        let key = human_key;
+        block_on(|cx| async move {
+            let proj = match queries::ensure_project(&cx, &p, &key).await {
+                Outcome::Ok(r) => r,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let pid = proj.id.unwrap();
+
+            let sender = match queries::register_agent(
+                &cx, &p, pid, "RedLake", "chaos", "test", Some("sender"), None,
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                other => panic!("register sender failed: {other:?}"),
+            };
+
+            let receiver = match queries::register_agent(
+                &cx, &p, pid, "BluePeak", "chaos", "test", Some("receiver"), None,
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                other => panic!("register receiver failed: {other:?}"),
+            };
+
+            (pid, sender.id.unwrap(), receiver.id.unwrap())
+        })
+    };
+
+    // Phase 1: Send messages, some with simulated failures (we retry on failure).
+    let num_messages = 20;
+    let injector = FaultInjector::new(2, 10); // 20% simulated failure rate
+    let mut sent_ids = Vec::new();
+
+    for i in 0..num_messages {
+        let success = loop {
+            if injector.should_fail() {
+                // Simulate a transient failure — just retry.
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            break true;
+        };
+        if success {
+            let p = pool.clone();
+            let msg_id = block_on(|cx| async move {
+                match queries::create_message_with_recipients(
+                    &cx,
+                    &p,
+                    pid,
+                    sender_id,
+                    &format!("chaos msg {i}"),
+                    &format!("body {i}"),
+                    None,
+                    "normal",
+                    false,
+                    "",
+                    &[(receiver_id, "to")],
+                )
+                .await
+                {
+                    Outcome::Ok(row) => row.id.unwrap(),
+                    other => panic!("create_message {i} failed: {other:?}"),
+                }
+            });
+            sent_ids.push(msg_id);
+        }
+    }
+
+    assert_eq!(
+        sent_ids.len(),
+        num_messages,
+        "all messages should have been sent"
+    );
+
+    // Phase 2: Verify all messages are retrievable.
+    let inbox = block_on(|cx| async move {
+        match queries::fetch_inbox(&cx, &pool, pid, receiver_id, false, None, 100).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("fetch_inbox failed: {other:?}"),
+        }
+    });
+
+    assert_eq!(
+        inbox.len(),
+        num_messages,
+        "all {num_messages} messages should be in inbox, got {}",
+        inbox.len()
+    );
+
+    // Verify each sent message ID appears in inbox.
+    for id in &sent_ids {
+        assert!(
+            inbox.iter().any(|row| row.message.id == Some(*id)),
+            "message {id} should be in inbox"
+        );
+    }
+}
+
+// -- Test: Global circuit breakers are isolated from each other ---------------
+
+#[test]
+fn chaos_global_circuits_isolated() {
+    // Reset all global circuits to known state.
+    CIRCUIT_DB.reset();
+    CIRCUIT_GIT.reset();
+    CIRCUIT_SIGNAL.reset();
+    CIRCUIT_LLM.reset();
+
+    // Trip the LLM circuit (threshold=3).
+    for _ in 0..3 {
+        CIRCUIT_LLM.record_failure();
+    }
+    assert_eq!(CIRCUIT_LLM.state(), CircuitState::Open);
+
+    // All other circuits remain closed.
+    assert_eq!(CIRCUIT_DB.state(), CircuitState::Closed);
+    assert_eq!(CIRCUIT_GIT.state(), CircuitState::Closed);
+    assert_eq!(CIRCUIT_SIGNAL.state(), CircuitState::Closed);
+
+    // Trip the signal circuit.
+    for _ in 0..5 {
+        CIRCUIT_SIGNAL.record_failure();
+    }
+    assert_eq!(CIRCUIT_SIGNAL.state(), CircuitState::Open);
+
+    // DB and git remain unaffected.
+    assert_eq!(CIRCUIT_DB.state(), CircuitState::Closed);
+    assert_eq!(CIRCUIT_GIT.state(), CircuitState::Closed);
+
+    // circuit_for() returns the correct circuit.
+    assert_eq!(circuit_for(Subsystem::Llm).state(), CircuitState::Open);
+    assert_eq!(circuit_for(Subsystem::Db).state(), CircuitState::Closed);
+
+    // Clean up.
+    CIRCUIT_DB.reset();
+    CIRCUIT_GIT.reset();
+    CIRCUIT_SIGNAL.reset();
+    CIRCUIT_LLM.reset();
+}

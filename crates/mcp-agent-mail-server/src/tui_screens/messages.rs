@@ -42,6 +42,69 @@ const MAX_RESULTS: usize = 1000;
 const BODY_PREVIEW_LEN: usize = 80;
 
 // ──────────────────────────────────────────────────────────────────────
+// Query presets — reusable filter shortcuts
+// ──────────────────────────────────────────────────────────────────────
+
+/// A named query preset for quick search access.
+#[derive(Debug, Clone)]
+struct QueryPreset {
+    /// Display label (shown in status bar).
+    label: &'static str,
+    /// The query string to inject into the search bar.
+    query: &'static str,
+    /// Short description for help overlay (shown in preset picker).
+    #[allow(dead_code)]
+    description: &'static str,
+}
+
+/// Built-in presets cycled with `p` key.
+const QUERY_PRESETS: &[QueryPreset] = &[
+    QueryPreset {
+        label: "All",
+        query: "",
+        description: "Show all recent messages",
+    },
+    QueryPreset {
+        label: "Urgent",
+        query: "urgent",
+        description: "Urgent importance messages",
+    },
+    QueryPreset {
+        label: "High",
+        query: "high",
+        description: "High importance messages",
+    },
+    QueryPreset {
+        label: "Ack",
+        query: "ack",
+        description: "Messages requiring acknowledgement",
+    },
+    QueryPreset {
+        label: "Error",
+        query: "error",
+        description: "Messages containing error",
+    },
+    QueryPreset {
+        label: "Plan",
+        query: "plan",
+        description: "Planning and coordination messages",
+    },
+];
+
+/// Describes how the last search was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchMethod {
+    /// No search executed yet.
+    None,
+    /// Showing recent messages (empty query).
+    Recent,
+    /// FTS5 full-text match.
+    Fts,
+    /// LIKE fallback (FTS returned no results).
+    LikeFallback,
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // MessageEntry — a single search result
 // ──────────────────────────────────────────────────────────────────────
 
@@ -97,6 +160,10 @@ pub struct MessageBrowserScreen {
     total_results: usize,
     /// Last tick we refreshed (for periodic refresh of empty-query mode).
     last_refresh: Option<Instant>,
+    /// Current preset index (0 = "All" / no preset).
+    preset_index: usize,
+    /// How the last search was resolved (for explainability).
+    search_method: SearchMethod,
 }
 
 impl MessageBrowserScreen {
@@ -117,7 +184,24 @@ impl MessageBrowserScreen {
             db_conn_attempted: false,
             total_results: 0,
             last_refresh: None,
+            preset_index: 0,
+            search_method: SearchMethod::None,
         }
+    }
+
+    /// Apply a query preset by index, injecting its query into the search bar.
+    fn apply_preset(&mut self, index: usize) {
+        let idx = index % QUERY_PRESETS.len();
+        self.preset_index = idx;
+        let preset = &QUERY_PRESETS[idx];
+        self.search_input.set_value(preset.query);
+        self.search_dirty = true;
+        self.debounce_remaining = 0;
+    }
+
+    /// Return the current active preset, if any.
+    fn active_preset(&self) -> &QueryPreset {
+        &QUERY_PRESETS[self.preset_index]
     }
 
     /// Ensure we have a DB connection, opening one if needed.
@@ -146,13 +230,16 @@ impl MessageBrowserScreen {
         let query = self.search_input.value().trim().to_string();
         self.last_refresh = Some(Instant::now());
 
-        let (results, total) = if query.is_empty() {
+        let (results, total, method) = if query.is_empty() {
             self.last_search.clear();
-            fetch_recent_messages(conn, PAGE_SIZE)
+            let (r, t) = fetch_recent_messages(conn, PAGE_SIZE);
+            (r, t, SearchMethod::Recent)
         } else {
             self.last_search.clone_from(&query);
-            search_messages_fts(conn, &query, MAX_RESULTS)
+            let (r, t, m) = search_messages_fts(conn, &query, MAX_RESULTS);
+            (r, t, m)
         };
+        self.search_method = method;
 
         self.results = results;
         self.total_results = total;
@@ -214,6 +301,7 @@ impl Default for MessageBrowserScreen {
 }
 
 impl MailScreen for MessageBrowserScreen {
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Press {
@@ -299,11 +387,24 @@ impl MailScreen for MessageBrowserScreen {
                                     ));
                                 }
                             }
+                            // Cycle query presets
+                            KeyCode::Char('p') => {
+                                self.apply_preset(self.preset_index + 1);
+                            }
+                            KeyCode::Char('P') => {
+                                let idx = if self.preset_index == 0 {
+                                    QUERY_PRESETS.len() - 1
+                                } else {
+                                    self.preset_index - 1
+                                };
+                                self.apply_preset(idx);
+                            }
                             // Clear search
                             KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
                                 self.search_input.clear();
                                 self.search_dirty = true;
                                 self.debounce_remaining = 0;
+                                self.preset_index = 0;
                             }
                             _ => {}
                         }
@@ -362,13 +463,26 @@ impl MailScreen for MessageBrowserScreen {
         let search_area = Rect::new(area.x, area.y, area.width, search_height);
         let content_area = Rect::new(area.x, area.y + search_height, area.width, content_height);
 
-        // Render search bar
+        // Render search bar with explainability
+        let method_label = match self.search_method {
+            SearchMethod::None => "",
+            SearchMethod::Recent => "recent",
+            SearchMethod::Fts => "FTS",
+            SearchMethod::LikeFallback => "LIKE",
+        };
+        let preset_label = if self.preset_index > 0 {
+            self.active_preset().label
+        } else {
+            ""
+        };
         render_search_bar(
             frame,
             search_area,
             &self.search_input,
             self.total_results,
             matches!(self.focus, Focus::SearchBar),
+            method_label,
+            preset_label,
         );
 
         // Split content: 45% results, 55% detail (if wide enough)
@@ -444,6 +558,10 @@ impl MailScreen for MessageBrowserScreen {
                 key: "Ctrl+C",
                 action: "Clear search",
             },
+            HelpEntry {
+                key: "p/P",
+                action: "Next/prev preset",
+            },
         ]
     }
 
@@ -487,16 +605,16 @@ fn fetch_recent_messages(conn: &SqliteConnection, limit: usize) -> (Vec<MessageE
     (results, total)
 }
 
-/// Full-text search using FTS5.
+/// Full-text search using FTS5, returning results and the search method used.
 fn search_messages_fts(
     conn: &SqliteConnection,
     query: &str,
     limit: usize,
-) -> (Vec<MessageEntry>, usize) {
+) -> (Vec<MessageEntry>, usize, SearchMethod) {
     // Sanitize the FTS query
     let sanitized = sanitize_fts_query(query);
     if sanitized.is_empty() {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, SearchMethod::LikeFallback);
     }
 
     let sql = format!(
@@ -521,7 +639,7 @@ fn search_messages_fts(
     let results = query_messages(conn, &sql);
     if !results.is_empty() {
         let total = results.len();
-        return (results, total);
+        return (results, total, SearchMethod::Fts);
     }
 
     // LIKE fallback
@@ -545,7 +663,7 @@ fn search_messages_fts(
 
     let results = query_messages(conn, &like_sql);
     let total = results.len();
-    (results, total)
+    (results, total, SearchMethod::LikeFallback)
 }
 
 /// Execute a message query and extract rows into `MessageEntry` structs.
@@ -627,19 +745,29 @@ fn sanitize_fts_query(query: &str) -> String {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-/// Render the search bar.
+/// Render the search bar with explainability metadata.
 fn render_search_bar(
     frame: &mut Frame<'_>,
     area: Rect,
     input: &TextInput,
     total_results: usize,
     focused: bool,
+    method_label: &str,
+    preset_label: &str,
 ) {
-    let title = if focused {
+    let mut title = if focused {
         format!("Search ({total_results} results) [EDITING]")
     } else {
         format!("Search ({total_results} results)")
     };
+    // Append search method for explainability
+    if !method_label.is_empty() {
+        let _ = std::fmt::Write::write_fmt(&mut title, format_args!(" via {method_label}"));
+    }
+    // Show active preset name
+    if !preset_label.is_empty() {
+        let _ = std::fmt::Write::write_fmt(&mut title, format_args!(" | Preset: {preset_label}"));
+    }
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded);
@@ -1087,7 +1215,15 @@ mod tests {
         let input = TextInput::new().with_placeholder("Search...");
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_search_bar(&mut frame, Rect::new(0, 0, 80, 3), &input, 42, false);
+        render_search_bar(
+            &mut frame,
+            Rect::new(0, 0, 80, 3),
+            &input,
+            42,
+            false,
+            "FTS",
+            "",
+        );
     }
 
     #[test]
@@ -1318,5 +1454,133 @@ mod tests {
         let mut screen = MessageBrowserScreen::new();
         let handled = screen.receive_deep_link(&DeepLinkTarget::ThreadById("x".to_string()));
         assert!(!handled);
+    }
+
+    // ── Query presets ──────────────────────────────────────────────
+
+    #[test]
+    fn presets_have_valid_structure() {
+        assert!(QUERY_PRESETS.len() >= 4);
+        for preset in QUERY_PRESETS {
+            assert!(!preset.label.is_empty());
+            assert!(!preset.description.is_empty());
+        }
+        // First preset should be "All" (empty query)
+        assert_eq!(QUERY_PRESETS[0].label, "All");
+        assert!(QUERY_PRESETS[0].query.is_empty());
+    }
+
+    #[test]
+    fn apply_preset_sets_query() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.apply_preset(1); // "Urgent"
+        assert_eq!(screen.preset_index, 1);
+        assert_eq!(screen.search_input.value(), "urgent");
+        assert!(screen.search_dirty);
+        assert_eq!(screen.debounce_remaining, 0);
+    }
+
+    #[test]
+    fn apply_preset_wraps_around() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.apply_preset(QUERY_PRESETS.len()); // Should wrap to 0
+        assert_eq!(screen.preset_index, 0);
+        assert!(screen.search_input.value().is_empty());
+    }
+
+    #[test]
+    fn p_key_cycles_presets_forward() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        assert_eq!(screen.preset_index, 0);
+
+        let p = Event::Key(ftui::KeyEvent::new(KeyCode::Char('p')));
+        screen.update(&p, &state);
+        assert_eq!(screen.preset_index, 1);
+        assert_eq!(screen.search_input.value(), "urgent");
+    }
+
+    #[test]
+    fn big_p_key_cycles_presets_backward() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        assert_eq!(screen.preset_index, 0);
+
+        let p = Event::Key(ftui::KeyEvent::new(KeyCode::Char('P')));
+        screen.update(&p, &state);
+        assert_eq!(screen.preset_index, QUERY_PRESETS.len() - 1);
+    }
+
+    #[test]
+    fn ctrl_c_resets_preset() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.apply_preset(2);
+        assert_eq!(screen.preset_index, 2);
+
+        let ctrl_c = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: Modifiers::CTRL,
+            kind: KeyEventKind::Press,
+        });
+        screen.update(&ctrl_c, &state);
+        assert_eq!(screen.preset_index, 0);
+        assert!(screen.search_input.value().is_empty());
+    }
+
+    #[test]
+    fn active_preset_returns_current() {
+        let mut screen = MessageBrowserScreen::new();
+        assert_eq!(screen.active_preset().label, "All");
+        screen.apply_preset(3);
+        assert_eq!(screen.active_preset().label, "Ack");
+    }
+
+    // ── Search method explainability ───────────────────────────────
+
+    #[test]
+    fn new_screen_has_no_search_method() {
+        let screen = MessageBrowserScreen::new();
+        assert_eq!(screen.search_method, SearchMethod::None);
+    }
+
+    #[test]
+    fn search_method_variants_exist() {
+        // Ensure all variants compile
+        let _ = SearchMethod::None;
+        let _ = SearchMethod::Recent;
+        let _ = SearchMethod::Fts;
+        let _ = SearchMethod::LikeFallback;
+    }
+
+    #[test]
+    fn render_search_bar_with_metadata_no_panic() {
+        let input = TextInput::new().with_placeholder("Search...");
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        render_search_bar(
+            &mut frame,
+            Rect::new(0, 0, 80, 3),
+            &input,
+            42,
+            false,
+            "FTS",
+            "Urgent",
+        );
+    }
+
+    #[test]
+    fn render_search_bar_empty_metadata_no_panic() {
+        let input = TextInput::new().with_placeholder("Search...");
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        render_search_bar(&mut frame, Rect::new(0, 0, 80, 3), &input, 0, true, "", "");
+    }
+
+    #[test]
+    fn keybindings_include_preset() {
+        let screen = MessageBrowserScreen::new();
+        let bindings = screen.keybindings();
+        assert!(bindings.iter().any(|b| b.key == "p/P"));
     }
 }
