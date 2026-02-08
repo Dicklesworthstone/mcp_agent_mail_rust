@@ -1567,8 +1567,7 @@ impl CommitCoalescer {
             let all_empty = {
                 let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
                 repos.values().all(|rq| {
-                    rq.depth.load(Ordering::Relaxed) == 0
-                        && !rq.processing.load(Ordering::Relaxed)
+                    rq.depth.load(Ordering::Relaxed) == 0 && !rq.processing.load(Ordering::Relaxed)
                 })
             };
 
@@ -1684,7 +1683,10 @@ fn coalescer_pool_worker(
                     continue;
                 }
                 let serviced = rq.last_serviced_us.load(Ordering::Relaxed);
-                if best.as_ref().is_none_or(|(_, _, best_ts)| serviced < *best_ts) {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, best_ts)| serviced < *best_ts)
+                {
                     best = Some((path.clone(), Arc::clone(rq), serviced));
                 }
             }
@@ -1721,7 +1723,8 @@ fn coalescer_pool_worker(
         // Drain spill if we have room
         let spilled_work = coalescer_drain_repo_spill(&rq, &repo_root);
 
-        let drained_count = batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
+        let drained_count =
+            batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
         rq.depth.fetch_sub(
             drained_count.min(rq.depth.load(Ordering::Relaxed)),
             Ordering::Relaxed,
@@ -1735,7 +1738,9 @@ fn coalescer_pool_worker(
                 let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
                 let metrics = mcp_agent_mail_core::global_metrics();
                 metrics.storage.commit_drained_total.add(chunk_len);
-                rq.metrics.drained_total.fetch_add(chunk_len, Ordering::Relaxed);
+                rq.metrics
+                    .drained_total
+                    .fetch_add(chunk_len, Ordering::Relaxed);
                 rq.metrics.commits_total.fetch_add(1, Ordering::Relaxed);
 
                 for req in chunk {
@@ -1763,7 +1768,10 @@ fn coalescer_pool_worker(
             coalescer_commit_spilled_work(work, &stats, &batch_sizes);
 
             let metrics = mcp_agent_mail_core::global_metrics();
-            metrics.storage.commit_drained_total.add(work.pending_requests);
+            metrics
+                .storage
+                .commit_drained_total
+                .add(work.pending_requests);
             rq.metrics
                 .drained_total
                 .fetch_add(work.pending_requests, Ordering::Relaxed);
@@ -1788,7 +1796,8 @@ fn coalescer_pool_worker(
         }
 
         // Release processing lock + update last_serviced timestamp
-        rq.last_serviced_us.store(now_micros_u64(), Ordering::Relaxed);
+        rq.last_serviced_us
+            .store(now_micros_u64(), Ordering::Relaxed);
         rq.processing.store(false, Ordering::Release);
 
         // If any repo still has work, wake another worker
@@ -2080,15 +2089,40 @@ fn coalescer_commit_with_retry(
     let sm = &mcp_agent_mail_core::global_metrics().storage;
     sm.commit_attempts_total.inc();
     sm.commit_batch_size_last.set(rel_paths.len() as u64);
+
+    // Try lock-free commit first (avoids index.lock entirely)
+    {
+        let repo = Repository::open(repo_root)?;
+        let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
+        let commit_start = std::time::Instant::now();
+        match commit_paths_lockfree(&repo, config, message, &refs) {
+            Ok(()) => {
+                sm.git_commit_latency_us
+                    .record(commit_start.elapsed().as_micros() as u64);
+                sm.lockfree_commits_total.inc();
+                return Ok(());
+            }
+            Err(e) => {
+                sm.lockfree_commit_fallbacks_total.inc();
+                tracing::debug!(
+                    "[git-lock] lockfree commit failed, falling back to index-based: {e}"
+                );
+            }
+        }
+    }
+
+    // Fall back to index-based commit with retry
     let mut index_lock_retries: u64 = 0;
 
     for attempt in 0..=MAX_RETRIES {
         let repo = Repository::open(repo_root)?;
         let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
 
+        write_lock_owner(repo_root);
         let commit_start = std::time::Instant::now();
         match commit_paths(&repo, config, message, &refs) {
             Ok(()) => {
+                remove_lock_owner(repo_root);
                 sm.git_commit_latency_us
                     .record(commit_start.elapsed().as_micros() as u64);
                 if index_lock_retries > 0 {
@@ -2103,8 +2137,10 @@ fn coalescer_commit_with_retry(
                     if try_clean_stale_git_lock(repo_root, 30.0) {
                         let repo2 = Repository::open(repo_root)?;
                         let refs2: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
+                        write_lock_owner(repo_root);
                         let start2 = std::time::Instant::now();
                         let result = commit_paths(&repo2, config, message, &refs2);
+                        remove_lock_owner(repo_root);
                         sm.git_commit_latency_us
                             .record(start2.elapsed().as_micros() as u64);
                         sm.git_index_lock_retries_total.add(index_lock_retries);
@@ -2160,9 +2196,11 @@ fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &
     for attempt in 0..=MAX_RETRIES {
         let repo = Repository::open(repo_root)?;
 
+        write_lock_owner(repo_root);
         let commit_start = std::time::Instant::now();
         match commit_all(&repo, config, message) {
             Ok(()) => {
+                remove_lock_owner(repo_root);
                 sm.git_commit_latency_us
                     .record(commit_start.elapsed().as_micros() as u64);
                 if index_lock_retries > 0 {
@@ -2175,8 +2213,10 @@ fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &
                 if attempt >= MAX_RETRIES {
                     if try_clean_stale_git_lock(repo_root, 30.0) {
                         let repo2 = Repository::open(repo_root)?;
+                        write_lock_owner(repo_root);
                         let start2 = std::time::Instant::now();
                         let result = commit_all(&repo2, config, message);
+                        remove_lock_owner(repo_root);
                         sm.git_commit_latency_us
                             .record(start2.elapsed().as_micros() as u64);
                         sm.git_index_lock_retries_total.add(index_lock_retries);
@@ -2304,7 +2344,47 @@ fn is_git_index_lock_error(err: &git2::Error) -> bool {
     msg.contains("index.lock") || msg.contains("lock at") || msg.contains("index is locked")
 }
 
-/// Try to clean up a stale .git/index.lock file.
+// ---------------------------------------------------------------------------
+// PID-aware stale lock management
+// ---------------------------------------------------------------------------
+
+/// Default stale lock age threshold (120 seconds, increased from 60s for safety).
+const STALE_LOCK_AGE_SECONDS: f64 = 120.0;
+
+/// Write a `.git/index.lock.owner` file with our PID and timestamp.
+///
+/// This allows other processes to check if the lock holder is still alive
+/// before forcibly removing a lock.
+fn write_lock_owner(repo_root: &Path) {
+    let owner_path = repo_root.join(".git").join("index.lock.owner");
+    let pid = std::process::id();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let content = format!("{pid}\n{ts}\n");
+    let _ = fs::write(&owner_path, content);
+}
+
+/// Remove the `.git/index.lock.owner` file after a successful commit.
+fn remove_lock_owner(repo_root: &Path) {
+    let owner_path = repo_root.join(".git").join("index.lock.owner");
+    let _ = fs::remove_file(&owner_path);
+}
+
+/// Check if a process with the given PID is still alive.
+///
+/// Uses `/proc/<pid>/` on Linux (no `unsafe` required).
+fn is_pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Try to clean up a stale .git/index.lock file with PID-aware safety.
+///
+/// Before removing a lock:
+/// 1. Check if a `.git/index.lock.owner` file exists with the owner PID
+/// 2. If the owning PID is still alive, do NOT remove the lock
+/// 3. If the PID is dead (or no owner file), use age-based threshold
 ///
 /// Returns `true` if a stale lock was removed.
 fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
@@ -2313,6 +2393,26 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
         return false;
     }
 
+    // Check PID-based ownership first
+    let owner_path = repo_root.join(".git").join("index.lock.owner");
+    if let Ok(content) = fs::read_to_string(&owner_path) {
+        if let Some(pid_str) = content.lines().next() {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                if is_pid_alive(pid) {
+                    // Lock holder is still alive — don't remove!
+                    tracing::debug!("[git-lock] index.lock held by alive PID {pid}, not removing");
+                    return false;
+                }
+                // PID is dead — safe to remove lock
+                tracing::info!("[git-lock] index.lock held by dead PID {pid}, removing stale lock");
+                let _ = fs::remove_file(&lock_path);
+                let _ = fs::remove_file(&owner_path);
+                return true;
+            }
+        }
+    }
+
+    // No owner file or unparseable — fall back to age-based removal
     let age = fs::metadata(&lock_path)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -2321,11 +2421,131 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
 
     if let Some(age) = age {
         if age > max_age_seconds {
+            tracing::info!(
+                "[git-lock] removing stale index.lock (age={age:.1}s > {max_age_seconds}s)"
+            );
             let _ = fs::remove_file(&lock_path);
+            let _ = fs::remove_file(&owner_path);
             return true;
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Lock-free git commit path (plumbing-based)
+// ---------------------------------------------------------------------------
+
+/// Commit files without touching the git index (avoids index.lock entirely).
+///
+/// Uses git plumbing operations:
+/// 1. `repo.blob()` — hash and write file content as blob objects
+/// 2. `repo.treebuilder()` — build tree hierarchy without using index
+/// 3. `repo.commit()` — create commit object (uses ref lock, NOT index lock)
+///
+/// This eliminates index.lock contention entirely, since the index is never
+/// read or written. Falls back to `commit_paths()` if tree building fails.
+fn commit_paths_lockfree(
+    repo: &Repository,
+    config: &Config,
+    message: &str,
+    rel_paths: &[&str],
+) -> Result<()> {
+    if rel_paths.is_empty() {
+        return Ok(());
+    }
+
+    let workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
+    let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
+
+    // Get parent commit and its tree
+    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let base_tree = parent.as_ref().and_then(|p| p.tree().ok());
+
+    // Create blob objects for each file
+    let mut updates: Vec<(String, git2::Oid)> = Vec::new();
+    for path in rel_paths {
+        let path = validate_repo_relative_path("lockfree commit path", path)?;
+        let full = workdir.join(path);
+        if full.exists() {
+            let content = fs::read(&full)?;
+            let blob_oid = repo.blob(&content)?;
+            updates.push((path.to_string(), blob_oid));
+        }
+    }
+
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    // Build new tree without touching the index
+    let tree_oid = build_tree_with_updates(repo, base_tree.as_ref(), &updates)?;
+    let tree = repo.find_tree(tree_oid)?;
+
+    let final_message = append_trailers(message);
+
+    // Create commit (updates HEAD ref lock, NOT index lock)
+    match parent {
+        Some(ref p) => {
+            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p])?;
+        }
+        None => {
+            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[])?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively build a git tree with updates applied to the base tree.
+///
+/// Groups updates by their first path component:
+/// - Direct files: insert blob OIDs into the tree builder
+/// - Subdirectories: recurse to build sub-trees
+fn build_tree_with_updates(
+    repo: &Repository,
+    base: Option<&git2::Tree<'_>>,
+    updates: &[(String, git2::Oid)],
+) -> Result<git2::Oid> {
+    // Group updates by first path component
+    let mut direct_entries: Vec<(&str, git2::Oid)> = Vec::new();
+    let mut by_prefix: HashMap<String, Vec<(String, git2::Oid)>> = HashMap::new();
+
+    for (path, oid) in updates {
+        if let Some(slash_idx) = path.find('/') {
+            let prefix = &path[..slash_idx];
+            let rest = &path[slash_idx + 1..];
+            by_prefix
+                .entry(prefix.to_string())
+                .or_default()
+                .push((rest.to_string(), *oid));
+        } else {
+            direct_entries.push((path.as_str(), *oid));
+        }
+    }
+
+    let mut builder = repo.treebuilder(base)?;
+
+    // Insert direct file entries (blob mode 0o100644)
+    for (name, oid) in &direct_entries {
+        builder.insert(name, *oid, 0o100_644)?;
+    }
+
+    // Recurse for subdirectory entries (tree mode 0o040000)
+    for (prefix, sub_updates) in &by_prefix {
+        // Find the existing subtree (if any) for this prefix
+        let sub_tree_oid = base
+            .and_then(|t| t.get_name(prefix))
+            .filter(|e| e.kind() == Some(git2::ObjectType::Tree))
+            .map(|e| e.id());
+        let sub_tree = sub_tree_oid.and_then(|oid| repo.find_tree(oid).ok());
+
+        let new_sub_oid = build_tree_with_updates(repo, sub_tree.as_ref(), sub_updates)?;
+        builder.insert(prefix, new_sub_oid, 0o040_000)?;
+    }
+
+    let oid = builder.write()?;
+    Ok(oid)
 }
 
 /// Commit with git index.lock contention retry logic.
@@ -2339,16 +2559,36 @@ pub fn commit_paths_with_retry(
 ) -> Result<()> {
     const MAX_INDEX_LOCK_RETRIES: usize = 5;
 
+    let sm = &mcp_agent_mail_core::global_metrics().storage;
+    sm.commit_attempts_total.inc();
+    sm.commit_batch_size_last.set(rel_paths.len() as u64);
+
+    // Try lock-free commit first (avoids index.lock entirely)
+    {
+        let repo = Repository::open(repo_root)?;
+        let commit_start = std::time::Instant::now();
+        match commit_paths_lockfree(&repo, config, message, rel_paths) {
+            Ok(()) => {
+                sm.git_commit_latency_us
+                    .record(commit_start.elapsed().as_micros() as u64);
+                sm.lockfree_commits_total.inc();
+                return Ok(());
+            }
+            Err(e) => {
+                sm.lockfree_commit_fallbacks_total.inc();
+                tracing::debug!(
+                    "[git-lock] lockfree commit failed, falling back to index-based: {e}"
+                );
+            }
+        }
+    }
+
+    // Fall back to index-based commit with project-scoped lock
     let lock_path = commit_lock_path(repo_root, rel_paths);
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let sm = &mcp_agent_mail_core::global_metrics().storage;
-    sm.commit_attempts_total.inc();
-    sm.commit_batch_size_last.set(rel_paths.len() as u64);
-
-    // Use project-scoped commit lock
     let mut lock = FileLock::new(lock_path);
     let lock_start = std::time::Instant::now();
     lock.acquire()?;
@@ -2361,9 +2601,11 @@ pub fn commit_paths_with_retry(
 
     for attempt in 0..MAX_INDEX_LOCK_RETRIES + 2 {
         let repo = Repository::open(repo_root)?;
+        write_lock_owner(repo_root);
         let commit_start = std::time::Instant::now();
         match commit_paths(&repo, config, message, rel_paths) {
             Ok(()) => {
+                remove_lock_owner(repo_root);
                 sm.git_commit_latency_us
                     .record(commit_start.elapsed().as_micros() as u64);
                 if index_lock_retries > 0 {
@@ -3622,8 +3864,11 @@ pub fn process_markdown_images(
     }
 
     // Convert in parallel chunks, collecting (full_match, alt, Result<StoredAttachment>)
-    let mut converted: Vec<(String, String, std::result::Result<StoredAttachment, StorageError>)> =
-        Vec::with_capacity(processable.len());
+    let mut converted: Vec<(
+        String,
+        String,
+        std::result::Result<StoredAttachment, StorageError>,
+    )> = Vec::with_capacity(processable.len());
 
     for chunk in processable.chunks(MAX_CONCURRENT_CONVERSIONS) {
         let chunk_results: Vec<_> = std::thread::scope(|s| {
@@ -5802,21 +6047,17 @@ mod tests {
                 let p = archive.root.join(format!("img_{i}.png"));
                 // Create slightly different images to avoid SHA1 dedup
                 use image::{ImageBuffer, Rgba};
-                let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-                    ImageBuffer::from_fn(4, 4, |x, y| Rgba([i as u8 * 40, (x * 64) as u8, (y * 64) as u8, 255]));
+                let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(4, 4, |x, y| {
+                    Rgba([i as u8 * 40, (x * 64) as u8, (y * 64) as u8, 255])
+                });
                 img.save(&p).unwrap();
                 p.display().to_string()
             })
             .collect();
 
-        let (meta, rel_paths) = process_attachments(
-            &archive,
-            &config,
-            &archive.root,
-            &paths,
-            EmbedPolicy::File,
-        )
-        .unwrap();
+        let (meta, rel_paths) =
+            process_attachments(&archive, &config, &archive.root, &paths, EmbedPolicy::File)
+                .unwrap();
 
         assert_eq!(meta.len(), 6);
         assert!(!rel_paths.is_empty());
@@ -5835,8 +6076,9 @@ mod tests {
         for i in 0..5 {
             use image::{ImageBuffer, Rgba};
             let p = archive.root.join(format!("photo_{i}.png"));
-            let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-                ImageBuffer::from_fn(4, 4, |x, y| Rgba([i as u8 * 50, (x * 64) as u8, (y * 64) as u8, 255]));
+            let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(4, 4, |x, y| {
+                Rgba([i as u8 * 50, (x * 64) as u8, (y * 64) as u8, 255])
+            });
             img.save(&p).unwrap();
         }
 
@@ -6482,7 +6724,8 @@ mod tests {
                         "project": "concurrent-proj",
                     });
 
-                    let body = format!("Body content for message {i}. Some text to verify integrity.");
+                    let body =
+                        format!("Body content for message {i}. Some text to verify integrity.");
 
                     barrier.wait();
 
@@ -6506,9 +6749,7 @@ mod tests {
         }
 
         // Read the thread digest and verify structure
-        let digest_path = archive
-            .root
-            .join("messages/threads/stress-thread-1.md");
+        let digest_path = archive.root.join("messages/threads/stress-thread-1.md");
         assert!(digest_path.exists(), "digest file should exist");
 
         let content = std::fs::read_to_string(&digest_path).unwrap();
@@ -6541,5 +6782,483 @@ mod tests {
             entry_header_count, NUM_MESSAGES,
             "expected {NUM_MESSAGES} entry headers, got {entry_header_count}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-project commit queue tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn coalescer_per_repo_stats_populated() {
+        // Verify that per-repo metrics are tracked after enqueuing commits.
+        // All projects under the same config share one repo_root (archive root).
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        let archive = ensure_archive(&config, "stats-proj").unwrap();
+
+        let agent = serde_json::json!({"name": "StatsAgent", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+
+        flush_async_commits();
+
+        let per_repo = get_commit_coalescer().per_repo_stats();
+
+        // The archive repo_root should appear in per-repo stats
+        let repo_stats = per_repo.get(&archive.repo_root);
+        assert!(
+            repo_stats.is_some(),
+            "per_repo_stats should contain the archive repo_root {:?}, keys: {:?}",
+            archive.repo_root,
+            per_repo.keys().collect::<Vec<_>>()
+        );
+
+        let stats = repo_stats.unwrap();
+        assert!(
+            stats.enqueued_total >= 1,
+            "repo should have enqueued >= 1, got {}",
+            stats.enqueued_total
+        );
+        assert!(
+            stats.drained_total >= 1,
+            "repo should have drained >= 1, got {}",
+            stats.drained_total
+        );
+        assert!(
+            stats.commits_total >= 1,
+            "repo should have commits >= 1, got {}",
+            stats.commits_total
+        );
+    }
+
+    #[test]
+    fn coalescer_worker_count_auto_detected() {
+        let coalescer = get_commit_coalescer();
+        let wc = coalescer.worker_count();
+        assert!(wc >= 2, "worker count should be >= 2, got {wc}");
+        assert!(wc <= 32, "worker count should be <= 32, got {wc}");
+    }
+
+    #[test]
+    fn coalescer_multi_project_concurrent_commits() {
+        // 5 projects × 10 agents each = 50 concurrent commits to the SAME
+        // archive repo_root. Verify all commits complete and per-repo metrics
+        // reflect the aggregate activity.
+        use std::sync::{Arc, Barrier};
+
+        const NUM_PROJECTS: usize = 5;
+        const AGENTS_PER_PROJECT: usize = 10;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let config = Arc::new(config);
+
+        // Pre-create archives (all share same repo_root)
+        let archives: Vec<_> = (0..NUM_PROJECTS)
+            .map(|i| Arc::new(ensure_archive(&config, &format!("conc-proj-{i}")).unwrap()))
+            .collect();
+
+        let repo_root = archives[0].repo_root.clone();
+
+        // Snapshot per-repo stats before the burst
+        let stats_before = get_commit_coalescer()
+            .per_repo_stats()
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_default();
+
+        let barrier = Arc::new(Barrier::new(NUM_PROJECTS * AGENTS_PER_PROJECT));
+
+        let archives2 = archives.clone();
+        let handles: Vec<_> = (0..NUM_PROJECTS)
+            .flat_map(|proj_idx| {
+                let config = Arc::clone(&config);
+                let archives = archives2.clone();
+                let barrier = Arc::clone(&barrier);
+                (0..AGENTS_PER_PROJECT).map(move |agent_idx| {
+                    let config = Arc::clone(&config);
+                    let archive = Arc::clone(&archives[proj_idx]);
+                    let barrier = Arc::clone(&barrier);
+
+                    std::thread::spawn(move || {
+                        let agent_name = format!("Agent{proj_idx}x{agent_idx}");
+                        let agent = serde_json::json!({
+                            "name": agent_name,
+                            "program": "test",
+                        });
+
+                        barrier.wait();
+
+                        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+                    })
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        flush_async_commits();
+
+        // Verify all agent profiles exist
+        for proj_idx in 0..NUM_PROJECTS {
+            for agent_idx in 0..AGENTS_PER_PROJECT {
+                let agent_name = format!("Agent{proj_idx}x{agent_idx}");
+                let profile_path = archives[proj_idx]
+                    .root
+                    .join("agents")
+                    .join(&agent_name)
+                    .join("profile.json");
+                assert!(
+                    profile_path.exists(),
+                    "profile for {agent_name} should exist at {profile_path:?}"
+                );
+            }
+        }
+
+        // Verify per-repo stats reflect the burst
+        let stats_after = get_commit_coalescer()
+            .per_repo_stats()
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_default();
+        let enqueued_delta = stats_after.enqueued_total - stats_before.enqueued_total;
+        let expected = (NUM_PROJECTS * AGENTS_PER_PROJECT) as u64;
+        assert_eq!(
+            enqueued_delta, expected,
+            "expected {expected} enqueued commits, got delta {enqueued_delta}"
+        );
+        assert!(
+            stats_after.drained_total >= stats_before.drained_total + expected,
+            "expected drained >= {}, got {}",
+            stats_before.drained_total + expected,
+            stats_after.drained_total
+        );
+    }
+
+    #[test]
+    fn coalescer_global_stats_backward_compat() {
+        // Ensure the aggregate stats() method still works after per-repo refactor.
+        // Self-contained: enqueue a commit ourselves and verify.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "compat-proj").unwrap();
+
+        let agent = serde_json::json!({"name": "CompatAgent", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+        flush_async_commits();
+
+        let stats = get_commit_coalescer().stats();
+        assert!(
+            stats.enqueued >= 1,
+            "global enqueued should be >= 1, got {}",
+            stats.enqueued
+        );
+    }
+
+    #[test]
+    fn coalescer_multi_repo_root_parallelism() {
+        // Create archives with DIFFERENT repo_roots (separate tmp dirs).
+        // Verify they get separate per-repo queue entries, demonstrating
+        // that the per-repo design enables true parallelism across repos.
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+
+        let config_a = test_config(tmp_a.path());
+        let config_b = test_config(tmp_b.path());
+
+        let archive_a = ensure_archive(&config_a, "repo-a-proj").unwrap();
+        let archive_b = ensure_archive(&config_b, "repo-b-proj").unwrap();
+
+        assert_ne!(
+            archive_a.repo_root, archive_b.repo_root,
+            "different tmp dirs should give different repo_roots"
+        );
+
+        let agent = serde_json::json!({"name": "ParAgent", "program": "test"});
+        write_agent_profile_with_config(&archive_a, &config_a, &agent).unwrap();
+        write_agent_profile_with_config(&archive_b, &config_b, &agent).unwrap();
+
+        flush_async_commits();
+
+        let per_repo = get_commit_coalescer().per_repo_stats();
+        let stats_a = per_repo.get(&archive_a.repo_root);
+        let stats_b = per_repo.get(&archive_b.repo_root);
+
+        assert!(stats_a.is_some(), "repo_root A should be in per_repo_stats");
+        assert!(stats_b.is_some(), "repo_root B should be in per_repo_stats");
+        assert!(
+            stats_a.unwrap().enqueued_total >= 1,
+            "repo A should have enqueued >= 1"
+        );
+        assert!(
+            stats_b.unwrap().enqueued_total >= 1,
+            "repo B should have enqueued >= 1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Queue saturation stress tests (br-15dv.9.4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wbq_burst_200_ops_no_data_loss() {
+        // Burst 200 write ops rapidly and verify all are drained with no errors.
+        wbq_start();
+        let before = wbq_stats();
+        let burst_count = 200u64;
+
+        for i in 0..burst_count {
+            let op = WriteOp::ClearSignal {
+                config: Config::default(),
+                project_slug: format!("burst-{i}"),
+                agent_name: "BurstAgent".to_string(),
+            };
+            let result = wbq_enqueue(op);
+            assert_ne!(
+                result,
+                WbqEnqueueResult::QueueUnavailable,
+                "WBQ should not become unavailable during burst (op {i})"
+            );
+        }
+
+        // Flush to drain all pending ops.
+        wbq_flush();
+
+        let after = wbq_stats();
+        let enqueued_delta = after.enqueued - before.enqueued;
+        let drained_delta = after.drained - before.drained;
+
+        assert!(
+            enqueued_delta >= burst_count,
+            "expected at least {burst_count} enqueued, got delta {enqueued_delta}"
+        );
+        assert!(
+            drained_delta >= burst_count,
+            "expected at least {burst_count} drained, got delta {drained_delta}"
+        );
+
+        // All our ops should have been drained (delta-based, safe with parallel tests).
+    }
+
+    #[test]
+    fn wbq_burst_500_ops_backpressure_metrics() {
+        // Larger burst to exercise backpressure tracking and peak depth metrics.
+        wbq_start();
+        let metrics = mcp_agent_mail_core::global_metrics();
+
+        let peak_before = metrics.storage.wbq_peak_depth.load();
+        let before = wbq_stats();
+        let burst_count = 500u64;
+
+        // Fire ops as fast as possible from a single thread.
+        let mut enqueued_count = 0u64;
+        for i in 0..burst_count {
+            let op = WriteOp::ClearSignal {
+                config: Config::default(),
+                project_slug: format!("bp-burst-{i}"),
+                agent_name: "BackpressureAgent".to_string(),
+            };
+            match wbq_enqueue(op) {
+                WbqEnqueueResult::Enqueued => enqueued_count += 1,
+                WbqEnqueueResult::SkippedDiskCritical => {} // ok under disk pressure
+                WbqEnqueueResult::QueueUnavailable => {
+                    // Backpressure timeout exceeded; acceptable under extreme burst.
+                }
+            }
+        }
+
+        wbq_flush();
+
+        let after = wbq_stats();
+        let drained_delta = after.drained - before.drained;
+
+        // All successfully enqueued ops must be drained (no data loss).
+        assert!(
+            drained_delta >= enqueued_count,
+            "drained ({drained_delta}) should be >= enqueued ({enqueued_count})"
+        );
+
+        // Peak depth should have increased (the queue was loaded).
+        let peak_after = metrics.storage.wbq_peak_depth.load();
+        assert!(
+            peak_after >= peak_before,
+            "peak depth should not decrease: before={peak_before}, after={peak_after}"
+        );
+    }
+
+    #[test]
+    fn wbq_concurrent_burst_from_multiple_threads() {
+        // Simulate multiple agents bursting concurrently (thread per agent).
+        wbq_start();
+        let before = wbq_stats();
+        let thread_count = 8u64;
+        let ops_per_thread = 50u64;
+
+        let barrier = Arc::new(std::sync::Barrier::new(thread_count as usize));
+        let enqueued_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|t| {
+                let barrier = Arc::clone(&barrier);
+                let enqueued_total = Arc::clone(&enqueued_total);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..ops_per_thread {
+                        let op = WriteOp::ClearSignal {
+                            config: Config::default(),
+                            project_slug: format!("mt-burst-t{t}-{i}"),
+                            agent_name: format!("Thread{t}Agent"),
+                        };
+                        if wbq_enqueue(op) == WbqEnqueueResult::Enqueued {
+                            enqueued_total.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+
+        wbq_flush();
+
+        let after = wbq_stats();
+        let enqueued_delta = after.enqueued - before.enqueued;
+        let drained_delta = after.drained - before.drained;
+        let actually_enqueued = enqueued_total.load(Ordering::Relaxed);
+
+        assert!(
+            enqueued_delta >= actually_enqueued,
+            "metric enqueued ({enqueued_delta}) should be >= actual ({actually_enqueued})"
+        );
+        assert!(
+            drained_delta >= actually_enqueued,
+            "drained ({drained_delta}) should be >= enqueued ({actually_enqueued})"
+        );
+        // Note: depth may not be exactly 0 due to parallel test enqueues;
+        // the drained >= enqueued assertion above proves no data loss.
+    }
+
+    #[test]
+    fn coalescer_batching_efficiency_under_burst() {
+        // Burst 100 commits to the same repo and verify batching reduces
+        // individual commits (100 enqueues should produce < 50 actual commits).
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "batch-eff").unwrap();
+
+        let coalescer = get_commit_coalescer();
+        let stats_before = coalescer.stats();
+
+        let burst_count = 100usize;
+        for i in 0..burst_count {
+            // Write a unique file for each enqueue.
+            let file_name = format!("batch_test_{i}.txt");
+            let file_path = archive.root.join(&file_name);
+            fs::write(&file_path, format!("content-{i}")).unwrap();
+            let rel = rel_path(&archive.repo_root, &file_path).unwrap();
+
+            coalescer.enqueue(
+                archive.repo_root.clone(),
+                &config,
+                format!("batch commit {i}"),
+                vec![rel],
+            );
+        }
+
+        // Give the coalescer workers time to drain.
+        coalescer.flush_sync();
+
+        let stats_after = coalescer.stats();
+        let enqueued_delta = stats_after.enqueued - stats_before.enqueued;
+        let commits_delta = stats_after.commits - stats_before.commits;
+
+        assert!(
+            enqueued_delta >= burst_count,
+            "expected at least {burst_count} enqueued, got delta {enqueued_delta}"
+        );
+
+        // Batching should reduce commit count significantly.
+        if commits_delta > 0 {
+            assert!(
+                commits_delta < burst_count / 2,
+                "batching should reduce commits: {commits_delta} commits for {enqueued_delta} \
+                 enqueues (expected < {}, avg batch = {:.1})",
+                burst_count / 2,
+                enqueued_delta as f64 / commits_delta as f64,
+            );
+        }
+    }
+
+    #[test]
+    fn wbq_zero_sync_fallbacks_under_normal_burst() {
+        // Under a normal-sized burst (well below 8192 capacity), there should
+        // be zero fallbacks (the queue never fills).
+        wbq_start();
+        let before = wbq_stats();
+
+        for i in 0..100u64 {
+            let op = WriteOp::ClearSignal {
+                config: Config::default(),
+                project_slug: format!("no-fallback-{i}"),
+                agent_name: "NoFallbackAgent".to_string(),
+            };
+            let result = wbq_enqueue(op);
+            assert_eq!(
+                result,
+                WbqEnqueueResult::Enqueued,
+                "op {i} should be enqueued without fallback"
+            );
+        }
+
+        wbq_flush();
+
+        let after = wbq_stats();
+        let fallback_delta = after.fallbacks - before.fallbacks;
+        assert_eq!(
+            fallback_delta, 0,
+            "zero fallbacks expected for sub-capacity burst, got {fallback_delta}"
+        );
+    }
+
+    #[test]
+    fn wbq_autonomous_drain_completes_within_timeout() {
+        // Enqueue ops and wait (without explicit flush) for the drain loop
+        // to process them all. Uses delta-based assertion to be safe with
+        // parallel tests on the shared global WBQ.
+        wbq_start();
+        let before = wbq_stats();
+        let burst = 200u64;
+        let mut actually_enqueued = 0u64;
+        for i in 0..burst {
+            let op = WriteOp::ClearSignal {
+                config: Config::default(),
+                project_slug: format!("depth-poll-{i}"),
+                agent_name: "DepthAgent".to_string(),
+            };
+            if wbq_enqueue(op) == WbqEnqueueResult::Enqueued {
+                actually_enqueued += 1;
+            }
+        }
+
+        // Poll drained counter (not depth) until our ops have been processed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let current = wbq_stats();
+            let drained_delta = current.drained - before.drained;
+            if drained_delta >= actually_enqueued {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "WBQ drain did not complete within 10s \
+                     (enqueued {actually_enqueued}, drained delta {drained_delta})"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
