@@ -1139,10 +1139,18 @@ mod tests {
     #[test]
     fn since_timestamp_returns_newer_events_only() {
         let ring = EventRingBuffer::with_capacity(8);
-        let _ = ring.push(sample_http("/a", 200));
-        let _ = ring.push(sample_http("/b", 200));
+        // Use explicit timestamps to avoid sub-microsecond timing collisions.
+        let mut ev_a = sample_http("/a", 200);
+        ev_a.set_timestamp_if_unset(1_000_000);
+        let _ = ring.push(ev_a);
+        let mut ev_b = sample_http("/b", 200);
+        ev_b.set_timestamp_if_unset(2_000_000);
+        let _ = ring.push(ev_b);
         let cutoff = ring.iter_recent(2)[0].timestamp_micros();
-        let _ = ring.push(sample_http("/c", 200));
+        assert_eq!(cutoff, 1_000_000);
+        let mut ev_c = sample_http("/c", 200);
+        ev_c.set_timestamp_if_unset(3_000_000);
+        let _ = ring.push(ev_c);
 
         let newer = ring.since_timestamp(cutoff);
         assert_eq!(newer.len(), 2);
