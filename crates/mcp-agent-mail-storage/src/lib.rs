@@ -10,7 +10,7 @@
 //! - Agent profile writes
 //! - Notification signals
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
@@ -1205,7 +1205,7 @@ struct CoalescerSpillRepo {
     pending_requests: u64,
     earliest_enqueued_at: Instant,
     dirty_all: bool,
-    paths: HashSet<String>,
+    paths: BTreeSet<String>,
     git_author_name: String,
     git_author_email: String,
     message_first_lines: VecDeque<String>,
@@ -1422,7 +1422,7 @@ impl CommitCoalescer {
             pending_requests: 0,
             earliest_enqueued_at: fields.enqueued_at,
             dirty_all: false,
-            paths: HashSet::new(),
+            paths: BTreeSet::new(),
             git_author_name: fields.git_author_name.clone(),
             git_author_email: fields.git_author_email.clone(),
             message_first_lines: VecDeque::new(),
@@ -1726,10 +1726,13 @@ fn coalescer_pool_worker(
 
         let drained_count =
             batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
-        rq.depth.fetch_sub(
-            drained_count.min(rq.depth.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
-        );
+        // Single atomic fetch_sub avoids TOCTOU race of load-then-sub.
+        // If drained_count > prev (shouldn't happen, but guards against wrapping),
+        // clamp back to 0.
+        let prev = rq.depth.fetch_sub(drained_count, Ordering::Relaxed);
+        if drained_count > prev {
+            rq.depth.store(0, Ordering::Relaxed);
+        }
 
         // Phase 4: Commit
         if !batch.is_empty() {

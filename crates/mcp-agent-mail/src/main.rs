@@ -58,7 +58,16 @@ enum Commands {
 
     /// Show configuration
     Config,
+
+    /// Catch-all for unknown subcommands (denial gate per ADR-001)
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
+
+/// Commands accepted by the MCP server binary (per SPEC-meta-command-allowlist.md).
+/// `--version` and `--help` are handled by clap before dispatch.
+#[cfg(test)]
+const MCP_ALLOWED_COMMANDS: &[&str] = &["serve", "config"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ServeTransport {
@@ -246,6 +255,29 @@ fn main() {
             // Show configuration
             ftui_runtime::ftui_println!("{:#?}", config);
         }
+        Some(Commands::External(args)) => {
+            // Denial gate (ADR-001 Invariant 4, SPEC-denial-ux-contract)
+            let command = args.first().map_or("(unknown)", String::as_str);
+            render_denial(command);
+            std::process::exit(2);
+        }
+    }
+}
+
+/// MCP-mode denial renderer per SPEC-denial-ux-contract.md.
+///
+/// Prints a clear error to stderr explaining that the command belongs in the
+/// CLI binary, with remediation hints.
+fn render_denial(command: &str) {
+    eprintln!(
+        "Error: \"{command}\" is not an MCP server command.\n\n\
+         Agent Mail MCP server accepts: serve, config\n\
+         For operator CLI commands, use: mcp-agent-mail-cli {command}"
+    );
+
+    // Show tip only when a TTY is detected (human, not agent)
+    if std::io::stderr().is_terminal() {
+        eprintln!("\nTip: Run `mcp-agent-mail-cli --help` for the full command list.");
     }
 }
 
@@ -336,5 +368,48 @@ mod tests {
         assert_eq!(HttpPathSource::CliTransport.as_str(), "--transport");
         assert_eq!(HttpPathSource::EnvHttpPath.as_str(), "HTTP_PATH");
         assert_eq!(HttpPathSource::ServeDefault.as_str(), "serve-default");
+    }
+
+    // -- Denial gate tests (br-21gj.3.1, br-21gj.3.4) --
+
+    #[test]
+    fn unknown_subcommand_parsed_as_external() {
+        let cli = Cli::try_parse_from(["mcp-agent-mail", "share", "export"]).expect("should parse");
+
+        match cli.command {
+            Some(Commands::External(args)) => {
+                assert_eq!(args[0], "share");
+                assert_eq!(args[1], "export");
+            }
+            other => panic!("expected External, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_cli_commands_caught_by_external_gate() {
+        for cmd in &["share", "guard", "doctor", "archive", "migrate"] {
+            let cli = Cli::try_parse_from(["mcp-agent-mail", cmd]).expect("should parse");
+            assert!(
+                matches!(cli.command, Some(Commands::External(_))),
+                "{cmd} should be caught as External"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_commands_not_caught_by_external_gate() {
+        for cmd in MCP_ALLOWED_COMMANDS {
+            let cli = Cli::try_parse_from(["mcp-agent-mail", cmd]).expect("should parse");
+            assert!(
+                !matches!(cli.command, Some(Commands::External(_))),
+                "{cmd} should NOT be caught as External"
+            );
+        }
+    }
+
+    #[test]
+    fn no_subcommand_is_none() {
+        let cli = Cli::try_parse_from(["mcp-agent-mail"]).expect("should parse");
+        assert!(cli.command.is_none());
     }
 }

@@ -543,6 +543,7 @@ mod tests {
                     p95: 0,
                     p99: 0,
                 },
+                contact_enforcement_bypass_total: 0,
             },
             db: DbMetricsSnapshot {
                 pool_acquires_total: 0,
