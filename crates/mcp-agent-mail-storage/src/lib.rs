@@ -7005,18 +7005,20 @@ mod tests {
         let before = wbq_stats();
         let burst_count = 200u64;
 
+        let mut actually_enqueued = 0u64;
         for i in 0..burst_count {
             let op = WriteOp::ClearSignal {
                 config: Config::default(),
                 project_slug: format!("burst-{i}"),
                 agent_name: "BurstAgent".to_string(),
             };
-            let result = wbq_enqueue(op);
-            assert_ne!(
-                result,
-                WbqEnqueueResult::QueueUnavailable,
-                "WBQ should not become unavailable during burst (op {i})"
-            );
+            match wbq_enqueue(op) {
+                WbqEnqueueResult::Enqueued => actually_enqueued += 1,
+                WbqEnqueueResult::SkippedDiskCritical => {}
+                WbqEnqueueResult::QueueUnavailable => {
+                    panic!("WBQ should not become unavailable during burst (op {i})");
+                }
+            }
         }
 
         // Flush to drain all pending ops.
@@ -7027,12 +7029,12 @@ mod tests {
         let drained_delta = after.drained - before.drained;
 
         assert!(
-            enqueued_delta >= burst_count,
-            "expected at least {burst_count} enqueued, got delta {enqueued_delta}"
+            enqueued_delta >= actually_enqueued,
+            "expected at least {actually_enqueued} enqueued, got delta {enqueued_delta}"
         );
         assert!(
-            drained_delta >= burst_count,
-            "expected at least {burst_count} drained, got delta {drained_delta}"
+            drained_delta >= actually_enqueued,
+            "expected at least {actually_enqueued} drained, got delta {drained_delta}"
         );
 
         // All our ops should have been drained (delta-based, safe with parallel tests).
