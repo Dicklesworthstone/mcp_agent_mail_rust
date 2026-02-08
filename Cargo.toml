@@ -41,6 +41,8 @@ ftui = { path = "../frankentui/crates/ftui" }
 ftui-runtime = { path = "../frankentui/crates/ftui-runtime" }
 ftui-extras = { path = "../frankentui/crates/ftui-extras", features = ["theme", "syntax", "export"] }
 ftui-widgets = { path = "../frankentui/crates/ftui-widgets" }
+ftui-harness = { path = "../frankentui/crates/ftui-harness" }
+ftui-render = { path = "../frankentui/crates/ftui-render" }
 beads_rust = { path = "../beads_rust" }
 
 # Agent detection (tokio-based upstream; declare optional in crates that use it)

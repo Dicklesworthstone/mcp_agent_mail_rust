@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1174,28 +1174,25 @@ pub fn get_commit_queue() -> &'static OrderedMutex<Option<CommitQueue>> {
 // Async commit coalescer (fire-and-forget git commits)
 // ---------------------------------------------------------------------------
 //
-// Architecture for extreme-load resilience:
+// Architecture for extreme-load resilience with per-project parallelism:
 //
 //   Tool call:  write files → enqueue_async_commit() → return immediately
-//   Worker:     accumulate requests → batch by repo → single commit per repo
+//   Per-repo:   each repo_root gets its own queue + spill + metrics
+//   Workers:    N threads pick repos via LRS (least-recently-serviced) scheduling
+//               Only one worker processes a given repo at a time (CAS lock)
 //
-// Under extreme load (50 agents, 1000s of ops/sec), commits coalesce:
-// - 50ms window → requests batch into bounded commits per repo
-// - Zero git contention on the tool hot path
-// - If worker dies, fallback to synchronous commit (no data loss)
-
-/// Messages sent to the coalescer worker thread.
-enum CoalescerMsg {
-    /// A commit request to be batched.
-    Commit(CoalescerCommitFields),
-    /// Flush all pending commits and signal completion via the sender.
-    Flush(std::sync::mpsc::SyncSender<()>),
-}
+// Under extreme load (1000+ agents across 50+ projects):
+// - Different projects commit in true parallel (no cross-project serialization)
+// - Per-repo batching coalesces many small commits into fewer large ones
+// - LRS scheduling ensures fairness: no hot project starves others
+// - Spill mechanism keeps the tool hot path non-blocking when queues are full
+// - If all workers die, fallback to synchronous commit (no data loss)
 
 /// Fields for a single commit request within the coalescer pipeline.
+///
+/// Note: `repo_root` is NOT stored here — it's the key in the per-repo queue map.
 struct CoalescerCommitFields {
     enqueued_at: Instant,
-    repo_root: PathBuf,
     git_author_name: String,
     git_author_email: String,
     message: String,
@@ -1225,84 +1222,154 @@ struct CoalescerSpilledWork {
     message_total: u64,
 }
 
-struct CommitCoalescerShard {
-    sender: std::sync::mpsc::SyncSender<CoalescerMsg>,
-    spill: Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>>,
+/// Per-repo queue with dedicated spill, processing lock, and metrics.
+struct RepoQueue {
+    queue: Mutex<VecDeque<CoalescerCommitFields>>,
+    spill: Mutex<CoalescerSpillState>,
+    /// Atomic depth counter (number of items in queue + spill).
+    depth: AtomicU64,
+    /// CAS lock: only one worker thread may process this repo at a time.
+    processing: AtomicBool,
+    /// Microsecond timestamp of last time a worker finished processing this repo.
+    last_serviced_us: AtomicU64,
+    /// Per-repo metrics for observability.
+    metrics: RepoCommitMetrics,
 }
 
-/// Fire-and-forget git commit coalescer with background worker thread.
+/// Spill state for a single repo (replaces the per-shard HashMap<PathBuf, _>).
+struct CoalescerSpillState {
+    inner: Option<CoalescerSpillRepo>,
+}
+
+impl Default for CoalescerSpillState {
+    fn default() -> Self {
+        Self { inner: None }
+    }
+}
+
+/// Per-repo commit metrics.
+struct RepoCommitMetrics {
+    enqueued_total: AtomicU64,
+    drained_total: AtomicU64,
+    commits_total: AtomicU64,
+    errors_total: AtomicU64,
+    retries_total: AtomicU64,
+    commit_latency_us_sum: AtomicU64,
+    commit_latency_us_count: AtomicU64,
+}
+
+impl Default for RepoCommitMetrics {
+    fn default() -> Self {
+        Self {
+            enqueued_total: AtomicU64::new(0),
+            drained_total: AtomicU64::new(0),
+            commits_total: AtomicU64::new(0),
+            errors_total: AtomicU64::new(0),
+            retries_total: AtomicU64::new(0),
+            commit_latency_us_sum: AtomicU64::new(0),
+            commit_latency_us_count: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Snapshot of per-repo commit queue statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoCommitStats {
+    pub queue_depth: u64,
+    pub enqueued_total: u64,
+    pub drained_total: u64,
+    pub commits_total: u64,
+    pub errors_total: u64,
+    pub retries_total: u64,
+    pub avg_commit_latency_us: u64,
+}
+
+/// Fire-and-forget git commit coalescer with per-repo queues and worker pool.
 ///
-/// All git index+commit operations are offloaded to a dedicated worker thread
-/// that batches requests by repository and commits at a configurable interval.
+/// Each unique `repo_root` gets its own queue, spill buffer, and metrics.
+/// A pool of N worker threads services repos via LRS (least-recently-serviced)
+/// scheduling, ensuring fairness across projects.
+///
+/// Only one worker processes a given repo at a time (CAS lock on `processing`),
+/// preventing git index.lock contention between workers on the same repo.
+///
 /// Tool responses never wait for git — they return as soon as files are on disk.
-///
-/// Under extreme load, this naturally coalesces many small commits into fewer
-/// large ones, dramatically reducing git index.lock contention.
 pub struct CommitCoalescer {
-    shards: Vec<CommitCoalescerShard>,
+    /// Per-repo queues, lazily created on first enqueue.
+    repos: Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
+    /// Condvar to wake workers when work is available.
+    work_cv: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// Signal workers to shut down.
+    shutdown: Arc<AtomicBool>,
+    /// Global stats (backward-compatible aggregate view).
     stats: Arc<Mutex<CommitQueueStats>>,
     pending_requests: Arc<AtomicU64>,
-    /// Kept alive to share with worker thread (accessed via Arc clone).
+    /// Rolling batch size window for avg_batch_size calculation.
     _batch_sizes: Arc<Mutex<VecDeque<usize>>>,
+    /// Number of worker threads spawned.
+    worker_count: usize,
 }
 
 /// Default flush interval for the coalescer (50ms).
 ///
 /// This is the maximum time a commit request waits before being processed.
-/// Under sustained load, the worker drains all pending requests every interval.
+/// Under sustained load, workers drain all pending requests every interval.
 pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 50;
 
 const COALESCER_MAX_BATCH_SIZE: usize = 10;
-const COMMIT_COALESCER_SHARDS: usize = 4;
 const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
-const COMMIT_COALESCER_SHARD_CAPACITY: usize =
-    COMMIT_COALESCER_SOFT_CAP.div_ceil(COMMIT_COALESCER_SHARDS as u64) as usize;
+/// Maximum worker threads for the coalescer pool.
+const COALESCER_MAX_WORKERS: usize = 32;
+/// Per-repo queue capacity before spilling.
+const COALESCER_REPO_QUEUE_CAP: usize = 512;
 
 const COALESCER_SPILL_PATH_CAP: usize = 4_096;
 const COALESCER_SPILL_MESSAGE_CAP: usize = 32;
 const COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS: usize = 120;
 
-fn coalescer_shard_idx(repo_root: &Path, shard_count: usize) -> usize {
-    if shard_count <= 1 {
-        return 0;
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(repo_root, &mut hasher);
-    (std::hash::Hasher::finish(&hasher) as usize) % shard_count
+/// Auto-detect worker count: `min(available_parallelism, COALESCER_MAX_WORKERS)`, minimum 2.
+fn coalescer_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, COALESCER_MAX_WORKERS)
 }
 
 impl CommitCoalescer {
-    /// Create a new coalescer and spawn the background worker thread.
+    /// Create a new coalescer and spawn the worker pool.
     pub fn new(flush_interval: Duration) -> Self {
         let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
         let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
         let pending_requests = Arc::new(AtomicU64::new(0));
-        let mut shards = Vec::with_capacity(COMMIT_COALESCER_SHARDS);
-        for shard_idx in 0..COMMIT_COALESCER_SHARDS {
-            let (tx, rx) = std::sync::mpsc::sync_channel(COMMIT_COALESCER_SHARD_CAPACITY);
-            let spill: Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>> =
-                Arc::new(Mutex::new(HashMap::new()));
+        let repos: Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let work_cv = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-            let worker_stats = Arc::clone(&stats);
-            let worker_sizes = Arc::clone(&batch_sizes);
-            let worker_pending_requests = Arc::clone(&pending_requests);
-            let worker_spill = Arc::clone(&spill);
+        let worker_count = coalescer_worker_count();
+
+        for worker_idx in 0..worker_count {
+            let w_repos = Arc::clone(&repos);
+            let w_cv = Arc::clone(&work_cv);
+            let w_shutdown = Arc::clone(&shutdown);
+            let w_stats = Arc::clone(&stats);
+            let w_sizes = Arc::clone(&batch_sizes);
+            let w_pending = Arc::clone(&pending_requests);
 
             std::thread::Builder::new()
-                .name(format!("commit-coalescer-{shard_idx}"))
+                .name(format!("commit-coalescer-{worker_idx}"))
                 .spawn(move || {
-                    coalescer_worker_loop(
-                        rx,
-                        worker_stats,
-                        worker_sizes,
-                        worker_pending_requests,
-                        worker_spill,
+                    coalescer_pool_worker(
+                        w_repos,
+                        w_cv,
+                        w_shutdown,
+                        w_stats,
+                        w_sizes,
+                        w_pending,
                         flush_interval,
                     );
                 })
                 .expect("failed to spawn commit coalescer worker");
-
-            shards.push(CommitCoalescerShard { sender: tx, spill });
         }
 
         mcp_agent_mail_core::global_metrics()
@@ -1311,19 +1378,36 @@ impl CommitCoalescer {
             .set(COMMIT_COALESCER_SOFT_CAP);
 
         Self {
-            shards,
+            repos,
+            work_cv,
+            shutdown,
             stats,
             pending_requests,
             _batch_sizes: batch_sizes,
+            worker_count,
         }
     }
 
-    fn spill_commit_fields(
-        spill: &Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>>,
-        fields: CoalescerCommitFields,
-    ) {
-        let repo_root = fields.repo_root;
+    /// Get or create a per-repo queue for the given repo_root.
+    fn get_or_create_repo(&self, repo_root: &Path) -> Arc<RepoQueue> {
+        let mut repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rq) = repos.get(repo_root) {
+            return Arc::clone(rq);
+        }
+        let rq = Arc::new(RepoQueue {
+            queue: Mutex::new(VecDeque::new()),
+            spill: Mutex::new(CoalescerSpillState::default()),
+            depth: AtomicU64::new(0),
+            processing: AtomicBool::new(false),
+            last_serviced_us: AtomicU64::new(0),
+            metrics: RepoCommitMetrics::default(),
+        });
+        repos.insert(repo_root.to_path_buf(), Arc::clone(&rq));
+        rq
+    }
 
+    /// Spill commit fields into the per-repo spill buffer.
+    fn spill_to_repo(rq: &RepoQueue, fields: CoalescerCommitFields) {
         let first_line = fields
             .message
             .lines()
@@ -1331,24 +1415,22 @@ impl CommitCoalescer {
             .unwrap_or("")
             .trim()
             .to_string();
-        let first_line = first_line
+        let first_line: String = first_line
             .chars()
             .take(COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS)
-            .collect::<String>();
+            .collect();
 
-        let mut guard = spill.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = guard
-            .entry(repo_root)
-            .or_insert_with(|| CoalescerSpillRepo {
-                pending_requests: 0,
-                earliest_enqueued_at: fields.enqueued_at,
-                dirty_all: false,
-                paths: HashSet::new(),
-                git_author_name: fields.git_author_name.clone(),
-                git_author_email: fields.git_author_email.clone(),
-                message_first_lines: VecDeque::new(),
-                message_total: 0,
-            });
+        let mut guard = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.inner.get_or_insert_with(|| CoalescerSpillRepo {
+            pending_requests: 0,
+            earliest_enqueued_at: fields.enqueued_at,
+            dirty_all: false,
+            paths: HashSet::new(),
+            git_author_name: fields.git_author_name.clone(),
+            git_author_email: fields.git_author_email.clone(),
+            message_first_lines: VecDeque::new(),
+            message_total: 0,
+        });
 
         entry.pending_requests = entry.pending_requests.saturating_add(1);
         entry.message_total = entry.message_total.saturating_add(1);
@@ -1356,7 +1438,6 @@ impl CommitCoalescer {
             entry.earliest_enqueued_at = fields.enqueued_at;
         }
 
-        // Use the most recent author info (expected to be stable).
         entry.git_author_name = fields.git_author_name;
         entry.git_author_email = fields.git_author_email;
 
@@ -1379,10 +1460,10 @@ impl CommitCoalescer {
     /// Enqueue a commit request. **Non-blocking, fire-and-forget.**
     ///
     /// Files must already be written to disk before calling this.
-    /// The background worker will add them to the git index and commit.
+    /// The background worker pool will add them to the git index and commit.
     ///
-    /// If the worker thread is unreachable (e.g., panicked), falls back to
-    /// a synchronous commit to prevent data loss.
+    /// Each unique `repo_root` gets its own queue, enabling true per-project
+    /// parallelism across the worker pool.
     pub fn enqueue(
         &self,
         repo_root: PathBuf,
@@ -1402,18 +1483,17 @@ impl CommitCoalescer {
             s.enqueued += 1;
         }
 
-        let shard_idx = coalescer_shard_idx(&repo_root, self.shards.len());
-        let shard = &self.shards[shard_idx];
+        let rq = self.get_or_create_repo(&repo_root);
+        rq.metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
 
         let enqueued_at = Instant::now();
-        let msg = CoalescerMsg::Commit(CoalescerCommitFields {
+        let fields = CoalescerCommitFields {
             enqueued_at,
-            repo_root,
             git_author_name: config.git_author_name.clone(),
             git_author_email: config.git_author_email.clone(),
             message,
             rel_paths,
-        });
+        };
 
         let pending = self
             .pending_requests
@@ -1439,69 +1519,32 @@ impl CommitCoalescer {
             metrics.storage.commit_over_80_since_us.set(0);
         }
 
-        match shard.sender.try_send(msg) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(CoalescerMsg::Commit(fields))) => {
-                // Queue is saturated. Spill minimal coalescable state so the tool hot path stays
-                // non-blocking and memory remains bounded.
-                Self::spill_commit_fields(&shard.spill, fields);
+        // Try to push into the per-repo queue; spill if full.
+        let queue_depth = rq.depth.load(Ordering::Relaxed);
+        if queue_depth < COALESCER_REPO_QUEUE_CAP as u64 {
+            let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+            // Re-check under lock
+            if q.len() < COALESCER_REPO_QUEUE_CAP {
+                q.push_back(fields);
+                drop(q);
+                rq.depth.fetch_add(1, Ordering::Relaxed);
+            } else {
+                drop(q);
+                Self::spill_to_repo(&rq, fields);
+                rq.depth.fetch_add(1, Ordering::Relaxed);
             }
-            Err(std::sync::mpsc::TrySendError::Full(CoalescerMsg::Flush(_))) => {
-                // We never send Flush from enqueue(), but handle defensively.
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(CoalescerMsg::Commit(fields))) => {
-                // Worker thread died — synchronous fallback prevents data loss for files already
-                // on disk. This is NOT a saturation policy.
-                tracing::warn!("[commit-coalescer] worker unreachable, sync fallback");
-                metrics.storage.commit_sync_fallbacks_total.inc();
-
-                let mut sync_ok = false;
-                if let Ok(repo) = Repository::open(&fields.repo_root) {
-                    let refs: Vec<&str> = fields.rel_paths.iter().map(String::as_str).collect();
-                    sync_ok = commit_paths(&repo, config, &fields.message, &refs).is_ok();
-                }
-                if !sync_ok {
-                    metrics.storage.commit_errors_total.inc();
-                    let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
-                    s.errors += 1;
-                }
-
-                let latency_us = u64::try_from(
-                    fields
-                        .enqueued_at
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX)),
-                )
-                .unwrap_or(u64::MAX);
-                metrics.storage.commit_queue_latency_us.record(latency_us);
-                metrics.storage.commit_drained_total.inc();
-
-                let pending_after = self
-                    .pending_requests
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                        Some(cur.saturating_sub(1))
-                    })
-                    .unwrap_or(0)
-                    .saturating_sub(1);
-                metrics.storage.commit_pending_requests.set(pending_after);
-
-                let threshold = COMMIT_COALESCER_SOFT_CAP
-                    .saturating_mul(80)
-                    .saturating_div(100);
-                if threshold > 0 && pending_after >= threshold {
-                    if metrics.storage.commit_over_80_since_us.load() == 0 {
-                        metrics
-                            .storage
-                            .commit_over_80_since_us
-                            .set(now_micros_u64());
-                    }
-                } else {
-                    metrics.storage.commit_over_80_since_us.set(0);
-                }
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(CoalescerMsg::Flush(_))) => {}
+        } else {
+            Self::spill_to_repo(&rq, fields);
+            rq.depth.fetch_add(1, Ordering::Relaxed);
         }
+
+        // Wake a worker
+        let (lock, cvar) = &*self.work_cv;
+        {
+            let mut ready = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *ready = true;
+        }
+        cvar.notify_one();
     }
 
     /// Block until all pending commits are flushed to git.
@@ -1510,120 +1553,191 @@ impl CommitCoalescer {
     /// commits are persisted before proceeding.
     pub fn flush_sync(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut done_rxs = Vec::with_capacity(self.shards.len());
 
-        for shard in &self.shards {
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-            let mut msg = CoalescerMsg::Flush(done_tx);
-            loop {
-                match shard.sender.try_send(msg) {
-                    Ok(()) => {
-                        done_rxs.push(done_rx);
-                        break;
-                    }
-                    Err(std::sync::mpsc::TrySendError::Full(m)) => {
-                        msg = m;
-                        if Instant::now() >= deadline {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                }
+        loop {
+            // Wake all workers
+            {
+                let (lock, cvar) = &*self.work_cv;
+                let mut ready = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *ready = true;
+                cvar.notify_all();
             }
-        }
 
-        for done_rx in done_rxs {
-            if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-                let _ = done_rx.recv_timeout(remaining);
-            } else {
-                return;
+            // Check if all repos are empty and not being processed
+            let all_empty = {
+                let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                repos.values().all(|rq| {
+                    rq.depth.load(Ordering::Relaxed) == 0
+                        && !rq.processing.load(Ordering::Relaxed)
+                })
+            };
+
+            if all_empty || Instant::now() >= deadline {
+                break;
             }
+
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
-    /// Get coalescer statistics.
+    /// Get coalescer statistics (aggregate across all repos).
     pub fn stats(&self) -> CommitQueueStats {
         let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        s.queue_size = 0;
+        // Sum queue depths across all repos
+        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        s.queue_size = repos
+            .values()
+            .map(|rq| rq.depth.load(Ordering::Relaxed) as usize)
+            .sum();
         s
+    }
+
+    /// Get per-repo commit statistics for observability.
+    pub fn per_repo_stats(&self) -> HashMap<PathBuf, RepoCommitStats> {
+        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        repos
+            .iter()
+            .map(|(path, rq)| {
+                let count = rq.metrics.commit_latency_us_count.load(Ordering::Relaxed);
+                let sum = rq.metrics.commit_latency_us_sum.load(Ordering::Relaxed);
+                let avg = if count == 0 { 0 } else { sum / count };
+                (
+                    path.clone(),
+                    RepoCommitStats {
+                        queue_depth: rq.depth.load(Ordering::Relaxed),
+                        enqueued_total: rq.metrics.enqueued_total.load(Ordering::Relaxed),
+                        drained_total: rq.metrics.drained_total.load(Ordering::Relaxed),
+                        commits_total: rq.metrics.commits_total.load(Ordering::Relaxed),
+                        errors_total: rq.metrics.errors_total.load(Ordering::Relaxed),
+                        retries_total: rq.metrics.retries_total.load(Ordering::Relaxed),
+                        avg_commit_latency_us: avg,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Number of worker threads in the pool.
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
     }
 }
 
-/// Background worker loop for the commit coalescer.
+impl Drop for CommitCoalescer {
+    fn drop(&mut self) {
+        // Signal all workers to exit
+        self.shutdown.store(true, Ordering::Release);
+        let (_, cvar) = &*self.work_cv;
+        cvar.notify_all();
+    }
+}
+
+/// Worker thread for the per-repo commit coalescer pool.
 ///
 /// Strategy:
-/// 1. Block on channel until a request arrives (or flush interval elapses)
-/// 2. Drain all pending requests (non-blocking)
-/// 3. Group by repo, merge non-conflicting paths into single commits
-/// 4. Commit with retry+jitter on index.lock contention
-/// 5. Repeat
-fn coalescer_worker_loop(
-    rx: std::sync::mpsc::Receiver<CoalescerMsg>,
+/// 1. Wait on condvar (with flush_interval timeout)
+/// 2. Scan all repos; pick the one with lowest last_serviced_us that has depth > 0
+///    and is not currently being processed by another worker (CAS lock)
+/// 3. Drain its queue + spill (up to batch size)
+/// 4. Commit batch for that single repo
+/// 5. Update per-repo and global metrics
+/// 6. If more work remains across any repo, re-signal condvar
+/// 7. Repeat
+fn coalescer_pool_worker(
+    repos: Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
+    work_cv: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<CommitQueueStats>>,
     batch_sizes: Arc<Mutex<VecDeque<usize>>>,
     pending_requests: Arc<AtomicU64>,
-    spill: Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>>,
     flush_interval: Duration,
 ) {
-    let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
-
     loop {
-        let mut pending: HashMap<PathBuf, Vec<CoalescerCommitFields>> = HashMap::new();
-
-        // Phase 1: Block until first message or timeout
-        match rx.recv_timeout(flush_interval) {
-            Ok(CoalescerMsg::Commit(fields)) => {
-                pending
-                    .entry(fields.repo_root.clone())
-                    .or_default()
-                    .push(fields);
-            }
-            Ok(CoalescerMsg::Flush(done_tx)) => {
-                flush_waiters.push(done_tx);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // No channel message: continue to spill-drain / flush notification below.
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        if shutdown.load(Ordering::Relaxed) {
+            return;
         }
 
-        // Phase 2: Drain all immediately available messages
-        loop {
-            match rx.try_recv() {
-                Ok(CoalescerMsg::Commit(fields)) => {
-                    pending
-                        .entry(fields.repo_root.clone())
-                        .or_default()
-                        .push(fields);
-                }
-                Ok(CoalescerMsg::Flush(done_tx)) => {
-                    flush_waiters.push(done_tx);
-                }
-                Err(_) => break,
-            }
+        // Phase 1: Wait for work or timeout
+        {
+            let (lock, cvar) = &*work_cv;
+            let ready = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = cvar
+                .wait_timeout(ready, flush_interval)
+                .unwrap_or_else(|e| e.into_inner());
         }
 
-        let spilled = coalescer_drain_spill(&spill);
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
 
-        if pending.is_empty() && spilled.is_empty() {
-            // Nothing pending — notify any flush waiters and continue
-            for w in flush_waiters.drain(..) {
-                let _ = w.try_send(());
+        // Phase 2: Pick a repo via LRS (least-recently-serviced) scheduling
+        let chosen: Option<(PathBuf, Arc<RepoQueue>)> = {
+            let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut best: Option<(PathBuf, Arc<RepoQueue>, u64)> = None;
+            for (path, rq) in repos_guard.iter() {
+                let depth = rq.depth.load(Ordering::Relaxed);
+                if depth == 0 {
+                    continue;
+                }
+                // Skip repos already being processed by another worker
+                if rq.processing.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let serviced = rq.last_serviced_us.load(Ordering::Relaxed);
+                if best.as_ref().is_none_or(|(_, _, best_ts)| serviced < *best_ts) {
+                    best = Some((path.clone(), Arc::clone(rq), serviced));
+                }
             }
+            best.map(|(p, rq, _)| (p, rq))
+        };
+
+        let Some((repo_root, rq)) = chosen else {
+            continue;
+        };
+
+        // CAS: claim exclusive processing of this repo
+        if rq
+            .processing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // Another worker beat us to it; try again
             continue;
         }
 
-        // Phase 3: Commit batches by repo
-        for (repo_root, requests) in pending {
-            for chunk in requests.chunks(COALESCER_MAX_BATCH_SIZE) {
+        // Phase 3: Drain queue + spill for this repo
+        let mut batch: Vec<CoalescerCommitFields> = Vec::new();
+        {
+            let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+            while batch.len() < COALESCER_MAX_BATCH_SIZE {
+                if let Some(fields) = q.pop_front() {
+                    batch.push(fields);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Drain spill if we have room
+        let spilled_work = coalescer_drain_repo_spill(&rq, &repo_root);
+
+        let drained_count = batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
+        rq.depth.fetch_sub(
+            drained_count.min(rq.depth.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+
+        // Phase 4: Commit
+        if !batch.is_empty() {
+            for chunk in batch.chunks(COALESCER_MAX_BATCH_SIZE) {
                 coalescer_commit_batch(&repo_root, chunk, &stats, &batch_sizes);
 
-                let drained_u64 = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
                 let metrics = mcp_agent_mail_core::global_metrics();
-                metrics.storage.commit_drained_total.add(drained_u64);
+                metrics.storage.commit_drained_total.add(chunk_len);
+                rq.metrics.drained_total.fetch_add(chunk_len, Ordering::Relaxed);
+                rq.metrics.commits_total.fetch_add(1, Ordering::Relaxed);
 
-                // End-to-end latency: from enqueue to commit completion (or failure).
                 for req in chunk {
                     let latency_us = u64::try_from(
                         req.enqueued_at
@@ -1633,38 +1747,27 @@ fn coalescer_worker_loop(
                     )
                     .unwrap_or(u64::MAX);
                     metrics.storage.commit_queue_latency_us.record(latency_us);
+                    rq.metrics
+                        .commit_latency_us_sum
+                        .fetch_add(latency_us, Ordering::Relaxed);
+                    rq.metrics
+                        .commit_latency_us_count
+                        .fetch_add(1, Ordering::Relaxed);
                 }
 
-                let pending_after = pending_requests
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                        Some(cur.saturating_sub(drained_u64))
-                    })
-                    .unwrap_or(0)
-                    .saturating_sub(drained_u64);
-                metrics.storage.commit_pending_requests.set(pending_after);
-
-                let threshold = COMMIT_COALESCER_SOFT_CAP
-                    .saturating_mul(80)
-                    .saturating_div(100);
-                if threshold > 0 && pending_after >= threshold {
-                    if metrics.storage.commit_over_80_since_us.load() == 0 {
-                        metrics
-                            .storage
-                            .commit_over_80_since_us
-                            .set(now_micros_u64());
-                    }
-                } else {
-                    metrics.storage.commit_over_80_since_us.set(0);
-                }
+                coalescer_update_pending(&pending_requests, chunk_len);
             }
         }
 
-        for work in &spilled {
+        if let Some(work) = &spilled_work {
             coalescer_commit_spilled_work(work, &stats, &batch_sizes);
 
-            let drained_u64 = work.pending_requests;
             let metrics = mcp_agent_mail_core::global_metrics();
-            metrics.storage.commit_drained_total.add(drained_u64);
+            metrics.storage.commit_drained_total.add(work.pending_requests);
+            rq.metrics
+                .drained_total
+                .fetch_add(work.pending_requests, Ordering::Relaxed);
+            rq.metrics.commits_total.fetch_add(1, Ordering::Relaxed);
 
             let latency_us = u64::try_from(
                 work.earliest_enqueued_at
@@ -1674,60 +1777,82 @@ fn coalescer_worker_loop(
             )
             .unwrap_or(u64::MAX);
             metrics.storage.commit_queue_latency_us.record(latency_us);
+            rq.metrics
+                .commit_latency_us_sum
+                .fetch_add(latency_us, Ordering::Relaxed);
+            rq.metrics
+                .commit_latency_us_count
+                .fetch_add(1, Ordering::Relaxed);
 
-            let pending_after = pending_requests
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(drained_u64))
-                })
-                .unwrap_or(0)
-                .saturating_sub(drained_u64);
-            metrics.storage.commit_pending_requests.set(pending_after);
-
-            let threshold = COMMIT_COALESCER_SOFT_CAP
-                .saturating_mul(80)
-                .saturating_div(100);
-            if threshold > 0 && pending_after >= threshold {
-                if metrics.storage.commit_over_80_since_us.load() == 0 {
-                    metrics
-                        .storage
-                        .commit_over_80_since_us
-                        .set(now_micros_u64());
-                }
-            } else {
-                metrics.storage.commit_over_80_since_us.set(0);
-            }
+            coalescer_update_pending(&pending_requests, work.pending_requests);
         }
 
-        // Phase 4: Notify flush waiters that all pending work is done
-        for w in flush_waiters.drain(..) {
-            let _ = w.try_send(());
+        // Release processing lock + update last_serviced timestamp
+        rq.last_serviced_us.store(now_micros_u64(), Ordering::Relaxed);
+        rq.processing.store(false, Ordering::Release);
+
+        // If any repo still has work, wake another worker
+        let more_work = {
+            let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
+            repos_guard
+                .values()
+                .any(|r| r.depth.load(Ordering::Relaxed) > 0)
+        };
+        if more_work {
+            let (lock, cvar) = &*work_cv;
+            {
+                let mut ready = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *ready = true;
+            }
+            cvar.notify_one();
         }
     }
 }
 
-fn coalescer_drain_spill(
-    spill: &Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>>,
-) -> Vec<CoalescerSpilledWork> {
-    let mut guard = spill.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_empty() {
-        return Vec::new();
-    }
+/// Update global pending_requests counter and 80% threshold metric.
+fn coalescer_update_pending(pending_requests: &Arc<AtomicU64>, drained: u64) {
+    let metrics = mcp_agent_mail_core::global_metrics();
+    let pending_after = pending_requests
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(drained))
+        })
+        .unwrap_or(0)
+        .saturating_sub(drained);
+    metrics.storage.commit_pending_requests.set(pending_after);
 
-    let mut drained = Vec::with_capacity(guard.len());
-    for (repo_root, repo) in guard.drain() {
-        drained.push(CoalescerSpilledWork {
-            repo_root,
-            pending_requests: repo.pending_requests,
-            earliest_enqueued_at: repo.earliest_enqueued_at,
-            dirty_all: repo.dirty_all,
-            paths: repo.paths.into_iter().collect(),
-            git_author_name: repo.git_author_name,
-            git_author_email: repo.git_author_email,
-            message_first_lines: repo.message_first_lines.into_iter().collect(),
-            message_total: repo.message_total,
-        });
+    let threshold = COMMIT_COALESCER_SOFT_CAP
+        .saturating_mul(80)
+        .saturating_div(100);
+    if threshold > 0 && pending_after >= threshold {
+        if metrics.storage.commit_over_80_since_us.load() == 0 {
+            metrics
+                .storage
+                .commit_over_80_since_us
+                .set(now_micros_u64());
+        }
+    } else {
+        metrics.storage.commit_over_80_since_us.set(0);
     }
-    drained
+}
+
+/// Drain a single repo's spill buffer into a `CoalescerSpilledWork`.
+fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<CoalescerSpilledWork> {
+    let mut guard = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = guard.inner.take()?;
+    if repo.pending_requests == 0 {
+        return None;
+    }
+    Some(CoalescerSpilledWork {
+        repo_root: repo_root.to_path_buf(),
+        pending_requests: repo.pending_requests,
+        earliest_enqueued_at: repo.earliest_enqueued_at,
+        dirty_all: repo.dirty_all,
+        paths: repo.paths.into_iter().collect(),
+        git_author_name: repo.git_author_name,
+        git_author_email: repo.git_author_email,
+        message_first_lines: repo.message_first_lines.into_iter().collect(),
+        message_total: repo.message_total,
+    })
 }
 
 fn coalescer_commit_spilled_work(

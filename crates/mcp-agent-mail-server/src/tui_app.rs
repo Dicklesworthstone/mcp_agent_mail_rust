@@ -246,6 +246,15 @@ impl MailAppModel {
                 self.accessibility.key_hints = !self.accessibility.key_hints;
                 return Cmd::none();
             }
+            palette_action_ids::THEME_CYCLE => {
+                let name = crate::tui_theme::cycle_and_get_name();
+                self.notifications.notify(
+                    Toast::new(format!("Theme: {name}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                return Cmd::none();
+            }
             _ => {}
         }
 
@@ -387,6 +396,15 @@ impl Model for MailAppModel {
                                 let _ = self
                                     .state
                                     .try_send_server_control(ServerControlMsg::ToggleTransportBase);
+                                return Cmd::none();
+                            }
+                            KeyCode::Char('T') if !text_mode => {
+                                let name = crate::tui_theme::cycle_and_get_name();
+                                self.notifications.notify(
+                                    Toast::new(format!("Theme: {name}"))
+                                        .icon(ToastIcon::Info)
+                                        .duration(Duration::from_secs(3)),
+                                );
                                 return Cmd::none();
                             }
                             KeyCode::Tab => {
@@ -541,6 +559,8 @@ mod palette_action_ids {
     pub const A11Y_TOGGLE_HC: &str = "a11y:toggle_high_contrast";
     pub const A11Y_TOGGLE_HINTS: &str = "a11y:toggle_key_hints";
 
+    pub const THEME_CYCLE: &str = "theme:cycle";
+
     pub const AGENT_PREFIX: &str = "agent:";
     pub const THREAD_PREFIX: &str = "thread:";
     pub const TOOL_PREFIX: &str = "tool:";
@@ -640,6 +660,13 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
             .with_description("Load dock layout from layout.json")
             .with_tags(&["layout", "import", "load", "json"])
             .with_category("Layout"),
+    );
+
+    out.push(
+        ActionItem::new(palette_action_ids::THEME_CYCLE, "Cycle Theme")
+            .with_description("Switch to the next color theme (T)")
+            .with_tags(&["theme", "colors", "appearance"])
+            .with_category("Appearance"),
     );
 
     out.push(

@@ -21,6 +21,7 @@ pub mod tui_layout;
 pub mod tui_persist;
 pub mod tui_poller;
 pub mod tui_screens;
+pub mod tui_theme;
 
 use asupersync::http::h1::HttpClient;
 use asupersync::http::h1::listener::Http1Listener;

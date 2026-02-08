@@ -34,6 +34,8 @@ mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools" }
 
 [dev-dependencies]
 tempfile.workspace = true
+ftui-harness.workspace = true
+ftui-render.workspace = true
 
 [lints]
 workspace = true

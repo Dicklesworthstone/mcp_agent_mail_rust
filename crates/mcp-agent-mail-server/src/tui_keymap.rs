@@ -58,6 +58,11 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
         text_suppressible: true,
     },
     GlobalBinding {
+        label: "T",
+        action: "Cycle theme",
+        text_suppressible: true,
+    },
+    GlobalBinding {
         label: "?",
         action: "Toggle help",
         text_suppressible: true,
@@ -362,7 +367,7 @@ mod tests {
                         binding.label
                     );
                 }
-                "q" | "?" | ":" | "m" | "1-7" => {
+                "q" | "?" | ":" | "m" | "T" | "1-7" => {
                     assert!(
                         binding.text_suppressible,
                         "{} should be text-suppressible",

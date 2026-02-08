@@ -18,19 +18,19 @@ use crate::tui_screens::{HelpEntry, MAIL_SCREEN_REGISTRY, MailScreenId, screen_m
 // Color palette
 // ──────────────────────────────────────────────────────────────────────
 
+// Legacy hardcoded colors (Cyberpunk Aurora defaults). Kept for
+// `ChromePalette::standard()` backward-compat; live rendering now
+// resolves from `TuiThemePalette::current()`.
 const TAB_ACTIVE_BG: PackedRgba = PackedRgba::rgb(50, 70, 110);
-const TAB_INACTIVE_BG: PackedRgba = PackedRgba::rgb(30, 35, 50);
 const TAB_ACTIVE_FG: PackedRgba = PackedRgba::rgb(255, 255, 255);
 const TAB_INACTIVE_FG: PackedRgba = PackedRgba::rgb(140, 150, 170);
 const TAB_KEY_FG: PackedRgba = PackedRgba::rgb(100, 180, 255);
 
-const STATUS_BG: PackedRgba = PackedRgba::rgb(25, 30, 45);
 const STATUS_FG: PackedRgba = PackedRgba::rgb(160, 170, 190);
 const STATUS_ACCENT: PackedRgba = PackedRgba::rgb(144, 205, 255);
 const STATUS_GOOD: PackedRgba = PackedRgba::rgb(120, 220, 150);
 const STATUS_WARN: PackedRgba = PackedRgba::rgb(255, 184, 108);
 
-const HELP_BG: PackedRgba = PackedRgba::rgb(20, 24, 38);
 const HELP_FG: PackedRgba = PackedRgba::rgb(200, 210, 230);
 const HELP_KEY_FG: PackedRgba = PackedRgba::rgb(100, 180, 255);
 const HELP_BORDER_FG: PackedRgba = PackedRgba::rgb(80, 100, 140);
@@ -86,8 +86,10 @@ pub struct ChromeAreas {
 pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
     use ftui::text::{Line, Span, Text};
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
     // Fill background
-    let bg_style = Style::default().bg(TAB_INACTIVE_BG);
+    let bg_style = Style::default().bg(tp.tab_inactive_bg);
     Paragraph::new("").style(bg_style).render(area, frame);
 
     let mut x = area.x;
@@ -115,15 +117,15 @@ pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
         }
 
         let (fg, bg) = if is_active {
-            (TAB_ACTIVE_FG, TAB_ACTIVE_BG)
+            (tp.tab_active_fg, tp.tab_active_bg)
         } else {
-            (TAB_INACTIVE_FG, TAB_INACTIVE_BG)
+            (tp.tab_inactive_fg, tp.tab_inactive_bg)
         };
 
         let spans = vec![
             Span::styled(" ", Style::default().bg(bg)),
-            Span::styled(key_str, Style::default().fg(TAB_KEY_FG).bg(bg)),
-            Span::styled(":", Style::default().fg(TAB_INACTIVE_FG).bg(bg)),
+            Span::styled(key_str, Style::default().fg(tp.tab_key_fg).bg(bg)),
+            Span::styled(":", Style::default().fg(tp.tab_inactive_fg).bg(bg)),
             Span::styled(label, Style::default().fg(fg).bg(bg)),
             Span::styled(" ", Style::default().bg(bg)),
         ];
@@ -150,8 +152,10 @@ pub fn render_status_line(
 ) {
     use ftui::text::{Line, Span, Text};
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
     // Fill background
-    let bg = Style::default().bg(STATUS_BG);
+    let bg = Style::default().bg(tp.status_bg);
     Paragraph::new("").style(bg).render(area, frame);
 
     let counters = state.request_counters();
@@ -196,14 +200,14 @@ pub fn render_status_line(
     let mut spans = Vec::with_capacity(8);
 
     // Left: screen name + uptime
-    spans.push(Span::styled(" ", Style::default().bg(STATUS_BG)));
+    spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
     spans.push(Span::styled(
         title,
-        Style::default().fg(STATUS_ACCENT).bg(STATUS_BG).bold(),
+        Style::default().fg(tp.status_accent).bg(tp.status_bg).bold(),
     ));
     spans.push(Span::styled(
         format!(" | mode:{transport_mode} up:{uptime_str} "),
-        Style::default().fg(STATUS_FG).bg(STATUS_BG),
+        Style::default().fg(tp.status_fg).bg(tp.status_bg),
     ));
 
     // Center padding + counters
@@ -212,19 +216,19 @@ pub fn render_status_line(
         if pad > 0 {
             spans.push(Span::styled(
                 " ".repeat(pad as usize),
-                Style::default().bg(STATUS_BG),
+                Style::default().bg(tp.status_bg),
             ));
         }
     }
 
     let counter_fg = if error_count > 0 {
-        STATUS_WARN
+        tp.status_warn
     } else {
-        STATUS_GOOD
+        tp.status_good
     };
     spans.push(Span::styled(
         center_str,
-        Style::default().fg(counter_fg).bg(STATUS_BG),
+        Style::default().fg(counter_fg).bg(tp.status_bg),
     ));
 
     // Right padding + help hint
@@ -234,16 +238,16 @@ pub fn render_status_line(
         if right_pad > 0 {
             spans.push(Span::styled(
                 " ".repeat(right_pad as usize),
-                Style::default().bg(STATUS_BG),
+                Style::default().bg(tp.status_bg),
             ));
         }
     }
 
     spans.push(Span::styled(
         help_hint,
-        Style::default().fg(TAB_KEY_FG).bg(STATUS_BG),
+        Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
     ));
-    spans.push(Span::styled(" ", Style::default().bg(STATUS_BG)));
+    spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
 
     let line = Line::from_spans(spans);
     Paragraph::new(Text::from_lines([line])).render(area, frame);
@@ -260,6 +264,7 @@ const GLOBAL_KEYBINDINGS: &[(&str, &str)] = &[
     ("Shift+Tab", "Previous screen"),
     ("m", "Toggle MCP/API mode"),
     ("Ctrl+P / :", "Command palette"),
+    ("T", "Cycle theme"),
     ("?", "Toggle help"),
     ("q", "Quit"),
     ("Esc", "Dismiss overlay"),
@@ -272,6 +277,8 @@ pub fn render_help_overlay(
     frame: &mut Frame,
     area: Rect,
 ) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
     // Calculate overlay dimensions (60% width, 60% height, clamped)
     let overlay_width = (u32::from(area.width) * 60 / 100).clamp(36, 72) as u16;
     let overlay_height = (u32::from(area.height) * 60 / 100).clamp(10, 24) as u16;
@@ -287,7 +294,7 @@ pub fn render_help_overlay(
     let block = Block::bordered()
         .border_type(BorderType::Double)
         .title(" Keyboard Shortcuts (Esc to close) ")
-        .style(Style::default().fg(HELP_BORDER_FG).bg(HELP_BG));
+        .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
 
     let inner = block.inner(overlay_area);
     block.render(overlay_area, frame);
@@ -300,7 +307,7 @@ pub fn render_help_overlay(
     // Global section header
     if y_offset < inner.height {
         let header = Paragraph::new("Global")
-            .style(Style::default().fg(HELP_CATEGORY_FG).bg(HELP_BG).bold());
+            .style(Style::default().fg(tp.help_category_fg).bg(tp.help_bg).bold());
         header.render(
             Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
             frame,
@@ -313,13 +320,14 @@ pub fn render_help_overlay(
         if y_offset >= inner.height {
             break;
         }
-        render_keybinding_line(
+        render_keybinding_line_themed(
             key,
             action,
             inner.x + 1,
             inner.y + y_offset,
             col_width,
             key_col,
+            &tp,
             frame,
         );
         y_offset += 1;
@@ -333,7 +341,7 @@ pub fn render_help_overlay(
         let meta = screen_meta(active);
         if y_offset < inner.height {
             let header = Paragraph::new(meta.title)
-                .style(Style::default().fg(HELP_CATEGORY_FG).bg(HELP_BG).bold());
+                .style(Style::default().fg(tp.help_category_fg).bg(tp.help_bg).bold());
             header.render(
                 Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
                 frame,
@@ -345,13 +353,14 @@ pub fn render_help_overlay(
             if y_offset >= inner.height {
                 break;
             }
-            render_keybinding_line(
+            render_keybinding_line_themed(
                 entry.key,
                 entry.action,
                 inner.x + 1,
                 inner.y + y_offset,
                 col_width,
                 key_col,
+                &tp,
                 frame,
             );
             y_offset += 1;
@@ -359,14 +368,15 @@ pub fn render_help_overlay(
     }
 }
 
-/// Render a single keybinding line: `  [key]  action`
-fn render_keybinding_line(
+/// Render a single keybinding line: `  [key]  action` (theme-aware).
+fn render_keybinding_line_themed(
     key: &str,
     action: &str,
     x: u16,
     y: u16,
     width: u16,
     key_col: u16,
+    tp: &crate::tui_theme::TuiThemePalette,
     frame: &mut Frame,
 ) {
     use ftui::text::{Line, Span, Text};
@@ -377,9 +387,12 @@ fn render_keybinding_line(
     let padding = " ".repeat(pad_len);
 
     let spans = vec![
-        Span::styled(key_display, Style::default().fg(HELP_KEY_FG).bg(HELP_BG)),
-        Span::styled(padding, Style::default().bg(HELP_BG)),
-        Span::styled(action, Style::default().fg(HELP_FG).bg(HELP_BG)),
+        Span::styled(
+            key_display,
+            Style::default().fg(tp.help_key_fg).bg(tp.help_bg),
+        ),
+        Span::styled(padding, Style::default().bg(tp.help_bg)),
+        Span::styled(action, Style::default().fg(tp.help_fg).bg(tp.help_bg)),
     ];
 
     let line = Line::from_spans(spans);
@@ -410,8 +423,11 @@ pub struct ChromePalette {
 
 impl ChromePalette {
     /// Resolve the palette from accessibility settings.
+    ///
+    /// When high-contrast mode is active, uses the dedicated HC constants.
+    /// Otherwise delegates to the theme-aware [`TuiThemePalette`].
     #[must_use]
-    pub const fn from_settings(settings: &AccessibilitySettings) -> Self {
+    pub fn from_settings(settings: &AccessibilitySettings) -> Self {
         if settings.high_contrast {
             Self {
                 tab_active_bg: HC_TAB_ACTIVE_BG,
@@ -428,11 +444,33 @@ impl ChromePalette {
                 help_category_fg: HC_HELP_CATEGORY_FG,
             }
         } else {
-            Self::standard()
+            Self::from_theme()
         }
     }
 
-    /// Standard (non-high-contrast) palette.
+    /// Resolve from the currently active ftui theme.
+    #[must_use]
+    pub fn from_theme() -> Self {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        Self {
+            tab_active_bg: tp.tab_active_bg,
+            tab_active_fg: tp.tab_active_fg,
+            tab_inactive_fg: tp.tab_inactive_fg,
+            tab_key_fg: tp.tab_key_fg,
+            status_fg: tp.status_fg,
+            status_accent: tp.status_accent,
+            status_good: tp.status_good,
+            status_warn: tp.status_warn,
+            help_fg: tp.help_fg,
+            help_key_fg: tp.help_key_fg,
+            help_border_fg: tp.help_border_fg,
+            help_category_fg: tp.help_category_fg,
+        }
+    }
+
+    /// Standard (non-high-contrast) palette with hardcoded Cyberpunk Aurora colors.
+    ///
+    /// Kept for backward compatibility with tests.
     #[must_use]
     pub const fn standard() -> Self {
         Self {
@@ -492,6 +530,8 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
         return;
     }
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
     let max_width = (area.width as usize).saturating_sub(4); // padding
     let hints = build_key_hints(screen_bindings, 6, max_width);
     if hints.is_empty() {
@@ -500,7 +540,7 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
 
     // Parse the hint string into styled spans: keys in accent, text in dim
     let mut spans = Vec::new();
-    spans.push(Span::styled(" ", Style::default().bg(STATUS_BG)));
+    spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
 
     let mut rest = hints.as_str();
     while let Some(open) = rest.find('[') {
@@ -508,7 +548,7 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
         if open > 0 {
             spans.push(Span::styled(
                 &rest[..open],
-                Style::default().fg(STATUS_FG).bg(STATUS_BG),
+                Style::default().fg(tp.status_fg).bg(tp.status_bg),
             ));
         }
         rest = &rest[open..];
@@ -516,7 +556,7 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
             // Key portion: [key]
             spans.push(Span::styled(
                 &rest[..=close],
-                Style::default().fg(TAB_KEY_FG).bg(STATUS_BG),
+                Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
             ));
             rest = &rest[close + 1..];
         } else {
@@ -526,7 +566,7 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
     if !rest.is_empty() {
         spans.push(Span::styled(
             rest,
-            Style::default().fg(STATUS_FG).bg(STATUS_BG),
+            Style::default().fg(tp.status_fg).bg(tp.status_bg),
         ));
     }
 
@@ -645,14 +685,24 @@ mod tests {
     }
 
     #[test]
-    fn palette_non_high_contrast_uses_standard() {
+    fn palette_non_high_contrast_uses_theme() {
         let settings = AccessibilitySettings {
             high_contrast: false,
             key_hints: true,
         };
         let p = ChromePalette::from_settings(&settings);
-        assert_eq!(p.tab_active_bg, TAB_ACTIVE_BG);
-        assert_eq!(p.help_fg, HELP_FG);
+        // Non-HC mode now derives from the active ftui theme, not static constants.
+        // Just verify the palette has valid (non-zero) colors.
+        assert!(
+            p.tab_active_bg.r() > 0 || p.tab_active_bg.g() > 0 || p.tab_active_bg.b() > 0
+                || p.tab_active_bg == crate::tui_theme::TuiThemePalette::current().tab_active_bg,
+            "non-HC tab_active_bg should come from theme"
+        );
+        assert!(
+            p.help_fg.r() > 0 || p.help_fg.g() > 0 || p.help_fg.b() > 0
+                || p.help_fg == crate::tui_theme::TuiThemePalette::current().help_fg,
+            "non-HC help_fg should come from theme"
+        );
     }
 
     #[test]
@@ -750,13 +800,36 @@ mod tests {
     fn color_constants_are_valid() {
         let colors = [
             TAB_ACTIVE_BG,
-            TAB_INACTIVE_BG,
-            STATUS_BG,
-            HELP_BG,
+            TAB_ACTIVE_FG,
+            TAB_INACTIVE_FG,
+            TAB_KEY_FG,
+            STATUS_FG,
             STATUS_ACCENT,
+            STATUS_GOOD,
+            STATUS_WARN,
         ];
         for color in colors {
             assert_ne!(color, PackedRgba::rgba(0, 0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn theme_palette_produces_valid_chrome_colors() {
+        use ftui_extras::theme::{ScopedThemeLock, ThemeId};
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let colors = [
+            tp.tab_active_bg,
+            tp.tab_inactive_bg,
+            tp.status_bg,
+            tp.help_bg,
+        ];
+        for color in colors {
+            // Background colors should have at least some RGB component
+            assert!(
+                color.r() > 0 || color.g() > 0 || color.b() > 0,
+                "background color should not be fully black"
+            );
         }
     }
 

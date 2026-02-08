@@ -2051,6 +2051,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftui-harness"
+version = "0.1.1"
+dependencies = [
+ "crossterm 0.29.0",
+ "ftui-core 0.1.1",
+ "ftui-extras 0.1.1",
+ "ftui-layout 0.1.1",
+ "ftui-render 0.1.1",
+ "ftui-runtime 0.1.1",
+ "ftui-style 0.1.1",
+ "ftui-text 0.1.1",
+ "ftui-widgets 0.1.1",
+ "serde_json",
+]
+
+[[package]]
 name = "ftui-i18n"
 version = "0.1.1"
 
@@ -4280,6 +4296,8 @@ dependencies = [
  "fastmcp-transport",
  "ftui 0.1.1",
  "ftui-extras 0.1.1",
+ "ftui-harness",
+ "ftui-render 0.1.1",
  "ftui-runtime 0.1.1",
  "ftui-widgets 0.1.1",
  "glob",
