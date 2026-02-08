@@ -23,6 +23,7 @@ pub mod macros;
 pub mod messaging;
 pub mod metrics;
 pub mod products;
+pub mod reservation_index;
 pub mod reservations;
 pub mod resources;
 pub mod search;
@@ -317,11 +318,45 @@ pub(crate) mod pattern_overlap {
         matcher: Option<GlobMatcher>,
     }
 
+    /// Returns `true` if the string contains glob metacharacters (`*`, `?`, `[`, `{`).
+    pub fn has_glob_meta(s: &str) -> bool {
+        s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+    }
+
     impl CompiledPattern {
         pub fn new(raw: &str) -> Self {
             let norm = normalize_pattern(raw);
             let matcher = Glob::new(&norm).ok().map(|g| g.compile_matcher());
             Self { norm, matcher }
+        }
+
+        /// Returns the normalized pattern string.
+        pub fn normalized(&self) -> &str {
+            &self.norm
+        }
+
+        /// Returns `true` if the normalized pattern contains glob metacharacters.
+        pub fn is_glob(&self) -> bool {
+            has_glob_meta(&self.norm)
+        }
+
+        /// Returns the first path segment if it doesn't contain glob chars.
+        ///
+        /// E.g. `"src/api/*.rs"` → `Some("src")`, `"*.rs"` → `None`.
+        pub fn first_literal_segment(&self) -> Option<&str> {
+            let seg = self.norm.split('/').next().unwrap_or("");
+            if seg.is_empty() || has_glob_meta(seg) {
+                None
+            } else {
+                Some(seg)
+            }
+        }
+
+        /// Returns `true` if the glob matcher matches the given path string.
+        ///
+        /// Returns `false` if the pattern couldn't be compiled.
+        pub fn matches(&self, path: &str) -> bool {
+            self.matcher.as_ref().is_some_and(|m| m.is_match(path))
         }
 
         pub fn overlaps(&self, other: &Self) -> bool {

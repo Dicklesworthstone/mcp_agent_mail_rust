@@ -14,11 +14,13 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::pattern_overlap::CompiledPattern;
+use crate::reservation_index::{ReservationIndex, ReservationRef};
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
 };
@@ -173,43 +175,50 @@ pub async fn file_reservation_paths(
         mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
     )?;
 
-    let mut paths_to_grant: Vec<&str> = Vec::new();
+    let mut paths_to_grant: SmallVec<[&str; 8]> = SmallVec::new();
 
     let mut pending_conflicts: Vec<PendingReservationConflict> = Vec::new();
 
-    // Precompile requested patterns once; the previous implementation compiled globs
-    // inside the nested loop which is expensive when reservations grow.
+    // Build prefix-partitioned index from exclusive reservations held by other
+    // agents. This replaces the O(M×N) brute-force loop with prefix-scoped
+    // lookups: only reservations sharing a first path segment (or root globs)
+    // are examined per request.
+    let index = ReservationIndex::build(
+        active
+            .iter()
+            .filter(|res| res.agent_id != agent_id && res.exclusive != 0)
+            .map(|res| {
+                (
+                    res.path_pattern.clone(),
+                    ReservationRef {
+                        agent_id: res.agent_id,
+                        reservation_id: res.id.unwrap_or(0),
+                        expires_ts: res.expires_ts,
+                    },
+                )
+            }),
+    );
+
+    // Precompile requested patterns once.
     let requested_compiled: Vec<CompiledPattern> =
         paths.iter().map(|p| CompiledPattern::new(p)).collect();
 
-    // Only exclusive reservations from other agents can conflict.
-    let active_compiled: Vec<(&mcp_agent_mail_db::FileReservationRow, CompiledPattern)> = active
-        .iter()
-        .filter(|res| res.agent_id != agent_id && res.exclusive != 0)
-        .map(|res| (res, CompiledPattern::new(&res.path_pattern)))
-        .collect();
-
     for (path, path_pat) in paths.iter().zip(requested_compiled.iter()) {
-        let mut path_conflicts: Vec<PendingConflictHolder> = Vec::new();
+        let conflict_refs = index.find_conflicts(path_pat);
 
-        for (res, res_pat) in &active_compiled {
-            if !res_pat.overlaps(path_pat) {
-                continue;
-            }
-
-            path_conflicts.push(PendingConflictHolder {
-                agent_id: res.agent_id,
-                reservation_id: res.id.unwrap_or(0),
-                expires_ts: micros_to_iso(res.expires_ts),
-            });
-        }
-
-        if path_conflicts.is_empty() {
+        if conflict_refs.is_empty() {
             paths_to_grant.push(path);
         } else {
             pending_conflicts.push(PendingReservationConflict {
                 path: path.clone(),
-                holders: path_conflicts,
+                holders: conflict_refs
+                    .into_iter()
+                    .map(|rref| PendingConflictHolder {
+                        agent_id: rref.agent_id,
+                        reservation_id: rref.reservation_id,
+                        expires_ts: micros_to_iso(rref.expires_ts),
+                    })
+                    .collect(),
             });
         }
     }
