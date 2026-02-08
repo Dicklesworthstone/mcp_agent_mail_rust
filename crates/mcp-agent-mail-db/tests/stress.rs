@@ -12,6 +12,7 @@
     clippy::too_many_lines,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::manual_let_else
 )]
@@ -1599,4 +1600,623 @@ fn fetch_unacked_returns_pending_and_excludes_acknowledged() {
             unacked_after.len()
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Cache thrashing with Zipfian access patterns (br-15dv.9.3)
+// ---------------------------------------------------------------------------
+
+/// Zipfian-like distribution using inverse CDF with configurable skew.
+/// Returns an index in `0..n` biased heavily toward lower indices.
+/// `skew` controls concentration: 1.0 = moderate, 2.0 = heavy, 3.0 = extreme.
+fn zipfian_index_skewed(n: usize, rng_state: &mut u64, skew: f64) -> usize {
+    // xorshift64 PRNG (fast, non-crypto)
+    let mut x = *rng_state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *rng_state = x;
+
+    // Map uniform u64 → Zipfian: rank = floor(n^(u^skew)).
+    // Squaring/cubing u concentrates probability on popular (low-rank) items:
+    //   skew=1.0 → ~74% of accesses hit top 20% of items
+    //   skew=2.0 → ~86% of accesses hit top 20% of items
+    //   skew=3.0 → ~91% of accesses hit top 20% of items
+    let u = (x as f64) / (u64::MAX as f64); // uniform in [0, 1)
+    let skewed_u = u.powf(skew);
+    let rank = (n as f64).powf(skewed_u) - 1.0;
+    (rank as usize).min(n - 1)
+}
+
+#[test]
+fn cache_zipfian_thrashing() {
+    use mcp_agent_mail_db::cache::ReadCache;
+    use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
+
+    const CACHE_CAPACITY: usize = 100;
+    const NUM_PROJECTS: usize = 10;
+    const AGENTS_PER_PROJECT: usize = 50; // 500 total agents
+    const TOTAL_AGENTS: usize = NUM_PROJECTS * AGENTS_PER_PROJECT;
+    const LOOKUPS_PER_CYCLE: usize = 2_000;
+    const NUM_CYCLES: usize = 6;
+
+    let cache = ReadCache::new_for_testing_with_capacity(CACHE_CAPACITY);
+
+    // Pre-create all project and agent rows
+    let projects: Vec<ProjectRow> = (0..NUM_PROJECTS)
+        .map(|i| ProjectRow {
+            id: Some(i as i64 + 1),
+            slug: format!("proj-{i}"),
+            human_key: format!("/data/proj-{i}"),
+            created_at: 0,
+        })
+        .collect();
+
+    let agents: Vec<AgentRow> = (0..TOTAL_AGENTS)
+        .map(|i| {
+            let project_idx = i / AGENTS_PER_PROJECT;
+            let project_id = projects[project_idx].id.unwrap();
+            AgentRow {
+                id: Some(i as i64 + 1),
+                project_id,
+                name: format!("Agent{i}"),
+                program: "test".to_string(),
+                model: "test".to_string(),
+                task_description: String::new(),
+                inception_ts: 0,
+                last_active_ts: 0,
+                attachments_policy: "auto".to_string(),
+                contact_policy: "open".to_string(),
+            }
+        })
+        .collect();
+
+    // Seed all agents into cache (only CACHE_CAPACITY will survive due to eviction)
+    for agent in &agents {
+        cache.put_agent(agent);
+    }
+
+    // Verify capacity is respected
+    let counts = cache.entry_counts();
+    assert!(
+        counts.agents_by_key <= CACHE_CAPACITY,
+        "agents_by_key ({}) exceeds capacity ({CACHE_CAPACITY})",
+        counts.agents_by_key
+    );
+
+    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    let mut hit_rates = Vec::with_capacity(NUM_CYCLES);
+
+    for cycle in 0..NUM_CYCLES {
+        let mut hits = 0_usize;
+        let mut misses = 0_usize;
+
+        for _ in 0..LOOKUPS_PER_CYCLE {
+            let idx = zipfian_index_skewed(TOTAL_AGENTS, &mut rng_state, 2.0);
+            let agent = &agents[idx];
+
+            // Try cache lookup
+            if cache.get_agent(agent.project_id, &agent.name).is_some() {
+                hits += 1;
+            } else {
+                misses += 1;
+                // Simulate DB fetch: re-insert into cache
+                cache.put_agent(agent);
+            }
+        }
+
+        let hit_rate = hits as f64 / (hits + misses) as f64;
+        hit_rates.push(hit_rate);
+        eprintln!(
+            "  cycle {cycle}: hits={hits}, misses={misses}, hit_rate={:.1}%",
+            hit_rate * 100.0
+        );
+    }
+
+    // After cycle 1 (0-indexed), cache should have warmed up with popular items.
+    // Zipfian skew means a small set of agents are accessed repeatedly.
+    assert!(
+        hit_rates[1] > 0.50,
+        "cycle 1 hit rate ({:.1}%) should be > 50% (Zipfian working set fits in cache)",
+        hit_rates[1] * 100.0
+    );
+
+    // After cycle 4, LRU should have stabilized popular items.
+    assert!(
+        hit_rates[4] > 0.70,
+        "cycle 4 hit rate ({:.1}%) should be > 70% (LRU stabilized popular items)",
+        hit_rates[4] * 100.0
+    );
+
+    // Final cycle should maintain high hit rate.
+    let last = hit_rates.last().unwrap();
+    assert!(
+        *last > 0.70,
+        "final cycle hit rate ({:.1}%) should be > 70%",
+        last * 100.0
+    );
+}
+
+#[test]
+fn cache_zipfian_within_capacity() {
+    use mcp_agent_mail_db::cache::ReadCache;
+    use mcp_agent_mail_db::models::AgentRow;
+
+    // When working set fits entirely in cache, hit rate should be ~100%
+    // after the initial cold start.
+    const CACHE_CAPACITY: usize = 200;
+    const NUM_AGENTS: usize = 100; // fits comfortably
+    const LOOKUPS: usize = 5_000;
+
+    let cache = ReadCache::new_for_testing_with_capacity(CACHE_CAPACITY);
+
+    let agents: Vec<AgentRow> = (0..NUM_AGENTS)
+        .map(|i| AgentRow {
+            id: Some(i as i64 + 1),
+            project_id: 1,
+            name: format!("FitAgent{i}"),
+            program: "test".to_string(),
+            model: "test".to_string(),
+            task_description: String::new(),
+            inception_ts: 0,
+            last_active_ts: 0,
+            attachments_policy: "auto".to_string(),
+            contact_policy: "open".to_string(),
+        })
+        .collect();
+
+    // Pre-warm cache
+    for agent in &agents {
+        cache.put_agent(agent);
+    }
+
+    let mut rng_state: u64 = 0xCAFE_1234_5678_ABCD;
+    let mut hits = 0_usize;
+    let mut misses = 0_usize;
+
+    for _ in 0..LOOKUPS {
+        let idx = zipfian_index_skewed(NUM_AGENTS, &mut rng_state, 2.0);
+        let agent = &agents[idx];
+        if cache.get_agent(agent.project_id, &agent.name).is_some() {
+            hits += 1;
+        } else {
+            misses += 1;
+            cache.put_agent(agent);
+        }
+    }
+
+    let hit_rate = hits as f64 / (hits + misses) as f64;
+    eprintln!(
+        "  within-capacity: hits={hits}, misses={misses}, hit_rate={:.1}%",
+        hit_rate * 100.0
+    );
+
+    // All agents fit in cache, so after pre-warm every lookup should hit.
+    assert!(
+        hit_rate > 0.99,
+        "within-capacity hit rate ({:.1}%) should be > 99%",
+        hit_rate * 100.0
+    );
+}
+
+#[test]
+fn cache_concurrent_zipfian_access() {
+    use mcp_agent_mail_db::cache::ReadCache;
+    use mcp_agent_mail_db::models::AgentRow;
+
+    const CACHE_CAPACITY: usize = 100;
+    const NUM_AGENTS: usize = 500;
+    const LOOKUPS_PER_THREAD: usize = 1_000;
+    const NUM_THREADS: usize = 8;
+
+    let cache = Arc::new(ReadCache::new_for_testing_with_capacity(CACHE_CAPACITY));
+
+    let agents: Arc<Vec<AgentRow>> = Arc::new(
+        (0..NUM_AGENTS)
+            .map(|i| AgentRow {
+                id: Some(i as i64 + 1),
+                project_id: 1,
+                name: format!("ConcAgent{i}"),
+                program: "test".to_string(),
+                model: "test".to_string(),
+                task_description: String::new(),
+                inception_ts: 0,
+                last_active_ts: 0,
+                attachments_policy: "auto".to_string(),
+                contact_policy: "open".to_string(),
+            })
+            .collect(),
+    );
+
+    let barrier = Arc::new(Barrier::new(NUM_THREADS));
+    let total_hits = Arc::new(AtomicU64::new(0));
+    let total_misses = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = (0..NUM_THREADS)
+        .map(|tid| {
+            let cache = Arc::clone(&cache);
+            let agents = Arc::clone(&agents);
+            let barrier = Arc::clone(&barrier);
+            let total_hits = Arc::clone(&total_hits);
+            let total_misses = Arc::clone(&total_misses);
+
+            std::thread::spawn(move || {
+                // Each thread gets a unique PRNG seed
+                let mut rng_state: u64 = 0xBEEF_DEAD_0000_0000 | (tid as u64 + 1);
+                barrier.wait();
+
+                let mut hits = 0_u64;
+                let mut misses = 0_u64;
+
+                for _ in 0..LOOKUPS_PER_THREAD {
+                    let idx = zipfian_index_skewed(NUM_AGENTS, &mut rng_state, 2.0);
+                    let agent = &agents[idx];
+                    if cache.get_agent(agent.project_id, &agent.name).is_some() {
+                        hits += 1;
+                    } else {
+                        misses += 1;
+                        cache.put_agent(agent);
+                    }
+                }
+
+                total_hits.fetch_add(hits, Ordering::Relaxed);
+                total_misses.fetch_add(misses, Ordering::Relaxed);
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    let hits = total_hits.load(Ordering::Relaxed);
+    let misses = total_misses.load(Ordering::Relaxed);
+    let total = hits + misses;
+    let hit_rate = hits as f64 / total as f64;
+
+    eprintln!(
+        "  concurrent: hits={hits}, misses={misses}, total={total}, hit_rate={:.1}%",
+        hit_rate * 100.0
+    );
+
+    // With concurrent access, hit rate will be lower due to contention, but
+    // should still be reasonable with Zipfian skew.
+    assert!(
+        hit_rate > 0.30,
+        "concurrent hit rate ({:.1}%) should be > 30% (Zipfian still concentrates on popular items)",
+        hit_rate * 100.0
+    );
+
+    // Verify no capacity violation
+    let counts = cache.entry_counts();
+    assert!(
+        counts.agents_by_key <= CACHE_CAPACITY,
+        "agents_by_key ({}) exceeds capacity ({CACHE_CAPACITY})",
+        counts.agents_by_key
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Large message payload stress tests (br-15dv.9.5)
+// ---------------------------------------------------------------------------
+
+/// Helper: generate a deterministic body of `n` bytes.
+fn make_large_body(n: usize) -> String {
+    // Produce repeating text with some variation so FTS can index real tokens.
+    let phrase = "The quick brown fox jumped over the lazy sleeping dog. ";
+    let mut body = String::with_capacity(n + phrase.len());
+    while body.len() < n {
+        body.push_str(phrase);
+    }
+    body.truncate(n);
+    body
+}
+
+/// Helper: set up a project + sender + receiver in the pool.
+fn setup_project_and_agents(
+    pool: &DbPool,
+) -> (i64, i64, i64) {
+    let suffix = unique_suffix();
+
+    let pid = block_on_with_retry(3, |cx| {
+        let pool = pool.clone();
+        let hk = format!("/data/lgmsg-{suffix}");
+        async move { queries::ensure_project(&cx, &pool, &hk).await }
+    })
+    .id
+    .unwrap();
+
+    let sender_id = block_on_with_retry(3, |cx| {
+        let pool = pool.clone();
+        async move {
+            queries::register_agent(&cx, &pool, pid, "BoldCastle", "test", "test", None, None)
+                .await
+        }
+    })
+    .id
+    .unwrap();
+
+    let receiver_id = block_on_with_retry(3, |cx| {
+        let pool = pool.clone();
+        async move {
+            queries::register_agent(&cx, &pool, pid, "QuietLake", "test", "test", None, None)
+                .await
+        }
+    })
+    .id
+    .unwrap();
+
+    (pid, sender_id, receiver_id)
+}
+
+#[test]
+fn stress_large_message_512kb_roundtrip() {
+    // Verify that a 512KB message body survives the full DB roundtrip:
+    // insert → fetch → FTS search.
+    let (pool, _dir) = make_pool();
+    let (pid, sender_id, receiver_id) = setup_project_and_agents(&pool);
+
+    let body = make_large_body(512 * 1024); // 512 KB
+    assert_eq!(body.len(), 512 * 1024);
+
+    let msg_id = block_on(|cx| {
+        let pool = pool.clone();
+        let body = body.clone();
+        async move {
+            match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                pid,
+                sender_id,
+                "Large 512KB message",
+                &body,
+                None,
+                "normal",
+                false,
+                "",
+                &[(receiver_id, "to")],
+            )
+            .await
+            {
+                Outcome::Ok(row) => row.id.unwrap(),
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            }
+        }
+    });
+
+    // Fetch the message back and verify body integrity
+    let fetched = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::fetch_inbox(&cx, &pool, pid, receiver_id, false, None, 10).await {
+                Outcome::Ok(rows) => rows,
+                other => panic!("fetch_inbox failed: {other:?}"),
+            }
+        }
+    });
+
+    assert!(!fetched.is_empty(), "inbox should contain the message");
+    let found = fetched.iter().find(|r| r.message.id == Some(msg_id));
+    assert!(found.is_some(), "message {msg_id} not found in inbox");
+    assert_eq!(
+        found.unwrap().message.body_md.len(),
+        512 * 1024,
+        "body should survive roundtrip intact"
+    );
+
+    // FTS search should find a word from the body
+    let results = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::search_messages(&cx, &pool, pid, "quick brown fox", 10).await {
+                Outcome::Ok(rows) => rows,
+                other => panic!("search_messages failed: {other:?}"),
+            }
+        }
+    });
+
+    assert!(
+        !results.is_empty(),
+        "FTS should find 'quick brown fox' in the 512KB body"
+    );
+    assert_eq!(results[0].id, msg_id);
+}
+
+#[test]
+fn stress_concurrent_large_messages() {
+    // Send 20 messages with 100KB bodies concurrently from multiple threads.
+    // Verifies no corruption or deadlocks under large-payload contention.
+    const NUM_MESSAGES: usize = 20;
+    const BODY_SIZE: usize = 100 * 1024; // 100 KB each
+
+    let (pool, _dir) = make_pool();
+    let (pid, sender_id, receiver_id) = setup_project_and_agents(&pool);
+
+    let pool = Arc::new(pool);
+    let barrier = Arc::new(Barrier::new(NUM_MESSAGES));
+    let success_count = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = (0..NUM_MESSAGES)
+        .map(|i| {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            let success_count = Arc::clone(&success_count);
+
+            std::thread::spawn(move || {
+                let body = make_large_body(BODY_SIZE);
+                let subject = format!("Concurrent large msg #{i}");
+
+                barrier.wait();
+
+                let result = block_on(|cx| {
+                    let pool = (*pool).clone();
+                    let subject = subject.clone();
+                    let body = body.clone();
+                    async move {
+                        queries::create_message_with_recipients(
+                            &cx,
+                            &pool,
+                            pid,
+                            sender_id,
+                            &subject,
+                            &body,
+                            None,
+                            "normal",
+                            false,
+                            "",
+                            &[(receiver_id, "to")],
+                        )
+                        .await
+                    }
+                });
+
+                match result {
+                    Outcome::Ok(row) => {
+                        assert!(row.id.is_some());
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    other => panic!("thread {i}: create failed: {other:?}"),
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    let successes = success_count.load(Ordering::Relaxed);
+    eprintln!("  concurrent large messages: {successes}/{NUM_MESSAGES} succeeded");
+    assert_eq!(
+        successes, NUM_MESSAGES as u64,
+        "all messages should succeed"
+    );
+
+    // Verify all messages are in the inbox
+    let fetched = block_on(|cx| {
+        let pool = (*pool).clone();
+        async move {
+            match queries::fetch_inbox(&cx, &pool, pid, receiver_id, false, None, 50).await {
+                Outcome::Ok(rows) => rows,
+                other => panic!("fetch_inbox failed: {other:?}"),
+            }
+        }
+    });
+
+    assert_eq!(
+        fetched.len(),
+        NUM_MESSAGES,
+        "inbox should contain all {NUM_MESSAGES} messages"
+    );
+
+    // Verify body integrity for each
+    for row in &fetched {
+        assert_eq!(
+            row.message.body_md.len(),
+            BODY_SIZE,
+            "message body should be {BODY_SIZE} bytes, got {}",
+            row.message.body_md.len()
+        );
+    }
+}
+
+#[test]
+fn stress_fts_large_body_search_performance() {
+    // Index 10 messages with 256KB bodies, then search.
+    // Measures that FTS works correctly with large payloads.
+    const NUM_MESSAGES: usize = 10;
+    const BODY_SIZE: usize = 256 * 1024; // 256 KB
+
+    let (pool, _dir) = make_pool();
+    let (pid, sender_id, receiver_id) = setup_project_and_agents(&pool);
+
+    // Each message gets a unique keyword so we can search for specific ones
+    let mut msg_ids = Vec::with_capacity(NUM_MESSAGES);
+    for i in 0..NUM_MESSAGES {
+        let mut body = make_large_body(BODY_SIZE - 50);
+        // Embed a unique searchable token at the end
+        let token = format!(" UNIQUETOKEN{i:04} ");
+        body.push_str(&token);
+
+        let msg_id = block_on(|cx| {
+            let pool = pool.clone();
+            let body = body.clone();
+            let subject = format!("FTS stress #{i}");
+            async move {
+                match queries::create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender_id,
+                    &subject,
+                    &body,
+                    None,
+                    "normal",
+                    false,
+                    "",
+                    &[(receiver_id, "to")],
+                )
+                .await
+                {
+                    Outcome::Ok(row) => row.id.unwrap(),
+                    other => panic!("create msg {i} failed: {other:?}"),
+                }
+            }
+        });
+        msg_ids.push(msg_id);
+    }
+
+    // Search for a specific unique token
+    let target_idx = 7;
+    let search_term = format!("UNIQUETOKEN{target_idx:04}");
+
+    let start = std::time::Instant::now();
+    let results = block_on(|cx| {
+        let pool = pool.clone();
+        let term = search_term.clone();
+        async move {
+            match queries::search_messages(&cx, &pool, pid, &term, 10).await {
+                Outcome::Ok(rows) => rows,
+                other => panic!("search failed: {other:?}"),
+            }
+        }
+    });
+    let search_ms = start.elapsed().as_millis();
+
+    eprintln!(
+        "  FTS search over {} × {}KB bodies took {search_ms}ms, found {} results",
+        NUM_MESSAGES,
+        BODY_SIZE / 1024,
+        results.len()
+    );
+
+    assert_eq!(
+        results.len(),
+        1,
+        "should find exactly 1 message with token '{search_term}'"
+    );
+    assert_eq!(results[0].id, msg_ids[target_idx]);
+
+    // Search for common term across all messages
+    let common_results = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::search_messages(&cx, &pool, pid, "quick brown fox", 20).await {
+                Outcome::Ok(rows) => rows,
+                other => panic!("common search failed: {other:?}"),
+            }
+        }
+    });
+
+    assert_eq!(
+        common_results.len(),
+        NUM_MESSAGES,
+        "all {NUM_MESSAGES} messages should match 'quick brown fox'"
+    );
+
+    // Search time should be reasonable even with large bodies
+    assert!(
+        search_ms < 5_000,
+        "FTS search should complete within 5s, took {search_ms}ms"
+    );
 }
