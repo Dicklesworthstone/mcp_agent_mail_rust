@@ -7459,9 +7459,7 @@ mod tests {
 
     #[test]
     fn jwks_bootstrap_empty_cache_populates_on_first_fetch() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let jwks_bytes = make_test_jwks_bytes();
 
         with_jwks_server(&jwks_bytes, 1, |jwks_url| {
@@ -7484,9 +7482,7 @@ mod tests {
 
     #[test]
     fn jwks_fresh_cache_returns_cached_without_network() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let jwks = make_test_jwks_set();
 
         // Unreachable URL: if the code tries to fetch it will fail.
@@ -7515,9 +7511,7 @@ mod tests {
 
     #[test]
     fn jwks_stale_while_revalidate_returns_stale_when_refreshing() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let jwks = make_test_jwks_set();
 
         let state = build_jwt_state_with_url("http://127.0.0.1:1/unreachable");
@@ -7554,9 +7548,7 @@ mod tests {
 
     #[test]
     fn jwks_stale_cache_triggers_refresh_when_not_refreshing() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let jwks_bytes = make_test_jwks_bytes();
         let old_jwks = make_test_jwks_set();
 
@@ -7592,9 +7584,7 @@ mod tests {
 
     #[test]
     fn jwks_force_bypasses_fresh_cache() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let jwks_bytes = make_test_jwks_bytes();
         let cached_jwks = make_test_jwks_set();
 
@@ -7624,9 +7614,7 @@ mod tests {
 
     #[test]
     fn jwks_fetch_failure_empty_cache_resets_guard() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
 
         // Bind then drop → connection refused.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -7651,9 +7639,7 @@ mod tests {
 
     #[test]
     fn jwks_force_failure_resets_guard() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let cached_jwks = make_test_jwks_set();
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -7685,9 +7671,7 @@ mod tests {
 
     #[test]
     fn jwks_recovery_succeeds_after_failure() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let jwks_bytes = make_test_jwks_bytes();
 
         // Phase 1: fail against closed port.
@@ -7718,9 +7702,7 @@ mod tests {
 
     #[test]
     fn jwks_non_200_response_returns_err() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
 
         with_status_server(500, b"{}", |url| {
             let state = build_jwt_state_with_url(&url);
@@ -7739,9 +7721,7 @@ mod tests {
 
     #[test]
     fn jwks_empty_keys_array_is_valid() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let empty_jwks = serde_json::to_vec(&serde_json::json!({"keys": []})).unwrap();
 
         with_jwks_server(&empty_jwks, 1, |jwks_url| {
@@ -9935,9 +9915,7 @@ mod tests {
                 let handles: Vec<_> = (0..10)
                     .map(|_| {
                         s.spawn(|| {
-                            let rt = RuntimeBuilder::current_thread()
-                                .build()
-                                .expect("runtime");
+                            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
                             rt.block_on(state.fetch_jwks(&url, false))
                         })
                     })
@@ -9986,9 +9964,7 @@ mod tests {
                     let handles: Vec<_> = (0..10)
                         .map(|_| {
                             s.spawn(|| {
-                                let rt = RuntimeBuilder::current_thread()
-                                    .build()
-                                    .expect("runtime");
+                                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
                                 let start = Instant::now();
                                 let result = rt.block_on(state.fetch_jwks(&url, false));
                                 let elapsed = start.elapsed();
@@ -10082,9 +10058,7 @@ mod tests {
                 let handles: Vec<_> = (0..5)
                     .map(|_| {
                         s.spawn(|| {
-                            let rt = RuntimeBuilder::current_thread()
-                                .build()
-                                .expect("runtime");
+                            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
                             rt.block_on(state.fetch_jwks(&url, false))
                         })
                     })
@@ -10096,10 +10070,7 @@ mod tests {
                     .count();
                 // All or most should succeed (depends on timing, but at
                 // least 1 must succeed since the server is available).
-                assert!(
-                    ok_count >= 1,
-                    "at least 1 cold-start fetch should succeed"
-                );
+                assert!(ok_count >= 1, "at least 1 cold-start fetch should succeed");
             });
 
             // Multiple HTTP requests are expected (no stale to serve).
