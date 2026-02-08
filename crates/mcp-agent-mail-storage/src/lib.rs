@@ -8222,4 +8222,345 @@ mod tests {
         assert!(removed, "should remove lock owned by dead PID");
         assert!(!lock_path.exists(), "lock file should be removed");
     }
+
+    // ── br-1i11.5.2: depth counter underflow recovery ─────────────────
+    //
+    // These tests exercise the fetch_update + saturating_sub pattern used
+    // in wbq_drain_loop() to decrement the op_depth counter. The pattern
+    // must handle the case where drained_count exceeds observed depth
+    // (e.g. due to counter reset or race) without wrapping around u64::MAX.
+
+    /// Helper: applies the same depth-decrement logic as wbq_drain_loop.
+    fn depth_decrement(counter: &AtomicU64, drained: u64) -> u64 {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(drained))
+            })
+            .unwrap_or(0)
+            .saturating_sub(drained)
+    }
+
+    #[test]
+    fn depth_counter_normal_decrement() {
+        let counter = AtomicU64::new(10);
+        let after = depth_decrement(&counter, 3);
+        assert_eq!(after, 7, "10 - 3 = 7");
+        assert_eq!(counter.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn depth_counter_exact_drain() {
+        let counter = AtomicU64::new(5);
+        let after = depth_decrement(&counter, 5);
+        assert_eq!(after, 0, "5 - 5 = 0");
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn depth_counter_underflow_saturates_to_zero() {
+        let counter = AtomicU64::new(3);
+        let after = depth_decrement(&counter, 10);
+        assert_eq!(after, 0, "3 - 10 should saturate to 0, not wrap");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "stored value should be 0 after saturation"
+        );
+    }
+
+    #[test]
+    fn depth_counter_underflow_from_zero() {
+        let counter = AtomicU64::new(0);
+        let after = depth_decrement(&counter, 5);
+        assert_eq!(after, 0, "0 - 5 should saturate to 0");
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn depth_counter_underflow_with_max_drain() {
+        let counter = AtomicU64::new(1);
+        let after = depth_decrement(&counter, u64::MAX);
+        assert_eq!(after, 0, "1 - MAX should saturate to 0");
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn depth_counter_recovery_after_underflow() {
+        let counter = AtomicU64::new(2);
+
+        // Cause underflow saturation
+        let after = depth_decrement(&counter, 100);
+        assert_eq!(after, 0, "should saturate to 0");
+
+        // Counter should still work correctly after saturation
+        counter.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
+
+        // Normal decrement should work
+        let after = depth_decrement(&counter, 2);
+        assert_eq!(after, 3, "5 - 2 = 3 after recovery");
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn depth_counter_sequential_decrements() {
+        let counter = AtomicU64::new(20);
+
+        let after = depth_decrement(&counter, 8);
+        assert_eq!(after, 12);
+
+        let after = depth_decrement(&counter, 8);
+        assert_eq!(after, 4);
+
+        // Third drain exceeds remaining depth
+        let after = depth_decrement(&counter, 8);
+        assert_eq!(after, 0, "4 - 8 should saturate to 0");
+
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn depth_counter_single_item_decrement() {
+        // Tests the single-op decrement path used during shutdown drain
+        let counter = AtomicU64::new(3);
+        let after = depth_decrement(&counter, 1);
+        assert_eq!(after, 2);
+        let after = depth_decrement(&counter, 1);
+        assert_eq!(after, 1);
+        let after = depth_decrement(&counter, 1);
+        assert_eq!(after, 0);
+        // One more past zero
+        let after = depth_decrement(&counter, 1);
+        assert_eq!(after, 0, "should not wrap past zero");
+    }
+
+    #[test]
+    fn depth_counter_concurrent_inc_dec_no_wraparound() {
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let num_threads = 8;
+        let ops_per_thread = 1000;
+
+        let mut handles = Vec::new();
+
+        // Spawn threads that increment and decrement
+        for _ in 0..num_threads {
+            let c = Arc::clone(&counter);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ops_per_thread {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                for _ in 0..ops_per_thread {
+                    c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(1))
+                    })
+                    .ok();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_val = counter.load(Ordering::Relaxed);
+        assert_eq!(
+            final_val, 0,
+            "after equal inc/dec across threads, depth should be 0, got {final_val}"
+        );
+    }
+
+    #[test]
+    fn depth_counter_concurrent_over_decrement_stays_zero() {
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicU64::new(100));
+        let num_threads = 8;
+
+        let mut handles = Vec::new();
+
+        // Each thread tries to drain 50, total = 400 > 100
+        for _ in 0..num_threads {
+            let c = Arc::clone(&counter);
+            handles.push(std::thread::spawn(move || {
+                c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(50))
+                })
+                .ok();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_val = counter.load(Ordering::Relaxed);
+        assert_eq!(
+            final_val, 0,
+            "over-decrement should saturate to 0, got {final_val}"
+        );
+    }
+
+    #[test]
+    fn depth_counter_increment_always_succeeds() {
+        let counter = AtomicU64::new(0);
+
+        // After underflow saturation, incrementing should work
+        depth_decrement(&counter, 999);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        counter.fetch_add(42, Ordering::Relaxed);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            42,
+            "increment after saturation should work normally"
+        );
+    }
+
+    // ── br-1i11.1.2: spill drain path ordering determinism ────────────
+    //
+    // Verify that CoalescerSpillRepo.paths (BTreeSet<String>) produces
+    // sorted output when drained, matching the pattern used in
+    // coalescer_drain_repo_spill().
+
+    /// Helper: simulates the spill drain pattern — insert paths into a
+    /// BTreeSet then collect via into_iter() (same as line 1863).
+    fn spill_drain_paths(inputs: &[&str]) -> Vec<String> {
+        let mut paths = BTreeSet::new();
+        for p in inputs {
+            paths.insert((*p).to_string());
+        }
+        paths.into_iter().collect()
+    }
+
+    #[test]
+    fn spill_drain_produces_sorted_paths() {
+        let result = spill_drain_paths(&["z.md", "a.md", "m.md"]);
+        assert_eq!(result, vec!["a.md", "m.md", "z.md"]);
+    }
+
+    #[test]
+    fn spill_drain_sorted_with_nested_paths() {
+        let result = spill_drain_paths(&[
+            "messages/2026/02/msg3.md",
+            "agents/ZebraAgent/profile.json",
+            "agents/AlphaAgent/profile.json",
+            "messages/2026/01/msg1.md",
+            "file_reservations/abc.json",
+        ]);
+        assert_eq!(
+            result,
+            vec![
+                "agents/AlphaAgent/profile.json",
+                "agents/ZebraAgent/profile.json",
+                "file_reservations/abc.json",
+                "messages/2026/01/msg1.md",
+                "messages/2026/02/msg3.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn spill_drain_deduplicates_paths() {
+        let result = spill_drain_paths(&["a.md", "b.md", "a.md", "c.md", "b.md"]);
+        assert_eq!(result, vec!["a.md", "b.md", "c.md"]);
+    }
+
+    #[test]
+    fn spill_drain_single_path() {
+        let result = spill_drain_paths(&["only.md"]);
+        assert_eq!(result, vec!["only.md"]);
+    }
+
+    #[test]
+    fn spill_drain_empty() {
+        let result = spill_drain_paths(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn spill_drain_already_sorted_input() {
+        let result = spill_drain_paths(&["a.md", "b.md", "c.md"]);
+        assert_eq!(result, vec!["a.md", "b.md", "c.md"]);
+    }
+
+    #[test]
+    fn spill_drain_reverse_sorted_input() {
+        let result = spill_drain_paths(&["c.md", "b.md", "a.md"]);
+        assert_eq!(result, vec!["a.md", "b.md", "c.md"]);
+    }
+
+    #[test]
+    fn spill_drain_unicode_paths_sorted() {
+        let result = spill_drain_paths(&["ñ.md", "a.md", "ä.md", "z.md"]);
+        // Unicode sort: a < z < ä < ñ (byte-order for UTF-8)
+        assert_eq!(result[0], "a.md");
+        assert_eq!(result[1], "z.md");
+        // Remaining are sorted by UTF-8 byte order
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn spill_drain_struct_roundtrip_preserves_order() {
+        // Simulate the full CoalescerSpillRepo → CoalescerSpilledWork path
+        let mut repo = CoalescerSpillRepo {
+            pending_requests: 3,
+            earliest_enqueued_at: Instant::now(),
+            dirty_all: false,
+            paths: BTreeSet::new(),
+            git_author_name: "test".to_string(),
+            git_author_email: "test@test".to_string(),
+            message_first_lines: VecDeque::new(),
+            message_total: 0,
+        };
+
+        repo.paths.insert("zebra/data.json".to_string());
+        repo.paths.insert("alpha/config.json".to_string());
+        repo.paths.insert("mid/state.json".to_string());
+
+        // Same drain pattern as coalescer_drain_repo_spill line 1863
+        let drained: Vec<String> = repo.paths.into_iter().collect();
+        assert_eq!(
+            drained,
+            vec!["alpha/config.json", "mid/state.json", "zebra/data.json",],
+            "spill drain must produce lexicographically sorted paths"
+        );
+    }
+
+    #[test]
+    fn spill_path_cap_triggers_dirty_all() {
+        let mut paths = BTreeSet::new();
+        let cap = COALESCER_SPILL_PATH_CAP;
+
+        // Insert up to cap, should not trigger dirty_all
+        for i in 0..cap {
+            paths.insert(format!("path_{i:05}.md"));
+        }
+        assert_eq!(paths.len(), cap);
+
+        // One more would exceed cap
+        paths.insert(format!("path_{cap:05}.md"));
+        assert!(
+            paths.len() > cap,
+            "BTreeSet grows past cap (coalescer code clears + sets dirty_all)"
+        );
+
+        // Verify that if the coalescer logic were applied, it would trigger dirty_all
+        let mut dirty_all = false;
+        let mut test_paths = BTreeSet::new();
+        for i in 0..=cap {
+            test_paths.insert(format!("path_{i:05}.md"));
+            if test_paths.len() > COALESCER_SPILL_PATH_CAP {
+                dirty_all = true;
+                test_paths.clear();
+                break;
+            }
+        }
+        assert!(dirty_all, "exceeding cap should trigger dirty_all");
+        assert!(
+            test_paths.is_empty(),
+            "paths should be cleared on dirty_all"
+        );
+    }
 }
