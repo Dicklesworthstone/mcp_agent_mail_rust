@@ -354,6 +354,23 @@ impl InterfaceModeResolver {
     /// Resolve the interface mode by checking sources in precedence order.
     #[must_use]
     pub fn resolve(&self) -> ResolvedMode {
+        self.resolve_with_env(env::var("INTERFACE_MODE").ok())
+    }
+
+    /// Validate that the resolved mode is consistent with the binary default.
+    ///
+    /// Returns `Some(warning)` if the env var contradicts the binary identity.
+    /// The binary identity always wins (per ADR-001 Invariant 3), but the
+    /// warning helps operators notice misconfiguration.
+    #[must_use]
+    pub fn validate(&self) -> Option<String> {
+        self.validate_with_env(env::var("INTERFACE_MODE").ok())
+    }
+
+    /// Internal resolve that accepts an env value for testability.
+    ///
+    /// Precedence: explicit override > env var > binary default.
+    fn resolve_with_env(&self, env_value: Option<String>) -> ResolvedMode {
         // 1. Explicit override (highest precedence)
         if let Some(mode) = self.explicit_override {
             return ResolvedMode {
@@ -363,7 +380,7 @@ impl InterfaceModeResolver {
         }
 
         // 2. Environment variable
-        if let Ok(v) = env::var("INTERFACE_MODE") {
+        if let Some(v) = env_value {
             let mode = match v.trim().to_lowercase().as_str() {
                 "cli" => InterfaceMode::Cli,
                 _ => InterfaceMode::Mcp,
@@ -381,14 +398,9 @@ impl InterfaceModeResolver {
         }
     }
 
-    /// Validate that the resolved mode is consistent with the binary default.
-    ///
-    /// Returns `Some(warning)` if the env var contradicts the binary identity.
-    /// The binary identity always wins (per ADR-001 Invariant 3), but the
-    /// warning helps operators notice misconfiguration.
-    #[must_use]
-    pub fn validate(&self) -> Option<String> {
-        if let Ok(v) = env::var("INTERFACE_MODE") {
+    /// Internal validate that accepts an env value for testability.
+    fn validate_with_env(&self, env_value: Option<String>) -> Option<String> {
+        if let Some(v) = env_value {
             let env_mode = match v.trim().to_lowercase().as_str() {
                 "cli" => InterfaceMode::Cli,
                 _ => InterfaceMode::Mcp,
@@ -2417,11 +2429,22 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_summary_format_empty_mode_no_mode_line() {
+    fn bootstrap_summary_format_empty_mode_no_trailing_mode_line() {
         let config = Config::default();
         let summary = config.bootstrap_summary();
         let formatted = summary.format("");
-        assert!(!formatted.contains("mode:"));
+        // Empty mode should not produce the trailing "mode: ..." line.
+        // (Note: "interface_mode:" is always present as a summary key, so
+        // we check specifically for the trailing mode footer pattern.)
+        let has_trailing_mode = formatted.lines().any(|l| {
+            let trimmed = l.trim();
+            // The trailing mode line looks like: "└─ mode:    <value>"
+            trimmed.contains("mode:") && !trimmed.contains("interface_mode:")
+        });
+        assert!(
+            !has_trailing_mode,
+            "Empty mode should not produce trailing mode line"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2495,5 +2518,280 @@ mod tests {
         // PATH is always set in process environment
         let source = detect_source("PATH");
         assert_eq!(source, ConfigSource::ProcessEnv);
+    }
+
+    // -----------------------------------------------------------------------
+    // br-21gj.5.1: InterfaceModeResolver, mode precedence, and invariants
+    // -----------------------------------------------------------------------
+
+    // -- InterfaceMode helpers --
+
+    #[test]
+    fn interface_mode_default_is_mcp() {
+        let mode = InterfaceMode::default();
+        assert_eq!(mode, InterfaceMode::Mcp);
+        assert!(mode.is_mcp());
+        assert!(!mode.is_cli());
+    }
+
+    #[test]
+    fn interface_mode_cli_helpers() {
+        let mode = InterfaceMode::Cli;
+        assert!(mode.is_cli());
+        assert!(!mode.is_mcp());
+    }
+
+    #[test]
+    fn interface_mode_display() {
+        assert_eq!(InterfaceMode::Mcp.to_string(), "mcp");
+        assert_eq!(InterfaceMode::Cli.to_string(), "cli");
+    }
+
+    #[test]
+    fn interface_mode_equality() {
+        assert_eq!(InterfaceMode::Mcp, InterfaceMode::Mcp);
+        assert_eq!(InterfaceMode::Cli, InterfaceMode::Cli);
+        assert_ne!(InterfaceMode::Mcp, InterfaceMode::Cli);
+    }
+
+    // -- ModeProvenance display --
+
+    #[test]
+    fn mode_provenance_display() {
+        assert_eq!(ModeProvenance::BinaryDefault.to_string(), "binary-default");
+        assert_eq!(ModeProvenance::EnvVar.to_string(), "env:INTERFACE_MODE");
+        assert_eq!(ModeProvenance::Explicit.to_string(), "explicit");
+    }
+
+    // -- ResolvedMode display --
+
+    #[test]
+    fn resolved_mode_display_binary_default() {
+        let rm = ResolvedMode {
+            mode: InterfaceMode::Mcp,
+            provenance: ModeProvenance::BinaryDefault,
+        };
+        assert_eq!(rm.to_string(), "mcp (from binary-default)");
+    }
+
+    #[test]
+    fn resolved_mode_display_explicit() {
+        let rm = ResolvedMode {
+            mode: InterfaceMode::Cli,
+            provenance: ModeProvenance::Explicit,
+        };
+        assert_eq!(rm.to_string(), "cli (from explicit)");
+    }
+
+    #[test]
+    fn resolved_mode_display_env_var() {
+        let rm = ResolvedMode {
+            mode: InterfaceMode::Cli,
+            provenance: ModeProvenance::EnvVar,
+        };
+        assert_eq!(rm.to_string(), "cli (from env:INTERFACE_MODE)");
+    }
+
+    // -- InterfaceModeResolver: explicit override (highest precedence) --
+
+    #[test]
+    fn resolver_explicit_override_wins_over_binary_default() {
+        let resolver =
+            InterfaceModeResolver::new(InterfaceMode::Mcp).with_override(InterfaceMode::Cli);
+        let result = resolver.resolve_with_env(None);
+        assert_eq!(result.mode, InterfaceMode::Cli);
+        assert_eq!(result.provenance, ModeProvenance::Explicit);
+    }
+
+    #[test]
+    fn resolver_explicit_override_wins_over_env_var() {
+        let resolver =
+            InterfaceModeResolver::new(InterfaceMode::Mcp).with_override(InterfaceMode::Mcp);
+        let result = resolver.resolve_with_env(Some("cli".to_string()));
+        assert_eq!(result.mode, InterfaceMode::Mcp);
+        assert_eq!(result.provenance, ModeProvenance::Explicit);
+    }
+
+    // -- InterfaceModeResolver: env var (second precedence) --
+
+    #[test]
+    fn resolver_env_var_overrides_binary_default() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        let result = resolver.resolve_with_env(Some("cli".to_string()));
+        assert_eq!(result.mode, InterfaceMode::Cli);
+        assert_eq!(result.provenance, ModeProvenance::EnvVar);
+    }
+
+    #[test]
+    fn resolver_env_var_mcp_value() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Cli);
+        let result = resolver.resolve_with_env(Some("mcp".to_string()));
+        assert_eq!(result.mode, InterfaceMode::Mcp);
+        assert_eq!(result.provenance, ModeProvenance::EnvVar);
+    }
+
+    #[test]
+    fn resolver_env_var_unknown_value_defaults_to_mcp() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Cli);
+        let result = resolver.resolve_with_env(Some("garbage".to_string()));
+        assert_eq!(result.mode, InterfaceMode::Mcp);
+        assert_eq!(result.provenance, ModeProvenance::EnvVar);
+    }
+
+    #[test]
+    fn resolver_env_var_case_insensitive() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        let result = resolver.resolve_with_env(Some("CLI".to_string()));
+        assert_eq!(result.mode, InterfaceMode::Cli);
+        assert_eq!(result.provenance, ModeProvenance::EnvVar);
+    }
+
+    #[test]
+    fn resolver_env_var_with_whitespace_trimmed() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        let result = resolver.resolve_with_env(Some("  cli  ".to_string()));
+        assert_eq!(result.mode, InterfaceMode::Cli);
+        assert_eq!(result.provenance, ModeProvenance::EnvVar);
+    }
+
+    // -- InterfaceModeResolver: binary default (lowest precedence) --
+
+    #[test]
+    fn resolver_binary_default_mcp() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        let result = resolver.resolve_with_env(None);
+        assert_eq!(result.mode, InterfaceMode::Mcp);
+        assert_eq!(result.provenance, ModeProvenance::BinaryDefault);
+    }
+
+    #[test]
+    fn resolver_binary_default_cli() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Cli);
+        let result = resolver.resolve_with_env(None);
+        assert_eq!(result.mode, InterfaceMode::Cli);
+        assert_eq!(result.provenance, ModeProvenance::BinaryDefault);
+    }
+
+    // -- InterfaceModeResolver::validate() --
+
+    #[test]
+    fn validate_no_conflict_when_env_unset() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        assert!(resolver.validate_with_env(None).is_none());
+    }
+
+    #[test]
+    fn validate_no_conflict_when_env_matches_binary_default_mcp() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        assert!(
+            resolver
+                .validate_with_env(Some("mcp".to_string()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn validate_no_conflict_when_env_matches_binary_default_cli() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Cli);
+        assert!(
+            resolver
+                .validate_with_env(Some("cli".to_string()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn validate_conflict_when_env_contradicts_mcp_binary() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        let warning = resolver.validate_with_env(Some("cli".to_string()));
+        assert!(warning.is_some());
+        let msg = warning.unwrap();
+        assert!(msg.contains("INTERFACE_MODE=cli"));
+        assert!(msg.contains("conflicts"));
+        assert!(msg.contains("mcp"));
+        assert!(msg.contains("ADR-001"));
+    }
+
+    #[test]
+    fn validate_conflict_when_env_contradicts_cli_binary() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Cli);
+        let warning = resolver.validate_with_env(Some("mcp".to_string()));
+        assert!(warning.is_some());
+        let msg = warning.unwrap();
+        assert!(msg.contains("INTERFACE_MODE=mcp"));
+        assert!(msg.contains("conflicts"));
+        assert!(msg.contains("cli"));
+    }
+
+    // -- Precedence invariant: explicit > env > binary default --
+
+    #[test]
+    fn precedence_invariant_explicit_beats_everything() {
+        // Binary default is MCP, env says CLI, explicit says MCP → explicit wins
+        let resolver =
+            InterfaceModeResolver::new(InterfaceMode::Mcp).with_override(InterfaceMode::Mcp);
+        let result = resolver.resolve_with_env(Some("cli".to_string()));
+        assert_eq!(result.mode, InterfaceMode::Mcp);
+        assert_eq!(result.provenance, ModeProvenance::Explicit);
+    }
+
+    #[test]
+    fn precedence_invariant_env_beats_binary_default() {
+        // No explicit override → env wins over binary default
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        let result = resolver.resolve_with_env(Some("cli".to_string()));
+        assert_eq!(result.mode, InterfaceMode::Cli);
+        assert_eq!(result.provenance, ModeProvenance::EnvVar);
+    }
+
+    // -- Edge cases --
+
+    #[test]
+    fn resolver_with_override_same_as_default() {
+        let resolver =
+            InterfaceModeResolver::new(InterfaceMode::Mcp).with_override(InterfaceMode::Mcp);
+        let result = resolver.resolve_with_env(None);
+        assert_eq!(result.mode, InterfaceMode::Mcp);
+        // Even though mode matches default, provenance should be Explicit
+        assert_eq!(result.provenance, ModeProvenance::Explicit);
+    }
+
+    #[test]
+    fn resolver_empty_env_var_treated_as_mcp() {
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Cli);
+        let result = resolver.resolve_with_env(Some(String::new()));
+        // Empty string is not "cli", so defaults to Mcp
+        assert_eq!(result.mode, InterfaceMode::Mcp);
+        assert_eq!(result.provenance, ModeProvenance::EnvVar);
+    }
+
+    #[test]
+    fn validate_still_warns_with_explicit_override() {
+        // validate() checks env vs binary_default, not the explicit override
+        let resolver =
+            InterfaceModeResolver::new(InterfaceMode::Mcp).with_override(InterfaceMode::Cli);
+        // Still warns because env contradicts binary default
+        assert!(
+            resolver
+                .validate_with_env(Some("cli".to_string()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn resolve_via_public_api_uses_binary_default_when_env_unset() {
+        // Verify the public resolve() delegates correctly.
+        // INTERFACE_MODE is not set in the test environment.
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Cli);
+        let result = resolver.resolve();
+        assert_eq!(result.mode, InterfaceMode::Cli);
+        assert_eq!(result.provenance, ModeProvenance::BinaryDefault);
+    }
+
+    #[test]
+    fn validate_via_public_api_no_conflict_when_env_unset() {
+        // Verify the public validate() delegates correctly.
+        let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+        assert!(resolver.validate().is_none());
     }
 }
