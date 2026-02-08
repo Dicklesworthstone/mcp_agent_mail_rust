@@ -19,6 +19,8 @@ fs2.workspace = true
 [features]
 # Placeholder feature for optional agent detection integration
 agent-detect = ["coding-agent-search"]
+# Enable loom model-checking tests (run with `cargo test --features loom-tests`)
+loom-tests = []
 
 [dependencies.coding-agent-search]
 workspace = true
@@ -26,6 +28,7 @@ optional = true
 
 [dev-dependencies]
 criterion.workspace = true
+loom.workspace = true
 tempfile.workspace = true
 
 [[bench]]
