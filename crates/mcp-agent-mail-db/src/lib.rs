@@ -39,7 +39,10 @@ pub use retry::{
     CIRCUIT_BREAKER, CircuitBreaker, CircuitState, DbHealthStatus, RetryConfig, db_health_status,
     retry_sync,
 };
-pub use timestamps::{iso_to_micros, micros_to_iso, micros_to_naive, naive_to_micros, now_micros};
+pub use timestamps::{
+    ClockSkewMetrics, clock_skew_metrics, clock_skew_reset, iso_to_micros, micros_to_iso,
+    micros_to_naive, naive_to_micros, now_micros, now_micros_raw,
+};
 pub use tracking::{
     ActiveTrackerGuard, QueryTracker, QueryTrackerSnapshot, SlowQueryEntry, TableId,
     active_tracker, elapsed_us, query_timer, record_query, set_active_tracker,
