@@ -140,7 +140,7 @@ Run these checks before declaring TUI parity complete:
 ```bash
 # 1. TUI mode: all screens render
 scripts/am
-# Press 1-7, verify each screen loads
+# Press 1-8, verify each screen loads
 # Press ?, verify help overlay
 # Press Ctrl+P, verify command palette
 # Press Shift+T, verify theme cycles
@@ -152,7 +152,7 @@ SERVER_PID=$!
 curl -s http://127.0.0.1:8765/mcp/ \
   -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-# Should return 23 tools
+# Should return 34 tools
 kill $SERVER_PID
 
 # 3. Sensitive value masking

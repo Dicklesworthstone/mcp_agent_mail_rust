@@ -76,8 +76,8 @@ Gating criteria for promoting `scripts/am` as the default workflow.
    ```
 
 3. Start `am` and verify:
-   - TUI renders correctly (all 7 screens load)
-   - Keybindings respond (Tab, 1-7, ?, q)
+   - TUI renders correctly (all 8 screens load)
+   - Keybindings respond (Tab, 1-8, ?, q)
    - Command palette opens (Ctrl+P)
    - System Health shows green status
 
@@ -90,10 +90,10 @@ Gating criteria for promoting `scripts/am` as the default workflow.
 5. Test headless mode:
    ```bash
    scripts/am --no-tui &
-   curl -s http://127.0.0.1:8765/mcp/ \
-     -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
-     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-   # Should return 23 tools
+     curl -s http://127.0.0.1:8765/mcp/ \
+       -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
+       -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+   # Should return 34 tools
    ```
 
 ### After promoting

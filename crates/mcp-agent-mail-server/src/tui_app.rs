@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_link_timeline_switches_to_threads() {
+    fn deep_link_timeline_switches_to_timeline() {
         use crate::tui_screens::DeepLinkTarget;
         let mut model = test_model();
         assert_eq!(model.active_screen(), MailScreenId::Dashboard);
@@ -1014,7 +1014,7 @@ mod tests {
         model.update(MailMsg::Screen(MailScreenMsg::DeepLink(
             DeepLinkTarget::TimelineAtTime(50_000_000),
         )));
-        assert_eq!(model.active_screen(), MailScreenId::Threads);
+        assert_eq!(model.active_screen(), MailScreenId::Timeline);
     }
 
     #[test]
@@ -1114,7 +1114,7 @@ mod tests {
         let mut model = test_model();
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('9')));
         model.update(MailMsg::Terminal(key));
-        // 9 > 7 screens, so should stay on Dashboard
+        // 9 > 8 screens, so should stay on Dashboard
         assert_eq!(model.active_screen(), MailScreenId::Dashboard);
     }
 

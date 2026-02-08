@@ -776,9 +776,10 @@ mod tests {
         {
             let g = m.lock();
             assert_eq!(*g, 42);
+            drop(g);
         }
         let (acq, cont, hold, _) = stats_for(level);
-        assert!(acq >= base_acq + 1, "acquire_count didn't increase");
+        assert!(acq > base_acq, "acquire_count didn't increase");
         assert_eq!(cont, base_cont, "should have 0 new contention events");
         assert!(hold > base_hold, "hold_ns should have increased");
     }
@@ -792,7 +793,7 @@ mod tests {
             let _g = m.try_lock().expect("should succeed");
         }
         let (acq, cont, _, _) = stats_for(level);
-        assert!(acq >= base_acq + 1, "acquire_count didn't increase");
+        assert!(acq > base_acq, "acquire_count didn't increase");
         assert_eq!(cont, base_cont, "try_lock success should not be contended");
     }
 
@@ -854,7 +855,8 @@ mod tests {
                     for _ in 0..iterations {
                         let mut g = m.lock();
                         *g += 1;
-                        // Hold the lock briefly to increase contention probability.
+                        drop(g);
+                        // Yield briefly to increase contention probability.
                         thread::yield_now();
                     }
                 })

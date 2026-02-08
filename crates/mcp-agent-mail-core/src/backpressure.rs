@@ -512,6 +512,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines)]
     fn from_snapshot_with_zero_metrics() {
         let snap = GlobalMetricsSnapshot {
             http: HttpMetricsSnapshot {

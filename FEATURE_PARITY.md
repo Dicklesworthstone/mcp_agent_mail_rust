@@ -116,8 +116,8 @@
 | Feature | Status | Evidence |
 | --- | --- | --- |
 | Python fixture generator | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance/python_reference/generate_fixtures.py` |
-| Rust conformance tests (23 tools) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
-| All resources (23+) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
+| Rust conformance tests (34 tools) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
+| All resources (33) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Tool filter conformance (6 profiles) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
 | Notification signal tests (9 tests) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Instrumentation fixture tests (40 vectors) | Verified (Tests) | `crates/mcp-agent-mail-db/src/tracking.rs` |

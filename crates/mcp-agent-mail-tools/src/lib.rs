@@ -1,13 +1,14 @@
 //! MCP tools and resources implementation for MCP Agent Mail
 //!
-//! This crate provides implementations for all 35 MCP tools:
-//! - Identity cluster (5 tools)
+//! This crate provides implementations for all 34 MCP tools:
+//! - Infrastructure cluster (4 tools)
+//! - Identity cluster (3 tools)
 //! - Messaging cluster (5 tools)
 //! - Contact cluster (4 tools)
-//! - File reservation cluster (6 tools)
+//! - File reservation cluster (4 tools)
 //! - Search cluster (2 tools)
-//! - Macro cluster (4 tools)
-//! - Product cluster (5 tools)
+//! - Workflow macro cluster (4 tools)
+//! - Product bus cluster (5 tools)
 //! - Build slot cluster (3 tools)
 //!
 //! And 20+ MCP resources for read-only data access.

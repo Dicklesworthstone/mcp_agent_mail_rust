@@ -7,7 +7,7 @@
 #   bash scripts/e2e_tui_interactions.sh
 #
 # Validates:
-#   - Screen switching via number keys (1-7) and Tab/BackTab
+#   - Screen switching via number keys (1-8) and Tab/BackTab
 #   - Help overlay toggle (?/Escape)
 #   - Command palette open/close (Ctrl+P, Escape)
 #   - Data visibility after seeding via API
@@ -200,7 +200,7 @@ EXPECT_EOF
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
 # ═══════════════════════════════════════════════════════════════════════
-# Case 1: Screen switching via number keys (1-7)
+# Case 1: Screen switching via number keys (1-8)
 # ═══════════════════════════════════════════════════════════════════════
 e2e_case_banner "screen_switching_number_keys"
 
@@ -236,7 +236,7 @@ spawn env DATABASE_URL=sqlite:////$db \
 # Wait for full TUI startup and first render
 sleep 4
 
-# Switch through all screens: 1-7 then back to 1
+# Switch through all screens: 1-8 then back to 1
 send "2"
 sleep 0.8
 send "3"
@@ -248,6 +248,8 @@ sleep 0.8
 send "6"
 sleep 0.8
 send "7"
+sleep 0.8
+send "8"
 sleep 0.8
 send "1"
 sleep 0.5
@@ -571,7 +573,7 @@ spawn env DATABASE_URL=sqlite:////$db \
 
 sleep 4
 
-# Step 1: Visit every screen (1-7)
+# Step 1: Visit every screen (1-8)
 send "1"
 sleep 0.5
 send "2"
@@ -585,6 +587,8 @@ sleep 0.5
 send "6"
 sleep 0.5
 send "7"
+sleep 0.5
+send "8"
 sleep 0.5
 
 # Step 2: Toggle help on and off

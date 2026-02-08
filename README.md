@@ -1,7 +1,7 @@
 # MCP Agent Mail (Rust)
 
 Mail-like coordination layer for coding agents. Provides an MCP server with
-23 tools and 20+ resources, Git-backed archive, SQLite indexing, and an
+34 tools and 20+ resources, Git-backed archive, SQLite indexing, and an
 interactive TUI operations console.
 
 ## Quick Start
@@ -39,7 +39,7 @@ cargo run -p mcp-agent-mail-cli -- --help
 
 ## TUI Controls
 
-The interactive TUI has 7 screens navigable with `1`-`7` or `Tab`:
+The interactive TUI has 8 screens navigable with `1`-`8` or `Tab`:
 
 | # | Screen       | Shows                                              |
 |---|--------------|-----------------------------------------------------|
@@ -50,6 +50,7 @@ The interactive TUI has 7 screens navigable with `1`-`7` or `Tab`:
 | 5 | Reservations | File reservations with TTL countdowns                |
 | 6 | ToolMetrics  | Per-tool latency and call counts                     |
 | 7 | SystemHealth | Connection probes, disk/memory, circuit breakers     |
+| 8 | Timeline     | Chronological event timeline with inspector          |
 
 Key bindings: `?` help, `Ctrl+P` command palette, `m` toggle MCP/API,
 `Shift+T` cycle theme, `q` quit.
@@ -86,7 +87,7 @@ mcp-agent-mail-core          (config, models, errors, metrics)
   ├─ mcp-agent-mail-storage  (Git archive, commit coalescer)
   ├─ mcp-agent-mail-guard    (pre-commit guard, reservation enforcement)
   ├─ mcp-agent-mail-share    (snapshot, bundle, export)
-  └─ mcp-agent-mail-tools    (23 MCP tool implementations)
+  └─ mcp-agent-mail-tools    (34 MCP tool implementations)
        └─ mcp-agent-mail-server  (HTTP/MCP runtime, TUI, web UI)
             ├─ mcp-agent-mail        (server binary)
             ├─ mcp-agent-mail-cli    (operator CLI)
