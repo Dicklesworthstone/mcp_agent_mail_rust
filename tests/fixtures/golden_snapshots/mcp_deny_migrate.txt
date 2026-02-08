@@ -1,0 +1,4 @@
+Error: "migrate" is not an MCP server command.
+
+Agent Mail MCP server accepts: serve, config
+For operator CLI commands, use: mcp-agent-mail-cli migrate

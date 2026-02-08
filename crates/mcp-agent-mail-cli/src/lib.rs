@@ -705,6 +705,24 @@ pub enum MailCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Summarize a thread (requires LLM API key).
+    #[command(name = "summarize-thread")]
+    SummarizeThread {
+        /// Project key (slug or human_key).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Thread ID to summarize.
+        thread_id: String,
+        /// Max messages per thread.
+        #[arg(long, short = 'n', default_value_t = 50)]
+        per_thread_limit: i64,
+        /// Skip LLM and return raw thread messages.
+        #[arg(long)]
+        no_llm: bool,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2427,10 +2445,10 @@ fn handle_contacts_with_conn(
             // Upsert agent_links: set status to 'pending'.
             conn.query_sync(
                 "INSERT INTO agent_links \
-                 (from_project_id, from_agent_id, to_project_id, to_agent_id, \
+                 (a_project_id, a_agent_id, b_project_id, b_agent_id, \
                   status, reason, created_ts, updated_ts, expires_ts) \
                  VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?) \
-                 ON CONFLICT(from_project_id, from_agent_id, to_project_id, to_agent_id) \
+                 ON CONFLICT(a_project_id, a_agent_id, b_project_id, b_agent_id) \
                  DO UPDATE SET status = 'pending', reason = excluded.reason, \
                     updated_ts = excluded.updated_ts, expires_ts = excluded.expires_ts",
                 &[
@@ -2518,11 +2536,11 @@ fn handle_contacts_with_conn(
                     CliError::InvalidArgument(format!("agent not found: {agent_name}"))
                 })?;
 
-            let updated = conn
+            let _updated = conn
                 .query_sync(
                     "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? \
-                     WHERE from_project_id = ? AND from_agent_id = ? \
-                       AND to_project_id = ? AND to_agent_id = ?",
+                     WHERE a_project_id = ? AND a_agent_id = ? \
+                       AND b_project_id = ? AND b_agent_id = ?",
                     &[
                         sqlmodel_core::Value::Text(new_status.to_string()),
                         sqlmodel_core::Value::BigInt(now_us),
@@ -2540,7 +2558,7 @@ fn handle_contacts_with_conn(
                 "to": agent_name,
                 "approved": approved,
                 "status": new_status,
-                "updated": !updated.is_empty() || true,
+                "updated": true,
             });
             ftui_runtime::ftui_println!(
                 "{}",
@@ -2592,8 +2610,8 @@ fn handle_contacts_with_conn(
                     "SELECT al.status, al.reason, al.updated_ts, al.expires_ts, \
                             a.name AS to_name \
                      FROM agent_links al \
-                     JOIN agents a ON a.id = al.to_agent_id \
-                     WHERE al.from_project_id = ? AND al.from_agent_id = ? \
+                     JOIN agents a ON a.id = al.b_agent_id \
+                     WHERE al.a_project_id = ? AND al.a_agent_id = ? \
                      ORDER BY al.updated_ts DESC",
                     &[
                         sqlmodel_core::Value::BigInt(project_id),
@@ -2608,8 +2626,8 @@ fn handle_contacts_with_conn(
                     "SELECT al.status, al.reason, al.updated_ts, al.expires_ts, \
                             a.name AS from_name \
                      FROM agent_links al \
-                     JOIN agents a ON a.id = al.from_agent_id \
-                     WHERE al.to_project_id = ? AND al.to_agent_id = ? \
+                     JOIN agents a ON a.id = al.a_agent_id \
+                     WHERE al.b_project_id = ? AND al.b_agent_id = ? \
                      ORDER BY al.updated_ts DESC",
                     &[
                         sqlmodel_core::Value::BigInt(project_id),
@@ -4170,6 +4188,88 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 context::format_ts(read_ts),
                 context::format_ts(ack_ts)
             ));
+            Ok(())
+        }
+
+        MailCommand::SummarizeThread {
+            project_key,
+            thread_id,
+            per_thread_limit,
+            no_llm,
+            json,
+        } => {
+            let config = mcp_agent_mail_core::config::Config::from_env();
+            let server_url = format!(
+                "http://{}:{}{}",
+                config.http_host, config.http_port, config.http_path
+            );
+            let bearer = config.http_bearer_token.as_deref();
+
+            let server_result = try_call_server_tool(
+                &server_url,
+                bearer,
+                "summarize_thread",
+                serde_json::json!({
+                    "project_key": project_key,
+                    "thread_id": thread_id,
+                    "include_examples": true,
+                    "llm_mode": !no_llm,
+                    "per_thread_limit": per_thread_limit,
+                }),
+            )
+            .await
+            .and_then(coerce_tool_result_json);
+
+            let Some(payload) = server_result else {
+                ftui_runtime::ftui_println!(
+                    "Server unavailable; summarization requires server tool. Try again when server is running."
+                );
+                return Err(CliError::ExitCode(2));
+            };
+
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            let summary = payload.get("summary").cloned().unwrap_or_default();
+            let participants = summary
+                .get("participants")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+
+            output::section(&format!("Thread summary: {thread_id}"));
+            output::kv("Participants", &participants);
+            output::kv(
+                "Total messages",
+                &summary
+                    .get("total_messages")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            );
+            output::kv(
+                "Open actions",
+                &summary
+                    .get("open_actions")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            );
+            output::kv(
+                "Done actions",
+                &summary
+                    .get("done_actions")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            );
             Ok(())
         }
 
@@ -8876,6 +8976,71 @@ sys.exit(7)
     }
 
     #[test]
+    fn clap_parses_mail_summarize_thread() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "summarize-thread",
+            "-p",
+            "my-proj",
+            "thread-42",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Mail {
+                action:
+                    MailCommand::SummarizeThread {
+                        project_key,
+                        thread_id,
+                        per_thread_limit,
+                        no_llm,
+                        json,
+                    },
+            } => {
+                assert_eq!(project_key, "my-proj");
+                assert_eq!(thread_id, "thread-42");
+                assert_eq!(per_thread_limit, 50);
+                assert!(!no_llm);
+                assert!(!json);
+            }
+            other => panic!("expected Mail SummarizeThread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_mail_summarize_thread_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "summarize-thread",
+            "-p",
+            "proj",
+            "t-1",
+            "-n",
+            "10",
+            "--no-llm",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Mail {
+                action:
+                    MailCommand::SummarizeThread {
+                        per_thread_limit,
+                        no_llm,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(per_thread_limit, 10);
+                assert!(no_llm);
+                assert!(json);
+            }
+            other => panic!("expected Mail SummarizeThread, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_parses_products_ensure_defaults() {
         let cli = Cli::try_parse_from(["am", "products", "ensure"]).unwrap();
         match cli.command {
@@ -11029,6 +11194,535 @@ sys.exit(7)
             "BlueLake",
         ]);
         assert!(err.is_err());
+    }
+
+    // ── Contacts clap parsing tests ──────────────────────────────────────
+
+    #[test]
+    fn clap_parses_contacts_request() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "contacts",
+            "request",
+            "--project",
+            "my-proj",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+            "--reason",
+            "need to coordinate",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Contacts {
+                action:
+                    ContactsCommand::Request {
+                        project_key,
+                        from_agent,
+                        to_agent,
+                        reason,
+                        ttl_seconds,
+                    },
+            } => {
+                assert_eq!(project_key, "my-proj");
+                assert_eq!(from_agent, "BlueLake");
+                assert_eq!(to_agent, "RedFox");
+                assert_eq!(reason, "need to coordinate");
+                assert_eq!(ttl_seconds, 604_800); // default 7 days
+            }
+            other => panic!("expected contacts request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_request_custom_ttl() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "contacts",
+            "request",
+            "-p",
+            "proj",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+            "--ttl-seconds",
+            "86400",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Contacts {
+                action:
+                    ContactsCommand::Request {
+                        ttl_seconds,
+                        reason,
+                        ..
+                    },
+            } => {
+                assert_eq!(ttl_seconds, 86400);
+                assert_eq!(reason, ""); // default
+            }
+            other => panic!("expected contacts request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_respond_accept() {
+        let cli = Cli::try_parse_from([
+            "am", "contacts", "respond", "-p", "proj", "-a", "RedFox", "--from", "BlueLake",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Contacts {
+                action:
+                    ContactsCommand::Respond {
+                        project_key,
+                        agent_name,
+                        from_agent,
+                        accept,
+                        reject,
+                        ..
+                    },
+            } => {
+                assert_eq!(project_key, "proj");
+                assert_eq!(agent_name, "RedFox");
+                assert_eq!(from_agent, "BlueLake");
+                assert!(accept);
+                assert!(!reject);
+            }
+            other => panic!("expected contacts respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_respond_reject() {
+        let cli = Cli::try_parse_from([
+            "am", "contacts", "respond", "-p", "proj", "-a", "RedFox", "--from", "BlueLake",
+            "--reject",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Contacts {
+                action:
+                    ContactsCommand::Respond {
+                        accept: _, reject, ..
+                    },
+            } => {
+                assert!(reject);
+            }
+            other => panic!("expected contacts respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_list() {
+        let cli = Cli::try_parse_from([
+            "am", "contacts", "list", "-p", "proj", "-a", "BlueLake", "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Contacts {
+                action:
+                    ContactsCommand::ListContacts {
+                        project_key,
+                        agent_name,
+                        json,
+                    },
+            } => {
+                assert_eq!(project_key, "proj");
+                assert_eq!(agent_name, "BlueLake");
+                assert!(json);
+            }
+            other => panic!("expected contacts list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_list_no_json() {
+        let cli = Cli::try_parse_from(["am", "contacts", "list", "-p", "proj", "-a", "BlueLake"])
+            .unwrap();
+        match cli.command {
+            Commands::Contacts {
+                action: ContactsCommand::ListContacts { json, .. },
+            } => {
+                assert!(!json);
+            }
+            other => panic!("expected contacts list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_policy() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "contacts",
+            "policy",
+            "-p",
+            "proj",
+            "-a",
+            "BlueLake",
+            "contacts_only",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Contacts {
+                action:
+                    ContactsCommand::Policy {
+                        project_key,
+                        agent_name,
+                        policy,
+                    },
+            } => {
+                assert_eq!(project_key, "proj");
+                assert_eq!(agent_name, "BlueLake");
+                assert_eq!(policy, "contacts_only");
+            }
+            other => panic!("expected contacts policy, got {other:?}"),
+        }
+    }
+
+    // ── Contacts integration tests ───────────────────────────────────────
+
+    #[test]
+    fn integration_contacts_request_creates_link() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "need coordination".to_string(),
+                ttl_seconds: 3600,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "request failed: {result:?}");
+        assert!(
+            output.contains("\"status\"") && output.contains("pending"),
+            "expected pending status, got: {output}"
+        );
+
+        // Verify link in DB.
+        let rows = conn
+            .query_sync(
+                "SELECT status, reason FROM agent_links WHERE a_agent_id = 1 AND b_agent_id = 2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected 1 agent_link row");
+        let status: String = rows[0].get_named("status").unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn integration_contacts_respond_approve() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        // First create a request.
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "collab".to_string(),
+                ttl_seconds: 3600,
+            },
+        )
+        .unwrap();
+
+        // Approve it.
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Respond {
+                project_key: "test-proj".to_string(),
+                agent_name: "RedFox".to_string(),
+                from_agent: "BlueLake".to_string(),
+                accept: true,
+                reject: false,
+                ttl_seconds: 86400,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "respond failed: {result:?}");
+        assert!(
+            output.contains("approved"),
+            "expected approved in output, got: {output}"
+        );
+
+        // Verify DB.
+        let rows = conn
+            .query_sync(
+                "SELECT status FROM agent_links WHERE a_agent_id = 1 AND b_agent_id = 2",
+                &[],
+            )
+            .unwrap();
+        let status: String = rows[0].get_named("status").unwrap();
+        assert_eq!(status, "approved");
+    }
+
+    #[test]
+    fn integration_contacts_respond_reject() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        // Create + reject.
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "RedFox".to_string(),
+                to_agent: "BlueLake".to_string(),
+                reason: "test".to_string(),
+                ttl_seconds: 3600,
+            },
+        )
+        .unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Respond {
+                project_key: "test-proj".to_string(),
+                agent_name: "BlueLake".to_string(),
+                from_agent: "RedFox".to_string(),
+                accept: false,
+                reject: true,
+                ttl_seconds: 86400,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "reject failed: {result:?}");
+        assert!(
+            output.contains("blocked"),
+            "expected blocked status, got: {output}"
+        );
+
+        // Verify DB.
+        let rows = conn
+            .query_sync(
+                "SELECT status FROM agent_links WHERE a_agent_id = 2 AND b_agent_id = 1",
+                &[],
+            )
+            .unwrap();
+        let status: String = rows[0].get_named("status").unwrap();
+        assert_eq!(status, "blocked");
+    }
+
+    #[test]
+    fn integration_contacts_list_json() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        // Create a link.
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "x".to_string(),
+                ttl_seconds: 3600,
+            },
+        )
+        .unwrap();
+
+        // List contacts as JSON for BlueLake.
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::ListContacts {
+                project_key: "test-proj".to_string(),
+                agent_name: "BlueLake".to_string(),
+                json: true,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "list failed: {result:?}");
+        assert!(
+            output.contains("\"direction\"") && output.contains("outgoing"),
+            "expected outgoing entry, got: {output}"
+        );
+        assert!(
+            output.contains("RedFox"),
+            "expected RedFox in contacts, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_contacts_list_empty() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::ListContacts {
+                project_key: "test-proj".to_string(),
+                agent_name: "BlueLake".to_string(),
+                json: false,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok());
+        assert!(
+            output.contains("No contacts") || output.is_empty(),
+            "expected empty message, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_contacts_policy_set() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Policy {
+                project_key: "test-proj".to_string(),
+                agent_name: "BlueLake".to_string(),
+                policy: "contacts_only".to_string(),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "policy set failed: {result:?}");
+        assert!(
+            output.contains("contacts_only"),
+            "expected policy in output, got: {output}"
+        );
+
+        // Verify DB.
+        let rows = conn
+            .query_sync(
+                "SELECT contact_policy FROM agents WHERE name = 'BlueLake'",
+                &[],
+            )
+            .unwrap();
+        let policy: String = rows[0].get_named("contact_policy").unwrap();
+        assert_eq!(policy, "contacts_only");
+    }
+
+    #[test]
+    fn integration_contacts_policy_invalid() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Policy {
+                project_key: "test-proj".to_string(),
+                agent_name: "BlueLake".to_string(),
+                policy: "invalid_policy".to_string(),
+            },
+        );
+        assert!(result.is_err(), "should fail for invalid policy");
+    }
+
+    #[test]
+    fn integration_contacts_request_invalid_project() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "nonexistent".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: String::new(),
+                ttl_seconds: 3600,
+            },
+        );
+        assert!(result.is_err(), "should fail for nonexistent project");
+    }
+
+    #[test]
+    fn integration_contacts_request_invalid_agent() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "NonexistentAgent".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: String::new(),
+                ttl_seconds: 3600,
+            },
+        );
+        assert!(result.is_err(), "should fail for nonexistent agent");
+    }
+
+    #[test]
+    fn integration_contacts_request_upsert() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        // First request.
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "first".to_string(),
+                ttl_seconds: 3600,
+            },
+        )
+        .unwrap();
+
+        // Second request (upsert) with different reason.
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "updated".to_string(),
+                ttl_seconds: 7200,
+            },
+        )
+        .unwrap();
+
+        // Should still be just 1 row (upserted).
+        let rows = conn
+            .query_sync(
+                "SELECT reason FROM agent_links WHERE a_agent_id = 1 AND b_agent_id = 2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected 1 row after upsert");
+        let reason: String = rows[0].get_named("reason").unwrap();
+        assert_eq!(reason, "updated");
     }
 }
 

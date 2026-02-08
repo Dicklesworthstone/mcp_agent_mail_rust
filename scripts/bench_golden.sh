@@ -70,7 +70,30 @@ capture_golden() {
         (( pass_count++ )) || true
     done
 
-    # 4. Stub encoder outputs (deterministic)
+    # 4. MCP denial messages (stderr from denied commands)
+    local mcp_bin="${CARGO_TARGET_DIR}/debug/mcp-agent-mail"
+    if [ ! -f "$mcp_bin" ]; then
+        log "Building MCP binary for denial captures..."
+        cargo build -p mcp-agent-mail 2>&1 | tail -3
+    fi
+    if [ -f "$mcp_bin" ]; then
+        for denied_cmd in "share" "guard" "doctor" "archive" "migrate"; do
+            log "Capturing: MCP denial for '${denied_cmd}'"
+            "$mcp_bin" "$denied_cmd" 2>&1 | normalize_output > "${GOLDEN_DIR}/mcp_deny_${denied_cmd}.txt" || true
+            (( pass_count++ )) || true
+        done
+    else
+        log "SKIP: MCP binary not found, skipping denial captures"
+    fi
+
+    # 5. Additional CLI subcommand help texts
+    for subcmd in "agents" "tooling" "macros" "contacts" "products" "archive" "projects" "file_reservations"; do
+        log "Capturing: am ${subcmd} --help"
+        "$bin" "$subcmd" --help 2>/dev/null | normalize_output > "${GOLDEN_DIR}/am_${subcmd}_help.txt" || echo "not available" > "${GOLDEN_DIR}/am_${subcmd}_help.txt"
+        (( pass_count++ )) || true
+    done
+
+    # 6. Stub encoder outputs (deterministic)
     local stub="${PROJECT_ROOT}/scripts/toon_stub_encoder.sh"
     if [ -x "$stub" ]; then
         log "Capturing: stub encoder outputs"
@@ -81,7 +104,7 @@ capture_golden() {
         (( pass_count += 4 )) || true
     fi
 
-    # 5. Generate checksums
+    # 7. Generate checksums
     log "Computing checksums..."
     (cd "$GOLDEN_DIR" && sha256sum *.txt > checksums.sha256 2>/dev/null)
 
@@ -115,6 +138,19 @@ validate_golden() {
     "$bin" --version 2>/dev/null | normalize_output > "${tmp_dir}/am_version.txt" || echo "version not available" > "${tmp_dir}/am_version.txt"
 
     for subcmd in "serve-http" "serve-stdio" "guard" "share" "doctor" "config" "mail"; do
+        "$bin" "$subcmd" --help 2>/dev/null | normalize_output > "${tmp_dir}/am_${subcmd}_help.txt" || echo "not available" > "${tmp_dir}/am_${subcmd}_help.txt"
+    done
+
+    # MCP denial messages
+    local mcp_bin="${CARGO_TARGET_DIR}/debug/mcp-agent-mail"
+    if [ -f "$mcp_bin" ]; then
+        for denied_cmd in "share" "guard" "doctor" "archive" "migrate"; do
+            "$mcp_bin" "$denied_cmd" 2>&1 | normalize_output > "${tmp_dir}/mcp_deny_${denied_cmd}.txt" || true
+        done
+    fi
+
+    # Additional CLI help
+    for subcmd in "agents" "tooling" "macros" "contacts" "products" "archive" "projects" "file_reservations"; do
         "$bin" "$subcmd" --help 2>/dev/null | normalize_output > "${tmp_dir}/am_${subcmd}_help.txt" || echo "not available" > "${tmp_dir}/am_${subcmd}_help.txt"
     done
 

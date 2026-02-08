@@ -1,0 +1,13 @@
+Composite workflow macros (session boot, thread prep, reservation cycles, contact handshake)
+
+Usage: am macros <COMMAND>
+
+Commands:
+  start-session           Boot a project session: ensure project, register agent, reserve files, fetch inbox
+  prepare-thread          Align with an existing thread: register agent, summarize thread, fetch inbox
+  file-reservation-cycle  Reserve files and optionally release them at the end
+  contact-handshake       Request contact approval, optionally auto-approve, and send a welcome message
+  help                    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
