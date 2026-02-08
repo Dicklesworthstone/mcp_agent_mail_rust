@@ -152,7 +152,7 @@ pub async fn file_reservation_paths(
         ));
     }
 
-    let ttl = ttl_seconds.unwrap_or(3600);
+    let ttl = ttl_seconds.unwrap_or(3600).max(0);
     if ttl < 60 {
         tracing::info!(
             "ttl_seconds={} is below recommended minimum (60s); continuing anyway",
@@ -445,7 +445,9 @@ pub async fn renew_file_reservations(
         .iter()
         .map(|r| {
             // Calculate old expiry (current - extend)
-            let old_expires = r.expires_ts - (extend * 1_000_000);
+            let old_expires = r
+                .expires_ts
+                .saturating_sub(extend.saturating_mul(1_000_000));
             RenewedReservation {
                 id: r.id.unwrap_or(0),
                 path_pattern: r.path_pattern.clone(),
@@ -540,8 +542,8 @@ pub async fn force_release_file_reservation(
     // Configurable thresholds
     let inactivity_seconds: i64 = 30 * 60; // 30 minutes
     let grace_seconds: i64 = 15 * 60; // 15 minutes
-    let inactivity_micros = inactivity_seconds * 1_000_000;
-    let grace_micros = grace_seconds * 1_000_000;
+    let inactivity_micros = inactivity_seconds.saturating_mul(1_000_000);
+    let grace_micros = grace_seconds.saturating_mul(1_000_000);
 
     // Validate inactivity heuristics (4 signals)
     let holder_agent = db_outcome_to_mcp_result(

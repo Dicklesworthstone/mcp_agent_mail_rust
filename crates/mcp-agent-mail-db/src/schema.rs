@@ -1117,7 +1117,7 @@ mod tests {
                     Value::BigInt(1),
                     Value::Text(subj.to_string()),
                     Value::Text(body.to_string()),
-                    Value::BigInt(i as i64 + 100),
+                    Value::BigInt(i64::try_from(i).unwrap() + 100),
                 ],
             )
             .expect("insert message");

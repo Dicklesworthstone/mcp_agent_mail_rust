@@ -358,12 +358,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_collect)]
     fn joiners_receive_leader_result() {
         let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(5)));
         let exec_count = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(5));
         let threads = 5;
 
+        // Phase 1: spawn all threads (must collect before joining — barrier
+        // needs all threads alive before any can proceed).
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 let map = Arc::clone(&map);
@@ -383,7 +386,7 @@ mod tests {
                 })
             })
             .collect();
-
+        // Phase 2: join all threads.
         let results: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         // All threads get the same result.
@@ -403,6 +406,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_collect)]
     fn different_keys_execute_independently() {
         let map = Arc::new(CoalesceMap::<String, String>::new(
             100,
@@ -410,6 +414,7 @@ mod tests {
         ));
         let exec_count = Arc::new(AtomicUsize::new(0));
 
+        // Phase 1: spawn all threads.
         let handles: Vec<_> = (0..3)
             .map(|i| {
                 let map = Arc::clone(&map);
@@ -426,7 +431,7 @@ mod tests {
                 })
             })
             .collect();
-
+        // Phase 2: join.
         let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         assert_eq!(results.len(), 3);
         // Each key should have executed independently.

@@ -330,9 +330,7 @@ pub fn render_help_overlay(
         render_keybinding_line_themed(
             key,
             action,
-            inner.x + 1,
-            inner.y + y_offset,
-            col_width,
+            Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
             key_col,
             &tp,
             frame,
@@ -367,9 +365,7 @@ pub fn render_help_overlay(
             render_keybinding_line_themed(
                 entry.key,
                 entry.action,
-                inner.x + 1,
-                inner.y + y_offset,
-                col_width,
+                Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
                 key_col,
                 &tp,
                 frame,
@@ -383,9 +379,7 @@ pub fn render_help_overlay(
 fn render_keybinding_line_themed(
     key: &str,
     action: &str,
-    x: u16,
-    y: u16,
-    width: u16,
+    area: Rect,
     key_col: u16,
     tp: &crate::tui_theme::TuiThemePalette,
     frame: &mut Frame,
@@ -407,7 +401,6 @@ fn render_keybinding_line_themed(
     ];
 
     let line = Line::from_spans(spans);
-    let area = Rect::new(x, y, width, 1);
     Paragraph::new(Text::from_lines([line])).render(area, frame);
 }
 

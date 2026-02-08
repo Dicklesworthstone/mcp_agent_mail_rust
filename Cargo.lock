@@ -1996,11 +1996,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftui-backend"
+version = "0.1.0"
+dependencies = [
+ "ftui-core 0.1.1",
+ "ftui-render 0.1.1",
+]
+
+[[package]]
 name = "ftui-core"
 version = "0.1.1"
 dependencies = [
  "bitflags 2.10.0",
- "crossterm 0.29.0",
  "signal-hook 0.4.3",
  "unicode-display-width",
  "unicode-segmentation",
@@ -2025,7 +2032,6 @@ name = "ftui-extras"
 version = "0.1.1"
 dependencies = [
  "ftui-render 0.1.1",
- "ftui-runtime 0.1.1",
  "ftui-style 0.1.1",
  "ftui-text 0.1.1",
 ]
@@ -2124,6 +2130,7 @@ name = "ftui-runtime"
 version = "0.1.1"
 dependencies = [
  "crossterm 0.29.0",
+ "ftui-backend",
  "ftui-core 0.1.1",
  "ftui-i18n 0.1.1",
  "ftui-layout 0.1.1",

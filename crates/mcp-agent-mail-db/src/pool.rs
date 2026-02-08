@@ -930,7 +930,7 @@ mod tests {
         );
     }
 
-    /// Verify `build_conn_pragmas` scales cache_size with pool size.
+    /// Verify `build_conn_pragmas` scales `cache_size` with pool size.
     #[test]
     fn build_conn_pragmas_budget_aware_cache() {
         // 100 connections: 512*1024 / 100 = 5242 KB each
@@ -978,7 +978,7 @@ mod tests {
         }
     }
 
-    /// Verify build_conn_pragmas handles zero pool size gracefully.
+    /// Verify `build_conn_pragmas` handles zero pool size gracefully.
     #[test]
     fn build_conn_pragmas_zero_pool_fallback() {
         let sql = schema::build_conn_pragmas(0);

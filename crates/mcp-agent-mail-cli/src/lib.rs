@@ -1637,7 +1637,7 @@ fn clear_and_reset_everything(
                     .unwrap_or("<archive>");
                 ftui_runtime::ftui_println!("Saved restore point to: {}", path.display());
                 ftui_runtime::ftui_println!(
-                    "Restore later with: mcp-agent-mail archive restore {display_name}"
+                    "Restore later with: am archive restore {display_name}"
                 );
                 archive_path = Some(path);
             }
@@ -1750,6 +1750,7 @@ fn handle_typecheck() -> CliResult<()> {
 struct ShareWizardScriptResolution {
     source_path: PathBuf,
     cwd_path: PathBuf,
+    legacy_path: PathBuf,
     chosen: Option<PathBuf>,
 }
 
@@ -1764,10 +1765,18 @@ fn resolve_share_wizard_script(cwd: &Path) -> ShareWizardScriptResolution {
         .unwrap_or(manifest_dir);
     let source_path = source_root.join("scripts/share_to_github_pages.py");
 
+    // Fallback: when running from this repo's source tree, allow using the legacy Python wizard.
+    // This keeps the installed-binary behavior unchanged (no hidden dependency on the legacy tree).
+    let legacy_path = source_root
+        .join("legacy_python_mcp_agent_mail_code/mcp_agent_mail/scripts/share_to_github_pages.py");
+    let allow_legacy = cwd.starts_with(source_root) && is_readable_file(&legacy_path);
+
     let chosen = if is_readable_file(&cwd_path) {
         Some(cwd_path.clone())
     } else if is_readable_file(&source_path) {
         Some(source_path.clone())
+    } else if allow_legacy {
+        Some(legacy_path.clone())
     } else {
         None
     };
@@ -1775,6 +1784,7 @@ fn resolve_share_wizard_script(cwd: &Path) -> ShareWizardScriptResolution {
     ShareWizardScriptResolution {
         source_path,
         cwd_path,
+        legacy_path,
         chosen,
     }
 }
@@ -1800,13 +1810,35 @@ fn run_share_wizard_in_cwd(cwd: &Path) -> CliResult<()> {
         return Err(CliError::ExitCode(1));
     };
 
-    run_python_script_in_cwd(script, cwd)
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("repo root")
+        .to_path_buf();
+    let legacy_python_src = repo_root.join("legacy_python_mcp_agent_mail_code/mcp_agent_mail/src");
+
+    let extra_pythonpath = if script == resolution.legacy_path && legacy_python_src.is_dir() {
+        Some(legacy_python_src)
+    } else {
+        None
+    };
+
+    run_python_script_in_cwd(script, cwd, extra_pythonpath.as_deref())
 }
 
-fn run_python_script_in_cwd(script: &Path, cwd: &Path) -> CliResult<()> {
+fn run_python_script_in_cwd(script: &Path, cwd: &Path, pythonpath: Option<&Path>) -> CliResult<()> {
     let mut cmd = std::process::Command::new("python");
     cmd.arg(script);
     cmd.current_dir(cwd);
+    if let Some(pythonpath) = pythonpath {
+        let mut paths: Vec<PathBuf> = vec![pythonpath.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PYTHONPATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PYTHONPATH", joined);
+        }
+    }
 
     let status = match cmd.status() {
         Ok(status) => status,
@@ -1814,6 +1846,15 @@ fn run_python_script_in_cwd(script: &Path, cwd: &Path) -> CliResult<()> {
             let mut cmd = std::process::Command::new("python3");
             cmd.arg(script);
             cmd.current_dir(cwd);
+            if let Some(pythonpath) = pythonpath {
+                let mut paths: Vec<PathBuf> = vec![pythonpath.to_path_buf()];
+                if let Some(existing) = std::env::var_os("PYTHONPATH") {
+                    paths.extend(std::env::split_paths(&existing));
+                }
+                if let Ok(joined) = std::env::join_paths(paths) {
+                    cmd.env("PYTHONPATH", joined);
+                }
+            }
             cmd.status()?
         }
         Err(err) => return Err(err.into()),
@@ -3455,6 +3496,26 @@ mod tests {
         assert!(output.contains("This command only works when running from source."));
         assert!(
             output.contains("Run the wizard directly: python scripts/share_to_github_pages.py")
+        );
+    }
+
+    #[test]
+    fn share_wizard_resolves_when_running_from_repo_root() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+
+        let resolution = resolve_share_wizard_script(&repo_root);
+        assert!(
+            resolution.chosen.is_some(),
+            "expected a wizard script to resolve when running from the repo root"
+        );
+        assert!(
+            resolution.legacy_path.is_file(),
+            "expected legacy wizard script to exist at {}",
+            resolution.legacy_path.display()
         );
     }
 
@@ -9127,7 +9188,7 @@ fn archive_save_state(
             "python": "",
         },
         "notes": [
-            format!("Restore with `mcp-agent-mail archive restore {}`", destination_name)
+            format!("Restore with `am archive restore {}`", destination_name)
         ],
     });
     let sorted_metadata = sort_json_keys(&metadata);
@@ -9213,7 +9274,7 @@ fn archive_save_state(
         format_bytes(size_bytes),
     );
     ftui_runtime::ftui_println!(
-        "Restore later with: mcp-agent-mail archive restore {}",
+        "Restore later with: am archive restore {}",
         destination_name
     );
 
@@ -9614,7 +9675,7 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                 );
             }
             ftui_runtime::ftui_println!(
-                "Archives live under {}. Restore with `mcp-agent-mail archive restore <file>`.",
+                "Archives live under {}. Restore with `am archive restore <file>`.",
                 archive_dir.display()
             );
             Ok(())

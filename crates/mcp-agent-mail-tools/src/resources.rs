@@ -2984,7 +2984,9 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
     )?;
 
     let now_us = mcp_agent_mail_db::now_micros();
-    let ttl_us = i64::try_from(ttl_seconds).unwrap_or(i64::MAX) * 1_000_000;
+    let ttl_us = i64::try_from(ttl_seconds)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
 
     let mut messages = Vec::with_capacity(unacked_rows.len());
     for row in unacked_rows {
@@ -3077,7 +3079,12 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
     // Compute cutoff: messages older than ttl_minutes are overdue
     let cutoff_minutes = ttl_minutes.max(1);
     let now_us = mcp_agent_mail_db::now_micros();
-    let cutoff_us = now_us - i64::try_from(cutoff_minutes).unwrap_or(i64::MAX) * 60 * 1_000_000;
+    let cutoff_us = now_us.saturating_sub(
+        i64::try_from(cutoff_minutes)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(60)
+            .saturating_mul(1_000_000),
+    );
 
     // Fetch unacked ack-required messages (over-fetch, then filter by cutoff)
     let unacked_rows = db_outcome_to_mcp_result(

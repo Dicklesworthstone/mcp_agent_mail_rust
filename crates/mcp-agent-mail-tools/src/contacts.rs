@@ -181,7 +181,7 @@ pub async fn request_contact(
 
     let to_row = resolve_agent(ctx, &pool, target_project_id, &to_agent).await?;
 
-    let ttl = ttl_seconds.unwrap_or(604_800); // 7 days default (legacy)
+    let ttl = ttl_seconds.unwrap_or(604_800).max(0); // 7 days default; clamp negative to 0
     let link_row = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::request_contact(
             ctx.cx(),
@@ -271,7 +271,7 @@ pub async fn respond_contact(
     let from_row = resolve_agent(ctx, &pool, source_project_id, &from_agent).await?;
     let to_row = resolve_agent(ctx, &pool, project_id, &to_agent).await?;
 
-    let ttl = ttl_seconds.unwrap_or(2_592_000); // 30 days default
+    let ttl = ttl_seconds.unwrap_or(2_592_000).max(0); // 30 days default; clamp negative to 0
     let (updated, link_row) = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::respond_contact(
             ctx.cx(),

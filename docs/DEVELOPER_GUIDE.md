@@ -148,7 +148,7 @@ pub mod my_new_screen;
 
 The `tui_keymap.rs` test `no_screen_conflicts_with_global_bindings` will
 automatically check that your screen's keybindings don't collide with global
-keys (`q`, `?`, `:`, `m`, `T`, `1`-`7`). If a screen needs one of these
+keys (`q`, `?`, `:`, `m`, `T`, `1`-`8`). If a screen needs one of these
 keys, set `consumes_text_input() -> true` for the input mode.
 
 ## Adding a Command Palette Action

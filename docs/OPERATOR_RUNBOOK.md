@@ -62,7 +62,7 @@ remediation hints and exits. Probes check:
 
 | Key         | Action            | Notes                           |
 |-------------|-------------------|---------------------------------|
-| `1`-`7`     | Jump to screen    | Suppressed during text input    |
+| `1`-`8`     | Jump to screen    | Suppressed during text input    |
 | `Tab`       | Next screen       |                                 |
 | `Shift+Tab` | Previous screen   |                                 |
 | `m`         | Toggle MCP/API    | Restarts transport              |
@@ -96,6 +96,7 @@ accessible via `?`. Common patterns:
 | 5 | Reservations | Active file reservations with TTL countdowns       |
 | 6 | ToolMetrics  | Per-tool latency histograms and call counts        |
 | 7 | SystemHealth | Connection probes, disk/memory, circuit breakers   |
+| 8 | Timeline     | Chronological event timeline with inspector         |
 
 ## 5. Transport Modes
 

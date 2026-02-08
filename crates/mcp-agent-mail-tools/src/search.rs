@@ -268,23 +268,8 @@ pub async fn search_messages(
     query: String,
     limit: Option<i32>,
 ) -> McpResult<String> {
-    let max_results_raw = limit.unwrap_or(20);
-    if max_results_raw < 1 {
-        return Err(legacy_tool_error(
-            "INVALID_LIMIT",
-            format!("limit must be at least 1, got {max_results_raw}. Use a positive integer."),
-            true,
-            json!({"provided": max_results_raw, "min": 1, "max": 1000}),
-        ));
-    }
-    let max_results = usize::try_from(max_results_raw).map_err(|_| {
-        legacy_tool_error(
-            "INVALID_LIMIT",
-            format!("limit exceeds supported range: {max_results_raw}"),
-            true,
-            json!({"provided": max_results_raw, "min": 1, "max": 1000}),
-        )
-    })?;
+    let max_results_raw = limit.unwrap_or(20).clamp(1, 1000);
+    let max_results = max_results_raw.unsigned_abs() as usize;
 
     // Legacy parity: empty query returns an empty result set (no DB call).
     let trimmed = query.trim();

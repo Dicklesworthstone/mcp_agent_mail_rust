@@ -75,6 +75,10 @@ pub struct ProjectArchive {
     pub root: PathBuf,
     pub repo_root: PathBuf,
     pub lock_path: PathBuf,
+    /// Pre-canonicalized root path — avoids repeated `readlink` syscalls.
+    canonical_root: PathBuf,
+    /// Pre-canonicalized repo root path — avoids repeated `readlink` syscalls.
+    canonical_repo_root: PathBuf,
 }
 
 /// Metadata about a single git commit.
@@ -714,9 +718,7 @@ impl FileLock {
 
         let start = Instant::now();
 
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        ensure_parent_dir(&self.path)?;
 
         for attempt in 0..=self.max_retries {
             let elapsed = start.elapsed();
@@ -1566,7 +1568,11 @@ impl CommitCoalescer {
                 })
             };
 
-            if all_empty || Instant::now() >= deadline {
+            if all_empty {
+                break;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!("flush_sync timed out after 30s; some commits may still be pending");
                 break;
             }
 
@@ -2581,9 +2587,7 @@ pub fn commit_paths_with_retry(
 
     // Fall back to index-based commit with project-scoped lock
     let lock_path = commit_lock_path(repo_root, rel_paths);
-    if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    ensure_parent_dir(&lock_path)?;
 
     let mut lock = FileLock::new(lock_path);
     let lock_start = std::time::Instant::now();
@@ -2768,6 +2772,39 @@ fn repo_cache_insert(root: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Directory existence cache — avoids repeated stat() syscalls from
+// create_dir_all() on directories that already exist.
+// ---------------------------------------------------------------------------
+
+static DIR_CACHE: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Create parent directories for `path`, skipping `create_dir_all` when the
+/// parent has already been seen. This eliminates redundant `stat`/`access`
+/// syscalls in the hot message-write path.
+fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Create a directory (and parents) only if we haven't already created it.
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    {
+        let cache = DIR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.contains(dir) {
+            return Ok(());
+        }
+    }
+    fs::create_dir_all(dir)?;
+    {
+        let mut cache = DIR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(dir.to_path_buf());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Archive initialization (br-2ei.2.1)
 // ---------------------------------------------------------------------------
 
@@ -2776,7 +2813,7 @@ fn repo_cache_insert(root: &Path) {
 /// Returns `(repo_root, was_freshly_initialized)`.
 pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
     let root = config.storage_root.clone();
-    fs::create_dir_all(&root)?;
+    ensure_dir(&root)?;
 
     let fresh = ensure_repo(&root, config)?;
     Ok((root, fresh))
@@ -2788,11 +2825,19 @@ pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
     let project_root = repo_root.join("projects").join(slug);
     fs::create_dir_all(&project_root)?;
 
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.clone());
+    let canonical_repo_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.clone());
     Ok(ProjectArchive {
         slug: slug.to_string(),
         root: project_root.clone(),
         repo_root,
         lock_path: project_root.join(".archive.lock"),
+        canonical_root,
+        canonical_repo_root,
     })
 }
 
@@ -2879,12 +2924,12 @@ pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) 
     let name = validate_archive_component("agent name", name)?;
 
     let profile_dir = archive.root.join("agents").join(name);
-    fs::create_dir_all(&profile_dir)?;
+    ensure_dir(&profile_dir)?;
 
     let profile_path = profile_dir.join("profile.json");
     write_json(&profile_path, agent)?;
 
-    let rel = rel_path(&archive.repo_root, &profile_path)?;
+    let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
     enqueue_async_commit(
         &archive.repo_root,
         &Config::default(),
@@ -2908,12 +2953,12 @@ pub fn write_agent_profile_with_config(
     let name = validate_archive_component("agent name", name)?;
 
     let profile_dir = archive.root.join("agents").join(name);
-    fs::create_dir_all(&profile_dir)?;
+    ensure_dir(&profile_dir)?;
 
     let profile_path = profile_dir.join("profile.json");
     write_json(&profile_path, agent)?;
 
-    let rel = rel_path(&archive.repo_root, &profile_path)?;
+    let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
     enqueue_async_commit(
         &archive.repo_root,
         config,
@@ -2956,7 +3001,7 @@ pub fn write_file_reservation_records(
     }
 
     let reservation_dir = archive.root.join("file_reservations");
-    fs::create_dir_all(&reservation_dir)?;
+    ensure_dir(&reservation_dir)?;
 
     let mut rel_paths = Vec::new();
     let mut entries = Vec::new();
@@ -2994,13 +3039,13 @@ pub fn write_file_reservation_records(
         };
         let legacy_path = reservation_dir.join(format!("{digest}.json"));
         write_json(&legacy_path, &normalized)?;
-        rel_paths.push(rel_path(&archive.repo_root, &legacy_path)?);
+        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &legacy_path)?);
 
         // Stable per-reservation artifact: id-<id>.json
         if let Some(id) = normalized.get("id").and_then(serde_json::Value::as_i64) {
             let id_path = reservation_dir.join(format!("id-{id}.json"));
             write_json(&id_path, &normalized)?;
-            rel_paths.push(rel_path(&archive.repo_root, &id_path)?);
+            rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
         }
 
         let agent_name = normalized
@@ -3249,34 +3294,31 @@ pub fn write_message_bundle(
     // Create directories and write files
     let mut rel_paths = Vec::new();
 
-    // Canonical
-    if let Some(parent) = paths.canonical.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // Canonical (ensure_parent_dir handled inside write_text)
     write_text(&paths.canonical, &content)?;
-    rel_paths.push(rel_path(&archive.repo_root, &paths.canonical)?);
+    rel_paths.push(rel_path_cached(
+        &archive.canonical_repo_root,
+        &paths.canonical,
+    )?);
 
     // Outbox
-    if let Some(parent) = paths.outbox.parent() {
-        fs::create_dir_all(parent)?;
-    }
     write_text(&paths.outbox, &content)?;
-    rel_paths.push(rel_path(&archive.repo_root, &paths.outbox)?);
+    rel_paths.push(rel_path_cached(
+        &archive.canonical_repo_root,
+        &paths.outbox,
+    )?);
 
     // Inbox copies
     for inbox_path in &paths.inbox {
-        if let Some(parent) = inbox_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         write_text(inbox_path, &content)?;
-        rel_paths.push(rel_path(&archive.repo_root, inbox_path)?);
+        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
     }
 
     // Thread digest
     if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
         let thread_id = thread_id.trim();
         if !thread_id.is_empty() {
-            let canonical_rel = rel_path(&archive.repo_root, &paths.canonical)?;
+            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
             if let Ok(digest_rel) = update_thread_digest(
                 archive,
                 thread_id,
@@ -3397,7 +3439,7 @@ fn update_thread_digest(
     canonical_rel: &str,
 ) -> Result<String> {
     let digest_dir = archive.root.join("messages").join("threads");
-    fs::create_dir_all(&digest_dir)?;
+    ensure_dir(&digest_dir)?;
 
     let safe_thread_id = sanitize_thread_id(thread_id);
     let digest_path = digest_dir.join(format!("{safe_thread_id}.md"));
@@ -3452,7 +3494,7 @@ fn update_thread_digest(
     };
     file.write_all(payload.as_bytes())?;
 
-    rel_path(&archive.repo_root, &digest_path)
+    rel_path_cached(&archive.canonical_repo_root, &digest_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -3548,7 +3590,7 @@ fn store_attachment_from_cache(
     let manifest_str = fs::read_to_string(manifest_path)?;
     let manifest: AttachmentManifest = serde_json::from_str(&manifest_str)?;
 
-    let webp_rel = rel_path(&archive.repo_root, webp_path)?;
+    let webp_rel = rel_path_cached(&archive.canonical_repo_root, webp_path)?;
 
     let should_inline = match embed_policy {
         EmbedPolicy::Inline => true,
@@ -3634,9 +3676,9 @@ pub fn store_attachment(
     let webp_dir = attach_dir.join(prefix);
     let manifest_dir = attach_dir.join("_manifests");
     let audit_dir = attach_dir.join("_audit");
-    fs::create_dir_all(&webp_dir)?;
-    fs::create_dir_all(&manifest_dir)?;
-    fs::create_dir_all(&audit_dir)?;
+    ensure_dir(&webp_dir)?;
+    ensure_dir(&manifest_dir)?;
+    ensure_dir(&audit_dir)?;
 
     // -- Cache check: skip conversion if this SHA1 was already converted --
     let webp_filename = format!("{digest}.webp");
@@ -3678,16 +3720,16 @@ pub fn store_attachment(
         .map_err(|e| StorageError::InvalidPath(format!("WebP encode error: {e}")))?;
 
     fs::write(&webp_path, &webp_bytes)?;
-    let webp_rel = rel_path(&archive.repo_root, &webp_path)?;
+    let webp_rel = rel_path_cached(&archive.canonical_repo_root, &webp_path)?;
     rel_paths.push(webp_rel.clone());
 
     // Optionally keep original
     let original_rel = if config.keep_original_images {
         let orig_dir = attach_dir.join("originals").join(prefix);
-        fs::create_dir_all(&orig_dir)?;
+        ensure_dir(&orig_dir)?;
         let orig_path = orig_dir.join(format!("{digest}{original_ext}"));
         fs::write(&orig_path, &original_bytes)?;
-        let rel = rel_path(&archive.repo_root, &orig_path)?;
+        let rel = rel_path_cached(&archive.canonical_repo_root, &orig_path)?;
         rel_paths.push(rel.clone());
         Some(rel)
     } else {
@@ -3706,7 +3748,10 @@ pub fn store_attachment(
         original_path: original_rel.clone(),
     };
     write_json(&manifest_path, &serde_json::to_value(&manifest)?)?;
-    rel_paths.push(rel_path(&archive.repo_root, &manifest_path)?);
+    rel_paths.push(rel_path_cached(
+        &archive.canonical_repo_root,
+        &manifest_path,
+    )?);
 
     // Write audit log entry
     let audit_path = audit_dir.join(format!("{digest}.log"));
@@ -3725,7 +3770,7 @@ pub fn store_attachment(
         .open(&audit_path)?;
     audit_file.write_all(audit_entry.to_string().as_bytes())?;
     audit_file.write_all(b"\n")?;
-    rel_paths.push(rel_path(&archive.repo_root, &audit_path)?);
+    rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &audit_path)?);
 
     // Decide inline vs file based on policy
     let should_inline = match embed_policy {
@@ -4372,7 +4417,7 @@ pub fn get_commit_for_message(
     archive: &ProjectArchive,
     message_paths: &MessageArchivePaths,
 ) -> Result<Option<CommitInfo>> {
-    let canonical_rel = rel_path(&archive.repo_root, &message_paths.canonical)?;
+    let canonical_rel = rel_path_cached(&archive.canonical_repo_root, &message_paths.canonical)?;
     find_commit_for_path(archive, &canonical_rel)
 }
 
@@ -4691,21 +4736,32 @@ fn append_trailers(message: &str) -> String {
 // Path / file helpers
 // ---------------------------------------------------------------------------
 
-/// Compute a relative path from `base` to `target`.
-fn rel_path(base: &Path, target: &Path) -> Result<String> {
-    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    let target = target
+/// Compute a relative path from a pre-canonicalized base to `target`.
+///
+/// The base is expected to already be canonicalized (avoiding repeated
+/// `readlink` syscalls).  The target is first attempted without
+/// canonicalization (fast path) and only falls back to `canonicalize()`
+/// if `strip_prefix` fails.
+fn rel_path_cached(canonical_base: &Path, target: &Path) -> Result<String> {
+    // Fast path: try strip_prefix without canonicalizing target.
+    // This succeeds when target is a direct join of the base (no symlinks).
+    if let Ok(rel) = target.strip_prefix(canonical_base) {
+        return Ok(rel.to_string_lossy().replace('\\', "/"));
+    }
+
+    // Slow path: canonicalize target and retry.
+    let target_canon = target
         .canonicalize()
         .unwrap_or_else(|_| target.to_path_buf());
 
-    target
-        .strip_prefix(&base)
+    target_canon
+        .strip_prefix(canonical_base)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .map_err(|_| {
             StorageError::InvalidPath(format!(
                 "Cannot compute relative path from {} to {}",
-                base.display(),
-                target.display()
+                canonical_base.display(),
+                target_canon.display()
             ))
         })
 }
@@ -4735,10 +4791,8 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
     }
 
     let safe_rel = normalized.trim_start_matches('/');
-    let root = archive
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| archive.root.clone());
+    // Use pre-canonicalized root to avoid repeated readlink syscalls.
+    let root = &archive.canonical_root;
 
     // First try canonicalize (resolves symlinks + normalizes). If the file
     // exists, this is the most robust check.
@@ -4765,7 +4819,7 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
         }
     };
 
-    if !candidate.starts_with(&root) {
+    if !candidate.starts_with(root) {
         return Err(StorageError::InvalidPath(
             "directory traversal not allowed".to_string(),
         ));
@@ -4780,9 +4834,7 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
 /// filesystems when source and destination are on the same filesystem,
 /// which they are because we put the temp file in the same directory.
 fn write_text(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    ensure_parent_dir(path)?;
     atomic_write_bytes(path, content.as_bytes())
 }
 
@@ -4790,9 +4842,7 @@ fn write_text(path: &Path, content: &str) -> Result<()> {
 ///
 /// Creates parent directories as needed.
 fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    ensure_parent_dir(path)?;
     let content = serde_json::to_string_pretty(value)?;
     atomic_write_bytes(path, content.as_bytes())
 }
@@ -5623,7 +5673,7 @@ mod tests {
         // Write a file to commit
         let test_file = archive.root.join("test.txt");
         fs::write(&test_file, "hello").unwrap();
-        let rel = rel_path(&archive.repo_root, &test_file).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &test_file).unwrap();
 
         let queue = CommitQueue::default();
         queue
@@ -5655,7 +5705,7 @@ mod tests {
         for i in 0..3 {
             let file = archive.root.join(format!("file{i}.txt"));
             fs::write(&file, format!("content {i}")).unwrap();
-            let rel = rel_path(&archive.repo_root, &file).unwrap();
+            let rel = rel_path_cached(&archive.canonical_repo_root, &file).unwrap();
             queue
                 .enqueue(
                     archive.repo_root.clone(),
@@ -7157,7 +7207,7 @@ mod tests {
             let file_name = format!("batch_test_{i}.txt");
             let file_path = archive.root.join(&file_name);
             fs::write(&file_path, format!("content-{i}")).unwrap();
-            let rel = rel_path(&archive.repo_root, &file_path).unwrap();
+            let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
 
             coalescer.enqueue(
                 archive.repo_root.clone(),
@@ -7272,7 +7322,7 @@ mod tests {
         let file_path = archive.root.join("agents/TestAgent/profile.json");
         fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         fs::write(&file_path, r#"{"name":"TestAgent"}"#).unwrap();
-        let rel = rel_path(&archive.repo_root, &file_path).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
 
         let before = mcp_agent_mail_core::global_metrics()
             .storage

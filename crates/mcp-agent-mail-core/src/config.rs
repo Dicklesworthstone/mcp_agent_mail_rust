@@ -33,7 +33,7 @@ impl Default for ToolFilterSettings {
 }
 
 /// Main configuration struct for MCP Agent Mail
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     // Application
@@ -580,6 +580,30 @@ fn global_config_cache_reset() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = None;
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact secret fields to prevent accidental credential leakage in logs.
+        f.debug_struct("Config")
+            .field("app_environment", &self.app_environment)
+            .field("database_url", &self.database_url)
+            .field("http_host", &self.http_host)
+            .field("http_port", &self.http_port)
+            .field("http_path", &self.http_path)
+            .field(
+                "http_bearer_token",
+                &self.http_bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "http_jwt_secret",
+                &self.http_jwt_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("storage_root", &self.storage_root)
+            .field("log_level", &self.log_level)
+            .field("tui_enabled", &self.tui_enabled)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {

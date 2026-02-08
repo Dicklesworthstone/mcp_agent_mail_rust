@@ -1964,7 +1964,7 @@ pub async fn create_file_reservations(
     reason: &str,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     let now = now_micros();
-    let expires = now + (ttl_seconds * 1_000_000);
+    let expires = now.saturating_add(ttl_seconds.saturating_mul(1_000_000));
 
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -2118,7 +2118,7 @@ pub async fn renew_reservations(
     reservation_ids: Option<&[i64]>,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     let now = now_micros();
-    let extend = extend_seconds * 1_000_000;
+    let extend = extend_seconds.saturating_mul(1_000_000);
 
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -2395,7 +2395,7 @@ pub async fn request_contact(
 ) -> Outcome<AgentLinkRow, DbError> {
     let now = now_micros();
     let expires = if ttl_seconds > 0 {
-        Some(now + (ttl_seconds * 1_000_000))
+        Some(now.saturating_add(ttl_seconds.saturating_mul(1_000_000)))
     } else {
         None
     };
@@ -2473,7 +2473,7 @@ pub async fn respond_contact(
     let now = now_micros();
     let status = if accept { "approved" } else { "blocked" };
     let expires = if ttl_seconds > 0 && accept {
-        Some(now + (ttl_seconds * 1_000_000))
+        Some(now.saturating_add(ttl_seconds.saturating_mul(1_000_000)))
     } else {
         None
     };
