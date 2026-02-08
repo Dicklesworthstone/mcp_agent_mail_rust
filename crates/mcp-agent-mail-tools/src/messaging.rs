@@ -111,6 +111,22 @@ fn is_valid_thread_id(tid: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
+/// Defense-in-depth sanitization for `thread_id` values derived from DB rows.
+/// Strips invalid characters, truncates to 128 chars, and ensures the result
+/// starts with an alphanumeric character. Returns the sanitized value, or
+/// falls back to `fallback` if sanitization produces an empty string.
+fn sanitize_thread_id(raw: &str, fallback: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .take(128)
+        .collect();
+    if sanitized.is_empty() || !sanitized.as_bytes()[0].is_ascii_alphanumeric() {
+        return fallback.to_string();
+    }
+    sanitized
+}
+
 /// Validate per-message size limits before any DB/archive operations.
 ///
 /// Enforces `max_subject_bytes`, `max_message_body_bytes`, `max_attachment_bytes`,
@@ -688,7 +704,16 @@ effective_free_bytes={free}"
                     )
                     .await,
                 )
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "contact enforcement: list_thread_messages failed (fail-open): {e}"
+                    );
+                    mcp_agent_mail_core::global_metrics()
+                        .tools
+                        .contact_enforcement_bypass_total
+                        .inc();
+                    Vec::new()
+                });
                 let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
                 for row in &thread_rows {
                     auto_ok_names.insert(row.from.clone());
@@ -703,7 +728,16 @@ effective_free_bytes={free}"
                     )
                     .await,
                 )
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "contact enforcement: list_message_recipient_names failed (fail-open): {e}"
+                    );
+                    mcp_agent_mail_core::global_metrics()
+                        .tools
+                        .contact_enforcement_bypass_total
+                        .inc();
+                    Vec::new()
+                });
                 for name in recipients {
                     auto_ok_names.insert(name);
                 }
@@ -714,7 +748,14 @@ effective_free_bytes={free}"
         let reservations = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
         )
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!("contact enforcement: get_active_reservations failed (fail-open): {e}");
+            mcp_agent_mail_core::global_metrics()
+                .tools
+                .contact_enforcement_bypass_total
+                .inc();
+            Vec::new()
+        });
         let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
             HashMap::with_capacity(reservations.len());
         for res in reservations {
@@ -1132,11 +1173,13 @@ effective_free_bytes={free}"
         mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, original.sender_id).await,
     )?;
 
-    // Determine thread_id: use original's thread_id, or the original message id as string
-    let thread_id = original
-        .thread_id
-        .clone()
-        .unwrap_or_else(|| message_id.to_string());
+    // Determine thread_id: use original's thread_id, or the original message id as string.
+    // Defense-in-depth: sanitize in case legacy data contains invalid characters.
+    let fallback_tid = message_id.to_string();
+    let thread_id = match original.thread_id.as_deref() {
+        Some(tid) => sanitize_thread_id(tid, &fallback_tid),
+        None => fallback_tid,
+    };
 
     // Apply subject prefix if not already present (case-insensitive)
     let subject = if original
@@ -2016,5 +2059,55 @@ mod tests {
     fn reply_body_limit_unlimited() {
         let cfg = config_with_limits(0, 0, 0, 0);
         assert!(validate_reply_body_limit(&cfg, &"r".repeat(10_000_000)).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_thread_id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_thread_id_valid_passthrough() {
+        assert_eq!(sanitize_thread_id("TKT-123", "fb"), "TKT-123");
+        assert_eq!(sanitize_thread_id("br-2ei.5.7", "fb"), "br-2ei.5.7");
+        assert_eq!(sanitize_thread_id("abc_123_xyz", "fb"), "abc_123_xyz");
+    }
+
+    #[test]
+    fn sanitize_thread_id_strips_invalid_chars() {
+        assert_eq!(sanitize_thread_id("foo bar", "fb"), "foobar");
+        assert_eq!(sanitize_thread_id("a/b/c", "fb"), "abc");
+        assert_eq!(sanitize_thread_id("test@host", "fb"), "testhost");
+    }
+
+    #[test]
+    fn sanitize_thread_id_truncates_long() {
+        let long = "a".repeat(200);
+        let result = sanitize_thread_id(&long, "fb");
+        assert_eq!(result.len(), 128);
+    }
+
+    #[test]
+    fn sanitize_thread_id_empty_uses_fallback() {
+        assert_eq!(sanitize_thread_id("", "fb"), "fb");
+        assert_eq!(sanitize_thread_id("@#$%", "fb"), "fb");
+    }
+
+    #[test]
+    fn sanitize_thread_id_non_alpha_start_uses_fallback() {
+        assert_eq!(sanitize_thread_id("-abc", "fb"), "fb");
+        assert_eq!(sanitize_thread_id(".xyz", "fb"), "fb");
+        assert_eq!(sanitize_thread_id("_foo", "fb"), "fb");
+    }
+
+    #[test]
+    fn sanitize_thread_id_preserves_numeric_start() {
+        assert_eq!(sanitize_thread_id("123", "fb"), "123");
+        assert_eq!(sanitize_thread_id("42-abc", "fb"), "42-abc");
+    }
+
+    #[test]
+    fn sanitize_thread_id_unicode_stripped() {
+        assert_eq!(sanitize_thread_id("café", "fb"), "caf");
+        assert_eq!(sanitize_thread_id("日本", "fb"), "fb");
     }
 }

@@ -168,12 +168,14 @@ impl Log2Histogram {
 
     #[inline]
     pub fn record(&self, value: u64) {
-        self.count.fetch_add(1, Ordering::Relaxed);
         self.sum.fetch_add(value, Ordering::Relaxed);
         self.min.fetch_min(value, Ordering::Relaxed);
         self.max.fetch_max(value, Ordering::Relaxed);
         let idx = bucket_index(value);
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        // count is written LAST with Release so that an Acquire load on count
+        // in snapshot() establishes a happens-before edge for all prior writes.
+        self.count.fetch_add(1, Ordering::Release);
     }
 
     /// Reset all counters to their initial state.
@@ -189,7 +191,9 @@ impl Log2Histogram {
 
     #[must_use]
     pub fn snapshot(&self) -> HistogramSnapshot {
-        let count = self.count.load(Ordering::Relaxed);
+        // Acquire on count pairs with Release in record(), ensuring all prior
+        // writes (sum, min, max, buckets) are visible.
+        let count = self.count.load(Ordering::Acquire);
         if count == 0 {
             return HistogramSnapshot {
                 count: 0,
@@ -205,7 +209,10 @@ impl Log2Histogram {
         let buckets: [u64; LOG2_BUCKETS] =
             std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));
 
+        let raw_min = self.min.load(Ordering::Relaxed);
         let max = self.max.load(Ordering::Relaxed);
+        // Clamp min <= max to maintain invariant even under concurrent races.
+        let min = raw_min.min(max);
         let p50 = estimate_quantile_frac(&buckets, count, 1, 2, max);
         let p95 = estimate_quantile_frac(&buckets, count, 19, 20, max);
         let p99 = estimate_quantile_frac(&buckets, count, 99, 100, max);
@@ -213,7 +220,7 @@ impl Log2Histogram {
         HistogramSnapshot {
             count,
             sum: self.sum.load(Ordering::Relaxed),
-            min: self.min.load(Ordering::Relaxed),
+            min,
             max,
             p50,
             p95,
@@ -335,6 +342,10 @@ pub struct ToolsMetrics {
     pub tool_calls_total: Counter,
     pub tool_errors_total: Counter,
     pub tool_latency_us: Log2Histogram,
+    /// Incremented when a contact enforcement DB query fails and the code
+    /// falls back to empty results (fail-open). Allows alerting on silent
+    /// enforcement degradation.
+    pub contact_enforcement_bypass_total: Counter,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -342,6 +353,7 @@ pub struct ToolsMetricsSnapshot {
     pub tool_calls_total: u64,
     pub tool_errors_total: u64,
     pub tool_latency_us: HistogramSnapshot,
+    pub contact_enforcement_bypass_total: u64,
 }
 
 impl Default for ToolsMetrics {
@@ -350,6 +362,7 @@ impl Default for ToolsMetrics {
             tool_calls_total: Counter::new(),
             tool_errors_total: Counter::new(),
             tool_latency_us: Log2Histogram::new(),
+            contact_enforcement_bypass_total: Counter::new(),
         }
     }
 }
@@ -370,6 +383,7 @@ impl ToolsMetrics {
             tool_calls_total: self.tool_calls_total.load(),
             tool_errors_total: self.tool_errors_total.load(),
             tool_latency_us: self.tool_latency_us.snapshot(),
+            contact_enforcement_bypass_total: self.contact_enforcement_bypass_total.load(),
         }
     }
 }
@@ -791,5 +805,51 @@ mod tests {
         assert!(json.get("commit_batch_size_last").is_some());
         assert!(json.get("lockfree_commits_total").is_some());
         assert!(json.get("lockfree_commit_fallbacks_total").is_some());
+    }
+
+    #[test]
+    fn histogram_min_max_clamped_invariant() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let h = Arc::new(Log2Histogram::new());
+
+        // Spawn threads to record interleaved values
+        let h1 = Arc::clone(&h);
+        let t1 = thread::spawn(move || {
+            h1.record(1000);
+        });
+        let h2 = Arc::clone(&h);
+        let t2 = thread::spawn(move || {
+            h2.record(1);
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Snapshot must always have min <= max
+        let snap = h.snapshot();
+        assert!(
+            snap.min <= snap.max,
+            "Invariant violated: min={} > max={}",
+            snap.min,
+            snap.max
+        );
+        assert_eq!(snap.count, 2);
+    }
+
+    #[test]
+    fn contact_enforcement_bypass_counter() {
+        let m = ToolsMetrics::default();
+        assert_eq!(m.contact_enforcement_bypass_total.load(), 0);
+
+        m.contact_enforcement_bypass_total.inc();
+        m.contact_enforcement_bypass_total.inc();
+        m.contact_enforcement_bypass_total.add(3);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.contact_enforcement_bypass_total, 5);
+
+        let json = serde_json::to_value(&snap).expect("snapshot should be serializable");
+        assert_eq!(json["contact_enforcement_bypass_total"], 5);
     }
 }

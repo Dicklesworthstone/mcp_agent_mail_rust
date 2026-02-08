@@ -915,8 +915,8 @@ fn render_api_project_agents(
 /// Get archive root path from Config (for git operations).
 fn get_archive_root() -> Result<std::path::PathBuf, (u16, String)> {
     let config = Config::from_env();
-    let (root, _) = ensure_archive_root(&config)
-        .map_err(|e| (500, format!("Archive error: {e}")))?;
+    let (root, _) =
+        ensure_archive_root(&config).map_err(|e| (500, format!("Archive error: {e}")))?;
     Ok(root)
 }
 
@@ -960,7 +960,11 @@ fn render_archive_route(
         }
         _ if sub.starts_with("/archive/browser/") && sub.contains("/file") => {
             // /archive/browser/{project}/file?path=...
-            let parts: Vec<&str> = sub.strip_prefix("/archive/browser/").unwrap_or("").split('/').collect();
+            let parts: Vec<&str> = sub
+                .strip_prefix("/archive/browser/")
+                .unwrap_or("")
+                .split('/')
+                .collect();
             let project_slug = parts.first().copied().unwrap_or("");
             let path = extract_query_str(query, "path").unwrap_or_default();
             render_archive_browser_file(project_slug, &path)
@@ -995,29 +999,25 @@ fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, 
     let config = Config::from_env();
     let storage_root = config.storage_root.display().to_string();
 
-    let (total_commits, last_commit_time, repo_size) =
-        get_archive_root().map_or_else(
-            |_| ("0".to_string(), "Never".to_string(), "N/A".to_string()),
-            |root| {
-                // Count commits (cap at 10_000)
-                let commits = storage::get_recent_commits_extended(&root, 10_000)
-                    .unwrap_or_default();
-                let total = if commits.len() >= 10_000 {
-                    "10,000+".to_string()
-                } else {
-                    format!("{}", commits.len())
-                };
-                let last = commits
-                    .first()
-                    .map_or_else(
-                        || "Never".to_string(),
-                        |c| c.date.get(..10).unwrap_or(&c.date).to_string(),
-                    );
+    let (total_commits, last_commit_time, repo_size) = get_archive_root().map_or_else(
+        |_| ("0".to_string(), "Never".to_string(), "N/A".to_string()),
+        |root| {
+            // Count commits (cap at 10_000)
+            let commits = storage::get_recent_commits_extended(&root, 10_000).unwrap_or_default();
+            let total = if commits.len() >= 10_000 {
+                "10,000+".to_string()
+            } else {
+                format!("{}", commits.len())
+            };
+            let last = commits.first().map_or_else(
+                || "Never".to_string(),
+                |c| c.date.get(..10).unwrap_or(&c.date).to_string(),
+            );
 
-                let size = estimate_repo_size(&root);
-                (total, last, size)
-            },
-        );
+            let size = estimate_repo_size(&root);
+            (total, last, size)
+        },
+    );
 
     let db_projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
     let projects: Vec<ArchiveGuideProject> = db_projects
@@ -1051,7 +1051,11 @@ fn estimate_repo_size(path: &std::path::Path) -> String {
     {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.split_whitespace().next().unwrap_or("Unknown").to_string()
+            stdout
+                .split_whitespace()
+                .next()
+                .unwrap_or("Unknown")
+                .to_string()
         }
         _ => "Unknown".to_string(),
     }
@@ -1066,8 +1070,7 @@ struct ArchiveActivityCtx {
 
 fn render_archive_activity(limit: usize) -> Result<Option<String>, (u16, String)> {
     let root = get_archive_root()?;
-    let commits = storage::get_recent_commits_extended(&root, limit)
-        .unwrap_or_default();
+    let commits = storage::get_recent_commits_extended(&root, limit).unwrap_or_default();
     render("archive_activity.html", ArchiveActivityCtx { commits })
 }
 
@@ -1084,11 +1087,10 @@ fn render_archive_commit(sha: &str) -> Result<Option<String>, (u16, String)> {
     }
 
     let root = get_archive_root()?;
-    storage::get_commit_detail(&root, sha, 5 * 1024 * 1024)
-        .map_or_else(
-            |_| render_error("Commit not found"),
-            |detail| render("archive_commit.html", ArchiveCommitCtx { commit: detail }),
-        )
+    storage::get_commit_detail(&root, sha, 5 * 1024 * 1024).map_or_else(
+        |_| render_error("Commit not found"),
+        |detail| render("archive_commit.html", ArchiveCommitCtx { commit: detail }),
+    )
 }
 
 // -- Timeline --
@@ -1110,12 +1112,15 @@ fn render_archive_timeline(
     // Default to first project if not specified
     let (slug, project_name) = resolve_project_slug(cx, pool, project)?;
 
-    let commits = storage::get_timeline_commits(&root, &slug, 100)
-        .unwrap_or_default();
+    let commits = storage::get_timeline_commits(&root, &slug, 100).unwrap_or_default();
 
     render(
         "archive_timeline.html",
-        ArchiveTimelineCtx { commits, project: slug, project_name },
+        ArchiveTimelineCtx {
+            commits,
+            project: slug,
+            project_name,
+        },
     )
 }
 
@@ -1130,7 +1135,9 @@ fn resolve_project_slug(
         Ok((p.slug.clone(), p.human_key))
     } else {
         let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-        let first = projects.first().ok_or_else(|| (404, "No projects found".to_string()))?;
+        let first = projects
+            .first()
+            .ok_or_else(|| (404, "No projects found".to_string()))?;
         Ok((first.slug.clone(), first.human_key.clone()))
     }
 }
@@ -1208,15 +1215,20 @@ fn render_archive_network(
     let root = get_archive_root()?;
     let (slug, project_name) = resolve_project_slug(cx, pool, project)?;
 
-    let graph = storage::get_communication_graph(&root, &slug, 200)
-        .unwrap_or_else(|_| storage::CommunicationGraph {
+    let graph = storage::get_communication_graph(&root, &slug, 200).unwrap_or_else(|_| {
+        storage::CommunicationGraph {
             nodes: Vec::new(),
             edges: Vec::new(),
-        });
+        }
+    });
 
     render(
         "archive_network.html",
-        ArchiveNetworkCtx { graph, project: slug, project_name },
+        ArchiveNetworkCtx {
+            graph,
+            project: slug,
+            project_name,
+        },
     )
 }
 
@@ -1227,13 +1239,13 @@ struct ArchiveTimeTravelCtx {
     projects: Vec<String>,
 }
 
-fn render_archive_time_travel(
-    cx: &Cx,
-    pool: &DbPool,
-) -> Result<Option<String>, (u16, String)> {
+fn render_archive_time_travel(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
     let slugs: Vec<String> = projects.iter().map(|p| p.slug.clone()).collect();
-    render("archive_time_travel.html", ArchiveTimeTravelCtx { projects: slugs })
+    render(
+        "archive_time_travel.html",
+        ArchiveTimeTravelCtx { projects: slugs },
+    )
 }
 
 /// JSON API: get historical inbox snapshot at a point in time.
@@ -1270,5 +1282,10 @@ fn render_error(message: &str) -> Result<Option<String>, (u16, String)> {
     struct ErrorCtx {
         message: String,
     }
-    render("error.html", ErrorCtx { message: message.to_string() })
+    render(
+        "error.html",
+        ErrorCtx {
+            message: message.to_string(),
+        },
+    )
 }

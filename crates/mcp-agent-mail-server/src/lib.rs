@@ -2749,6 +2749,9 @@ struct HttpState {
     handler: Arc<HttpRequestHandler>,
     jwks_http_client: HttpClient,
     jwks_cache: Mutex<Option<JwksCacheEntry>>,
+    /// Stampede guard: only one task refreshes JWKS at a time.
+    /// Others serve stale cached data while refresh is in-flight.
+    jwks_refreshing: AtomicBool,
     /// Optional web root for SPA static file serving.
     web_root: Option<static_files::WebRoot>,
 }
@@ -2795,6 +2798,7 @@ impl HttpState {
             handler,
             jwks_http_client: HttpClient::new(),
             jwks_cache: Mutex::new(None),
+            jwks_refreshing: AtomicBool::new(false),
             web_root,
         }
     }
@@ -3182,7 +3186,15 @@ impl HttpState {
     }
 
     async fn fetch_jwks(&self, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
-        if !force {
+        // Fast path: return cached value if still fresh.
+        if force {
+            let _ = self.jwks_refreshing.compare_exchange(
+                false,
+                true,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            );
+        } else {
             let cached = self
                 .jwks_cache
                 .lock()
@@ -3192,30 +3204,55 @@ impl HttpState {
                 if entry.fetched_at.elapsed() < JWKS_CACHE_TTL {
                     return Ok(entry.jwks);
                 }
+                // Stale-while-revalidate: if another task is already refreshing,
+                // serve the stale cached value instead of stampeding.
+                if self
+                    .jwks_refreshing
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
+                {
+                    return Ok(entry.jwks);
+                }
+                // We won the CAS — proceed to refresh below.
+            } else {
+                // No cached entry at all — acquire the refresh lock.
+                let _ = self.jwks_refreshing.compare_exchange(
+                    false,
+                    true,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                );
             }
         }
 
-        let fut = Box::pin(self.jwks_http_client.get(url));
-        let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
-            return Err(());
-        };
-        if resp.status != 200 {
-            return Err(());
-        }
-        let jwks: JwkSet = serde_json::from_slice(&resp.body).map_err(|_| ())?;
-        let jwks = Arc::new(jwks);
+        let result = async {
+            let fut = Box::pin(self.jwks_http_client.get(url));
+            let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
+                return Err(());
+            };
+            if resp.status != 200 {
+                return Err(());
+            }
+            let jwks: JwkSet = serde_json::from_slice(&resp.body).map_err(|_| ())?;
+            let jwks = Arc::new(jwks);
 
-        {
-            let mut cache = self
-                .jwks_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *cache = Some(JwksCacheEntry {
-                fetched_at: Instant::now(),
-                jwks: Arc::clone(&jwks),
-            });
+            {
+                let mut cache = self
+                    .jwks_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *cache = Some(JwksCacheEntry {
+                    fetched_at: Instant::now(),
+                    jwks: Arc::clone(&jwks),
+                });
+            }
+            Ok(jwks)
         }
-        Ok(jwks)
+        .await;
+
+        // Always release the refresh lock.
+        self.jwks_refreshing.store(false, Ordering::Release);
+        result
     }
 
     fn parse_bearer_token(req: &Http1Request) -> Result<&str, ()> {

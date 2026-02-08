@@ -4458,15 +4458,27 @@ fn relative_date_from_secs(authored_secs: i64) -> String {
             .map(|dt| dt.format("%b %d, %Y").to_string())
             .unwrap_or_else(|| "unknown".to_string())
     } else if days > 0 {
-        if days == 1 { "1 day ago".to_string() } else { format!("{days} days ago") }
+        if days == 1 {
+            "1 day ago".to_string()
+        } else {
+            format!("{days} days ago")
+        }
     } else {
         let hours = delta / 3600;
         if hours > 0 {
-            if hours == 1 { "1 hour ago".to_string() } else { format!("{hours} hours ago") }
+            if hours == 1 {
+                "1 hour ago".to_string()
+            } else {
+                format!("{hours} hours ago")
+            }
         } else {
             let minutes = delta / 60;
             if minutes > 0 {
-                if minutes == 1 { "1 minute ago".to_string() } else { format!("{minutes} minutes ago") }
+                if minutes == 1 {
+                    "1 minute ago".to_string()
+                } else {
+                    format!("{minutes} minutes ago")
+                }
             } else {
                 "just now".to_string()
             }
@@ -4596,10 +4608,7 @@ pub fn get_commit_detail(
     max_diff_bytes: usize,
 ) -> Result<CommitDetail> {
     // Validate SHA format
-    if sha.len() < 7
-        || sha.len() > 40
-        || !sha.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    if sha.len() < 7 || sha.len() > 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Invalid commit SHA format",
@@ -4652,8 +4661,16 @@ pub fn get_commit_detail(
             changed_files.push(ChangedFile {
                 path: display_path,
                 change_type: change_type.to_string(),
-                a_path: if old_path.is_empty() { "/dev/null".to_string() } else { old_path },
-                b_path: if new_path.is_empty() { "/dev/null".to_string() } else { new_path },
+                a_path: if old_path.is_empty() {
+                    "/dev/null".to_string()
+                } else {
+                    old_path
+                },
+                b_path: if new_path.is_empty() {
+                    "/dev/null".to_string()
+                } else {
+                    new_path
+                },
             });
             true
         },
@@ -4755,10 +4772,7 @@ pub struct TreeEntry {
 ///
 /// `path` is relative to the project root within the archive
 /// (e.g., "messages/2026" or "" for root).
-pub fn get_archive_tree(
-    archive: &ProjectArchive,
-    path: &str,
-) -> Result<Vec<TreeEntry>> {
+pub fn get_archive_tree(archive: &ProjectArchive, path: &str) -> Result<Vec<TreeEntry>> {
     // Sanitize path to prevent traversal
     let safe_path = sanitize_browse_path(path)?;
 
@@ -4883,7 +4897,10 @@ pub fn get_archive_file_content(
     if blob.size() > max_size_bytes {
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("File too large: {} bytes (max {max_size_bytes})", blob.size()),
+            format!(
+                "File too large: {} bytes (max {max_size_bytes})",
+                blob.size()
+            ),
         )));
     }
 
@@ -4928,7 +4945,10 @@ pub fn get_communication_graph(
 
     let mut revwalk = repo.revwalk()?;
     if revwalk.push_head().is_err() {
-        return Ok(CommunicationGraph { nodes: Vec::new(), edges: Vec::new() });
+        return Ok(CommunicationGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        });
     }
     revwalk.set_sorting(git2::Sort::TIME)?;
 
@@ -4975,9 +4995,7 @@ pub fn get_communication_graph(
                     continue;
                 }
                 agent_stats.entry(recipient.clone()).or_insert((0, 0)).1 += 1;
-                *connections
-                    .entry((sender.clone(), recipient))
-                    .or_insert(0) += 1;
+                *connections.entry((sender.clone(), recipient)).or_insert(0) += 1;
             }
         }
     }

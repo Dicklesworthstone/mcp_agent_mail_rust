@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod context;
 pub mod output;
 
 use clap::{Args, Parser, Subcommand};

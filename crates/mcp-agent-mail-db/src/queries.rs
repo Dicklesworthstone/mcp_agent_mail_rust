@@ -1093,6 +1093,13 @@ pub async fn create_message_with_recipients(
 
     // COMMIT (single fsync)
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+
+    // Invalidate cached inbox stats for all recipients.
+    let cache = crate::cache::read_cache();
+    for (agent_id, _kind) in recipients {
+        cache.invalidate_inbox_stats(*agent_id);
+    }
+
     Outcome::Ok(row)
 }
 
@@ -1828,6 +1835,8 @@ pub async fn mark_message_read(
                     format!("{agent_id}:{message_id}"),
                 ))
             } else {
+                // Invalidate cached inbox stats (unread_count may have changed).
+                crate::cache::read_cache().invalidate_inbox_stats(agent_id);
                 Outcome::Ok(now)
             }
         }
@@ -1874,6 +1883,8 @@ pub async fn acknowledge_message(
                     format!("{agent_id}:{message_id}"),
                 ))
             } else {
+                // Invalidate cached inbox stats (ack_pending_count may have changed).
+                crate::cache::read_cache().invalidate_inbox_stats(agent_id);
                 Outcome::Ok((now, now))
             }
         }
@@ -1896,6 +1907,11 @@ pub async fn get_inbox_stats(
     pool: &DbPool,
     agent_id: i64,
 ) -> Outcome<Option<InboxStatsRow>, DbError> {
+    // Check cache first (30s TTL).
+    if let Some(cached) = crate::cache::read_cache().get_inbox_stats(agent_id) {
+        return Outcome::Ok(Some(cached));
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -1938,6 +1954,8 @@ pub async fn get_inbox_stats(
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     },
                 };
+                // Populate cache for next lookup.
+                crate::cache::read_cache().put_inbox_stats(&stats);
                 Outcome::Ok(Some(stats))
             }
         }
