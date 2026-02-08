@@ -76,7 +76,7 @@ pub fn sanitize_known_value(key: &str, value: &str) -> Option<String> {
 pub fn mask_json(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
-            let mut out = serde_json::Map::new();
+            let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
                 if is_sensitive_key(k) {
                     out.insert(k.clone(), Value::String(mask_sensitive_value("")));
@@ -819,7 +819,7 @@ fn colorize_json_line(line: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '"' {
             // Read until closing quote
-            let mut s = String::new();
+            let mut s = String::with_capacity(32);
             for inner in chars.by_ref() {
                 if inner == '"' {
                     break;
@@ -834,7 +834,7 @@ fn colorize_json_line(line: &str) -> String {
             out.push('"');
             out.push_str(RESET);
         } else if c.is_ascii_digit() || c == '-' {
-            let mut num = String::new();
+            let mut num = String::with_capacity(16);
             num.push(c);
             while let Some(&next) = chars.peek() {
                 if next.is_ascii_digit() || next == '.' {
@@ -1632,7 +1632,7 @@ impl TimelinePane {
     }
 
     fn visible_indices(&self, events: &[ConsoleEvent]) -> Vec<usize> {
-        let mut idx = Vec::new();
+        let mut idx = Vec::with_capacity(events.len());
         for (i, ev) in events.iter().enumerate() {
             if self.matches_event(ev) {
                 idx.push(i);
@@ -1869,10 +1869,10 @@ impl TimelinePane {
             .bold();
         let selected_bg = ftui::PackedRgba::rgb(35, 35, 35);
 
-        let mut rows = Vec::new();
         let max_rows = usize::from(list_area.height.saturating_sub(2)).max(1);
         let start = self.scroll_offset.min(visible.len());
         let end = (start + max_rows).min(visible.len());
+        let mut rows = Vec::with_capacity(end - start);
         for (pos, idx) in visible[start..end].iter().enumerate() {
             let ev = &events[*idx];
             let mut row = Row::new(vec![

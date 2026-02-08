@@ -497,11 +497,13 @@ effective_free_bytes={free}"
     let cc_list = cc.unwrap_or_default();
     let bcc_list = bcc.unwrap_or_default();
 
-    let mut all_recipients: Vec<(i64, String)> = Vec::new();
-    let mut resolved_to: Vec<String> = Vec::new();
-    let mut resolved_cc_recipients: Vec<String> = Vec::new();
-    let mut resolved_bcc_recipients: Vec<String> = Vec::new();
-    let mut recipient_map: HashMap<String, mcp_agent_mail_db::AgentRow> = HashMap::new();
+    let total_recip = to.len() + cc_list.len() + bcc_list.len();
+    let mut all_recipients: Vec<(i64, String)> = Vec::with_capacity(total_recip);
+    let mut resolved_to: Vec<String> = Vec::with_capacity(to.len());
+    let mut resolved_cc_recipients: Vec<String> = Vec::with_capacity(cc_list.len());
+    let mut resolved_bcc_recipients: Vec<String> = Vec::with_capacity(bcc_list.len());
+    let mut recipient_map: HashMap<String, mcp_agent_mail_db::AgentRow> =
+        HashMap::with_capacity(total_recip);
 
     for name in &to {
         push_recipient(
@@ -564,8 +566,9 @@ effective_free_bytes={free}"
 
     // Process attachments and markdown images
     let mut final_body = body_md.clone();
-    let mut all_attachment_meta: Vec<serde_json::Value> = Vec::new();
-    let mut all_attachment_rel_paths: Vec<String> = Vec::new();
+    let attachment_count = attachment_paths.as_ref().map_or(0, Vec::len);
+    let mut all_attachment_meta: Vec<serde_json::Value> = Vec::with_capacity(attachment_count + 4);
+    let mut all_attachment_rel_paths: Vec<String> = Vec::with_capacity(attachment_count + 4);
     let base_dir = std::path::Path::new(&project.human_key);
 
     if do_convert {
@@ -684,7 +687,7 @@ effective_free_bytes={free}"
                     .await,
                 )
                 .unwrap_or_default();
-                let mut message_ids: Vec<i64> = Vec::new();
+                let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
                 for row in &thread_rows {
                     auto_ok_names.insert(row.from.clone());
                     message_ids.push(row.id);
@@ -710,7 +713,8 @@ effective_free_bytes={free}"
             mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
         )
         .unwrap_or_default();
-        let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> = HashMap::new();
+        let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
+            HashMap::with_capacity(reservations.len());
         for res in reservations {
             patterns_by_agent
                 .entry(res.agent_id)
@@ -1159,10 +1163,11 @@ effective_free_bytes={free}"
     let bcc_names = bcc.unwrap_or_default();
 
     // Resolve all recipients
-    let mut all_recipients: Vec<(i64, String)> = Vec::new();
-    let mut resolved_to: Vec<String> = Vec::new();
-    let mut resolved_cc_recipients: Vec<String> = Vec::new();
-    let mut resolved_bcc_recipients: Vec<String> = Vec::new();
+    let total_recip = to_names.len() + cc_names.len() + bcc_names.len();
+    let mut all_recipients: Vec<(i64, String)> = Vec::with_capacity(total_recip);
+    let mut resolved_to: Vec<String> = Vec::with_capacity(to_names.len());
+    let mut resolved_cc_recipients: Vec<String> = Vec::with_capacity(cc_names.len());
+    let mut resolved_bcc_recipients: Vec<String> = Vec::with_capacity(bcc_names.len());
 
     for name in &to_names {
         let agent = resolve_agent(ctx, &pool, project_id, name).await?;

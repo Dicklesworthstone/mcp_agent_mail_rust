@@ -326,7 +326,7 @@ pub async fn list_contacts(
     )?;
 
     // Resolve referenced agents to names
-    let mut agent_names: HashMap<i64, String> = HashMap::new();
+    let mut agent_names: HashMap<i64, String> = HashMap::with_capacity(outgoing_rows.len());
     for r in &outgoing_rows {
         if let std::collections::hash_map::Entry::Vacant(e) = agent_names.entry(r.b_agent_id) {
             if let Ok(row) = db_outcome_to_mcp_result(

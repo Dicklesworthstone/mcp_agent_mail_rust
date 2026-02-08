@@ -115,13 +115,13 @@ fn is_ordered_prefix(s: &str) -> bool {
 pub(crate) fn summarize_messages(
     rows: &[mcp_agent_mail_db::queries::ThreadMessageRow],
 ) -> ThreadSummary {
-    let mut participants: HashSet<String> = HashSet::new();
-    let mut key_points: Vec<String> = Vec::new();
-    let mut action_items: Vec<String> = Vec::new();
+    let mut participants: HashSet<String> = HashSet::with_capacity(rows.len().min(16));
+    let mut key_points: Vec<String> = Vec::with_capacity(8);
+    let mut action_items: Vec<String> = Vec::with_capacity(8);
     let mut open_actions: i64 = 0;
     let mut done_actions: i64 = 0;
-    let mut mentions: HashMap<String, i64> = HashMap::new();
-    let mut code_references: HashSet<String> = HashSet::new();
+    let mut mentions: HashMap<String, i64> = HashMap::with_capacity(8);
+    let mut code_references: HashSet<String> = HashSet::with_capacity(8);
     let keywords = ["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"];
 
     for row in rows {
@@ -409,10 +409,10 @@ pub async fn summarize_thread(
 
     if thread_ids.len() > 1 {
         // Multi-thread mode - aggregate across threads
-        let mut all_mentions: HashMap<String, i64> = HashMap::new();
-        let mut all_actions: Vec<String> = Vec::new();
-        let mut all_points: Vec<String> = Vec::new();
-        let mut threads: Vec<ThreadEntry> = Vec::new();
+        let mut all_mentions: HashMap<String, i64> = HashMap::with_capacity(16);
+        let mut all_actions: Vec<String> = Vec::with_capacity(thread_ids.len() * 4);
+        let mut all_points: Vec<String> = Vec::with_capacity(thread_ids.len() * 4);
+        let mut threads: Vec<ThreadEntry> = Vec::with_capacity(thread_ids.len());
 
         for tid in &thread_ids {
             let messages = db_outcome_to_mcp_result(

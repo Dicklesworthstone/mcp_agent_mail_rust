@@ -308,7 +308,8 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
     mcp_agent_mail_db::record_query(sql, mcp_agent_mail_db::elapsed_us(start));
     let unread_rows = unread_rows.map_err(|e| McpError::internal_error(e.to_string()))?;
 
-    let mut unread_counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut unread_counts: std::collections::HashMap<i64, i64> =
+        std::collections::HashMap::with_capacity(agents.len());
     for row in unread_rows {
         let agent_id: i64 = row.get_named("agent_id").unwrap_or(0);
         let count: i64 = row.get_named("unread").unwrap_or(0);
@@ -1931,7 +1932,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     )?;
 
     // Build messages list - need to get sender names
-    let mut messages: Vec<ThreadMessageEntry> = Vec::new();
+    let mut messages: Vec<ThreadMessageEntry> = Vec::with_capacity(rows.len());
     for row in rows {
         // Get sender name
         let sender = db_outcome_to_mcp_result(
@@ -2561,7 +2562,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     mcp_agent_mail_db::record_query(&sql, mcp_agent_mail_db::elapsed_us(start));
     let rows = rows.map_err(|e| McpError::internal_error(e.to_string()))?;
 
-    let mut messages: Vec<OutboxMessageEntry> = Vec::new();
+    let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(rows.len());
     for row in rows {
         let id: i64 = row.get_named("id").unwrap_or(0);
         let msg_project_id: i64 = row.get_named("project_id").unwrap_or(0);
@@ -2587,9 +2588,9 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         mcp_agent_mail_db::record_query(recip_sql, mcp_agent_mail_db::elapsed_us(recip_start));
         let recip_rows = recip_rows.map_err(|e| McpError::internal_error(e.to_string()))?;
 
-        let mut to_list: Vec<String> = Vec::new();
-        let mut cc_list: Vec<String> = Vec::new();
-        let mut bcc_list: Vec<String> = Vec::new();
+        let mut to_list: Vec<String> = Vec::with_capacity(4);
+        let mut cc_list: Vec<String> = Vec::with_capacity(2);
+        let mut bcc_list: Vec<String> = Vec::with_capacity(2);
         for rr in recip_rows {
             let name: String = rr.get_named("name").unwrap_or_default();
             let kind: String = rr.get_named("kind").unwrap_or_default();
@@ -2951,7 +2952,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
     let now_us = mcp_agent_mail_db::now_micros();
     let ttl_us = i64::try_from(ttl_seconds).unwrap_or(i64::MAX) * 1_000_000;
 
-    let mut messages = Vec::new();
+    let mut messages = Vec::with_capacity(unacked_rows.len());
     for row in unacked_rows {
         let age_us = now_us.saturating_sub(row.message.created_ts);
         if age_us >= ttl_us {
@@ -3056,7 +3057,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
         .await,
     )?;
 
-    let mut messages = Vec::new();
+    let mut messages = Vec::with_capacity(unacked_rows.len());
     for row in unacked_rows {
         if row.message.created_ts <= cutoff_us {
             let msg = &row.message;
@@ -3413,7 +3414,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     // Cleanup: release any expired (TTL) reservations and any stale reservations.
     //
     // Parity with Python: this resource is allowed to perform best-effort cleanup.
-    let mut release_payloads: Vec<serde_json::Value> = Vec::new();
+    let mut release_payloads: Vec<serde_json::Value> = Vec::with_capacity(8);
 
     // We only need agents map + mail cache for stale evaluation.
     let agent_rows = db_outcome_to_mcp_result(
@@ -3424,8 +3425,10 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         .filter_map(|row| row.id.map(|id| (id, row.clone())))
         .collect();
 
-    let mut mail_activity_cache: HashMap<i64, Option<i64>> = HashMap::new();
-    let mut pattern_activity_cache: HashMap<String, ReservationPatternActivity> = HashMap::new();
+    let mut mail_activity_cache: HashMap<i64, Option<i64>> =
+        HashMap::with_capacity(agent_rows.len());
+    let mut pattern_activity_cache: HashMap<String, ReservationPatternActivity> =
+        HashMap::with_capacity(16);
 
     // Cleanup only needs unreleased rows (including expired). Released history is unbounded and
     // scanning it on every resource read can time out on long-lived projects.
@@ -3625,7 +3628,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             && agent_inactive
             && !(recent_mail || recent_fs || recent_git);
 
-        let mut stale_reasons = Vec::new();
+        let mut stale_reasons = Vec::with_capacity(4);
         if agent_inactive {
             stale_reasons.push(format!("agent_inactive>{inactivity_seconds}s"));
         } else {

@@ -524,12 +524,13 @@ impl QueryTrackerSnapshot {
     /// Convert the snapshot into a JSON-friendly dictionary matching legacy output.
     #[must_use]
     pub fn to_dict(&self) -> serde_json::Value {
-        let mut pairs: Vec<(&String, &u64)> = self.per_table.iter().collect();
+        let mut pairs: Vec<(&String, &u64)> = Vec::with_capacity(self.per_table.len());
+        pairs.extend(self.per_table.iter());
         pairs.sort_by(|(a_name, a_count), (b_name, b_count)| {
             b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
         });
 
-        let mut per_table = serde_json::Map::new();
+        let mut per_table = serde_json::Map::with_capacity(pairs.len());
         for (name, count) in pairs {
             per_table.insert(name.clone(), serde_json::Value::Number((*count).into()));
         }

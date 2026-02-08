@@ -306,7 +306,7 @@ pub async fn search_messages_product(
         mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
     )?;
 
-    let mut result: Vec<ProductSearchItem> = Vec::new();
+    let mut result: Vec<ProductSearchItem> = Vec::with_capacity(projects.len() * 4);
     for p in projects {
         let pid = p.id.unwrap_or(0);
         let rows = db_outcome_to_mcp_result(
@@ -376,7 +376,7 @@ pub async fn fetch_inbox_product(
         .as_deref()
         .and_then(mcp_agent_mail_db::iso_to_micros);
 
-    let mut items: Vec<(i64, i64, InboxMessage)> = Vec::new(); // (created_ts, id, msg)
+    let mut items: Vec<(i64, i64, InboxMessage)> = Vec::with_capacity(limit.unwrap_or(20) as usize); // (created_ts, id, msg)
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         // Skip if agent doesn't exist in this project.
@@ -464,7 +464,8 @@ pub async fn summarize_thread_product(
         mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
     )?;
 
-    let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> = Vec::new();
+    let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> =
+        Vec::with_capacity(per_thread_limit.unwrap_or(50) as usize);
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         let limit = per_thread_limit.and_then(|v| usize::try_from(v).ok());
@@ -521,7 +522,7 @@ pub async fn summarize_thread_product(
     }
 
     let with_examples = include_examples.unwrap_or(false);
-    let mut examples = Vec::new();
+    let mut examples = Vec::with_capacity(if with_examples { 10 } else { 0 });
     if with_examples {
         for row in rows.iter().take(10) {
             examples.push(ExampleMessage {

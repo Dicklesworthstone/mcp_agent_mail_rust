@@ -11,6 +11,7 @@ use chrono::{NaiveDateTime, TimeZone, Utc};
 const MICROS_PER_SECOND: i64 = 1_000_000;
 
 /// Convert chrono `NaiveDateTime` to microseconds since Unix epoch.
+#[inline]
 #[must_use]
 pub fn naive_to_micros(dt: NaiveDateTime) -> i64 {
     dt.and_utc().timestamp_micros()
@@ -20,6 +21,7 @@ pub fn naive_to_micros(dt: NaiveDateTime) -> i64 {
 ///
 /// For extreme values outside chrono's representable range, returns the
 /// Unix epoch (1970-01-01 00:00:00) as a safe fallback instead of panicking.
+#[inline]
 #[must_use]
 pub fn micros_to_naive(micros: i64) -> NaiveDateTime {
     // Use divrem that handles negative values correctly
@@ -34,12 +36,14 @@ pub fn micros_to_naive(micros: i64) -> NaiveDateTime {
 }
 
 /// Get current time as microseconds since Unix epoch.
+#[inline]
 #[must_use]
 pub fn now_micros() -> i64 {
     Utc::now().timestamp_micros()
 }
 
 /// Convert microseconds to ISO-8601 string.
+#[inline]
 #[must_use]
 pub fn micros_to_iso(micros: i64) -> String {
     micros_to_naive(micros)
