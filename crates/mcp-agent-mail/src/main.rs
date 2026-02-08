@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_core::config::{ConfigSource, env_value};
+use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, InterfaceModeResolver, env_value};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -169,8 +169,17 @@ fn main() {
 
     let cli = Cli::parse();
 
-    // Load configuration
-    let config = Config::from_env();
+    // Resolve interface mode (MCP binary → MCP default per ADR-001)
+    let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
+    if let Some(warning) = resolver.validate() {
+        tracing::warn!("{warning}");
+    }
+    let resolved_mode = resolver.resolve();
+    tracing::debug!("Interface mode: {resolved_mode}");
+
+    // Load configuration and stamp it with the resolved mode
+    let mut config = Config::from_env();
+    config.interface_mode = resolved_mode.mode;
 
     if cli.verbose {
         tracing::info!("Configuration loaded: {:?}", config);

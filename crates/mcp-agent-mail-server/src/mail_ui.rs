@@ -996,30 +996,28 @@ fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, 
     let storage_root = config.storage_root.display().to_string();
 
     let (total_commits, last_commit_time, repo_size) =
-        if let Ok(root) = get_archive_root() {
-            // Count commits (cap at 10_000)
-            let commits = storage::get_recent_commits_extended(&root, 10_000)
-                .unwrap_or_default();
-            let total = if commits.len() >= 10_000 {
-                "10,000+".to_string()
-            } else {
-                format!("{}", commits.len())
-            };
-            let last = commits
-                .first()
-                .map(|c| {
-                    // Extract just the date part
-                    c.date.get(..10).unwrap_or(&c.date).to_string()
-                })
-                .unwrap_or_else(|| "Never".to_string());
+        get_archive_root().map_or_else(
+            |_| ("0".to_string(), "Never".to_string(), "N/A".to_string()),
+            |root| {
+                // Count commits (cap at 10_000)
+                let commits = storage::get_recent_commits_extended(&root, 10_000)
+                    .unwrap_or_default();
+                let total = if commits.len() >= 10_000 {
+                    "10,000+".to_string()
+                } else {
+                    format!("{}", commits.len())
+                };
+                let last = commits
+                    .first()
+                    .map_or_else(
+                        || "Never".to_string(),
+                        |c| c.date.get(..10).unwrap_or(&c.date).to_string(),
+                    );
 
-            // Estimate repo size
-            let size = estimate_repo_size(&root);
-
-            (total, last, size)
-        } else {
-            ("0".to_string(), "Never".to_string(), "0 MB".to_string())
-        };
+                let size = estimate_repo_size(&root);
+                (total, last, size)
+            },
+        );
 
     let db_projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
     let projects: Vec<ArchiveGuideProject> = db_projects
@@ -1086,10 +1084,11 @@ fn render_archive_commit(sha: &str) -> Result<Option<String>, (u16, String)> {
     }
 
     let root = get_archive_root()?;
-    match storage::get_commit_detail(&root, sha, 5 * 1024 * 1024) {
-        Ok(detail) => render("archive_commit.html", ArchiveCommitCtx { commit: detail }),
-        Err(_) => render_error("Commit not found"),
-    }
+    storage::get_commit_detail(&root, sha, 5 * 1024 * 1024)
+        .map_or_else(
+            |_| render_error("Commit not found"),
+            |detail| render("archive_commit.html", ArchiveCommitCtx { commit: detail }),
+        )
 }
 
 // -- Timeline --
@@ -1120,7 +1119,7 @@ fn render_archive_timeline(
     )
 }
 
-/// Resolve a project slug + human_key, defaulting to the first project.
+/// Resolve a project slug + `human_key`, defaulting to the first project.
 fn resolve_project_slug(
     cx: &Cx,
     pool: &DbPool,
@@ -1128,10 +1127,10 @@ fn resolve_project_slug(
 ) -> Result<(String, String), (u16, String)> {
     if let Some(slug) = project {
         let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
-        Ok((p.slug.clone(), p.human_key.clone()))
+        Ok((p.slug.clone(), p.human_key))
     } else {
         let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-        let first = projects.first().ok_or((404, "No projects found".to_string()))?;
+        let first = projects.first().ok_or_else(|| (404, "No projects found".to_string()))?;
         Ok((first.slug.clone(), first.human_key.clone()))
     }
 }

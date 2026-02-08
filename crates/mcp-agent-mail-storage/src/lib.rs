@@ -5047,8 +5047,7 @@ pub fn get_timeline_commits(
         let authored_secs = commit.author().when().seconds();
 
         // Classify commit type and extract sender/recipients
-        let (commit_type, sender, recipients) = if subject.starts_with("mail: ") {
-            let rest = &subject[6..];
+        let (commit_type, sender, recipients) = if let Some(rest) = subject.strip_prefix("mail: ") {
             let sender_part = if let Some((sp, _)) = rest.split_once(" | ") {
                 sp
             } else {

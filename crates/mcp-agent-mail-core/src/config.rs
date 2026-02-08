@@ -36,6 +36,9 @@ impl Default for ToolFilterSettings {
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Config {
+    // Interface mode (MCP default, CLI opt-in per ADR-001)
+    pub interface_mode: InterfaceMode,
+
     // Application
     pub app_environment: AppEnvironment,
     pub worktrees_enabled: bool,
@@ -121,7 +124,6 @@ pub struct Config {
     // Contact & Messaging
     pub contact_enforcement_enabled: bool,
     pub contact_auto_ttl_seconds: u64,
-    pub contact_auto_retry_enabled: bool,
     pub messaging_auto_register_recipients: bool,
     pub messaging_auto_handshake_on_block: bool,
 
@@ -150,17 +152,11 @@ pub struct Config {
     pub ack_escalation_claim_exclusive: bool,
     pub ack_escalation_claim_holder_name: String,
 
-    // Agent Naming
-    pub agent_name_enforcement_mode: AgentNameEnforcementMode,
-
     // LLM
     pub llm_enabled: bool,
     pub llm_default_model: String,
     pub llm_temperature: f64,
     pub llm_max_tokens: u32,
-    pub llm_cache_enabled: bool,
-    pub llm_cache_backend: String,
-    pub llm_cache_redis_url: String,
     pub llm_cost_logging_enabled: bool,
 
     // Notifications
@@ -248,6 +244,168 @@ pub enum ProjectIdentityMode {
     GitToplevel,
 }
 
+/// Interface mode: which surface is active.
+///
+/// Per ADR-001, mode is primarily determined by which binary is executed.
+/// The MCP binary defaults to `Mcp`, the CLI binary defaults to `Cli`.
+/// The `INTERFACE_MODE` env var can override for testing but is not
+/// intended for production use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InterfaceMode {
+    /// MCP server mode (stdio or HTTP transport). Default for the main binary.
+    #[default]
+    Mcp,
+    /// Operator CLI mode. Default for the CLI binary.
+    Cli,
+}
+
+impl InterfaceMode {
+    /// Returns `true` if the current mode is MCP (server).
+    #[must_use]
+    pub const fn is_mcp(self) -> bool {
+        matches!(self, Self::Mcp)
+    }
+
+    /// Returns `true` if the current mode is CLI (operator).
+    #[must_use]
+    pub const fn is_cli(self) -> bool {
+        matches!(self, Self::Cli)
+    }
+}
+
+impl std::fmt::Display for InterfaceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mcp => write!(f, "mcp"),
+            Self::Cli => write!(f, "cli"),
+        }
+    }
+}
+
+/// Where the interface mode decision came from (provenance tracking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeProvenance {
+    /// Set by the binary itself (compile-time default for that binary).
+    BinaryDefault,
+    /// Overridden by `INTERFACE_MODE` environment variable.
+    EnvVar,
+    /// Explicitly set via `Config::with_interface_mode()`.
+    Explicit,
+}
+
+impl std::fmt::Display for ModeProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BinaryDefault => write!(f, "binary-default"),
+            Self::EnvVar => write!(f, "env:INTERFACE_MODE"),
+            Self::Explicit => write!(f, "explicit"),
+        }
+    }
+}
+
+/// Resolved interface mode with provenance tracking.
+///
+/// Both the MCP server binary and the CLI binary call
+/// `InterfaceModeResolver::resolve()` at startup to get a deterministic,
+/// auditable mode decision.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedMode {
+    pub mode: InterfaceMode,
+    pub provenance: ModeProvenance,
+}
+
+impl std::fmt::Display for ResolvedMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (from {})", self.mode, self.provenance)
+    }
+}
+
+/// Shared interface mode resolver.
+///
+/// Precedence (highest wins):
+/// 1. Explicit override via `with_binary_default()` / `with_override()`
+/// 2. `INTERFACE_MODE` environment variable
+/// 3. Binary default (`InterfaceMode::Mcp`)
+pub struct InterfaceModeResolver {
+    binary_default: InterfaceMode,
+    explicit_override: Option<InterfaceMode>,
+}
+
+impl InterfaceModeResolver {
+    /// Create a resolver with the given binary default.
+    ///
+    /// The MCP binary should pass `InterfaceMode::Mcp`,
+    /// the CLI binary should pass `InterfaceMode::Cli`.
+    #[must_use]
+    pub const fn new(binary_default: InterfaceMode) -> Self {
+        Self {
+            binary_default,
+            explicit_override: None,
+        }
+    }
+
+    /// Set an explicit override (highest precedence).
+    #[must_use]
+    pub const fn with_override(mut self, mode: InterfaceMode) -> Self {
+        self.explicit_override = Some(mode);
+        self
+    }
+
+    /// Resolve the interface mode by checking sources in precedence order.
+    #[must_use]
+    pub fn resolve(&self) -> ResolvedMode {
+        // 1. Explicit override (highest precedence)
+        if let Some(mode) = self.explicit_override {
+            return ResolvedMode {
+                mode,
+                provenance: ModeProvenance::Explicit,
+            };
+        }
+
+        // 2. Environment variable
+        if let Ok(v) = env::var("INTERFACE_MODE") {
+            let mode = match v.trim().to_lowercase().as_str() {
+                "cli" => InterfaceMode::Cli,
+                _ => InterfaceMode::Mcp,
+            };
+            return ResolvedMode {
+                mode,
+                provenance: ModeProvenance::EnvVar,
+            };
+        }
+
+        // 3. Binary default
+        ResolvedMode {
+            mode: self.binary_default,
+            provenance: ModeProvenance::BinaryDefault,
+        }
+    }
+
+    /// Validate that the resolved mode is consistent with the binary default.
+    ///
+    /// Returns `Some(warning)` if the env var contradicts the binary identity.
+    /// The binary identity always wins (per ADR-001 Invariant 3), but the
+    /// warning helps operators notice misconfiguration.
+    #[must_use]
+    pub fn validate(&self) -> Option<String> {
+        if let Ok(v) = env::var("INTERFACE_MODE") {
+            let env_mode = match v.trim().to_lowercase().as_str() {
+                "cli" => InterfaceMode::Cli,
+                _ => InterfaceMode::Mcp,
+            };
+            if env_mode != self.binary_default {
+                return Some(format!(
+                    "INTERFACE_MODE={v} conflicts with this binary's default mode ({}). \
+                     The binary identity wins per ADR-001. \
+                     Remove INTERFACE_MODE or use the correct binary.",
+                    self.binary_default,
+                ));
+            }
+        }
+        None
+    }
+}
+
 /// Rate limit backend
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitBackend {
@@ -320,21 +478,13 @@ impl ConsoleThemeId {
     }
 }
 
-/// Agent name enforcement mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentNameEnforcementMode {
-    /// Reject invalid names with error
-    Strict,
-    /// Ignore invalid names, auto-generate instead
-    Coerce,
-    /// Always auto-generate, ignore provided names
-    AlwaysAuto,
-}
-
 impl Default for Config {
     #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         Self {
+            // Interface mode: MCP by default (per ADR-001)
+            interface_mode: InterfaceMode::Mcp,
+
             // Application
             app_environment: AppEnvironment::Development,
             worktrees_enabled: false,
@@ -436,7 +586,6 @@ impl Default for Config {
             // Contact & Messaging
             contact_enforcement_enabled: true,
             contact_auto_ttl_seconds: 86400, // 24 hours
-            contact_auto_retry_enabled: true,
             messaging_auto_register_recipients: true,
             messaging_auto_handshake_on_block: true,
 
@@ -465,17 +614,11 @@ impl Default for Config {
             ack_escalation_claim_exclusive: false,
             ack_escalation_claim_holder_name: String::new(),
 
-            // Agent Naming
-            agent_name_enforcement_mode: AgentNameEnforcementMode::Coerce,
-
             // LLM
             llm_enabled: true,
             llm_default_model: "gpt-4o-mini".to_string(),
             llm_temperature: 0.2,
             llm_max_tokens: 512,
-            llm_cache_enabled: true,
-            llm_cache_backend: "memory".to_string(),
-            llm_cache_redis_url: String::new(),
             llm_cost_logging_enabled: true,
 
             // Notifications
@@ -618,6 +761,15 @@ impl Config {
     #[allow(clippy::too_many_lines)]
     pub fn from_env() -> Self {
         let mut config = Self::default();
+
+        // Interface mode (primarily set by binary, env override for testing)
+        // Precedence: INTERFACE_MODE env > binary default (Mcp)
+        if let Some(v) = env_value("INTERFACE_MODE") {
+            config.interface_mode = match v.trim().to_lowercase().as_str() {
+                "cli" => InterfaceMode::Cli,
+                _ => InterfaceMode::Mcp,
+            };
+        }
 
         // Application
         if let Some(v) = env_value("APP_ENVIRONMENT") {
@@ -805,10 +957,6 @@ impl Config {
         );
         config.contact_auto_ttl_seconds =
             env_u64("CONTACT_AUTO_TTL_SECONDS", config.contact_auto_ttl_seconds);
-        config.contact_auto_retry_enabled = env_bool(
-            "CONTACT_AUTO_RETRY_ENABLED",
-            config.contact_auto_retry_enabled,
-        );
         config.messaging_auto_register_recipients = env_bool(
             "MESSAGING_AUTO_REGISTER_RECIPIENTS",
             config.messaging_auto_register_recipients,
@@ -875,15 +1023,6 @@ impl Config {
             config.ack_escalation_claim_holder_name = v;
         }
 
-        // Agent Naming
-        if let Some(v) = env_value("AGENT_NAME_ENFORCEMENT_MODE") {
-            config.agent_name_enforcement_mode = match v.trim().to_lowercase().as_str() {
-                "strict" => AgentNameEnforcementMode::Strict,
-                "always_auto" | "alwaysauto" => AgentNameEnforcementMode::AlwaysAuto,
-                _ => AgentNameEnforcementMode::Coerce,
-            };
-        }
-
         // LLM
         config.llm_enabled = env_bool("LLM_ENABLED", config.llm_enabled);
         if let Some(v) = env_value("LLM_DEFAULT_MODEL") {
@@ -891,13 +1030,6 @@ impl Config {
         }
         config.llm_temperature = env_f64("LLM_TEMPERATURE", config.llm_temperature);
         config.llm_max_tokens = env_u32("LLM_MAX_TOKENS", config.llm_max_tokens);
-        config.llm_cache_enabled = env_bool("LLM_CACHE_ENABLED", config.llm_cache_enabled);
-        if let Some(v) = env_value("LLM_CACHE_BACKEND") {
-            config.llm_cache_backend = v;
-        }
-        if let Some(v) = env_value("LLM_CACHE_REDIS_URL") {
-            config.llm_cache_redis_url = v;
-        }
         config.llm_cost_logging_enabled =
             env_bool("LLM_COST_LOGGING_ENABLED", config.llm_cost_logging_enabled);
 
@@ -1193,6 +1325,11 @@ impl Config {
     pub fn bootstrap_summary(&self) -> BootstrapSummary {
         let mut lines = Vec::new();
 
+        lines.push(BootstrapLine {
+            key: "interface_mode",
+            value: self.interface_mode.to_string(),
+            source: detect_source("INTERFACE_MODE"),
+        });
         lines.push(BootstrapLine {
             key: "host",
             value: self.http_host.clone(),

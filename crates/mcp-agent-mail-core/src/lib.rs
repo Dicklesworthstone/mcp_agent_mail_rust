@@ -33,7 +33,8 @@ pub use backpressure::{
     compute_health_level_with_signals, is_shedable_tool, level_transitions, refresh_health_level,
 };
 pub use config::{
-    AgentNameEnforcementMode, AppEnvironment, Config, ProjectIdentityMode, RateLimitBackend,
+    AppEnvironment, Config, InterfaceMode, InterfaceModeResolver, ModeProvenance,
+    ProjectIdentityMode, RateLimitBackend, ResolvedMode,
 };
 pub use diagnostics::{
     DiagnosticReport, HealthInfo, Recommendation, SystemInfo, init_process_start,
