@@ -2,15 +2,15 @@
 
 use std::collections::HashMap;
 
+use ftui::layout::Constraint;
 use ftui::layout::Rect;
+use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::widgets::StatefulWidget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
-use ftui::layout::Constraint;
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
@@ -42,14 +42,20 @@ struct ActiveReservation {
 
 impl ActiveReservation {
     /// Remaining seconds until expiry, capped at 0.
+    #[allow(clippy::cast_sign_loss)]
     fn remaining_secs(&self) -> u64 {
         let now = chrono::Utc::now().timestamp_micros();
-        let expires_micros = self.granted_ts + (self.ttl_s as i64 * 1_000_000);
+        let expires_micros = self.granted_ts.saturating_add(
+            i64::try_from(self.ttl_s)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000),
+        );
         let remaining = (expires_micros - now) / 1_000_000;
         if remaining < 0 { 0 } else { remaining as u64 }
     }
 
     /// Progress ratio (1.0 = full TTL remaining, 0.0 = expired).
+    #[allow(clippy::cast_precision_loss)]
     fn ttl_ratio(&self) -> f64 {
         if self.ttl_s == 0 {
             return 0.0;
@@ -176,9 +182,9 @@ impl ReservationsScreen {
         let len = self.sorted_keys.len();
         let current = self.table_state.selected.unwrap_or(0);
         let next = if delta > 0 {
-            (current + delta as usize).min(len - 1)
+            current.saturating_add(delta.unsigned_abs()).min(len - 1)
         } else {
-            current.saturating_sub((-delta) as usize)
+            current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
     }
@@ -187,7 +193,7 @@ impl ReservationsScreen {
         let mut active = 0usize;
         let mut exclusive = 0usize;
         let mut shared = 0usize;
-        for (_, res) in &self.reservations {
+        for res in self.reservations.values() {
             if !res.released {
                 active += 1;
                 if res.exclusive {
@@ -262,12 +268,19 @@ impl MailScreen for ReservationsScreen {
 
         // Summary line
         let (active, exclusive, shared) = self.summary_counts();
-        let sort_indicator = if self.sort_asc { "\u{25b2}" } else { "\u{25bc}" };
+        let sort_indicator = if self.sort_asc {
+            "\u{25b2}"
+        } else {
+            "\u{25bc}"
+        };
         let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
-        let released_label = if self.show_released { " [x:show released]" } else { "" };
+        let released_label = if self.show_released {
+            " [x:show released]"
+        } else {
+            ""
+        };
         let summary = format!(
-            " {} active | {} exclusive | {} shared | Sort: {}{} {}",
-            active, exclusive, shared, sort_label, sort_indicator, released_label,
+            " {active} active | {exclusive} exclusive | {shared} shared | Sort: {sort_label}{sort_indicator} {released_label}",
         );
         let p = Paragraph::new(summary);
         p.render(header_area, frame);
@@ -282,12 +295,16 @@ impl MailScreen for ReservationsScreen {
             .enumerate()
             .filter_map(|(i, key)| {
                 let res = self.reservations.get(key)?;
-                let excl_str = if res.exclusive { "\u{2713}" } else { "\u{2717}" };
+                let excl_str = if res.exclusive {
+                    "\u{2713}"
+                } else {
+                    "\u{2717}"
+                };
                 let remaining = res.remaining_secs();
                 let ratio = res.ttl_ratio();
                 let ttl_bar = render_ttl_bar(ratio, TTL_BAR_WIDTH);
                 let ttl_text = format_ttl(remaining);
-                let ttl_display = format!("{} {}", ttl_bar, ttl_text);
+                let ttl_display = format!("{ttl_bar} {ttl_text}");
 
                 let style = if Some(i) == self.table_state.selected {
                     Style::default()
@@ -372,6 +389,11 @@ impl MailScreen for ReservationsScreen {
 }
 
 /// Render an inline TTL progress bar using Unicode block characters.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn render_ttl_bar(ratio: f64, width: usize) -> String {
     if width == 0 {
         return String::new();

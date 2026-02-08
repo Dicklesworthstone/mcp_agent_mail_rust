@@ -2,15 +2,15 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use ftui::layout::Constraint;
 use ftui::layout::Rect;
+use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::widgets::StatefulWidget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
-use ftui::layout::Constraint;
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
@@ -29,7 +29,10 @@ const SORT_LABELS: &[&str] = &["Name", "Calls", "Errors", "Err%", "Avg(ms)"];
 const LATENCY_HISTORY: usize = 30;
 
 /// Unicode block characters for inline sparkline.
-const SPARK_CHARS: &[char] = &[' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+const SPARK_CHARS: &[char] = &[
+    ' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+    '\u{2588}',
+];
 
 /// Accumulated stats for a single tool.
 #[derive(Debug, Clone)]
@@ -56,6 +59,7 @@ impl ToolStats {
         self.total_duration_ms.checked_div(self.calls).unwrap_or(0)
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn err_pct(&self) -> f64 {
         if self.calls == 0 {
             return 0.0;
@@ -63,11 +67,22 @@ impl ToolStats {
         (self.errors as f64 / self.calls as f64) * 100.0
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn sparkline_str(&self) -> String {
         if self.recent_latencies.is_empty() {
             return String::new();
         }
-        let max = self.recent_latencies.iter().copied().max().unwrap_or(1).max(1);
+        let max = self
+            .recent_latencies
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1);
         self.recent_latencies
             .iter()
             .map(|&v| {
@@ -125,7 +140,7 @@ impl ToolMetricsScreen {
             {
                 let is_error = result_preview
                     .as_deref()
-                    .map_or(false, |p| p.contains("error") || p.contains("Error"));
+                    .is_some_and(|p| p.contains("error") || p.contains("Error"));
                 self.tool_map
                     .entry(tool_name.clone())
                     .or_insert_with(|| ToolStats::new(tool_name.clone()))
@@ -141,7 +156,10 @@ impl ToolMetricsScreen {
                 COL_NAME => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 COL_CALLS => a.calls.cmp(&b.calls),
                 COL_ERRORS => a.errors.cmp(&b.errors),
-                COL_ERR_PCT => a.err_pct().partial_cmp(&b.err_pct()).unwrap_or(std::cmp::Ordering::Equal),
+                COL_ERR_PCT => a
+                    .err_pct()
+                    .partial_cmp(&b.err_pct())
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 COL_AVG_MS => a.avg_ms().cmp(&b.avg_ms()),
                 _ => std::cmp::Ordering::Equal,
             };
@@ -168,9 +186,9 @@ impl ToolMetricsScreen {
         let len = self.sorted_tools.len();
         let current = self.table_state.selected.unwrap_or(0);
         let next = if delta > 0 {
-            (current + delta as usize).min(len - 1)
+            current.saturating_add(delta.unsigned_abs()).min(len - 1)
         } else {
-            current.saturating_sub((-delta) as usize)
+            current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
     }
@@ -256,7 +274,11 @@ impl MailScreen for ToolMetricsScreen {
 
         // Summary line
         let (total_calls, total_errors, avg_ms) = self.totals();
-        let sort_indicator = if self.sort_asc { "\u{25b2}" } else { "\u{25bc}" };
+        let sort_indicator = if self.sort_asc {
+            "\u{25b2}"
+        } else {
+            "\u{25bc}"
+        };
         let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
         let summary = format!(
             " {} tools | {} calls | {} errors | avg {}ms | Sort: {}{}",
@@ -464,10 +486,24 @@ mod tests {
         let mut screen = ToolMetricsScreen::new();
 
         let _ = state.push_event(MailEvent::tool_call_end(
-            "send_message", 42, Some("ok".into()), 1, 0.5, vec![], None, None,
+            "send_message",
+            42,
+            Some("ok".into()),
+            1,
+            0.5,
+            vec![],
+            None,
+            None,
         ));
         let _ = state.push_event(MailEvent::tool_call_end(
-            "fetch_inbox", 10, None, 2, 0.2, vec![], None, None,
+            "fetch_inbox",
+            10,
+            None,
+            2,
+            0.2,
+            vec![],
+            None,
+            None,
         ));
 
         screen.ingest_events(&state);
@@ -480,8 +516,7 @@ mod tests {
     fn deep_link_tool_by_name() {
         let mut screen = ToolMetricsScreen::new();
         screen.sorted_tools = vec!["send_message".into(), "fetch_inbox".into()];
-        let handled =
-            screen.receive_deep_link(&DeepLinkTarget::ToolByName("fetch_inbox".into()));
+        let handled = screen.receive_deep_link(&DeepLinkTarget::ToolByName("fetch_inbox".into()));
         assert!(handled);
         assert_eq!(screen.table_state.selected, Some(1));
     }

@@ -7,12 +7,12 @@ use std::collections::HashSet;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
+use ftui::widgets::Sparkline;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::progress::MiniBar;
-use ftui::widgets::Sparkline;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_runtime::program::Cmd;
 
@@ -214,7 +214,13 @@ impl MailScreen for DashboardScreen {
             footer_height,
         );
 
-        render_stat_tiles(frame, stat_area, state, &self.prev_db_stats, &self.sparkline_data);
+        render_stat_tiles(
+            frame,
+            stat_area,
+            state,
+            &self.prev_db_stats,
+            &self.sparkline_data,
+        );
         render_event_log(
             frame,
             log_area,
@@ -435,7 +441,7 @@ fn truncate(s: &str, max: usize) -> &str {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-/// Render the stat tiles row with Sparkline and MiniBar widgets.
+/// Render the stat tiles row with Sparkline and `MiniBar` widgets.
 fn render_stat_tiles(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -477,8 +483,7 @@ fn render_stat_tiles(
     let spark_inner_w = col_width.saturating_sub(2);
     if spark_inner_w > 4 && col1.height >= 5 {
         let spark_area = Rect::new(col1.x + 1, spark_inner_y, spark_inner_w, 1);
-        let sparkline = Sparkline::new(sparkline_data)
-            .gradient(PackedRgba::GREEN, PackedRgba::RED);
+        let sparkline = Sparkline::new(sparkline_data).gradient(PackedRgba::GREEN, PackedRgba::RED);
         sparkline.render(spark_area, frame);
     }
 

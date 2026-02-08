@@ -1,7 +1,8 @@
-//! Exponential backoff + circuit breaker for `SQLite` lock contention.
+//! Exponential backoff + per-subsystem circuit breakers.
 //!
 //! Matches the legacy Python `retry_on_db_lock` decorator and circuit breaker
-//! from `mcp_agent_mail/db.py`.
+//! from `mcp_agent_mail/db.py`, extended with per-subsystem isolation so that
+//! a git failure cannot take down database operations (and vice versa).
 //!
 //! # Backoff Schedule (defaults)
 //!
@@ -15,15 +16,51 @@
 //! | 5       | 1600ms      | 1200–2000ms      |
 //! | 6       | 3200ms      | 2400–4000ms      |
 //!
-//! # Circuit Breaker
+//! # Per-Subsystem Circuit Breakers
 //!
-//! After 5 consecutive lock failures the circuit opens for 30 s, failing
-//! fast with `CircuitBreakerOpen`. A successful operation after the reset
-//! window closes the circuit.
+//! Each subsystem (DB, Git, Signal, LLM) has an independent circuit breaker
+//! so that failures in one do not cascade to others. Each circuit has:
+//! - Independent threshold and reset duration (configurable via env vars)
+//! - Rate-limited half-open probes (max 1 per 5 s)
+//! - Success threshold: 3 consecutive successes required to close from half-open
+//! - WARN-level logging on state transitions
 
 use crate::error::{DbError, DbResult};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// Subsystem identification
+// ---------------------------------------------------------------------------
+
+/// Identifies which subsystem a circuit breaker protects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Subsystem {
+    /// `SQLite` operations (pool acquire, query execution).
+    Db,
+    /// Git archive operations (commit, read).
+    Git,
+    /// Notification signal writes.
+    Signal,
+    /// LLM API calls.
+    Llm,
+}
+
+impl Subsystem {
+    /// All subsystem variants for iteration.
+    pub const ALL: [Self; 4] = [Self::Db, Self::Git, Self::Signal, Self::Llm];
+}
+
+impl std::fmt::Display for Subsystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db => write!(f, "db"),
+            Self::Git => write!(f, "git"),
+            Self::Signal => write!(f, "signal"),
+            Self::Llm => write!(f, "llm"),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Circuit breaker
@@ -36,7 +73,7 @@ pub enum CircuitState {
     Closed,
     /// Failing fast — calls are rejected immediately.
     Open,
-    /// Testing recovery — one probe call is allowed.
+    /// Testing recovery — rate-limited probe calls are allowed.
     HalfOpen,
 }
 
@@ -50,20 +87,38 @@ impl std::fmt::Display for CircuitState {
     }
 }
 
-/// Thread-safe circuit breaker for database operations.
+/// Minimum interval between half-open probe attempts (5 seconds).
+const HALF_OPEN_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Number of consecutive successes required to close from half-open.
+const HALF_OPEN_SUCCESS_THRESHOLD: u32 = 3;
+
+/// Thread-safe circuit breaker with per-subsystem isolation.
 ///
-/// Uses atomics for lock-free reads of state.
+/// Uses atomics for lock-free reads of state. Enhanced over the legacy
+/// single-breaker design with:
+/// - Subsystem label for diagnostics
+/// - Rate-limited half-open probes (max 1 per `HALF_OPEN_PROBE_INTERVAL`)
+/// - Success threshold: requires `HALF_OPEN_SUCCESS_THRESHOLD` consecutive
+///   successes in half-open before closing
+/// - WARN-level logging on state transitions
 pub struct CircuitBreaker {
     /// Consecutive failure count.
     failures: AtomicU32,
-    /// Monotonic microseconds when the circuit should close (0 = not open).
+    /// Consecutive successes in half-open state (resets on failure or close).
+    half_open_successes: AtomicU32,
+    /// Monotonic microseconds when the circuit should enter half-open (0 = not open).
     open_until_us: AtomicU64,
+    /// Monotonic microseconds of the last half-open probe (0 = never).
+    last_probe_us: AtomicU64,
     /// Threshold before the circuit opens.
     threshold: u32,
     /// Duration the circuit stays open before entering half-open.
     reset_duration: Duration,
     /// Anchor instant for monotonic time.
     epoch: Instant,
+    /// Subsystem this breaker protects (for logging and diagnostics).
+    subsystem: &'static str,
 }
 
 impl CircuitBreaker {
@@ -73,25 +128,46 @@ impl CircuitBreaker {
     /// - `reset_duration`: 30 s before half-open
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            failures: AtomicU32::new(0),
-            open_until_us: AtomicU64::new(0),
-            threshold: 5,
-            reset_duration: Duration::from_secs(30),
-            epoch: Instant::now(),
-        }
+        Self::with_subsystem("db", 5, Duration::from_secs(30))
     }
 
-    /// Create with custom parameters.
+    /// Create with custom parameters (legacy API).
     #[must_use]
     pub fn with_params(threshold: u32, reset_duration: Duration) -> Self {
+        Self::with_subsystem("db", threshold, reset_duration)
+    }
+
+    /// Create with subsystem label and custom parameters.
+    #[must_use]
+    pub fn with_subsystem(subsystem: &'static str, threshold: u32, reset_duration: Duration) -> Self {
         Self {
             failures: AtomicU32::new(0),
+            half_open_successes: AtomicU32::new(0),
             open_until_us: AtomicU64::new(0),
+            last_probe_us: AtomicU64::new(0),
             threshold,
             reset_duration,
             epoch: Instant::now(),
+            subsystem,
         }
+    }
+
+    /// The subsystem label this breaker protects.
+    #[must_use]
+    pub const fn subsystem(&self) -> &str {
+        self.subsystem
+    }
+
+    /// The configured failure threshold.
+    #[must_use]
+    pub const fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    /// The configured reset duration.
+    #[must_use]
+    pub const fn reset_duration(&self) -> Duration {
+        self.reset_duration
     }
 
     /// Current circuit state (lock-free read).
@@ -115,6 +191,12 @@ impl CircuitBreaker {
         self.failures.load(Ordering::Acquire)
     }
 
+    /// Number of consecutive half-open successes (toward the close threshold).
+    #[must_use]
+    pub fn half_open_success_count(&self) -> u32 {
+        self.half_open_successes.load(Ordering::Acquire)
+    }
+
     /// Seconds remaining until the circuit transitions from `Open` to `HalfOpen`.
     /// Returns 0.0 if not open.
     #[must_use]
@@ -134,19 +216,42 @@ impl CircuitBreaker {
 
     /// Check if a call should be allowed.
     ///
-    /// Returns `Ok(())` if the circuit is closed or half-open (probe allowed),
-    /// or `Err(CircuitBreakerOpen)` if the circuit is open.
+    /// Returns `Ok(())` if the circuit is closed, or if the circuit is half-open
+    /// and the rate-limited probe interval has elapsed.
+    /// Returns `Err(CircuitBreakerOpen)` if the circuit is open, or if we're
+    /// in half-open but a probe was already issued recently.
     pub fn check(&self) -> DbResult<()> {
         match self.state() {
-            CircuitState::Closed | CircuitState::HalfOpen => Ok(()),
+            CircuitState::Closed => Ok(()),
+            CircuitState::HalfOpen => {
+                // Rate-limit probes: only allow one per HALF_OPEN_PROBE_INTERVAL.
+                let now_us = self.now_us();
+                let last = self.last_probe_us.load(Ordering::Acquire);
+                let interval_us = micros_from_duration(HALF_OPEN_PROBE_INTERVAL);
+                if last > 0 && now_us.saturating_sub(last) < interval_us {
+                    #[allow(clippy::cast_precision_loss)]
+                    let remaining = (interval_us - now_us.saturating_sub(last)) as f64 / 1_000_000.0;
+                    return Err(DbError::CircuitBreakerOpen {
+                        message: format!(
+                            "[{subsystem}] Circuit breaker half-open, probe rate-limited. \
+                             Next probe in {remaining:.1}s.",
+                            subsystem = self.subsystem,
+                        ),
+                        failures: self.failures.load(Ordering::Acquire),
+                        reset_after_secs: 0.0,
+                    });
+                }
+                // Allow probe and record the time.
+                self.last_probe_us.store(now_us, Ordering::Release);
+                Ok(())
+            }
             CircuitState::Open => Err(DbError::CircuitBreakerOpen {
                 message: format!(
-                    "Circuit breaker open after {} consecutive failures. \
-                     Resets in {:.1}s. Consider: (1) reducing concurrent operations, \
-                     (2) increasing busy_timeout, (3) checking for long-running transactions, \
-                     (4) running PRAGMA wal_checkpoint(TRUNCATE).",
-                    self.failures.load(Ordering::Acquire),
-                    self.remaining_open_secs(),
+                    "[{subsystem}] Circuit breaker open after {failures} consecutive failures. \
+                     Resets in {remaining:.1}s.",
+                    subsystem = self.subsystem,
+                    failures = self.failures.load(Ordering::Acquire),
+                    remaining = self.remaining_open_secs(),
                 ),
                 failures: self.failures.load(Ordering::Acquire),
                 reset_after_secs: self.remaining_open_secs(),
@@ -154,20 +259,57 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a successful operation — resets the circuit to `Closed`.
+    /// Record a successful operation.
+    ///
+    /// In half-open state, increments the success counter. Once
+    /// `HALF_OPEN_SUCCESS_THRESHOLD` consecutive successes are reached,
+    /// the circuit closes. In closed state, resets any stale failure count.
     pub fn record_success(&self) {
-        self.failures.store(0, Ordering::Release);
-        self.open_until_us.store(0, Ordering::Release);
+        let prev_state = self.state();
+        match prev_state {
+            CircuitState::HalfOpen => {
+                let prev = self.half_open_successes.fetch_add(1, Ordering::AcqRel);
+                if prev + 1 >= HALF_OPEN_SUCCESS_THRESHOLD {
+                    // Enough consecutive successes — close the circuit.
+                    self.failures.store(0, Ordering::Release);
+                    self.open_until_us.store(0, Ordering::Release);
+                    self.half_open_successes.store(0, Ordering::Release);
+                    self.last_probe_us.store(0, Ordering::Release);
+                    log_transition(self.subsystem, prev_state, CircuitState::Closed);
+                }
+            }
+            CircuitState::Closed => {
+                // Reset stale failures to prevent accumulation across calls.
+                self.failures.store(0, Ordering::Release);
+            }
+            CircuitState::Open => {
+                // Shouldn't happen (check() blocks open), but be safe.
+                self.failures.store(0, Ordering::Release);
+                self.open_until_us.store(0, Ordering::Release);
+                self.half_open_successes.store(0, Ordering::Release);
+                self.last_probe_us.store(0, Ordering::Release);
+            }
+        }
     }
 
     /// Record a failed operation — may open the circuit.
     pub fn record_failure(&self) {
+        let prev_state = self.state();
+        // Reset half-open success streak on any failure.
+        self.half_open_successes.store(0, Ordering::Release);
+
         let prev = self.failures.fetch_add(1, Ordering::AcqRel);
         let new_count = prev + 1;
         if new_count >= self.threshold {
+            let was_already_open = self.open_until_us.load(Ordering::Acquire) > 0
+                && self.now_us() < self.open_until_us.load(Ordering::Acquire);
             let reset_us = micros_from_duration(self.reset_duration);
             let open_until = self.now_us() + reset_us;
             self.open_until_us.store(open_until, Ordering::Release);
+            let new_state = CircuitState::Open;
+            if !was_already_open && prev_state != CircuitState::Open {
+                log_transition(self.subsystem, prev_state, new_state);
+            }
         }
     }
 
@@ -175,11 +317,20 @@ impl CircuitBreaker {
     pub fn reset(&self) {
         self.failures.store(0, Ordering::Release);
         self.open_until_us.store(0, Ordering::Release);
+        self.half_open_successes.store(0, Ordering::Release);
+        self.last_probe_us.store(0, Ordering::Release);
     }
 
     fn now_us(&self) -> u64 {
         micros_from_duration(self.epoch.elapsed())
     }
+}
+
+/// Log a circuit state transition at WARN level.
+fn log_transition(subsystem: &str, from: CircuitState, to: CircuitState) {
+    eprintln!(
+        "[WARN] circuit_breaker[{subsystem}]: {from} -> {to}",
+    );
 }
 
 /// Convert a [`Duration`] to microseconds as `u64`, saturating on overflow.
@@ -200,12 +351,87 @@ impl Default for CircuitBreaker {
 }
 
 // ---------------------------------------------------------------------------
-// Global circuit breaker singleton
+// Per-subsystem circuit breaker globals
 // ---------------------------------------------------------------------------
 
-/// Global circuit breaker instance (legacy Python uses module-level globals).
+/// Read a u32 from an environment variable, returning `default` on missing/parse error.
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Read a u64 from an environment variable, returning `default` on missing/parse error.
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Circuit breaker for **database** (`SQLite`) operations.
+///
+/// Env vars: `CIRCUIT_DB_THRESHOLD` (default 5), `CIRCUIT_DB_RESET_SECS` (default 30).
+pub static CIRCUIT_DB: std::sync::LazyLock<CircuitBreaker> = std::sync::LazyLock::new(|| {
+    CircuitBreaker::with_subsystem(
+        "db",
+        env_u32("CIRCUIT_DB_THRESHOLD", 5),
+        Duration::from_secs(env_u64("CIRCUIT_DB_RESET_SECS", 30)),
+    )
+});
+
+/// Circuit breaker for **git** archive operations.
+///
+/// Git is inherently flakier (index.lock, network), so defaults are more lenient.
+/// Env vars: `CIRCUIT_GIT_THRESHOLD` (default 8), `CIRCUIT_GIT_RESET_SECS` (default 45).
+pub static CIRCUIT_GIT: std::sync::LazyLock<CircuitBreaker> = std::sync::LazyLock::new(|| {
+    CircuitBreaker::with_subsystem(
+        "git",
+        env_u32("CIRCUIT_GIT_THRESHOLD", 8),
+        Duration::from_secs(env_u64("CIRCUIT_GIT_RESET_SECS", 45)),
+    )
+});
+
+/// Circuit breaker for **signal** (notification) writes.
+///
+/// Env vars: `CIRCUIT_SIGNAL_THRESHOLD` (default 5), `CIRCUIT_SIGNAL_RESET_SECS` (default 30).
+pub static CIRCUIT_SIGNAL: std::sync::LazyLock<CircuitBreaker> = std::sync::LazyLock::new(|| {
+    CircuitBreaker::with_subsystem(
+        "signal",
+        env_u32("CIRCUIT_SIGNAL_THRESHOLD", 5),
+        Duration::from_secs(env_u64("CIRCUIT_SIGNAL_RESET_SECS", 30)),
+    )
+});
+
+/// Circuit breaker for **LLM** API calls.
+///
+/// LLM depends on external APIs — more lenient threshold, longer reset.
+/// Env vars: `CIRCUIT_LLM_THRESHOLD` (default 3), `CIRCUIT_LLM_RESET_SECS` (default 60).
+pub static CIRCUIT_LLM: std::sync::LazyLock<CircuitBreaker> = std::sync::LazyLock::new(|| {
+    CircuitBreaker::with_subsystem(
+        "llm",
+        env_u32("CIRCUIT_LLM_THRESHOLD", 3),
+        Duration::from_secs(env_u64("CIRCUIT_LLM_RESET_SECS", 60)),
+    )
+});
+
+/// Legacy global circuit breaker — aliased to `CIRCUIT_DB` for backward compatibility.
+///
+/// New code should use `CIRCUIT_DB` directly, or the appropriate subsystem breaker.
 pub static CIRCUIT_BREAKER: std::sync::LazyLock<CircuitBreaker> =
     std::sync::LazyLock::new(CircuitBreaker::new);
+
+/// Look up the circuit breaker for a given subsystem.
+#[must_use]
+pub fn circuit_for(subsystem: Subsystem) -> &'static CircuitBreaker {
+    match subsystem {
+        Subsystem::Db => &CIRCUIT_DB,
+        Subsystem::Git => &CIRCUIT_GIT,
+        Subsystem::Signal => &CIRCUIT_SIGNAL,
+        Subsystem::Llm => &CIRCUIT_LLM,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Retry configuration
@@ -222,6 +448,8 @@ pub struct RetryConfig {
     pub max_delay: Duration,
     /// Whether to consult the circuit breaker (default: true).
     pub use_circuit_breaker: bool,
+    /// Which subsystem circuit breaker to use (default: `Db`).
+    pub subsystem: Subsystem,
 }
 
 impl Default for RetryConfig {
@@ -231,6 +459,7 @@ impl Default for RetryConfig {
             base_delay: Duration::from_millis(50),
             max_delay: Duration::from_secs(8),
             use_circuit_breaker: true,
+            subsystem: Subsystem::Db,
         }
     }
 }
@@ -320,7 +549,7 @@ where
     F: FnMut() -> DbResult<T>,
 {
     let cb = if config.use_circuit_breaker {
-        Some(&*CIRCUIT_BREAKER)
+        Some(circuit_for(config.subsystem))
     } else {
         None
     };
@@ -374,28 +603,51 @@ where
 // Health status
 // ---------------------------------------------------------------------------
 
+/// Per-subsystem circuit breaker status snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubsystemCircuitStatus {
+    /// Subsystem name (e.g. "db", "git", "signal", "llm").
+    pub subsystem: String,
+    /// Current circuit state: `"closed"`, `"open"`, or `"half_open"`.
+    pub state: String,
+    /// Number of consecutive failures.
+    pub failures: u32,
+    /// Configured failure threshold.
+    pub threshold: u32,
+    /// Configured reset duration in seconds.
+    pub reset_secs: u64,
+    /// Consecutive successes in half-open (toward close threshold).
+    pub half_open_successes: u32,
+    /// Recommendation text when circuit is open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+}
+
 /// Database health status snapshot (matches legacy `get_db_health_status()`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DbHealthStatus {
-    /// Current circuit state: "closed", "open", or "`half_open`".
+    /// Current circuit state: `"closed"`, `"open"`, or `"half_open"`.
     pub circuit_state: String,
     /// Number of consecutive failures.
     pub circuit_failures: u32,
     /// Recommendation text when circuit is open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommendation: Option<String>,
+    /// Per-subsystem circuit breaker statuses.
+    pub circuits: Vec<SubsystemCircuitStatus>,
 }
 
-/// Return the current database health status.
+/// Return the current database health status including all subsystem circuits.
 #[must_use]
 pub fn db_health_status() -> DbHealthStatus {
-    let cb = &*CIRCUIT_BREAKER;
-    let state = cb.state();
-    let failures = cb.failure_count();
+    // Primary DB circuit for backward-compatible top-level fields.
+    let db_cb = &*CIRCUIT_DB;
+    let db_state = db_cb.state();
+    let db_failures = db_cb.failure_count();
 
-    let recommendation = if state == CircuitState::Open {
+    let recommendation = if db_state == CircuitState::Open {
         Some(
-            "Circuit breaker is OPEN. Database is experiencing sustained lock contention. \
+            "Circuit breaker [db] is OPEN. Database is experiencing sustained lock contention. \
              Consider: (1) reducing concurrent operations, (2) increasing busy_timeout, \
              (3) checking for long-running transactions, (4) running PRAGMA wal_checkpoint(TRUNCATE)."
                 .to_string(),
@@ -404,10 +656,43 @@ pub fn db_health_status() -> DbHealthStatus {
         None
     };
 
+    let circuits = Subsystem::ALL
+        .iter()
+        .map(|&sub| {
+            let cb = circuit_for(sub);
+            let state = cb.state();
+            let rec = match (sub, state) {
+                (Subsystem::Db, CircuitState::Open) => Some(
+                    "DB circuit OPEN: reduce concurrent operations or increase busy_timeout.".to_string(),
+                ),
+                (Subsystem::Git, CircuitState::Open) => Some(
+                    "Git circuit OPEN: check for index.lock contention or network issues.".to_string(),
+                ),
+                (Subsystem::Signal, CircuitState::Open) => Some(
+                    "Signal circuit OPEN: check filesystem permissions and disk space.".to_string(),
+                ),
+                (Subsystem::Llm, CircuitState::Open) => Some(
+                    "LLM circuit OPEN: check API keys and network connectivity.".to_string(),
+                ),
+                _ => None,
+            };
+            SubsystemCircuitStatus {
+                subsystem: sub.to_string(),
+                state: state.to_string(),
+                failures: cb.failure_count(),
+                threshold: cb.threshold(),
+                reset_secs: cb.reset_duration().as_secs(),
+                half_open_successes: cb.half_open_success_count(),
+                recommendation: rec,
+            }
+        })
+        .collect();
+
     DbHealthStatus {
-        circuit_state: state.to_string(),
-        circuit_failures: failures,
+        circuit_state: db_state.to_string(),
+        circuit_failures: db_failures,
         recommendation,
+        circuits,
     }
 }
 
@@ -473,6 +758,55 @@ mod tests {
     }
 
     #[test]
+    fn half_open_requires_multiple_successes_to_close() {
+        let cb = CircuitBreaker::with_params(3, Duration::from_millis(50));
+        for _ in 0..3 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Wait for half-open.
+        std::thread::sleep(Duration::from_millis(70));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // First success — still half-open (need HALF_OPEN_SUCCESS_THRESHOLD).
+        cb.record_success();
+        assert_eq!(cb.half_open_success_count(), 1);
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Second success — still half-open.
+        cb.record_success();
+        assert_eq!(cb.half_open_success_count(), 2);
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Third success — circuit closes.
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.failure_count(), 0);
+        assert_eq!(cb.half_open_success_count(), 0);
+    }
+
+    #[test]
+    fn half_open_failure_resets_success_streak() {
+        let cb = CircuitBreaker::with_params(3, Duration::from_millis(50));
+        for _ in 0..3 {
+            cb.record_failure();
+        }
+        std::thread::sleep(Duration::from_millis(70));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Two successes, then a failure.
+        cb.record_success();
+        cb.record_success();
+        assert_eq!(cb.half_open_success_count(), 2);
+
+        cb.record_failure();
+        assert_eq!(cb.half_open_success_count(), 0);
+        // Failure re-opens the circuit.
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
     fn circuit_breaker_resets_on_success() {
         let cb = CircuitBreaker::with_params(3, Duration::from_millis(50));
         for _ in 0..3 {
@@ -484,8 +818,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(70));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
-        // Successful probe resets to closed.
-        cb.record_success();
+        // 3 successful probes close the circuit.
+        for _ in 0..HALF_OPEN_SUCCESS_THRESHOLD {
+            cb.record_success();
+        }
         assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(cb.failure_count(), 0);
     }
@@ -501,9 +837,112 @@ mod tests {
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(cb.failure_count(), 0);
+        assert_eq!(cb.half_open_success_count(), 0);
+    }
+
+    // -- Subsystem tests ----------------------------------------------------
+
+    #[test]
+    fn subsystem_display() {
+        assert_eq!(Subsystem::Db.to_string(), "db");
+        assert_eq!(Subsystem::Git.to_string(), "git");
+        assert_eq!(Subsystem::Signal.to_string(), "signal");
+        assert_eq!(Subsystem::Llm.to_string(), "llm");
+    }
+
+    #[test]
+    fn subsystem_all_contains_four() {
+        assert_eq!(Subsystem::ALL.len(), 4);
+    }
+
+    #[test]
+    fn per_subsystem_circuit_independence() {
+        // Open the git circuit — DB should remain closed.
+        let git = CircuitBreaker::with_subsystem("git", 2, Duration::from_secs(30));
+        let db = CircuitBreaker::with_subsystem("db", 5, Duration::from_secs(30));
+
+        git.record_failure();
+        git.record_failure();
+        assert_eq!(git.state(), CircuitState::Open);
+        assert_eq!(db.state(), CircuitState::Closed);
+
+        // DB operations still allowed.
+        assert!(db.check().is_ok());
+        // Git operations blocked.
+        assert!(git.check().is_err());
+    }
+
+    #[test]
+    fn subsystem_label_in_error_message() {
+        let cb = CircuitBreaker::with_subsystem("git", 2, Duration::from_secs(30));
+        cb.record_failure();
+        cb.record_failure();
+        let err = cb.check().unwrap_err();
+        if let DbError::CircuitBreakerOpen { message, .. } = err {
+            assert!(message.contains("[git]"), "error should name subsystem: {message}");
+        } else {
+            panic!("expected CircuitBreakerOpen");
+        }
+    }
+
+    #[test]
+    fn circuit_for_returns_correct_subsystem() {
+        let db = circuit_for(Subsystem::Db);
+        assert_eq!(db.subsystem(), "db");
+        let git = circuit_for(Subsystem::Git);
+        assert_eq!(git.subsystem(), "git");
+        let signal = circuit_for(Subsystem::Signal);
+        assert_eq!(signal.subsystem(), "signal");
+        let llm = circuit_for(Subsystem::Llm);
+        assert_eq!(llm.subsystem(), "llm");
+    }
+
+    #[test]
+    fn global_circuits_have_correct_defaults() {
+        // DB: threshold=5, reset=30s
+        assert_eq!(CIRCUIT_DB.threshold(), 5);
+        assert_eq!(CIRCUIT_DB.reset_duration(), Duration::from_secs(30));
+        // Git: threshold=8, reset=45s
+        assert_eq!(CIRCUIT_GIT.threshold(), 8);
+        assert_eq!(CIRCUIT_GIT.reset_duration(), Duration::from_secs(45));
+        // Signal: threshold=5, reset=30s
+        assert_eq!(CIRCUIT_SIGNAL.threshold(), 5);
+        assert_eq!(CIRCUIT_SIGNAL.reset_duration(), Duration::from_secs(30));
+        // LLM: threshold=3, reset=60s
+        assert_eq!(CIRCUIT_LLM.threshold(), 3);
+        assert_eq!(CIRCUIT_LLM.reset_duration(), Duration::from_secs(60));
+    }
+
+    // -- Half-open rate limiting tests ---------------------------------------
+
+    #[test]
+    fn half_open_rate_limits_probes() {
+        let cb = CircuitBreaker::with_params(2, Duration::from_millis(50));
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        std::thread::sleep(Duration::from_millis(70));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // First probe: allowed.
+        assert!(cb.check().is_ok());
+
+        // Immediate second probe: rate-limited (within 5s interval).
+        let err = cb.check().unwrap_err();
+        assert!(matches!(err, DbError::CircuitBreakerOpen { .. }));
+        if let DbError::CircuitBreakerOpen { message, .. } = err {
+            assert!(message.contains("rate-limited"), "should mention rate limit: {message}");
+        }
     }
 
     // -- RetryConfig tests --------------------------------------------------
+
+    #[test]
+    fn retry_config_default_subsystem_is_db() {
+        let config = RetryConfig::default();
+        assert_eq!(config.subsystem, Subsystem::Db);
+    }
 
     #[test]
     fn backoff_schedule_matches_legacy() {
@@ -512,6 +951,7 @@ mod tests {
             base_delay: Duration::from_millis(50),
             max_delay: Duration::from_secs(8),
             use_circuit_breaker: false,
+            subsystem: Subsystem::Db,
         };
 
         // Expected base delays (before jitter): 50, 100, 200, 400, 800, 1600, 3200
@@ -536,6 +976,7 @@ mod tests {
             base_delay: Duration::from_millis(50),
             max_delay: Duration::from_secs(8),
             use_circuit_breaker: false,
+            subsystem: Subsystem::Db,
         };
 
         // Very high attempt should be capped at max_delay.
@@ -619,6 +1060,7 @@ mod tests {
             base_delay: Duration::from_millis(1), // fast for tests
             max_delay: Duration::from_millis(10),
             use_circuit_breaker: false,
+            ..Default::default()
         };
 
         let attempt = std::cell::Cell::new(0u32);
@@ -642,6 +1084,7 @@ mod tests {
             base_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(5),
             use_circuit_breaker: false,
+            ..Default::default()
         };
 
         let attempt = std::cell::Cell::new(0u32);
@@ -661,6 +1104,7 @@ mod tests {
             base_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(5),
             use_circuit_breaker: false,
+            ..Default::default()
         };
 
         let attempt = std::cell::Cell::new(0u32);
@@ -688,16 +1132,58 @@ mod tests {
         assert!(err.is_recoverable());
     }
 
-    // -- Health status test -------------------------------------------------
+    // -- Health status tests ------------------------------------------------
 
     #[test]
     fn health_status_closed() {
-        // Reset global CB for this test.
+        // Reset global CBs for this test.
         CIRCUIT_BREAKER.reset();
+        CIRCUIT_DB.reset();
+        CIRCUIT_GIT.reset();
+        CIRCUIT_SIGNAL.reset();
+        CIRCUIT_LLM.reset();
         let status = db_health_status();
         assert_eq!(status.circuit_state, "closed");
         assert_eq!(status.circuit_failures, 0);
         assert!(status.recommendation.is_none());
+        assert_eq!(status.circuits.len(), 4);
+        for circuit in &status.circuits {
+            assert_eq!(circuit.state, "closed");
+            assert_eq!(circuit.failures, 0);
+            assert!(circuit.recommendation.is_none());
+        }
+    }
+
+    #[test]
+    fn health_status_shows_per_subsystem() {
+        CIRCUIT_DB.reset();
+        CIRCUIT_GIT.reset();
+        CIRCUIT_SIGNAL.reset();
+        CIRCUIT_LLM.reset();
+
+        // Open just the git circuit.
+        for _ in 0..8 {
+            CIRCUIT_GIT.record_failure();
+        }
+        assert_eq!(CIRCUIT_GIT.state(), CircuitState::Open);
+
+        let status = db_health_status();
+        // Top-level should still be "closed" (DB is fine).
+        assert_eq!(status.circuit_state, "closed");
+
+        // Git circuit should show as open.
+        let git_status = status.circuits.iter().find(|c| c.subsystem == "git").unwrap();
+        assert_eq!(git_status.state, "open");
+        assert!(git_status.recommendation.is_some());
+        assert!(git_status.recommendation.as_ref().unwrap().contains("index.lock"));
+
+        // DB circuit should be closed.
+        let db_status = status.circuits.iter().find(|c| c.subsystem == "db").unwrap();
+        assert_eq!(db_status.state, "closed");
+        assert!(db_status.recommendation.is_none());
+
+        // Clean up.
+        CIRCUIT_GIT.reset();
     }
 
     // -- Jitter test --------------------------------------------------------
@@ -719,15 +1205,6 @@ mod tests {
 
     // -- Legacy parity tests ------------------------------------------------
 
-    /// Verify retry + circuit breaker defaults match legacy Python `retry_on_db_lock`.
-    ///
-    /// Python legacy:
-    /// - `max_retries`: 7 (attempts 0..=7)
-    /// - `base_delay`: 50ms
-    /// - `max_delay`: 8s
-    /// - jitter: ±25%
-    /// - circuit threshold: 5 consecutive failures
-    /// - circuit reset: 30s
     #[test]
     fn retry_defaults_match_legacy_python() {
         let config = RetryConfig::default();
@@ -746,6 +1223,7 @@ mod tests {
             config.use_circuit_breaker,
             "circuit breaker should be enabled by default"
         );
+        assert_eq!(config.subsystem, Subsystem::Db, "default subsystem is DB");
 
         let cb = CircuitBreaker::new();
         assert_eq!(cb.threshold, 5, "legacy circuit threshold is 5");

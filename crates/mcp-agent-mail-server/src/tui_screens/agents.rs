@@ -2,20 +2,19 @@
 
 use std::collections::HashMap;
 
+use ftui::layout::Constraint;
 use ftui::layout::Rect;
-use ftui::text::{Line, Span};
+use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::widgets::StatefulWidget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
-use ftui::layout::Constraint;
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_events::{AgentSummary, MailEvent, MailEventKind};
+use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 /// Column indices for sorting.
@@ -129,7 +128,7 @@ impl AgentsScreen {
                     // Update model info for agents we know about
                     for agent in &mut self.agents {
                         if agent.name == *name {
-                            agent.model = model_name.clone();
+                            agent.model.clone_from(model_name);
                         }
                     }
                 }
@@ -145,9 +144,9 @@ impl AgentsScreen {
         let len = self.agents.len();
         let current = self.table_state.selected.unwrap_or(0);
         let next = if delta > 0 {
-            (current + delta as usize).min(len - 1)
+            current.saturating_add(delta.unsigned_abs()).min(len - 1)
         } else {
-            current.saturating_sub((-delta) as usize)
+            current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
     }
@@ -166,10 +165,7 @@ impl MailScreen for AgentsScreen {
                 // Filter mode: capture text input
                 if self.filter_active {
                     match key.code {
-                        KeyCode::Escape => {
-                            self.filter_active = false;
-                        }
-                        KeyCode::Enter => {
+                        KeyCode::Escape | KeyCode::Enter => {
                             self.filter_active = false;
                         }
                         KeyCode::Backspace => {
@@ -253,7 +249,11 @@ impl MailScreen for AgentsScreen {
         let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
 
         // Render header info line
-        let sort_indicator = if self.sort_asc { " \u{25b2}" } else { " \u{25bc}" };
+        let sort_indicator = if self.sort_asc {
+            " \u{25b2}"
+        } else {
+            " \u{25bc}"
+        };
         let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
         let filter_display = if self.filter_active {
             format!(" [/] Search: {}_ ", self.filter)
@@ -388,7 +388,7 @@ fn format_relative_time(ts_micros: i64) -> String {
     if delta_secs < 0 {
         return "future".to_string();
     }
-    let delta = delta_secs as u64;
+    let delta = delta_secs.unsigned_abs();
     if delta < 60 {
         format!("{delta}s ago")
     } else if delta < 3600 {
@@ -525,8 +525,7 @@ mod tests {
     #[test]
     fn deep_link_unknown_agent() {
         let mut screen = AgentsScreen::new();
-        let handled =
-            screen.receive_deep_link(&DeepLinkTarget::AgentByName("Unknown".into()));
+        let handled = screen.receive_deep_link(&DeepLinkTarget::AgentByName("Unknown".into()));
         assert!(!handled);
     }
 

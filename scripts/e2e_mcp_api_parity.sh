@@ -147,7 +147,8 @@ jsonrpc_resources_list_payload() {
 
 jsonrpc_tools_call_payload() {
     local tool_name="$1"
-    local args_json="${2:-{}}"
+    local args_json="$2"
+    [ -z "${args_json}" ] && args_json="{}"
     python3 - <<'PY' "$tool_name" "$args_json"
 import json, sys
 tool = sys.argv[1]
