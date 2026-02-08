@@ -21,12 +21,13 @@ use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::schema;
-use mcp_agent_mail_db::{DbPool, DbPoolConfig};
+use mcp_agent_mail_db::{DbPool, DbPoolConfig, InboxStatsRow, read_cache};
 use sqlmodel_schema::MigrationStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static INBOX_STATS_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 fn unique_suffix() -> u64 {
     UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1943,6 +1944,378 @@ fn setup_project_and_agents(pool: &DbPool) -> (i64, i64, i64) {
     .unwrap();
 
     (pid, sender_id, receiver_id)
+}
+
+fn create_message_for_receiver(
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    receiver_id: i64,
+    subject: &str,
+    ack_required: bool,
+) -> i64 {
+    block_on(|cx| {
+        let pool = pool.clone();
+        let subject = subject.to_string();
+        async move {
+            match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &subject,
+                "inbox stats cache lifecycle body",
+                None,
+                "normal",
+                ack_required,
+                "",
+                &[(receiver_id, "to")],
+            )
+            .await
+            {
+                Outcome::Ok(row) => row.id.expect("created message must include id"),
+                Outcome::Err(e) => {
+                    panic!("create_message_with_recipients failed: {e:?}")
+                }
+                Outcome::Cancelled(r) => panic!("create_message_with_recipients cancelled: {r:?}"),
+                Outcome::Panicked(p) => panic!("{p}"),
+            }
+        }
+    })
+}
+
+fn get_inbox_stats_opt(pool: &DbPool, agent_id: i64) -> Option<InboxStatsRow> {
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::get_inbox_stats(&cx, &pool, agent_id).await {
+                Outcome::Ok(stats) => stats,
+                Outcome::Err(e) => panic!("get_inbox_stats failed for agent {agent_id}: {e:?}"),
+                Outcome::Cancelled(r) => {
+                    panic!("get_inbox_stats cancelled for agent {agent_id}: {r:?}")
+                }
+                Outcome::Panicked(p) => panic!("{p}"),
+            }
+        }
+    })
+}
+
+fn get_inbox_stats(pool: &DbPool, agent_id: i64) -> InboxStatsRow {
+    get_inbox_stats_opt(pool, agent_id)
+        .unwrap_or_else(|| panic!("expected inbox stats row for agent {agent_id}, got None"))
+}
+
+fn mark_message_read(pool: &DbPool, agent_id: i64, message_id: i64) -> i64 {
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::mark_message_read(&cx, &pool, agent_id, message_id).await {
+                Outcome::Ok(ts) => ts,
+                Outcome::Err(e) => {
+                    panic!("mark_message_read failed for {agent_id}:{message_id}: {e:?}")
+                }
+                Outcome::Cancelled(r) => {
+                    panic!("mark_message_read cancelled for {agent_id}:{message_id}: {r:?}")
+                }
+                Outcome::Panicked(p) => panic!("{p}"),
+            }
+        }
+    })
+}
+
+fn acknowledge_message(pool: &DbPool, agent_id: i64, message_id: i64) -> (i64, i64) {
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::acknowledge_message(&cx, &pool, agent_id, message_id).await {
+                Outcome::Ok(ts) => ts,
+                Outcome::Err(e) => {
+                    panic!("acknowledge_message failed for {agent_id}:{message_id}: {e:?}")
+                }
+                Outcome::Cancelled(r) => {
+                    panic!("acknowledge_message cancelled for {agent_id}:{message_id}: {r:?}")
+                }
+                Outcome::Panicked(p) => panic!("{p}"),
+            }
+        }
+    })
+}
+
+#[test]
+fn stress_inbox_stats_cache_miss_read_through_and_hit() {
+    let _cache_guard = INBOX_STATS_TEST_MUTEX.lock().expect("mutex lock");
+    let (pool, _dir) = make_pool();
+    let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
+
+    read_cache().invalidate_inbox_stats(receiver_id);
+    assert!(
+        read_cache().get_inbox_stats(receiver_id).is_none(),
+        "cache should start empty for receiver {receiver_id}"
+    );
+
+    let no_stats = get_inbox_stats_opt(&pool, receiver_id);
+    assert!(
+        no_stats.is_none(),
+        "agent {receiver_id} should not have inbox stats before receiving messages"
+    );
+    assert!(
+        read_cache().get_inbox_stats(receiver_id).is_none(),
+        "cache miss path must not materialize stats when DB has no row"
+    );
+
+    let _msg_id = create_message_for_receiver(
+        &pool,
+        project_id,
+        sender_id,
+        receiver_id,
+        "cache-miss-read-through",
+        true,
+    );
+
+    let first = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(
+        first.total_count, 1,
+        "first DB-backed read should report exactly one delivered message"
+    );
+    assert_eq!(
+        first.unread_count, 1,
+        "first message should be unread before mark_message_read"
+    );
+    assert_eq!(
+        first.ack_pending_count, 1,
+        "ack_required message should increment ack_pending_count"
+    );
+    let cached_after_first = read_cache().get_inbox_stats(receiver_id);
+    assert!(
+        cached_after_first.is_some(),
+        "read-through miss should populate cache for receiver {receiver_id}"
+    );
+    let cached_after_first = cached_after_first.unwrap();
+    assert_eq!(
+        cached_after_first.total_count, first.total_count,
+        "cached total_count should match first DB-backed read"
+    );
+    assert_eq!(
+        cached_after_first.unread_count, first.unread_count,
+        "cached unread_count should match first DB-backed read"
+    );
+    assert_eq!(
+        cached_after_first.ack_pending_count, first.ack_pending_count,
+        "cached ack_pending_count should match first DB-backed read"
+    );
+
+    let second = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(
+        second.total_count, first.total_count,
+        "cache hit should preserve total_count"
+    );
+    assert_eq!(
+        second.unread_count, first.unread_count,
+        "cache hit should preserve unread_count"
+    );
+    assert_eq!(
+        second.ack_pending_count, first.ack_pending_count,
+        "cache hit should preserve ack_pending_count"
+    );
+    assert!(
+        read_cache().get_inbox_stats(receiver_id).is_some(),
+        "cache entry should remain present after hit"
+    );
+
+    read_cache().invalidate_inbox_stats(receiver_id);
+}
+
+#[test]
+fn stress_inbox_stats_cache_short_circuits_db_on_hit() {
+    let _cache_guard = INBOX_STATS_TEST_MUTEX.lock().expect("mutex lock");
+    let (pool, _dir) = make_pool();
+    let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
+
+    read_cache().invalidate_inbox_stats(receiver_id);
+    let _msg_id = create_message_for_receiver(
+        &pool,
+        project_id,
+        sender_id,
+        receiver_id,
+        "cache-hit-short-circuit",
+        false,
+    );
+
+    let db_stats = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(
+        db_stats.total_count, 1,
+        "DB stats should report one delivered message before cache override"
+    );
+    assert_eq!(
+        db_stats.unread_count, 1,
+        "DB stats should report unread message before cache override"
+    );
+    assert_eq!(
+        db_stats.ack_pending_count, 0,
+        "non-ack-required message should not increment ack_pending_count"
+    );
+
+    let sentinel = InboxStatsRow {
+        agent_id: receiver_id,
+        total_count: 999,
+        unread_count: 888,
+        ack_pending_count: 777,
+        last_message_ts: Some(db_stats.last_message_ts.unwrap_or(0) + 1),
+    };
+    read_cache().put_inbox_stats(&sentinel);
+
+    let cached = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(
+        cached.total_count, sentinel.total_count,
+        "cache hit should return cached total_count instead of DB value"
+    );
+    assert_eq!(
+        cached.unread_count, sentinel.unread_count,
+        "cache hit should return cached unread_count instead of DB value"
+    );
+    assert_eq!(
+        cached.ack_pending_count, sentinel.ack_pending_count,
+        "cache hit should return cached ack_pending_count instead of DB value"
+    );
+
+    read_cache().invalidate_inbox_stats(receiver_id);
+    let refreshed = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(
+        refreshed.total_count, db_stats.total_count,
+        "after invalidation, read should return DB total_count"
+    );
+    assert_eq!(
+        refreshed.unread_count, db_stats.unread_count,
+        "after invalidation, read should return DB unread_count"
+    );
+    assert_eq!(
+        refreshed.ack_pending_count, db_stats.ack_pending_count,
+        "after invalidation, read should return DB ack_pending_count"
+    );
+
+    read_cache().invalidate_inbox_stats(receiver_id);
+}
+
+#[test]
+fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
+    let _cache_guard = INBOX_STATS_TEST_MUTEX.lock().expect("mutex lock");
+    let (pool, _dir) = make_pool();
+    let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
+
+    read_cache().invalidate_inbox_stats(receiver_id);
+
+    let first_msg = create_message_for_receiver(
+        &pool,
+        project_id,
+        sender_id,
+        receiver_id,
+        "invalidation-baseline",
+        true,
+    );
+
+    let baseline = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(baseline.total_count, 1, "baseline total_count should be 1");
+    assert_eq!(
+        baseline.unread_count, 1,
+        "baseline unread_count should be 1"
+    );
+    assert_eq!(
+        baseline.ack_pending_count, 1,
+        "baseline ack_pending_count should be 1 for ack-required message"
+    );
+
+    let stale_before_mark_read = InboxStatsRow {
+        agent_id: receiver_id,
+        total_count: 71,
+        unread_count: 71,
+        ack_pending_count: 71,
+        last_message_ts: Some(baseline.last_message_ts.unwrap_or(0) + 11),
+    };
+    read_cache().put_inbox_stats(&stale_before_mark_read);
+
+    let _read_ts = mark_message_read(&pool, receiver_id, first_msg);
+    let after_mark_read = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(
+        after_mark_read.total_count, 1,
+        "mark_message_read should not change total_count"
+    );
+    assert_eq!(
+        after_mark_read.unread_count, 0,
+        "mark_message_read should decrement unread_count to zero"
+    );
+    assert_eq!(
+        after_mark_read.ack_pending_count, 1,
+        "mark_message_read should not change ack_pending_count"
+    );
+    assert_ne!(
+        after_mark_read.unread_count, stale_before_mark_read.unread_count,
+        "stale cached unread_count must be cleared by mark_message_read invalidation"
+    );
+
+    let stale_before_ack = InboxStatsRow {
+        agent_id: receiver_id,
+        total_count: 62,
+        unread_count: 62,
+        ack_pending_count: 62,
+        last_message_ts: Some(after_mark_read.last_message_ts.unwrap_or(0) + 22),
+    };
+    read_cache().put_inbox_stats(&stale_before_ack);
+
+    let _ack_ts = acknowledge_message(&pool, receiver_id, first_msg);
+    let after_ack = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(
+        after_ack.total_count, 1,
+        "ack should not change total_count"
+    );
+    assert_eq!(
+        after_ack.unread_count, 0,
+        "ack should not change unread_count"
+    );
+    assert_eq!(
+        after_ack.ack_pending_count, 0,
+        "acknowledge_message should decrement ack_pending_count to zero"
+    );
+    assert_ne!(
+        after_ack.ack_pending_count, stale_before_ack.ack_pending_count,
+        "stale cached ack_pending_count must be cleared by acknowledge_message invalidation"
+    );
+
+    let stale_before_create = InboxStatsRow {
+        agent_id: receiver_id,
+        total_count: -1,
+        unread_count: -1,
+        ack_pending_count: -1,
+        last_message_ts: Some(0),
+    };
+    read_cache().put_inbox_stats(&stale_before_create);
+
+    let _second_msg = create_message_for_receiver(
+        &pool,
+        project_id,
+        sender_id,
+        receiver_id,
+        "invalidation-create",
+        true,
+    );
+    let after_create = get_inbox_stats(&pool, receiver_id);
+    assert_eq!(
+        after_create.total_count, 2,
+        "new recipient message should increment total_count"
+    );
+    assert_eq!(
+        after_create.unread_count, 1,
+        "new unread message should increment unread_count"
+    );
+    assert_eq!(
+        after_create.ack_pending_count, 1,
+        "new ack-required message should increment ack_pending_count"
+    );
+    assert_ne!(
+        after_create.total_count, stale_before_create.total_count,
+        "stale cached totals must be cleared by create_message_with_recipients invalidation"
+    );
+
+    read_cache().invalidate_inbox_stats(receiver_id);
 }
 
 #[test]

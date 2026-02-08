@@ -29,7 +29,7 @@ use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::models::{VALID_ADJECTIVES, VALID_NOUNS};
 use mcp_agent_mail_db::queries;
-use mcp_agent_mail_db::{DbPool, DbPoolConfig};
+use mcp_agent_mail_db::{DbPool, DbPoolConfig, QUERY_TRACKER, read_cache};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -172,6 +172,39 @@ impl LatencyReport {
             self.errors,
         );
     }
+}
+
+fn run_inbox_stats_polling_phase(
+    pool: &DbPool,
+    receiver_id: i64,
+    polls: usize,
+    force_invalidate_each_poll: bool,
+) -> (LatencyReport, u64) {
+    let mut latencies: Vec<u64> = Vec::with_capacity(polls);
+    for _ in 0..polls {
+        if force_invalidate_each_poll {
+            read_cache().invalidate_inbox_stats(receiver_id);
+        }
+
+        let t0 = Instant::now();
+        let outcome = block_on(|cx| {
+            let pp = pool.clone();
+            async move { queries::get_inbox_stats(&cx, &pp, receiver_id).await }
+        });
+        match outcome {
+            Outcome::Ok(Some(_)) => {
+                latencies.push(t0.elapsed().as_micros() as u64);
+            }
+            other => panic!("get_inbox_stats polling failed: {other:?}"),
+        }
+    }
+
+    let snapshot = QUERY_TRACKER.snapshot();
+    let inbox_stats_queries = snapshot.per_table.get("inbox_stats").copied().unwrap_or(0);
+    (
+        LatencyReport::from_latencies(&mut latencies, 0),
+        inbox_stats_queries,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -843,5 +876,188 @@ fn load_scenario_d_thundering_herd() {
         report.p95 < 500_000,
         "SLO: p95 < 500ms, got {:.1}ms",
         report.p95 as f64 / 1000.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario E: Inbox-stats polling cache effectiveness
+// ---------------------------------------------------------------------------
+// Compare two polling patterns for get_inbox_stats:
+//   1) forced-miss polling (invalidate before each poll)
+//   2) warm-cache polling (single cold miss, then repeated hits)
+//
+// Emits structured JSON so CI artifacts can be consumed by tooling.
+
+#[test]
+#[ignore = "benchmark scenario: inbox-stats polling cache effectiveness"]
+fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
+    let (pool, _dir) = make_load_pool(32);
+    let polls: usize = 1000;
+    let polls_u64 = u64::try_from(polls).expect("poll count fits u64");
+
+    let project_id = block_on_with_retry(5, |cx| {
+        let pp = pool.clone();
+        let key = format!("/data/load/inbox_stats_polling_{}", unique_suffix());
+        async move { queries::ensure_project(&cx, &pp, &key).await }
+    })
+    .id
+    .unwrap();
+
+    let sender_id = block_on_with_retry(5, |cx| {
+        let pp = pool.clone();
+        async move {
+            queries::register_agent(
+                &cx,
+                &pp,
+                project_id,
+                "BoldCastle",
+                "load-bench",
+                "model",
+                None,
+                None,
+            )
+            .await
+        }
+    })
+    .id
+    .unwrap();
+
+    let receiver_id = block_on_with_retry(5, |cx| {
+        let pp = pool.clone();
+        async move {
+            queries::register_agent(
+                &cx,
+                &pp,
+                project_id,
+                "QuietLake",
+                "load-bench",
+                "model",
+                None,
+                None,
+            )
+            .await
+        }
+    })
+    .id
+    .unwrap();
+
+    // Seed inbox_stats materialized row with a realistic payload.
+    for i in 0..50 {
+        let required_ack = i % 2 == 0;
+        let out = block_on(|cx| {
+            let pp = pool.clone();
+            async move {
+                queries::create_message_with_recipients(
+                    &cx,
+                    &pp,
+                    project_id,
+                    sender_id,
+                    &format!("polling-seed-{i}"),
+                    "seed body for inbox stats polling benchmark",
+                    None,
+                    "normal",
+                    required_ack,
+                    "",
+                    &[(receiver_id, "to")],
+                )
+                .await
+            }
+        });
+        assert!(
+            matches!(out, Outcome::Ok(_)),
+            "seed message creation failed at index {i}"
+        );
+    }
+
+    QUERY_TRACKER.enable(None);
+    QUERY_TRACKER.reset();
+
+    read_cache().invalidate_inbox_stats(receiver_id);
+    let forced_start = Instant::now();
+    let (forced_report, forced_db_queries) =
+        run_inbox_stats_polling_phase(&pool, receiver_id, polls, true);
+    let forced_elapsed = forced_start.elapsed();
+
+    QUERY_TRACKER.reset();
+    read_cache().invalidate_inbox_stats(receiver_id);
+    let warm_start = Instant::now();
+    let (warm_report, warm_db_queries) =
+        run_inbox_stats_polling_phase(&pool, receiver_id, polls, false);
+    let warm_elapsed = warm_start.elapsed();
+
+    QUERY_TRACKER.disable();
+    QUERY_TRACKER.reset();
+    read_cache().invalidate_inbox_stats(receiver_id);
+
+    let forced_hit_ratio = (polls_u64.saturating_sub(forced_db_queries)) as f64 / polls_u64 as f64;
+    let warm_hit_ratio = (polls_u64.saturating_sub(warm_db_queries)) as f64 / polls_u64 as f64;
+    let query_reduction_factor = if warm_db_queries == 0 {
+        forced_db_queries as f64
+    } else {
+        forced_db_queries as f64 / warm_db_queries as f64
+    };
+
+    eprintln!("\n=== Scenario E: Inbox Stats Polling Cache Effectiveness ===");
+    forced_report.print("forced-miss polling");
+    warm_report.print("warm-cache polling");
+    eprintln!(
+        "  forced elapsed={:.2}ms, warm elapsed={:.2}ms",
+        forced_elapsed.as_secs_f64() * 1000.0,
+        warm_elapsed.as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  DB queries (inbox_stats): forced={forced_db_queries}, warm={warm_db_queries}, reduction={query_reduction_factor:.2}x"
+    );
+    eprintln!(
+        "  estimated hit ratio: forced={:.2}%, warm={:.2}%",
+        forced_hit_ratio * 100.0,
+        warm_hit_ratio * 100.0
+    );
+
+    let metrics = serde_json::json!({
+        "scenario": "load_scenario_e_inbox_stats_polling_cache_effectiveness",
+        "polls": polls,
+        "forced_miss": {
+            "count": forced_report.count,
+            "p50_ms": forced_report.p50 as f64 / 1000.0,
+            "p95_ms": forced_report.p95 as f64 / 1000.0,
+            "p99_ms": forced_report.p99 as f64 / 1000.0,
+            "max_ms": forced_report.max as f64 / 1000.0,
+            "elapsed_ms": forced_elapsed.as_secs_f64() * 1000.0,
+            "db_queries_inbox_stats": forced_db_queries,
+            "estimated_cache_hit_ratio": forced_hit_ratio
+        },
+        "warm_cache": {
+            "count": warm_report.count,
+            "p50_ms": warm_report.p50 as f64 / 1000.0,
+            "p95_ms": warm_report.p95 as f64 / 1000.0,
+            "p99_ms": warm_report.p99 as f64 / 1000.0,
+            "max_ms": warm_report.max as f64 / 1000.0,
+            "elapsed_ms": warm_elapsed.as_secs_f64() * 1000.0,
+            "db_queries_inbox_stats": warm_db_queries,
+            "estimated_cache_hit_ratio": warm_hit_ratio
+        },
+        "comparison": {
+            "query_reduction_factor": query_reduction_factor,
+            "warm_vs_forced_p50_ratio": if forced_report.p50 == 0 {
+                0.0
+            } else {
+                warm_report.p50 as f64 / forced_report.p50 as f64
+            }
+        }
+    });
+    eprintln!("BENCH_JSON {metrics}");
+
+    assert!(
+        forced_db_queries >= polls_u64.saturating_mul(95) / 100,
+        "forced-miss polling should issue DB queries on almost every poll (got {forced_db_queries}/{polls})"
+    );
+    assert!(
+        warm_db_queries <= polls_u64 / 20 + 2,
+        "warm-cache polling should issue very few DB queries (got {warm_db_queries}/{polls})"
+    );
+    assert!(
+        warm_hit_ratio > forced_hit_ratio,
+        "warm-cache polling should yield a higher hit ratio (forced={forced_hit_ratio:.4}, warm={warm_hit_ratio:.4})"
     );
 }
