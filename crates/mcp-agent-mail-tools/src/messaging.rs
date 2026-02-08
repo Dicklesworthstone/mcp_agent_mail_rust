@@ -13,6 +13,7 @@ use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
@@ -238,8 +239,8 @@ async fn push_recipient(
     sender: &mcp_agent_mail_db::AgentRow,
     config: &Config,
     recipient_map: &mut HashMap<String, mcp_agent_mail_db::AgentRow>,
-    all_recipients: &mut Vec<(i64, String)>,
-    resolved_list: &mut Vec<String>,
+    all_recipients: &mut SmallVec<[(i64, String); 8]>,
+    resolved_list: &mut SmallVec<[String; 4]>,
 ) -> McpResult<()> {
     let name_key = name.to_lowercase();
     let agent = if let Some(existing) = recipient_map.get(&name_key) {
@@ -498,10 +499,11 @@ effective_free_bytes={free}"
     let bcc_list = bcc.unwrap_or_default();
 
     let total_recip = to.len() + cc_list.len() + bcc_list.len();
-    let mut all_recipients: Vec<(i64, String)> = Vec::with_capacity(total_recip);
-    let mut resolved_to: Vec<String> = Vec::with_capacity(to.len());
-    let mut resolved_cc_recipients: Vec<String> = Vec::with_capacity(cc_list.len());
-    let mut resolved_bcc_recipients: Vec<String> = Vec::with_capacity(bcc_list.len());
+    let mut all_recipients: SmallVec<[(i64, String); 8]> = SmallVec::with_capacity(total_recip);
+    let mut resolved_to: SmallVec<[String; 4]> = SmallVec::with_capacity(to.len());
+    let mut resolved_cc_recipients: SmallVec<[String; 4]> = SmallVec::with_capacity(cc_list.len());
+    let mut resolved_bcc_recipients: SmallVec<[String; 4]> =
+        SmallVec::with_capacity(bcc_list.len());
     let mut recipient_map: HashMap<String, mcp_agent_mail_db::AgentRow> =
         HashMap::with_capacity(total_recip);
 
@@ -912,7 +914,7 @@ effective_free_bytes={free}"
         serde_json::to_string(&all_attachment_meta).unwrap_or_else(|_| "[]".to_string());
 
     // Create message + recipients in a single DB transaction (1 fsync)
-    let recipient_refs: Vec<(i64, &str)> = all_recipients
+    let recipient_refs: SmallVec<[(i64, &str); 8]> = all_recipients
         .iter()
         .map(|(id, kind)| (*id, kind.as_str()))
         .collect();
@@ -960,9 +962,10 @@ effective_free_bytes={free}"
 
     // Write message bundle to git archive (best-effort)
     {
-        let mut all_recipient_names: Vec<String> = resolved_to.clone();
-        all_recipient_names.extend(resolved_cc_recipients.clone());
-        all_recipient_names.extend(resolved_bcc_recipients.clone());
+        let mut all_recipient_names: SmallVec<[String; 12]> = SmallVec::new();
+        all_recipient_names.extend(resolved_to.iter().cloned());
+        all_recipient_names.extend(resolved_cc_recipients.iter().cloned());
+        all_recipient_names.extend(resolved_bcc_recipients.iter().cloned());
 
         let msg_json = serde_json::json!({
             "id": message_id,
@@ -1008,9 +1011,9 @@ effective_free_bytes={free}"
         created_ts: Some(micros_to_iso(message.created_ts)),
         attachments: attachment_paths_out.clone(),
         from: sender_name.clone(),
-        to: resolved_to,
-        cc: resolved_cc_recipients,
-        bcc: resolved_bcc_recipients,
+        to: resolved_to.into_vec(),
+        cc: resolved_cc_recipients.into_vec(),
+        bcc: resolved_bcc_recipients.into_vec(),
     };
 
     let response = SendMessageResponse {
@@ -1164,10 +1167,11 @@ effective_free_bytes={free}"
 
     // Resolve all recipients
     let total_recip = to_names.len() + cc_names.len() + bcc_names.len();
-    let mut all_recipients: Vec<(i64, String)> = Vec::with_capacity(total_recip);
-    let mut resolved_to: Vec<String> = Vec::with_capacity(to_names.len());
-    let mut resolved_cc_recipients: Vec<String> = Vec::with_capacity(cc_names.len());
-    let mut resolved_bcc_recipients: Vec<String> = Vec::with_capacity(bcc_names.len());
+    let mut all_recipients: SmallVec<[(i64, String); 8]> = SmallVec::with_capacity(total_recip);
+    let mut resolved_to: SmallVec<[String; 4]> = SmallVec::with_capacity(to_names.len());
+    let mut resolved_cc_recipients: SmallVec<[String; 4]> = SmallVec::with_capacity(cc_names.len());
+    let mut resolved_bcc_recipients: SmallVec<[String; 4]> =
+        SmallVec::with_capacity(bcc_names.len());
 
     for name in &to_names {
         let agent = resolve_agent(ctx, &pool, project_id, name).await?;
@@ -1186,7 +1190,7 @@ effective_free_bytes={free}"
     }
 
     // Create reply message + recipients in a single DB transaction
-    let recipient_refs: Vec<(i64, &str)> = all_recipients
+    let recipient_refs: SmallVec<[(i64, &str); 8]> = all_recipients
         .iter()
         .map(|(id, kind)| (*id, kind.as_str()))
         .collect();
@@ -1211,9 +1215,10 @@ effective_free_bytes={free}"
 
     // Write reply message bundle to git archive (best-effort)
     {
-        let mut all_recipient_names: Vec<String> = resolved_to.clone();
-        all_recipient_names.extend(resolved_cc_recipients.clone());
-        all_recipient_names.extend(resolved_bcc_recipients.clone());
+        let mut all_recipient_names: SmallVec<[String; 12]> = SmallVec::new();
+        all_recipient_names.extend(resolved_to.iter().cloned());
+        all_recipient_names.extend(resolved_cc_recipients.iter().cloned());
+        all_recipient_names.extend(resolved_bcc_recipients.iter().cloned());
 
         let msg_json = serde_json::json!({
             "id": reply_id,
@@ -1254,9 +1259,9 @@ effective_free_bytes={free}"
         created_ts: Some(micros_to_iso(reply.created_ts)),
         attachments: vec![],
         from: sender_name.clone(),
-        to: resolved_to.clone(),
-        cc: resolved_cc_recipients.clone(),
-        bcc: resolved_bcc_recipients.clone(),
+        to: resolved_to.to_vec(),
+        cc: resolved_cc_recipients.to_vec(),
+        bcc: resolved_bcc_recipients.to_vec(),
     };
 
     let response = ReplyMessageResponse {
@@ -1271,9 +1276,9 @@ effective_free_bytes={free}"
         attachments: vec![],
         body_md: reply.body_md,
         from: sender_name.clone(),
-        to: resolved_to,
-        cc: resolved_cc_recipients,
-        bcc: resolved_bcc_recipients,
+        to: resolved_to.into_vec(),
+        cc: resolved_cc_recipients.into_vec(),
+        bcc: resolved_bcc_recipients.into_vec(),
         reply_to: message_id,
         deliveries: vec![DeliveryResult {
             project: project.human_key.clone(),

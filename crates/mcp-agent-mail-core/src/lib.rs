@@ -17,6 +17,7 @@ pub mod error;
 pub mod identity;
 pub mod intern;
 pub mod lock_order;
+pub mod memory;
 pub mod metrics;
 pub mod models;
 pub mod slo;
@@ -44,6 +45,7 @@ pub use lock_order::{
     LockContentionEntry, LockLevel, OrderedMutex, OrderedRwLock, lock_contention_reset,
     lock_contention_snapshot,
 };
+pub use memory::{MemoryPressure, MemorySample};
 pub use metrics::{
     Counter, DbMetricsSnapshot, GaugeI64, GaugeU64, GlobalMetricsSnapshot, HistogramSnapshot,
     HttpMetricsSnapshot, Log2Histogram, StorageMetricsSnapshot, ToolsMetricsSnapshot,

@@ -177,21 +177,29 @@ pub fn cache_metrics() -> &'static CacheMetrics {
     &CACHE_METRICS
 }
 
-/// In-memory read cache for projects and agents.
+/// In-memory read cache for projects, agents, and inbox stats.
 pub struct ReadCache {
     projects_by_slug: OrderedRwLock<IndexMap<String, CacheEntry<ProjectRow>>>,
     projects_by_human_key: OrderedRwLock<IndexMap<String, CacheEntry<ProjectRow>>>,
     agents_by_key: OrderedRwLock<IndexMap<(i64, InternedStr), CacheEntry<AgentRow>>>,
     agents_by_id: OrderedRwLock<IndexMap<i64, CacheEntry<AgentRow>>>,
+    /// Cached inbox aggregate counters keyed by `agent_id` (30s TTL).
+    inbox_stats: OrderedRwLock<IndexMap<i64, CacheEntry<InboxStatsRow>>>,
     /// Sharded deferred touch queue (16 shards, keyed by `agent_id % 16`).
     /// Each shard maps `agent_id` → latest requested timestamp (micros).
     deferred_touch_shards: [OrderedMutex<HashMap<i64, i64>>; NUM_TOUCH_SHARDS],
     /// Last time we flushed the deferred touches.
     last_touch_flush: OrderedMutex<Instant>,
+    /// Max entries per category (configurable for testing; defaults to 16,384).
+    capacity: usize,
 }
 
 impl ReadCache {
     fn new() -> Self {
+        Self::with_capacity(MAX_ENTRIES_PER_CATEGORY)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
         Self {
             projects_by_slug: OrderedRwLock::new(
                 LockLevel::DbReadCacheProjectsBySlug,
@@ -203,6 +211,7 @@ impl ReadCache {
             ),
             agents_by_key: OrderedRwLock::new(LockLevel::DbReadCacheAgentsByKey, IndexMap::new()),
             agents_by_id: OrderedRwLock::new(LockLevel::DbReadCacheAgentsById, IndexMap::new()),
+            inbox_stats: OrderedRwLock::new(LockLevel::DbReadCacheInboxStats, IndexMap::new()),
             deferred_touch_shards: std::array::from_fn(|_| {
                 OrderedMutex::new(LockLevel::DbReadCacheDeferredTouches, HashMap::new())
             }),
@@ -210,6 +219,7 @@ impl ReadCache {
                 LockLevel::DbReadCacheLastTouchFlush,
                 Instant::now(),
             ),
+            capacity,
         }
     }
 
@@ -273,13 +283,13 @@ impl ReadCache {
         // Index by slug
         {
             let mut map = self.projects_by_slug.write();
-            lru_evict_if_full(&mut map, PROJECT_TTL);
+            lru_evict_if_full(&mut map, PROJECT_TTL, self.capacity);
             map.insert(project.slug.clone(), CacheEntry::new(project.clone()));
         }
         // Index by human_key
         {
             let mut map = self.projects_by_human_key.write();
-            lru_evict_if_full(&mut map, PROJECT_TTL);
+            lru_evict_if_full(&mut map, PROJECT_TTL, self.capacity);
             map.insert(project.human_key.clone(), CacheEntry::new(project.clone()));
         }
     }
@@ -343,7 +353,7 @@ impl ReadCache {
         // Index by (project_id, name)
         {
             let mut map = self.agents_by_key.write();
-            lru_evict_if_full_tuple(&mut map, AGENT_TTL);
+            lru_evict_if_full_tuple(&mut map, AGENT_TTL, self.capacity);
             map.insert(
                 (agent.project_id, InternedStr::new(&agent.name)),
                 CacheEntry::new(agent.clone()),
@@ -352,7 +362,7 @@ impl ReadCache {
         // Index by id (if present)
         if let Some(id) = agent.id {
             let mut map = self.agents_by_id.write();
-            lru_evict_if_full_i64(&mut map, AGENT_TTL);
+            lru_evict_if_full_i64(&mut map, AGENT_TTL, self.capacity);
             map.insert(id, CacheEntry::new(agent.clone()));
         }
     }
@@ -407,6 +417,50 @@ impl ReadCache {
                 id_map.shift_remove(&id);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Inbox stats cache
+    // -------------------------------------------------------------------------
+
+    /// Look up cached inbox stats for an agent. Returns `None` if not cached
+    /// or expired (30s TTL).
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn get_inbox_stats(&self, agent_id: i64) -> Option<InboxStatsRow> {
+        let mut map = self.inbox_stats.write();
+        let idx = map.get_index_of(&agent_id)?;
+        let (expired, value) = {
+            let (_, entry) = map.get_index(idx).unwrap();
+            (entry.is_expired(INBOX_STATS_TTL), entry.value.clone())
+        };
+        if expired {
+            map.shift_remove_index(idx);
+            return None;
+        }
+        // Touch for LRU
+        {
+            let (_, entry) = map.get_index_mut(idx).unwrap();
+            entry.touch();
+        }
+        let last = map.len() - 1;
+        map.move_index(idx, last);
+        Some(value)
+    }
+
+    /// Insert or update cached inbox stats for an agent.
+    pub fn put_inbox_stats(&self, stats: &InboxStatsRow) {
+        let mut map = self.inbox_stats.write();
+        if map.len() >= self.capacity {
+            // Evict oldest entry (front of IndexMap)
+            map.shift_remove_index(0);
+        }
+        map.insert(stats.agent_id, CacheEntry::new(stats.clone()));
+    }
+
+    /// Invalidate cached inbox stats for an agent.
+    pub fn invalidate_inbox_stats(&self, agent_id: i64) {
+        let mut map = self.inbox_stats.write();
+        map.shift_remove(&agent_id);
     }
 
     // -------------------------------------------------------------------------
@@ -465,6 +519,7 @@ impl ReadCache {
             projects_by_human_key: self.projects_by_human_key.read().len(),
             agents_by_key: self.agents_by_key.read().len(),
             agents_by_id: self.agents_by_id.read().len(),
+            inbox_stats: self.inbox_stats.read().len(),
         }
     }
 
@@ -472,6 +527,12 @@ impl ReadCache {
     #[must_use]
     pub fn new_for_testing() -> Self {
         Self::new()
+    }
+
+    /// Create a cache with a custom capacity (for stress testing).
+    #[must_use]
+    pub fn new_for_testing_with_capacity(capacity: usize) -> Self {
+        Self::with_capacity(capacity)
     }
 
     /// Clear all cache entries (for testing).
@@ -494,19 +555,24 @@ pub struct CacheEntryCounts {
     pub projects_by_human_key: usize,
     pub agents_by_key: usize,
     pub agents_by_id: usize,
+    pub inbox_stats: usize,
 }
 
 /// LRU eviction for `IndexMap<String, CacheEntry<T>>`:
 /// 1. First remove expired entries.
 /// 2. If still at capacity, evict the oldest (front) entries until below capacity.
-fn lru_evict_if_full<T>(map: &mut IndexMap<String, CacheEntry<T>>, ttl: Duration) {
-    if map.len() < MAX_ENTRIES_PER_CATEGORY {
+fn lru_evict_if_full<T>(
+    map: &mut IndexMap<String, CacheEntry<T>>,
+    ttl: Duration,
+    capacity: usize,
+) {
+    if map.len() < capacity {
         return;
     }
     // Phase 1: evict expired
     map.retain(|_, entry| !entry.is_expired(ttl));
     // Phase 2: LRU eviction from the front if still at capacity
-    while map.len() >= MAX_ENTRIES_PER_CATEGORY {
+    while map.len() >= capacity {
         map.shift_remove_index(0);
     }
 }
@@ -515,23 +581,28 @@ fn lru_evict_if_full<T>(map: &mut IndexMap<String, CacheEntry<T>>, ttl: Duration
 fn lru_evict_if_full_tuple<T>(
     map: &mut IndexMap<(i64, InternedStr), CacheEntry<T>>,
     ttl: Duration,
+    capacity: usize,
 ) {
-    if map.len() < MAX_ENTRIES_PER_CATEGORY {
+    if map.len() < capacity {
         return;
     }
     map.retain(|_, entry| !entry.is_expired(ttl));
-    while map.len() >= MAX_ENTRIES_PER_CATEGORY {
+    while map.len() >= capacity {
         map.shift_remove_index(0);
     }
 }
 
 /// LRU eviction for `IndexMap<i64, CacheEntry<T>>`.
-fn lru_evict_if_full_i64<T>(map: &mut IndexMap<i64, CacheEntry<T>>, ttl: Duration) {
-    if map.len() < MAX_ENTRIES_PER_CATEGORY {
+fn lru_evict_if_full_i64<T>(
+    map: &mut IndexMap<i64, CacheEntry<T>>,
+    ttl: Duration,
+    capacity: usize,
+) {
+    if map.len() < capacity {
         return;
     }
     map.retain(|_, entry| !entry.is_expired(ttl));
-    while map.len() >= MAX_ENTRIES_PER_CATEGORY {
+    while map.len() >= capacity {
         map.shift_remove_index(0);
     }
 }

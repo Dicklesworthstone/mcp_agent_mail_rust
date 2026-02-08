@@ -440,7 +440,7 @@ impl Default for ProjectSiblingSuggestionRow {
 
 /// Materialized aggregate counters for an agent's inbox.
 ///
-/// Maintained by SQLite triggers on `message_recipients` so that inbox
+/// Maintained by `SQLite` triggers on `message_recipients` so that inbox
 /// stats queries are O(1) instead of scanning the recipients table.
 #[derive(Model, Debug, Clone, Serialize, Deserialize)]
 #[sqlmodel(table = "inbox_stats")]

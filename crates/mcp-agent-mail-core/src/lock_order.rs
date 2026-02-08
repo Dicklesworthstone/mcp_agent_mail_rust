@@ -59,6 +59,7 @@ pub enum LockLevel {
     DbReadCacheProjectsByHumanKey,
     DbReadCacheAgentsByKey,
     DbReadCacheAgentsById,
+    DbReadCacheInboxStats,
     DbReadCacheDeferredTouches,
     DbReadCacheLastTouchFlush,
     DbQueryTrackerInner,
@@ -87,7 +88,7 @@ pub enum LockLevel {
 
 impl LockLevel {
     /// Number of distinct lock levels.
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 19;
 
     /// All lock levels in rank order (for iteration/snapshots).
     pub const ALL: [Self; Self::COUNT] = [
@@ -97,6 +98,7 @@ impl LockLevel {
         Self::DbReadCacheProjectsByHumanKey,
         Self::DbReadCacheAgentsByKey,
         Self::DbReadCacheAgentsById,
+        Self::DbReadCacheInboxStats,
         Self::DbReadCacheDeferredTouches,
         Self::DbReadCacheLastTouchFlush,
         Self::DbQueryTrackerInner,
@@ -121,18 +123,19 @@ impl LockLevel {
             Self::DbReadCacheProjectsByHumanKey => 3,
             Self::DbReadCacheAgentsByKey => 4,
             Self::DbReadCacheAgentsById => 5,
-            Self::DbReadCacheDeferredTouches => 6,
-            Self::DbReadCacheLastTouchFlush => 7,
-            Self::DbQueryTrackerInner => 8,
-            Self::StorageArchiveLockMap => 9,
-            Self::StorageRepoCache => 10,
-            Self::StorageSignalDebounce => 11,
-            Self::StorageWbqDrainHandle => 12,
-            Self::StorageWbqStats => 13,
-            Self::StorageCommitQueue => 14,
-            Self::ToolsBridgedEnv => 15,
-            Self::ToolsToolMetrics => 16,
-            Self::ServerLiveDashboard => 17,
+            Self::DbReadCacheInboxStats => 6,
+            Self::DbReadCacheDeferredTouches => 7,
+            Self::DbReadCacheLastTouchFlush => 8,
+            Self::DbQueryTrackerInner => 9,
+            Self::StorageArchiveLockMap => 10,
+            Self::StorageRepoCache => 11,
+            Self::StorageSignalDebounce => 12,
+            Self::StorageWbqDrainHandle => 13,
+            Self::StorageWbqStats => 14,
+            Self::StorageCommitQueue => 15,
+            Self::ToolsBridgedEnv => 16,
+            Self::ToolsToolMetrics => 17,
+            Self::ServerLiveDashboard => 18,
         }
     }
 
@@ -146,18 +149,19 @@ impl LockLevel {
             3 => Some(Self::DbReadCacheProjectsByHumanKey),
             4 => Some(Self::DbReadCacheAgentsByKey),
             5 => Some(Self::DbReadCacheAgentsById),
-            6 => Some(Self::DbReadCacheDeferredTouches),
-            7 => Some(Self::DbReadCacheLastTouchFlush),
-            8 => Some(Self::DbQueryTrackerInner),
-            9 => Some(Self::StorageArchiveLockMap),
-            10 => Some(Self::StorageRepoCache),
-            11 => Some(Self::StorageSignalDebounce),
-            12 => Some(Self::StorageWbqDrainHandle),
-            13 => Some(Self::StorageWbqStats),
-            14 => Some(Self::StorageCommitQueue),
-            15 => Some(Self::ToolsBridgedEnv),
-            16 => Some(Self::ToolsToolMetrics),
-            17 => Some(Self::ServerLiveDashboard),
+            6 => Some(Self::DbReadCacheInboxStats),
+            7 => Some(Self::DbReadCacheDeferredTouches),
+            8 => Some(Self::DbReadCacheLastTouchFlush),
+            9 => Some(Self::DbQueryTrackerInner),
+            10 => Some(Self::StorageArchiveLockMap),
+            11 => Some(Self::StorageRepoCache),
+            12 => Some(Self::StorageSignalDebounce),
+            13 => Some(Self::StorageWbqDrainHandle),
+            14 => Some(Self::StorageWbqStats),
+            15 => Some(Self::StorageCommitQueue),
+            16 => Some(Self::ToolsBridgedEnv),
+            17 => Some(Self::ToolsToolMetrics),
+            18 => Some(Self::ServerLiveDashboard),
             _ => None,
         }
     }
@@ -173,8 +177,9 @@ impl LockLevel {
             Self::DbReadCacheProjectsByHumanKey => 21,
             Self::DbReadCacheAgentsByKey => 22,
             Self::DbReadCacheAgentsById => 23,
-            Self::DbReadCacheDeferredTouches => 24,
-            Self::DbReadCacheLastTouchFlush => 25,
+            Self::DbReadCacheInboxStats => 24,
+            Self::DbReadCacheDeferredTouches => 25,
+            Self::DbReadCacheLastTouchFlush => 26,
             Self::DbQueryTrackerInner => 30,
 
             // Storage

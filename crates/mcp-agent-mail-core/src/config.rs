@@ -69,6 +69,11 @@ pub struct Config {
     pub disk_space_fatal_mb: u64,
     pub disk_space_check_interval_seconds: u64,
 
+    // Memory pressure monitoring (RSS-based)
+    pub memory_warning_mb: u64,
+    pub memory_critical_mb: u64,
+    pub memory_fatal_mb: u64,
+
     // HTTP
     pub http_host: String,
     pub http_port: u16,
@@ -363,6 +368,11 @@ impl Default for Config {
             disk_space_critical_mb: 100,
             disk_space_fatal_mb: 10,
             disk_space_check_interval_seconds: 60,
+
+            // Memory pressure monitoring
+            memory_warning_mb: 2048,  // 2 GB
+            memory_critical_mb: 4096, // 4 GB
+            memory_fatal_mb: 8192,    // 8 GB
 
             // HTTP
             http_host: "127.0.0.1".to_string(),
@@ -659,6 +669,11 @@ impl Config {
             "DISK_SPACE_CHECK_INTERVAL_SECONDS",
             config.disk_space_check_interval_seconds,
         );
+
+        // Memory pressure monitoring
+        config.memory_warning_mb = env_u64("MEMORY_WARNING_MB", config.memory_warning_mb);
+        config.memory_critical_mb = env_u64("MEMORY_CRITICAL_MB", config.memory_critical_mb);
+        config.memory_fatal_mb = env_u64("MEMORY_FATAL_MB", config.memory_fatal_mb);
 
         // HTTP
         if let Some(v) = env_value("HTTP_HOST") {
