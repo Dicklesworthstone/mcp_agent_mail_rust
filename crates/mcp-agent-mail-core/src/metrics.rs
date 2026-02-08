@@ -469,6 +469,25 @@ pub struct StorageMetrics {
 
     /// Count of DB rows missing corresponding archive files (set at startup).
     pub needs_reindex_total: Counter,
+
+    // -- Git/archive IO metrics --
+
+    /// Time spent waiting to acquire the project advisory lock (`.archive.lock`).
+    pub archive_lock_wait_us: Log2Histogram,
+    /// Time spent waiting for the commit/index lock in `commit_paths_with_retry`.
+    pub commit_lock_wait_us: Log2Histogram,
+    /// Time spent performing `commit_paths` (git index update + commit).
+    pub git_commit_latency_us: Log2Histogram,
+    /// Number of git index.lock retries across all `commit_paths_with_retry` calls.
+    pub git_index_lock_retries_total: Counter,
+    /// Number of git index.lock exhaustion failures (all retries failed).
+    pub git_index_lock_failures_total: Counter,
+    /// Total `commit_paths_with_retry` invocations.
+    pub commit_attempts_total: Counter,
+    /// Total `commit_paths_with_retry` failures (any error, not just index.lock).
+    pub commit_failures_total: Counter,
+    /// Number of `rel_paths` in the most recent commit call.
+    pub commit_batch_size_last: GaugeU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -494,6 +513,15 @@ pub struct StorageMetricsSnapshot {
     pub commit_queue_latency_us: HistogramSnapshot,
 
     pub needs_reindex_total: u64,
+
+    pub archive_lock_wait_us: HistogramSnapshot,
+    pub commit_lock_wait_us: HistogramSnapshot,
+    pub git_commit_latency_us: HistogramSnapshot,
+    pub git_index_lock_retries_total: u64,
+    pub git_index_lock_failures_total: u64,
+    pub commit_attempts_total: u64,
+    pub commit_failures_total: u64,
+    pub commit_batch_size_last: u64,
 }
 
 #[derive(Debug)]
@@ -504,6 +532,12 @@ pub struct SystemMetrics {
     pub disk_pressure_level: GaugeU64,
     pub disk_last_sample_us: GaugeU64,
     pub disk_sample_errors_total: Counter,
+
+    // Memory pressure (RSS-based)
+    pub memory_rss_bytes: GaugeU64,
+    pub memory_pressure_level: GaugeU64,
+    pub memory_last_sample_us: GaugeU64,
+    pub memory_sample_errors_total: Counter,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -514,6 +548,11 @@ pub struct SystemMetricsSnapshot {
     pub disk_pressure_level: u64,
     pub disk_last_sample_us: u64,
     pub disk_sample_errors_total: u64,
+
+    pub memory_rss_bytes: u64,
+    pub memory_pressure_level: u64,
+    pub memory_last_sample_us: u64,
+    pub memory_sample_errors_total: u64,
 }
 
 impl Default for SystemMetrics {
@@ -525,6 +564,11 @@ impl Default for SystemMetrics {
             disk_pressure_level: GaugeU64::new(),
             disk_last_sample_us: GaugeU64::new(),
             disk_sample_errors_total: Counter::new(),
+
+            memory_rss_bytes: GaugeU64::new(),
+            memory_pressure_level: GaugeU64::new(),
+            memory_last_sample_us: GaugeU64::new(),
+            memory_sample_errors_total: Counter::new(),
         }
     }
 }
@@ -539,6 +583,11 @@ impl SystemMetrics {
             disk_pressure_level: self.disk_pressure_level.load(),
             disk_last_sample_us: self.disk_last_sample_us.load(),
             disk_sample_errors_total: self.disk_sample_errors_total.load(),
+
+            memory_rss_bytes: self.memory_rss_bytes.load(),
+            memory_pressure_level: self.memory_pressure_level.load(),
+            memory_last_sample_us: self.memory_last_sample_us.load(),
+            memory_sample_errors_total: self.memory_sample_errors_total.load(),
         }
     }
 }
@@ -567,6 +616,15 @@ impl Default for StorageMetrics {
             commit_queue_latency_us: Log2Histogram::new(),
 
             needs_reindex_total: Counter::new(),
+
+            archive_lock_wait_us: Log2Histogram::new(),
+            commit_lock_wait_us: Log2Histogram::new(),
+            git_commit_latency_us: Log2Histogram::new(),
+            git_index_lock_retries_total: Counter::new(),
+            git_index_lock_failures_total: Counter::new(),
+            commit_attempts_total: Counter::new(),
+            commit_failures_total: Counter::new(),
+            commit_batch_size_last: GaugeU64::new(),
         }
     }
 }
@@ -596,6 +654,15 @@ impl StorageMetrics {
             commit_queue_latency_us: self.commit_queue_latency_us.snapshot(),
 
             needs_reindex_total: self.needs_reindex_total.load(),
+
+            archive_lock_wait_us: self.archive_lock_wait_us.snapshot(),
+            commit_lock_wait_us: self.commit_lock_wait_us.snapshot(),
+            git_commit_latency_us: self.git_commit_latency_us.snapshot(),
+            git_index_lock_retries_total: self.git_index_lock_retries_total.load(),
+            git_index_lock_failures_total: self.git_index_lock_failures_total.load(),
+            commit_attempts_total: self.commit_attempts_total.load(),
+            commit_failures_total: self.commit_failures_total.load(),
+            commit_batch_size_last: self.commit_batch_size_last.load(),
         }
     }
 }
@@ -672,5 +739,42 @@ mod tests {
         assert!(snap.p50 <= snap.p95);
         assert!(snap.p95 <= snap.p99);
         assert!(snap.max >= snap.p99);
+    }
+
+    #[test]
+    fn storage_io_metrics_snapshot_includes_new_fields() {
+        let m = StorageMetrics::default();
+
+        // Simulate some IO activity.
+        m.archive_lock_wait_us.record(150);
+        m.commit_lock_wait_us.record(80);
+        m.git_commit_latency_us.record(5_000);
+        m.git_index_lock_retries_total.add(3);
+        m.git_index_lock_failures_total.inc();
+        m.commit_attempts_total.add(10);
+        m.commit_failures_total.inc();
+        m.commit_batch_size_last.set(7);
+
+        let snap = m.snapshot();
+
+        assert_eq!(snap.archive_lock_wait_us.count, 1);
+        assert_eq!(snap.commit_lock_wait_us.count, 1);
+        assert_eq!(snap.git_commit_latency_us.count, 1);
+        assert_eq!(snap.git_index_lock_retries_total, 3);
+        assert_eq!(snap.git_index_lock_failures_total, 1);
+        assert_eq!(snap.commit_attempts_total, 10);
+        assert_eq!(snap.commit_failures_total, 1);
+        assert_eq!(snap.commit_batch_size_last, 7);
+
+        // Verify JSON serialization includes the new keys.
+        let json = serde_json::to_value(&snap).expect("snapshot should be serializable");
+        assert!(json.get("archive_lock_wait_us").is_some());
+        assert!(json.get("commit_lock_wait_us").is_some());
+        assert!(json.get("git_commit_latency_us").is_some());
+        assert!(json.get("git_index_lock_retries_total").is_some());
+        assert!(json.get("git_index_lock_failures_total").is_some());
+        assert!(json.get("commit_attempts_total").is_some());
+        assert!(json.get("commit_failures_total").is_some());
+        assert!(json.get("commit_batch_size_last").is_some());
     }
 }

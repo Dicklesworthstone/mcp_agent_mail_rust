@@ -875,7 +875,12 @@ where
     let _guard = process_lock.lock().expect("archive process lock poisoned");
 
     let mut lock = FileLock::new(archive.lock_path.clone());
+    let lock_start = std::time::Instant::now();
     lock.acquire()?;
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .archive_lock_wait_us
+        .record(lock_start.elapsed().as_micros() as u64);
     let result = f();
     lock.release()?;
     result
@@ -1947,21 +1952,46 @@ fn coalescer_commit_with_retry(
     rel_paths: &[String],
 ) -> Result<()> {
     const MAX_RETRIES: usize = 7;
+    let sm = &mcp_agent_mail_core::global_metrics().storage;
+    sm.commit_attempts_total.inc();
+    sm.commit_batch_size_last.set(rel_paths.len() as u64);
+    let mut index_lock_retries: u64 = 0;
 
     for attempt in 0..=MAX_RETRIES {
         let repo = Repository::open(repo_root)?;
         let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
 
+        let commit_start = std::time::Instant::now();
         match commit_paths(&repo, config, message, &refs) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                sm.git_commit_latency_us
+                    .record(commit_start.elapsed().as_micros() as u64);
+                if index_lock_retries > 0 {
+                    sm.git_index_lock_retries_total.add(index_lock_retries);
+                }
+                return Ok(());
+            }
             Err(StorageError::Git(ref git_err)) if is_git_index_lock_error(git_err) => {
+                index_lock_retries += 1;
                 if attempt >= MAX_RETRIES {
                     // Last-resort stale lock cleanup
                     if try_clean_stale_git_lock(repo_root, 30.0) {
                         let repo2 = Repository::open(repo_root)?;
                         let refs2: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
-                        return commit_paths(&repo2, config, message, &refs2);
+                        let start2 = std::time::Instant::now();
+                        let result = commit_paths(&repo2, config, message, &refs2);
+                        sm.git_commit_latency_us
+                            .record(start2.elapsed().as_micros() as u64);
+                        sm.git_index_lock_retries_total.add(index_lock_retries);
+                        if result.is_err() {
+                            sm.commit_failures_total.inc();
+                            sm.git_index_lock_failures_total.inc();
+                        }
+                        return result;
                     }
+                    sm.commit_failures_total.inc();
+                    sm.git_index_lock_failures_total.inc();
+                    sm.git_index_lock_retries_total.add(index_lock_retries);
                     return Err(StorageError::GitIndexLock {
                         message: format!("index.lock contention after {MAX_RETRIES} retries"),
                         lock_path: repo_root.join(".git").join("index.lock"),
@@ -1983,7 +2013,13 @@ fn coalescer_commit_with_retry(
                     let _ = try_clean_stale_git_lock(repo_root, 60.0);
                 }
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                sm.commit_failures_total.inc();
+                if index_lock_retries > 0 {
+                    sm.git_index_lock_retries_total.add(index_lock_retries);
+                }
+                return Err(other);
+            }
         }
     }
 
@@ -1992,18 +2028,42 @@ fn coalescer_commit_with_retry(
 
 fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &str) -> Result<()> {
     const MAX_RETRIES: usize = 7;
+    let sm = &mcp_agent_mail_core::global_metrics().storage;
+    sm.commit_attempts_total.inc();
+    let mut index_lock_retries: u64 = 0;
 
     for attempt in 0..=MAX_RETRIES {
         let repo = Repository::open(repo_root)?;
 
+        let commit_start = std::time::Instant::now();
         match commit_all(&repo, config, message) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                sm.git_commit_latency_us
+                    .record(commit_start.elapsed().as_micros() as u64);
+                if index_lock_retries > 0 {
+                    sm.git_index_lock_retries_total.add(index_lock_retries);
+                }
+                return Ok(());
+            }
             Err(StorageError::Git(ref git_err)) if is_git_index_lock_error(git_err) => {
+                index_lock_retries += 1;
                 if attempt >= MAX_RETRIES {
                     if try_clean_stale_git_lock(repo_root, 30.0) {
                         let repo2 = Repository::open(repo_root)?;
-                        return commit_all(&repo2, config, message);
+                        let start2 = std::time::Instant::now();
+                        let result = commit_all(&repo2, config, message);
+                        sm.git_commit_latency_us
+                            .record(start2.elapsed().as_micros() as u64);
+                        sm.git_index_lock_retries_total.add(index_lock_retries);
+                        if result.is_err() {
+                            sm.commit_failures_total.inc();
+                            sm.git_index_lock_failures_total.inc();
+                        }
+                        return result;
                     }
+                    sm.commit_failures_total.inc();
+                    sm.git_index_lock_failures_total.inc();
+                    sm.git_index_lock_retries_total.add(index_lock_retries);
                     return Err(StorageError::GitIndexLock {
                         message: format!("index.lock contention after {MAX_RETRIES} retries"),
                         lock_path: repo_root.join(".git").join("index.lock"),
@@ -2023,7 +2083,13 @@ fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &
                     let _ = try_clean_stale_git_lock(repo_root, 60.0);
                 }
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                sm.commit_failures_total.inc();
+                if index_lock_retries > 0 {
+                    sm.git_index_lock_retries_total.add(index_lock_retries);
+                }
+                return Err(other);
+            }
         }
     }
 
@@ -2153,22 +2219,37 @@ pub fn commit_paths_with_retry(
         fs::create_dir_all(parent)?;
     }
 
+    let sm = &mcp_agent_mail_core::global_metrics().storage;
+    sm.commit_attempts_total.inc();
+    sm.commit_batch_size_last.set(rel_paths.len() as u64);
+
     // Use project-scoped commit lock
     let mut lock = FileLock::new(lock_path);
+    let lock_start = std::time::Instant::now();
     lock.acquire()?;
+    sm.commit_lock_wait_us
+        .record(lock_start.elapsed().as_micros() as u64);
 
     let mut last_err_msg: Option<String> = None;
     let mut did_last_resort_clean = false;
+    let mut index_lock_retries: u64 = 0;
 
     for attempt in 0..MAX_INDEX_LOCK_RETRIES + 2 {
         let repo = Repository::open(repo_root)?;
+        let commit_start = std::time::Instant::now();
         match commit_paths(&repo, config, message, rel_paths) {
             Ok(()) => {
+                sm.git_commit_latency_us
+                    .record(commit_start.elapsed().as_micros() as u64);
+                if index_lock_retries > 0 {
+                    sm.git_index_lock_retries_total.add(index_lock_retries);
+                }
                 lock.release()?;
                 return Ok(());
             }
             Err(StorageError::Git(ref git_err)) if is_git_index_lock_error(git_err) => {
                 last_err_msg = Some(git_err.message().to_string());
+                index_lock_retries += 1;
 
                 if attempt >= MAX_INDEX_LOCK_RETRIES {
                     if !did_last_resort_clean && try_clean_stale_git_lock(repo_root, 60.0) {
@@ -2186,12 +2267,20 @@ pub fn commit_paths_with_retry(
                 let _ = try_clean_stale_git_lock(repo_root, 300.0);
             }
             Err(other) => {
+                sm.commit_failures_total.inc();
+                if index_lock_retries > 0 {
+                    sm.git_index_lock_retries_total.add(index_lock_retries);
+                }
                 lock.release()?;
                 return Err(other);
             }
         }
     }
 
+    // All retries exhausted — record failure metrics.
+    sm.commit_failures_total.inc();
+    sm.git_index_lock_failures_total.inc();
+    sm.git_index_lock_retries_total.add(index_lock_retries);
     lock.release()?;
 
     let git_lock_path = repo_root.join(".git").join("index.lock");
@@ -2972,6 +3061,13 @@ fn update_thread_digest(
 
     // Append to digest. Use create_new to atomically determine if this is
     // the first entry (eliminates TOCTOU race between exists() + create).
+    //
+    // CORRECTNESS: Build the full payload in memory and write it with a
+    // single `write_all()` call. On most filesystems, writes under the
+    // `PIPE_BUF` limit (~4 KB on Linux) to an O_APPEND fd are atomic with
+    // respect to other appenders. Even for larger payloads, combining
+    // header + entry into one write avoids interleaving from concurrent
+    // writers between the two calls.
     let (mut file, is_new) = match fs::OpenOptions::new()
         .append(true)
         .create_new(true)
@@ -2985,10 +3081,13 @@ fn update_thread_digest(
         Err(e) => return Err(e.into()),
     };
 
-    if is_new {
-        file.write_all(format!("# Thread {thread_id}\n\n").as_bytes())?;
-    }
-    file.write_all(entry.as_bytes())?;
+    // Single write: header (if new) + entry — no interleaving possible.
+    let payload = if is_new {
+        format!("# Thread {thread_id}\n\n{entry}")
+    } else {
+        entry
+    };
+    file.write_all(payload.as_bytes())?;
 
     rel_path(&archive.repo_root, &digest_path)
 }
@@ -5906,5 +6005,41 @@ mod tests {
         assert_eq!(parse_year_month("abc"), None);
         assert_eq!(parse_year_month(""), None);
         assert_eq!(parse_year_month("20"), None);
+    }
+
+    #[test]
+    fn io_metrics_nonzero_after_archive_write() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "io-metrics-test").unwrap();
+
+        let agent = serde_json::json!({
+            "name": "TestAgent",
+            "program": "test",
+            "model": "test-model",
+        });
+
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+        flush_async_commits();
+
+        let snap = mcp_agent_mail_core::global_metrics().storage.snapshot();
+
+        // The coalescer path should have recorded at least one commit attempt.
+        assert!(
+            snap.commit_attempts_total >= 1,
+            "expected commit_attempts_total >= 1, got {}",
+            snap.commit_attempts_total
+        );
+        assert!(
+            snap.git_commit_latency_us.count >= 1,
+            "expected git_commit_latency_us count >= 1, got {}",
+            snap.git_commit_latency_us.count
+        );
+
+        // Verify the snapshot serializes to JSON with the IO metric keys.
+        let json = serde_json::to_value(&snap).expect("snapshot should be JSON-serializable");
+        assert!(json.get("archive_lock_wait_us").is_some());
+        assert!(json.get("git_commit_latency_us").is_some());
+        assert!(json.get("commit_attempts_total").is_some());
     }
 }

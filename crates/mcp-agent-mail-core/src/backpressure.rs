@@ -599,6 +599,20 @@ mod tests {
                     p99: 0,
                 },
                 needs_reindex_total: 0,
+                archive_lock_wait_us: HistogramSnapshot {
+                    count: 0, sum: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0,
+                },
+                commit_lock_wait_us: HistogramSnapshot {
+                    count: 0, sum: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0,
+                },
+                git_commit_latency_us: HistogramSnapshot {
+                    count: 0, sum: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0,
+                },
+                git_index_lock_retries_total: 0,
+                git_index_lock_failures_total: 0,
+                commit_attempts_total: 0,
+                commit_failures_total: 0,
+                commit_batch_size_last: 0,
             },
             system: SystemMetricsSnapshot {
                 disk_storage_free_bytes: 0,
@@ -607,6 +621,10 @@ mod tests {
                 disk_pressure_level: 0,
                 disk_last_sample_us: 0,
                 disk_sample_errors_total: 0,
+                memory_rss_bytes: 0,
+                memory_pressure_level: 0,
+                memory_last_sample_us: 0,
+                memory_sample_errors_total: 0,
             },
         };
 
