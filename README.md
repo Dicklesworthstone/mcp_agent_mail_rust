@@ -1,175 +1,132 @@
-# MCP Agent Mail (Rust Port)
+# MCP Agent Mail (Rust)
 
-This repository is a Rust port of the legacy Python `mcp_agent_mail` project. It provides a
-mail‑like coordination layer for coding agents via an MCP server, with Git‑backed artifacts and
-SQLite indexing.
+Mail-like coordination layer for coding agents. Provides an MCP server with
+23 tools and 20+ resources, Git-backed archive, SQLite indexing, and an
+interactive TUI operations console.
 
 ## Quick Start
 
-### Easiest Local Run (`am`)
 ```bash
-cd /data/projects/mcp_agent_mail_rust
-alias am='/data/projects/mcp_agent_mail_rust/scripts/am'
-am
+scripts/am
 ```
 
-What `am` / `am serve` does by default:
-- uses MCP base path `/mcp/` (override with `--path api` or `--api`)
-- sets `LOG_RICH_ENABLED=true`
-- auto-loads `HTTP_BEARER_TOKEN` from `~/mcp_agent_mail/.env` if not already set
+That's it. The `am` command starts the HTTP server on `127.0.0.1:8765` with
+the interactive TUI. It auto-discovers your auth token from
+`~/.mcp_agent_mail/.env` and defaults to the `/mcp/` transport path.
 
-### Run MCP Server (stdio)
+Common variations:
+
 ```bash
-cargo run -p mcp-agent-mail
+scripts/am --api              # Use /api/ transport instead of /mcp/
+scripts/am --port 9000        # Different port
+scripts/am --host 0.0.0.0     # Bind to all interfaces
+scripts/am --no-tui           # Headless server (no interactive TUI)
+scripts/am --no-auth          # Skip authentication (local dev)
 ```
 
-### Run MCP Server (HTTP)
+### Alternative: Direct Binary
+
 ```bash
+# HTTP server (same as am, but no convenience defaults)
 cargo run -p mcp-agent-mail -- serve --host 127.0.0.1 --port 8765
-```
 
-Notes:
-- The server accepts both `/mcp/` and `/api/` as MCP HTTP base-path aliases for local/dev compatibility.
-- `mcp-agent-mail serve` now supports explicit `--transport mcp|api|auto` and `--path`.
-- `scripts/am` options: `--path mcp|api`, `--mcp`, `--api`, `--host`, `--port`, `--env-file`, `--no-auth`.
+# stdio transport (for MCP client integration)
+cargo run -p mcp-agent-mail
 
-### Run CLI
-```bash
+# CLI tool
 cargo run -p mcp-agent-mail-cli -- --help
 ```
 
+## TUI Controls
+
+The interactive TUI has 7 screens navigable with `1`-`7` or `Tab`:
+
+| # | Screen       | Shows                                              |
+|---|--------------|-----------------------------------------------------|
+| 1 | Dashboard    | Real-time event stream with sparkline               |
+| 2 | Messages     | Message browser with search and filtering            |
+| 3 | Threads      | Thread view with correlation                         |
+| 4 | Agents       | Registered agents with activity indicators           |
+| 5 | Reservations | File reservations with TTL countdowns                |
+| 6 | ToolMetrics  | Per-tool latency and call counts                     |
+| 7 | SystemHealth | Connection probes, disk/memory, circuit breakers     |
+
+Key bindings: `?` help, `Ctrl+P` command palette, `m` toggle MCP/API,
+`Shift+T` cycle theme, `q` quit.
+
+## Configuration
+
+All configuration is via environment variables. The server reads them at
+startup via `Config::from_env()`. Key variables:
+
+| Variable            | Default            | Description               |
+|---------------------|--------------------|---------------------------|
+| `HTTP_HOST`         | `127.0.0.1`        | Bind address              |
+| `HTTP_PORT`         | `8765`             | Bind port                 |
+| `HTTP_PATH`         | `/mcp/`            | MCP base path             |
+| `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token                |
+| `DATABASE_URL`      | `sqlite:///:memory:`| SQLite connection URL    |
+| `STORAGE_ROOT`      | `~/.mcp_agent_mail`| Archive root directory    |
+| `LOG_LEVEL`         | `info`             | Minimum log level         |
+| `TUI_HIGH_CONTRAST` | `false`            | Accessibility mode        |
+
+For the full list of 100+ env vars, see
+`crates/mcp-agent-mail-core/src/config.rs`.
+
+For operations guidance, troubleshooting, and diagnostics, see
+[docs/OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md).
+
 ## Architecture
 
-This is a Cargo workspace with small crates and a strict dependency layering. The goal is to keep hot-path performance work isolated (DB + storage) and keep the MCP/tool surface thin and testable.
-
-### Crate Map
-
-| Crate | Kind | Purpose |
-|------|------|---------|
-| `mcp-agent-mail` | bin | Server entrypoint and CLI glue (`serve`, stdio transport, etc.). |
-| `mcp-agent-mail-server` | lib | HTTP/MCP server runtime + web UI + TUI surfaces. |
-| `mcp-agent-mail-tools` | lib | MCP tool implementations (register agent, send messages, reservations, search, etc.). |
-| `mcp-agent-mail-storage` | lib | Git-backed artifact archive writing (commit coalescing, archive locks, spill/backpressure policies). |
-| `mcp-agent-mail-db` | lib | SQLite schema + queries + pool/retry/caching. |
-| `mcp-agent-mail-core` | lib | Shared config, models, errors, metrics, lock-order rules. Keep this “bottom of the stack”. |
-| `mcp-agent-mail-cli` | bin (`am`) | Operator CLI/launcher helpers and local tooling. |
-| `mcp-agent-mail-guard` | lib | Pre-commit guard and file-reservation enforcement helpers. |
-| `mcp-agent-mail-share` | lib | Snapshot/bundle/export helpers (shareable artifacts). |
-| `mcp-agent-mail-conformance` | test harness | Fixture-based parity tests against legacy Python behavior. |
-
-### Dependency Layering
+Cargo workspace with strict dependency layering:
 
 ```text
-mcp-agent-mail-core
-  ├─ mcp-agent-mail-db
-  ├─ mcp-agent-mail-storage
-  ├─ mcp-agent-mail-guard
-  ├─ mcp-agent-mail-share
-  └─ mcp-agent-mail-tools (core + db + storage + guard)
-       └─ mcp-agent-mail-server (core + db + storage + tools + fastmcp + ftui)
-            ├─ mcp-agent-mail (bin)
-            ├─ mcp-agent-mail-cli (bin: am)
-            └─ mcp-agent-mail-conformance (tests)
+mcp-agent-mail-core          (config, models, errors, metrics)
+  ├─ mcp-agent-mail-db       (SQLite schema, queries, pool)
+  ├─ mcp-agent-mail-storage  (Git archive, commit coalescer)
+  ├─ mcp-agent-mail-guard    (pre-commit guard, reservation enforcement)
+  ├─ mcp-agent-mail-share    (snapshot, bundle, export)
+  └─ mcp-agent-mail-tools    (23 MCP tool implementations)
+       └─ mcp-agent-mail-server  (HTTP/MCP runtime, TUI, web UI)
+            ├─ mcp-agent-mail        (server binary)
+            ├─ mcp-agent-mail-cli    (operator CLI)
+            └─ mcp-agent-mail-conformance  (parity tests)
 ```
 
-### Server Module Map (Where Things Live)
+### File Reservations for Multi-Agent Editing
 
-| Area | Files/globs | Notes |
-|------|-------------|------|
-| Server runtime + HTTP/MCP routing | `crates/mcp-agent-mail-server/src/lib.rs` | Owns transports, auth, base-path aliases, and router wiring. |
-| Web UI (mail + static assets) | `crates/mcp-agent-mail-server/src/mail_ui.rs`, `crates/mcp-agent-mail-server/src/static_files.rs`, `crates/mcp-agent-mail-server/src/templates.rs` | Operator-facing web surfaces. |
-| Console/rich logging | `crates/mcp-agent-mail-server/src/console.rs`, `crates/mcp-agent-mail-server/src/tool_metrics.rs`, `crates/mcp-agent-mail-server/src/theme.rs` | High-signal operator output and metrics panels. |
-| TUI event backbone + shared state | `crates/mcp-agent-mail-server/src/tui_events.rs`, `crates/mcp-agent-mail-server/src/tui_bridge.rs` | Typed `MailEvent` model + bounded ring buffer + shared counters/state. |
-| TUI data ingestion | `crates/mcp-agent-mail-server/src/tui_poller.rs` | Background DB polling that feeds the shared state (stats + agent list). |
-| Full-screen TUI | `crates/mcp-agent-mail-server/src/tui_app.rs`, `crates/mcp-agent-mail-server/src/tui_chrome.rs`, `crates/mcp-agent-mail-server/src/tui_screens/**` | Interactive AgentMailTUI (“ops cockpit”). |
-| Housekeeping | `crates/mcp-agent-mail-server/src/startup_checks.rs`, `crates/mcp-agent-mail-server/src/cleanup.rs`, `crates/mcp-agent-mail-server/src/retention.rs`, `crates/mcp-agent-mail-server/src/ack_ttl.rs` | Startup validation and background maintenance. |
+Before editing, agents should reserve file paths to avoid conflicts:
 
-Console/TUI layout persistence and the `CONSOLE_*` configuration contract live in `crates/mcp-agent-mail-core/src/config.rs` (real env + a persisted envfile at `CONSOLE_PERSIST_PATH`).
+| Area               | Reserve glob                                 |
+|--------------------|----------------------------------------------|
+| Core types/config  | `crates/mcp-agent-mail-core/src/**`          |
+| SQLite layer       | `crates/mcp-agent-mail-db/src/**`            |
+| Git archive        | `crates/mcp-agent-mail-storage/src/**`       |
+| Tool implementations | `crates/mcp-agent-mail-tools/src/**`       |
+| TUI                | `crates/mcp-agent-mail-server/src/tui_*.rs`  |
+| CLI/launcher       | `crates/mcp-agent-mail-cli/src/**`, `scripts/am` |
 
-### Ownership Map (File Reservations)
+## Development
 
-Before editing, reserve the smallest surface that matches your work. Suggested reservation globs:
-
-| Area | Reserve paths/globs |
-|------|----------------------|
-| Core types/config | `crates/mcp-agent-mail-core/src/**` |
-| SQLite schema/queries/pool | `crates/mcp-agent-mail-db/src/**` |
-| Git archive + commit coalescing | `crates/mcp-agent-mail-storage/src/**` |
-| MCP tool implementations | `crates/mcp-agent-mail-tools/src/**` |
-| Server router + web UI | `crates/mcp-agent-mail-server/src/lib.rs`, `crates/mcp-agent-mail-server/src/static_files.rs`, `crates/mcp-agent-mail-server/src/templates.rs`, `crates/mcp-agent-mail-server/src/mail_ui.rs` |
-| TUI | `crates/mcp-agent-mail-server/src/tui_*.rs`, `crates/mcp-agent-mail-server/src/tui_screens/**` |
-| CLI/launcher | `crates/mcp-agent-mail-cli/src/**`, `scripts/am` |
-| Pre-commit guard | `crates/mcp-agent-mail-guard/src/**` |
-| Share/export | `crates/mcp-agent-mail-share/src/**` |
-| Conformance fixtures/harness | `crates/mcp-agent-mail-conformance/src/**`, `crates/mcp-agent-mail-conformance/tests/conformance/**` |
-
-## Configuration (Env Vars)
-
-Config is loaded from environment variables (and `.env` in the working directory). See
-`crates/mcp-agent-mail-core/src/config.rs` for the full set.
-
-Console/logging related:
-
-- `LOG_RICH_ENABLED` (default: `true`): enable rich/ftui console output.
-- `LOG_TOOL_CALLS_ENABLED` (default: `true`): enable tool call start/end panel logging.
-- `LOG_TOOL_CALLS_RESULT_MAX_CHARS` (default: `2000`): max characters of tool result JSON rendered in panels.
-
-Console layout + persistence (rich TTY only; interactive tuning is HTTP mode only):
-
-- `CONSOLE_PERSIST_PATH` (default: `~/.config/mcp-agent-mail/config.env`): user-local envfile where console prefs are read/written. Read from real env only; `CONSOLE_*` keys do not fall back to repo `.env`.
-- `CONSOLE_AUTO_SAVE` (default: `true`): automatically persist console prefs on interactive changes.
-- `CONSOLE_INTERACTIVE` (default: `true`): enable interactive console layout tuning (HTTP + TTY only).
-- `CONSOLE_UI_HEIGHT_PERCENT` (default: `33`, clamp `10..80`): inline HUD height percent.
-- `CONSOLE_UI_ANCHOR` (default: `bottom`): `bottom|top`.
-- `CONSOLE_UI_AUTO_SIZE` (default: `false`): use inline auto-sizing mode.
-- `CONSOLE_INLINE_AUTO_MIN_ROWS` (default: `8`, clamp `>=4`).
-- `CONSOLE_INLINE_AUTO_MAX_ROWS` (default: `18`, clamp `>=min`).
-- `CONSOLE_SPLIT_MODE` (default: `inline`): `inline|left` (left requires AltScreen work; see `br-1m6a.20`).
-- `CONSOLE_SPLIT_RATIO_PERCENT` (default: `30`, clamp `10..80`): requested left split ratio.
-- `CONSOLE_THEME` (default: `cyberpunk_aurora`): console theme id (see `br-1m6a.12`).
-
-## Conformance Tests
-
-Run fixture-based parity tests against the Rust server router:
 ```bash
-cargo test -p mcp-agent-mail-conformance
-```
-
-### Regenerate Fixtures (Legacy Python)
-Use the legacy Python venv (bundled in `legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv`):
-```bash
-legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/bin/python \
-  crates/mcp-agent-mail-conformance/tests/conformance/python_reference/generate_fixtures.py
-```
-
-## Benchmarks
-```bash
-cargo bench -p mcp-agent-mail
-```
-
-## Dev Workflow
-
-Quality gates:
-```bash
+# Quality gates
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-```
 
-## Multi-Agent Builds (Target Dir Isolation)
+# Conformance tests (parity with legacy Python)
+cargo test -p mcp-agent-mail-conformance
 
-When multiple agents build in parallel, set a per-agent target dir to avoid lock contention:
-```bash
+# Benchmarks
+cargo bench -p mcp-agent-mail
+
+# Multi-agent builds: isolate target dir to avoid lock contention
 export CARGO_TARGET_DIR="/tmp/target-$(whoami)-am"
 ```
 
 ## Notes
 
-- Rust nightly is required (see `rust-toolchain.toml`).
-- This port uses local crates for MCP, SQLite, async IO, and UI:
-  - `/dp/fastmcp_rust`
-  - `/dp/sqlmodel_rust`
-  - `/dp/asupersync`
-  - `/dp/frankentui`
-  - `/dp/beads_rust`
-  - `/dp/coding_agent_session_search`
+- Rust nightly required (see `rust-toolchain.toml`)
+- Uses local crates: `/dp/fastmcp_rust`, `/dp/sqlmodel_rust`,
+  `/dp/asupersync`, `/dp/frankentui`, `/dp/beads_rust`,
+  `/dp/coding_agent_session_search`
