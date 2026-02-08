@@ -286,7 +286,7 @@ impl DbPool {
     /// Create a new pool (does not open connections until first acquire).
     pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
         let sqlite_path = config.sqlite_path()?;
-        let init_sql = Arc::new(schema::PRAGMA_CONN_SETTINGS_SQL.to_string());
+        let init_sql = Arc::new(schema::build_conn_pragmas(config.max_connections));
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
 
         let pool_config = PoolConfig::new(config.max_connections)
@@ -602,6 +602,48 @@ impl DbPool {
 
         Ok(refs)
     }
+
+    /// Run an explicit WAL checkpoint (`TRUNCATE` mode).
+    ///
+    /// This moves all WAL content back into the main database file and truncates
+    /// the WAL to zero length. Useful for:
+    /// - Graceful shutdown (ensures DB file is self-contained)
+    /// - Before export/snapshot (no loose WAL journal)
+    /// - Idle periods (reclaim WAL disk space)
+    ///
+    /// Returns the number of WAL frames checkpointed, or an error.
+    /// No-ops silently for `:memory:` databases.
+    pub fn wal_checkpoint(&self) -> DbResult<u64> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(0);
+        }
+        let conn = SqliteConnection::open_file(&self.sqlite_path)
+            .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
+
+        // Apply busy_timeout so the checkpoint waits for active readers/writers.
+        conn.execute_raw("PRAGMA busy_timeout = 60000;")
+            .map_err(|e| DbError::Sqlite(format!("checkpoint: busy_timeout: {e}")))?;
+
+        let rows = conn
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .map_err(|e| DbError::Sqlite(format!("checkpoint: {e}")))?;
+
+        // wal_checkpoint returns (busy, log, checkpointed)
+        let checkpointed = rows
+            .first()
+            .and_then(|r| match r.get_by_name("checkpointed") {
+                Some(sqlmodel_core::Value::BigInt(n)) => {
+                    if *n >= 0 { Some(*n as u64) } else { Some(0) }
+                }
+                Some(sqlmodel_core::Value::Int(n)) => {
+                    if *n >= 0 { Some(*n as u64) } else { Some(0) }
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        Ok(checkpointed)
+    }
 }
 
 static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<OnceCell<()>>>>> =
@@ -899,6 +941,58 @@ mod tests {
         assert_eq!(
             cfg.warmup_connections, 0,
             "warmup should be disabled by default"
+        );
+    }
+
+    /// Verify `build_conn_pragmas` scales cache_size with pool size.
+    #[test]
+    fn build_conn_pragmas_budget_aware_cache() {
+        // 100 connections: 512*1024 / 100 = 5242 KB each
+        let sql_100 = schema::build_conn_pragmas(100);
+        assert!(
+            sql_100.contains("cache_size = -5242"),
+            "100 conns should get ~5MB each: {sql_100}"
+        );
+
+        // 25 connections: 512*1024 / 25 = 20971 KB each
+        let sql_25 = schema::build_conn_pragmas(25);
+        assert!(
+            sql_25.contains("cache_size = -20971"),
+            "25 conns should get ~20MB each: {sql_25}"
+        );
+
+        // 1 connection: 512*1024 / 1 = 524288 KB → clamped to 65536 (64MB max)
+        let sql_1 = schema::build_conn_pragmas(1);
+        assert!(
+            sql_1.contains("cache_size = -65536"),
+            "1 conn should get 64MB (clamped max): {sql_1}"
+        );
+
+        // 500 connections: clamped to 2MB min
+        let sql_500 = schema::build_conn_pragmas(500);
+        assert!(
+            sql_500.contains("cache_size = -2048"),
+            "500 conns should get 2MB (clamped min): {sql_500}"
+        );
+
+        // All should have journal_size_limit
+        for sql in [&sql_100, &sql_25, &sql_1, &sql_500] {
+            assert!(
+                sql.contains("journal_size_limit = 67108864"),
+                "all should have 64MB journal_size_limit"
+            );
+            assert!(sql.contains("busy_timeout = 60000"), "must have busy_timeout");
+            assert!(sql.contains("mmap_size = 268435456"), "must have 256MB mmap");
+        }
+    }
+
+    /// Verify build_conn_pragmas handles zero pool size gracefully.
+    #[test]
+    fn build_conn_pragmas_zero_pool_fallback() {
+        let sql = schema::build_conn_pragmas(0);
+        assert!(
+            sql.contains("cache_size = -8192"),
+            "0 conns should fallback to 8MB: {sql}"
         );
     }
 }

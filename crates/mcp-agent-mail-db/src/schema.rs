@@ -182,19 +182,21 @@ END;
 /// - `synchronous=NORMAL`: fsync on commit (not per-statement); safe with WAL
 /// - `busy_timeout=60s`: 60 second wait for locks (matches Python `PRAGMA busy_timeout=60000`)
 /// - `wal_autocheckpoint=2000`: fewer checkpoints under sustained write bursts
-/// - `cache_size=64MB`: large page cache to avoid disk reads for hot data
-/// - `mmap_size=512MB`: memory-mapped I/O for sequential scan acceleration
+/// - `cache_size`: budget-aware, scales inversely with pool size (see [`build_conn_pragmas`])
+/// - `mmap_size=256MB`: memory-mapped I/O for sequential scan acceleration
 /// - `temp_store=MEMORY`: temp tables and indices stay in RAM (never hit disk)
 /// - `threads=4`: allow `SQLite` to parallelize sorting and other internal work
+/// - `journal_size_limit=64MB`: cap WAL file size to prevent unbounded growth
 pub const PRAGMA_SETTINGS_SQL: &str = r"
 PRAGMA busy_timeout = 60000;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;
-PRAGMA cache_size = -65536;
-PRAGMA mmap_size = 536870912;
+PRAGMA cache_size = -8192;
+PRAGMA mmap_size = 268435456;
 PRAGMA temp_store = MEMORY;
 PRAGMA threads = 4;
+PRAGMA journal_size_limit = 67108864;
 ";
 
 /// Database-wide initialization PRAGMAs (applied once per sqlite file).
@@ -210,11 +212,48 @@ pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA busy_timeout = 60000;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;
-PRAGMA cache_size = -65536;
-PRAGMA mmap_size = 536870912;
+PRAGMA cache_size = -8192;
+PRAGMA mmap_size = 268435456;
 PRAGMA temp_store = MEMORY;
 PRAGMA threads = 4;
+PRAGMA journal_size_limit = 67108864;
 ";
+
+/// Total memory budget (in KB) for page caches across all pooled connections.
+///
+/// Default: 512 MB. With 100 connections, each gets ~5 MB of page cache.
+/// With 25 connections, each gets ~20 MB. This prevents memory blowup when
+/// `max_connections` increases.
+const TOTAL_CACHE_BUDGET_KB: usize = 512 * 1024;
+
+/// Build per-connection PRAGMAs with a cache_size that respects the total
+/// memory budget.
+///
+/// `max_connections` is the pool's maximum size. The per-connection cache
+/// is `TOTAL_CACHE_BUDGET_KB / max_connections`, clamped to \[2 MB, 64 MB\].
+///
+/// Returns a SQL string suitable for `execute_raw()`.
+#[must_use]
+pub fn build_conn_pragmas(max_connections: usize) -> String {
+    let per_conn_kb = if max_connections == 0 {
+        8192 // fallback: 8 MB
+    } else {
+        (TOTAL_CACHE_BUDGET_KB / max_connections).clamp(2048, 65536)
+    };
+
+    format!(
+        "\
+PRAGMA busy_timeout = 60000;
+PRAGMA synchronous = NORMAL;
+PRAGMA wal_autocheckpoint = 2000;
+PRAGMA cache_size = -{per_conn_kb};
+PRAGMA mmap_size = 268435456;
+PRAGMA temp_store = MEMORY;
+PRAGMA threads = 4;
+PRAGMA journal_size_limit = 67108864;
+"
+    )
+}
 
 /// Initialize the database schema
 #[must_use]
