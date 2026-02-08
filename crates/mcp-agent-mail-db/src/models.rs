@@ -433,3 +433,35 @@ impl Default for ProjectSiblingSuggestionRow {
         }
     }
 }
+
+// =============================================================================
+// Inbox Stats (materialized aggregate counters)
+// =============================================================================
+
+/// Materialized aggregate counters for an agent's inbox.
+///
+/// Maintained by SQLite triggers on `message_recipients` so that inbox
+/// stats queries are O(1) instead of scanning the recipients table.
+#[derive(Model, Debug, Clone, Serialize, Deserialize)]
+#[sqlmodel(table = "inbox_stats")]
+pub struct InboxStatsRow {
+    /// The agent whose inbox these stats describe.
+    #[sqlmodel(primary_key)]
+    pub agent_id: i64,
+
+    /// Total messages delivered to this agent.
+    #[sqlmodel(default = "0")]
+    pub total_count: i64,
+
+    /// Messages not yet marked as read.
+    #[sqlmodel(default = "0")]
+    pub unread_count: i64,
+
+    /// Messages with `ack_required=1` that haven't been acknowledged.
+    #[sqlmodel(default = "0")]
+    pub ack_pending_count: i64,
+
+    /// Timestamp of the most recent message (microseconds since epoch).
+    #[sqlmodel(nullable)]
+    pub last_message_ts: Option<i64>,
+}

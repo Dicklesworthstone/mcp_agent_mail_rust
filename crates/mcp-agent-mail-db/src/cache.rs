@@ -35,11 +35,12 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
-use crate::models::{AgentRow, ProjectRow};
+use crate::models::{AgentRow, InboxStatsRow, ProjectRow};
 use mcp_agent_mail_core::{InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
 
 const PROJECT_TTL: Duration = Duration::from_secs(300); // 5 min
 const AGENT_TTL: Duration = Duration::from_secs(300); // 5 min
+const INBOX_STATS_TTL: Duration = Duration::from_secs(30); // 30 sec (shorter: counters change often)
 const MAX_ENTRIES_PER_CATEGORY: usize = 16_384;
 /// Minimum interval between deferred touch flushes.
 const TOUCH_FLUSH_INTERVAL: Duration = Duration::from_secs(30);

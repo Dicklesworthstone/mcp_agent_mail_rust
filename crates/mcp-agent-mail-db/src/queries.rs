@@ -10,8 +10,8 @@
 
 use crate::error::DbError;
 use crate::models::{
-    AgentLinkRow, AgentRow, FileReservationRow, MessageRecipientRow, MessageRow, ProductRow,
-    ProjectRow,
+    AgentLinkRow, AgentRow, FileReservationRow, InboxStatsRow, MessageRecipientRow, MessageRow,
+    ProductRow, ProjectRow,
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
@@ -1875,6 +1875,70 @@ pub async fn acknowledge_message(
                 ))
             } else {
                 Outcome::Ok((now, now))
+            }
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+// =============================================================================
+// Inbox Stats Queries (materialized aggregate counters)
+// =============================================================================
+
+/// Fetch materialized inbox stats for an agent (O(1) primary key lookup).
+///
+/// Returns `None` if the agent has never received any messages (no row
+/// in `inbox_stats`).
+pub async fn get_inbox_stats(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+) -> Outcome<Option<InboxStatsRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let sql = "SELECT agent_id, total_count, unread_count, ack_pending_count, last_message_ts \
+               FROM inbox_stats WHERE agent_id = ?";
+    let params = [Value::BigInt(agent_id)];
+
+    let out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
+    match out {
+        Outcome::Ok(rows) => {
+            if rows.is_empty() {
+                Outcome::Ok(None)
+            } else {
+                let row = &rows[0];
+                let stats = InboxStatsRow {
+                    agent_id: match row.get_named("agent_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    },
+                    total_count: match row.get_named("total_count") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    },
+                    unread_count: match row.get_named("unread_count") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    },
+                    ack_pending_count: match row.get_named("ack_pending_count") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    },
+                    last_message_ts: match row.get_named("last_message_ts") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    },
+                };
+                Outcome::Ok(Some(stats))
             }
         }
         Outcome::Err(e) => Outcome::Err(e),
