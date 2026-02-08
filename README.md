@@ -33,9 +33,49 @@ cargo run -p mcp-agent-mail -- serve --host 127.0.0.1 --port 8765
 # stdio transport (for MCP client integration)
 cargo run -p mcp-agent-mail
 
-# CLI tool
+# CLI tool (runs the `am` binary)
 cargo run -p mcp-agent-mail-cli -- --help
 ```
+
+### Dual-Mode Interface (MCP Server vs CLI)
+
+This repo intentionally exposes **two disjoint command surfaces**:
+
+| Use case | Entry point | Notes |
+|---------|-------------|-------|
+| MCP server (default) | `mcp-agent-mail` | Default is MCP stdio transport. HTTP is `serve`. |
+| CLI (operator + agent-first) | `am` | Built from the `mcp-agent-mail-cli` crate. |
+
+Common footgun: running CLI-only commands via the MCP server binary.
+The MCP binary will **deny** unknown subcommands with a deterministic message
+on `stderr` and exit code `2`:
+
+```bash
+cargo run -p mcp-agent-mail -- share export
+# Error: "share" is not an MCP server command.
+# Agent Mail MCP server accepts: serve, config
+# For operator CLI commands, use: mcp-agent-mail-cli share
+```
+
+To use the CLI surface during development:
+
+```bash
+cargo run -p mcp-agent-mail-cli -- mail send \
+  --project /abs/path/to/project \
+  --from RedHarbor \
+  --to OrangeFinch \
+  --subject "hello" \
+  --body "test"
+```
+
+Note: `scripts/am` is a dev convenience wrapper around `mcp-agent-mail serve`.
+It is not the `am` CLI binary.
+
+For the canonical contract/specs:
+- `docs/ADR-001-dual-mode-invariants.md`
+- `docs/SPEC-meta-command-allowlist.md`
+- `docs/SPEC-denial-ux-contract.md`
+- `docs/SPEC-parity-matrix.md`
 
 ## TUI Controls
 
@@ -90,7 +130,7 @@ mcp-agent-mail-core          (config, models, errors, metrics)
   └─ mcp-agent-mail-tools    (34 MCP tool implementations)
        └─ mcp-agent-mail-server  (HTTP/MCP runtime, TUI, web UI)
             ├─ mcp-agent-mail        (server binary)
-            ├─ mcp-agent-mail-cli    (operator CLI)
+            ├─ mcp-agent-mail-cli    (am CLI binary)
             └─ mcp-agent-mail-conformance  (parity tests)
 ```
 

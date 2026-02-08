@@ -35,6 +35,28 @@ cargo run -p mcp-agent-mail -- serve \
   --host 127.0.0.1 --port 8765 --path /mcp/
 ```
 
+### CLI vs Server Binaries (Dual-Mode)
+
+This repo intentionally keeps **MCP server** and **CLI** command surfaces separate:
+
+- MCP server: `mcp-agent-mail` (default: MCP stdio; `serve` for HTTP; `config` for debugging)
+- CLI: `am` (built from the `mcp-agent-mail-cli` crate)
+
+The most common mistake is trying to run CLI-only commands through the MCP server binary.
+In that case, `mcp-agent-mail` should deny on `stderr` and exit with code `2` (usage error).
+
+Examples:
+
+```bash
+# Wrong binary (denied, exit 2)
+cargo run -p mcp-agent-mail -- share export
+
+# Correct binary (CLI)
+cargo run -p mcp-agent-mail-cli -- --help   # runs `am`
+```
+
+Note: `scripts/am` is a dev wrapper around `mcp-agent-mail serve` (HTTP + TUI). It is not the `am` CLI binary.
+
 ## 2. Pre-Flight Checklist
 
 Before starting, verify:

@@ -731,6 +731,18 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 - **Token-efficient:** Messages stored in per-project archive, not in context
 - **Quick reads:** `resource://inbox/...`, `resource://thread/...`
 
+### Dual-Mode Reminder (MCP Server vs CLI)
+
+This project intentionally keeps **MCP server** and **CLI** command surfaces separate:
+
+- MCP server binary: `mcp-agent-mail` (default: MCP stdio; `serve` for HTTP; `config` for debugging)
+- CLI binary: `am` (built by the `mcp-agent-mail-cli` crate)
+
+If you accidentally run a CLI-only command via the MCP binary (e.g. `mcp-agent-mail share ...`),
+it should deny with a deterministic message and exit code `2` telling you to use the CLI.
+
+Note: `scripts/am` is a dev wrapper around `mcp-agent-mail serve` (HTTP + TUI). It is not the `am` CLI binary.
+
 ### Same Repository Workflow
 
 1. **Register identity:**
