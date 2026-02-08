@@ -9592,7 +9592,14 @@ sys.exit(7)
     #[test]
     fn help_macros_start_session_lists_flags() {
         let h = help_text_for(&["am", "macros", "start-session", "--help"]);
-        for flag in ["--project", "--program", "--model", "--reserve", "--inbox-limit", "--json"] {
+        for flag in [
+            "--project",
+            "--program",
+            "--model",
+            "--reserve",
+            "--inbox-limit",
+            "--json",
+        ] {
             assert!(
                 h.contains(flag),
                 "macros start-session help missing flag '{flag}'\n{h}"
