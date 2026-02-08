@@ -450,10 +450,10 @@ pub async fn send_message(
         }
     }
 
-    let config = Config::from_env();
+    let config = &Config::get();
 
     // ── Per-message size limits (fail fast before any DB/archive work) ──
-    validate_message_size_limits(&config, &subject, &body_md, attachment_paths.as_deref())?;
+    validate_message_size_limits(config, &subject, &body_md, attachment_paths.as_deref())?;
 
     if config.disk_space_monitor_enabled {
         let pressure = mcp_agent_mail_core::disk::DiskPressure::from_u64(
@@ -511,7 +511,7 @@ effective_free_bytes={free}"
             name,
             "to",
             &sender,
-            &config,
+            config,
             &mut recipient_map,
             &mut all_recipients,
             &mut resolved_to,
@@ -526,7 +526,7 @@ effective_free_bytes={free}"
             name,
             "cc",
             &sender,
-            &config,
+            config,
             &mut recipient_map,
             &mut all_recipients,
             &mut resolved_cc_recipients,
@@ -541,7 +541,7 @@ effective_free_bytes={free}"
             name,
             "bcc",
             &sender,
-            &config,
+            config,
             &mut recipient_map,
             &mut all_recipients,
             &mut resolved_bcc_recipients,
@@ -570,13 +570,13 @@ effective_free_bytes={free}"
 
     if do_convert {
         let slug = &project.slug;
-        match mcp_agent_mail_storage::ensure_archive(&config, slug) {
+        match mcp_agent_mail_storage::ensure_archive(config, slug) {
             Ok(archive) => {
                 // Process inline markdown images
                 if let Ok((updated_body, md_meta, rel_paths)) =
                     mcp_agent_mail_storage::process_markdown_images(
                         &archive,
-                        &config,
+                        config,
                         base_dir,
                         &body_md,
                         embed_policy,
@@ -596,7 +596,7 @@ effective_free_bytes={free}"
                     if !paths.is_empty() {
                         let (att_meta, rel_paths) = mcp_agent_mail_storage::process_attachments(
                             &archive,
-                            &config,
+                            config,
                             base_dir,
                             paths,
                             embed_policy,
@@ -642,7 +642,7 @@ effective_free_bytes={free}"
         // No conversion: validate source paths and store canonical references.
         for p in paths {
             let resolved =
-                mcp_agent_mail_storage::resolve_attachment_source_path(base_dir, &config, p)
+                mcp_agent_mail_storage::resolve_attachment_source_path(base_dir, config, p)
                     .map_err(|e| {
                         legacy_tool_error(
                             "INVALID_ARGUMENT",
@@ -946,7 +946,7 @@ effective_free_bytes={free}"
     for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
         if notified.insert(name.clone()) {
             let _ = mcp_agent_mail_storage::emit_notification_signal(
-                &config,
+                config,
                 &project.slug,
                 name,
                 Some(&notification_meta),
@@ -976,7 +976,7 @@ effective_free_bytes={free}"
             "attachments": &all_attachment_meta,
         });
         try_write_message_archive(
-            &config,
+            config,
             &project.slug,
             &msg_json,
             &message.body_md,
@@ -1059,12 +1059,12 @@ pub async fn reply_message(
     subject_prefix: Option<String>,
 ) -> McpResult<String> {
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
-    let config = Config::from_env();
+    let config = &Config::get();
 
     // ── Per-message size limits (fail fast before any DB/archive work) ──
     // Reply has no subject yet (inherited below) and no attachment_paths, so
     // validate body only here; subject is checked after construction.
-    validate_reply_body_limit(&config, &body_md)?;
+    validate_reply_body_limit(config, &body_md)?;
 
     if config.disk_space_monitor_enabled {
         let pressure = mcp_agent_mail_core::disk::DiskPressure::from_u64(
@@ -1227,7 +1227,7 @@ effective_free_bytes={free}"
             "reply_to": message_id,
         });
         try_write_message_archive(
-            &config,
+            config,
             &project.slug,
             &msg_json,
             &reply.body_md,
@@ -1415,8 +1415,8 @@ pub async fn fetch_inbox(
     );
 
     // Clear notification signal (best-effort).
-    let config = Config::from_env();
-    let _ = mcp_agent_mail_storage::clear_notification_signal(&config, &project.slug, &agent.name);
+    let config = &Config::get();
+    let _ = mcp_agent_mail_storage::clear_notification_signal(config, &project.slug, &agent.name);
 
     serde_json::to_string(&messages)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))

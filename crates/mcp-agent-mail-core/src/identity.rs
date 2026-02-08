@@ -233,7 +233,7 @@ const fn mode_to_str(mode: ProjectIdentityMode) -> &'static str {
 /// Compute the project slug based on config and path.
 #[must_use]
 pub fn compute_project_slug(human_key: &str) -> String {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return slugify(human_key);
     }
@@ -307,7 +307,7 @@ pub fn compute_project_slug(human_key: &str) -> String {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
-    let config = Config::from_env();
+    let config = &Config::get();
     let mode_config = config.project_identity_mode;
     let mode_used = if config.worktrees_enabled {
         mode_to_str(mode_config).to_string()

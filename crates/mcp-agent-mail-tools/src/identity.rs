@@ -214,7 +214,7 @@ pub struct CommitInfo {
 #[tool(description = "Return basic readiness information for the Agent Mail server.")]
 #[allow(clippy::too_many_lines)]
 pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     let pool = get_db_pool()?;
     pool.sample_pool_stats_now();
     // Ensure background workers are running so health_check reports stable
@@ -223,7 +223,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let _ = mcp_agent_mail_storage::get_commit_coalescer();
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
     let disk_sample = if config.disk_space_monitor_enabled {
-        Some(mcp_agent_mail_core::disk::sample_and_record(&config))
+        Some(mcp_agent_mail_core::disk::sample_and_record(config))
     } else {
         None
     };
@@ -244,7 +244,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         status: "ok".to_string(),
         health_level: health_level.to_string(),
         environment: config.app_environment.to_string(),
-        http_host: config.http_host,
+        http_host: config.http_host.clone(),
         http_port: config.http_port,
         database_url: redact_database_url(&config.database_url),
         pool_utilization: Some(PoolUtilizationResponse {
@@ -395,7 +395,7 @@ Check that all parameters have valid values."
         ));
     }
 
-    let config = Config::from_env();
+    let config = &Config::get();
     let pool = get_db_pool()?;
 
     // Log identity_mode if provided (future: resolve project identity via git remotes, etc.)
@@ -408,29 +408,18 @@ Check that all parameters have valid values."
     )?;
 
     // Ensure the git archive directory exists for this project
-    if let Err(e) = mcp_agent_mail_storage::ensure_archive(&config, &row.slug) {
+    if let Err(e) = mcp_agent_mail_storage::ensure_archive(config, &row.slug) {
         tracing::warn!("Failed to ensure archive for project '{}': {e}", row.slug);
     }
 
-    if config.worktrees_enabled {
-        let mut identity = mcp_agent_mail_core::resolve_project_identity(&human_key);
-        identity.slug.clone_from(&row.slug); // Ensure follow-up calls using slug resolve correctly.
+    // Always return extended format with identity fields (null when not resolved)
+    let mut identity = mcp_agent_mail_core::resolve_project_identity(&human_key);
+    identity.slug.clone_from(&row.slug);
 
-        let response = ProjectWithIdentityResponse {
-            id: row.id.unwrap_or(0),
-            created_at: micros_to_iso(row.created_at),
-            identity,
-        };
-
-        return serde_json::to_string(&response)
-            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
-    }
-
-    let response = ProjectResponse {
+    let response = ProjectWithIdentityResponse {
         id: row.id.unwrap_or(0),
-        slug: row.slug,
-        human_key: row.human_key,
         created_at: micros_to_iso(row.created_at),
+        identity,
     };
 
     serde_json::to_string(&response)
@@ -550,7 +539,7 @@ Check that all parameters have valid values."
     mcp_agent_mail_db::read_cache().put_agent(&row);
 
     // Write agent profile to git archive (best-effort)
-    let config = Config::from_env();
+    let config = &Config::get();
     let agent_json = serde_json::json!({
         "name": row.name,
         "program": row.program,
@@ -560,7 +549,7 @@ Check that all parameters have valid values."
         "last_active_ts": micros_to_iso(row.last_active_ts),
         "attachments_policy": row.attachments_policy,
     });
-    try_write_agent_profile(&config, &project.slug, &agent_json);
+    try_write_agent_profile(config, &project.slug, &agent_json);
 
     let response = AgentResponse {
         id: row.id.unwrap_or(0),
@@ -722,7 +711,7 @@ Choose a different name (or omit the name to auto-generate one)."
     mcp_agent_mail_db::read_cache().put_agent(&row);
 
     // Write agent profile to git archive (best-effort)
-    let config = Config::from_env();
+    let config = &Config::get();
     let agent_json = serde_json::json!({
         "name": row.name,
         "program": row.program,
@@ -732,7 +721,7 @@ Choose a different name (or omit the name to auto-generate one)."
         "last_active_ts": micros_to_iso(row.last_active_ts),
         "attachments_policy": row.attachments_policy,
     });
-    try_write_agent_profile(&config, &project.slug, &agent_json);
+    try_write_agent_profile(config, &project.slug, &agent_json);
 
     let response = AgentResponse {
         id: row.id.unwrap_or(0),
@@ -791,8 +780,8 @@ pub async fn whois(
 
     // Fetch recent commits from the git archive if requested
     let recent_commits = if include_commits && limit > 0 {
-        let config = Config::from_env();
-        match mcp_agent_mail_storage::ensure_archive(&config, &project.slug) {
+        let config = &Config::get();
+        match mcp_agent_mail_storage::ensure_archive(config, &project.slug) {
             Ok(archive) => {
                 let path_filter = format!("projects/{}/agents/{}", project.slug, agent_row.name);
                 match mcp_agent_mail_storage::get_recent_commits(

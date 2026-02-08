@@ -278,7 +278,7 @@ pub async fn file_reservation_paths(
 
     // Write reservation artifacts to git archive (best-effort, via WBQ)
     if !granted_rows.is_empty() {
-        let config = Config::from_env();
+        let config = &Config::get();
         let res_jsons: Vec<serde_json::Value> = granted_rows
             .iter()
             .map(|r| {
@@ -294,7 +294,7 @@ pub async fn file_reservation_paths(
             .collect();
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
             project_slug: project.slug.clone(),
-            config,
+            config: config.clone(),
             reservations: res_jsons,
         };
         match mcp_agent_mail_storage::wbq_enqueue(op) {
@@ -569,8 +569,8 @@ pub async fn force_release_file_reservation(
     }
 
     // Signal 3: Git activity (via archive commits)
-    let config = Config::from_env();
-    let git_activity = get_git_activity_for_agent(&config, &project.slug, &holder_agent.name);
+    let config = &Config::get();
+    let git_activity = get_git_activity_for_agent(config, &project.slug, &holder_agent.name);
     let git_stale = git_activity.is_none_or(|ts| (now_micros - ts) > grace_micros);
     if git_stale {
         stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
@@ -747,7 +747,7 @@ pub fn install_precommit_guard(
     project_key: String,
     code_repo_path: String,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return serde_json::to_string(&serde_json::json!({ "hook": "" }))
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));

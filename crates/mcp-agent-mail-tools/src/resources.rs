@@ -164,15 +164,15 @@ fn redact_database_url(url: &str) -> String {
 )]
 pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
     use mcp_agent_mail_core::Config;
-    let config = Config::from_env();
+    let config = &Config::get();
 
     let snapshot = EnvironmentSnapshot {
         environment: config.app_environment.to_string(),
         database_url: redact_database_url(&config.database_url),
         http: HttpSnapshot {
-            host: config.http_host,
+            host: config.http_host.clone(),
             port: config.http_port,
-            path: config.http_path,
+            path: config.http_path.clone(),
         },
     };
 
@@ -421,7 +421,7 @@ pub struct ToolDirectory {
 
 #[allow(clippy::too_many_lines)]
 fn build_tool_directory() -> ToolDirectory {
-    let config = Config::from_env();
+    let config = &Config::get();
     let output_formats = OutputFormats {
         default: "json".to_string(),
         tool_param: "format".to_string(),
@@ -874,7 +874,7 @@ fn build_tool_directory() -> ToolDirectory {
         for cluster in &mut clusters {
             cluster
                 .tools
-                .retain(|tool| tool_filter_allows(&config, &tool.name));
+                .retain(|tool| tool_filter_allows(config, &tool.name));
         }
         clusters.retain(|cluster| !cluster.tools.is_empty());
     }
@@ -1007,7 +1007,7 @@ pub struct ToolSchemasResponse {
     description = "Tool schemas and JSON definitions"
 )]
 pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     let output_formats = OutputFormats {
         default: "json".to_string(),
         tool_param: "format".to_string(),
@@ -1080,7 +1080,7 @@ pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
     );
 
     if config.tool_filter.enabled {
-        tools.retain(|name, _| tool_filter_allows(&config, name));
+        tools.retain(|name, _| tool_filter_allows(config, name));
     }
 
     let response = ToolSchemasResponse {
@@ -1129,7 +1129,7 @@ pub struct ToolMetricsResponse {
     description = "Tool call counts and error rates"
 )]
 pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
 
     // Use live metrics from the global tracker, showing all known tools.
     let snapshot = crate::metrics::tool_metrics_snapshot_full();
@@ -1147,7 +1147,7 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
         .collect();
 
     if config.tool_filter.enabled {
-        tools.retain(|entry| tool_filter_allows(&config, &entry.name));
+        tools.retain(|entry| tool_filter_allows(config, &entry.name));
     }
 
     let response = ToolMetricsResponse {
@@ -1231,8 +1231,8 @@ pub struct LocksResponse {
 /// Get active archive locks.
 #[resource(uri = "resource://tooling/locks", description = "Active archive locks")]
 pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
-    let config = mcp_agent_mail_core::Config::from_env();
-    let lock_info = mcp_agent_mail_storage::collect_lock_status(&config).unwrap_or_else(|e| {
+    let config = &mcp_agent_mail_core::Config::get();
+    let lock_info = mcp_agent_mail_storage::collect_lock_status(config).unwrap_or_else(|e| {
         tracing::warn!("Failed to collect lock status: {e}");
         serde_json::json!({"archive_root": "", "exists": false, "locks": []})
     });
@@ -1363,7 +1363,7 @@ pub struct ToolingRecentSnapshot {
 )]
 #[allow(clippy::too_many_lines)]
 pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     let (window_seconds_str, query) = split_param_and_query(&window_seconds);
     let window_seconds: u64 = window_seconds_str.parse().unwrap_or(0);
     let agent = query.get("agent").cloned();
@@ -1534,7 +1534,7 @@ pub fn tooling_recent(_ctx: &McpContext, window_seconds: String) -> McpResult<St
     };
 
     if config.tool_filter.enabled {
-        entries.retain(|entry| tool_filter_allows(&config, &entry.tool));
+        entries.retain(|entry| tool_filter_allows(config, &entry.tool));
     }
 
     let count = entries.len();
@@ -1739,7 +1739,7 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
         Ok(Some(product))
     }
 
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(McpError::new(
             McpErrorCode::InvalidParams,
@@ -3395,7 +3395,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     let project_id = project.id.unwrap_or(0);
 
-    let config = Config::from_env();
+    let config = &Config::get();
     let now_micros = mcp_agent_mail_db::now_micros();
     let inactivity_seconds =
         i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(i64::MAX);
@@ -3538,12 +3538,12 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     // Best-effort archive artifact writes for any releases.
     if !release_payloads.is_empty() {
-        match mcp_agent_mail_storage::ensure_archive(&config, &project.slug) {
+        match mcp_agent_mail_storage::ensure_archive(config, &project.slug) {
             Ok(archive) => {
                 let result = mcp_agent_mail_storage::with_project_lock(&archive, || {
                     mcp_agent_mail_storage::write_file_reservation_records(
                         &archive,
-                        &config,
+                        config,
                         &release_payloads,
                     )
                 });

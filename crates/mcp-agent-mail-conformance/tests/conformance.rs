@@ -246,6 +246,9 @@ impl ToolFilterEnvGuard {
             }
         }
 
+        // Reset cached config so Config::get() re-reads env vars
+        mcp_agent_mail_core::Config::reset_cached();
+
         Self { previous }
     }
 }
@@ -262,6 +265,7 @@ impl Drop for ToolFilterEnvGuard {
                 },
             }
         }
+        mcp_agent_mail_core::Config::reset_cached();
     }
 }
 
@@ -279,6 +283,7 @@ impl EnvVarGuard {
                 std::env::set_var(key, value);
             }
         }
+        mcp_agent_mail_core::Config::reset_cached();
         Self { previous }
     }
 }
@@ -295,6 +300,7 @@ impl Drop for EnvVarGuard {
                 },
             }
         }
+        mcp_agent_mail_core::Config::reset_cached();
     }
 }
 

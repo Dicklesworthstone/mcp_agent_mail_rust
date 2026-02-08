@@ -542,6 +542,30 @@ impl Default for Config {
     }
 }
 
+/// Module-level shared config cache (used by `Config::get` and `Config::reset_cached`).
+static CONFIG_CACHE: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
+
+fn global_config_cache_get() -> Config {
+    // Fast path: read lock, return clone if present
+    {
+        let guard = CONFIG_CACHE.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref c) = *guard {
+            return c.clone();
+        }
+    }
+    // Slow path: write lock, initialize from env
+    let mut guard = CONFIG_CACHE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.is_none() {
+        *guard = Some(Config::from_env());
+    }
+    guard.as_ref().expect("just initialized").clone()
+}
+
+fn global_config_cache_reset() {
+    let mut guard = CONFIG_CACHE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
+}
+
 impl Config {
     fn apply_environment_defaults(&mut self) {
         let is_dev = self.app_environment == AppEnvironment::Development;
@@ -1019,6 +1043,30 @@ impl Config {
         config.tui_key_hints = console_bool("TUI_KEY_HINTS", config.tui_key_hints);
 
         config
+    }
+
+    /// Return a clone of the globally cached configuration.
+    ///
+    /// On first call, parses environment variables via [`Config::from_env`] and
+    /// stores the result in a process-wide cache. Subsequent calls return a
+    /// clone of the cached value, avoiding repeated env-var parsing.
+    ///
+    /// Use this in hot paths (tool handlers) instead of `Config::from_env()`.
+    /// For tests or CLI commands that need a fresh or mutated config, continue
+    /// using `Config::from_env()` directly.
+    ///
+    /// Cloning a ~60-field struct is ~2-3 KB and takes <1 microsecond — far
+    /// cheaper than parsing 40+ environment variables with string conversions.
+    #[must_use]
+    pub fn get() -> Self {
+        global_config_cache_get()
+    }
+
+    /// Reset the global config cache, forcing the next [`Config::get`] call to
+    /// re-parse environment variables. Intended for tests that modify env vars
+    /// between test cases.
+    pub fn reset_cached() {
+        global_config_cache_reset();
     }
 
     /// Returns whether running in production mode

@@ -124,7 +124,7 @@ pub async fn acquire_build_slot(
     ttl_seconds: Option<i64>,
     exclusive: Option<bool>,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
     }
@@ -138,7 +138,7 @@ pub async fn acquire_build_slot(
     let branch = compute_branch(&project.human_key);
     let is_exclusive = exclusive.unwrap_or(true);
 
-    let project_root = project_archive_root(&config, &project.slug);
+    let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
     std::fs::create_dir_all(&slot_path)
         .map_err(|e| McpError::internal_error(format!("failed to create slot dir: {e}")))?;
@@ -189,7 +189,7 @@ pub async fn renew_build_slot(
     slot: String,
     extend_seconds: Option<i64>,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
     }
@@ -201,7 +201,7 @@ pub async fn renew_build_slot(
     let extend = std::cmp::max(extend_seconds.unwrap_or(1800), 60);
     let new_exp = (now + chrono::Duration::seconds(extend)).to_rfc3339();
 
-    let project_root = project_archive_root(&config, &project.slug);
+    let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
 
     let branch = compute_branch(&project.human_key);
@@ -246,7 +246,7 @@ pub async fn release_build_slot(
     agent_name: String,
     slot: String,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
     }
@@ -257,7 +257,7 @@ pub async fn release_build_slot(
     let now = chrono::Utc::now();
     let now_iso = now.to_rfc3339();
 
-    let project_root = project_archive_root(&config, &project.slug);
+    let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
     let branch = compute_branch(&project.human_key);
     let holder_id = safe_component(&format!(

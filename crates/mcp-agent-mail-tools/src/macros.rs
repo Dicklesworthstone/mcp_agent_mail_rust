@@ -265,7 +265,7 @@ pub async fn macro_prepare_thread(
     let mut summary = crate::search::summarize_messages(&messages);
 
     // Optional LLM refinement (legacy parity: same merge semantics as summarize_thread).
-    let config = mcp_agent_mail_core::Config::from_env();
+    let config = &mcp_agent_mail_core::Config::get();
     if use_llm && config.llm_enabled {
         let msg_tuples: Vec<(i64, String, String, String)> = messages
             .iter()

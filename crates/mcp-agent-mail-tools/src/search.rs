@@ -454,7 +454,7 @@ pub async fn summarize_thread(
         };
 
         // LLM refinement for multi-thread (if enabled)
-        let config = mcp_agent_mail_core::Config::from_env();
+        let config = &mcp_agent_mail_core::Config::get();
         if use_llm && config.llm_enabled {
             let thread_context: Vec<(String, Vec<String>, Vec<String>)> = threads
                 .iter()
@@ -535,7 +535,7 @@ pub async fn summarize_thread(
         let mut summary = summarize_messages(&messages);
 
         // LLM refinement (if enabled)
-        let config = mcp_agent_mail_core::Config::from_env();
+        let config = &mcp_agent_mail_core::Config::get();
         if use_llm && config.llm_enabled {
             let msg_tuples: Vec<(i64, String, String, String)> = messages
                 .iter()

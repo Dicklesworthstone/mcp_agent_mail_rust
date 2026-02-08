@@ -106,7 +106,7 @@ pub async fn ensure_product(
     product_key: Option<String>,
     name: Option<String>,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
     }
@@ -200,7 +200,7 @@ pub async fn products_link(
     product_key: String,
     project_key: String,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
     }
@@ -275,7 +275,7 @@ pub async fn search_messages_product(
     query: String,
     limit: Option<i32>,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
     }
@@ -347,7 +347,7 @@ pub async fn fetch_inbox_product(
     include_bodies: Option<bool>,
     since_ts: Option<String>,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
     }
@@ -442,7 +442,7 @@ pub async fn summarize_thread_product(
     llm_model: Option<String>,
     per_thread_limit: Option<i32>,
 ) -> McpResult<String> {
-    let config = Config::from_env();
+    let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
     }
