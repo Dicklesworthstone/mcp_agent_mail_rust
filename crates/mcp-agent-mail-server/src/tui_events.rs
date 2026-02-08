@@ -2559,7 +2559,7 @@ mod tests {
     #[test]
     fn push_fills_timestamp_when_zero() {
         let ring = EventRingBuffer::with_capacity(100);
-        ring.push(sample_tool_start("t"));
+        let _ = ring.push(sample_tool_start("t"));
         let events = ring.events_since_seq(0);
         assert!(!events.is_empty());
         let ts = events[0].timestamp_micros();
@@ -2747,7 +2747,7 @@ mod tests {
         for (key, url, should_sanitize, expected_user, expected_mask) in cases {
             let result = crate::console::sanitize_known_value(key, url);
             if should_sanitize {
-                let sanitized = result.expect(&format!("should sanitize {key}={url}"));
+                let sanitized = result.unwrap_or_else(|| panic!("should sanitize {key}={url}"));
                 assert!(
                     sanitized.contains(expected_user),
                     "user should be preserved in {sanitized}"
