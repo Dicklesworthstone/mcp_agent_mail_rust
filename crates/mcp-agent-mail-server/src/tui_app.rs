@@ -12,6 +12,8 @@ use ftui::Frame;
 use ftui::layout::Rect;
 use ftui::widgets::Widget;
 use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
+use ftui::widgets::notification_queue::NotificationStack;
+use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
 use ftui::{Event, KeyCode, KeyEventKind, Modifiers};
 use ftui_runtime::program::{Cmd, Model};
 
@@ -19,8 +21,9 @@ use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
-    PlaceholderScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen, screen_meta,
-    system_health::SystemHealthScreen, timeline::TimelineScreen,
+    agents::AgentsScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen,
+    reservations::ReservationsScreen, screen_meta, system_health::SystemHealthScreen,
+    timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -89,8 +92,12 @@ impl MailAppModel {
                 screens.insert(id, Box::new(TimelineScreen::new()));
             } else if id == MailScreenId::SystemHealth {
                 screens.insert(id, Box::new(SystemHealthScreen::new(Arc::clone(&state))));
-            } else {
-                screens.insert(id, Box::new(PlaceholderScreen::new(id)));
+            } else if id == MailScreenId::Agents {
+                screens.insert(id, Box::new(AgentsScreen::new()));
+            } else if id == MailScreenId::ToolMetrics {
+                screens.insert(id, Box::new(ToolMetricsScreen::new()));
+            } else if id == MailScreenId::Reservations {
+                screens.insert(id, Box::new(ReservationsScreen::new()));
             }
         }
         let mut command_palette = CommandPalette::new().with_max_visible(PALETTE_MAX_VISIBLE);
@@ -853,9 +860,9 @@ mod tests {
     #[test]
     fn set_screen_replaces_instance() {
         let mut model = test_model();
-        let new_screen = Box::new(PlaceholderScreen::new(MailScreenId::Messages));
-        model.set_screen(MailScreenId::Messages, new_screen);
-        assert!(model.screens.contains_key(&MailScreenId::Messages));
+        let new_screen = Box::new(AgentsScreen::new());
+        model.set_screen(MailScreenId::Agents, new_screen);
+        assert!(model.screens.contains_key(&MailScreenId::Agents));
     }
 
     #[test]

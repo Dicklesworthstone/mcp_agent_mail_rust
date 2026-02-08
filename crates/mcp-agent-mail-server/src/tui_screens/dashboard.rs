@@ -11,7 +11,9 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind};
+use ftui::widgets::progress::MiniBar;
+use ftui::widgets::Sparkline;
+use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
@@ -195,8 +197,8 @@ impl MailScreen for DashboardScreen {
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
-        // Main layout: [stat tiles row: 5 lines] | [event log: fill] | [footer: 1 line]
-        let stat_height = 5_u16;
+        // Main layout: [stat tiles row: 7 lines] | [event log: fill] | [footer: 1 line]
+        let stat_height = 7_u16;
         let footer_height = 1_u16;
         let log_height = area
             .height
@@ -212,7 +214,7 @@ impl MailScreen for DashboardScreen {
             footer_height,
         );
 
-        render_stat_tiles(frame, stat_area, state, &self.prev_db_stats);
+        render_stat_tiles(frame, stat_area, state, &self.prev_db_stats, &self.sparkline_data);
         render_event_log(
             frame,
             log_area,
@@ -433,12 +435,13 @@ fn truncate(s: &str, max: usize) -> &str {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-/// Render the stat tiles row.
+/// Render the stat tiles row with Sparkline and MiniBar widgets.
 fn render_stat_tiles(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &TuiSharedState,
     _prev_stats: &DbStatSnapshot,
+    sparkline_data: &[f64],
 ) {
     // Split into 3 columns: server info | DB stats | agents
     let col_width = area.width / 3;
@@ -451,12 +454,16 @@ fn render_stat_tiles(
         area.height,
     );
 
-    // Server info
+    // ── Server tile: uptime + counters + latency sparkline ──────
     let counters = state.request_counters();
     let uptime = state.uptime();
     let uptime_str = format_duration(uptime);
+    let avg_ms = counters
+        .latency_total_ms
+        .checked_div(counters.total)
+        .unwrap_or(0);
     let info = format!(
-        "Up: {uptime_str}\nReq: {} 2xx:{} 4xx:{} 5xx:{}",
+        "Up: {uptime_str}  Avg: {avg_ms}ms\nReq: {} 2xx:{} 4xx:{} 5xx:{}",
         counters.total, counters.status_2xx, counters.status_4xx, counters.status_5xx,
     );
     let block = Block::default()
@@ -465,7 +472,17 @@ fn render_stat_tiles(
     let p = Paragraph::new(info).block(block);
     p.render(col1, frame);
 
-    // DB stats
+    // Render latency sparkline in the bottom of the server tile (inside the border)
+    let spark_inner_y = col1.y + col1.height.saturating_sub(2);
+    let spark_inner_w = col_width.saturating_sub(2);
+    if spark_inner_w > 4 && col1.height >= 5 {
+        let spark_area = Rect::new(col1.x + 1, spark_inner_y, spark_inner_w, 1);
+        let sparkline = Sparkline::new(sparkline_data)
+            .gradient(PackedRgba::GREEN, PackedRgba::RED);
+        sparkline.render(spark_area, frame);
+    }
+
+    // ── Database tile: stats + MiniBar gauges ───────────────────
     let db = state.db_stats_snapshot().unwrap_or_default();
     let stats_text = format!(
         "Proj: {:>5}  Agents: {:>5}\nMsg:  {:>5}  Reserv: {:>5}\nLinks:{:>5}  AckPnd: {:>5}",
@@ -477,20 +494,36 @@ fn render_stat_tiles(
     let p = Paragraph::new(stats_text).block(block);
     p.render(col2, frame);
 
-    // Agents list
+    // MiniBar for request success rate in the bottom of the DB tile
+    let bar_inner_y = col2.y + col2.height.saturating_sub(2);
+    let bar_inner_w = col_width.saturating_sub(2);
+    if bar_inner_w > 6 && col2.height >= 5 {
+        let bar_area = Rect::new(col2.x + 1, bar_inner_y, bar_inner_w, 1);
+        #[allow(clippy::cast_precision_loss)]
+        let success_rate = if counters.total > 0 {
+            counters.status_2xx as f64 / counters.total as f64
+        } else {
+            1.0
+        };
+        let bar = MiniBar::new(success_rate, bar_inner_w).show_percent(true);
+        bar.render(bar_area, frame);
+    }
+
+    // ── Agents tile: show top 5 agents ──────────────────────────
     let agents = &db.agents_list;
     let agent_text = if agents.is_empty() {
         "(no agents)".to_string()
     } else {
         agents
             .iter()
-            .take(3)
+            .take(5)
             .map(|a| format!("{} ({})", a.name, a.program))
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let title = format!("Agents ({})", db.agents);
     let block = Block::default()
-        .title("Agents")
+        .title(title.as_str())
         .border_type(BorderType::Rounded);
     let p = Paragraph::new(agent_text).block(block);
     p.render(col3, frame);

@@ -4,11 +4,14 @@
 //! [`MailScreenId`].  The [`MAIL_SCREEN_REGISTRY`] provides static
 //! metadata used by the chrome shell (tab bar, help overlay).
 
+pub mod agents;
 pub mod dashboard;
 pub mod inspector;
 pub mod messages;
+pub mod reservations;
 pub mod system_health;
 pub mod timeline;
+pub mod tool_metrics;
 
 use ftui::layout::Rect;
 use ftui_runtime::program::Cmd;
