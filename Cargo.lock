@@ -4197,6 +4197,8 @@ dependencies = [
  "mcp-agent-mail-guard",
  "mcp-agent-mail-server",
  "mcp-agent-mail-share",
+ "mcp-agent-mail-storage",
+ "mcp-agent-mail-tools",
  "serde",
  "serde_json",
  "sha2",
@@ -4212,12 +4214,14 @@ dependencies = [
 name = "mcp-agent-mail-conformance"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "clap",
  "fastmcp-core",
  "fastmcp-rust",
  "indexmap",
  "insta",
  "mcp-agent-mail-core",
+ "mcp-agent-mail-db",
  "mcp-agent-mail-server",
  "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",

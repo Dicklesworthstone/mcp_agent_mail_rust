@@ -171,6 +171,22 @@ pub enum Commands {
         #[command(subcommand)]
         action: DoctorCommand,
     },
+    #[command(name = "agents")]
+    Agents {
+        #[command(subcommand)]
+        action: AgentsCommand,
+    },
+    #[command(name = "tooling")]
+    Tooling {
+        #[command(subcommand)]
+        action: ToolingCommand,
+    },
+    /// Composite workflow macros (session boot, thread prep, reservation cycles, contact handshake).
+    #[command(name = "macros")]
+    Macros {
+        #[command(subcommand)]
+        action: MacroCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -444,7 +460,123 @@ pub enum ProjectsCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum MailCommand {
-    Status { project_path: PathBuf },
+    Status {
+        project_path: PathBuf,
+    },
+    /// Send a message to one or more agents.
+    Send {
+        /// Project key (slug or human_key).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Sender agent name.
+        #[arg(long = "from")]
+        sender: String,
+        /// Primary recipients (comma-separated agent names).
+        #[arg(long)]
+        to: String,
+        /// Subject line.
+        #[arg(long, short = 's')]
+        subject: String,
+        /// Message body (Markdown).
+        #[arg(long, short = 'b')]
+        body: String,
+        /// CC recipients (comma-separated).
+        #[arg(long)]
+        cc: Option<String>,
+        /// Importance: low, normal, high, urgent.
+        #[arg(long, default_value = "normal")]
+        importance: String,
+        /// Require acknowledgement.
+        #[arg(long, default_value_t = false)]
+        ack_required: bool,
+        /// Thread ID to associate with.
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Reply to an existing message.
+    Reply {
+        /// Project key.
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Sender agent name.
+        #[arg(long = "from")]
+        sender: String,
+        /// Message ID to reply to.
+        #[arg(long)]
+        message_id: i64,
+        /// Reply body (Markdown).
+        #[arg(long, short = 'b')]
+        body: String,
+        /// Override recipients (comma-separated; defaults to original sender).
+        #[arg(long)]
+        to: Option<String>,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Fetch inbox messages for an agent.
+    Inbox {
+        /// Project key.
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent name.
+        #[arg(long = "agent", short = 'a')]
+        agent_name: String,
+        /// Only high/urgent messages.
+        #[arg(long, default_value_t = false)]
+        urgent_only: bool,
+        /// Messages after this ISO-8601 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Max results.
+        #[arg(long, short = 'l', default_value_t = 20)]
+        limit: i64,
+        /// Include message bodies.
+        #[arg(long, default_value_t = false)]
+        include_bodies: bool,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Mark a message as read.
+    Read {
+        /// Project key.
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent name.
+        #[arg(long = "agent", short = 'a')]
+        agent_name: String,
+        /// Message ID.
+        message_id: i64,
+    },
+    /// Acknowledge a message (also marks as read).
+    Ack {
+        /// Project key.
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent name.
+        #[arg(long = "agent", short = 'a')]
+        agent_name: String,
+        /// Message ID.
+        message_id: i64,
+    },
+    /// Full-text search over messages.
+    Search {
+        /// Project key.
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Search query (FTS5 syntax).
+        query: String,
+        /// Max results.
+        #[arg(long, short = 'l', default_value_t = 20)]
+        limit: i64,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -552,6 +684,283 @@ pub enum DoctorCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum AgentsCommand {
+    /// Register or update an agent identity in a project (idempotent).
+    Register {
+        /// Project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent program (e.g. "claude-code", "codex-cli").
+        #[arg(long)]
+        program: String,
+        /// Underlying model (e.g. "opus-4.6", "gpt-5-turbo").
+        #[arg(long)]
+        model: String,
+        /// Agent name (adjective+noun, e.g. "BlueLake"). Auto-generated if omitted.
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+        /// Short description of the agent's current task.
+        #[arg(long, short = 't')]
+        task: Option<String>,
+        /// Attachments policy: auto, inline, file, none.
+        #[arg(long, default_value = "auto")]
+        attachments_policy: String,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Create a new, unique agent identity (never updates existing).
+    Create {
+        /// Project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent program.
+        #[arg(long)]
+        program: String,
+        /// Underlying model.
+        #[arg(long)]
+        model: String,
+        /// Name hint (adjective+noun). Auto-generated if omitted.
+        #[arg(long, short = 'n')]
+        name_hint: Option<String>,
+        /// Short description of the agent's current task.
+        #[arg(long, short = 't')]
+        task: Option<String>,
+        /// Attachments policy: auto, inline, file, none.
+        #[arg(long, default_value = "auto")]
+        attachments_policy: String,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// List agents registered in a project.
+    List {
+        /// Project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show details for a specific agent.
+    Show {
+        /// Project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent name.
+        agent: String,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MacroCommand {
+    /// Boot a project session: ensure project, register agent, reserve files, fetch inbox.
+    #[command(name = "start-session")]
+    StartSession {
+        /// Project human_key (absolute path, e.g. "/data/projects/backend").
+        #[arg(long = "project", short = 'p')]
+        human_key: String,
+        /// Agent program (e.g. "claude-code", "codex-cli").
+        #[arg(long)]
+        program: String,
+        /// Model identifier (e.g. "opus-4.6", "gpt-5").
+        #[arg(long)]
+        model: String,
+        /// Agent name (adjective+noun). Auto-generated if omitted.
+        #[arg(long, short = 'n')]
+        agent_name: Option<String>,
+        /// Short description of agent's current task.
+        #[arg(long, short = 't')]
+        task: Option<String>,
+        /// File paths/globs to reserve (repeatable).
+        #[arg(long = "reserve")]
+        reserve_paths: Vec<String>,
+        /// Reason for file reservations.
+        #[arg(long)]
+        reserve_reason: Option<String>,
+        /// TTL for file reservations in seconds.
+        #[arg(long, default_value_t = 3600)]
+        reserve_ttl: i64,
+        /// Max inbox messages to fetch.
+        #[arg(long, default_value_t = 10)]
+        inbox_limit: i32,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Align with an existing thread: register agent, summarize thread, fetch inbox.
+    #[command(name = "prepare-thread")]
+    PrepareThread {
+        /// Project key (slug or human_key).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Thread ID to prepare for.
+        #[arg(long)]
+        thread_id: String,
+        /// Agent program.
+        #[arg(long)]
+        program: String,
+        /// Model identifier.
+        #[arg(long)]
+        model: String,
+        /// Agent name. Auto-generated if omitted.
+        #[arg(long, short = 'n')]
+        agent_name: Option<String>,
+        /// Short description of agent's current task.
+        #[arg(long, short = 't')]
+        task: Option<String>,
+        /// Register agent if not already exists.
+        #[arg(long, default_value_t = true)]
+        register: bool,
+        /// Do not register agent if missing.
+        #[arg(long = "no-register", conflicts_with = "register")]
+        no_register: bool,
+        /// Include example messages in thread summary.
+        #[arg(long, default_value_t = true)]
+        examples: bool,
+        /// Exclude example messages.
+        #[arg(long = "no-examples", conflicts_with = "examples")]
+        no_examples: bool,
+        /// Include message bodies in inbox.
+        #[arg(long, default_value_t = false)]
+        inbox_bodies: bool,
+        /// Max inbox messages to fetch.
+        #[arg(long, default_value_t = 10)]
+        inbox_limit: i32,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Reserve files and optionally release them at the end.
+    #[command(name = "file-reservation-cycle")]
+    FileReservationCycle {
+        /// Project key (slug or human_key).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent name making reservations.
+        #[arg(long = "agent", short = 'a')]
+        agent_name: String,
+        /// File paths/globs to reserve (repeatable).
+        #[arg(long = "path", required = true)]
+        paths: Vec<String>,
+        /// TTL in seconds (minimum 60).
+        #[arg(long, default_value_t = 3600)]
+        ttl: i64,
+        /// Request exclusive reservations.
+        #[arg(long, default_value_t = true)]
+        exclusive: bool,
+        /// Request shared (non-exclusive) reservations.
+        #[arg(long = "no-exclusive", conflicts_with = "exclusive")]
+        no_exclusive: bool,
+        /// Reason for reservations.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Automatically release reservations after granting.
+        #[arg(long, default_value_t = false)]
+        auto_release: bool,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Request contact approval, optionally auto-approve, and send a welcome message.
+    #[command(name = "contact-handshake")]
+    ContactHandshake {
+        /// Project key (slug or human_key).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Requesting agent name.
+        #[arg(long)]
+        from: String,
+        /// Target agent name.
+        #[arg(long)]
+        to: String,
+        /// Target project if different (cross-project coordination).
+        #[arg(long)]
+        to_project: Option<String>,
+        /// Reason for the contact request.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Auto-approve the contact request.
+        #[arg(long, default_value_t = false)]
+        auto_accept: bool,
+        /// TTL for the contact link in seconds.
+        #[arg(long, default_value_t = 604_800)]
+        ttl: i64,
+        /// Subject for optional welcome message.
+        #[arg(long)]
+        welcome_subject: Option<String>,
+        /// Body for optional welcome message (Markdown).
+        #[arg(long)]
+        welcome_body: Option<String>,
+        /// Thread ID for welcome message.
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// Register requesting agent if not exists.
+        #[arg(long, default_value_t = false)]
+        register_missing: bool,
+        /// Program for auto-registration.
+        #[arg(long)]
+        reg_program: Option<String>,
+        /// Model for auto-registration.
+        #[arg(long)]
+        reg_model: Option<String>,
+        /// Task description for auto-registration.
+        #[arg(long)]
+        reg_task: Option<String>,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ToolingCommand {
+    /// List all available MCP tools with cluster and capability metadata.
+    Directory {
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show tool schemas and parameter definitions.
+    Schemas {
+        /// Filter to a specific tool name.
+        #[arg(long)]
+        tool: Option<String>,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show tool call counts and error rates.
+    Metrics {
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show core system metrics (HTTP/DB/Storage/Locks).
+    #[command(name = "metrics-core")]
+    MetricsCore {
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show comprehensive diagnostic report with health metrics and recommendations.
+    Diagnostics {
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show active archive locks.
+    Locks {
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
 pub fn run() -> i32 {
     let cli = Cli::parse();
     match execute(cli) {
@@ -611,6 +1020,9 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Mail { action } => handle_mail(action),
         Commands::Products { action } => handle_products(action),
         Commands::Docs { action } => handle_docs(action),
+        Commands::Agents { action } => handle_agents(action),
+        Commands::Tooling { action } => handle_tooling(action),
+        Commands::Macros { action } => handle_macros(action),
     }
 }
 
@@ -2509,50 +2921,405 @@ fn handle_doctor_check_with(
 }
 
 fn handle_mail(action: MailCommand) -> CliResult<()> {
-    let conn = open_db_sync()?;
-    handle_mail_with_conn(&conn, action)
+    match action {
+        MailCommand::Status { .. } => {
+            let conn = open_db_sync()?;
+            handle_mail_status_sync(&conn, action)
+        }
+        _ => context::run_async(async move { handle_mail_async(action).await }),
+    }
 }
 
-fn handle_mail_with_conn(
+fn handle_mail_status_sync(
     conn: &sqlmodel_sqlite::SqliteConnection,
     action: MailCommand,
 ) -> CliResult<()> {
+    let MailCommand::Status { project_path } = action else {
+        unreachable!()
+    };
+    let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
+    let slug = &identity.project_uid;
+
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM messages m \
+             JOIN projects p ON p.id = m.project_id \
+             WHERE p.slug = ?",
+            &[sqlmodel_core::Value::Text(slug.to_string())],
+        )
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+    let total: i64 = rows
+        .first()
+        .and_then(|r| r.get_named("cnt").ok())
+        .unwrap_or(0);
+
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM agents a \
+             JOIN projects p ON p.id = a.project_id \
+             WHERE p.slug = ?",
+            &[sqlmodel_core::Value::Text(slug.to_string())],
+        )
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+    let agents: i64 = rows
+        .first()
+        .and_then(|r| r.get_named("cnt").ok())
+        .unwrap_or(0);
+
+    output::section(&format!("Project: {slug}"));
+    output::kv("Messages", &total.to_string());
+    output::kv("Agents", &agents.to_string());
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
+    let ctx = context::AsyncCliContext::open()?;
+    let cx = asupersync::Cx::for_request();
+
     match action {
-        MailCommand::Status { project_path } => {
-            let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
-            let slug = &identity.project_uid;
+        MailCommand::Status { .. } => unreachable!("handled in sync path"),
 
-            // Count messages for this project
-            let rows = conn
-                .query_sync(
-                    "SELECT COUNT(*) AS cnt FROM messages m \
-                     JOIN projects p ON p.id = m.project_id \
-                     WHERE p.slug = ?",
-                    &[sqlmodel_core::Value::Text(slug.to_string())],
+        MailCommand::Send {
+            project_key,
+            sender,
+            to,
+            subject,
+            body,
+            cc,
+            importance,
+            ack_required,
+            thread_id,
+            json,
+        } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+            let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
+
+            // Parse recipients
+            let to_names: Vec<&str> = to
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if to_names.is_empty() {
+                return Err(CliError::InvalidArgument(
+                    "--to requires at least one recipient".into(),
+                ));
+            }
+
+            let mut recipients: Vec<(i64, &str)> = Vec::new();
+            for name in &to_names {
+                let agent = resolve_agent_async(&cx, &ctx.pool, pid, name).await?;
+                recipients.push((agent.id.unwrap_or(0), "to"));
+            }
+            if let Some(ref cc_str) = cc {
+                for name in cc_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let agent = resolve_agent_async(&cx, &ctx.pool, pid, name).await?;
+                    recipients.push((agent.id.unwrap_or(0), "cc"));
+                }
+            }
+
+            let msg = outcome_to_result(
+                mcp_agent_mail_db::queries::create_message_with_recipients(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    sender_row.id.unwrap_or(0),
+                    &subject,
+                    &body,
+                    thread_id.as_deref(),
+                    &importance,
+                    ack_required,
+                    "", // attachments
+                    &recipients,
                 )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let total: i64 = rows
-                .first()
-                .and_then(|r| r.get_named("cnt").ok())
-                .unwrap_or(0);
+                .await,
+            )?;
 
-            // Count agents
-            let rows = conn
-                .query_sync(
-                    "SELECT COUNT(*) AS cnt FROM agents a \
-                     JOIN projects p ON p.id = a.project_id \
-                     WHERE p.slug = ?",
-                    &[sqlmodel_core::Value::Text(slug.to_string())],
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&message_row_to_json(&msg, &sender))
+                        .unwrap_or_default()
+                );
+            } else {
+                output::success(&format!(
+                    "Message sent (id={}) to {}",
+                    msg.id.unwrap_or(0),
+                    to
+                ));
+            }
+            Ok(())
+        }
+
+        MailCommand::Reply {
+            project_key,
+            sender,
+            message_id,
+            body,
+            to,
+            json,
+        } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+            let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
+
+            // Get original message to derive thread_id and default recipient
+            let orig = get_message_by_id_async(&cx, &ctx.pool, message_id).await?;
+            let thread_id = orig
+                .thread_id
+                .clone()
+                .unwrap_or_else(|| message_id.to_string());
+
+            // Determine recipients
+            let to_names: Vec<String> = if let Some(ref explicit_to) = to {
+                explicit_to
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else {
+                // Default to original sender
+                let orig_sender = outcome_to_result(
+                    mcp_agent_mail_db::queries::get_agent_by_id(&cx, &ctx.pool, orig.sender_id)
+                        .await,
+                )?;
+                vec![orig_sender.name.clone()]
+            };
+
+            let mut recipients: Vec<(i64, &str)> = Vec::new();
+            for name in &to_names {
+                let agent = resolve_agent_async(&cx, &ctx.pool, pid, name).await?;
+                recipients.push((agent.id.unwrap_or(0), "to"));
+            }
+
+            // Prefix subject
+            let subject = if orig.subject.to_ascii_lowercase().starts_with("re:") {
+                orig.subject.clone()
+            } else {
+                format!("Re: {}", orig.subject)
+            };
+
+            let msg = outcome_to_result(
+                mcp_agent_mail_db::queries::create_message_with_recipients(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    sender_row.id.unwrap_or(0),
+                    &subject,
+                    &body,
+                    Some(&thread_id),
+                    &orig.importance,
+                    orig.ack_required != 0,
+                    "",
+                    &recipients,
                 )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let agents: i64 = rows
-                .first()
-                .and_then(|r| r.get_named("cnt").ok())
-                .unwrap_or(0);
+                .await,
+            )?;
 
-            output::section(&format!("Project: {slug}"));
-            output::kv("Messages", &total.to_string());
-            output::kv("Agents", &agents.to_string());
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&message_row_to_json(&msg, &sender))
+                        .unwrap_or_default()
+                );
+            } else {
+                output::success(&format!(
+                    "Reply sent (id={}, thread={})",
+                    msg.id.unwrap_or(0),
+                    thread_id
+                ));
+            }
+            Ok(())
+        }
+
+        MailCommand::Inbox {
+            project_key,
+            agent_name,
+            urgent_only,
+            since,
+            limit,
+            include_bodies,
+            json,
+        } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+            let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
+
+            let since_ts = match since.as_deref() {
+                None => None,
+                Some(s) => Some(mcp_agent_mail_db::iso_to_micros(s).ok_or_else(|| {
+                    CliError::InvalidArgument(format!("bad --since timestamp: {s}"))
+                })?),
+            };
+
+            let rows = outcome_to_result(
+                mcp_agent_mail_db::queries::fetch_inbox(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    agent.id.unwrap_or(0),
+                    urgent_only,
+                    since_ts,
+                    limit.max(0) as usize,
+                )
+                .await,
+            )?;
+
+            if json {
+                let data: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| inbox_row_to_json(r, include_bodies))
+                    .collect();
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            if rows.is_empty() {
+                output::empty_result(false, "No messages.");
+                return Ok(());
+            }
+
+            let mut table =
+                output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
+            for r in &rows {
+                table.add_row(vec![
+                    r.message.id.unwrap_or(0).to_string(),
+                    r.sender_name.clone(),
+                    truncate_str(&r.message.subject, 50),
+                    r.message.importance.clone(),
+                    context::format_ts_short(r.message.created_ts),
+                ]);
+            }
+            table.render();
+
+            if include_bodies {
+                for r in &rows {
+                    ftui_runtime::ftui_println!(
+                        "\n--- #{} {} ---",
+                        r.message.id.unwrap_or(0),
+                        r.message.subject
+                    );
+                    ftui_runtime::ftui_println!("{}", r.message.body_md);
+                }
+            }
+            Ok(())
+        }
+
+        MailCommand::Read {
+            project_key,
+            agent_name,
+            message_id,
+        } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+            let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
+
+            let ts = outcome_to_result(
+                mcp_agent_mail_db::queries::mark_message_read(
+                    &cx,
+                    &ctx.pool,
+                    agent.id.unwrap_or(0),
+                    message_id,
+                )
+                .await,
+            )?;
+            output::success(&format!(
+                "Message {message_id} marked as read at {}",
+                context::format_ts(ts)
+            ));
+            Ok(())
+        }
+
+        MailCommand::Ack {
+            project_key,
+            agent_name,
+            message_id,
+        } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+            let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
+
+            let (read_ts, ack_ts) = outcome_to_result(
+                mcp_agent_mail_db::queries::acknowledge_message(
+                    &cx,
+                    &ctx.pool,
+                    agent.id.unwrap_or(0),
+                    message_id,
+                )
+                .await,
+            )?;
+            output::success(&format!(
+                "Message {message_id} acknowledged (read={}, ack={})",
+                context::format_ts(read_ts),
+                context::format_ts(ack_ts)
+            ));
+            Ok(())
+        }
+
+        MailCommand::Search {
+            project_key,
+            query,
+            limit,
+            json,
+        } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+
+            let rows = outcome_to_result(
+                mcp_agent_mail_db::queries::search_messages(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    &query,
+                    limit.max(0) as usize,
+                )
+                .await,
+            )?;
+
+            if json {
+                let data: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "subject": r.subject,
+                            "importance": r.importance,
+                            "ack_required": r.ack_required != 0,
+                            "created_ts": mcp_agent_mail_db::micros_to_iso(r.created_ts),
+                            "thread_id": r.thread_id,
+                            "from": r.from,
+                        })
+                    })
+                    .collect();
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            if rows.is_empty() {
+                output::empty_result(false, "No results.");
+                return Ok(());
+            }
+
+            let mut table =
+                output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
+            for r in &rows {
+                table.add_row(vec![
+                    r.id.to_string(),
+                    r.from.clone(),
+                    truncate_str(&r.subject, 50),
+                    r.importance.clone(),
+                    context::format_ts_short(r.created_ts),
+                ]);
+            }
+            table.render();
             Ok(())
         }
     }
@@ -2592,6 +3359,913 @@ fn handle_amctl(action: AmctlCommand) -> CliResult<()> {
             ftui_runtime::ftui_println!("ARTIFACT_DIR={}", artifact_dir.display());
             Ok(())
         }
+    }
+}
+
+// ── agents command family (br-21gj.4.2) ────────────────────────────────
+
+fn handle_agents(action: AgentsCommand) -> CliResult<()> {
+    context::run_async(async move { handle_agents_async(action).await })
+}
+
+async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
+    let ctx = context::AsyncCliContext::open()?;
+    let cx = asupersync::Cx::for_request();
+
+    match action {
+        AgentsCommand::Register {
+            project_key,
+            program,
+            model,
+            name,
+            task,
+            attachments_policy,
+            json,
+        } => {
+            let program = program.trim().to_string();
+            if program.is_empty() {
+                return Err(CliError::InvalidArgument("program cannot be empty".into()));
+            }
+            let model = model.trim().to_string();
+            if model.is_empty() {
+                return Err(CliError::InvalidArgument("model cannot be empty".into()));
+            }
+
+            // Resolve project
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+
+            // Resolve or generate agent name
+            let agent_name = name.unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
+
+            let row = match mcp_agent_mail_db::queries::register_agent(
+                &cx,
+                &ctx.pool,
+                proj.id.unwrap_or(0),
+                &agent_name,
+                &program,
+                &model,
+                task.as_deref(),
+                Some(attachments_policy.as_str()),
+            )
+            .await
+            {
+                asupersync::Outcome::Ok(r) => r,
+                asupersync::Outcome::Err(e) => {
+                    return Err(CliError::Other(format!("register_agent failed: {e}")));
+                }
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".into()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            };
+
+            render_agent_row(&row, json);
+            Ok(())
+        }
+
+        AgentsCommand::Create {
+            project_key,
+            program,
+            model,
+            name_hint,
+            task,
+            attachments_policy,
+            json,
+        } => {
+            let program = program.trim().to_string();
+            if program.is_empty() {
+                return Err(CliError::InvalidArgument("program cannot be empty".into()));
+            }
+            let model = model.trim().to_string();
+            if model.is_empty() {
+                return Err(CliError::InvalidArgument("model cannot be empty".into()));
+            }
+
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+
+            let agent_name =
+                name_hint.unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
+
+            // Enforce uniqueness: check if agent already exists
+            let existing = match mcp_agent_mail_db::queries::get_agent(
+                &cx,
+                &ctx.pool,
+                proj.id.unwrap_or(0),
+                &agent_name,
+            )
+            .await
+            {
+                asupersync::Outcome::Ok(row) => Some(row),
+                asupersync::Outcome::Err(_) => None,
+                asupersync::Outcome::Cancelled(_) => None,
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            };
+
+            if existing.is_some() {
+                return Err(CliError::InvalidArgument(format!(
+                    "agent name already exists in this project: {agent_name}"
+                )));
+            }
+
+            let row = match mcp_agent_mail_db::queries::register_agent(
+                &cx,
+                &ctx.pool,
+                proj.id.unwrap_or(0),
+                &agent_name,
+                &program,
+                &model,
+                task.as_deref(),
+                Some(attachments_policy.as_str()),
+            )
+            .await
+            {
+                asupersync::Outcome::Ok(r) => r,
+                asupersync::Outcome::Err(e) => {
+                    return Err(CliError::Other(format!("create_agent failed: {e}")));
+                }
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".into()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            };
+
+            render_agent_row(&row, json);
+            Ok(())
+        }
+
+        AgentsCommand::List { project_key, json } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+
+            let agents =
+                match mcp_agent_mail_db::queries::list_agents(&cx, &ctx.pool, proj.id.unwrap_or(0))
+                    .await
+                {
+                    asupersync::Outcome::Ok(rows) => rows,
+                    asupersync::Outcome::Err(e) => {
+                        return Err(CliError::Other(format!("list_agents failed: {e}")));
+                    }
+                    asupersync::Outcome::Cancelled(_) => {
+                        return Err(CliError::Other("request cancelled".into()));
+                    }
+                    asupersync::Outcome::Panicked(p) => {
+                        return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                    }
+                };
+
+            if json {
+                let data: Vec<serde_json::Value> = agents.iter().map(agent_row_to_json).collect();
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            if agents.is_empty() {
+                output::empty_result(false, "No agents found.");
+                return Ok(());
+            }
+
+            let mut table =
+                output::CliTable::new(vec!["NAME", "PROGRAM", "MODEL", "TASK", "LAST_ACTIVE"]);
+            for a in &agents {
+                table.add_row(vec![
+                    a.name.clone(),
+                    a.program.clone(),
+                    a.model.clone(),
+                    truncate_str(&a.task_description, 40),
+                    context::format_ts_short(a.last_active_ts),
+                ]);
+            }
+            table.render();
+            Ok(())
+        }
+
+        AgentsCommand::Show {
+            project_key,
+            agent,
+            json,
+        } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+
+            let row = match mcp_agent_mail_db::queries::get_agent(
+                &cx,
+                &ctx.pool,
+                proj.id.unwrap_or(0),
+                &agent,
+            )
+            .await
+            {
+                asupersync::Outcome::Ok(r) => r,
+                asupersync::Outcome::Err(e) => {
+                    return Err(CliError::InvalidArgument(format!(
+                        "agent not found: {agent} ({e})"
+                    )));
+                }
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".into()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            };
+
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&agent_row_to_json(&row)).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            output::section(&format!("Agent: {}", row.name));
+            output::kv("ID", &row.id.unwrap_or(0).to_string());
+            output::kv("Program", &row.program);
+            output::kv("Model", &row.model);
+            output::kv("Task", &row.task_description);
+            output::kv("Attachments", &row.attachments_policy);
+            output::kv("Contact Policy", &row.contact_policy);
+            output::kv("Inception", &context::format_ts(row.inception_ts));
+            output::kv("Last Active", &context::format_ts(row.last_active_ts));
+            Ok(())
+        }
+    }
+}
+
+/// Resolve a project key to a `ProjectRow` via the async DB layer.
+async fn resolve_project_async(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    key: &str,
+) -> CliResult<mcp_agent_mail_db::ProjectRow> {
+    // Try by slug first
+    let by_slug = mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, key).await;
+    if let asupersync::Outcome::Ok(row) = by_slug {
+        return Ok(row);
+    }
+
+    // Try by human_key
+    let by_hk = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, key).await;
+    if let asupersync::Outcome::Ok(row) = by_hk {
+        return Ok(row);
+    }
+
+    // If it looks like an absolute path, auto-create it
+    if key.starts_with('/') {
+        let proj = mcp_agent_mail_db::queries::ensure_project(cx, pool, key).await;
+        return match proj {
+            asupersync::Outcome::Ok(row) => Ok(row),
+            asupersync::Outcome::Err(e) => {
+                Err(CliError::Other(format!("ensure_project failed: {e}")))
+            }
+            asupersync::Outcome::Cancelled(_) => Err(CliError::Other("request cancelled".into())),
+            asupersync::Outcome::Panicked(p) => {
+                return Err(CliError::Other(format!("internal panic: {}", p.message())));
+            }
+        };
+    }
+
+    Err(CliError::InvalidArgument(format!(
+        "project not found: {key}"
+    )))
+}
+
+fn agent_row_to_json(a: &mcp_agent_mail_db::AgentRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": a.id.unwrap_or(0),
+        "name": a.name,
+        "program": a.program,
+        "model": a.model,
+        "task_description": a.task_description,
+        "inception_ts": mcp_agent_mail_db::micros_to_iso(a.inception_ts),
+        "last_active_ts": mcp_agent_mail_db::micros_to_iso(a.last_active_ts),
+        "project_id": a.project_id,
+        "attachments_policy": a.attachments_policy,
+        "contact_policy": a.contact_policy,
+    })
+}
+
+fn render_agent_row(row: &mcp_agent_mail_db::AgentRow, json: bool) {
+    if json {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string_pretty(&agent_row_to_json(row)).unwrap_or_default()
+        );
+    } else {
+        output::success(&format!("Agent: {}", row.name));
+        output::kv("ID", &row.id.unwrap_or(0).to_string());
+        output::kv("Program", &row.program);
+        output::kv("Model", &row.model);
+        output::kv("Task", &row.task_description);
+        output::kv("Attachments", &row.attachments_policy);
+        output::kv("Inception", &context::format_ts(row.inception_ts));
+        output::kv("Last Active", &context::format_ts(row.last_active_ts));
+    }
+}
+
+// ── Macro command handler ────────────────────────────────────────────
+
+fn handle_macros(action: MacroCommand) -> CliResult<()> {
+    context::run_async(async move { handle_macros_async(action).await })
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
+    let ctx = context::AsyncCliContext::open()?;
+    let cx = asupersync::Cx::for_request();
+
+    match action {
+        MacroCommand::StartSession {
+            human_key,
+            program,
+            model,
+            agent_name,
+            task,
+            reserve_paths,
+            reserve_reason,
+            reserve_ttl,
+            inbox_limit,
+            json,
+        } => {
+            // Validate human_key is absolute
+            if !human_key.starts_with('/') {
+                return Err(CliError::InvalidArgument(
+                    "project key must be an absolute path (e.g. /data/projects/backend)".into(),
+                ));
+            }
+
+            // 1. Ensure project
+            let proj = resolve_project_async(&cx, &ctx.pool, &human_key).await?;
+            let pid = proj.id.unwrap_or(0);
+
+            // 2. Register agent
+            let agent_name =
+                agent_name.unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
+            let agent = outcome_to_result(
+                mcp_agent_mail_db::queries::register_agent(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    &agent_name,
+                    &program,
+                    &model,
+                    task.as_deref(),
+                    Some("auto"),
+                )
+                .await,
+            )?;
+
+            // 3. Reserve files (if any paths given)
+            let reservations = if reserve_paths.is_empty() {
+                Vec::new()
+            } else {
+                let path_refs: Vec<&str> = reserve_paths.iter().map(String::as_str).collect();
+                let reason = reserve_reason.unwrap_or_else(|| "macro-session".to_string());
+                outcome_to_result(
+                    mcp_agent_mail_db::queries::create_file_reservations(
+                        &cx,
+                        &ctx.pool,
+                        pid,
+                        agent.id.unwrap_or(0),
+                        &path_refs,
+                        reserve_ttl,
+                        true, // exclusive
+                        &reason,
+                    )
+                    .await,
+                )?
+            };
+
+            // 4. Fetch inbox
+            let inbox = outcome_to_result(
+                mcp_agent_mail_db::queries::fetch_inbox(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    agent.id.unwrap_or(0),
+                    false,
+                    None,
+                    inbox_limit as usize,
+                )
+                .await,
+            )?;
+
+            if json {
+                let resp = serde_json::json!({
+                    "project": {
+                        "id": pid,
+                        "slug": proj.slug,
+                        "human_key": proj.human_key,
+                        "created_at": mcp_agent_mail_db::micros_to_iso(proj.created_at),
+                    },
+                    "agent": agent_row_to_json(&agent),
+                    "file_reservations": {
+                        "granted": reservations.iter().map(|r| serde_json::json!({
+                            "id": r.id.unwrap_or(0),
+                            "path_pattern": r.path_pattern,
+                            "exclusive": r.exclusive != 0,
+                            "reason": r.reason,
+                            "expires_ts": mcp_agent_mail_db::micros_to_iso(r.expires_ts),
+                        })).collect::<Vec<_>>(),
+                        "conflicts": [],
+                    },
+                    "inbox": inbox.iter().map(|r| inbox_row_to_json(r, false)).collect::<Vec<_>>(),
+                });
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_default()
+                );
+            } else {
+                output::success(&format!("Session started for project: {}", proj.slug));
+                output::kv("Agent", &agent.name);
+                output::kv("Program", &program);
+                output::kv("Model", &model);
+                if !reservations.is_empty() {
+                    output::kv(
+                        "Reservations",
+                        &format!("{} path(s) reserved", reservations.len()),
+                    );
+                }
+                output::kv("Inbox", &format!("{} message(s)", inbox.len()));
+            }
+            Ok(())
+        }
+
+        MacroCommand::PrepareThread {
+            project_key,
+            thread_id,
+            program,
+            model,
+            agent_name,
+            task,
+            register,
+            no_register,
+            examples,
+            no_examples,
+            inbox_bodies,
+            inbox_limit,
+            json,
+        } => {
+            let should_register = context::resolve_bool(register, no_register, true);
+            let include_examples = context::resolve_bool(examples, no_examples, true);
+
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+
+            // Register or resolve agent
+            let agent = if should_register {
+                let name =
+                    agent_name.unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
+                outcome_to_result(
+                    mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &ctx.pool,
+                        pid,
+                        &name,
+                        &program,
+                        &model,
+                        task.as_deref(),
+                        Some("auto"),
+                    )
+                    .await,
+                )?
+            } else {
+                let name = agent_name.ok_or_else(|| {
+                    CliError::InvalidArgument(
+                        "agent name is required when --no-register is set".into(),
+                    )
+                })?;
+                resolve_agent_async(&cx, &ctx.pool, pid, &name).await?
+            };
+
+            // Get thread messages
+            let messages = outcome_to_result(
+                mcp_agent_mail_db::queries::list_thread_messages(
+                    &cx, &ctx.pool, pid, &thread_id, None,
+                )
+                .await,
+            )?;
+
+            let total_messages = messages.len();
+
+            // Collect participants
+            let mut participants: Vec<String> = messages
+                .iter()
+                .map(|m| m.from.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            participants.sort();
+
+            let example_msgs: Vec<serde_json::Value> = if include_examples {
+                messages
+                    .iter()
+                    .take(3)
+                    .map(|m| {
+                        serde_json::json!({
+                            "id": m.id,
+                            "from": m.from,
+                            "subject": m.subject,
+                            "created_ts": mcp_agent_mail_db::micros_to_iso(m.created_ts),
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // Fetch inbox
+            let inbox = outcome_to_result(
+                mcp_agent_mail_db::queries::fetch_inbox(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    agent.id.unwrap_or(0),
+                    false,
+                    None,
+                    inbox_limit as usize,
+                )
+                .await,
+            )?;
+
+            if json {
+                let resp = serde_json::json!({
+                    "project": {
+                        "id": pid,
+                        "slug": proj.slug,
+                        "human_key": proj.human_key,
+                    },
+                    "agent": agent_row_to_json(&agent),
+                    "thread": {
+                        "thread_id": thread_id,
+                        "total_messages": total_messages,
+                        "participants": participants,
+                        "examples": example_msgs,
+                    },
+                    "inbox": inbox.iter().map(|r| inbox_row_to_json(r, inbox_bodies)).collect::<Vec<_>>(),
+                });
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_default()
+                );
+            } else {
+                output::success(&format!("Thread prepared: {thread_id}"));
+                output::kv("Agent", &agent.name);
+                output::kv("Messages", &total_messages.to_string());
+                output::kv("Participants", &participants.join(", "));
+                if include_examples && !example_msgs.is_empty() {
+                    output::section("Examples:");
+                    for ex in &example_msgs {
+                        ftui_runtime::ftui_println!(
+                            "  #{} from {} — {}",
+                            ex["id"],
+                            ex["from"].as_str().unwrap_or("?"),
+                            ex["subject"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+                output::kv("Inbox", &format!("{} message(s)", inbox.len()));
+            }
+            Ok(())
+        }
+
+        MacroCommand::FileReservationCycle {
+            project_key,
+            agent_name,
+            paths,
+            ttl,
+            exclusive,
+            no_exclusive,
+            reason,
+            auto_release,
+            json,
+        } => {
+            let is_exclusive = context::resolve_bool(exclusive, no_exclusive, true);
+
+            if ttl < 60 {
+                return Err(CliError::InvalidArgument(
+                    "ttl must be at least 60 seconds".into(),
+                ));
+            }
+
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+            let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
+            let aid = agent.id.unwrap_or(0);
+
+            let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let reason_str = reason.unwrap_or_else(|| "macro-file_reservation".to_string());
+
+            let reservations = outcome_to_result(
+                mcp_agent_mail_db::queries::create_file_reservations(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    aid,
+                    &path_refs,
+                    ttl,
+                    is_exclusive,
+                    &reason_str,
+                )
+                .await,
+            )?;
+
+            let released = if auto_release {
+                let count = outcome_to_result(
+                    mcp_agent_mail_db::queries::release_reservations(
+                        &cx,
+                        &ctx.pool,
+                        pid,
+                        aid,
+                        Some(&path_refs),
+                        None,
+                    )
+                    .await,
+                )?;
+                Some(count)
+            } else {
+                None
+            };
+
+            if json {
+                let resp = serde_json::json!({
+                    "file_reservations": {
+                        "granted": reservations.iter().map(|r| serde_json::json!({
+                            "id": r.id.unwrap_or(0),
+                            "path_pattern": r.path_pattern,
+                            "exclusive": r.exclusive != 0,
+                            "reason": r.reason,
+                            "expires_ts": mcp_agent_mail_db::micros_to_iso(r.expires_ts),
+                        })).collect::<Vec<_>>(),
+                        "conflicts": [],
+                    },
+                    "released": released.map(|n| serde_json::json!({
+                        "released": n,
+                        "released_at": mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::timestamps::now_micros()),
+                    })),
+                });
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_default()
+                );
+            } else {
+                output::success(&format!(
+                    "{} reservation(s) granted for {}",
+                    reservations.len(),
+                    agent_name
+                ));
+                for r in &reservations {
+                    output::kv(
+                        "  Path",
+                        &format!(
+                            "{} (exclusive={}, expires={})",
+                            r.path_pattern,
+                            r.exclusive != 0,
+                            mcp_agent_mail_db::micros_to_iso(r.expires_ts)
+                        ),
+                    );
+                }
+                if let Some(n) = released {
+                    output::kv("Released", &n.to_string());
+                }
+            }
+            Ok(())
+        }
+
+        MacroCommand::ContactHandshake {
+            project_key,
+            from,
+            to,
+            to_project,
+            reason,
+            auto_accept,
+            ttl,
+            welcome_subject,
+            welcome_body,
+            thread_id,
+            register_missing,
+            reg_program,
+            reg_model,
+            reg_task,
+            json,
+        } => {
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+
+            // Resolve from agent
+            let from_agent = resolve_agent_async(&cx, &ctx.pool, pid, &from).await?;
+
+            // Resolve target project + agent
+            let (target_pid, target_proj_slug) = if let Some(ref tp) = to_project {
+                let target = resolve_project_async(&cx, &ctx.pool, tp).await?;
+                (target.id.unwrap_or(0), target.slug.clone())
+            } else {
+                (pid, proj.slug.clone())
+            };
+
+            // Resolve or register target agent
+            let to_agent = match resolve_agent_async(&cx, &ctx.pool, target_pid, &to).await {
+                Ok(a) => a,
+                Err(_) if register_missing => {
+                    let program = reg_program.unwrap_or_else(|| "unknown".to_string());
+                    let model = reg_model.unwrap_or_else(|| "unknown".to_string());
+                    outcome_to_result(
+                        mcp_agent_mail_db::queries::register_agent(
+                            &cx,
+                            &ctx.pool,
+                            target_pid,
+                            &to,
+                            &program,
+                            &model,
+                            reg_task.as_deref(),
+                            Some("auto"),
+                        )
+                        .await,
+                    )?
+                }
+                Err(e) => return Err(e),
+            };
+
+            let ttl_clamped = if ttl < 60 { 60 } else { ttl };
+
+            // 1. Request contact
+            let _link = outcome_to_result(
+                mcp_agent_mail_db::queries::request_contact(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    from_agent.id.unwrap_or(0),
+                    target_pid,
+                    to_agent.id.unwrap_or(0),
+                    reason.as_deref().unwrap_or(""),
+                    ttl_clamped,
+                )
+                .await,
+            )?;
+
+            // 2. Auto-accept
+            let response_val = if auto_accept {
+                let (_, approved) = outcome_to_result(
+                    mcp_agent_mail_db::queries::respond_contact(
+                        &cx,
+                        &ctx.pool,
+                        pid,
+                        from_agent.id.unwrap_or(0),
+                        target_pid,
+                        to_agent.id.unwrap_or(0),
+                        true,
+                        ttl_clamped,
+                    )
+                    .await,
+                )?;
+                Some(serde_json::json!({
+                    "status": approved.status,
+                    "expires_ts": approved.expires_ts.map(mcp_agent_mail_db::micros_to_iso),
+                }))
+            } else {
+                None
+            };
+
+            // 3. Welcome message
+            let welcome_val = if let (Some(subject), Some(body)) = (welcome_subject, welcome_body) {
+                if to_project.is_none() {
+                    let msg = outcome_to_result(
+                        mcp_agent_mail_db::queries::create_message_with_recipients(
+                            &cx,
+                            &ctx.pool,
+                            pid,
+                            from_agent.id.unwrap_or(0),
+                            &subject,
+                            &body,
+                            thread_id.as_deref(),
+                            "normal",
+                            false,
+                            "",
+                            &[(to_agent.id.unwrap_or(0), "to")],
+                        )
+                        .await,
+                    )?;
+                    Some(message_row_to_json(&msg, &from))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if json {
+                let resp = serde_json::json!({
+                    "request": {
+                        "from": from,
+                        "from_project": proj.slug,
+                        "to": to,
+                        "to_project": target_proj_slug,
+                    },
+                    "response": response_val,
+                    "welcome_message": welcome_val,
+                });
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_default()
+                );
+            } else {
+                output::success(&format!("Contact handshake: {from} → {to}"));
+                if auto_accept {
+                    output::kv("Status", "approved");
+                } else {
+                    output::kv("Status", "pending");
+                }
+                if welcome_val.is_some() {
+                    output::kv("Welcome", "sent");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Resolve an agent by name within a project via the async DB layer.
+async fn resolve_agent_async(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    agent_name: &str,
+) -> CliResult<mcp_agent_mail_db::AgentRow> {
+    outcome_to_result(mcp_agent_mail_db::queries::get_agent(cx, pool, project_id, agent_name).await)
+        .map_err(|_| CliError::InvalidArgument(format!("agent not found: {agent_name}")))
+}
+
+/// Convert an asupersync `Outcome` to a `CliResult`.
+fn outcome_to_result<T>(
+    outcome: asupersync::Outcome<T, mcp_agent_mail_db::DbError>,
+) -> CliResult<T> {
+    match outcome {
+        asupersync::Outcome::Ok(v) => Ok(v),
+        asupersync::Outcome::Err(e) => Err(CliError::Other(format!("{e}"))),
+        asupersync::Outcome::Cancelled(_) => Err(CliError::Other("request cancelled".into())),
+        asupersync::Outcome::Panicked(p) => {
+            Err(CliError::Other(format!("internal panic: {}", p.message())))
+        }
+    }
+}
+
+/// Get a message by ID via the async DB layer.
+async fn get_message_by_id_async(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    message_id: i64,
+) -> CliResult<mcp_agent_mail_db::MessageRow> {
+    outcome_to_result(mcp_agent_mail_db::queries::get_message(cx, pool, message_id).await)
+        .map_err(|_| CliError::InvalidArgument(format!("message not found: {message_id}")))
+}
+
+fn message_row_to_json(m: &mcp_agent_mail_db::MessageRow, sender_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": m.id.unwrap_or(0),
+        "subject": m.subject,
+        "body_md": m.body_md,
+        "importance": m.importance,
+        "ack_required": m.ack_required != 0,
+        "thread_id": m.thread_id,
+        "created_ts": mcp_agent_mail_db::micros_to_iso(m.created_ts),
+        "from": sender_name,
+    })
+}
+
+fn inbox_row_to_json(
+    r: &mcp_agent_mail_db::queries::InboxRow,
+    include_body: bool,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": r.message.id.unwrap_or(0),
+        "subject": r.message.subject,
+        "from": r.sender_name,
+        "importance": r.message.importance,
+        "ack_required": r.message.ack_required != 0,
+        "created_ts": mcp_agent_mail_db::micros_to_iso(r.message.created_ts),
+        "kind": r.kind,
+        "thread_id": r.message.thread_id,
+    });
+    if include_body {
+        v.as_object_mut().unwrap().insert(
+            "body_md".to_string(),
+            serde_json::Value::String(r.message.body_md.clone()),
+        );
+    }
+    v
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max.saturating_sub(3)])
     }
 }
 
@@ -6273,6 +7947,7 @@ sys.exit(7)
             "products",
             "docs",
             "doctor",
+            "macros",
         ];
         for cmd in expected {
             assert!(
@@ -7184,7 +8859,7 @@ sys.exit(7)
         let conn = seed_mail_status_db(&db_path, project_path);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_mail_with_conn(
+        let result = handle_mail_status_sync(
             &conn,
             MailCommand::Status {
                 project_path: PathBuf::from(project_path),
@@ -7212,7 +8887,7 @@ sys.exit(7)
         let conn = seed_mail_status_db(&db_path, "/tmp/some-project");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_mail_with_conn(
+        let result = handle_mail_status_sync(
             &conn,
             MailCommand::Status {
                 project_path: PathBuf::from("/tmp/nonexistent"),
@@ -7485,6 +9160,472 @@ sys.exit(7)
             aliases.contains("src-proj"),
             "aliases.json should contain former source slug"
         );
+    }
+
+    // ── br-21gj.4.6: macro command parsing ─────────────────────────────
+
+    #[test]
+    fn clap_parses_macros_start_session_minimal() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "start-session",
+            "-p",
+            "/tmp/proj",
+            "--program",
+            "claude-code",
+            "--model",
+            "opus-4.6",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Macros {
+                action:
+                    MacroCommand::StartSession {
+                        human_key,
+                        program,
+                        model,
+                        agent_name,
+                        task,
+                        reserve_paths,
+                        inbox_limit,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(human_key, "/tmp/proj");
+                assert_eq!(program, "claude-code");
+                assert_eq!(model, "opus-4.6");
+                assert!(agent_name.is_none());
+                assert!(task.is_none());
+                assert!(reserve_paths.is_empty());
+                assert_eq!(inbox_limit, 10);
+                assert!(!json);
+            }
+            other => panic!("expected Macros StartSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_macros_start_session_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "start-session",
+            "-p",
+            "/tmp/proj",
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5",
+            "-n",
+            "BlueLake",
+            "-t",
+            "DB migration",
+            "--reserve",
+            "src/**",
+            "--reserve",
+            "tests/**",
+            "--reserve-reason",
+            "editing",
+            "--reserve-ttl",
+            "7200",
+            "--inbox-limit",
+            "25",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Macros {
+                action:
+                    MacroCommand::StartSession {
+                        human_key,
+                        program,
+                        model,
+                        agent_name,
+                        task,
+                        reserve_paths,
+                        reserve_reason,
+                        reserve_ttl,
+                        inbox_limit,
+                        json,
+                    },
+            } => {
+                assert_eq!(human_key, "/tmp/proj");
+                assert_eq!(program, "codex-cli");
+                assert_eq!(model, "gpt-5");
+                assert_eq!(agent_name.as_deref(), Some("BlueLake"));
+                assert_eq!(task.as_deref(), Some("DB migration"));
+                assert_eq!(reserve_paths, vec!["src/**", "tests/**"]);
+                assert_eq!(reserve_reason.as_deref(), Some("editing"));
+                assert_eq!(reserve_ttl, 7200);
+                assert_eq!(inbox_limit, 25);
+                assert!(json);
+            }
+            other => panic!("expected Macros StartSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_macros_prepare_thread_minimal() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "prepare-thread",
+            "-p",
+            "/tmp/proj",
+            "--thread-id",
+            "TKT-42",
+            "--program",
+            "claude-code",
+            "--model",
+            "opus-4.6",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Macros {
+                action:
+                    MacroCommand::PrepareThread {
+                        project_key,
+                        thread_id,
+                        program,
+                        model,
+                        agent_name,
+                        inbox_limit,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(project_key, "/tmp/proj");
+                assert_eq!(thread_id, "TKT-42");
+                assert_eq!(program, "claude-code");
+                assert_eq!(model, "opus-4.6");
+                assert!(agent_name.is_none());
+                assert_eq!(inbox_limit, 10);
+                assert!(!json);
+            }
+            other => panic!("expected Macros PrepareThread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_macros_prepare_thread_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "prepare-thread",
+            "-p",
+            "/tmp/proj",
+            "--thread-id",
+            "TKT-99",
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5",
+            "-n",
+            "RedFox",
+            "-t",
+            "thread review",
+            "--no-register",
+            "--no-examples",
+            "--inbox-bodies",
+            "--inbox-limit",
+            "5",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Macros {
+                action:
+                    MacroCommand::PrepareThread {
+                        project_key,
+                        thread_id,
+                        program,
+                        model,
+                        agent_name,
+                        task,
+                        no_register,
+                        no_examples,
+                        inbox_bodies,
+                        inbox_limit,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(project_key, "/tmp/proj");
+                assert_eq!(thread_id, "TKT-99");
+                assert_eq!(program, "codex-cli");
+                assert_eq!(model, "gpt-5");
+                assert_eq!(agent_name.as_deref(), Some("RedFox"));
+                assert_eq!(task.as_deref(), Some("thread review"));
+                assert!(no_register);
+                assert!(no_examples);
+                assert!(inbox_bodies);
+                assert_eq!(inbox_limit, 5);
+                assert!(json);
+            }
+            other => panic!("expected Macros PrepareThread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_macros_file_reservation_cycle_minimal() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "file-reservation-cycle",
+            "-p",
+            "/tmp/proj",
+            "-a",
+            "BlueLake",
+            "--path",
+            "src/**",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Macros {
+                action:
+                    MacroCommand::FileReservationCycle {
+                        project_key,
+                        agent_name,
+                        paths,
+                        ttl,
+                        auto_release,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(project_key, "/tmp/proj");
+                assert_eq!(agent_name, "BlueLake");
+                assert_eq!(paths, vec!["src/**"]);
+                assert_eq!(ttl, 3600);
+                assert!(!auto_release);
+                assert!(!json);
+            }
+            other => panic!("expected Macros FileReservationCycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_macros_file_reservation_cycle_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "file-reservation-cycle",
+            "-p",
+            "/tmp/proj",
+            "-a",
+            "RedFox",
+            "--path",
+            "src/**",
+            "--path",
+            "tests/**",
+            "--ttl",
+            "7200",
+            "--no-exclusive",
+            "--reason",
+            "refactoring",
+            "--auto-release",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Macros {
+                action:
+                    MacroCommand::FileReservationCycle {
+                        project_key,
+                        agent_name,
+                        paths,
+                        ttl,
+                        no_exclusive,
+                        reason,
+                        auto_release,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(project_key, "/tmp/proj");
+                assert_eq!(agent_name, "RedFox");
+                assert_eq!(paths, vec!["src/**", "tests/**"]);
+                assert_eq!(ttl, 7200);
+                assert!(no_exclusive);
+                assert_eq!(reason.as_deref(), Some("refactoring"));
+                assert!(auto_release);
+                assert!(json);
+            }
+            other => panic!("expected Macros FileReservationCycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_macros_contact_handshake_minimal() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "contact-handshake",
+            "-p",
+            "/tmp/proj",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Macros {
+                action:
+                    MacroCommand::ContactHandshake {
+                        project_key,
+                        from,
+                        to,
+                        to_project,
+                        auto_accept,
+                        ttl,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(project_key, "/tmp/proj");
+                assert_eq!(from, "BlueLake");
+                assert_eq!(to, "RedFox");
+                assert!(to_project.is_none());
+                assert!(!auto_accept);
+                assert_eq!(ttl, 604_800);
+                assert!(!json);
+            }
+            other => panic!("expected Macros ContactHandshake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_macros_contact_handshake_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "contact-handshake",
+            "-p",
+            "/tmp/proj",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+            "--to-project",
+            "/tmp/other",
+            "--reason",
+            "collaboration",
+            "--auto-accept",
+            "--ttl",
+            "86400",
+            "--welcome-subject",
+            "Hello!",
+            "--welcome-body",
+            "Let's work together.",
+            "--thread-id",
+            "TKT-1",
+            "--register-missing",
+            "--reg-program",
+            "claude-code",
+            "--reg-model",
+            "opus-4.6",
+            "--reg-task",
+            "coordination",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Macros {
+                action:
+                    MacroCommand::ContactHandshake {
+                        project_key,
+                        from,
+                        to,
+                        to_project,
+                        reason,
+                        auto_accept,
+                        ttl,
+                        welcome_subject,
+                        welcome_body,
+                        thread_id,
+                        register_missing,
+                        reg_program,
+                        reg_model,
+                        reg_task,
+                        json,
+                    },
+            } => {
+                assert_eq!(project_key, "/tmp/proj");
+                assert_eq!(from, "BlueLake");
+                assert_eq!(to, "RedFox");
+                assert_eq!(to_project.as_deref(), Some("/tmp/other"));
+                assert_eq!(reason.as_deref(), Some("collaboration"));
+                assert!(auto_accept);
+                assert_eq!(ttl, 86400);
+                assert_eq!(welcome_subject.as_deref(), Some("Hello!"));
+                assert_eq!(welcome_body.as_deref(), Some("Let's work together."));
+                assert_eq!(thread_id.as_deref(), Some("TKT-1"));
+                assert!(register_missing);
+                assert_eq!(reg_program.as_deref(), Some("claude-code"));
+                assert_eq!(reg_model.as_deref(), Some("opus-4.6"));
+                assert_eq!(reg_task.as_deref(), Some("coordination"));
+                assert!(json);
+            }
+            other => panic!("expected Macros ContactHandshake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_macros_lists_subcommands() {
+        let h = help_text_for(&["am", "macros", "--help"]);
+        for cmd in [
+            "start-session",
+            "prepare-thread",
+            "file-reservation-cycle",
+            "contact-handshake",
+        ] {
+            assert!(
+                h.contains(cmd),
+                "macros help missing subcommand '{cmd}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_macros_start_session_lists_flags() {
+        let h = help_text_for(&["am", "macros", "start-session", "--help"]);
+        for flag in ["--project", "--program", "--model", "--reserve", "--inbox-limit", "--json"] {
+            assert!(
+                h.contains(flag),
+                "macros start-session help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn clap_rejects_macros_start_session_missing_project() {
+        let err = Cli::try_parse_from([
+            "am",
+            "macros",
+            "start-session",
+            "--program",
+            "test",
+            "--model",
+            "test",
+        ]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn clap_rejects_macros_file_reservation_cycle_missing_paths() {
+        let err = Cli::try_parse_from([
+            "am",
+            "macros",
+            "file-reservation-cycle",
+            "-p",
+            "/tmp/proj",
+            "-a",
+            "BlueLake",
+        ]);
+        assert!(err.is_err());
     }
 }
 
@@ -11586,6 +13727,433 @@ fn run_share_preview_with_control(
 
     if deployment_requested {
         return Err(CliError::ExitCode(42));
+    }
+    Ok(())
+}
+
+// ── Tooling + Diagnostics CLI handlers ────────────────────────────────
+
+fn handle_tooling(action: ToolingCommand) -> CliResult<()> {
+    match action {
+        ToolingCommand::Directory { json } => handle_tooling_directory(json),
+        ToolingCommand::Schemas { tool, json } => handle_tooling_schemas(tool, json),
+        ToolingCommand::Metrics { json } => handle_tooling_metrics(json),
+        ToolingCommand::MetricsCore { json } => handle_tooling_metrics_core(json),
+        ToolingCommand::Diagnostics { json } => handle_tooling_diagnostics(json),
+        ToolingCommand::Locks { json } => handle_tooling_locks(json),
+    }
+}
+
+fn handle_tooling_directory(json_mode: bool) -> CliResult<()> {
+    let cluster_map = mcp_agent_mail_tools::TOOL_CLUSTER_MAP;
+
+    if json_mode {
+        let mut clusters: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for &(tool, cluster) in cluster_map {
+            clusters
+                .entry(cluster.to_string())
+                .or_default()
+                .push(tool.to_string());
+        }
+        let val = serde_json::json!({
+            "tool_count": cluster_map.len(),
+            "clusters": clusters,
+        });
+        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+    } else {
+        output::section("Tool Directory:");
+        output::kv("Total tools", &cluster_map.len().to_string());
+        ftui_runtime::ftui_println!("");
+
+        let mut table = output::CliTable::new(vec!["TOOL", "CLUSTER"]);
+        for &(tool, cluster) in cluster_map {
+            table.add_row(vec![tool.to_string(), cluster.to_string()]);
+        }
+        table.render();
+    }
+    Ok(())
+}
+
+fn handle_tooling_schemas(filter_tool: Option<String>, json_mode: bool) -> CliResult<()> {
+    let cluster_map = mcp_agent_mail_tools::TOOL_CLUSTER_MAP;
+
+    let mut tools: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+
+    for &(tool_name, cluster) in cluster_map {
+        if let Some(ref filter) = filter_tool {
+            if tool_name != filter.as_str() {
+                continue;
+            }
+        }
+        let meta = mcp_agent_mail_tools::tool_meta(tool_name);
+        tools.insert(
+            tool_name.to_string(),
+            serde_json::json!({
+                "cluster": cluster,
+                "capabilities": meta.map(|m| m.capabilities).unwrap_or_default(),
+                "complexity": meta.map(|m| m.complexity).unwrap_or("unknown"),
+            }),
+        );
+    }
+
+    if json_mode {
+        let val = serde_json::json!({
+            "tool_count": tools.len(),
+            "tools": tools,
+        });
+        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+    } else {
+        if tools.is_empty() {
+            if let Some(ref name) = filter_tool {
+                output::empty_result(false, &format!("Tool not found: {name}"));
+            } else {
+                output::empty_result(false, "No tools available.");
+            }
+            return Ok(());
+        }
+
+        output::section("Tool Schemas:");
+        ftui_runtime::ftui_println!("");
+
+        let mut table =
+            output::CliTable::new(vec!["TOOL", "CLUSTER", "COMPLEXITY", "CAPABILITIES"]);
+        for (name, val) in &tools {
+            let cluster = val["cluster"].as_str().unwrap_or("");
+            let complexity = val["complexity"].as_str().unwrap_or("unknown");
+            let caps = val["capabilities"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            table.add_row(vec![
+                name.clone(),
+                cluster.to_string(),
+                complexity.to_string(),
+                caps,
+            ]);
+        }
+        table.render();
+    }
+    Ok(())
+}
+
+fn handle_tooling_metrics(json_mode: bool) -> CliResult<()> {
+    let snapshot = mcp_agent_mail_tools::tool_metrics_snapshot_full();
+    let health = mcp_agent_mail_core::cached_health_level().to_string();
+
+    if json_mode {
+        let entries: Vec<serde_json::Value> = snapshot
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "calls": e.calls,
+                    "errors": e.errors,
+                    "cluster": e.cluster,
+                    "latency": {
+                        "p50_ms": e.latency.as_ref().map(|l| l.p50_ms),
+                        "p95_ms": e.latency.as_ref().map(|l| l.p95_ms),
+                        "p99_ms": e.latency.as_ref().map(|l| l.p99_ms),
+                    },
+                })
+            })
+            .collect();
+        let val = serde_json::json!({
+            "health_level": health,
+            "tool_count": entries.len(),
+            "tools": entries,
+        });
+        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+    } else {
+        output::section("Tool Metrics:");
+        output::kv("Health level", &health);
+        ftui_runtime::ftui_println!("");
+
+        if snapshot.is_empty() {
+            ftui_runtime::ftui_println!("  No tool metrics recorded yet.");
+            return Ok(());
+        }
+
+        let mut table =
+            output::CliTable::new(vec!["TOOL", "CLUSTER", "CALLS", "ERRORS", "P95(ms)"]);
+        for e in &snapshot {
+            let p95_str = e
+                .latency
+                .as_ref()
+                .map(|l| {
+                    if l.p95_ms > 0.0 {
+                        format!("{:.1}", l.p95_ms)
+                    } else {
+                        "--".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "--".to_string());
+            table.add_row(vec![
+                e.name.clone(),
+                e.cluster.clone(),
+                e.calls.to_string(),
+                e.errors.to_string(),
+                p95_str,
+            ]);
+        }
+        table.render();
+
+        let slow = mcp_agent_mail_tools::slow_tools();
+        if !slow.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::warn(&format!("{} slow tool(s) (p95 > 500ms):", slow.len()));
+            for s in &slow {
+                let p95 = s
+                    .latency
+                    .as_ref()
+                    .map(|l| format!("{:.0}ms", l.p95_ms))
+                    .unwrap_or_default();
+                ftui_runtime::ftui_println!("  {} (p95: {})", s.name, p95);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_tooling_metrics_core(json_mode: bool) -> CliResult<()> {
+    let health = mcp_agent_mail_core::cached_health_level().to_string();
+    let metrics = mcp_agent_mail_core::global_metrics().snapshot();
+    let locks = mcp_agent_mail_core::lock_contention_snapshot();
+
+    if json_mode {
+        let val = serde_json::json!({
+            "health_level": health,
+            "metrics": metrics,
+            "lock_contention": locks,
+        });
+        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+    } else {
+        output::section("Core System Metrics:");
+        output::kv("Health level", &health);
+        ftui_runtime::ftui_println!("");
+
+        output::section("  HTTP:");
+        output::kv("    Requests", &metrics.http.requests_total.to_string());
+        output::kv("    4xx", &metrics.http.requests_4xx.to_string());
+        output::kv("    5xx", &metrics.http.requests_5xx.to_string());
+
+        output::section("  Tools:");
+        output::kv(
+            "    Total calls",
+            &metrics.tools.tool_calls_total.to_string(),
+        );
+        output::kv(
+            "    Total errors",
+            &metrics.tools.tool_errors_total.to_string(),
+        );
+
+        output::section("  Database:");
+        output::kv(
+            "    Pool acquires",
+            &metrics.db.pool_acquires_total.to_string(),
+        );
+        output::kv(
+            "    Pool errors",
+            &metrics.db.pool_acquire_errors_total.to_string(),
+        );
+
+        output::section("  Storage:");
+        output::kv(
+            "    Commits enqueued",
+            &metrics.storage.commit_enqueued_total.to_string(),
+        );
+        output::kv(
+            "    Commits drained",
+            &metrics.storage.commit_drained_total.to_string(),
+        );
+
+        if !locks.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::section("  Lock Contention:");
+            let mut lock_table =
+                output::CliTable::new(vec!["LOCK", "CONTENTIONS", "TOTAL_WAIT(ms)"]);
+            for entry in &locks {
+                lock_table.add_row(vec![
+                    entry.lock_name.clone(),
+                    entry.contended_count.to_string(),
+                    format!("{:.1}", entry.total_wait_ns as f64 / 1_000_000.0),
+                ]);
+            }
+            lock_table.render();
+        }
+    }
+    Ok(())
+}
+
+fn handle_tooling_diagnostics(json_mode: bool) -> CliResult<()> {
+    let tools_detail: Vec<serde_json::Value> = mcp_agent_mail_tools::tool_metrics_snapshot()
+        .into_iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .collect();
+    let slow: Vec<serde_json::Value> = mcp_agent_mail_tools::slow_tools()
+        .into_iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .collect();
+
+    let report = mcp_agent_mail_core::DiagnosticReport::build(tools_detail, slow);
+
+    if json_mode {
+        ftui_runtime::ftui_println!("{}", report.to_json());
+    } else {
+        output::section("Diagnostic Report:");
+        output::kv("Generated at", &report.generated_at);
+        ftui_runtime::ftui_println!("");
+
+        output::section("  System:");
+        output::kv("    Uptime", &format!("{}s", report.system.uptime_secs));
+        output::kv("    Rust version", report.system.rust_version);
+        output::kv("    Target", report.system.target);
+        output::kv("    OS", &report.system.os);
+        output::kv("    CPUs", &report.system.cpu_count.to_string());
+
+        ftui_runtime::ftui_println!("");
+        output::section("  Health:");
+        output::kv("    Level", &report.health.level);
+
+        ftui_runtime::ftui_println!("");
+        output::section("  HTTP:");
+        output::kv("    Requests", &report.http.requests_total.to_string());
+        output::kv("    4xx", &report.http.requests_4xx.to_string());
+        output::kv("    5xx", &report.http.requests_5xx.to_string());
+
+        output::section("  Database:");
+        output::kv(
+            "    Pool acquires",
+            &report.database.pool_acquires_total.to_string(),
+        );
+        output::kv(
+            "    Pool errors",
+            &report.database.pool_acquire_errors_total.to_string(),
+        );
+
+        output::section("  Storage:");
+        output::kv(
+            "    Commits enqueued",
+            &report.storage.commit_enqueued_total.to_string(),
+        );
+        output::kv(
+            "    Commits drained",
+            &report.storage.commit_drained_total.to_string(),
+        );
+
+        if !report.tools_detail.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::section("  Tools:");
+            output::kv(
+                "    Total calls",
+                &report.tools_aggregate.tool_calls_total.to_string(),
+            );
+            output::kv(
+                "    Total errors",
+                &report.tools_aggregate.tool_errors_total.to_string(),
+            );
+        }
+
+        if !report.slow_tools.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::warn(&format!(
+                "  {} slow tool(s) (p95 > 500ms)",
+                report.slow_tools.len()
+            ));
+        }
+
+        if !report.locks.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::section("  Lock Contention:");
+            for entry in &report.locks {
+                output::kv(
+                    &format!("    {}", entry.lock_name),
+                    &format!(
+                        "{} contentions, {:.1}ms total wait",
+                        entry.contended_count,
+                        entry.total_wait_ns as f64 / 1_000_000.0
+                    ),
+                );
+            }
+        }
+
+        if !report.recommendations.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::section("  Recommendations:");
+            for rec in &report.recommendations {
+                let icon = match rec.severity {
+                    "critical" => "CRIT",
+                    "warning" => "WARN",
+                    _ => "INFO",
+                };
+                ftui_runtime::ftui_println!("    [{}] {}: {}", icon, rec.subsystem, rec.message);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_tooling_locks(json_mode: bool) -> CliResult<()> {
+    let config = Config::from_env();
+    let lock_info = mcp_agent_mail_storage::collect_lock_status(&config)
+        .unwrap_or_else(|_e| serde_json::json!({"archive_root": "", "exists": false, "locks": []}));
+
+    let raw_locks = lock_info
+        .get("locks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if json_mode {
+        let val = serde_json::json!({
+            "total": raw_locks.len(),
+            "locks": raw_locks,
+        });
+        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+    } else {
+        output::section("Archive Locks:");
+
+        if raw_locks.is_empty() {
+            ftui_runtime::ftui_println!("  No active locks.");
+            return Ok(());
+        }
+
+        output::kv("Total", &raw_locks.len().to_string());
+        ftui_runtime::ftui_println!("");
+
+        let mut table = output::CliTable::new(vec!["PATH", "OWNER", "CREATED"]);
+        for lock in &raw_locks {
+            let path = lock
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let owner = lock
+                .get("owner")
+                .and_then(|o| o.get("pid"))
+                .and_then(serde_json::Value::as_u64)
+                .map(|pid| format!("pid:{pid}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let created = lock
+                .get("owner")
+                .and_then(|o| o.get("created_ts"))
+                .and_then(serde_json::Value::as_f64)
+                .map(|ts| {
+                    let secs = ts as i64;
+                    let nanos = ((ts - secs as f64) * 1e9) as u32;
+                    chrono::DateTime::from_timestamp(secs, nanos)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| format!("{ts}"))
+                })
+                .unwrap_or_else(|| "--".to_string());
+            table.add_row(vec![path.to_string(), owner, created]);
+        }
+        table.render();
     }
     Ok(())
 }
