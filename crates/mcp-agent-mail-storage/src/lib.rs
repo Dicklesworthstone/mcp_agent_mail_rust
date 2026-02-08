@@ -8665,4 +8665,299 @@ mod tests {
 
         eprintln!("spill replay seed={REPLAY_SEED} input={input_a:?} output={drained_a:?}");
     }
+
+    // ── br-1i11.1.5: spill-path BTreeSet overhead benchmark ─────────────
+    //
+    // Quantifies the performance of BTreeSet vs hypothetical unsorted insert+sort
+    // for the spill path container. Logs runtime, variance, and acceptance
+    // thresholds.
+
+    #[test]
+    fn spill_path_btreeset_benchmark_insert_and_drain() {
+        use std::time::Instant;
+
+        const SIZES: &[usize] = &[100, 500, 1_000, 4_096];
+        const ITERATIONS: usize = 50;
+        const MAX_OVERHEAD_FACTOR: f64 = 3.0; // BTreeSet must be < 3x of Vec+sort
+
+        for &size in SIZES {
+            let paths: Vec<String> = (0..size)
+                .map(|i| format!("agents/Agent{:04}/inbox/2026/02/msg_{:06}.md", i % 50, i))
+                .collect();
+
+            // BTreeSet path (current production code)
+            let mut btree_times = Vec::with_capacity(ITERATIONS);
+            for _ in 0..ITERATIONS {
+                let start = Instant::now();
+                let mut set = BTreeSet::new();
+                for p in &paths {
+                    set.insert(p.clone());
+                }
+                let _drained: Vec<String> = set.into_iter().collect();
+                btree_times.push(start.elapsed().as_nanos() as f64);
+            }
+
+            // Vec + sort path (alternative baseline)
+            let mut vecsort_times = Vec::with_capacity(ITERATIONS);
+            for _ in 0..ITERATIONS {
+                let start = Instant::now();
+                let mut vec: Vec<String> = paths.clone();
+                vec.sort();
+                vec.dedup();
+                vecsort_times.push(start.elapsed().as_nanos() as f64);
+            }
+
+            let btree_mean = btree_times.iter().sum::<f64>() / ITERATIONS as f64;
+            let vecsort_mean = vecsort_times.iter().sum::<f64>() / ITERATIONS as f64;
+            let ratio = btree_mean / vecsort_mean.max(1.0);
+
+            let btree_variance = btree_times
+                .iter()
+                .map(|t| (t - btree_mean).powi(2))
+                .sum::<f64>()
+                / ITERATIONS as f64;
+
+            eprintln!(
+                "spill_bench size={size} btree_mean_ns={btree_mean:.0} vecsort_mean_ns={vecsort_mean:.0} \
+                 ratio={ratio:.2}x btree_stddev_ns={:.0} iterations={ITERATIONS}",
+                btree_variance.sqrt()
+            );
+
+            assert!(
+                ratio < MAX_OVERHEAD_FACTOR,
+                "BTreeSet overhead too high at size={size}: {ratio:.2}x (max {MAX_OVERHEAD_FACTOR}x)"
+            );
+        }
+    }
+
+    #[test]
+    fn spill_path_btreeset_benchmark_random_order_stability() {
+        use std::time::Instant;
+
+        const SIZE: usize = 1_000;
+        const ITERATIONS: u64 = 100;
+        const BASE_SEED: u64 = 0xBEEF_CAFE_0000_0001;
+
+        let base_paths: Vec<String> = (0..SIZE)
+            .map(|i| format!("path/{:04}.md", i))
+            .collect();
+
+        let mut times = Vec::with_capacity(ITERATIONS as usize);
+        for iteration in 0..ITERATIONS {
+            let seed = BASE_SEED.wrapping_add(iteration);
+            let shuffled = seeded_permutation(&base_paths, seed);
+
+            let start = Instant::now();
+            let _drained = spill_drain_paths_owned(&shuffled);
+            times.push(start.elapsed().as_nanos() as f64);
+        }
+
+        let mean = times.iter().sum::<f64>() / ITERATIONS as f64;
+        let variance = times
+            .iter()
+            .map(|t| (t - mean).powi(2))
+            .sum::<f64>()
+            / ITERATIONS as f64;
+        let stddev = variance.sqrt();
+        let cv = stddev / mean.max(1.0);
+
+        eprintln!(
+            "spill_bench_random size={SIZE} mean_ns={mean:.0} stddev_ns={stddev:.0} \
+             cv={cv:.3} iterations={ITERATIONS}"
+        );
+
+        // Coefficient of variation should be < 1.0 (stable performance)
+        assert!(
+            cv < 1.0,
+            "Spill drain performance too variable: cv={cv:.3} (max 1.0)"
+        );
+    }
+
+    // ── br-1i11.5.5: depth counter concurrency stress tests ─────────────
+    //
+    // High-contention stress tests for the fetch_update + saturating_sub
+    // depth counter pattern, with diagnostic logging for triage.
+
+    #[test]
+    fn depth_counter_stress_interleaved_inc_dec_32_threads() {
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let num_threads = 32;
+        let ops_per_thread = 5_000;
+
+        std::thread::scope(|s| {
+            for tid in 0..num_threads {
+                let c = Arc::clone(&counter);
+                s.spawn(move || {
+                    for i in 0..ops_per_thread {
+                        if i % 2 == 0 {
+                            c.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                                Some(cur.saturating_sub(1))
+                            })
+                            .ok();
+                        }
+                    }
+                    // Each thread does equal inc/dec, so net contribution = 0
+                    eprintln!("depth_stress thread={tid} completed {ops_per_thread} ops");
+                });
+            }
+        });
+
+        let final_val = counter.load(Ordering::Relaxed);
+        assert_eq!(
+            final_val, 0,
+            "32 threads × 5000 balanced ops should net to 0, got {final_val}"
+        );
+    }
+
+    #[test]
+    fn depth_counter_stress_burst_drain_never_wraps() {
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicU64::new(500));
+        let num_drain_threads = 16;
+        let drain_per_thread = 100; // Total drain: 1600 >> 500
+        let observed_max = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        std::thread::scope(|s| {
+            for tid in 0..num_drain_threads {
+                let c = Arc::clone(&counter);
+                let om = Arc::clone(&observed_max);
+                s.spawn(move || {
+                    for batch in 0..drain_per_thread {
+                        let prev = c
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                                Some(cur.saturating_sub(1))
+                            })
+                            .unwrap_or(0);
+                        // Track highest value seen (for diagnostics)
+                        om.fetch_max(prev, Ordering::Relaxed);
+
+                        let current = c.load(Ordering::Relaxed);
+                        assert!(
+                            current <= 500,
+                            "thread={tid} batch={batch}: counter={current} exceeds initial 500 — wraparound detected!"
+                        );
+                    }
+                });
+            }
+        });
+
+        let final_val = counter.load(Ordering::Relaxed);
+        let peak = observed_max.load(Ordering::Relaxed);
+        eprintln!(
+            "depth_stress_burst initial=500 threads={num_drain_threads} drain_total={} \
+             final={final_val} peak_observed={peak}",
+            num_drain_threads * drain_per_thread
+        );
+        assert_eq!(final_val, 0, "burst drain should saturate to 0");
+    }
+
+    #[test]
+    fn depth_counter_stress_rapid_inc_then_bulk_drain() {
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let inc_threads = 8;
+        let inc_per_thread = 1_000;
+        let expected_total = (inc_threads * inc_per_thread) as u64;
+
+        // Phase 1: rapid concurrent increments
+        std::thread::scope(|s| {
+            for _ in 0..inc_threads {
+                let c = Arc::clone(&counter);
+                s.spawn(move || {
+                    for _ in 0..inc_per_thread {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        let after_inc = counter.load(Ordering::Relaxed);
+        assert_eq!(
+            after_inc, expected_total,
+            "after {inc_threads}×{inc_per_thread} increments"
+        );
+
+        // Phase 2: bulk drain with varying batch sizes
+        let drain_amounts = [256, 256, 256, 256, 7000]; // Total: 8024 >> 8000
+        std::thread::scope(|s| {
+            for &amount in &drain_amounts {
+                let c = Arc::clone(&counter);
+                s.spawn(move || {
+                    let amount_u64 = amount as u64;
+                    c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(amount_u64))
+                    })
+                    .ok();
+                });
+            }
+        });
+
+        let final_val = counter.load(Ordering::Relaxed);
+        eprintln!(
+            "depth_stress_bulk_drain total_inc={expected_total} drain_amounts={drain_amounts:?} final={final_val}"
+        );
+        assert_eq!(final_val, 0, "bulk drain should saturate to 0");
+    }
+
+    #[test]
+    fn depth_counter_stress_contention_profile_no_anomaly() {
+        use std::sync::Arc;
+
+        // Simulates realistic WBQ workload: many producers, few batch drainers
+        let counter = Arc::new(AtomicU64::new(0));
+        let producers = 16;
+        let drainers = 4;
+        let produce_ops = 2_000;
+        let drain_batch = 256_u64;
+        let anomaly_count = Arc::new(AtomicU64::new(0));
+
+        std::thread::scope(|s| {
+            // Producers: enqueue-like increments
+            for _ in 0..producers {
+                let c = Arc::clone(&counter);
+                s.spawn(move || {
+                    for _ in 0..produce_ops {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+
+            // Drainers: batch drain with anomaly detection
+            for _ in 0..drainers {
+                let c = Arc::clone(&counter);
+                let ac = Arc::clone(&anomaly_count);
+                s.spawn(move || {
+                    loop {
+                        let prev = c
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                                Some(cur.saturating_sub(drain_batch))
+                            })
+                            .unwrap_or(0);
+                        if prev == 0 {
+                            break;
+                        }
+                        let after = c.load(Ordering::Relaxed);
+                        // Anomaly: value somehow larger than theoretical max
+                        if after > (producers * produce_ops) as u64 {
+                            ac.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+
+        let anomalies = anomaly_count.load(Ordering::Relaxed);
+        let final_val = counter.load(Ordering::Relaxed);
+        eprintln!(
+            "depth_stress_contention producers={producers}×{produce_ops} drainers={drainers}×batch{drain_batch} \
+             final={final_val} anomalies={anomalies}"
+        );
+        assert_eq!(anomalies, 0, "no anomalous counter values detected");
+    }
 }

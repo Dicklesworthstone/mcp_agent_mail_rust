@@ -2110,4 +2110,260 @@ mod tests {
         assert_eq!(sanitize_thread_id("café", "fb"), "caf");
         assert_eq!(sanitize_thread_id("日本", "fb"), "fb");
     }
+
+    // ── br-1i11.6.6: E2E reply-flow tests with malformed thread_id fixtures ──
+    //
+    // Exercises the full sanitize → validate → reply path with realistic
+    // malformed thread_id data that could appear in legacy databases.
+    // Each fixture includes the original value, the expected sanitized result,
+    // the decision path taken, and a reproduction command.
+
+    /// Fixture entry for malformed `thread_id` E2E testing.
+    struct ThreadIdFixture {
+        raw: &'static str,
+        /// Expected result after `sanitize_thread_id`
+        expected: &'static str,
+        uses_fallback: bool,
+        decision_path: &'static str,
+    }
+
+    const MALFORMED_THREAD_ID_FIXTURES: &[ThreadIdFixture] = &[
+        // Path traversal attempts (migration artifacts)
+        ThreadIdFixture {
+            raw: "../../../etc/passwd",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "strip slashes+dots → '..etcpasswd' → starts with dot → fallback",
+        },
+        ThreadIdFixture {
+            raw: "..%2F..%2Fetc%2Fpasswd",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "strip % → '..2F..2Fetc2Fpasswd' → starts with dot → fallback",
+        },
+        // SQL injection fragments — dashes are valid chars so they survive
+        ThreadIdFixture {
+            raw: "thread'; DROP TABLE messages;--",
+            expected: "threadDROPTABLEmessages--",
+            uses_fallback: false,
+            decision_path: "strip quotes/spaces/semicolons → 'threadDROPTABLEmessages--' → starts with 't' → accept",
+        },
+        // Unicode normalization edge cases
+        ThreadIdFixture {
+            raw: "café-thread",
+            expected: "caf-thread",
+            uses_fallback: false,
+            decision_path: "strip non-ASCII 'é' → 'caf-thread' → starts with 'c' → accept",
+        },
+        ThreadIdFixture {
+            raw: "日本語スレッド",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "strip all non-ASCII → empty → fallback",
+        },
+        // Null bytes and control chars
+        ThreadIdFixture {
+            raw: "thread\x00-id",
+            expected: "thread-id",
+            uses_fallback: false,
+            decision_path: "strip null → 'thread-id' → starts with 't' → accept",
+        },
+        ThreadIdFixture {
+            raw: "\x01\x02\x03abc",
+            expected: "abc",
+            uses_fallback: false,
+            decision_path: "strip control chars → 'abc' → starts with 'a' → accept",
+        },
+        // Empty and whitespace-only
+        ThreadIdFixture {
+            raw: "",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "empty → fallback",
+        },
+        ThreadIdFixture {
+            raw: "   ",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "strip spaces → empty → fallback",
+        },
+        ThreadIdFixture {
+            raw: "\t\n\r",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "strip whitespace → empty → fallback",
+        },
+        // Leading invalid chars
+        ThreadIdFixture {
+            raw: "-starts-with-dash",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "strip nothing, first char '-' not alphanumeric → fallback",
+        },
+        ThreadIdFixture {
+            raw: ".hidden-thread",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "first char '.' → not stripped (valid char) but not alphanumeric start → fallback",
+        },
+        ThreadIdFixture {
+            raw: "_underscore_start",
+            expected: "fb",
+            uses_fallback: true,
+            decision_path: "first char '_' → valid char but not alphanumeric start → fallback",
+        },
+        // Very long legacy values
+        ThreadIdFixture {
+            raw: "abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnopqrstuvwxyz0123456789-extra",
+            expected: "abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnopq",
+            uses_fallback: false,
+            decision_path: "truncate to 128 chars → starts with 'a' → accept",
+        },
+        // Mixed valid and invalid
+        ThreadIdFixture {
+            raw: "TKT 123 with spaces",
+            expected: "TKT123withspaces",
+            uses_fallback: false,
+            decision_path: "strip spaces → 'TKT123withspaces' → starts with 'T' → accept",
+        },
+        // HTML/script injection — angle brackets/quotes/parens stripped
+        ThreadIdFixture {
+            raw: "<script>alert('xss')</script>",
+            expected: "scriptalertxssscript",
+            uses_fallback: false,
+            decision_path: "strip '<', '>', '(', ')', quote → 'scriptalertxssscript' → starts with 's' → accept",
+        },
+        // Valid legacy formats that should pass through
+        ThreadIdFixture {
+            raw: "TKT-123",
+            expected: "TKT-123",
+            uses_fallback: false,
+            decision_path: "all chars valid, starts with 'T' → passthrough",
+        },
+        ThreadIdFixture {
+            raw: "br-2ei.5.7.2",
+            expected: "br-2ei.5.7.2",
+            uses_fallback: false,
+            decision_path: "all chars valid, starts with 'b' → passthrough",
+        },
+        ThreadIdFixture {
+            raw: "42",
+            expected: "42",
+            uses_fallback: false,
+            decision_path: "numeric start valid → passthrough",
+        },
+    ];
+
+    #[test]
+    fn sanitize_thread_id_e2e_malformed_fixtures() {
+        let fallback = "fb";
+        for (i, fixture) in MALFORMED_THREAD_ID_FIXTURES.iter().enumerate() {
+            let result = sanitize_thread_id(fixture.raw, fallback);
+            let used_fallback = result == fallback && fixture.raw != fallback;
+
+            eprintln!(
+                "fixture[{i}] raw={:?} expected={:?} got={:?} fallback={} decision={}",
+                fixture.raw, fixture.expected, result, used_fallback, fixture.decision_path
+            );
+
+            assert_eq!(
+                result, fixture.expected,
+                "fixture[{i}]: sanitize_thread_id({:?}, {:?}) = {:?}, expected {:?}\n  decision_path: {}\n  reproduction: cargo test -p mcp-agent-mail-tools sanitize_thread_id_e2e_malformed_fixtures -- --nocapture",
+                fixture.raw, fallback, result, fixture.expected, fixture.decision_path
+            );
+
+            if fixture.uses_fallback {
+                assert_eq!(
+                    result, fallback,
+                    "fixture[{i}]: expected fallback but got {result:?}"
+                );
+            }
+
+            // Post-condition: result must be a valid thread_id (or fallback)
+            assert!(
+                is_valid_thread_id(&result),
+                "fixture[{i}]: sanitized result {result:?} is not a valid thread_id"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_thread_id_e2e_reply_flow_simulation() {
+        // Simulate the exact code path from reply_message (lines 1176-1182):
+        // let fallback_tid = message_id.to_string();
+        // let thread_id = match original.thread_id.as_deref() {
+        //     Some(tid) => sanitize_thread_id(tid, &fallback_tid),
+        //     None => fallback_tid,
+        // };
+
+        #[allow(clippy::struct_field_names)]
+        struct ReplyScenario {
+            original_thread_id: Option<&'static str>,
+            message_id: i64,
+            expected_thread_id: &'static str,
+        }
+
+        let scenarios = [
+            ReplyScenario {
+                original_thread_id: Some("TKT-123"),
+                message_id: 42,
+                expected_thread_id: "TKT-123",
+            },
+            ReplyScenario {
+                original_thread_id: Some("../etc/passwd"),
+                message_id: 99,
+                expected_thread_id: "99", // fallback to message_id
+            },
+            ReplyScenario {
+                original_thread_id: Some(""),
+                message_id: 7,
+                expected_thread_id: "7",
+            },
+            ReplyScenario {
+                original_thread_id: None,
+                message_id: 55,
+                expected_thread_id: "55",
+            },
+            ReplyScenario {
+                original_thread_id: Some("-invalid-start"),
+                message_id: 101,
+                expected_thread_id: "101",
+            },
+            ReplyScenario {
+                original_thread_id: Some("valid.thread-id_123"),
+                message_id: 200,
+                expected_thread_id: "valid.thread-id_123",
+            },
+            ReplyScenario {
+                original_thread_id: Some("日本語"),
+                message_id: 300,
+                expected_thread_id: "300",
+            },
+        ];
+
+        for (i, s) in scenarios.iter().enumerate() {
+            let fallback_tid = s.message_id.to_string();
+            let thread_id = match s.original_thread_id {
+                Some(tid) => sanitize_thread_id(tid, &fallback_tid),
+                None => fallback_tid,
+            };
+
+            eprintln!(
+                "reply_flow[{i}] original_tid={:?} msg_id={} → thread_id={:?}",
+                s.original_thread_id, s.message_id, thread_id
+            );
+
+            assert_eq!(
+                thread_id, s.expected_thread_id,
+                "reply_flow[{i}]: expected {:?}, got {:?}\n  reproduction: cargo test -p mcp-agent-mail-tools sanitize_thread_id_e2e_reply_flow_simulation -- --nocapture",
+                s.expected_thread_id, thread_id
+            );
+
+            // Post-condition: result must always be valid
+            assert!(
+                is_valid_thread_id(&thread_id),
+                "reply_flow[{i}]: result {thread_id:?} is not a valid thread_id"
+            );
+        }
+    }
 }

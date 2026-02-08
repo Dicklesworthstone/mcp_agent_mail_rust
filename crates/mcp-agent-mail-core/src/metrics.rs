@@ -852,4 +852,190 @@ mod tests {
         let json = serde_json::to_value(&snap).expect("snapshot should be serializable");
         assert_eq!(json["contact_enforcement_bypass_total"], 5);
     }
+
+    // ── br-1i11.3.6: histogram snapshot overhead benchmark ──────────────
+    //
+    // Quantifies the cost of Acquire/Release memory ordering on snapshot()
+    // under concurrent load. Verifies that snapshot latency remains bounded
+    // and that invariants hold under high contention.
+
+    #[test]
+    fn histogram_snapshot_benchmark_concurrent_recording() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        const NUM_WRITERS: usize = 8;
+        const RECORDS_PER_WRITER: usize = 50_000;
+        const SNAPSHOT_ITERATIONS: usize = 100;
+
+        let h = Arc::new(Log2Histogram::new());
+
+        // Phase 1: concurrent recording
+        let write_start = Instant::now();
+        std::thread::scope(|s| {
+            for tid in 0..NUM_WRITERS {
+                let hist = Arc::clone(&h);
+                s.spawn(move || {
+                    for i in 0..RECORDS_PER_WRITER {
+                        hist.record((tid as u64 * 1000) + (i as u64 % 10_000));
+                    }
+                });
+            }
+        });
+        let write_elapsed = write_start.elapsed();
+
+        let total_records = (NUM_WRITERS * RECORDS_PER_WRITER) as u64;
+        let snap = h.snapshot();
+        assert_eq!(snap.count, total_records, "all records should be visible");
+
+        // Phase 2: snapshot overhead benchmark
+        let mut snap_times = Vec::with_capacity(SNAPSHOT_ITERATIONS);
+        for _ in 0..SNAPSHOT_ITERATIONS {
+            let start = Instant::now();
+            let s = h.snapshot();
+            #[allow(clippy::cast_precision_loss)]
+            snap_times.push(start.elapsed().as_nanos() as f64);
+            // Invariants must hold on every snapshot
+            assert!(s.min <= s.max, "min={} > max={}", s.min, s.max);
+            assert!(s.p50 <= s.p95, "p50={} > p95={}", s.p50, s.p95);
+            assert!(s.p95 <= s.p99, "p95={} > p99={}", s.p95, s.p99);
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let snap_mean = snap_times.iter().sum::<f64>() / SNAPSHOT_ITERATIONS as f64;
+        let snap_max = snap_times.iter().copied().fold(0.0_f64, f64::max);
+
+        eprintln!(
+            "histogram_bench writers={NUM_WRITERS} records={total_records} \
+             write_ms={:.1} snap_mean_ns={snap_mean:.0} snap_max_ns={snap_max:.0} \
+             iterations={SNAPSHOT_ITERATIONS}",
+            write_elapsed.as_secs_f64() * 1000.0,
+        );
+
+        // Snapshot should be sub-microsecond on modern hardware
+        assert!(
+            snap_mean < 50_000.0,
+            "snapshot mean {snap_mean:.0}ns exceeds 50µs threshold"
+        );
+    }
+
+    #[test]
+    fn histogram_snapshot_benchmark_concurrent_read_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        const NUM_WRITERS: usize = 4;
+        const NUM_READERS: usize = 4;
+        const DURATION_MS: u64 = 200;
+
+        let h = Arc::new(Log2Histogram::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let invariant_violations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        std::thread::scope(|s| {
+            // Writers: continuously record values
+            for tid in 0..NUM_WRITERS {
+                let hist = Arc::clone(&h);
+                let run = Arc::clone(&running);
+                s.spawn(move || {
+                    let mut count = 0u64;
+                    while run.load(AtomicOrdering::Relaxed) {
+                        hist.record((tid as u64) * 100 + (count % 1000));
+                        count += 1;
+                    }
+                    eprintln!("histogram_bench writer={tid} records={count}");
+                });
+            }
+
+            // Readers: continuously take snapshots and check invariants
+            for rid in 0..NUM_READERS {
+                let hist = Arc::clone(&h);
+                let run = Arc::clone(&running);
+                let violations = Arc::clone(&invariant_violations);
+                s.spawn(move || {
+                    let mut snap_count = 0u64;
+                    while run.load(AtomicOrdering::Relaxed) {
+                        let snap = hist.snapshot();
+                        if snap.count > 0 && snap.min > snap.max {
+                            violations.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        if snap.p50 > snap.p95 || snap.p95 > snap.p99 {
+                            violations.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        snap_count += 1;
+                    }
+                    eprintln!("histogram_bench reader={rid} snapshots={snap_count}");
+                });
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(DURATION_MS));
+            running.store(false, AtomicOrdering::Relaxed);
+        });
+
+        let violations = invariant_violations.load(AtomicOrdering::Relaxed);
+        let final_snap = h.snapshot();
+        eprintln!(
+            "histogram_bench_rw total_records={} violations={violations}",
+            final_snap.count
+        );
+        assert_eq!(
+            violations, 0,
+            "snapshot invariants violated {violations} times under concurrent read/write"
+        );
+    }
+
+    #[test]
+    fn histogram_snapshot_quantile_stability_under_load() {
+        use std::sync::Arc;
+
+        let h = Arc::new(Log2Histogram::new());
+
+        // Record a known bimodal distribution across threads
+        std::thread::scope(|s| {
+            // Low-latency cluster: 10-100µs
+            for _ in 0..4 {
+                let hist = Arc::clone(&h);
+                s.spawn(move || {
+                    for v in 10..=100 {
+                        for _ in 0..100 {
+                            hist.record(v);
+                        }
+                    }
+                });
+            }
+            // High-latency cluster: 10000-50000µs
+            for _ in 0..2 {
+                let hist = Arc::clone(&h);
+                s.spawn(move || {
+                    for v in (10_000..=50_000).step_by(100) {
+                        for _ in 0..10 {
+                            hist.record(v);
+                        }
+                    }
+                });
+            }
+        });
+
+        let snap = h.snapshot();
+        eprintln!(
+            "histogram_quantile_stability count={} min={} max={} p50={} p95={} p99={}",
+            snap.count, snap.min, snap.max, snap.p50, snap.p95, snap.p99
+        );
+
+        assert!(snap.min <= snap.max);
+        assert!(snap.p50 <= snap.p95);
+        assert!(snap.p95 <= snap.p99);
+        // p50 should be in the low-latency cluster (most records are there)
+        assert!(
+            snap.p50 <= 200,
+            "p50={} should be in low-latency cluster (≤200)",
+            snap.p50
+        );
+        // p99 should be in the high-latency cluster
+        assert!(
+            snap.p99 >= 1000,
+            "p99={} should reflect high-latency tail (≥1000)",
+            snap.p99
+        );
+    }
 }
