@@ -471,7 +471,6 @@ pub struct StorageMetrics {
     pub needs_reindex_total: Counter,
 
     // -- Git/archive IO metrics --
-
     /// Time spent waiting to acquire the project advisory lock (`.archive.lock`).
     pub archive_lock_wait_us: Log2Histogram,
     /// Time spent waiting for the commit/index lock in `commit_paths_with_retry`.
@@ -488,6 +487,10 @@ pub struct StorageMetrics {
     pub commit_failures_total: Counter,
     /// Number of `rel_paths` in the most recent commit call.
     pub commit_batch_size_last: GaugeU64,
+    /// Successful lock-free (plumbing-based) commits that bypassed index.lock.
+    pub lockfree_commits_total: Counter,
+    /// Lock-free commit attempts that failed and fell back to index-based commit.
+    pub lockfree_commit_fallbacks_total: Counter,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -522,6 +525,8 @@ pub struct StorageMetricsSnapshot {
     pub commit_attempts_total: u64,
     pub commit_failures_total: u64,
     pub commit_batch_size_last: u64,
+    pub lockfree_commits_total: u64,
+    pub lockfree_commit_fallbacks_total: u64,
 }
 
 #[derive(Debug)]
@@ -625,6 +630,8 @@ impl Default for StorageMetrics {
             commit_attempts_total: Counter::new(),
             commit_failures_total: Counter::new(),
             commit_batch_size_last: GaugeU64::new(),
+            lockfree_commits_total: Counter::new(),
+            lockfree_commit_fallbacks_total: Counter::new(),
         }
     }
 }
@@ -663,6 +670,8 @@ impl StorageMetrics {
             commit_attempts_total: self.commit_attempts_total.load(),
             commit_failures_total: self.commit_failures_total.load(),
             commit_batch_size_last: self.commit_batch_size_last.load(),
+            lockfree_commits_total: self.lockfree_commits_total.load(),
+            lockfree_commit_fallbacks_total: self.lockfree_commit_fallbacks_total.load(),
         }
     }
 }
@@ -754,6 +763,8 @@ mod tests {
         m.commit_attempts_total.add(10);
         m.commit_failures_total.inc();
         m.commit_batch_size_last.set(7);
+        m.lockfree_commits_total.add(5);
+        m.lockfree_commit_fallbacks_total.add(2);
 
         let snap = m.snapshot();
 
@@ -765,6 +776,8 @@ mod tests {
         assert_eq!(snap.commit_attempts_total, 10);
         assert_eq!(snap.commit_failures_total, 1);
         assert_eq!(snap.commit_batch_size_last, 7);
+        assert_eq!(snap.lockfree_commits_total, 5);
+        assert_eq!(snap.lockfree_commit_fallbacks_total, 2);
 
         // Verify JSON serialization includes the new keys.
         let json = serde_json::to_value(&snap).expect("snapshot should be serializable");
@@ -776,5 +789,7 @@ mod tests {
         assert!(json.get("commit_attempts_total").is_some());
         assert!(json.get("commit_failures_total").is_some());
         assert!(json.get("commit_batch_size_last").is_some());
+        assert!(json.get("lockfree_commits_total").is_some());
+        assert!(json.get("lockfree_commit_fallbacks_total").is_some());
     }
 }

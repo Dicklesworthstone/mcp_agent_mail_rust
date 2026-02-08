@@ -2498,7 +2498,11 @@ mod tests {
             MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1"),
         ];
         for event in &events {
-            assert!(!event.redacted(), "factory event should not be redacted: {:?}", event.kind());
+            assert!(
+                !event.redacted(),
+                "factory event should not be redacted: {:?}",
+                event.kind()
+            );
         }
     }
 
@@ -2736,13 +2740,7 @@ mod tests {
                 "",
                 "",
             ), // No userinfo
-            (
-                "other_key",
-                "postgres://user:pass@host/db",
-                false,
-                "",
-                "",
-            ), // Key not recognized
+            ("other_key", "postgres://user:pass@host/db", false, "", ""), // Key not recognized
         ];
         for (key, url, should_sanitize, expected_user, expected_mask) in cases {
             let result = crate::console::sanitize_known_value(key, url);
@@ -2810,9 +2808,18 @@ mod tests {
 
         // Verify through Debug that secret is masked
         let debug = format!("{event:?}");
-        assert!(!debug.contains("my-secret-token-123"), "raw secret should not appear");
-        assert!(debug.contains("<redacted>"), "redaction marker should appear");
-        assert!(debug.contains("/safe/path"), "safe value should be preserved");
+        assert!(
+            !debug.contains("my-secret-token-123"),
+            "raw secret should not appear"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "redaction marker should appear"
+        );
+        assert!(
+            debug.contains("/safe/path"),
+            "safe value should be preserved"
+        );
     }
 
     /// `HealthPulse` events carry `DbStatSnapshot` data.

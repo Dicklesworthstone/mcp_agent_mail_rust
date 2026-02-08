@@ -28,7 +28,7 @@ pub struct GlobalBinding {
 /// when the active screen or command palette is consuming text input.
 pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
     GlobalBinding {
-        label: "1-7",
+        label: "1-8",
         action: "Jump to screen",
         text_suppressible: true,
     },
@@ -81,7 +81,7 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
 
 /// Normalize a keybinding label to a set of `KeyCode` values it matches.
 ///
-/// Returns `None` for compound labels like "1-7" or "Ctrl+P" that
+/// Returns `None` for compound labels like "1-8" or "Ctrl+P" that
 /// don't map to a single `KeyCode`.
 #[must_use]
 pub fn label_to_keycodes(label: &str) -> Vec<KeyCode> {
@@ -100,7 +100,7 @@ pub fn label_to_keycodes(label: &str) -> Vec<KeyCode> {
         "Home" => vec![KeyCode::Home],
         "End" => vec![KeyCode::End],
         // Ranges
-        "1-7" => (1..=7)
+        "1-8" => (1..=8)
             .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap()))
             .collect(),
         "1-9" => (1..=9)
@@ -199,10 +199,11 @@ mod tests {
 
     #[test]
     fn label_to_keycodes_range() {
-        let codes = label_to_keycodes("1-7");
-        assert_eq!(codes.len(), 7);
+        let codes = label_to_keycodes("1-8");
+        assert_eq!(codes.len(), 8);
         assert_eq!(codes[0], KeyCode::Char('1'));
         assert_eq!(codes[6], KeyCode::Char('7'));
+        assert_eq!(codes[7], KeyCode::Char('8'));
     }
 
     #[test]
@@ -307,10 +308,10 @@ mod tests {
         let critical: Vec<&str> = all_conflicts
             .iter()
             .filter(|c| {
-                // Number keys 1-7 overlap with timeline's "1-9" correlation links.
+                // Number keys 1-8 overlap with timeline's "1-9" correlation links.
                 // This is handled: timeline only processes 1-9 when the dock is visible,
                 // while global number keys are caught first in tui_app.rs.
-                !c.contains("1-7")
+                !c.contains("1-8")
             })
             .map(String::as_str)
             .collect();
@@ -367,7 +368,7 @@ mod tests {
                         binding.label
                     );
                 }
-                "q" | "?" | ":" | "m" | "T" | "1-7" => {
+                "q" | "?" | ":" | "m" | "T" | "1-8" => {
                     assert!(
                         binding.text_suppressible,
                         "{} should be text-suppressible",

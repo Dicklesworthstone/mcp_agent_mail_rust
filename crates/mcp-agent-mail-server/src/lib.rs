@@ -63,12 +63,12 @@ use mcp_agent_mail_tools::{
     ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage, RequestContact,
     RespondContact, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
     SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
-    ToolingDirectoryQueryResource, ToolingDirectoryResource, ToolingLocksQueryResource,
-    ToolingLocksResource, ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource,
-    ToolingMetricsQueryResource, ToolingMetricsResource, ToolingRecentResource,
-    ToolingSchemasQueryResource, ToolingSchemasResource, UninstallPrecommitGuard,
-    ViewsAckOverdueResource, ViewsAckRequiredResource, ViewsAcksStaleResource,
-    ViewsUrgentUnreadResource, Whois, clusters,
+    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
+    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
+    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
+    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
+    ToolingSchemasResource, UninstallPrecommitGuard, ViewsAckOverdueResource,
+    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
@@ -614,6 +614,8 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         .resource(ToolingMetricsQueryResource)
         .resource(ToolingMetricsCoreResource)
         .resource(ToolingMetricsCoreQueryResource)
+        .resource(ToolingDiagnosticsResource)
+        .resource(ToolingDiagnosticsQueryResource)
         .resource(ToolingLocksResource)
         .resource(ToolingLocksQueryResource)
         .resource(ToolingCapabilitiesResource)

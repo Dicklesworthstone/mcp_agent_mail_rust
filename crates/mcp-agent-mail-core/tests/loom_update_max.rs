@@ -22,8 +22,8 @@
 
 #![cfg(feature = "loom-tests")]
 
-use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::Arc;
+use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::thread;
 
 /// Reimplementation of `lock_order::update_max` using loom atomics.
@@ -33,12 +33,8 @@ use loom::thread;
 fn update_max(target: &AtomicU64, candidate: u64) {
     let mut current = target.load(Ordering::Relaxed);
     while candidate > current {
-        match target.compare_exchange_weak(
-            current,
-            candidate,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match target.compare_exchange_weak(current, candidate, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => break,
             Err(actual) => current = actual,
         }

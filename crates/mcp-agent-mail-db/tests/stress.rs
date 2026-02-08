@@ -1913,9 +1913,7 @@ fn make_large_body(n: usize) -> String {
 }
 
 /// Helper: set up a project + sender + receiver in the pool.
-fn setup_project_and_agents(
-    pool: &DbPool,
-) -> (i64, i64, i64) {
+fn setup_project_and_agents(pool: &DbPool) -> (i64, i64, i64) {
     let suffix = unique_suffix();
 
     let pid = block_on_with_retry(3, |cx| {
@@ -1929,8 +1927,7 @@ fn setup_project_and_agents(
     let sender_id = block_on_with_retry(3, |cx| {
         let pool = pool.clone();
         async move {
-            queries::register_agent(&cx, &pool, pid, "BoldCastle", "test", "test", None, None)
-                .await
+            queries::register_agent(&cx, &pool, pid, "BoldCastle", "test", "test", None, None).await
         }
     })
     .id
@@ -1939,8 +1936,7 @@ fn setup_project_and_agents(
     let receiver_id = block_on_with_retry(3, |cx| {
         let pool = pool.clone();
         async move {
-            queries::register_agent(&cx, &pool, pid, "QuietLake", "test", "test", None, None)
-                .await
+            queries::register_agent(&cx, &pool, pid, "QuietLake", "test", "test", None, None).await
         }
     })
     .id
@@ -2226,7 +2222,7 @@ fn stress_fts_large_body_search_performance() {
 // =============================================================================
 
 use mcp_agent_mail_db::{
-    CircuitBreaker, CircuitState, Subsystem, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL,
+    CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL, CircuitBreaker, CircuitState, Subsystem,
     circuit_for,
 };
 use std::sync::atomic::AtomicBool;
@@ -2296,7 +2292,11 @@ fn chaos_db_circuit_trips_and_recovers() {
     for _ in 0..5 {
         cb.record_failure();
     }
-    assert_eq!(cb.state(), CircuitState::Open, "circuit should be open after 5 failures");
+    assert_eq!(
+        cb.state(),
+        CircuitState::Open,
+        "circuit should be open after 5 failures"
+    );
 
     // Verify injector produces ~10% failure rate.
     let mut inj_failures = 0u32;
@@ -2305,7 +2305,10 @@ fn chaos_db_circuit_trips_and_recovers() {
             inj_failures += 1;
         }
     }
-    assert!(inj_failures >= 5, "injector should produce ~10% failures, got {inj_failures}");
+    assert!(
+        inj_failures >= 5,
+        "injector should produce ~10% failures, got {inj_failures}"
+    );
 
     // Phase 2: Wait for recovery window — circuit should become half-open.
     std::thread::sleep(Duration::from_millis(150));
@@ -2319,11 +2322,22 @@ fn chaos_db_circuit_trips_and_recovers() {
     // First probe goes through check(); subsequent record_success() calls
     // simulate the real retry path (check gates the first call, then
     // record_success handles the half-open accumulation).
-    assert!(cb.check().is_ok(), "first half-open probe should be allowed");
+    assert!(
+        cb.check().is_ok(),
+        "first half-open probe should be allowed"
+    );
     cb.record_success();
-    assert_eq!(cb.state(), CircuitState::HalfOpen, "still half-open after 1 success");
+    assert_eq!(
+        cb.state(),
+        CircuitState::HalfOpen,
+        "still half-open after 1 success"
+    );
     cb.record_success();
-    assert_eq!(cb.state(), CircuitState::HalfOpen, "still half-open after 2 successes");
+    assert_eq!(
+        cb.state(),
+        CircuitState::HalfOpen,
+        "still half-open after 2 successes"
+    );
     cb.record_success();
     assert_eq!(
         cb.state(),
@@ -2346,8 +2360,14 @@ fn chaos_db_circuit_trips_and_recovers() {
             successes += 1;
         }
     }
-    assert!(successes > 0, "should have some successes under 10% fault rate");
-    assert!(failures > 0, "should have some failures under 10% fault rate");
+    assert!(
+        successes > 0,
+        "should have some successes under 10% fault rate"
+    );
+    assert!(
+        failures > 0,
+        "should have some failures under 10% fault rate"
+    );
 }
 
 // -- Test: Git circuit independent from DB circuit ---------------------------
@@ -2361,10 +2381,18 @@ fn chaos_git_failure_does_not_affect_db() {
     for _ in 0..3 {
         git_cb.record_failure();
     }
-    assert_eq!(git_cb.state(), CircuitState::Open, "git circuit should be open");
+    assert_eq!(
+        git_cb.state(),
+        CircuitState::Open,
+        "git circuit should be open"
+    );
 
     // DB circuit should be unaffected.
-    assert_eq!(db_cb.state(), CircuitState::Closed, "db circuit should remain closed");
+    assert_eq!(
+        db_cb.state(),
+        CircuitState::Closed,
+        "db circuit should remain closed"
+    );
     assert!(db_cb.check().is_ok(), "db operations should still work");
 
     // Simulate successful DB operations.
@@ -2372,7 +2400,11 @@ fn chaos_git_failure_does_not_affect_db() {
         db_cb.record_success();
     }
     assert_eq!(db_cb.state(), CircuitState::Closed, "db should stay closed");
-    assert_eq!(git_cb.state(), CircuitState::Open, "git should still be open");
+    assert_eq!(
+        git_cb.state(),
+        CircuitState::Open,
+        "git should still be open"
+    );
 }
 
 // -- Test: Alternating failures across subsystems ----------------------------
@@ -2416,7 +2448,11 @@ fn chaos_alternating_subsystem_failures() {
 
 #[test]
 fn chaos_concurrent_threads_with_db_faults() {
-    let cb = Arc::new(CircuitBreaker::with_subsystem("db", 5, Duration::from_millis(200)));
+    let cb = Arc::new(CircuitBreaker::with_subsystem(
+        "db",
+        5,
+        Duration::from_millis(200),
+    ));
     let injector = Arc::new(FaultInjector::new(3, 10)); // 30% failure rate
     let n_threads = 8;
     let ops_per_thread = 50;
@@ -2486,7 +2522,7 @@ fn chaos_circuit_state_transitions_valid() {
         (false, "success"),
         (true, "fail"),
         (true, "fail"),
-        (true, "fail"),  // trips at 3
+        (true, "fail"), // trips at 3
     ];
 
     for (should_fail, _label) in &ops {
@@ -2540,7 +2576,10 @@ fn chaos_circuit_state_transitions_valid() {
             (from, to),
             (CircuitState::Closed, CircuitState::Open)
                 | (CircuitState::Open, CircuitState::HalfOpen)
-                | (CircuitState::HalfOpen, CircuitState::Closed | CircuitState::Open)
+                | (
+                    CircuitState::HalfOpen,
+                    CircuitState::Closed | CircuitState::Open
+                )
         );
         assert!(valid, "invalid transition: {from} -> {to}");
     }
@@ -2566,7 +2605,14 @@ fn chaos_data_integrity_after_cb_recovery() {
             let pid = proj.id.unwrap();
 
             let sender = match queries::register_agent(
-                &cx, &p, pid, "RedLake", "chaos", "test", Some("sender"), None,
+                &cx,
+                &p,
+                pid,
+                "RedLake",
+                "chaos",
+                "test",
+                Some("sender"),
+                None,
             )
             .await
             {
@@ -2575,7 +2621,14 @@ fn chaos_data_integrity_after_cb_recovery() {
             };
 
             let receiver = match queries::register_agent(
-                &cx, &p, pid, "BluePeak", "chaos", "test", Some("receiver"), None,
+                &cx,
+                &p,
+                pid,
+                "BluePeak",
+                "chaos",
+                "test",
+                Some("receiver"),
+                None,
             )
             .await
             {

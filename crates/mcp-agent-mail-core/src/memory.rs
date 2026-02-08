@@ -170,7 +170,10 @@ pub fn sample_and_record(config: &Config) -> MemorySample {
         .system
         .memory_pressure_level
         .set(sample.pressure.as_u64());
-    metrics.system.memory_last_sample_us.set(now_unix_micros_u64());
+    metrics
+        .system
+        .memory_last_sample_us
+        .set(now_unix_micros_u64());
     if sample.error.is_some() {
         metrics.system.memory_sample_errors_total.add(1);
     }
@@ -206,10 +209,7 @@ mod tests {
     #[test]
     fn pressure_disabled_thresholds() {
         // Threshold of 0 means disabled
-        assert_eq!(
-            classify_pressure(10_000 * MIB, 0, 0, 0),
-            MemoryPressure::Ok,
-        );
+        assert_eq!(classify_pressure(10_000 * MIB, 0, 0, 0), MemoryPressure::Ok,);
         // Only warning enabled
         assert_eq!(
             classify_pressure(3000 * MIB, 2048, 0, 0),

@@ -36,6 +36,7 @@ pub enum MailScreenId {
     Reservations,
     ToolMetrics,
     SystemHealth,
+    Timeline,
 }
 
 /// All screen IDs in display order.
@@ -47,6 +48,7 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::Reservations,
     MailScreenId::ToolMetrics,
     MailScreenId::SystemHealth,
+    MailScreenId::Timeline,
 ];
 
 impl MailScreenId {
@@ -271,6 +273,13 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         category: ScreenCategory::System,
         description: "Database, queue, and connection diagnostics",
     },
+    MailScreenMeta {
+        id: MailScreenId::Timeline,
+        title: "Timeline",
+        short_label: "Time",
+        category: ScreenCategory::Overview,
+        description: "Chronological event timeline with cursor + inspector",
+    },
 ];
 
 /// Look up metadata for a screen ID.
@@ -348,13 +357,13 @@ mod tests {
     #[test]
     fn screen_count_matches() {
         assert_eq!(ALL_SCREEN_IDS.len(), MAIL_SCREEN_REGISTRY.len());
-        assert_eq!(ALL_SCREEN_IDS.len(), 7);
+        assert_eq!(ALL_SCREEN_IDS.len(), 8);
     }
 
     #[test]
     fn next_prev_wraps() {
         let first = MailScreenId::Dashboard;
-        let last = MailScreenId::SystemHealth;
+        let last = MailScreenId::Timeline;
 
         assert_eq!(last.next(), first);
         assert_eq!(first.prev(), last);
@@ -375,12 +384,13 @@ mod tests {
             MailScreenId::from_number(7),
             Some(MailScreenId::SystemHealth)
         );
+        assert_eq!(MailScreenId::from_number(8), Some(MailScreenId::Timeline));
     }
 
     #[test]
     fn from_number_invalid() {
         assert_eq!(MailScreenId::from_number(0), None);
-        assert_eq!(MailScreenId::from_number(8), None);
+        assert_eq!(MailScreenId::from_number(9), None);
         assert_eq!(MailScreenId::from_number(100), None);
     }
 

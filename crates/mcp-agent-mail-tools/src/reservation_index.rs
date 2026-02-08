@@ -85,10 +85,7 @@ impl ReservationIndex {
     /// Find all reservations that conflict with the given request path.
     ///
     /// `request_pat` must be a `CompiledPattern` for the same `request_path`.
-    pub fn find_conflicts<'a>(
-        &'a self,
-        request_pat: &CompiledPattern,
-    ) -> Vec<&'a ReservationRef> {
+    pub fn find_conflicts<'a>(&'a self, request_pat: &CompiledPattern) -> Vec<&'a ReservationRef> {
         let mut conflicts: Vec<&ReservationRef> = Vec::new();
         let req_norm = request_pat.normalized();
         let req_is_glob = request_pat.is_glob();
@@ -207,11 +204,7 @@ impl ReservationIndex {
 /// Extract the first path segment from a normalized path.
 fn first_segment(norm: &str) -> Option<&str> {
     let seg = norm.split('/').next().unwrap_or("");
-    if seg.is_empty() {
-        None
-    } else {
-        Some(seg)
-    }
+    if seg.is_empty() { None } else { Some(seg) }
 }
 
 #[cfg(test)]
@@ -228,9 +221,8 @@ mod tests {
 
     #[test]
     fn exact_path_conflict_detected() {
-        let idx = ReservationIndex::build(
-            vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter(),
-        );
+        let idx =
+            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
@@ -239,9 +231,8 @@ mod tests {
 
     #[test]
     fn exact_path_no_conflict_different_file() {
-        let idx = ReservationIndex::build(
-            vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter(),
-        );
+        let idx =
+            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter());
         let req = CompiledPattern::new("src/lib.rs");
         let conflicts = idx.find_conflicts(&req);
         assert!(conflicts.is_empty());
@@ -249,9 +240,8 @@ mod tests {
 
     #[test]
     fn glob_reservation_matches_exact_request() {
-        let idx = ReservationIndex::build(
-            vec![("src/**".to_string(), make_ref(1, 10))].into_iter(),
-        );
+        let idx =
+            ReservationIndex::build(vec![("src/**".to_string(), make_ref(1, 10))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
@@ -259,9 +249,8 @@ mod tests {
 
     #[test]
     fn glob_request_matches_exact_reservation() {
-        let idx = ReservationIndex::build(
-            vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter(),
-        );
+        let idx =
+            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter());
         let req = CompiledPattern::new("src/**");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
@@ -269,9 +258,8 @@ mod tests {
 
     #[test]
     fn root_glob_reservation_checked_against_all() {
-        let idx = ReservationIndex::build(
-            vec![("**/*.rs".to_string(), make_ref(1, 10))].into_iter(),
-        );
+        let idx =
+            ReservationIndex::build(vec![("**/*.rs".to_string(), make_ref(1, 10))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
@@ -331,9 +319,8 @@ mod tests {
 
     #[test]
     fn glob_vs_glob_overlap_detected() {
-        let idx = ReservationIndex::build(
-            vec![("src/**/*.rs".to_string(), make_ref(1, 10))].into_iter(),
-        );
+        let idx =
+            ReservationIndex::build(vec![("src/**/*.rs".to_string(), make_ref(1, 10))].into_iter());
         let req = CompiledPattern::new("src/**");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);

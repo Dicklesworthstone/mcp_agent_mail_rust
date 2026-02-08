@@ -203,7 +203,10 @@ pub fn render_status_line(
     spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
     spans.push(Span::styled(
         title,
-        Style::default().fg(tp.status_accent).bg(tp.status_bg).bold(),
+        Style::default()
+            .fg(tp.status_accent)
+            .bg(tp.status_bg)
+            .bold(),
     ));
     spans.push(Span::styled(
         format!(" | mode:{transport_mode} up:{uptime_str} "),
@@ -259,7 +262,7 @@ pub fn render_status_line(
 
 /// Global keybindings shown in every help overlay.
 const GLOBAL_KEYBINDINGS: &[(&str, &str)] = &[
-    ("1-7", "Jump to screen"),
+    ("1-8", "Jump to screen"),
     ("Tab", "Next screen"),
     ("Shift+Tab", "Previous screen"),
     ("m", "Toggle MCP/API mode"),
@@ -306,8 +309,12 @@ pub fn render_help_overlay(
 
     // Global section header
     if y_offset < inner.height {
-        let header = Paragraph::new("Global")
-            .style(Style::default().fg(tp.help_category_fg).bg(tp.help_bg).bold());
+        let header = Paragraph::new("Global").style(
+            Style::default()
+                .fg(tp.help_category_fg)
+                .bg(tp.help_bg)
+                .bold(),
+        );
         header.render(
             Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
             frame,
@@ -340,8 +347,12 @@ pub fn render_help_overlay(
 
         let meta = screen_meta(active);
         if y_offset < inner.height {
-            let header = Paragraph::new(meta.title)
-                .style(Style::default().fg(tp.help_category_fg).bg(tp.help_bg).bold());
+            let header = Paragraph::new(meta.title).style(
+                Style::default()
+                    .fg(tp.help_category_fg)
+                    .bg(tp.help_bg)
+                    .bold(),
+            );
             header.render(
                 Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
                 frame,
@@ -694,12 +705,16 @@ mod tests {
         // Non-HC mode now derives from the active ftui theme, not static constants.
         // Just verify the palette has valid (non-zero) colors.
         assert!(
-            p.tab_active_bg.r() > 0 || p.tab_active_bg.g() > 0 || p.tab_active_bg.b() > 0
+            p.tab_active_bg.r() > 0
+                || p.tab_active_bg.g() > 0
+                || p.tab_active_bg.b() > 0
                 || p.tab_active_bg == crate::tui_theme::TuiThemePalette::current().tab_active_bg,
             "non-HC tab_active_bg should come from theme"
         );
         assert!(
-            p.help_fg.r() > 0 || p.help_fg.g() > 0 || p.help_fg.b() > 0
+            p.help_fg.r() > 0
+                || p.help_fg.g() > 0
+                || p.help_fg.b() > 0
                 || p.help_fg == crate::tui_theme::TuiThemePalette::current().help_fg,
             "non-HC help_fg should come from theme"
         );

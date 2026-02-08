@@ -23,7 +23,7 @@ use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
     agents::AgentsScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen,
     reservations::ReservationsScreen, screen_meta, system_health::SystemHealthScreen,
-    threads::ThreadExplorerScreen, tool_metrics::ToolMetricsScreen,
+    threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -92,6 +92,8 @@ impl MailAppModel {
                 screens.insert(id, Box::new(MessageBrowserScreen::new()));
             } else if id == MailScreenId::Threads {
                 screens.insert(id, Box::new(ThreadExplorerScreen::new()));
+            } else if id == MailScreenId::Timeline {
+                screens.insert(id, Box::new(TimelineScreen::new()));
             } else if id == MailScreenId::SystemHealth {
                 screens.insert(id, Box::new(SystemHealthScreen::new(Arc::clone(&state))));
             } else if id == MailScreenId::Agents {
@@ -449,9 +451,8 @@ impl Model for MailAppModel {
                 // Route deep-link to the appropriate screen.
                 use crate::tui_screens::DeepLinkTarget;
                 let target_screen = match target {
-                    DeepLinkTarget::TimelineAtTime(_) | DeepLinkTarget::ThreadById(_) => {
-                        MailScreenId::Threads
-                    }
+                    DeepLinkTarget::TimelineAtTime(_) => MailScreenId::Timeline,
+                    DeepLinkTarget::ThreadById(_) => MailScreenId::Threads,
                     DeepLinkTarget::MessageById(_) => MailScreenId::Messages,
                     DeepLinkTarget::AgentByName(_) => MailScreenId::Agents,
                     DeepLinkTarget::ToolByName(_) => MailScreenId::ToolMetrics,
@@ -568,6 +569,7 @@ mod palette_action_ids {
     pub const SCREEN_DASHBOARD: &str = "screen:dashboard";
     pub const SCREEN_MESSAGES: &str = "screen:messages";
     pub const SCREEN_THREADS: &str = "screen:threads";
+    pub const SCREEN_TIMELINE: &str = "screen:timeline";
     pub const SCREEN_AGENTS: &str = "screen:agents";
     pub const SCREEN_RESERVATIONS: &str = "screen:reservations";
     pub const SCREEN_TOOL_METRICS: &str = "screen:tool_metrics";
@@ -579,6 +581,7 @@ fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
         palette_action_ids::SCREEN_DASHBOARD => Some(MailScreenId::Dashboard),
         palette_action_ids::SCREEN_MESSAGES => Some(MailScreenId::Messages),
         palette_action_ids::SCREEN_THREADS => Some(MailScreenId::Threads),
+        palette_action_ids::SCREEN_TIMELINE => Some(MailScreenId::Timeline),
         palette_action_ids::SCREEN_AGENTS => Some(MailScreenId::Agents),
         palette_action_ids::SCREEN_RESERVATIONS => Some(MailScreenId::Reservations),
         palette_action_ids::SCREEN_TOOL_METRICS => Some(MailScreenId::ToolMetrics),
@@ -592,6 +595,7 @@ const fn screen_palette_action_id(id: MailScreenId) -> &'static str {
         MailScreenId::Dashboard => palette_action_ids::SCREEN_DASHBOARD,
         MailScreenId::Messages => palette_action_ids::SCREEN_MESSAGES,
         MailScreenId::Threads => palette_action_ids::SCREEN_THREADS,
+        MailScreenId::Timeline => palette_action_ids::SCREEN_TIMELINE,
         MailScreenId::Agents => palette_action_ids::SCREEN_AGENTS,
         MailScreenId::Reservations => palette_action_ids::SCREEN_RESERVATIONS,
         MailScreenId::ToolMetrics => palette_action_ids::SCREEN_TOOL_METRICS,

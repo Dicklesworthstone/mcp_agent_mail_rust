@@ -139,7 +139,11 @@ impl CircuitBreaker {
 
     /// Create with subsystem label and custom parameters.
     #[must_use]
-    pub fn with_subsystem(subsystem: &'static str, threshold: u32, reset_duration: Duration) -> Self {
+    pub fn with_subsystem(
+        subsystem: &'static str,
+        threshold: u32,
+        reset_duration: Duration,
+    ) -> Self {
         Self {
             failures: AtomicU32::new(0),
             half_open_successes: AtomicU32::new(0),
@@ -230,7 +234,8 @@ impl CircuitBreaker {
                 let interval_us = micros_from_duration(HALF_OPEN_PROBE_INTERVAL);
                 if last > 0 && now_us.saturating_sub(last) < interval_us {
                     #[allow(clippy::cast_precision_loss)]
-                    let remaining = (interval_us - now_us.saturating_sub(last)) as f64 / 1_000_000.0;
+                    let remaining =
+                        (interval_us - now_us.saturating_sub(last)) as f64 / 1_000_000.0;
                     return Err(DbError::CircuitBreakerOpen {
                         message: format!(
                             "[{subsystem}] Circuit breaker half-open, probe rate-limited. \
@@ -328,9 +333,7 @@ impl CircuitBreaker {
 
 /// Log a circuit state transition at WARN level.
 fn log_transition(subsystem: &str, from: CircuitState, to: CircuitState) {
-    eprintln!(
-        "[WARN] circuit_breaker[{subsystem}]: {from} -> {to}",
-    );
+    eprintln!("[WARN] circuit_breaker[{subsystem}]: {from} -> {to}",);
 }
 
 /// Convert a [`Duration`] to microseconds as `u64`, saturating on overflow.
@@ -663,17 +666,19 @@ pub fn db_health_status() -> DbHealthStatus {
             let state = cb.state();
             let rec = match (sub, state) {
                 (Subsystem::Db, CircuitState::Open) => Some(
-                    "DB circuit OPEN: reduce concurrent operations or increase busy_timeout.".to_string(),
+                    "DB circuit OPEN: reduce concurrent operations or increase busy_timeout."
+                        .to_string(),
                 ),
                 (Subsystem::Git, CircuitState::Open) => Some(
-                    "Git circuit OPEN: check for index.lock contention or network issues.".to_string(),
+                    "Git circuit OPEN: check for index.lock contention or network issues."
+                        .to_string(),
                 ),
                 (Subsystem::Signal, CircuitState::Open) => Some(
                     "Signal circuit OPEN: check filesystem permissions and disk space.".to_string(),
                 ),
-                (Subsystem::Llm, CircuitState::Open) => Some(
-                    "LLM circuit OPEN: check API keys and network connectivity.".to_string(),
-                ),
+                (Subsystem::Llm, CircuitState::Open) => {
+                    Some("LLM circuit OPEN: check API keys and network connectivity.".to_string())
+                }
                 _ => None,
             };
             SubsystemCircuitStatus {
@@ -879,7 +884,10 @@ mod tests {
         cb.record_failure();
         let err = cb.check().unwrap_err();
         if let DbError::CircuitBreakerOpen { message, .. } = err {
-            assert!(message.contains("[git]"), "error should name subsystem: {message}");
+            assert!(
+                message.contains("[git]"),
+                "error should name subsystem: {message}"
+            );
         } else {
             panic!("expected CircuitBreakerOpen");
         }
@@ -932,7 +940,10 @@ mod tests {
         let err = cb.check().unwrap_err();
         assert!(matches!(err, DbError::CircuitBreakerOpen { .. }));
         if let DbError::CircuitBreakerOpen { message, .. } = err {
-            assert!(message.contains("rate-limited"), "should mention rate limit: {message}");
+            assert!(
+                message.contains("rate-limited"),
+                "should mention rate limit: {message}"
+            );
         }
     }
 
@@ -1172,13 +1183,27 @@ mod tests {
         assert_eq!(status.circuit_state, "closed");
 
         // Git circuit should show as open.
-        let git_status = status.circuits.iter().find(|c| c.subsystem == "git").unwrap();
+        let git_status = status
+            .circuits
+            .iter()
+            .find(|c| c.subsystem == "git")
+            .unwrap();
         assert_eq!(git_status.state, "open");
         assert!(git_status.recommendation.is_some());
-        assert!(git_status.recommendation.as_ref().unwrap().contains("index.lock"));
+        assert!(
+            git_status
+                .recommendation
+                .as_ref()
+                .unwrap()
+                .contains("index.lock")
+        );
 
         // DB circuit should be closed.
-        let db_status = status.circuits.iter().find(|c| c.subsystem == "db").unwrap();
+        let db_status = status
+            .circuits
+            .iter()
+            .find(|c| c.subsystem == "db")
+            .unwrap();
         assert_eq!(db_status.state, "closed");
         assert!(db_status.recommendation.is_none());
 

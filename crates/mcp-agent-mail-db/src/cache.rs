@@ -561,11 +561,7 @@ pub struct CacheEntryCounts {
 /// LRU eviction for `IndexMap<String, CacheEntry<T>>`:
 /// 1. First remove expired entries.
 /// 2. If still at capacity, evict the oldest (front) entries until below capacity.
-fn lru_evict_if_full<T>(
-    map: &mut IndexMap<String, CacheEntry<T>>,
-    ttl: Duration,
-    capacity: usize,
-) {
+fn lru_evict_if_full<T>(map: &mut IndexMap<String, CacheEntry<T>>, ttl: Duration, capacity: usize) {
     if map.len() < capacity {
         return;
     }

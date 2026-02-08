@@ -7261,4 +7261,169 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+
+    // ── Lock-free commit tests ────────────────────────────────────────
+
+    #[test]
+    fn lockfree_commit_single_file_success() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "lockfree-single").unwrap();
+
+        // Write a file to commit
+        let file_path = archive.root.join("agents/TestAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, r#"{"name":"TestAgent"}"#).unwrap();
+
+        let before = mcp_agent_mail_core::global_metrics()
+            .storage
+            .lockfree_commits_total
+            .load();
+
+        commit_paths_with_retry(
+            &archive.root,
+            &config,
+            "lockfree single file test",
+            &["agents/TestAgent/profile.json"],
+        )
+        .unwrap();
+
+        let after = mcp_agent_mail_core::global_metrics()
+            .storage
+            .lockfree_commits_total
+            .load();
+
+        // At least one lockfree commit should have happened (delta ≥ 1)
+        assert!(
+            after > before,
+            "lockfree_commits_total did not increment: before={before}, after={after}"
+        );
+
+        // Verify file is in git
+        let repo = Repository::open(&archive.root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let tree = head.tree().unwrap();
+        assert!(tree.get_path(Path::new("agents/TestAgent/profile.json")).is_ok());
+    }
+
+    #[test]
+    fn lockfree_commit_10_concurrent_agents() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "lockfree-concurrent").unwrap();
+        let root = archive.root.clone();
+
+        let n_threads = 10usize;
+        let barrier = Arc::new(Barrier::new(n_threads));
+        let mut handles = Vec::new();
+
+        for i in 0..n_threads {
+            let bar = barrier.clone();
+            let root = root.clone();
+            let cfg = config.clone();
+            handles.push(std::thread::spawn(move || {
+                let rel = format!("agents/Agent{i}/profile.json");
+                let full = root.join(&rel);
+                fs::create_dir_all(full.parent().unwrap()).unwrap();
+                fs::write(&full, format!(r#"{{"name":"Agent{i}"}}"#)).unwrap();
+
+                bar.wait(); // synchronize for maximum contention
+
+                commit_paths_with_retry(&root, &cfg, &format!("agent {i} commit"), &[&rel])
+                    .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify all files are reachable in the final git tree
+        let repo = Repository::open(&root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let tree = head.tree().unwrap();
+        for i in 0..n_threads {
+            let p = format!("agents/Agent{i}/profile.json");
+            assert!(
+                tree.get_path(Path::new(&p)).is_ok(),
+                "file {p} not found in HEAD tree after concurrent commits"
+            );
+        }
+
+        // Metrics should show activity
+        let snap = mcp_agent_mail_core::global_metrics().storage.snapshot();
+        assert!(
+            snap.lockfree_commits_total > 0 || snap.lockfree_commit_fallbacks_total > 0,
+            "expected at least some lockfree activity in metrics"
+        );
+    }
+
+    #[test]
+    fn pid_owner_tracking_write_and_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "pid-owner").unwrap();
+
+        // Write owner file
+        write_lock_owner(&archive.root);
+        let owner_path = archive.root.join(".git/index.lock.owner");
+        assert!(owner_path.exists(), "owner file should be created");
+
+        let content = fs::read_to_string(&owner_path).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 2, "owner file should have PID and timestamp");
+
+        let pid: u32 = lines[0].parse().unwrap();
+        assert_eq!(pid, std::process::id(), "owner PID should match current process");
+
+        let ts: u64 = lines[1].parse().unwrap();
+        assert!(ts > 0, "timestamp should be non-zero");
+
+        // Remove owner file
+        remove_lock_owner(&archive.root);
+        assert!(!owner_path.exists(), "owner file should be removed");
+    }
+
+    #[test]
+    fn stale_lock_cleanup_respects_alive_pid() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "alive-pid").unwrap();
+
+        // Create a fake index.lock with an owner that is the current (alive) PID
+        let lock_path = archive.root.join(".git/index.lock");
+        fs::write(&lock_path, "fake lock").unwrap();
+        write_lock_owner(&archive.root);
+
+        // Stale lock cleanup should NOT remove the lock (PID is alive)
+        let removed = try_clean_stale_git_lock(&archive.root, 0.0);
+        assert!(!removed, "should not remove lock owned by alive PID");
+        assert!(lock_path.exists(), "lock file should still exist");
+
+        // Clean up
+        fs::remove_file(&lock_path).ok();
+        remove_lock_owner(&archive.root);
+    }
+
+    #[test]
+    fn stale_lock_cleanup_removes_dead_pid_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "dead-pid").unwrap();
+
+        // Create a fake index.lock with a dead PID owner
+        let lock_path = archive.root.join(".git/index.lock");
+        fs::write(&lock_path, "fake lock").unwrap();
+
+        let owner_path = archive.root.join(".git/index.lock.owner");
+        // PID 999999999 is virtually guaranteed to not exist
+        fs::write(&owner_path, "999999999\n1000000000\n").unwrap();
+
+        // Stale lock cleanup SHOULD remove the lock (PID is dead)
+        let removed = try_clean_stale_git_lock(&archive.root, 0.0);
+        assert!(removed, "should remove lock owned by dead PID");
+        assert!(!lock_path.exists(), "lock file should be removed");
+    }
 }

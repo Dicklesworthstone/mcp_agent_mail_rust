@@ -85,9 +85,7 @@ where
 
 fn make_load_pool(max_connections: usize) -> (DbPool, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let db_path = dir
-        .path()
-        .join(format!("load_{}.db", unique_suffix()));
+    let db_path = dir.path().join(format!("load_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
         max_connections,
@@ -223,7 +221,14 @@ fn load_scenario_a_registration_storm() {
                         let n = name.clone();
                         async move {
                             queries::register_agent(
-                                &cx, &pp, project_id, &n, "load-bench", "model", None, None,
+                                &cx,
+                                &pp,
+                                project_id,
+                                &n,
+                                "load-bench",
+                                "model",
+                                None,
+                                None,
                             )
                             .await
                         }
@@ -443,7 +448,14 @@ fn load_scenario_c_mixed_workload() {
                 let n = name.clone();
                 async move {
                     queries::register_agent(
-                        &cx, &pp, project_id, &n, "load-bench", "model", None, None,
+                        &cx,
+                        &pp,
+                        project_id,
+                        &n,
+                        "load-bench",
+                        "model",
+                        None,
+                        None,
                     )
                     .await
                 }
@@ -569,8 +581,7 @@ fn load_scenario_c_mixed_workload() {
                             match block_on(|cx| {
                                 let pp = pool.clone();
                                 async move {
-                                    queries::search_messages(&cx, &pp, project_id, "seed", 10)
-                                        .await
+                                    queries::search_messages(&cx, &pp, project_id, "seed", 10).await
                                 }
                             }) {
                                 Outcome::Ok(_) => {
@@ -587,8 +598,14 @@ fn load_scenario_c_mixed_workload() {
                                 let pat = format!("src/file_{op_counter}.rs");
                                 async move {
                                     queries::create_file_reservations(
-                                        &cx, &pp, project_id, agent_id,
-                                        &[pat.as_str()], 3600, true, "",
+                                        &cx,
+                                        &pp,
+                                        project_id,
+                                        agent_id,
+                                        &[pat.as_str()],
+                                        3600,
+                                        true,
+                                        "",
                                     )
                                     .await
                                 }
@@ -631,7 +648,14 @@ fn load_scenario_c_mixed_workload() {
                         }
                     }
                 }
-                (fetch_lats, send_lats, search_lats, reserve_lats, ack_lats, errors)
+                (
+                    fetch_lats,
+                    send_lats,
+                    search_lats,
+                    reserve_lats,
+                    ack_lats,
+                    errors,
+                )
             })
         })
         .collect();
@@ -654,7 +678,8 @@ fn load_scenario_c_mixed_workload() {
     }
 
     let elapsed = start.elapsed();
-    let total_ops = all_fetch.len() + all_send.len() + all_search.len() + all_reserve.len() + all_ack.len();
+    let total_ops =
+        all_fetch.len() + all_send.len() + all_search.len() + all_reserve.len() + all_ack.len();
 
     let fetch_r = LatencyReport::from_latencies(&mut all_fetch, 0);
     let send_r = LatencyReport::from_latencies(&mut all_send, 0);
@@ -725,10 +750,8 @@ fn load_scenario_d_thundering_herd() {
             let pp = pool.clone();
             let n = name.clone();
             async move {
-                queries::register_agent(
-                    &cx, &pp, project_id, &n, "load-bench", "model", None, None,
-                )
-                .await
+                queries::register_agent(&cx, &pp, project_id, &n, "load-bench", "model", None, None)
+                    .await
             }
         })
         .id
@@ -782,8 +805,7 @@ fn load_scenario_d_thundering_herd() {
                 let result = block_on(|cx| {
                     let pp = pool.clone();
                     async move {
-                        queries::fetch_inbox(&cx, &pp, project_id, agent_id, false, None, 20)
-                            .await
+                        queries::fetch_inbox(&cx, &pp, project_id, agent_id, false, None, 20).await
                     }
                 });
 
