@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Build + Unit + Integration ──────────────────────────────────────
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Unit + integration tests
+        run: cargo test --workspace
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_test.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts
+          path: tests/artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── Mode matrix harness (Rust integration) ──────────────────────────
+  mode-matrix:
+    name: Mode Matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries
+        run: |
+          cargo build -p mcp-agent-mail-cli
+          cargo build -p mcp-agent-mail
+
+      - name: Mode matrix harness (Rust)
+        run: cargo test -p mcp-agent-mail-cli --test mode_matrix_harness -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_matrix.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Upload matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mode-matrix-artifacts
+          path: tests/artifacts/cli/mode_matrix/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── Semantic conformance ────────────────────────────────────────────
+  conformance:
+    name: Semantic Conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI binary
+        run: cargo build -p mcp-agent-mail-cli
+
+      - name: Semantic conformance suite
+        run: cargo test -p mcp-agent-mail-cli --test semantic_conformance -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_conform.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Upload conformance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-artifacts
+          path: tests/artifacts/cli/semantic_conformance/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── Perf + security regressions ─────────────────────────────────────
+  perf-security:
+    name: Perf & Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries
+        run: |
+          cargo build -p mcp-agent-mail-cli
+          cargo build -p mcp-agent-mail
+
+      - name: Perf + security regression suite
+        run: cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_perf.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Upload perf/security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-security-artifacts
+          path: tests/artifacts/cli/perf_security/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── E2E dual-mode shell suite ───────────────────────────────────────
+  e2e-dual-mode:
+    name: E2E Dual-Mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries
+        run: |
+          cargo build -p mcp-agent-mail-cli
+          cargo build -p mcp-agent-mail
+
+      - name: E2E dual-mode suite
+        run: bash scripts/e2e_dual_mode.sh
+
+      - name: E2E mode matrix suite
+        run: bash scripts/e2e_mode_matrix.sh
+
+      - name: Upload E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: tests/artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── Help snapshots (golden contract drift detection) ────────────────
+  snapshots:
+    name: Help Snapshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI binary
+        run: cargo build -p mcp-agent-mail-cli
+
+      - name: Verify help snapshots
+        run: cargo test -p mcp-agent-mail-cli --test help_snapshots -- --nocapture
+        env:
+          COLUMNS: "120"
+          DATABASE_URL: "sqlite:///tmp/ci_snap.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Upload snapshot diff artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-diff-artifacts
+          path: tests/artifacts/cli/help/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── Skip guard ──────────────────────────────────────────────────────
+  # Prevents silent test-skip regressions by asserting non-zero test counts.
+  skip-guard:
+    name: Skip Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [test, mode-matrix, conformance, perf-security, e2e-dual-mode, snapshots]
+    if: always()
+    steps:
+      - name: Verify all required jobs passed
+        run: |
+          echo "Job results:"
+          echo "  test: ${{ needs.test.result }}"
+          echo "  mode-matrix: ${{ needs.mode-matrix.result }}"
+          echo "  conformance: ${{ needs.conformance.result }}"
+          echo "  perf-security: ${{ needs.perf-security.result }}"
+          echo "  e2e-dual-mode: ${{ needs.e2e-dual-mode.result }}"
+          echo "  snapshots: ${{ needs.snapshots.result }}"
+
+          FAILED=0
+          for result in \
+            "${{ needs.test.result }}" \
+            "${{ needs.mode-matrix.result }}" \
+            "${{ needs.conformance.result }}" \
+            "${{ needs.perf-security.result }}" \
+            "${{ needs.e2e-dual-mode.result }}" \
+            "${{ needs.snapshots.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "FAIL: job result = $result"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "One or more required jobs did not succeed."
+            exit 1
+          fi
+          echo "All required jobs passed."

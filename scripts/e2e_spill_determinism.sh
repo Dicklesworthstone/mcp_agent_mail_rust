@@ -16,6 +16,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Suite identity (used for artifact directory naming inside e2e_lib.sh)
+E2E_SUITE="spill_determinism"
+
+# Safety: default to keeping temp dirs so shared harness cleanup doesn't run `rm -rf`.
+: "${AM_E2E_KEEP_TMP:=1}"
+
 # shellcheck source=./e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
@@ -59,20 +65,27 @@ set +e
 REPLAY_OUT="$("${REPLAY_CMD[@]}" 2>&1)"
 REPLAY_RC=$?
 set -e
+REPLAY_OUT_PATH="${E2E_ARTIFACT_DIR}/case_02_replay_stdout.txt"
 e2e_save_artifact "case_02_replay_stdout.txt" "$REPLAY_OUT"
 e2e_assert_exit_code "seed replay exits 0" "0" "$REPLAY_RC"
 
 e2e_case_banner "bundle_generation_and_order_validation"
 BUNDLE_PATH="${E2E_ARTIFACT_DIR}/spill_replay_bundle.json"
 set +e
-BUNDLE_STATUS="$(python3 - "$REPLAY_OUT" "$BUNDLE_PATH" <<'PY'
+BUNDLE_STATUS="$(python3 - "$REPLAY_OUT_PATH" "$BUNDLE_PATH" <<'PY'
 import json
 import pathlib
 import re
 import sys
 
-text = sys.argv[1]
+replay_stdout_path = pathlib.Path(sys.argv[1])
 bundle_path = pathlib.Path(sys.argv[2])
+
+try:
+    text = replay_stdout_path.read_text(encoding="utf-8", errors="replace")
+except FileNotFoundError:
+    print(f"ERROR: replay stdout file not found: {replay_stdout_path}")
+    raise SystemExit(2)
 
 line = None
 for raw in text.splitlines():
@@ -132,4 +145,3 @@ else
 fi
 
 e2e_summary
-
