@@ -336,6 +336,48 @@ fn tracked(conn: &sqlmodel_sqlite::SqliteConnection) -> TrackedConnection<'_> {
     TrackedConnection::new(conn)
 }
 
+// =============================================================================
+// Transaction helpers
+// =============================================================================
+
+/// Begin an immediate write transaction (acquires the WAL write lock).
+async fn begin_immediate_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    map_sql_outcome(tracked.execute(cx, "BEGIN IMMEDIATE", &[]).await).map(|_| ())
+}
+
+/// Commit the current transaction (single fsync in WAL mode).
+async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await).map(|_| ())
+}
+
+/// Rollback the current transaction (best-effort, errors ignored).
+async fn rollback_tx(cx: &Cx, tracked: &TrackedConnection<'_>) {
+    let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
+}
+
+/// Unwrap an `Outcome` inside a transaction: on non-`Ok`, rollback and return early.
+///
+/// Usage: `let val = try_in_tx!(cx, tracked, some_outcome_expr);`
+macro_rules! try_in_tx {
+    ($cx:expr, $tracked:expr, $out:expr) => {
+        match $out {
+            Outcome::Ok(v) => v,
+            Outcome::Err(e) => {
+                rollback_tx($cx, $tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx($cx, $tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx($cx, $tracked).await;
+                return Outcome::Panicked(p);
+            }
+        }
+    };
+}
+
 /// Ensure a project exists, creating if necessary.
 ///
 /// Returns the project row (existing or newly created).
@@ -796,10 +838,25 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
         }
     }
 
-    let sql = "UPDATE agents SET last_active_ts = ? WHERE id = ?";
-    for (agent_id, ts) in &pending {
-        let params = [Value::BigInt(*ts), Value::BigInt(*agent_id)];
-        match map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await) {
+    // Batch UPDATE using VALUES CTE: 1 prepare/execute per chunk instead of per-agent.
+    // SQLite parameter limit is 999; 2 params per row → max 499 per chunk.
+    let entries: Vec<_> = pending.iter().collect();
+
+    for chunk in entries.chunks(400) {
+        let placeholders = std::iter::repeat_n("(?,?)", chunk.len()).collect::<Vec<_>>();
+        let sql = format!(
+            "WITH batch(agent_id, new_ts) AS (VALUES {}) \
+             UPDATE agents SET last_active_ts = batch.new_ts \
+             FROM batch WHERE agents.id = batch.agent_id",
+            placeholders.join(",")
+        );
+        let mut params = Vec::with_capacity(chunk.len() * 2);
+        for &(&agent_id, &ts) in chunk {
+            params.push(Value::BigInt(agent_id));
+            params.push(Value::BigInt(ts));
+        }
+
+        match map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await) {
             Outcome::Ok(_) => {}
             Outcome::Err(e) => {
                 let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
@@ -995,13 +1052,7 @@ pub async fn create_message_with_recipients(
 
     let tracked = tracked(&*conn);
 
-    // BEGIN TRANSACTION (manual SQL so we can keep using Connection-based insert!)
-    match tracked.execute(cx, "BEGIN IMMEDIATE", &[]).await {
-        Outcome::Ok(_) => {}
-        Outcome::Err(e) => return Outcome::Err(map_sql_error(&e)),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    }
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
     // Insert message
     let mut row = MessageRow {
@@ -1017,25 +1068,12 @@ pub async fn create_message_with_recipients(
         attachments: attachments.to_string(),
     };
 
-    let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
-    let message_id = match id_out {
-        Outcome::Ok(id) => {
-            row.id = Some(id);
-            id
-        }
-        Outcome::Err(e) => {
-            let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => {
-            let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
-            return Outcome::Cancelled(r);
-        }
-        Outcome::Panicked(p) => {
-            let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
-            return Outcome::Panicked(p);
-        }
-    };
+    let message_id = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
+    );
+    row.id = Some(message_id);
 
     // Insert all recipients within the same transaction
     for (agent_id, kind) in recipients {
@@ -1046,32 +1084,16 @@ pub async fn create_message_with_recipients(
             read_ts: None,
             ack_ts: None,
         };
-
-        let out = map_sql_outcome(insert!(&recip).execute(cx, &tracked).await);
-        match out {
-            Outcome::Ok(_) => {}
-            Outcome::Err(e) => {
-                let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
-                return Outcome::Err(e);
-            }
-            Outcome::Cancelled(r) => {
-                let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
-                return Outcome::Cancelled(r);
-            }
-            Outcome::Panicked(p) => {
-                let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
-                return Outcome::Panicked(p);
-            }
-        }
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(insert!(&recip).execute(cx, &tracked).await)
+        );
     }
 
     // COMMIT (single fsync)
-    match tracked.execute(cx, "COMMIT", &[]).await {
-        Outcome::Ok(_) => Outcome::Ok(row),
-        Outcome::Err(e) => Outcome::Err(map_sql_error(&e)),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    Outcome::Ok(row)
 }
 
 /// List messages for a thread.
@@ -1653,7 +1675,7 @@ pub async fn search_messages(
                    JOIN messages m ON m.id = fts_messages.message_id \
                    JOIN agents a ON a.id = m.sender_id \
                    WHERE m.project_id = ? AND fts_messages MATCH ? \
-                   ORDER BY bm25(fts_messages) ASC, m.id ASC \
+                   ORDER BY bm25(fts_messages, 10.0, 1.0) ASC, m.id ASC \
                    LIMIT ?";
         let params = [
             Value::BigInt(project_id),
@@ -1750,6 +1772,9 @@ pub async fn add_recipients(
 
     let tracked = tracked(&*conn);
 
+    // Batch all recipient inserts in a single transaction (1 fsync instead of N).
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
     for (agent_id, kind) in recipients {
         let row = MessageRecipientRow {
             message_id,
@@ -1758,16 +1783,14 @@ pub async fn add_recipients(
             read_ts: None,
             ack_ts: None,
         };
-
-        let out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
-        match out {
-            Outcome::Ok(_) => {}
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
+        );
     }
 
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     Outcome::Ok(())
 }
 
@@ -1888,6 +1911,9 @@ pub async fn create_file_reservations(
 
     let tracked = tracked(&*conn);
 
+    // Batch all reservation inserts in a single transaction (1 fsync instead of N).
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
     let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
     for path in paths {
         let mut row = FileReservationRow {
@@ -1902,18 +1928,16 @@ pub async fn create_file_reservations(
             released_ts: None,
         };
 
-        let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
-        match id_out {
-            Outcome::Ok(id) => {
-                row.id = Some(id);
-                out.push(row);
-            }
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
+        let id = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
+        );
+        row.id = Some(id);
+        out.push(row);
     }
 
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     Outcome::Ok(out)
 }
 
