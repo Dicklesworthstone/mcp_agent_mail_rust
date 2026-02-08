@@ -11,7 +11,7 @@ Gating criteria for promoting `scripts/am` as the default workflow.
 - [x] `am --api` / `am --mcp` switches transport modes
 - [x] `am --no-auth` disables authentication for local dev
 - [x] Auth token auto-discovered from `~/.mcp_agent_mail/.env`
-- [x] All 23 MCP tools respond correctly
+- [x] All 34 MCP tools respond correctly
 - [x] All 20+ MCP resources return correct data
 - [x] Startup probes catch and report common failures (port, storage, DB)
 - [x] Graceful shutdown flushes commit queue
