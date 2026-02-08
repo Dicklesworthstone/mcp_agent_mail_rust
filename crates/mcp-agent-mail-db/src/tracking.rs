@@ -2,6 +2,15 @@
 //!
 //! Provides lightweight counters for total queries, per-table breakdowns,
 //! and a capped slow-query log. Mirrors the Python `QueryTracker`.
+//!
+//! ## Lock-Free Design
+//!
+//! The hot path (`record`) uses only atomic operations:
+//! - `AtomicU64` for total query count and cumulative duration
+//! - `[AtomicU64; TableId::COUNT]` array for per-table counters
+//! - Fast keyword-based table extraction (no regex on hot path)
+//!
+//! The `OrderedMutex` is only acquired for slow-query logging (rare cold path).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +25,7 @@ use serde::{Deserialize, Serialize};
 const SLOW_QUERY_LIMIT: usize = 50;
 
 /// Compiled table extraction patterns (built once, reused).
+/// Used only for slow-query logging and the legacy `extract_table()` API.
 static TABLE_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
         Regex::new(r#"(?i)\binsert\s+(?:or\s+\w+\s+)?into\s+([\w.`"\[\]]+)"#).unwrap(),
@@ -24,6 +34,277 @@ static TABLE_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     ]
 });
 
+// =============================================================================
+// TableId — known table enumeration for lock-free counting
+// =============================================================================
+
+/// Known database tables for O(1) atomic counter indexing.
+///
+/// Each variant maps to a slot in the `per_table: [AtomicU64; COUNT]` array.
+/// `Unknown` captures queries against unrecognized tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TableId {
+    Projects = 0,
+    Products = 1,
+    ProductProjectLinks = 2,
+    Agents = 3,
+    Messages = 4,
+    MessageRecipients = 5,
+    FileReservations = 6,
+    AgentLinks = 7,
+    ProjectSiblingSuggestions = 8,
+    FtsMessages = 9,
+    Unknown = 10,
+}
+
+impl TableId {
+    /// Total number of variants (for array sizing).
+    pub const COUNT: usize = 11;
+
+    /// Human-readable table name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Projects => "projects",
+            Self::Products => "products",
+            Self::ProductProjectLinks => "product_project_links",
+            Self::Agents => "agents",
+            Self::Messages => "messages",
+            Self::MessageRecipients => "message_recipients",
+            Self::FileReservations => "file_reservations",
+            Self::AgentLinks => "agent_links",
+            Self::ProjectSiblingSuggestions => "project_sibling_suggestions",
+            Self::FtsMessages => "fts_messages",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Convert array index back to `TableId`.
+    #[must_use]
+    pub const fn from_index(i: usize) -> Self {
+        match i {
+            0 => Self::Projects,
+            1 => Self::Products,
+            2 => Self::ProductProjectLinks,
+            3 => Self::Agents,
+            4 => Self::Messages,
+            5 => Self::MessageRecipients,
+            6 => Self::FileReservations,
+            7 => Self::AgentLinks,
+            8 => Self::ProjectSiblingSuggestions,
+            9 => Self::FtsMessages,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Match a lowercase table name to a known `TableId`.
+fn match_known_table_lower(name: &[u8]) -> TableId {
+    // Ordered by expected query frequency (messages/agents most common).
+    match name {
+        b"messages" => TableId::Messages,
+        b"agents" => TableId::Agents,
+        b"message_recipients" => TableId::MessageRecipients,
+        b"projects" => TableId::Projects,
+        b"file_reservations" => TableId::FileReservations,
+        b"agent_links" => TableId::AgentLinks,
+        b"fts_messages" => TableId::FtsMessages,
+        b"products" => TableId::Products,
+        b"product_project_links" => TableId::ProductProjectLinks,
+        b"project_sibling_suggestions" => TableId::ProjectSiblingSuggestions,
+        _ => TableId::Unknown,
+    }
+}
+
+// =============================================================================
+// Fast table extraction (no regex, no allocation)
+// =============================================================================
+
+/// Extract the `TableId` from a SQL statement using fast keyword scanning.
+///
+/// Scans for `INTO`, `UPDATE`, and `FROM` keywords (case-insensitive) in
+/// priority order, then matches the extracted table name against known tables.
+///
+/// This is the hot-path replacement for `extract_table()` — no regex, no
+/// heap allocation.
+fn extract_table_id(sql: &str) -> TableId {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    if len < 6 {
+        return TableId::Unknown;
+    }
+
+    // Track the earliest keyword match position to preserve priority
+    // (INSERT INTO > UPDATE > FROM, naturally by position).
+    let mut best_pos = usize::MAX;
+    let mut best_name_start = 0usize;
+
+    // Scan for " INTO " or "\nINTO " or "\tINTO " (case-insensitive)
+    let mut i = 1; // INTO always preceded by whitespace
+    while i + 5 <= len {
+        if is_ws(bytes[i - 1]) && ci_eq4(bytes, i, *b"into") && i + 4 < len && is_ws(bytes[i + 4])
+        {
+            let ns = skip_ws(bytes, i + 5);
+            if ns < len && i < best_pos {
+                best_pos = i;
+                best_name_start = ns;
+            }
+            break; // INTO is highest priority, no need to continue
+        }
+        i += 1;
+    }
+
+    // Scan for "UPDATE " at start or after whitespace
+    i = 0;
+    while i + 7 <= len {
+        if (i == 0 || is_ws(bytes[i - 1]))
+            && ci_eq_n(bytes, i, b"update")
+            && is_ws(bytes[i + 6])
+        {
+            let ns = skip_ws(bytes, i + 7);
+            if ns < len && i < best_pos {
+                best_pos = i;
+                best_name_start = ns;
+            }
+            break;
+        }
+        i += 1;
+    }
+
+    // Scan for " FROM " (case-insensitive)
+    i = 1;
+    while i + 5 <= len {
+        if is_ws(bytes[i - 1]) && ci_eq4(bytes, i, *b"from") && i + 4 < len && is_ws(bytes[i + 4])
+        {
+            let ns = skip_ws(bytes, i + 5);
+            if ns < len && i < best_pos {
+                best_pos = i;
+                best_name_start = ns;
+            }
+            break; // Take the first FROM occurrence
+        }
+        i += 1;
+    }
+
+    if best_pos == usize::MAX {
+        return TableId::Unknown;
+    }
+
+    // Skip quote characters at start
+    let start = skip_quotes_at(bytes, best_name_start);
+    if start >= len {
+        return TableId::Unknown;
+    }
+
+    // Extract the table name word (lowercase it in-place on the stack)
+    let mut buf = [0u8; 64]; // known table names are all < 64 bytes
+    let mut bi = 0;
+
+    // Handle schema-qualified: skip to the part after the last dot
+    let qname_end = find_qname_end(bytes, start);
+    let last_segment_start = find_last_segment(bytes, start, qname_end);
+    let mut si = skip_quotes_at(bytes, last_segment_start);
+
+    while si < qname_end && bi < buf.len() {
+        let b = bytes[si];
+        if is_ident_char(b) {
+            buf[bi] = b.to_ascii_lowercase();
+            bi += 1;
+        } else if is_quote_char(b) {
+            // skip quote chars
+        } else {
+            break;
+        }
+        si += 1;
+    }
+
+    match_known_table_lower(&buf[..bi])
+}
+
+/// Check if byte is ASCII whitespace (space, tab, newline, carriage return).
+#[inline]
+const fn is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Check if byte is a quote character.
+#[inline]
+const fn is_quote_char(b: u8) -> bool {
+    matches!(b, b'`' | b'"' | b'[' | b']')
+}
+
+/// Check if byte is valid in a table identifier.
+#[inline]
+const fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Case-insensitive 4-byte match. `keyword` must be lowercase (e.g., `b"from"`).
+#[inline]
+fn ci_eq4(bytes: &[u8], pos: usize, keyword: [u8; 4]) -> bool {
+    bytes[pos].to_ascii_lowercase() == keyword[0]
+        && bytes[pos + 1].to_ascii_lowercase() == keyword[1]
+        && bytes[pos + 2].to_ascii_lowercase() == keyword[2]
+        && bytes[pos + 3].to_ascii_lowercase() == keyword[3]
+}
+
+/// Case-insensitive N-byte match. `keyword` must be lowercase.
+#[inline]
+fn ci_eq_n(bytes: &[u8], pos: usize, keyword: &[u8]) -> bool {
+    for (i, &k) in keyword.iter().enumerate() {
+        if bytes[pos + i].to_ascii_lowercase() != k {
+            return false;
+        }
+    }
+    true
+}
+
+/// Skip whitespace starting at `pos`, return the position of the first non-ws byte.
+#[inline]
+fn skip_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_ws(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+/// Skip quote characters at `pos`.
+#[inline]
+fn skip_quotes_at(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_quote_char(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+/// Find the end of a qualified name (identifiers, dots, and quotes).
+fn find_qname_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && (is_ident_char(bytes[i]) || bytes[i] == b'.' || is_quote_char(bytes[i]))
+    {
+        i += 1;
+    }
+    i
+}
+
+/// Find the start of the last segment after the last dot in a qualified name.
+fn find_last_segment(bytes: &[u8], start: usize, end: usize) -> usize {
+    let mut last_dot = None;
+    let mut i = start;
+    while i < end {
+        if bytes[i] == b'.' {
+            last_dot = Some(i);
+        }
+        i += 1;
+    }
+    last_dot.map_or(start, |pos| pos + 1)
+}
+
+// =============================================================================
+// SlowQueryEntry
+// =============================================================================
+
 /// A slow-query entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlowQueryEntry {
@@ -31,9 +312,25 @@ pub struct SlowQueryEntry {
     pub duration_ms: f64,
 }
 
+// =============================================================================
+// QueryTracker
+// =============================================================================
+
+/// Auxiliary state protected by mutex (cold path only).
+///
+/// Locked for: (a) unknown table names, (b) slow query logging.
+/// Both are rare in production since 99.9%+ of queries target known tables
+/// and few queries exceed the slow-query threshold.
+#[derive(Debug, Default)]
+struct TrackerAux {
+    slow_queries: Vec<SlowQueryEntry>,
+    unknown_tables: std::collections::HashMap<String, u64>,
+}
+
 /// Lightweight query tracker matching the Python `QueryTracker`.
 ///
-/// Thread-safe via atomics for counters and a mutex for per-table/slow maps.
+/// Thread-safe via atomics for counters. The mutex is only used for the
+/// slow-query log and unknown-table counting (cold path).
 #[derive(Debug)]
 pub struct QueryTracker {
     enabled: AtomicBool,
@@ -41,13 +338,15 @@ pub struct QueryTracker {
     total_time_us: AtomicU64,
     slow_enabled: AtomicBool,
     slow_threshold_us: AtomicU64,
-    inner: OrderedMutex<TrackerInner>,
+    /// Lock-free per-table counters indexed by `TableId`.
+    per_table: [AtomicU64; TableId::COUNT],
+    /// Mutex-protected auxiliary state (slow queries + unknown table counts).
+    aux: OrderedMutex<TrackerAux>,
 }
 
-#[derive(Debug, Default)]
-struct TrackerInner {
-    per_table: std::collections::HashMap<String, u64>,
-    slow_queries: Vec<SlowQueryEntry>,
+/// Helper to create a zeroed `AtomicU64` array.
+fn new_atomic_array<const N: usize>() -> [AtomicU64; N] {
+    std::array::from_fn(|_| AtomicU64::new(0))
 }
 
 impl Default for QueryTracker {
@@ -66,7 +365,8 @@ impl QueryTracker {
             total_time_us: AtomicU64::new(0),
             slow_enabled: AtomicBool::new(true),
             slow_threshold_us: AtomicU64::new(250_000), // 250ms default
-            inner: OrderedMutex::new(LockLevel::DbQueryTrackerInner, TrackerInner::default()),
+            per_table: new_atomic_array(),
+            aux: OrderedMutex::new(LockLevel::DbQueryTrackerInner, TrackerAux::default()),
         }
     }
 
@@ -98,31 +398,61 @@ impl QueryTracker {
     }
 
     /// Record a completed query. Call this after each SQL execution.
+    ///
+    /// **Hot path** (known tables): uses only atomic operations — no locks,
+    /// no regex, no allocation.
+    ///
+    /// **Cold path** (unknown tables or slow queries): falls back to regex
+    /// extraction and mutex for the auxiliary state. This is rare in
+    /// production since 99.9%+ of queries target known tables.
     pub fn record(&self, sql: &str, duration_us: u64) {
         if !self.is_enabled() {
             return;
         }
 
+        // Atomic counters — no locks
         self.total.fetch_add(1, Ordering::Relaxed);
         self.total_time_us.fetch_add(duration_us, Ordering::Relaxed);
 
-        let table = extract_table(sql);
+        // Fast table ID extraction (no regex, no allocation)
+        let table_id = extract_table_id(sql);
 
-        let mut inner = self.inner.lock();
+        // Check if we need the slow path (unknown table or slow query)
+        let is_slow = self.slow_enabled.load(Ordering::Acquire)
+            && duration_us >= self.slow_threshold_us.load(Ordering::Relaxed);
+        let needs_mutex = table_id == TableId::Unknown || is_slow;
 
-        // Per-table count
-        if let Some(ref table_name) = table {
-            *inner.per_table.entry(table_name.clone()).or_insert(0) += 1;
+        if !needs_mutex {
+            // HOT PATH: known table, not slow — pure atomic increment
+            self.per_table[table_id as usize].fetch_add(1, Ordering::Relaxed);
+            return;
         }
 
-        // Slow query log
-        if self.slow_enabled.load(Ordering::Acquire) {
-            let threshold = self.slow_threshold_us.load(Ordering::Relaxed);
-            if duration_us >= threshold && inner.slow_queries.len() < SLOW_QUERY_LIMIT {
-                inner.slow_queries.push(SlowQueryEntry {
-                    table,
+        // COLD PATH: unknown table or slow query — lock mutex
+        if table_id == TableId::Unknown {
+            // Unknown table: regex extraction + mutex for counting
+            let name = extract_table(sql);
+            let mut aux = self.aux.lock();
+            if let Some(ref table_str) = name {
+                *aux.unknown_tables.entry(table_str.clone()).or_insert(0) += 1;
+            }
+            if is_slow && aux.slow_queries.len() < SLOW_QUERY_LIMIT {
+                aux.slow_queries.push(SlowQueryEntry {
+                    table: name,
                     duration_ms: round_ms(duration_us),
                 });
+            }
+        } else {
+            // Known table + slow query
+            self.per_table[table_id as usize].fetch_add(1, Ordering::Relaxed);
+            if is_slow {
+                let mut aux = self.aux.lock();
+                if aux.slow_queries.len() < SLOW_QUERY_LIMIT {
+                    aux.slow_queries.push(SlowQueryEntry {
+                        table: Some(table_id.as_str().to_string()),
+                        duration_ms: round_ms(duration_us),
+                    });
+                }
             }
         }
     }
@@ -131,18 +461,39 @@ impl QueryTracker {
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn snapshot(&self) -> QueryTrackerSnapshot {
-        let inner = self.inner.lock();
+        // Build per_table HashMap from atomic array (known tables)
+        let mut per_table = std::collections::HashMap::new();
+        for i in 0..TableId::COUNT {
+            let count = self.per_table[i].load(Ordering::Relaxed);
+            if count > 0 {
+                let id = TableId::from_index(i);
+                // Don't include "unknown" bucket in the per_table map
+                if id != TableId::Unknown {
+                    per_table.insert(id.as_str().to_string(), count);
+                }
+            }
+        }
+
         let slow_query_ms = if self.slow_enabled.load(Ordering::Acquire) {
             Some(self.slow_threshold_us.load(Ordering::Relaxed) as f64 / 1000.0)
         } else {
             None
         };
+
+        // Merge unknown table counts and grab slow queries
+        let aux = self.aux.lock();
+        for (table, &count) in &aux.unknown_tables {
+            *per_table.entry(table.clone()).or_insert(0) += count;
+        }
+        let slow_queries = aux.slow_queries.clone();
+        drop(aux);
+
         QueryTrackerSnapshot {
             total: self.total.load(Ordering::Relaxed),
             total_time_ms: round_ms(self.total_time_us.load(Ordering::Relaxed)),
-            per_table: inner.per_table.clone(),
+            per_table,
             slow_query_ms,
-            slow_queries: inner.slow_queries.clone(),
+            slow_queries,
         }
     }
 
@@ -150,9 +501,12 @@ impl QueryTracker {
     pub fn reset(&self) {
         self.total.store(0, Ordering::Relaxed);
         self.total_time_us.store(0, Ordering::Relaxed);
-        let mut inner = self.inner.lock();
-        inner.per_table.clear();
-        inner.slow_queries.clear();
+        for counter in &self.per_table {
+            counter.store(0, Ordering::Relaxed);
+        }
+        let mut aux = self.aux.lock();
+        aux.slow_queries.clear();
+        aux.unknown_tables.clear();
     }
 }
 
@@ -262,10 +616,17 @@ pub fn record_query(sql: &str, duration_us: u64) {
     }
 }
 
-/// Extract the primary table name from a SQL statement.
+// =============================================================================
+// Legacy regex-based table extraction (used for slow-query log + fixtures)
+// =============================================================================
+
+/// Extract the primary table name from a SQL statement using regex.
 ///
 /// Handles schema-qualified names (`public.agents` → `agents`) and
 /// various quoting styles (backticks, double-quotes, brackets).
+///
+/// This is the **slow path** — only called for slow-query log entries when the
+/// fast `extract_table_id()` returns `Unknown`, and for fixture tests.
 fn extract_table(sql: &str) -> Option<String> {
     /// Compiled pattern to split on schema dots, capturing optional schema segments.
     static SCHEMA_DOT: LazyLock<Regex> =
@@ -309,6 +670,8 @@ mod tests {
         }
     }
 
+    // ── extract_table (regex, legacy) tests ─────────────────────────────
+
     #[test]
     fn extract_table_insert() {
         assert_eq!(
@@ -345,6 +708,157 @@ mod tests {
     fn extract_table_unknown() {
         assert_eq!(extract_table("PRAGMA wal_checkpoint"), None);
     }
+
+    // ── extract_table_id (fast path) tests ──────────────────────────────
+
+    #[test]
+    fn fast_extract_known_tables() {
+        assert_eq!(
+            extract_table_id("SELECT * FROM messages WHERE id = 1"),
+            TableId::Messages
+        );
+        assert_eq!(
+            extract_table_id("INSERT INTO agents (name) VALUES ('x')"),
+            TableId::Agents
+        );
+        assert_eq!(
+            extract_table_id("UPDATE projects SET name = 'x'"),
+            TableId::Projects
+        );
+        assert_eq!(
+            extract_table_id("SELECT * FROM file_reservations WHERE 1"),
+            TableId::FileReservations
+        );
+        assert_eq!(
+            extract_table_id("SELECT * FROM agent_links WHERE status = 'approved'"),
+            TableId::AgentLinks
+        );
+        assert_eq!(
+            extract_table_id("INSERT INTO message_recipients (message_id) VALUES (1)"),
+            TableId::MessageRecipients
+        );
+        assert_eq!(
+            extract_table_id("SELECT * FROM fts_messages WHERE fts_messages MATCH 'test'"),
+            TableId::FtsMessages
+        );
+        assert_eq!(
+            extract_table_id("INSERT INTO products (name) VALUES ('test')"),
+            TableId::Products
+        );
+        assert_eq!(
+            extract_table_id("SELECT * FROM product_project_links WHERE 1"),
+            TableId::ProductProjectLinks
+        );
+        assert_eq!(
+            extract_table_id("SELECT * FROM project_sibling_suggestions"),
+            TableId::ProjectSiblingSuggestions
+        );
+    }
+
+    #[test]
+    fn fast_extract_unknown() {
+        assert_eq!(
+            extract_table_id("PRAGMA wal_checkpoint"),
+            TableId::Unknown
+        );
+        assert_eq!(extract_table_id("SELECT 1"), TableId::Unknown);
+        assert_eq!(extract_table_id(""), TableId::Unknown);
+        assert_eq!(
+            extract_table_id("DELETE FROM old_messages WHERE 1"),
+            TableId::Unknown
+        );
+    }
+
+    #[test]
+    fn fast_extract_case_insensitive() {
+        assert_eq!(
+            extract_table_id("select * FROM Messages"),
+            TableId::Messages
+        );
+        assert_eq!(
+            extract_table_id("Insert Into agents (name) values ('x')"),
+            TableId::Agents
+        );
+        assert_eq!(
+            extract_table_id("update projects set name = 'y'"),
+            TableId::Projects
+        );
+    }
+
+    #[test]
+    fn fast_extract_with_quotes() {
+        assert_eq!(
+            extract_table_id(r#"SELECT * FROM "messages" WHERE id=1"#),
+            TableId::Messages
+        );
+        assert_eq!(
+            extract_table_id("SELECT * FROM `agents` WHERE 1"),
+            TableId::Agents
+        );
+    }
+
+    #[test]
+    fn fast_extract_schema_qualified() {
+        assert_eq!(
+            extract_table_id(r#"SELECT * FROM "public"."messages""#),
+            TableId::Messages
+        );
+        assert_eq!(
+            extract_table_id("SELECT * FROM catalog.schema.agents"),
+            TableId::Agents
+        );
+    }
+
+    #[test]
+    fn fast_extract_insert_priority() {
+        // INSERT INTO should take priority over FROM in subqueries
+        assert_eq!(
+            extract_table_id("INSERT INTO messages SELECT * FROM agents"),
+            TableId::Messages
+        );
+    }
+
+    #[test]
+    fn fast_extract_or_ignore() {
+        assert_eq!(
+            extract_table_id("INSERT OR IGNORE INTO agents (name) VALUES ('x')"),
+            TableId::Agents
+        );
+    }
+
+    #[test]
+    fn fast_extract_multiline() {
+        assert_eq!(
+            extract_table_id("SELECT id, name\nFROM agents\nWHERE active=1"),
+            TableId::Agents
+        );
+    }
+
+    #[test]
+    fn fast_extract_extra_whitespace() {
+        assert_eq!(
+            extract_table_id("INSERT   INTO   messages  (body) VALUES (?)"),
+            TableId::Messages
+        );
+        assert_eq!(
+            extract_table_id("UPDATE    projects   SET archived=1"),
+            TableId::Projects
+        );
+    }
+
+    // ── TableId round-trip ──────────────────────────────────────────────
+
+    #[test]
+    fn table_id_from_index_roundtrip() {
+        for i in 0..TableId::COUNT {
+            let id = TableId::from_index(i);
+            assert_eq!(id as usize, i);
+        }
+        // Out of range -> Unknown
+        assert_eq!(TableId::from_index(99), TableId::Unknown);
+    }
+
+    // ── Tracker tests ───────────────────────────────────────────────────
 
     #[test]
     fn tracker_disabled_by_default() {
