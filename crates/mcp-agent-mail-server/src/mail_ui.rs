@@ -7,10 +7,12 @@
 
 use asupersync::Cx;
 use fastmcp_core::block_on;
+use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
 use mcp_agent_mail_db::pool::DbPool;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
+use mcp_agent_mail_storage::{self as storage, ensure_archive, ensure_archive_root};
 use serde::Serialize;
 
 use crate::markdown;
@@ -35,7 +37,7 @@ pub fn dispatch(path: &str, query: &str) -> Result<Option<String>, (u16, String)
             render_unified_inbox(&cx, &pool, limit, filter_importance.as_deref())
         }
         _ if sub.starts_with("/api/") => handle_api_route(sub, &cx, &pool),
-        _ if sub.starts_with("/archive/") => render_archive_route(sub, &cx, &pool),
+        _ if sub.starts_with("/archive/") => render_archive_route(sub, query, &cx, &pool),
         _ => dispatch_project_route(sub, &cx, &pool, query),
     }
 }
@@ -907,32 +909,367 @@ fn render_api_project_agents(
 }
 
 // ---------------------------------------------------------------------------
-// Archive routes (minimal stubs)
+// Archive routes
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct ArchiveCtx {
-    projects: Vec<String>,
+/// Get archive root path from Config (for git operations).
+fn get_archive_root() -> Result<std::path::PathBuf, (u16, String)> {
+    let config = Config::from_env();
+    let (root, _) = ensure_archive_root(&config)
+        .map_err(|e| (500, format!("Archive error: {e}")))?;
+    Ok(root)
+}
+
+/// Get a `ProjectArchive` handle for a specific project slug.
+fn get_project_archive(slug: &str) -> Result<storage::ProjectArchive, (u16, String)> {
+    let config = Config::from_env();
+    ensure_archive(&config, slug).map_err(|e| (500, format!("Archive error: {e}")))
 }
 
 fn render_archive_route(
     sub: &str,
+    query: &str,
+    cx: &Cx,
+    pool: &DbPool,
+) -> Result<Option<String>, (u16, String)> {
+    match sub {
+        "/archive/guide" => render_archive_guide(cx, pool),
+        "/archive/activity" => {
+            let limit = extract_query_int(query, "limit", 50).min(500);
+            render_archive_activity(limit)
+        }
+        "/archive/timeline" => {
+            let project = extract_query_str(query, "project");
+            render_archive_timeline(cx, pool, project.as_deref())
+        }
+        "/archive/browser" => {
+            let project = extract_query_str(query, "project");
+            let path = extract_query_str(query, "path").unwrap_or_default();
+            render_archive_browser(project.as_deref(), &path)
+        }
+        "/archive/network" => {
+            let project = extract_query_str(query, "project");
+            render_archive_network(cx, pool, project.as_deref())
+        }
+        "/archive/time-travel" => render_archive_time_travel(cx, pool),
+        "/archive/time-travel/snapshot" => {
+            let project = extract_query_str(query, "project").unwrap_or_default();
+            let agent = extract_query_str(query, "agent").unwrap_or_default();
+            let timestamp = extract_query_str(query, "timestamp").unwrap_or_default();
+            render_archive_time_travel_snapshot(cx, pool, &project, &agent, &timestamp)
+        }
+        _ if sub.starts_with("/archive/browser/") && sub.contains("/file") => {
+            // /archive/browser/{project}/file?path=...
+            let parts: Vec<&str> = sub.strip_prefix("/archive/browser/").unwrap_or("").split('/').collect();
+            let project_slug = parts.first().copied().unwrap_or("");
+            let path = extract_query_str(query, "path").unwrap_or_default();
+            render_archive_browser_file(project_slug, &path)
+        }
+        _ if sub.starts_with("/archive/commit/") => {
+            let sha = sub.strip_prefix("/archive/commit/").unwrap_or("");
+            render_archive_commit(sha)
+        }
+        _ => Ok(None),
+    }
+}
+
+// -- Guide --
+
+#[derive(Serialize)]
+struct ArchiveGuideCtx {
+    storage_root: String,
+    total_commits: String,
+    project_count: usize,
+    repo_size: String,
+    last_commit_time: String,
+    projects: Vec<ArchiveGuideProject>,
+}
+
+#[derive(Serialize)]
+struct ArchiveGuideProject {
+    slug: String,
+    human_key: String,
+}
+
+fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
+    let config = Config::from_env();
+    let storage_root = config.storage_root.display().to_string();
+
+    let (total_commits, last_commit_time, repo_size) =
+        if let Ok(root) = get_archive_root() {
+            // Count commits (cap at 10_000)
+            let commits = storage::get_recent_commits_extended(&root, 10_000)
+                .unwrap_or_default();
+            let total = if commits.len() >= 10_000 {
+                "10,000+".to_string()
+            } else {
+                format!("{}", commits.len())
+            };
+            let last = commits
+                .first()
+                .map(|c| {
+                    // Extract just the date part
+                    c.date.get(..10).unwrap_or(&c.date).to_string()
+                })
+                .unwrap_or_else(|| "Never".to_string());
+
+            // Estimate repo size
+            let size = estimate_repo_size(&root);
+
+            (total, last, size)
+        } else {
+            ("0".to_string(), "Never".to_string(), "0 MB".to_string())
+        };
+
+    let db_projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
+    let projects: Vec<ArchiveGuideProject> = db_projects
+        .iter()
+        .map(|p| ArchiveGuideProject {
+            slug: p.slug.clone(),
+            human_key: p.human_key.clone(),
+        })
+        .collect();
+    let project_count = projects.len();
+
+    render(
+        "archive_guide.html",
+        ArchiveGuideCtx {
+            storage_root,
+            total_commits,
+            project_count,
+            repo_size,
+            last_commit_time,
+            projects,
+        },
+    )
+}
+
+/// Estimate the size of a directory tree, returned as a human-readable string.
+fn estimate_repo_size(path: &std::path::Path) -> String {
+    // Try `du -sh` with timeout, fall back to "Unknown"
+    match std::process::Command::new("du")
+        .args(["-sh", &path.display().to_string()])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.split_whitespace().next().unwrap_or("Unknown").to_string()
+        }
+        _ => "Unknown".to_string(),
+    }
+}
+
+// -- Activity --
+
+#[derive(Serialize)]
+struct ArchiveActivityCtx {
+    commits: Vec<storage::ExtendedCommitInfo>,
+}
+
+fn render_archive_activity(limit: usize) -> Result<Option<String>, (u16, String)> {
+    let root = get_archive_root()?;
+    let commits = storage::get_recent_commits_extended(&root, limit)
+        .unwrap_or_default();
+    render("archive_activity.html", ArchiveActivityCtx { commits })
+}
+
+// -- Commit detail --
+
+#[derive(Serialize)]
+struct ArchiveCommitCtx {
+    commit: storage::CommitDetail,
+}
+
+fn render_archive_commit(sha: &str) -> Result<Option<String>, (u16, String)> {
+    if sha.is_empty() {
+        return render_error("Invalid commit identifier");
+    }
+
+    let root = get_archive_root()?;
+    match storage::get_commit_detail(&root, sha, 5 * 1024 * 1024) {
+        Ok(detail) => render("archive_commit.html", ArchiveCommitCtx { commit: detail }),
+        Err(_) => render_error("Commit not found"),
+    }
+}
+
+// -- Timeline --
+
+#[derive(Serialize)]
+struct ArchiveTimelineCtx {
+    commits: Vec<storage::TimelineEntry>,
+    project: String,
+    project_name: String,
+}
+
+fn render_archive_timeline(
+    cx: &Cx,
+    pool: &DbPool,
+    project: Option<&str>,
+) -> Result<Option<String>, (u16, String)> {
+    let root = get_archive_root()?;
+
+    // Default to first project if not specified
+    let (slug, project_name) = resolve_project_slug(cx, pool, project)?;
+
+    let commits = storage::get_timeline_commits(&root, &slug, 100)
+        .unwrap_or_default();
+
+    render(
+        "archive_timeline.html",
+        ArchiveTimelineCtx { commits, project: slug, project_name },
+    )
+}
+
+/// Resolve a project slug + human_key, defaulting to the first project.
+fn resolve_project_slug(
+    cx: &Cx,
+    pool: &DbPool,
+    project: Option<&str>,
+) -> Result<(String, String), (u16, String)> {
+    if let Some(slug) = project {
+        let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
+        Ok((p.slug.clone(), p.human_key.clone()))
+    } else {
+        let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
+        let first = projects.first().ok_or((404, "No projects found".to_string()))?;
+        Ok((first.slug.clone(), first.human_key.clone()))
+    }
+}
+
+// -- Browser --
+
+#[derive(Serialize)]
+struct ArchiveBrowserCtx {
+    tree: Vec<storage::TreeEntry>,
+    project: String,
+    path: String,
+}
+
+fn render_archive_browser(
+    project: Option<&str>,
+    path: &str,
+) -> Result<Option<String>, (u16, String)> {
+    let slug = match project {
+        Some(s) if !s.is_empty() => s,
+        _ => return render_error("Please select a project to browse"),
+    };
+
+    let archive = get_project_archive(slug)?;
+    let tree = storage::get_archive_tree(&archive, path)
+        .map_err(|e| (400, format!("Browse error: {e}")))?;
+
+    render(
+        "archive_browser.html",
+        ArchiveBrowserCtx {
+            tree,
+            project: slug.to_string(),
+            path: path.to_string(),
+        },
+    )
+}
+
+/// JSON API: get file content from archive.
+fn render_archive_browser_file(
+    project_slug: &str,
+    path: &str,
+) -> Result<Option<String>, (u16, String)> {
+    if project_slug.is_empty() {
+        return Err((400, "Invalid project identifier".to_string()));
+    }
+
+    let archive = get_project_archive(project_slug)?;
+    match storage::get_archive_file_content(&archive, path, 10 * 1024 * 1024) {
+        Ok(Some(content)) => {
+            let json = serde_json::to_string(&serde_json::json!({
+                "content": content,
+                "path": path,
+            }))
+            .map_err(|e| (500, format!("JSON error: {e}")))?;
+            Ok(Some(json))
+        }
+        Ok(None) => Err((404, "File not found".to_string())),
+        Err(e) => Err((400, format!("File error: {e}"))),
+    }
+}
+
+// -- Network graph --
+
+#[derive(Serialize)]
+struct ArchiveNetworkCtx {
+    graph: storage::CommunicationGraph,
+    project: String,
+    project_name: String,
+}
+
+fn render_archive_network(
+    cx: &Cx,
+    pool: &DbPool,
+    project: Option<&str>,
+) -> Result<Option<String>, (u16, String)> {
+    let root = get_archive_root()?;
+    let (slug, project_name) = resolve_project_slug(cx, pool, project)?;
+
+    let graph = storage::get_communication_graph(&root, &slug, 200)
+        .unwrap_or_else(|_| storage::CommunicationGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        });
+
+    render(
+        "archive_network.html",
+        ArchiveNetworkCtx { graph, project: slug, project_name },
+    )
+}
+
+// -- Time Travel --
+
+#[derive(Serialize)]
+struct ArchiveTimeTravelCtx {
+    projects: Vec<String>,
+}
+
+fn render_archive_time_travel(
     cx: &Cx,
     pool: &DbPool,
 ) -> Result<Option<String>, (u16, String)> {
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
     let slugs: Vec<String> = projects.iter().map(|p| p.slug.clone()).collect();
+    render("archive_time_travel.html", ArchiveTimeTravelCtx { projects: slugs })
+}
 
-    let template = match sub {
-        "/archive/guide" => "archive_guide.html",
-        "/archive/activity" => "archive_activity.html",
-        "/archive/timeline" => "archive_timeline.html",
-        "/archive/browser" => "archive_browser.html",
-        "/archive/network" => "archive_network.html",
-        "/archive/time-travel" => "archive_time_travel.html",
-        _ if sub.starts_with("/archive/commit/") => "archive_commit.html",
-        _ => return Ok(None),
-    };
+/// JSON API: get historical inbox snapshot at a point in time.
+fn render_archive_time_travel_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project_slug: &str,
+    agent_name: &str,
+    _timestamp: &str,
+) -> Result<Option<String>, (u16, String)> {
+    if project_slug.is_empty() || agent_name.is_empty() {
+        return Err((400, "project and agent parameters required".to_string()));
+    }
 
-    render(template, ArchiveCtx { projects: slugs })
+    // Validate project exists
+    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
+    let agent_names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+
+    // Return current agent list + project info (full time-travel requires git checkout)
+    let json = serde_json::to_string(&serde_json::json!({
+        "project": project_slug,
+        "agent": agent_name,
+        "agents": agent_names,
+        "note": "Time-travel snapshot shows current state; full git history browsing available via archive browser",
+    }))
+    .map_err(|e| (500, format!("JSON error: {e}")))?;
+    Ok(Some(json))
+}
+
+/// Render an error page.
+fn render_error(message: &str) -> Result<Option<String>, (u16, String)> {
+    #[derive(Serialize)]
+    struct ErrorCtx {
+        message: String,
+    }
+    render("error.html", ErrorCtx { message: message.to_string() })
 }

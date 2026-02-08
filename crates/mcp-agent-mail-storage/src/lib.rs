@@ -4421,6 +4421,674 @@ pub fn get_commit_for_message(
     find_commit_for_path(archive, &canonical_rel)
 }
 
+// ---------------------------------------------------------------------------
+// Archive web UI helpers
+// ---------------------------------------------------------------------------
+
+/// Extended commit info including diff stats and relative date.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtendedCommitInfo {
+    pub sha: String,
+    pub short_sha: String,
+    pub author: String,
+    pub email: String,
+    pub date: String,
+    pub relative_date: String,
+    pub subject: String,
+    pub body: String,
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+/// Compute a human-readable relative date string.
+fn relative_date_from_secs(authored_secs: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let delta = now - authored_secs;
+    if delta < 0 {
+        return "just now".to_string();
+    }
+    let days = delta / 86400;
+    if days > 30 {
+        // Format as "Feb 08, 2026"
+        DateTime::from_timestamp(authored_secs, 0)
+            .map(|dt| dt.format("%b %d, %Y").to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    } else if days > 0 {
+        if days == 1 { "1 day ago".to_string() } else { format!("{days} days ago") }
+    } else {
+        let hours = delta / 3600;
+        if hours > 0 {
+            if hours == 1 { "1 hour ago".to_string() } else { format!("{hours} hours ago") }
+        } else {
+            let minutes = delta / 60;
+            if minutes > 0 {
+                if minutes == 1 { "1 minute ago".to_string() } else { format!("{minutes} minutes ago") }
+            } else {
+                "just now".to_string()
+            }
+        }
+    }
+}
+
+/// Get recent commits with extended metadata (stats, relative dates).
+///
+/// Used by the archive activity feed. Returns commits from the repo root
+/// (not scoped to a single project).
+pub fn get_recent_commits_extended(
+    archive_root: &Path,
+    limit: usize,
+) -> Result<Vec<ExtendedCommitInfo>> {
+    let repo = Repository::open(archive_root)?;
+
+    let mut revwalk = repo.revwalk()?;
+    if revwalk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    revwalk.set_sorting(git2::Sort::TIME)?;
+
+    let mut commits = Vec::new();
+
+    for oid_result in revwalk {
+        if commits.len() >= limit {
+            break;
+        }
+        let oid = oid_result?;
+        let commit = repo.find_commit(oid)?;
+        let author = commit.author();
+        let authored_secs = author.when().seconds();
+
+        // Compute diff stats
+        let (files_changed, insertions, deletions) = commit_diff_stats(&repo, &commit);
+
+        let message = commit.message().unwrap_or("");
+        let subject = message.lines().next().unwrap_or("").to_string();
+        let body = message.to_string();
+
+        commits.push(ExtendedCommitInfo {
+            sha: oid.to_string(),
+            short_sha: oid.to_string()[..8.min(oid.to_string().len())].to_string(),
+            author: author.name().unwrap_or("unknown").to_string(),
+            email: author.email().unwrap_or("").to_string(),
+            date: DateTime::from_timestamp(authored_secs, 0)
+                .unwrap_or_default()
+                .to_rfc3339(),
+            relative_date: relative_date_from_secs(authored_secs),
+            subject,
+            body,
+            files_changed,
+            insertions,
+            deletions,
+        });
+    }
+
+    Ok(commits)
+}
+
+/// Compute diff stats (files_changed, insertions, deletions) for a commit.
+fn commit_diff_stats(repo: &Repository, commit: &git2::Commit<'_>) -> (usize, usize, usize) {
+    let tree = match commit.tree() {
+        Ok(t) => t,
+        Err(_) => return (0, 0, 0),
+    };
+
+    let parent_tree = if commit.parent_count() > 0 {
+        commit.parent(0).ok().and_then(|p| p.tree().ok())
+    } else {
+        None
+    };
+
+    let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) {
+        Ok(d) => d,
+        Err(_) => return (0, 0, 0),
+    };
+
+    let stats = match diff.stats() {
+        Ok(s) => s,
+        Err(_) => return (0, 0, 0),
+    };
+
+    (stats.files_changed(), stats.insertions(), stats.deletions())
+}
+
+/// Detailed commit information including diffs and changed files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitDetail {
+    pub sha: String,
+    pub short_sha: String,
+    pub author: String,
+    pub email: String,
+    pub date: String,
+    pub subject: String,
+    pub body: String,
+    pub trailers: Vec<(String, String)>,
+    pub files_changed: Vec<ChangedFile>,
+    pub diff: String,
+    pub stats: CommitStats,
+}
+
+/// A file changed in a commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub change_type: String,
+    pub a_path: String,
+    pub b_path: String,
+}
+
+/// Aggregate commit statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitStats {
+    pub files: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+/// Get detailed information about a specific commit including diffs.
+///
+/// `sha` must be a valid hex string (7-40 chars).
+pub fn get_commit_detail(
+    archive_root: &Path,
+    sha: &str,
+    max_diff_bytes: usize,
+) -> Result<CommitDetail> {
+    // Validate SHA format
+    if sha.len() < 7
+        || sha.len() > 40
+        || !sha.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid commit SHA format",
+        )));
+    }
+
+    let repo = Repository::open(archive_root)?;
+    let oid = git2::Oid::from_str(sha)?;
+    let commit = repo.find_commit(oid)?;
+    let tree = commit.tree()?;
+
+    let parent_tree = if commit.parent_count() > 0 {
+        commit.parent(0).ok().and_then(|p| p.tree().ok())
+    } else {
+        None
+    };
+
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+
+    // Collect changed files
+    let mut changed_files = Vec::new();
+    diff.foreach(
+        &mut |delta, _| {
+            let new_path = delta
+                .new_file()
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let old_path = delta
+                .old_file()
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let change_type = match delta.status() {
+                git2::Delta::Added => "added",
+                git2::Delta::Deleted => "deleted",
+                git2::Delta::Modified => "modified",
+                git2::Delta::Renamed => "renamed",
+                git2::Delta::Copied => "copied",
+                _ => "modified",
+            };
+
+            let display_path = if new_path.is_empty() || new_path == "/dev/null" {
+                old_path.clone()
+            } else {
+                new_path.clone()
+            };
+
+            changed_files.push(ChangedFile {
+                path: display_path,
+                change_type: change_type.to_string(),
+                a_path: if old_path.is_empty() { "/dev/null".to_string() } else { old_path },
+                b_path: if new_path.is_empty() { "/dev/null".to_string() } else { new_path },
+            });
+            true
+        },
+        None,
+        None,
+        None,
+    )?;
+
+    // Build diff text
+    let mut diff_text = String::new();
+    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+        if diff_text.len() < max_diff_bytes {
+            let origin = line.origin();
+            if origin == '+' || origin == '-' || origin == ' ' {
+                diff_text.push(origin);
+            }
+            if let Ok(s) = std::str::from_utf8(line.content()) {
+                diff_text.push_str(s);
+            }
+        }
+        true
+    })?;
+
+    if diff_text.len() >= max_diff_bytes {
+        diff_text.push_str("\n\n[... Diff truncated — exceeds size limit ...]\n");
+    }
+
+    // Compute stats
+    let stats = diff.stats()?;
+
+    // Parse commit message
+    let message = commit.message().unwrap_or("").to_string();
+    let lines: Vec<&str> = message.lines().collect();
+    let subject = lines.first().copied().unwrap_or("").to_string();
+
+    // Extract body and trailers
+    let rest = if lines.len() > 1 { &lines[1..] } else { &[] };
+    let mut body_lines = Vec::new();
+    let mut trailers = Vec::new();
+
+    // Scan from end for trailers (lines matching "Key: Value")
+    let mut trailer_start = rest.len();
+    for i in (0..rest.len()).rev() {
+        let line = rest[i].trim();
+        if !line.is_empty() && line.contains(": ") && !line.starts_with(' ') {
+            trailer_start = i;
+        } else if line.is_empty() && trailer_start < rest.len() {
+            break;
+        } else {
+            trailer_start = rest.len();
+            break;
+        }
+    }
+
+    for (i, line) in rest.iter().enumerate() {
+        if i < trailer_start {
+            body_lines.push(*line);
+        } else if let Some((k, v)) = line.split_once(": ") {
+            trailers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+
+    let body = body_lines.join("\n").trim().to_string();
+    let author = commit.author();
+    let authored_secs = author.when().seconds();
+
+    Ok(CommitDetail {
+        sha: oid.to_string(),
+        short_sha: oid.to_string()[..8.min(oid.to_string().len())].to_string(),
+        author: author.name().unwrap_or("unknown").to_string(),
+        email: author.email().unwrap_or("").to_string(),
+        date: DateTime::from_timestamp(authored_secs, 0)
+            .unwrap_or_default()
+            .to_rfc3339(),
+        subject,
+        body,
+        trailers,
+        files_changed: changed_files,
+        diff: diff_text,
+        stats: CommitStats {
+            files: stats.files_changed(),
+            insertions: stats.insertions(),
+            deletions: stats.deletions(),
+        },
+    })
+}
+
+/// An entry in the archive file tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeEntry {
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub size: u64,
+}
+
+/// Get directory tree listing from the archive's git tree.
+///
+/// `path` is relative to the project root within the archive
+/// (e.g., "messages/2026" or "" for root).
+pub fn get_archive_tree(
+    archive: &ProjectArchive,
+    path: &str,
+) -> Result<Vec<TreeEntry>> {
+    // Sanitize path to prevent traversal
+    let safe_path = sanitize_browse_path(path)?;
+
+    let repo = Repository::open(&archive.repo_root)?;
+    let head = match repo.head() {
+        Ok(h) => h,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let commit = head.peel_to_commit()?;
+    let root_tree = commit.tree()?;
+
+    // Navigate to projects/{slug}/{path}
+    let tree_path = if safe_path.is_empty() {
+        format!("projects/{}", archive.slug)
+    } else {
+        format!("projects/{}/{safe_path}", archive.slug)
+    };
+
+    let tree_obj = match root_tree.get_path(std::path::Path::new(&tree_path)) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let obj = repo.find_object(tree_obj.id(), None)?;
+    let tree = match obj.as_tree() {
+        Some(t) => t,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut entries = Vec::new();
+    for item in tree.iter() {
+        let name = item.name().unwrap_or("").to_string();
+        let entry_path = if safe_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{safe_path}/{name}")
+        };
+
+        let (entry_type, size) = match item.kind() {
+            Some(git2::ObjectType::Tree) => ("dir".to_string(), 0),
+            Some(git2::ObjectType::Blob) => {
+                let sz = repo
+                    .find_blob(item.id())
+                    .map(|b| b.size() as u64)
+                    .unwrap_or(0);
+                ("file".to_string(), sz)
+            }
+            _ => ("file".to_string(), 0),
+        };
+
+        entries.push(TreeEntry {
+            name,
+            path: entry_path,
+            entry_type,
+            size,
+        });
+    }
+
+    // Sort: directories first, then files, both alphabetically
+    entries.sort_by(|a, b| {
+        let a_dir = a.entry_type == "dir";
+        let b_dir = b.entry_type == "dir";
+        b_dir
+            .cmp(&a_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    Ok(entries)
+}
+
+/// Sanitize a browsable path to prevent directory traversal.
+fn sanitize_browse_path(path: &str) -> Result<String> {
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with('/')
+        || normalized.starts_with("..")
+        || normalized.contains("/../")
+        || normalized.ends_with("/..")
+        || normalized == ".."
+    {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid path: directory traversal not allowed",
+        )));
+    }
+    Ok(normalized.trim_start_matches('/').to_string())
+}
+
+/// Read file content from the archive's git tree.
+///
+/// Returns the UTF-8 content of the file, or `None` if not found.
+/// Path is relative to the project root within the archive.
+pub fn get_archive_file_content(
+    archive: &ProjectArchive,
+    path: &str,
+    max_size_bytes: usize,
+) -> Result<Option<String>> {
+    let safe_path = sanitize_browse_path(path)?;
+    if safe_path.is_empty() {
+        return Ok(None);
+    }
+
+    let repo = Repository::open(&archive.repo_root)?;
+    let head = match repo.head() {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+    let commit = head.peel_to_commit()?;
+    let root_tree = commit.tree()?;
+
+    let full_path = format!("projects/{}/{safe_path}", archive.slug);
+
+    let entry = match root_tree.get_path(std::path::Path::new(&full_path)) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+
+    let blob = match repo.find_blob(entry.id()) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    if blob.size() > max_size_bytes {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("File too large: {} bytes (max {max_size_bytes})", blob.size()),
+        )));
+    }
+
+    Ok(Some(String::from_utf8_lossy(blob.content()).to_string()))
+}
+
+/// A node in the agent communication graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub label: String,
+    pub sent: usize,
+    pub received: usize,
+    pub total: usize,
+}
+
+/// An edge in the agent communication graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub count: usize,
+}
+
+/// Agent communication graph built from commit history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunicationGraph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Build an agent communication graph from message commit history.
+///
+/// Analyzes commits under `projects/{slug}/messages` and parses
+/// commit subjects with format "mail: Sender -> Recipient1, Recipient2 | Subject".
+pub fn get_communication_graph(
+    archive_root: &Path,
+    project_slug: &str,
+    limit: usize,
+) -> Result<CommunicationGraph> {
+    let repo = Repository::open(archive_root)?;
+
+    let mut revwalk = repo.revwalk()?;
+    if revwalk.push_head().is_err() {
+        return Ok(CommunicationGraph { nodes: Vec::new(), edges: Vec::new() });
+    }
+    revwalk.set_sorting(git2::Sort::TIME)?;
+
+    let path_prefix = format!("projects/{project_slug}/messages");
+    let mut agent_stats: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    let mut connections: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+
+    let mut seen = 0usize;
+    for oid_result in revwalk {
+        if seen >= limit {
+            break;
+        }
+        let oid = oid_result?;
+        let commit = repo.find_commit(oid)?;
+
+        // Check if commit touches message path
+        if !commit_touches_path(&repo, &commit, &path_prefix) {
+            continue;
+        }
+        seen += 1;
+
+        let subject = commit.summary().unwrap_or("");
+        if !subject.starts_with("mail: ") {
+            continue;
+        }
+
+        // Parse "mail: Sender -> Recipient1, Recipient2 | Subject"
+        let rest = &subject[6..];
+        let sender_part = if let Some((sp, _)) = rest.split_once(" | ") {
+            sp
+        } else {
+            rest
+        };
+
+        if let Some((sender, recipients_str)) = sender_part.split_once(" -> ") {
+            let sender = sender.trim().to_string();
+            agent_stats.entry(sender.clone()).or_insert((0, 0)).0 += 1;
+
+            for r in recipients_str.split(',') {
+                let recipient = r.trim().to_string();
+                if recipient.is_empty() {
+                    continue;
+                }
+                agent_stats.entry(recipient.clone()).or_insert((0, 0)).1 += 1;
+                *connections
+                    .entry((sender.clone(), recipient))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    let nodes = agent_stats
+        .into_iter()
+        .map(|(name, (sent, received))| GraphNode {
+            id: name.clone(),
+            label: name,
+            sent,
+            received,
+            total: sent + received,
+        })
+        .collect();
+
+    let edges = connections
+        .into_iter()
+        .map(|((from, to), count)| GraphEdge { from, to, count })
+        .collect();
+
+    Ok(CommunicationGraph { nodes, edges })
+}
+
+/// A commit entry formatted for timeline visualization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEntry {
+    pub sha: String,
+    pub short_sha: String,
+    pub date: String,
+    pub timestamp: i64,
+    pub subject: String,
+    #[serde(rename = "type")]
+    pub commit_type: String,
+    pub sender: Option<String>,
+    pub recipients: Vec<String>,
+    pub author: String,
+}
+
+/// Get commits for timeline visualization, scoped to a project.
+///
+/// Commits are returned in chronological order (oldest first).
+pub fn get_timeline_commits(
+    archive_root: &Path,
+    project_slug: &str,
+    limit: usize,
+) -> Result<Vec<TimelineEntry>> {
+    let repo = Repository::open(archive_root)?;
+
+    let mut revwalk = repo.revwalk()?;
+    if revwalk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    revwalk.set_sorting(git2::Sort::TIME)?;
+
+    let path_prefix = format!("projects/{project_slug}");
+    let mut entries = Vec::new();
+
+    for oid_result in revwalk {
+        if entries.len() >= limit {
+            break;
+        }
+        let oid = oid_result?;
+        let commit = repo.find_commit(oid)?;
+
+        if !commit_touches_path(&repo, &commit, &path_prefix) {
+            continue;
+        }
+
+        let subject = commit.summary().unwrap_or("").to_string();
+        let authored_secs = commit.author().when().seconds();
+
+        // Classify commit type and extract sender/recipients
+        let (commit_type, sender, recipients) = if subject.starts_with("mail: ") {
+            let rest = &subject[6..];
+            let sender_part = if let Some((sp, _)) = rest.split_once(" | ") {
+                sp
+            } else {
+                rest
+            };
+            if let Some((s, r)) = sender_part.split_once(" -> ") {
+                let recips: Vec<String> = r.split(',').map(|x| x.trim().to_string()).collect();
+                ("message".to_string(), Some(s.trim().to_string()), recips)
+            } else {
+                ("message".to_string(), None, Vec::new())
+            }
+        } else if subject.starts_with("file_reservation: ") {
+            ("file_reservation".to_string(), None, Vec::new())
+        } else if subject.starts_with("chore: ") {
+            ("chore".to_string(), None, Vec::new())
+        } else {
+            ("other".to_string(), None, Vec::new())
+        };
+
+        entries.push(TimelineEntry {
+            sha: oid.to_string(),
+            short_sha: oid.to_string()[..8.min(oid.to_string().len())].to_string(),
+            date: DateTime::from_timestamp(authored_secs, 0)
+                .unwrap_or_default()
+                .to_rfc3339(),
+            timestamp: authored_secs,
+            subject,
+            commit_type,
+            sender,
+            recipients,
+            author: commit.author().name().unwrap_or("unknown").to_string(),
+        });
+    }
+
+    // Sort oldest first for timeline
+    entries.sort_by_key(|e| e.timestamp);
+
+    Ok(entries)
+}
+
 /// Read a message file from the archive and parse its frontmatter.
 ///
 /// Returns `(frontmatter_json, body_markdown)`.
