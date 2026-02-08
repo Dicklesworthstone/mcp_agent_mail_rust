@@ -1,0 +1,786 @@
+#!/usr/bin/env bash
+# e2e_mcp_api_parity.sh - PTY E2E suite for MCP/API mode switching and parity.
+#
+# Run via:
+#   ./scripts/e2e_test.sh mcp_api_parity
+#   # or directly:
+#   bash scripts/e2e_mcp_api_parity.sh
+#
+# Validates:
+#   - MCP and API transport modes return identical results for critical tools.
+#   - Path alias behaviour: /mcp/ server also responds on /api/ and vice versa.
+#   - Explicit --transport and --path flags are respected.
+#   - Bootstrap banner shows correct mode information.
+#   - Diagnostics are clear when misconfigured.
+#   - resources/list parity across modes.
+#
+# Artifacts:
+#   tests/artifacts/mcp_api_parity/<timestamp>/*
+
+set -euo pipefail
+
+: "${AM_E2E_KEEP_TMP:=1}"
+
+E2E_SUITE="${E2E_SUITE:-mcp_api_parity}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./e2e_lib.sh
+source "${SCRIPT_DIR}/e2e_lib.sh"
+
+e2e_init_artifacts
+e2e_banner "MCP/API Mode Switching Parity E2E Test Suite"
+
+e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
+
+for cmd in curl python3; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        e2e_log "${cmd} not found; skipping suite"
+        e2e_skip "${cmd} required"
+        e2e_summary
+        exit 0
+    fi
+done
+
+e2e_fatal() {
+    local msg="$1"
+    e2e_fail "${msg}"
+    e2e_summary || true
+    exit 1
+}
+
+pick_port() {
+python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+start_server() {
+    local label="$1"
+    local port="$2"
+    local db_path="$3"
+    local storage_root="$4"
+    local bin="$5"
+    shift 5
+
+    local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
+    e2e_log "Starting server (${label}): 127.0.0.1:${port}"
+
+    (
+        export DATABASE_URL="sqlite:////${db_path}"
+        export STORAGE_ROOT="${storage_root}"
+        export HTTP_HOST="127.0.0.1"
+        export HTTP_PORT="${port}"
+        export HTTP_RBAC_ENABLED=0
+        export HTTP_RATE_LIMIT_ENABLED=0
+        export HTTP_JWT_ENABLED=0
+        export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1
+
+        while [ $# -gt 0 ]; do
+            export "$1"
+            shift
+        done
+
+        timeout 20s "${bin}" serve --host 127.0.0.1 --port "${port}" --no-tui
+    ) >"${server_log}" 2>&1 &
+    echo $!
+}
+
+stop_server() {
+    local pid="$1"
+    if kill -0 "${pid}" 2>/dev/null; then
+        kill "${pid}" 2>/dev/null || true
+        sleep 0.2
+        kill -9 "${pid}" 2>/dev/null || true
+    fi
+}
+
+http_post_json() {
+    local case_id="$1"
+    local url="$2"
+    local payload="$3"
+    shift 3
+
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+
+    e2e_save_artifact "${case_id}_request.json" "${payload}"
+
+    local args=(
+        -sS
+        -o "${body_file}"
+        -w "%{http_code}"
+        -X POST
+        "${url}"
+        -H "content-type: application/json"
+        --data "${payload}"
+    )
+    for h in "$@"; do
+        args+=(-H "$h")
+    done
+
+    set +e
+    local status
+    status="$(curl "${args[@]}" 2>/dev/null)"
+    local rc=$?
+    set -e
+
+    echo "${status}" > "${status_file}"
+    if [ "$rc" -ne 0 ]; then
+        echo "000" > "${status_file}"
+    fi
+}
+
+jsonrpc_tools_list_payload() {
+    echo '{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}'
+}
+
+jsonrpc_resources_list_payload() {
+    echo '{"jsonrpc":"2.0","method":"resources/list","id":1,"params":{}}'
+}
+
+jsonrpc_tools_call_payload() {
+    local tool_name="$1"
+    local args_json="${2:-{}}"
+    python3 - <<'PY' "$tool_name" "$args_json"
+import json, sys
+tool = sys.argv[1]
+args = json.loads(sys.argv[2])
+print(json.dumps({
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 1,
+  "params": { "name": tool, "arguments": args },
+}, separators=(",", ":")))
+PY
+}
+
+count_tools_in_response() {
+    local resp_file="$1"
+    python3 - <<'PY' "$resp_file"
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+res = data.get("result") or {}
+tools = res.get("tools") or []
+print(len(tools) if isinstance(tools, list) else 0)
+PY
+}
+
+count_resources_in_response() {
+    local resp_file="$1"
+    python3 - <<'PY' "$resp_file"
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+res = data.get("result") or {}
+resources = res.get("resources") or []
+print(len(resources) if isinstance(resources, list) else 0)
+PY
+}
+
+extract_tool_text() {
+    local resp_file="$1"
+    python3 - <<'PY' "$resp_file"
+import json, sys
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+res = data.get("result") or {}
+content = res.get("content") or []
+if content and isinstance(content[0], dict) and content[0].get("type") == "text":
+    print(content[0].get("text") or "")
+else:
+    print(json.dumps(res))
+PY
+}
+
+has_jsonrpc_result() {
+    local resp_file="$1"
+    python3 - <<'PY' "$resp_file"
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+    print("1" if "result" in data else "0")
+except Exception:
+    print("0")
+PY
+}
+
+has_jsonrpc_error() {
+    local resp_file="$1"
+    python3 - <<'PY' "$resp_file"
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+    print("1" if "error" in data else "0")
+except Exception:
+    print("0")
+PY
+}
+
+# Compare two JSON response files structurally (field-level parity).
+# Returns 0 if the critical fields match, 1 otherwise.
+compare_tool_call_results() {
+    local file_a="$1"
+    local file_b="$2"
+    python3 - <<'PY' "$file_a" "$file_b"
+import json, sys
+
+a = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+b = json.load(open(sys.argv[2], "r", encoding="utf-8"))
+
+def extract_text(d):
+    res = d.get("result") or {}
+    content = res.get("content") or []
+    if content and isinstance(content[0], dict) and content[0].get("type") == "text":
+        return content[0].get("text") or ""
+    return json.dumps(res, sort_keys=True)
+
+ta = extract_text(a)
+tb = extract_text(b)
+
+# Parse inner JSON if present (tool results are often JSON strings).
+try:
+    ja = json.loads(ta)
+    jb = json.loads(tb)
+    # Compare structurally: same keys at top level
+    if isinstance(ja, dict) and isinstance(jb, dict):
+        keys_a = set(ja.keys())
+        keys_b = set(jb.keys())
+        if keys_a == keys_b:
+            print("MATCH")
+            sys.exit(0)
+        else:
+            print(f"KEY_DIFF: a_only={keys_a-keys_b}, b_only={keys_b-keys_a}")
+            sys.exit(1)
+    elif isinstance(ja, list) and isinstance(jb, list):
+        if len(ja) == len(jb):
+            print("MATCH")
+            sys.exit(0)
+        else:
+            print(f"LEN_DIFF: {len(ja)} vs {len(jb)}")
+            sys.exit(1)
+except (json.JSONDecodeError, TypeError):
+    pass
+
+# Fallback: compare text directly
+if ta == tb:
+    print("MATCH")
+    sys.exit(0)
+else:
+    print(f"TEXT_DIFF: len(a)={len(ta)}, len(b)={len(tb)}")
+    sys.exit(1)
+PY
+}
+
+e2e_assert_file_contains() {
+    local label="$1"
+    local path="$2"
+    local needle="$3"
+    if grep -Fq -- "${needle}" "${path}" 2>/dev/null; then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label}"
+        e2e_log "missing needle: ${needle}"
+        e2e_log "in file: ${path}"
+        tail -n 40 "${path}" 2>/dev/null || true
+    fi
+}
+
+e2e_assert_file_not_contains() {
+    local label="$1"
+    local path="$2"
+    local needle="$3"
+    if grep -Fq -- "${needle}" "${path}" 2>/dev/null; then
+        e2e_fail "${label}"
+        e2e_log "unexpected needle: ${needle}"
+    else
+        e2e_pass "${label}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Build binary
+# ---------------------------------------------------------------------------
+
+BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 1: tools/list parity — MCP and API mode return same tool set
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "tools_list_parity_across_modes"
+
+WORK1="$(e2e_mktemp "e2e_parity_tl")"
+DB1="${WORK1}/db.sqlite3"
+STORAGE1="${WORK1}/storage"
+mkdir -p "${STORAGE1}"
+
+PORT_MCP="$(pick_port)"
+PORT_API="$(pick_port)"
+
+PID_MCP="$(start_server "mcp_mode" "${PORT_MCP}" "${DB1}" "${STORAGE1}" "${BIN}" "HTTP_PATH=/mcp/")"
+PID_API="$(start_server "api_mode" "${PORT_API}" "${DB1}" "${STORAGE1}" "${BIN}" "HTTP_PATH=/api/")"
+
+e2e_wait_port 127.0.0.1 "${PORT_MCP}" 10 || { stop_server "${PID_MCP}"; stop_server "${PID_API}"; e2e_fatal "MCP server failed to start"; }
+e2e_wait_port 127.0.0.1 "${PORT_API}" 10 || { stop_server "${PID_MCP}"; stop_server "${PID_API}"; e2e_fatal "API server failed to start"; }
+
+PAYLOAD_TL="$(jsonrpc_tools_list_payload)"
+http_post_json "c1_mcp_tools_list" "http://127.0.0.1:${PORT_MCP}/mcp/" "${PAYLOAD_TL}"
+http_post_json "c1_api_tools_list" "http://127.0.0.1:${PORT_API}/api/" "${PAYLOAD_TL}"
+
+MCP_STATUS="$(cat "${E2E_ARTIFACT_DIR}/c1_mcp_tools_list_status.txt")"
+API_STATUS="$(cat "${E2E_ARTIFACT_DIR}/c1_api_tools_list_status.txt")"
+e2e_assert_eq "MCP tools/list HTTP 200" "200" "${MCP_STATUS}"
+e2e_assert_eq "API tools/list HTTP 200" "200" "${API_STATUS}"
+
+MCP_COUNT="$(count_tools_in_response "${E2E_ARTIFACT_DIR}/c1_mcp_tools_list_body.json")"
+API_COUNT="$(count_tools_in_response "${E2E_ARTIFACT_DIR}/c1_api_tools_list_body.json")"
+e2e_assert_eq "tool count parity (MCP=${MCP_COUNT} API=${API_COUNT})" "${MCP_COUNT}" "${API_COUNT}"
+
+MCP_HAS_RESULT="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c1_mcp_tools_list_body.json")"
+API_HAS_RESULT="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c1_api_tools_list_body.json")"
+e2e_assert_eq "MCP has result field" "1" "${MCP_HAS_RESULT}"
+e2e_assert_eq "API has result field" "1" "${API_HAS_RESULT}"
+
+stop_server "${PID_MCP}"
+stop_server "${PID_API}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 2: resources/list parity
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "resources_list_parity_across_modes"
+
+WORK2="$(e2e_mktemp "e2e_parity_rl")"
+DB2="${WORK2}/db.sqlite3"
+STORAGE2="${WORK2}/storage"
+mkdir -p "${STORAGE2}"
+
+PORT_MCP2="$(pick_port)"
+PORT_API2="$(pick_port)"
+
+PID_MCP2="$(start_server "mcp_res" "${PORT_MCP2}" "${DB2}" "${STORAGE2}" "${BIN}" "HTTP_PATH=/mcp/")"
+PID_API2="$(start_server "api_res" "${PORT_API2}" "${DB2}" "${STORAGE2}" "${BIN}" "HTTP_PATH=/api/")"
+
+e2e_wait_port 127.0.0.1 "${PORT_MCP2}" 10 || { stop_server "${PID_MCP2}"; stop_server "${PID_API2}"; e2e_fatal "MCP res server failed"; }
+e2e_wait_port 127.0.0.1 "${PORT_API2}" 10 || { stop_server "${PID_MCP2}"; stop_server "${PID_API2}"; e2e_fatal "API res server failed"; }
+
+PAYLOAD_RL="$(jsonrpc_resources_list_payload)"
+http_post_json "c2_mcp_res_list" "http://127.0.0.1:${PORT_MCP2}/mcp/" "${PAYLOAD_RL}"
+http_post_json "c2_api_res_list" "http://127.0.0.1:${PORT_API2}/api/" "${PAYLOAD_RL}"
+
+MCP_R_STATUS="$(cat "${E2E_ARTIFACT_DIR}/c2_mcp_res_list_status.txt")"
+API_R_STATUS="$(cat "${E2E_ARTIFACT_DIR}/c2_api_res_list_status.txt")"
+e2e_assert_eq "MCP resources/list HTTP 200" "200" "${MCP_R_STATUS}"
+e2e_assert_eq "API resources/list HTTP 200" "200" "${API_R_STATUS}"
+
+MCP_R_COUNT="$(count_resources_in_response "${E2E_ARTIFACT_DIR}/c2_mcp_res_list_body.json")"
+API_R_COUNT="$(count_resources_in_response "${E2E_ARTIFACT_DIR}/c2_api_res_list_body.json")"
+e2e_assert_eq "resource count parity (MCP=${MCP_R_COUNT} API=${API_R_COUNT})" "${MCP_R_COUNT}" "${API_R_COUNT}"
+
+stop_server "${PID_MCP2}"
+stop_server "${PID_API2}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 3: ensure_project + register_agent tool call parity
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "tool_call_parity_ensure_project_register_agent"
+
+WORK3="$(e2e_mktemp "e2e_parity_tools")"
+DB3_MCP="${WORK3}/db_mcp.sqlite3"
+DB3_API="${WORK3}/db_api.sqlite3"
+STORAGE3_MCP="${WORK3}/storage_mcp"
+STORAGE3_API="${WORK3}/storage_api"
+mkdir -p "${STORAGE3_MCP}" "${STORAGE3_API}"
+
+PORT_MCP3="$(pick_port)"
+PORT_API3="$(pick_port)"
+
+PID_MCP3="$(start_server "mcp_tools" "${PORT_MCP3}" "${DB3_MCP}" "${STORAGE3_MCP}" "${BIN}" "HTTP_PATH=/mcp/")"
+PID_API3="$(start_server "api_tools" "${PORT_API3}" "${DB3_API}" "${STORAGE3_API}" "${BIN}" "HTTP_PATH=/api/")"
+
+e2e_wait_port 127.0.0.1 "${PORT_MCP3}" 10 || { stop_server "${PID_MCP3}"; stop_server "${PID_API3}"; e2e_fatal "MCP tools server failed"; }
+e2e_wait_port 127.0.0.1 "${PORT_API3}" 10 || { stop_server "${PID_MCP3}"; stop_server "${PID_API3}"; e2e_fatal "API tools server failed"; }
+
+# ensure_project
+EP_ARGS='{"human_key":"/tmp/e2e_parity_project"}'
+PAYLOAD_EP="$(jsonrpc_tools_call_payload "ensure_project" "${EP_ARGS}")"
+http_post_json "c3_mcp_ep" "http://127.0.0.1:${PORT_MCP3}/mcp/" "${PAYLOAD_EP}"
+http_post_json "c3_api_ep" "http://127.0.0.1:${PORT_API3}/api/" "${PAYLOAD_EP}"
+
+MCP_EP_STATUS="$(cat "${E2E_ARTIFACT_DIR}/c3_mcp_ep_status.txt")"
+API_EP_STATUS="$(cat "${E2E_ARTIFACT_DIR}/c3_api_ep_status.txt")"
+e2e_assert_eq "MCP ensure_project HTTP 200" "200" "${MCP_EP_STATUS}"
+e2e_assert_eq "API ensure_project HTTP 200" "200" "${API_EP_STATUS}"
+
+MCP_EP_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c3_mcp_ep_body.json")"
+API_EP_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c3_api_ep_body.json")"
+e2e_assert_eq "MCP ensure_project has result" "1" "${MCP_EP_OK}"
+e2e_assert_eq "API ensure_project has result" "1" "${API_EP_OK}"
+
+# Structural parity check
+set +e
+PARITY_EP="$(compare_tool_call_results "${E2E_ARTIFACT_DIR}/c3_mcp_ep_body.json" "${E2E_ARTIFACT_DIR}/c3_api_ep_body.json" 2>&1)"
+PARITY_EP_RC=$?
+set -e
+if [ "${PARITY_EP_RC}" -eq 0 ]; then
+    e2e_pass "ensure_project structural parity: ${PARITY_EP}"
+else
+    e2e_fail "ensure_project structural parity: ${PARITY_EP}"
+fi
+
+# register_agent
+RA_ARGS='{"project_key":"/tmp/e2e_parity_project","program":"e2e-test","model":"test-1"}'
+PAYLOAD_RA="$(jsonrpc_tools_call_payload "register_agent" "${RA_ARGS}")"
+http_post_json "c3_mcp_ra" "http://127.0.0.1:${PORT_MCP3}/mcp/" "${PAYLOAD_RA}"
+http_post_json "c3_api_ra" "http://127.0.0.1:${PORT_API3}/api/" "${PAYLOAD_RA}"
+
+MCP_RA_STATUS="$(cat "${E2E_ARTIFACT_DIR}/c3_mcp_ra_status.txt")"
+API_RA_STATUS="$(cat "${E2E_ARTIFACT_DIR}/c3_api_ra_status.txt")"
+e2e_assert_eq "MCP register_agent HTTP 200" "200" "${MCP_RA_STATUS}"
+e2e_assert_eq "API register_agent HTTP 200" "200" "${API_RA_STATUS}"
+
+MCP_RA_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c3_mcp_ra_body.json")"
+API_RA_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c3_api_ra_body.json")"
+e2e_assert_eq "MCP register_agent has result" "1" "${MCP_RA_OK}"
+e2e_assert_eq "API register_agent has result" "1" "${API_RA_OK}"
+
+set +e
+PARITY_RA="$(compare_tool_call_results "${E2E_ARTIFACT_DIR}/c3_mcp_ra_body.json" "${E2E_ARTIFACT_DIR}/c3_api_ra_body.json" 2>&1)"
+PARITY_RA_RC=$?
+set -e
+if [ "${PARITY_RA_RC}" -eq 0 ]; then
+    e2e_pass "register_agent structural parity: ${PARITY_RA}"
+else
+    e2e_fail "register_agent structural parity: ${PARITY_RA}"
+fi
+
+stop_server "${PID_MCP3}"
+stop_server "${PID_API3}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 4: Path alias — /mcp/ server also accepts /api/ and vice versa
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "path_alias_mcp_accepts_api_and_vice_versa"
+
+WORK4="$(e2e_mktemp "e2e_parity_alias")"
+DB4="${WORK4}/db.sqlite3"
+STORAGE4="${WORK4}/storage"
+mkdir -p "${STORAGE4}"
+
+PORT_ALIAS="$(pick_port)"
+
+# Start with MCP path
+PID_ALIAS="$(start_server "alias_mcp" "${PORT_ALIAS}" "${DB4}" "${STORAGE4}" "${BIN}" "HTTP_PATH=/mcp/")"
+e2e_wait_port 127.0.0.1 "${PORT_ALIAS}" 10 || { stop_server "${PID_ALIAS}"; e2e_fatal "alias server failed"; }
+
+# /mcp/ should respond
+http_post_json "c4_primary_mcp" "http://127.0.0.1:${PORT_ALIAS}/mcp/" "${PAYLOAD_TL}"
+S_PRIMARY="$(cat "${E2E_ARTIFACT_DIR}/c4_primary_mcp_status.txt")"
+e2e_assert_eq "primary /mcp/ responds 200" "200" "${S_PRIMARY}"
+
+# /api/ alias should also respond
+http_post_json "c4_alias_api" "http://127.0.0.1:${PORT_ALIAS}/api/" "${PAYLOAD_TL}"
+S_ALIAS="$(cat "${E2E_ARTIFACT_DIR}/c4_alias_api_status.txt")"
+e2e_assert_eq "alias /api/ responds 200" "200" "${S_ALIAS}"
+
+# Parity: both return same tool count
+C_PRIMARY="$(count_tools_in_response "${E2E_ARTIFACT_DIR}/c4_primary_mcp_body.json")"
+C_ALIAS="$(count_tools_in_response "${E2E_ARTIFACT_DIR}/c4_alias_api_body.json")"
+e2e_assert_eq "alias tool count matches primary (${C_PRIMARY}=${C_ALIAS})" "${C_PRIMARY}" "${C_ALIAS}"
+
+stop_server "${PID_ALIAS}"
+sleep 0.3
+
+# Now start with API path and verify /mcp/ alias works
+PORT_ALIAS2="$(pick_port)"
+PID_ALIAS2="$(start_server "alias_api" "${PORT_ALIAS2}" "${DB4}" "${STORAGE4}" "${BIN}" "HTTP_PATH=/api/")"
+e2e_wait_port 127.0.0.1 "${PORT_ALIAS2}" 10 || { stop_server "${PID_ALIAS2}"; e2e_fatal "alias api server failed"; }
+
+# /api/ primary responds
+http_post_json "c4_primary_api" "http://127.0.0.1:${PORT_ALIAS2}/api/" "${PAYLOAD_TL}"
+S_PRIMARY2="$(cat "${E2E_ARTIFACT_DIR}/c4_primary_api_status.txt")"
+e2e_assert_eq "primary /api/ responds 200" "200" "${S_PRIMARY2}"
+
+# /mcp/ alias responds
+http_post_json "c4_alias_mcp" "http://127.0.0.1:${PORT_ALIAS2}/mcp/" "${PAYLOAD_TL}"
+S_ALIAS2="$(cat "${E2E_ARTIFACT_DIR}/c4_alias_mcp_status.txt")"
+e2e_assert_eq "alias /mcp/ responds 200" "200" "${S_ALIAS2}"
+
+C_PRIMARY2="$(count_tools_in_response "${E2E_ARTIFACT_DIR}/c4_primary_api_body.json")"
+C_ALIAS2="$(count_tools_in_response "${E2E_ARTIFACT_DIR}/c4_alias_mcp_body.json")"
+e2e_assert_eq "reverse alias tool count matches (${C_PRIMARY2}=${C_ALIAS2})" "${C_PRIMARY2}" "${C_ALIAS2}"
+
+stop_server "${PID_ALIAS2}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 5: --transport flag sets correct base path
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "transport_flag_sets_base_path"
+
+WORK5="$(e2e_mktemp "e2e_parity_transport")"
+DB5="${WORK5}/db.sqlite3"
+STORAGE5="${WORK5}/storage"
+mkdir -p "${STORAGE5}"
+
+PORT5="$(pick_port)"
+
+# Start with --transport api (should set /api/ path)
+LOG5="${E2E_ARTIFACT_DIR}/server_transport_api.log"
+(
+    export DATABASE_URL="sqlite:////${DB5}"
+    export STORAGE_ROOT="${STORAGE5}"
+    export HTTP_HOST="127.0.0.1"
+    export HTTP_PORT="${PORT5}"
+    export HTTP_RBAC_ENABLED=0
+    export HTTP_RATE_LIMIT_ENABLED=0
+    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1
+    timeout 15s "${BIN}" serve --host 127.0.0.1 --port "${PORT5}" --transport api --no-tui
+) >"${LOG5}" 2>&1 &
+PID5=$!
+
+e2e_wait_port 127.0.0.1 "${PORT5}" 10 || { stop_server "${PID5}"; e2e_fatal "transport api server failed"; }
+
+# /api/ should respond
+http_post_json "c5_transport_api" "http://127.0.0.1:${PORT5}/api/" "${PAYLOAD_TL}"
+S5_API="$(cat "${E2E_ARTIFACT_DIR}/c5_transport_api_status.txt")"
+e2e_assert_eq "--transport api: /api/ responds 200" "200" "${S5_API}"
+
+# Banner should show /api/ path
+e2e_assert_file_contains "banner shows /api/ path" "${LOG5}" "/api/"
+
+stop_server "${PID5}"
+sleep 0.3
+
+# Now test --transport mcp
+PORT5M="$(pick_port)"
+DB5M="${WORK5}/db_mcp.sqlite3"
+LOG5M="${E2E_ARTIFACT_DIR}/server_transport_mcp.log"
+(
+    export DATABASE_URL="sqlite:////${DB5M}"
+    export STORAGE_ROOT="${STORAGE5}"
+    export HTTP_HOST="127.0.0.1"
+    export HTTP_PORT="${PORT5M}"
+    export HTTP_RBAC_ENABLED=0
+    export HTTP_RATE_LIMIT_ENABLED=0
+    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1
+    timeout 15s "${BIN}" serve --host 127.0.0.1 --port "${PORT5M}" --transport mcp --no-tui
+) >"${LOG5M}" 2>&1 &
+PID5M=$!
+
+e2e_wait_port 127.0.0.1 "${PORT5M}" 10 || { stop_server "${PID5M}"; e2e_fatal "transport mcp server failed"; }
+
+http_post_json "c5_transport_mcp" "http://127.0.0.1:${PORT5M}/mcp/" "${PAYLOAD_TL}"
+S5_MCP="$(cat "${E2E_ARTIFACT_DIR}/c5_transport_mcp_status.txt")"
+e2e_assert_eq "--transport mcp: /mcp/ responds 200" "200" "${S5_MCP}"
+
+e2e_assert_file_contains "banner shows /mcp/ path" "${LOG5M}" "/mcp/"
+
+stop_server "${PID5M}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 6: --path override takes precedence over --transport
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "path_override_trumps_transport"
+
+WORK6="$(e2e_mktemp "e2e_parity_path_override")"
+DB6="${WORK6}/db.sqlite3"
+STORAGE6="${WORK6}/storage"
+mkdir -p "${STORAGE6}"
+
+PORT6="$(pick_port)"
+LOG6="${E2E_ARTIFACT_DIR}/server_path_override.log"
+(
+    export DATABASE_URL="sqlite:////${DB6}"
+    export STORAGE_ROOT="${STORAGE6}"
+    export HTTP_HOST="127.0.0.1"
+    export HTTP_PORT="${PORT6}"
+    export HTTP_RBAC_ENABLED=0
+    export HTTP_RATE_LIMIT_ENABLED=0
+    export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1
+    timeout 15s "${BIN}" serve --host 127.0.0.1 --port "${PORT6}" --transport mcp --path /custom/ --no-tui
+) >"${LOG6}" 2>&1 &
+PID6=$!
+
+e2e_wait_port 127.0.0.1 "${PORT6}" 10 || { stop_server "${PID6}"; e2e_fatal "path override server failed"; }
+
+# /custom/ should respond
+http_post_json "c6_custom_path" "http://127.0.0.1:${PORT6}/custom/" "${PAYLOAD_TL}"
+S6_CUSTOM="$(cat "${E2E_ARTIFACT_DIR}/c6_custom_path_status.txt")"
+e2e_assert_eq "--path /custom/ responds 200" "200" "${S6_CUSTOM}"
+
+C6_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c6_custom_path_body.json")"
+e2e_assert_eq "--path /custom/ has result" "1" "${C6_OK}"
+
+# Banner should show /custom/ (not /mcp/ despite --transport mcp)
+e2e_assert_file_contains "banner shows /custom/ path" "${LOG6}" "/custom/"
+
+stop_server "${PID6}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 7: health endpoints respond regardless of mode
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "health_endpoints_mode_independent"
+
+WORK7="$(e2e_mktemp "e2e_parity_health")"
+DB7="${WORK7}/db.sqlite3"
+STORAGE7="${WORK7}/storage"
+mkdir -p "${STORAGE7}"
+
+PORT7="$(pick_port)"
+
+PID7="$(start_server "health_test" "${PORT7}" "${DB7}" "${STORAGE7}" "${BIN}" "HTTP_PATH=/api/")"
+e2e_wait_port 127.0.0.1 "${PORT7}" 10 || { stop_server "${PID7}"; e2e_fatal "health test server failed"; }
+
+# /health/liveness
+set +e
+LIVE_BODY="$(curl -sS "http://127.0.0.1:${PORT7}/health/liveness" 2>/dev/null)"
+LIVE_RC=$?
+set -e
+if [ "$LIVE_RC" -eq 0 ]; then
+    e2e_assert_contains "liveness has alive" "${LIVE_BODY}" "alive"
+else
+    e2e_fail "liveness curl failed"
+fi
+
+# /health/readiness
+set +e
+READY_BODY="$(curl -sS "http://127.0.0.1:${PORT7}/health/readiness" 2>/dev/null)"
+READY_RC=$?
+set -e
+if [ "$READY_RC" -eq 0 ]; then
+    e2e_assert_contains "readiness has ready" "${READY_BODY}" "ready"
+else
+    e2e_fail "readiness curl failed"
+fi
+
+stop_server "${PID7}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 8: send_message + fetch_inbox parity across modes
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "message_send_fetch_parity"
+
+WORK8="$(e2e_mktemp "e2e_parity_msg")"
+DB8_MCP="${WORK8}/db_mcp.sqlite3"
+DB8_API="${WORK8}/db_api.sqlite3"
+STORAGE8_MCP="${WORK8}/storage_mcp"
+STORAGE8_API="${WORK8}/storage_api"
+mkdir -p "${STORAGE8_MCP}" "${STORAGE8_API}"
+
+PORT_MCP8="$(pick_port)"
+PORT_API8="$(pick_port)"
+
+PID_MCP8="$(start_server "msg_mcp" "${PORT_MCP8}" "${DB8_MCP}" "${STORAGE8_MCP}" "${BIN}" "HTTP_PATH=/mcp/")"
+PID_API8="$(start_server "msg_api" "${PORT_API8}" "${DB8_API}" "${STORAGE8_API}" "${BIN}" "HTTP_PATH=/api/")"
+
+e2e_wait_port 127.0.0.1 "${PORT_MCP8}" 10 || { stop_server "${PID_MCP8}"; stop_server "${PID_API8}"; e2e_fatal "msg mcp server failed"; }
+e2e_wait_port 127.0.0.1 "${PORT_API8}" 10 || { stop_server "${PID_MCP8}"; stop_server "${PID_API8}"; e2e_fatal "msg api server failed"; }
+
+# Setup: ensure project + register agents on both
+PROJ_KEY="/tmp/e2e_parity_msg_proj"
+EP8='{"human_key":"'"${PROJ_KEY}"'"}'
+PAYLOAD_EP8="$(jsonrpc_tools_call_payload "ensure_project" "${EP8}")"
+http_post_json "c8_mcp_ep" "http://127.0.0.1:${PORT_MCP8}/mcp/" "${PAYLOAD_EP8}"
+http_post_json "c8_api_ep" "http://127.0.0.1:${PORT_API8}/api/" "${PAYLOAD_EP8}"
+
+RA8='{"project_key":"'"${PROJ_KEY}"'","program":"e2e","model":"test","name":"RedLake"}'
+PAYLOAD_RA8="$(jsonrpc_tools_call_payload "register_agent" "${RA8}")"
+http_post_json "c8_mcp_ra1" "http://127.0.0.1:${PORT_MCP8}/mcp/" "${PAYLOAD_RA8}"
+http_post_json "c8_api_ra1" "http://127.0.0.1:${PORT_API8}/api/" "${PAYLOAD_RA8}"
+
+RA8B='{"project_key":"'"${PROJ_KEY}"'","program":"e2e","model":"test","name":"BluePeak"}'
+PAYLOAD_RA8B="$(jsonrpc_tools_call_payload "register_agent" "${RA8B}")"
+http_post_json "c8_mcp_ra2" "http://127.0.0.1:${PORT_MCP8}/mcp/" "${PAYLOAD_RA8B}"
+http_post_json "c8_api_ra2" "http://127.0.0.1:${PORT_API8}/api/" "${PAYLOAD_RA8B}"
+
+# Send message on both
+SM8='{"project_key":"'"${PROJ_KEY}"'","sender_name":"RedLake","to":["BluePeak"],"subject":"parity test","body_md":"hello from parity"}'
+PAYLOAD_SM8="$(jsonrpc_tools_call_payload "send_message" "${SM8}")"
+http_post_json "c8_mcp_sm" "http://127.0.0.1:${PORT_MCP8}/mcp/" "${PAYLOAD_SM8}"
+http_post_json "c8_api_sm" "http://127.0.0.1:${PORT_API8}/api/" "${PAYLOAD_SM8}"
+
+MCP_SM_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c8_mcp_sm_body.json")"
+API_SM_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c8_api_sm_body.json")"
+e2e_assert_eq "MCP send_message has result" "1" "${MCP_SM_OK}"
+e2e_assert_eq "API send_message has result" "1" "${API_SM_OK}"
+
+# Fetch inbox on both
+FI8='{"project_key":"'"${PROJ_KEY}"'","agent_name":"BluePeak","include_bodies":true}'
+PAYLOAD_FI8="$(jsonrpc_tools_call_payload "fetch_inbox" "${FI8}")"
+http_post_json "c8_mcp_fi" "http://127.0.0.1:${PORT_MCP8}/mcp/" "${PAYLOAD_FI8}"
+http_post_json "c8_api_fi" "http://127.0.0.1:${PORT_API8}/api/" "${PAYLOAD_FI8}"
+
+MCP_FI_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c8_mcp_fi_body.json")"
+API_FI_OK="$(has_jsonrpc_result "${E2E_ARTIFACT_DIR}/c8_api_fi_body.json")"
+e2e_assert_eq "MCP fetch_inbox has result" "1" "${MCP_FI_OK}"
+e2e_assert_eq "API fetch_inbox has result" "1" "${API_FI_OK}"
+
+# Both inboxes should contain the message body
+MCP_FI_TEXT="$(extract_tool_text "${E2E_ARTIFACT_DIR}/c8_mcp_fi_body.json")"
+API_FI_TEXT="$(extract_tool_text "${E2E_ARTIFACT_DIR}/c8_api_fi_body.json")"
+e2e_assert_contains "MCP inbox has message" "${MCP_FI_TEXT}" "parity test"
+e2e_assert_contains "API inbox has message" "${API_FI_TEXT}" "parity test"
+
+stop_server "${PID_MCP8}"
+stop_server "${PID_API8}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 9: wrong path returns 404 (not a silent mismatch)
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "wrong_path_returns_404"
+
+WORK9="$(e2e_mktemp "e2e_parity_404")"
+DB9="${WORK9}/db.sqlite3"
+STORAGE9="${WORK9}/storage"
+mkdir -p "${STORAGE9}"
+
+PORT9="$(pick_port)"
+
+PID9="$(start_server "wrong_path" "${PORT9}" "${DB9}" "${STORAGE9}" "${BIN}" "HTTP_PATH=/custom/")"
+e2e_wait_port 127.0.0.1 "${PORT9}" 10 || { stop_server "${PID9}"; e2e_fatal "wrong path server failed"; }
+
+# /badpath/ should fail (not 200)
+http_post_json "c9_badpath" "http://127.0.0.1:${PORT9}/badpath/" "${PAYLOAD_TL}"
+S9_BAD="$(cat "${E2E_ARTIFACT_DIR}/c9_badpath_status.txt")"
+if [ "${S9_BAD}" = "404" ] || [ "${S9_BAD}" = "405" ]; then
+    e2e_pass "wrong path returns ${S9_BAD} (not 200)"
+else
+    e2e_fail "expected 404/405 for wrong path, got ${S9_BAD}"
+fi
+
+# /custom/ should still work
+http_post_json "c9_goodpath" "http://127.0.0.1:${PORT9}/custom/" "${PAYLOAD_TL}"
+S9_GOOD="$(cat "${E2E_ARTIFACT_DIR}/c9_goodpath_status.txt")"
+e2e_assert_eq "correct path /custom/ responds 200" "200" "${S9_GOOD}"
+
+stop_server "${PID9}"
+sleep 0.3
+
+# ══════════════════════════════════════════════════════════════════════
+# Case 10: bootstrap banner diagnostics clarity
+# ══════════════════════════════════════════════════════════════════════
+e2e_case_banner "bootstrap_diagnostics_clarity"
+
+# MCP mode banner
+LOG_MCP_DIAG="${E2E_ARTIFACT_DIR}/server_mcp_mode.log"
+e2e_assert_file_contains "MCP banner shows host" "${LOG_MCP_DIAG}" "host:" || true
+e2e_assert_file_contains "MCP banner shows mode" "${LOG_MCP_DIAG}" "mode:" || true
+
+# API mode banner
+LOG_API_DIAG="${E2E_ARTIFACT_DIR}/server_api_mode.log"
+e2e_assert_file_contains "API banner shows host" "${LOG_API_DIAG}" "host:" || true
+e2e_assert_file_contains "API banner shows mode" "${LOG_API_DIAG}" "mode:" || true
+
+# ══════════════════════════════════════════════════════════════════════
+e2e_summary
