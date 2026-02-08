@@ -1207,6 +1207,38 @@ pub fn tooling_metrics_core_query(ctx: &McpContext, query: String) -> McpResult<
     tooling_metrics_core(ctx)
 }
 
+/// Get a comprehensive diagnostic report combining all system health metrics.
+///
+/// Includes system info, health level, HTTP/DB/storage metrics, per-tool latencies,
+/// slow tools, lock contention, and automated recommendations.
+#[resource(
+    uri = "resource://tooling/diagnostics",
+    description = "Comprehensive diagnostic report with health metrics and recommendations"
+)]
+pub fn tooling_diagnostics(_ctx: &McpContext) -> McpResult<String> {
+    let tools_detail: Vec<serde_json::Value> = crate::metrics::tool_metrics_snapshot()
+        .into_iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .collect();
+    let slow: Vec<serde_json::Value> = crate::metrics::slow_tools()
+        .into_iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .collect();
+
+    let report = mcp_agent_mail_core::DiagnosticReport::build(tools_detail, slow);
+    Ok(report.to_json())
+}
+
+/// Get a comprehensive diagnostic report (query-aware variant).
+#[resource(
+    uri = "resource://tooling/diagnostics?{query}",
+    description = "Comprehensive diagnostic report with health metrics and recommendations (with query)"
+)]
+pub fn tooling_diagnostics_query(ctx: &McpContext, query: String) -> McpResult<String> {
+    let _query = parse_query(&query);
+    tooling_diagnostics(ctx)
+}
+
 /// Archive lock info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveLock {

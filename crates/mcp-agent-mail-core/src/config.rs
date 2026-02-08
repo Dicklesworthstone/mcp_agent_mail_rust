@@ -431,10 +431,10 @@ impl Default for Config {
             messaging_auto_handshake_on_block: true,
 
             // Message size limits
-            max_message_body_bytes: 1_048_576,       // 1 MiB
-            max_attachment_bytes: 10_485_760,         // 10 MiB per attachment
-            max_total_message_bytes: 20_971_520,      // 20 MiB total (body + all attachments)
-            max_subject_bytes: 1_024,                 // 1 KiB
+            max_message_body_bytes: 1_048_576,   // 1 MiB
+            max_attachment_bytes: 10_485_760,    // 10 MiB per attachment
+            max_total_message_bytes: 20_971_520, // 20 MiB total (body + all attachments)
+            max_subject_bytes: 1_024,            // 1 KiB
 
             // File Reservations
             file_reservations_cleanup_enabled: false,
@@ -548,13 +548,17 @@ static CONFIG_CACHE: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(
 fn global_config_cache_get() -> Config {
     // Fast path: read lock, return clone if present
     {
-        let guard = CONFIG_CACHE.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = CONFIG_CACHE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(ref c) = *guard {
             return c.clone();
         }
     }
     // Slow path: write lock, initialize from env
-    let mut guard = CONFIG_CACHE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = CONFIG_CACHE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if guard.is_none() {
         *guard = Some(Config::from_env());
     }
@@ -562,7 +566,9 @@ fn global_config_cache_get() -> Config {
 }
 
 fn global_config_cache_reset() {
-    let mut guard = CONFIG_CACHE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = CONFIG_CACHE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = None;
 }
 
@@ -611,8 +617,10 @@ impl Config {
         config.database_pool_size = env_usize_opt("DATABASE_POOL_SIZE");
         config.database_max_overflow = env_usize_opt("DATABASE_MAX_OVERFLOW");
         config.database_pool_timeout = env_u64_opt("DATABASE_POOL_TIMEOUT");
-        config.integrity_check_on_startup =
-            env_bool("INTEGRITY_CHECK_ON_STARTUP", config.integrity_check_on_startup);
+        config.integrity_check_on_startup = env_bool(
+            "INTEGRITY_CHECK_ON_STARTUP",
+            config.integrity_check_on_startup,
+        );
         config.integrity_check_interval_hours = env_u64(
             "INTEGRITY_CHECK_INTERVAL_HOURS",
             config.integrity_check_interval_hours,

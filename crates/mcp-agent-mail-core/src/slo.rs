@@ -191,10 +191,22 @@ mod tests {
     #[test]
     fn pool_health_classify() {
         assert_eq!(PoolHealth::classify(0), PoolHealth::Green);
-        assert_eq!(PoolHealth::classify(POOL_ACQUIRE_GREEN_US), PoolHealth::Green);
-        assert_eq!(PoolHealth::classify(POOL_ACQUIRE_GREEN_US + 1), PoolHealth::Yellow);
-        assert_eq!(PoolHealth::classify(POOL_ACQUIRE_YELLOW_US), PoolHealth::Yellow);
-        assert_eq!(PoolHealth::classify(POOL_ACQUIRE_YELLOW_US + 1), PoolHealth::Red);
+        assert_eq!(
+            PoolHealth::classify(POOL_ACQUIRE_GREEN_US),
+            PoolHealth::Green
+        );
+        assert_eq!(
+            PoolHealth::classify(POOL_ACQUIRE_GREEN_US + 1),
+            PoolHealth::Yellow
+        );
+        assert_eq!(
+            PoolHealth::classify(POOL_ACQUIRE_YELLOW_US),
+            PoolHealth::Yellow
+        );
+        assert_eq!(
+            PoolHealth::classify(POOL_ACQUIRE_YELLOW_US + 1),
+            PoolHealth::Red
+        );
         assert_eq!(PoolHealth::classify(POOL_ACQUIRE_RED_US), PoolHealth::Red);
     }
 
@@ -218,6 +230,9 @@ mod tests {
         assert_eq!(OpClass::Tool.budget_us(), (TOOL_P95_US, TOOL_P99_US));
         assert_eq!(OpClass::Read.budget_us(), (READ_P95_US, READ_P99_US));
         assert_eq!(OpClass::Send.budget_us(), (SEND_P95_US, SEND_P99_US));
-        assert_eq!(OpClass::SendAttach.budget_us(), (SEND_ATTACH_P95_US, SEND_ATTACH_P99_US));
+        assert_eq!(
+            OpClass::SendAttach.budget_us(),
+            (SEND_ATTACH_P95_US, SEND_ATTACH_P99_US)
+        );
     }
 }

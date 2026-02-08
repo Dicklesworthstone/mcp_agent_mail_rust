@@ -1057,9 +1057,7 @@ fn stress_1000_agent_concurrent_workload() {
 
     // Pool with enough connections for 50 concurrent threads
     let dir = tempfile::tempdir().expect("create tempdir");
-    let db_path = dir
-        .path()
-        .join(format!("stress_1k_{}.db", unique_suffix()));
+    let db_path = dir.path().join(format!("stress_1k_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
         max_connections: 100,
@@ -1131,7 +1129,14 @@ fn stress_1000_agent_concurrent_workload() {
                         let n = name.clone();
                         async move {
                             queries::register_agent(
-                                &cx, &pp, project_id, &n, "stress", "stress-model", None, None,
+                                &cx,
+                                &pp,
+                                project_id,
+                                &n,
+                                "stress",
+                                "stress-model",
+                                None,
+                                None,
                             )
                             .await
                         }
@@ -1186,10 +1191,8 @@ fn stress_1000_agent_concurrent_workload() {
                     match block_on(|cx| {
                         let pp2 = pp.clone();
                         async move {
-                            queries::fetch_inbox(
-                                &cx, &pp2, project_id, agent_id, false, None, 50,
-                            )
-                            .await
+                            queries::fetch_inbox(&cx, &pp2, project_id, agent_id, false, None, 50)
+                                .await
                         }
                     }) {
                         Outcome::Ok(msgs) => {
@@ -1200,8 +1203,7 @@ fn stress_1000_agent_concurrent_workload() {
                                 match block_on(|cx| {
                                     let pp4 = pp3.clone();
                                     async move {
-                                        queries::acknowledge_message(&cx, &pp4, agent_id, mid)
-                                            .await
+                                        queries::acknowledge_message(&cx, &pp4, agent_id, mid).await
                                     }
                                 }) {
                                     Outcome::Ok(_) => {
@@ -1277,9 +1279,7 @@ fn stress_1000_agent_concurrent_workload() {
 #[test]
 fn stress_burst_200_concurrent_acquire_release() {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let db_path = dir
-        .path()
-        .join(format!("burst200_{}.db", unique_suffix()));
+    let db_path = dir.path().join(format!("burst200_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
         max_connections: 50,
@@ -1448,7 +1448,10 @@ fn stress_pool_acquire_latency_budget() {
     }
 
     let errs = error_count.load(Ordering::Relaxed);
-    assert_eq!(errs, 0, "expected 0 errors during latency measurement, got {errs}");
+    assert_eq!(
+        errs, 0,
+        "expected 0 errors during latency measurement, got {errs}"
+    );
 
     // Check the histogram
     let snap = metrics.db.pool_acquire_latency_us.snapshot();

@@ -143,8 +143,7 @@ fn extract_table_id(sql: &str) -> TableId {
     // Scan for " INTO " or "\nINTO " or "\tINTO " (case-insensitive)
     let mut i = 1; // INTO always preceded by whitespace
     while i + 5 <= len {
-        if is_ws(bytes[i - 1]) && ci_eq4(bytes, i, *b"into") && i + 4 < len && is_ws(bytes[i + 4])
-        {
+        if is_ws(bytes[i - 1]) && ci_eq4(bytes, i, *b"into") && i + 4 < len && is_ws(bytes[i + 4]) {
             let ns = skip_ws(bytes, i + 5);
             if ns < len && i < best_pos {
                 best_pos = i;
@@ -158,10 +157,7 @@ fn extract_table_id(sql: &str) -> TableId {
     // Scan for "UPDATE " at start or after whitespace
     i = 0;
     while i + 7 <= len {
-        if (i == 0 || is_ws(bytes[i - 1]))
-            && ci_eq_n(bytes, i, b"update")
-            && is_ws(bytes[i + 6])
-        {
+        if (i == 0 || is_ws(bytes[i - 1])) && ci_eq_n(bytes, i, b"update") && is_ws(bytes[i + 6]) {
             let ns = skip_ws(bytes, i + 7);
             if ns < len && i < best_pos {
                 best_pos = i;
@@ -175,8 +171,7 @@ fn extract_table_id(sql: &str) -> TableId {
     // Scan for " FROM " (case-insensitive)
     i = 1;
     while i + 5 <= len {
-        if is_ws(bytes[i - 1]) && ci_eq4(bytes, i, *b"from") && i + 4 < len && is_ws(bytes[i + 4])
-        {
+        if is_ws(bytes[i - 1]) && ci_eq4(bytes, i, *b"from") && i + 4 < len && is_ws(bytes[i + 4]) {
             let ns = skip_ws(bytes, i + 5);
             if ns < len && i < best_pos {
                 best_pos = i;
@@ -281,7 +276,8 @@ fn skip_quotes_at(bytes: &[u8], mut pos: usize) -> usize {
 /// Find the end of a qualified name (identifiers, dots, and quotes).
 fn find_qname_end(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
-    while i < bytes.len() && (is_ident_char(bytes[i]) || bytes[i] == b'.' || is_quote_char(bytes[i]))
+    while i < bytes.len()
+        && (is_ident_char(bytes[i]) || bytes[i] == b'.' || is_quote_char(bytes[i]))
     {
         i += 1;
     }
@@ -758,10 +754,7 @@ mod tests {
 
     #[test]
     fn fast_extract_unknown() {
-        assert_eq!(
-            extract_table_id("PRAGMA wal_checkpoint"),
-            TableId::Unknown
-        );
+        assert_eq!(extract_table_id("PRAGMA wal_checkpoint"), TableId::Unknown);
         assert_eq!(extract_table_id("SELECT 1"), TableId::Unknown);
         assert_eq!(extract_table_id(""), TableId::Unknown);
         assert_eq!(

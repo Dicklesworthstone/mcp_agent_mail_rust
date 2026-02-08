@@ -167,6 +167,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         mcp_agent_mail_core::global_metrics()
             .tools
             .record_call(latency_us, is_error);
+        mcp_agent_mail_tools::record_latency_idx(self.tool_index, latency_us);
 
         // Emit ToolCallEnd with duration and query delta
         let qt_after = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
@@ -233,6 +234,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             mcp_agent_mail_core::global_metrics()
                 .tools
                 .record_call(latency_us, is_error);
+            mcp_agent_mail_tools::record_latency_idx(self.tool_index, latency_us);
 
             // Emit ToolCallEnd with duration and query delta
             let qt_after = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
@@ -638,6 +640,8 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
+    // Pre-intern well-known strings to avoid first-request contention.
+    mcp_agent_mail_core::pre_intern_policies();
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -651,6 +655,8 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
+    // Pre-intern well-known strings to avoid first-request contention.
+    mcp_agent_mail_core::pre_intern_policies();
 
     // Run startup verification probes before committing to background workers.
     let probe_report = startup_checks::run_startup_probes(config);
@@ -727,6 +733,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
+    mcp_agent_mail_core::pre_intern_policies();
 
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {

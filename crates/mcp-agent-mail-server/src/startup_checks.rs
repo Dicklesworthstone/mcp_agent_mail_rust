@@ -289,7 +289,11 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         Ok(_) => ProbeResult::Ok { name: "integrity" },
         Err(mcp_agent_mail_db::DbError::IntegrityCorruption { message, details }) => {
             let detail_str = if details.len() > 5 {
-                format!("{} (and {} more)", details[..5].join("; "), details.len() - 5)
+                format!(
+                    "{} (and {} more)",
+                    details[..5].join("; "),
+                    details.len() - 5
+                )
             } else {
                 details.join("; ")
             };
@@ -374,8 +378,7 @@ fn probe_consistency(config: &Config) -> ProbeResult {
         };
     }
 
-    let report =
-        mcp_agent_mail_storage::check_archive_consistency(&config.storage_root, &refs);
+    let report = mcp_agent_mail_storage::check_archive_consistency(&config.storage_root, &refs);
 
     if report.missing > 0 {
         tracing::warn!(

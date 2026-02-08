@@ -583,9 +583,8 @@ fn wbq_execute_op(op: &WriteOp) -> Result<()> {
 static ARCHIVE_LOCK_MAP: OnceLock<OrderedRwLock<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 fn archive_process_lock(project_slug: &str) -> Arc<Mutex<()>> {
-    let map = ARCHIVE_LOCK_MAP.get_or_init(|| {
-        OrderedRwLock::new(LockLevel::StorageArchiveLockMap, HashMap::new())
-    });
+    let map = ARCHIVE_LOCK_MAP
+        .get_or_init(|| OrderedRwLock::new(LockLevel::StorageArchiveLockMap, HashMap::new()));
 
     // Fast path: read lock for existing entry.
     {
@@ -4267,10 +4266,7 @@ pub fn check_archive_consistency(
             }
         };
 
-        let iso_filename = msg
-            .created_ts_iso
-            .replace(':', "-")
-            .replace('+', "");
+        let iso_filename = msg.created_ts_iso.replace(':', "-").replace('+', "");
         // Truncate to seconds-level precision for filename matching
         let iso_prefix = if iso_filename.len() >= 19 {
             &iso_filename[..19]

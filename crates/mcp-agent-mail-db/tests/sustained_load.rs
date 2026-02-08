@@ -31,8 +31,8 @@ use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::metrics::Log2Histogram;
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ===========================================================================
@@ -106,8 +106,7 @@ impl RateLimiter {
     /// Block until a token is available, maintaining the target rate.
     fn wait_for_token(&self) {
         loop {
-            let elapsed_us =
-                u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let elapsed_us = u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
             let available = elapsed_us * self.rate_per_sec / 1_000_000;
             let consumed = self.consumed.load(Ordering::Relaxed);
             if consumed < available {
@@ -208,9 +207,7 @@ fn sustained_100_rps_load_test() {
 
     // ── Pool setup ──
     let dir = tempfile::tempdir().expect("create tempdir");
-    let db_path = dir
-        .path()
-        .join(format!("sustained_{}.db", unique_suffix()));
+    let db_path = dir.path().join(format!("sustained_{}.db", unique_suffix()));
     let db_path_str = db_path.display().to_string();
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{db_path_str}"),
@@ -248,11 +245,7 @@ fn sustained_100_rps_load_test() {
             let noun = mcp_agent_mail_core::VALID_NOUNS;
             let mut ids = Vec::with_capacity(n_agents);
             for i in 0..n_agents {
-                let name = format!(
-                    "{}{}",
-                    cap(adj[i % adj.len()]),
-                    cap(noun[i % noun.len()])
-                );
+                let name = format!("{}{}", cap(adj[i % adj.len()]), cap(noun[i % noun.len()]));
                 let agent = match queries::register_agent(
                     &cx,
                     &p,
@@ -291,9 +284,7 @@ fn sustained_100_rps_load_test() {
                     project_id,
                     aids[sender_idx],
                     &format!("stress sustained test message {i}"),
-                    &format!(
-                        "body for sustained load test iteration {i} with searchable keywords"
-                    ),
+                    &format!("body for sustained load test iteration {i} with searchable keywords"),
                     None,
                     "normal",
                     ack,
@@ -372,9 +363,17 @@ fn sustained_100_rps_load_test() {
                 };
                 eprintln!(
                     "  [{:>4}s] ops={:<6} rps={:<7.1} p50={:<7}μs p95={:<7}μs p99={:<7}μs max={:<7}μs errs={} rss={}KB wal={}B health={}",
-                    s.elapsed_secs, s.ops_total, s.actual_rps,
-                    s.p50_us, s.p95_us, s.p99_us, s.max_us,
-                    s.errors, s.rss_kb, s.wal_bytes, s.health_level,
+                    s.elapsed_secs,
+                    s.ops_total,
+                    s.actual_rps,
+                    s.p50_us,
+                    s.p95_us,
+                    s.p99_us,
+                    s.max_us,
+                    s.errors,
+                    s.rss_kb,
+                    s.wal_bytes,
+                    s.health_level,
                 );
                 snaps.lock().unwrap().push(s);
             }
@@ -425,17 +424,14 @@ fn sustained_100_rps_load_test() {
                                 .await
                                 {
                                     Outcome::Ok(_) => Ok(()),
-                                    Outcome::Err(e) => {
-                                        Err(format!("fetch_inbox: {e:?}"))
-                                    }
+                                    Outcome::Err(e) => Err(format!("fetch_inbox: {e:?}")),
                                     _ => Err("cancelled".into()),
                                 }
                             })
                         }
                         OpType::SendMessage => {
                             let p = pool.clone();
-                            let subj =
-                                format!("load w{worker_id} op{local_ops}");
+                            let subj = format!("load w{worker_id} op{local_ops}");
                             let body = format!(
                                 "sustained load body from worker {worker_id} op {local_ops}"
                             );
@@ -456,9 +452,7 @@ fn sustained_100_rps_load_test() {
                                 .await
                                 {
                                     Outcome::Ok(_) => Ok(()),
-                                    Outcome::Err(e) => {
-                                        Err(format!("send: {e:?}"))
-                                    }
+                                    Outcome::Err(e) => Err(format!("send: {e:?}")),
                                     _ => Err("cancelled".into()),
                                 }
                             })
@@ -472,24 +466,17 @@ fn sustained_100_rps_load_test() {
                                 _ => "load",
                             };
                             block_on(|cx| async move {
-                                match queries::search_messages(
-                                    &cx, &p, project_id, term, 20,
-                                )
-                                .await
+                                match queries::search_messages(&cx, &p, project_id, term, 20).await
                                 {
                                     Outcome::Ok(_) => Ok(()),
-                                    Outcome::Err(e) => {
-                                        Err(format!("search: {e:?}"))
-                                    }
+                                    Outcome::Err(e) => Err(format!("search: {e:?}")),
                                     _ => Err("cancelled".into()),
                                 }
                             })
                         }
                         OpType::Reservation => {
                             let p = pool.clone();
-                            let path = format!(
-                                "src/worker_{worker_id}/file_{local_ops}.rs"
-                            );
+                            let path = format!("src/worker_{worker_id}/file_{local_ops}.rs");
                             block_on(|cx| async move {
                                 match queries::create_file_reservations(
                                     &cx,
@@ -504,22 +491,16 @@ fn sustained_100_rps_load_test() {
                                 .await
                                 {
                                     Outcome::Ok(reservations) => {
-                                        let ids: Vec<i64> = reservations
-                                            .iter()
-                                            .filter_map(|r| r.id)
-                                            .collect();
+                                        let ids: Vec<i64> =
+                                            reservations.iter().filter_map(|r| r.id).collect();
                                         if !ids.is_empty() {
                                             let _ =
-                                                queries::release_reservations_by_ids(
-                                                    &cx, &p, &ids,
-                                                )
-                                                .await;
+                                                queries::release_reservations_by_ids(&cx, &p, &ids)
+                                                    .await;
                                         }
                                         Ok(())
                                     }
-                                    Outcome::Err(e) => {
-                                        Err(format!("reservation: {e:?}"))
-                                    }
+                                    Outcome::Err(e) => Err(format!("reservation: {e:?}")),
                                     _ => Err("cancelled".into()),
                                 }
                             })
@@ -528,21 +509,16 @@ fn sustained_100_rps_load_test() {
                             if ackables.is_empty() {
                                 Ok(())
                             } else {
-                                let msg_idx =
-                                    (local_ops as usize) % ackables.len();
+                                let msg_idx = (local_ops as usize) % ackables.len();
                                 let msg_id = ackables[msg_idx];
                                 let p = pool.clone();
                                 block_on(|cx| async move {
                                     // Both ops are idempotent; NotFound for
                                     // non-recipients is expected.
-                                    let _ = queries::mark_message_read(
-                                        &cx, &p, agent_id, msg_id,
-                                    )
-                                    .await;
-                                    match queries::acknowledge_message(
-                                        &cx, &p, agent_id, msg_id,
-                                    )
-                                    .await
+                                    let _ =
+                                        queries::mark_message_read(&cx, &p, agent_id, msg_id).await;
+                                    match queries::acknowledge_message(&cx, &p, agent_id, msg_id)
+                                        .await
                                     {
                                         Outcome::Ok(_) => Ok(()),
                                         Outcome::Err(e) => {
@@ -566,8 +542,7 @@ fn sustained_100_rps_load_test() {
                         }
                     };
 
-                    let op_us = u64::try_from(op_start.elapsed().as_micros())
-                        .unwrap_or(u64::MAX);
+                    let op_us = u64::try_from(op_start.elapsed().as_micros()).unwrap_or(u64::MAX);
                     latency.record(op_us);
 
                     match result {
@@ -611,9 +586,7 @@ fn sustained_100_rps_load_test() {
     eprintln!("\n=== Final Results ===");
     eprintln!("Duration:   {:.1}s", elapsed.as_secs_f64());
     eprintln!("Total ops:  {total_ops}");
-    eprintln!(
-        "Actual RPS: {final_rps:.1} (target: {target_rps})"
-    );
+    eprintln!("Actual RPS: {final_rps:.1} (target: {target_rps})");
     eprintln!("Errors:     {total_errors}");
     eprintln!(
         "Latency:    p50={}μs p95={}μs p99={}μs max={}μs",
@@ -624,7 +597,11 @@ fn sustained_100_rps_load_test() {
         rss_growth_kb,
         rss_growth_kb as f64 / 1024.0
     );
-    eprintln!("WAL size:   {}B ({:.1}MB)", final_wal, final_wal as f64 / (1024.0 * 1024.0));
+    eprintln!(
+        "WAL size:   {}B ({:.1}MB)",
+        final_wal,
+        final_wal as f64 / (1024.0 * 1024.0)
+    );
 
     // ── Time-series summary ──
     let snaps = snapshots.lock().unwrap();
@@ -693,21 +670,17 @@ fn sustained_100_rps_load_test() {
                     0.0
                 }
             } else {
-                let dt = snaps[i].elapsed_secs.saturating_sub(snaps[i - 1].elapsed_secs);
+                let dt = snaps[i]
+                    .elapsed_secs
+                    .saturating_sub(snaps[i - 1].elapsed_secs);
                 let dops = snaps[i].ops_total.saturating_sub(snaps[i - 1].ops_total);
-                if dt > 0 {
-                    dops as f64 / dt as f64
-                } else {
-                    0.0
-                }
+                if dt > 0 { dops as f64 / dt as f64 } else { 0.0 }
             }
         };
 
-        let first_half_rps: f64 =
-            (0..mid).map(&interval_rps).sum::<f64>() / mid as f64;
+        let first_half_rps: f64 = (0..mid).map(&interval_rps).sum::<f64>() / mid as f64;
         let second_half_rps: f64 =
-            (mid..snaps.len()).map(interval_rps).sum::<f64>()
-                / (snaps.len() - mid) as f64;
+            (mid..snaps.len()).map(interval_rps).sum::<f64>() / (snaps.len() - mid) as f64;
 
         if first_half_rps > 10.0 {
             let degradation = (first_half_rps - second_half_rps) / first_half_rps;

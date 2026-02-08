@@ -442,12 +442,7 @@ impl DbPool {
     /// Connections are acquired and immediately returned to the pool idle set.
     /// Bounded: stops after `timeout` elapses or on first acquire error.
     /// Returns the number of connections successfully warmed up.
-    pub async fn warmup(
-        &self,
-        cx: &Cx,
-        n: usize,
-        timeout: std::time::Duration,
-    ) -> usize {
+    pub async fn warmup(&self, cx: &Cx, n: usize, timeout: std::time::Duration) -> usize {
         let deadline = Instant::now() + timeout;
         let mut opened = 0usize;
         // Acquire connections in batches; hold them briefly then release.
@@ -536,10 +531,7 @@ impl DbPool {
     /// Returns lightweight refs that the storage layer can use to verify
     /// archive file presence. Opens a dedicated connection (outside the pool)
     /// so this works even if the pool isn't fully started yet.
-    pub fn sample_recent_message_refs(
-        &self,
-        limit: i64,
-    ) -> DbResult<Vec<ConsistencyMessageRef>> {
+    pub fn sample_recent_message_refs(&self, limit: i64) -> DbResult<Vec<ConsistencyMessageRef>> {
         if self.sqlite_path == ":memory:" {
             return Ok(Vec::new());
         }
@@ -584,9 +576,7 @@ impl DbPool {
                 _ => continue,
             };
             let created_ts = match row.get_by_name("created_ts") {
-                Some(sqlmodel_core::Value::BigInt(us)) => {
-                    crate::micros_to_iso(*us)
-                }
+                Some(sqlmodel_core::Value::BigInt(us)) => crate::micros_to_iso(*us),
                 Some(sqlmodel_core::Value::Text(s)) => s.clone(),
                 _ => continue,
             };
@@ -632,12 +622,8 @@ impl DbPool {
         let checkpointed = rows
             .first()
             .and_then(|r| match r.get_by_name("checkpointed") {
-                Some(sqlmodel_core::Value::BigInt(n)) => {
-                    Some(u64::try_from(*n).unwrap_or(0))
-                }
-                Some(sqlmodel_core::Value::Int(n)) => {
-                    Some(u64::try_from(*n).unwrap_or(0))
-                }
+                Some(sqlmodel_core::Value::BigInt(n)) => Some(u64::try_from(*n).unwrap_or(0)),
+                Some(sqlmodel_core::Value::Int(n)) => Some(u64::try_from(*n).unwrap_or(0)),
                 _ => None,
             })
             .unwrap_or(0);
@@ -981,8 +967,14 @@ mod tests {
                 sql.contains("journal_size_limit = 67108864"),
                 "all should have 64MB journal_size_limit"
             );
-            assert!(sql.contains("busy_timeout = 60000"), "must have busy_timeout");
-            assert!(sql.contains("mmap_size = 268435456"), "must have 256MB mmap");
+            assert!(
+                sql.contains("busy_timeout = 60000"),
+                "must have busy_timeout"
+            );
+            assert!(
+                sql.contains("mmap_size = 268435456"),
+                "must have 256MB mmap"
+            );
         }
     }
 
@@ -1037,7 +1029,9 @@ mod tests {
             ..Default::default()
         };
         let pool = DbPool::new(&config).expect("create pool");
-        let frames = pool.wal_checkpoint().expect("memory checkpoint should succeed");
+        let frames = pool
+            .wal_checkpoint()
+            .expect("memory checkpoint should succeed");
         assert_eq!(frames, 0, "memory DB checkpoint should return 0");
     }
 }

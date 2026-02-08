@@ -2,12 +2,15 @@
 //!
 //! Mirrors legacy Python `TOOL_METRICS` defaultdict:
 //! - Thread-safe atomic counters for calls/errors per tool
-//! - `tool_metrics_snapshot()` returns sorted snapshot with metadata
+//! - Per-tool latency histograms with streaming P50/P95/P99 (br-15dv.8.4)
+//! - `tool_metrics_snapshot()` returns sorted snapshot with metadata + latency
 //!
 //! Call `record_call(tool_name)` / `record_error(tool_name)` from tool handlers.
+//! Call `record_latency_idx(tool_index, latency_us)` from `InstrumentedTool`.
 
 #![forbid(unsafe_code)]
 
+use mcp_agent_mail_core::Log2Histogram;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,10 +19,15 @@ use crate::TOOL_CLUSTER_MAP;
 
 const TOOL_COUNT: usize = TOOL_CLUSTER_MAP.len();
 
+/// Threshold in microseconds: tools with p95 above this are flagged as slow.
+const SLOW_TOOL_P95_THRESHOLD_US: u64 = 500_000; // 500ms
+
 static TOOL_CALLS: LazyLock<[AtomicU64; TOOL_COUNT]> =
     LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 static TOOL_ERRORS: LazyLock<[AtomicU64; TOOL_COUNT]> =
     LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+static TOOL_LATENCIES: LazyLock<[Log2Histogram; TOOL_COUNT]> =
+    LazyLock::new(|| std::array::from_fn(|_| Log2Histogram::new()));
 
 /// Convert tool name -> stable index into the pre-allocated counter arrays.
 ///
@@ -67,7 +75,21 @@ pub fn record_error(tool_name: &str) {
     }
 }
 
-/// Clear all tool metrics counters.
+/// Record per-tool latency in microseconds (called from `InstrumentedTool`).
+#[inline]
+pub fn record_latency_idx(tool_index: usize, latency_us: u64) {
+    debug_assert!(tool_index < TOOL_COUNT);
+    TOOL_LATENCIES[tool_index].record(latency_us);
+}
+
+/// Record per-tool latency by name (convenience wrapper).
+pub fn record_latency(tool_name: &str, latency_us: u64) {
+    if let Some(idx) = tool_index(tool_name) {
+        record_latency_idx(idx, latency_us);
+    }
+}
+
+/// Clear all tool metrics counters (calls, errors, and latency histograms).
 ///
 /// Intended for tests that need deterministic snapshots across multiple tool calls.
 pub fn reset_tool_metrics() {
@@ -76,6 +98,19 @@ pub fn reset_tool_metrics() {
     }
     for e in TOOL_ERRORS.iter() {
         e.store(0, Ordering::Relaxed);
+    }
+    for h in TOOL_LATENCIES.iter() {
+        h.reset();
+    }
+}
+
+/// Reset only the per-tool latency histograms (rolling window support).
+///
+/// Called periodically by the tool metrics emit worker to provide a rolling
+/// window view of latency rather than cumulative all-time stats.
+pub fn reset_tool_latencies() {
+    for h in TOOL_LATENCIES.iter() {
+        h.reset();
     }
 }
 
@@ -350,9 +385,29 @@ pub fn tool_meta(tool_name: &str) -> Option<&'static ToolMeta> {
         .map(|(_, meta)| meta)
 }
 
+/// Per-tool latency statistics in a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencySnapshot {
+    /// Average latency in milliseconds.
+    pub avg_ms: f64,
+    /// Minimum observed latency in milliseconds.
+    pub min_ms: f64,
+    /// Maximum observed latency in milliseconds.
+    pub max_ms: f64,
+    /// 50th percentile latency in milliseconds.
+    pub p50_ms: f64,
+    /// 95th percentile latency in milliseconds.
+    pub p95_ms: f64,
+    /// 99th percentile latency in milliseconds.
+    pub p99_ms: f64,
+    /// True if p95 exceeds the slow-tool threshold (500ms).
+    pub is_slow: bool,
+}
+
 /// A single entry in a metrics snapshot.
 ///
-/// Matches legacy Python `_tool_metrics_snapshot()` dict structure.
+/// Includes call/error counters, cluster metadata, and per-tool latency
+/// histogram statistics (P50/P95/P99).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshotEntry {
     pub name: String,
@@ -361,14 +416,41 @@ pub struct MetricsSnapshotEntry {
     pub cluster: String,
     pub capabilities: Vec<String>,
     pub complexity: String,
+    /// Per-tool latency statistics. `None` if no latency has been recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency: Option<LatencySnapshot>,
+}
+
+/// Convert microseconds to milliseconds as f64.
+#[inline]
+#[allow(clippy::cast_precision_loss)] // microsecond values fit comfortably in f64
+fn us_to_ms(us: u64) -> f64 {
+    us as f64 / 1000.0
+}
+
+/// Build a `LatencySnapshot` from a tool's histogram, or `None` if no data.
+fn latency_snapshot_for(idx: usize) -> Option<LatencySnapshot> {
+    let hs = TOOL_LATENCIES[idx].snapshot();
+    if hs.count == 0 {
+        return None;
+    }
+    let avg_us = hs.sum.checked_div(hs.count).unwrap_or(0);
+    Some(LatencySnapshot {
+        avg_ms: us_to_ms(avg_us),
+        min_ms: us_to_ms(hs.min),
+        max_ms: us_to_ms(hs.max),
+        p50_ms: us_to_ms(hs.p50),
+        p95_ms: us_to_ms(hs.p95),
+        p99_ms: us_to_ms(hs.p99),
+        is_slow: hs.p95 > SLOW_TOOL_P95_THRESHOLD_US,
+    })
 }
 
 /// Produce a sorted metrics snapshot.
 ///
-/// Mirrors legacy Python `_tool_metrics_snapshot()`:
-/// - Returns all tools that have been called (calls > 0)
-/// - Sorted alphabetically by name
-/// - Enriched with cluster, capabilities, complexity from metadata
+/// Returns all tools that have been called (calls > 0), sorted alphabetically
+/// by name, enriched with cluster, capabilities, complexity, and per-tool
+/// latency histogram statistics (P50/P95/P99).
 #[must_use]
 pub fn tool_metrics_snapshot() -> Vec<MetricsSnapshotEntry> {
     let mut entries: Vec<MetricsSnapshotEntry> = TOOL_CLUSTER_MAP
@@ -391,6 +473,7 @@ pub fn tool_metrics_snapshot() -> Vec<MetricsSnapshotEntry> {
                     .map(|m| m.capabilities.iter().map(|s| (*s).to_string()).collect())
                     .unwrap_or_default(),
                 complexity: meta.map_or("unknown", |m| m.complexity).to_string(),
+                latency: latency_snapshot_for(idx),
             })
         })
         .collect();
@@ -418,12 +501,24 @@ pub fn tool_metrics_snapshot_full() -> Vec<MetricsSnapshotEntry> {
                     .map(|m| m.capabilities.iter().map(|s| (*s).to_string()).collect())
                     .unwrap_or_default(),
                 complexity: meta.map_or("unknown", |m| m.complexity).to_string(),
+                latency: latency_snapshot_for(idx),
             }
         })
         .collect();
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
+}
+
+/// Return only tools flagged as slow (p95 > 500ms).
+///
+/// Useful for alerting and diagnostic reports.
+#[must_use]
+pub fn slow_tools() -> Vec<MetricsSnapshotEntry> {
+    tool_metrics_snapshot()
+        .into_iter()
+        .filter(|e| e.latency.as_ref().is_some_and(|l| l.is_slow))
+        .collect()
 }
 
 #[cfg(test)]
@@ -498,5 +593,121 @@ mod tests {
         assert_eq!(ep.complexity, "low");
         assert!(ep.capabilities.contains(&"infrastructure".to_string()));
         assert!(ep.capabilities.contains(&"storage".to_string()));
+    }
+
+    #[test]
+    fn latency_tracking_basic() {
+        reset_tool_metrics();
+        let idx = tool_index("health_check").unwrap();
+
+        // Record calls with latency.
+        record_call_idx(idx);
+        record_latency_idx(idx, 1_000); // 1ms
+        record_call_idx(idx);
+        record_latency_idx(idx, 2_000); // 2ms
+        record_call_idx(idx);
+        record_latency_idx(idx, 3_000); // 3ms
+
+        let snapshot = tool_metrics_snapshot();
+        let hc = snapshot.iter().find(|e| e.name == "health_check").unwrap();
+        assert_eq!(hc.calls, 3);
+
+        let lat = hc.latency.as_ref().expect("latency should be present");
+        assert!(
+            lat.avg_ms >= 1.0 && lat.avg_ms <= 3.0,
+            "avg_ms={}",
+            lat.avg_ms
+        );
+        assert!(
+            lat.min_ms >= 0.5 && lat.min_ms <= 1.5,
+            "min_ms={}",
+            lat.min_ms
+        );
+        assert!(
+            lat.max_ms >= 2.5 && lat.max_ms <= 4.0,
+            "max_ms={}",
+            lat.max_ms
+        );
+        assert!(!lat.is_slow, "3ms p95 should not be flagged as slow");
+    }
+
+    #[test]
+    fn latency_no_data_returns_none() {
+        reset_tool_metrics();
+        // Record a call without latency.
+        record_call("whois");
+
+        let snapshot = tool_metrics_snapshot();
+        let w = snapshot.iter().find(|e| e.name == "whois").unwrap();
+        assert!(w.latency.is_none(), "no latency recorded, should be None");
+    }
+
+    #[test]
+    fn slow_tool_detection() {
+        reset_tool_metrics();
+        let idx = tool_index("send_message").unwrap();
+
+        // Record a mix of fast and slow calls.
+        for _ in 0..20 {
+            record_call_idx(idx);
+            record_latency_idx(idx, 600_000); // 600ms — above 500ms threshold
+        }
+
+        let snapshot = tool_metrics_snapshot();
+        let sm = snapshot.iter().find(|e| e.name == "send_message").unwrap();
+        let lat = sm.latency.as_ref().unwrap();
+        assert!(lat.is_slow, "p95 at 600ms should be flagged as slow");
+        assert!(lat.p95_ms >= 400.0, "p95_ms should be high: {}", lat.p95_ms);
+
+        let slow = slow_tools();
+        assert!(
+            slow.iter().any(|e| e.name == "send_message"),
+            "send_message should appear in slow_tools()"
+        );
+    }
+
+    #[test]
+    fn reset_clears_latency_histograms() {
+        reset_tool_metrics();
+        let idx = tool_index("fetch_inbox").unwrap();
+        record_call_idx(idx);
+        record_latency_idx(idx, 5_000);
+
+        // Verify latency is present.
+        let snap1 = tool_metrics_snapshot();
+        let fi = snap1.iter().find(|e| e.name == "fetch_inbox").unwrap();
+        assert!(fi.latency.is_some());
+
+        // Reset only latencies.
+        reset_tool_latencies();
+
+        // Calls should still be present but latency gone.
+        let snap2 = tool_metrics_snapshot();
+        let fi2 = snap2.iter().find(|e| e.name == "fetch_inbox").unwrap();
+        assert_eq!(fi2.calls, 1);
+        assert!(
+            fi2.latency.is_none(),
+            "latency should be cleared after reset"
+        );
+    }
+
+    #[test]
+    fn latency_snapshot_json_serializable() {
+        reset_tool_metrics();
+        let idx = tool_index("register_agent").unwrap();
+        record_call_idx(idx);
+        record_latency_idx(idx, 10_000);
+
+        let snapshot = tool_metrics_snapshot();
+        let json = serde_json::to_value(&snapshot).expect("should serialize");
+        let arr = json.as_array().unwrap();
+        let entry = arr.iter().find(|v| v["name"] == "register_agent").unwrap();
+        assert!(entry.get("latency").is_some());
+        let lat = &entry["latency"];
+        assert!(lat.get("avg_ms").is_some());
+        assert!(lat.get("p50_ms").is_some());
+        assert!(lat.get("p95_ms").is_some());
+        assert!(lat.get("p99_ms").is_some());
+        assert!(lat.get("is_slow").is_some());
     }
 }

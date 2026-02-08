@@ -1,0 +1,440 @@
+//! Structured diagnostic report combining all system health metrics.
+//!
+//! Provides a comprehensive snapshot for operators debugging issues with
+//! 1000+ concurrent agents. Includes system info, database, storage,
+//! tools, lock contention, health level, and automated recommendations.
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! let report = DiagnosticReport::build(tool_snapshot, slow_tools);
+//! let json = serde_json::to_string_pretty(&report).unwrap();
+//! ```
+
+#![forbid(unsafe_code)]
+
+use serde::Serialize;
+
+use crate::backpressure::{self, HealthLevel, HealthSignals};
+use crate::lock_order::{LockContentionEntry, lock_contention_snapshot};
+use crate::metrics::{
+    DbMetricsSnapshot, GlobalMetricsSnapshot, HttpMetricsSnapshot, StorageMetricsSnapshot,
+    SystemMetricsSnapshot, ToolsMetricsSnapshot, global_metrics,
+};
+
+/// Maximum serialized report size in bytes (100KB).
+const MAX_REPORT_BYTES: usize = 100 * 1024;
+
+// ---------------------------------------------------------------------------
+// Report types
+// ---------------------------------------------------------------------------
+
+/// Top-level diagnostic report.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticReport {
+    /// Report generation timestamp (ISO-8601).
+    pub generated_at: String,
+    /// System information (uptime, Rust version, OS, CPU count).
+    pub system: SystemInfo,
+    /// Health level assessment.
+    pub health: HealthInfo,
+    /// HTTP request metrics.
+    pub http: HttpMetricsSnapshot,
+    /// Aggregate tool call metrics.
+    pub tools_aggregate: ToolsMetricsSnapshot,
+    /// Per-tool call/error/latency snapshots (passed in from tools crate).
+    pub tools_detail: Vec<serde_json::Value>,
+    /// Slow tools (p95 > 500ms), passed in from tools crate.
+    pub slow_tools: Vec<serde_json::Value>,
+    /// Database pool metrics.
+    pub database: DbMetricsSnapshot,
+    /// Storage (WBQ + commit queue) metrics.
+    pub storage: StorageMetricsSnapshot,
+    /// Disk usage metrics.
+    pub disk: SystemMetricsSnapshot,
+    /// Lock contention metrics.
+    pub locks: Vec<LockContentionEntry>,
+    /// Automated recommendations based on current metrics.
+    pub recommendations: Vec<Recommendation>,
+}
+
+/// System information gathered at report time.
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemInfo {
+    /// Process uptime in seconds.
+    pub uptime_secs: u64,
+    /// Rust compiler version used to build.
+    pub rust_version: &'static str,
+    /// Target architecture.
+    pub target: &'static str,
+    /// Operating system description.
+    pub os: String,
+    /// Number of available CPUs.
+    pub cpu_count: usize,
+}
+
+/// Health level with underlying signal breakdown.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthInfo {
+    /// Current health level: `"green"`, `"yellow"`, or `"red"`.
+    pub level: String,
+    /// Underlying signals that drive the health classification.
+    pub signals: HealthSignals,
+}
+
+/// A single recommendation for the operator.
+#[derive(Debug, Clone, Serialize)]
+pub struct Recommendation {
+    /// Severity: `"info"`, `"warning"`, `"critical"`.
+    pub severity: &'static str,
+    /// Which subsystem the recommendation relates to.
+    pub subsystem: &'static str,
+    /// Human-readable recommendation text.
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Static system info
+// ---------------------------------------------------------------------------
+
+/// Process start time for uptime calculation.
+static PROCESS_START: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Call early in `main()` to anchor uptime measurement.
+pub fn init_process_start() {
+    let _ = &*PROCESS_START;
+}
+
+fn system_info() -> SystemInfo {
+    let uptime = PROCESS_START.elapsed();
+    SystemInfo {
+        uptime_secs: uptime.as_secs(),
+        rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("nightly"),
+        target: std::env::consts::ARCH,
+        os: std::env::consts::OS.to_string(),
+        cpu_count: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recommendation engine
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::cast_precision_loss)] // deliberate: metric values fit in f64
+fn health_recommendations(
+    health: HealthLevel,
+    signals: &HealthSignals,
+    recs: &mut Vec<Recommendation>,
+) {
+    match health {
+        HealthLevel::Red => recs.push(Recommendation {
+            severity: "critical",
+            subsystem: "health",
+            message: "System is in RED health state. Shedding low-priority tool calls. \
+                      Investigate pool utilization, WBQ depth, and commit queue."
+                .into(),
+        }),
+        HealthLevel::Yellow => recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "health",
+            message: "System is in YELLOW health state. Load is elevated but not critical.".into(),
+        }),
+        HealthLevel::Green => {}
+    }
+
+    // Pool utilization
+    if signals.pool_utilization_pct >= 90 {
+        recs.push(Recommendation {
+            severity: "critical",
+            subsystem: "database",
+            message: format!(
+                "Pool utilization at {}%. Consider increasing DATABASE_POOL_SIZE.",
+                signals.pool_utilization_pct,
+            ),
+        });
+    } else if signals.pool_utilization_pct >= 70 {
+        recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "database",
+            message: format!(
+                "Pool utilization at {}%. Monitor for growth.",
+                signals.pool_utilization_pct,
+            ),
+        });
+    }
+
+    // Pool acquire latency
+    if signals.pool_acquire_p95_us > 100_000 {
+        recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "database",
+            message: format!(
+                "Pool acquire p95 latency is {:.1}ms. Consider increasing pool size or \
+                 reducing concurrent tool calls.",
+                signals.pool_acquire_p95_us as f64 / 1000.0,
+            ),
+        });
+    }
+
+    // WBQ depth
+    if signals.wbq_depth_pct >= 80 {
+        recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "storage",
+            message: format!(
+                "Write-back queue at {}% capacity. Archive writes may be backing up.",
+                signals.wbq_depth_pct,
+            ),
+        });
+    }
+
+    // Commit queue
+    if signals.commit_depth_pct >= 80 {
+        recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "storage",
+            message: format!(
+                "Commit queue at {}% capacity. Git commits may be falling behind.",
+                signals.commit_depth_pct,
+            ),
+        });
+    }
+}
+
+#[allow(clippy::cast_precision_loss)] // deliberate: metric values fit in f64
+fn operational_recommendations(
+    snap: &GlobalMetricsSnapshot,
+    lock_snap: &[LockContentionEntry],
+    slow_tool_count: usize,
+    recs: &mut Vec<Recommendation>,
+) {
+    // Slow tools
+    if slow_tool_count > 0 {
+        recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "tools",
+            message: format!(
+                "{slow_tool_count} tool(s) have p95 latency > 500ms. Check tools_detail for specifics.",
+            ),
+        });
+    }
+
+    // High error rate
+    let tool_calls = snap.tools.tool_calls_total;
+    let tool_errors = snap.tools.tool_errors_total;
+    if tool_calls > 100 {
+        let error_pct = (tool_errors as f64 / tool_calls as f64) * 100.0;
+        if error_pct > 10.0 {
+            recs.push(Recommendation {
+                severity: "warning",
+                subsystem: "tools",
+                message: format!(
+                    "Tool error rate is {error_pct:.1}% ({tool_errors}/{tool_calls}). Investigate failing tools.",
+                ),
+            });
+        }
+    }
+
+    // Lock contention
+    for entry in lock_snap {
+        if entry.contention_ratio > 0.1 && entry.acquire_count > 100 {
+            recs.push(Recommendation {
+                severity: "warning",
+                subsystem: "locks",
+                message: format!(
+                    "Lock '{}' has {:.1}% contention rate ({} contended / {} acquires). \
+                     Max wait: {:.2}ms.",
+                    entry.lock_name,
+                    entry.contention_ratio * 100.0,
+                    entry.contended_count,
+                    entry.acquire_count,
+                    entry.max_wait_ns as f64 / 1_000_000.0,
+                ),
+            });
+        }
+    }
+
+    // Disk pressure
+    if snap.system.disk_pressure_level >= 2 {
+        recs.push(Recommendation {
+            severity: "critical",
+            subsystem: "disk",
+            message: format!(
+                "Disk pressure level {} \u{2014} storage free: {} bytes, DB free: {} bytes.",
+                snap.system.disk_pressure_level,
+                snap.system.disk_storage_free_bytes,
+                snap.system.disk_db_free_bytes,
+            ),
+        });
+    }
+}
+
+fn generate_recommendations(
+    snap: &GlobalMetricsSnapshot,
+    health: HealthLevel,
+    signals: &HealthSignals,
+    lock_snap: &[LockContentionEntry],
+    slow_tool_count: usize,
+) -> Vec<Recommendation> {
+    let mut recs = Vec::with_capacity(8);
+    health_recommendations(health, signals, &mut recs);
+    operational_recommendations(snap, lock_snap, slow_tool_count, &mut recs);
+    recs
+}
+
+// ---------------------------------------------------------------------------
+// Report builder
+// ---------------------------------------------------------------------------
+
+impl DiagnosticReport {
+    /// Build a comprehensive diagnostic report.
+    ///
+    /// `tools_detail` and `slow_tools` are passed in as `serde_json::Value`
+    /// because the per-tool `MetricsSnapshotEntry` type lives in the tools
+    /// crate (which depends on core, not the other way around). The server or
+    /// tools crate serializes these before passing them in.
+    #[must_use]
+    pub fn build(tools_detail: Vec<serde_json::Value>, slow_tools: Vec<serde_json::Value>) -> Self {
+        let snap = global_metrics().snapshot();
+        let (health_level, signals) = backpressure::compute_health_level_with_signals();
+        let lock_snap = lock_contention_snapshot();
+        let slow_tool_count = slow_tools.len();
+
+        let recs =
+            generate_recommendations(&snap, health_level, &signals, &lock_snap, slow_tool_count);
+
+        Self {
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            system: system_info(),
+            health: HealthInfo {
+                level: health_level.as_str().to_string(),
+                signals,
+            },
+            http: snap.http,
+            tools_aggregate: snap.tools,
+            tools_detail,
+            slow_tools,
+            database: snap.db,
+            storage: snap.storage,
+            disk: snap.system,
+            locks: lock_snap,
+            recommendations: recs,
+        }
+    }
+
+    /// Serialize to JSON, truncating if the report exceeds 100KB.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        match serde_json::to_string_pretty(self) {
+            Ok(json) if json.len() <= MAX_REPORT_BYTES => json,
+            Ok(json) => {
+                // Truncate tools_detail to fit within budget.
+                let mut truncated = self.clone();
+                while serde_json::to_string(&truncated).map_or(0, |s| s.len()) > MAX_REPORT_BYTES {
+                    if truncated.tools_detail.len() > 5 {
+                        truncated.tools_detail.truncate(5);
+                        truncated.tools_detail.push(serde_json::json!({
+                            "_truncated": true,
+                            "_message": "tools_detail truncated to fit 100KB report limit"
+                        }));
+                    } else if truncated.locks.len() > 5 {
+                        truncated.locks.truncate(5);
+                    } else {
+                        // Give up and return truncated raw JSON.
+                        return json[..MAX_REPORT_BYTES].to_string();
+                    }
+                }
+                serde_json::to_string_pretty(&truncated).unwrap_or(json)
+            }
+            Err(_) => r#"{"error":"failed to serialize diagnostic report"}"#.to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_builds_without_panic() {
+        let report = DiagnosticReport::build(vec![], vec![]);
+        assert!(!report.generated_at.is_empty());
+        assert!(report.system.cpu_count >= 1);
+        assert_eq!(report.health.level, "green");
+    }
+
+    #[test]
+    fn report_json_serializable() {
+        let report = DiagnosticReport::build(vec![], vec![]);
+        let json = report.to_json();
+        assert!(!json.is_empty());
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(parsed.get("generated_at").is_some());
+        assert!(parsed.get("health").is_some());
+        assert!(parsed.get("recommendations").is_some());
+    }
+
+    #[test]
+    fn report_respects_size_limit() {
+        // Build a report with lots of tool detail to test truncation.
+        let big_tools: Vec<serde_json::Value> = (0..1000)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("tool_{i}"),
+                    "calls": i,
+                    "errors": 0,
+                    "cluster": "test",
+                    "padding": "x".repeat(200),
+                })
+            })
+            .collect();
+        let report = DiagnosticReport::build(big_tools, vec![]);
+        let json = report.to_json();
+        assert!(
+            json.len() <= MAX_REPORT_BYTES + 1024, // small grace for truncation boundary
+            "report too large: {} bytes",
+            json.len()
+        );
+    }
+
+    #[test]
+    fn recommendations_for_healthy_system() {
+        let report = DiagnosticReport::build(vec![], vec![]);
+        assert_eq!(report.health.level, "green");
+        assert!(
+            !report
+                .recommendations
+                .iter()
+                .any(|r| r.severity == "critical"),
+            "healthy system should have no critical recommendations"
+        );
+    }
+
+    #[test]
+    fn slow_tools_generates_recommendation() {
+        let slow = vec![serde_json::json!({
+            "name": "send_message",
+            "p95_ms": 600.0,
+        })];
+        let report = DiagnosticReport::build(vec![], slow);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.subsystem == "tools" && r.message.contains("p95")),
+            "should warn about slow tools"
+        );
+    }
+
+    #[test]
+    fn system_info_populated() {
+        let info = system_info();
+        assert!(info.cpu_count >= 1);
+        assert!(!info.os.is_empty());
+    }
+}

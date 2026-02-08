@@ -149,7 +149,10 @@ impl HealthSignals {
         let commit_over_80_for_s = duration_since_s(snap.storage.commit_over_80_since_us, now_us);
 
         let wbq_depth_pct = pct(snap.storage.wbq_depth, snap.storage.wbq_capacity);
-        let commit_depth_pct = pct(snap.storage.commit_pending_requests, snap.storage.commit_soft_cap);
+        let commit_depth_pct = pct(
+            snap.storage.commit_pending_requests,
+            snap.storage.commit_soft_cap,
+        );
 
         Self {
             pool_acquire_p95_us: snap.db.pool_acquire_latency_us.p95,
@@ -453,7 +456,11 @@ mod tests {
 
     #[test]
     fn health_level_roundtrip_u8() {
-        for (v, expected) in [(0u8, HealthLevel::Green), (1, HealthLevel::Yellow), (2, HealthLevel::Red)] {
+        for (v, expected) in [
+            (0u8, HealthLevel::Green),
+            (1, HealthLevel::Yellow),
+            (2, HealthLevel::Red),
+        ] {
             assert_eq!(HealthLevel::from_u8(v), expected);
             assert_eq!(expected as u8, v);
         }
@@ -514,21 +521,39 @@ mod tests {
                 requests_4xx: 0,
                 requests_5xx: 0,
                 latency_us: HistogramSnapshot {
-                    count: 0, sum: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0,
+                    count: 0,
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p95: 0,
+                    p99: 0,
                 },
             },
             tools: ToolsMetricsSnapshot {
                 tool_calls_total: 0,
                 tool_errors_total: 0,
                 tool_latency_us: HistogramSnapshot {
-                    count: 0, sum: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0,
+                    count: 0,
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p95: 0,
+                    p99: 0,
                 },
             },
             db: DbMetricsSnapshot {
                 pool_acquires_total: 0,
                 pool_acquire_errors_total: 0,
                 pool_acquire_latency_us: HistogramSnapshot {
-                    count: 0, sum: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0,
+                    count: 0,
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p95: 0,
+                    p99: 0,
                 },
                 pool_total_connections: 100,
                 pool_idle_connections: 100,
@@ -548,7 +573,13 @@ mod tests {
                 wbq_peak_depth: 0,
                 wbq_over_80_since_us: 0,
                 wbq_queue_latency_us: HistogramSnapshot {
-                    count: 0, sum: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0,
+                    count: 0,
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p95: 0,
+                    p99: 0,
                 },
                 commit_enqueued_total: 0,
                 commit_drained_total: 0,
@@ -559,7 +590,13 @@ mod tests {
                 commit_peak_pending_requests: 0,
                 commit_over_80_since_us: 0,
                 commit_queue_latency_us: HistogramSnapshot {
-                    count: 0, sum: 0, min: 0, max: 0, p50: 0, p95: 0, p99: 0,
+                    count: 0,
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p95: 0,
+                    p99: 0,
                 },
                 needs_reindex_total: 0,
             },
@@ -585,7 +622,10 @@ mod tests {
         // Note: tests run in parallel, so the global may have been modified.
         // We can at least verify the API is callable.
         let level = cached_health_level();
-        assert!(matches!(level, HealthLevel::Green | HealthLevel::Yellow | HealthLevel::Red));
+        assert!(matches!(
+            level,
+            HealthLevel::Green | HealthLevel::Yellow | HealthLevel::Red
+        ));
     }
 
     #[test]
@@ -593,7 +633,10 @@ mod tests {
         // Since we can't control the global metrics in unit tests,
         // just verify the API returns the expected shape.
         let (level, _changed) = refresh_health_level();
-        assert!(matches!(level, HealthLevel::Green | HealthLevel::Yellow | HealthLevel::Red));
+        assert!(matches!(
+            level,
+            HealthLevel::Green | HealthLevel::Yellow | HealthLevel::Red
+        ));
     }
 
     #[test]

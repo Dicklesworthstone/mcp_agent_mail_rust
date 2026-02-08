@@ -1,8 +1,10 @@
 //! Background worker for tool metrics emission.
 //!
 //! Mirrors legacy Python `_worker_tool_metrics` in `http.py`:
-//! - Periodically snapshots tool call/error counters
+//! - Periodically snapshots tool call/error counters and latency histograms
 //! - Logs via structlog `tool.metrics` logger with `tool_metrics_snapshot` event
+//! - Resets per-tool latency histograms each cycle for rolling-window view
+//! - Logs slow tool warnings when any tool's p95 exceeds 500ms
 //!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
@@ -10,10 +12,10 @@
 #![forbid(unsafe_code)]
 
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_tools::tool_metrics_snapshot;
+use mcp_agent_mail_tools::{reset_tool_latencies, slow_tools, tool_metrics_snapshot};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Global shutdown flag for the tool metrics worker.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -83,7 +85,30 @@ fn metrics_loop(config: &Config) {
                     );
                 }
             }
+
+            // Emit slow tool warnings (p95 > 500ms).
+            let slow = slow_tools();
+            for entry in &slow {
+                if let Some(lat) = &entry.latency {
+                    warn!(
+                        target: "tool.metrics",
+                        event = "slow_tool_detected",
+                        tool = entry.name.as_str(),
+                        p95_ms = lat.p95_ms,
+                        p99_ms = lat.p99_ms,
+                        avg_ms = lat.avg_ms,
+                        calls = entry.calls,
+                        "slow tool detected: {} (p95={:.1}ms)",
+                        entry.name,
+                        lat.p95_ms,
+                    );
+                }
+            }
         }
+
+        // Rolling window: reset per-tool latency histograms so the next
+        // snapshot reflects only the most recent interval.
+        reset_tool_latencies();
 
         // Sleep in small increments to allow quick shutdown.
         let mut remaining = interval;

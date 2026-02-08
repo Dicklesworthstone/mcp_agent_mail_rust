@@ -19,8 +19,8 @@
 use crate::error::{DbError, DbResult};
 use sqlmodel_core::{Row, Value};
 use sqlmodel_sqlite::SqliteConnection;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Result of an integrity check.
 #[derive(Debug, Clone)]
@@ -131,15 +131,19 @@ pub fn full_check(conn: &SqliteConnection) -> DbResult<IntegrityCheckResult> {
     run_check(conn, "PRAGMA integrity_check", CheckKind::Full)
 }
 
-fn run_check(conn: &SqliteConnection, pragma: &str, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
+fn run_check(
+    conn: &SqliteConnection,
+    pragma: &str,
+    kind: CheckKind,
+) -> DbResult<IntegrityCheckResult> {
     let start = std::time::Instant::now();
 
     let rows: Vec<Row> = conn
         .query_sync(pragma, &[])
         .map_err(|e| DbError::Sqlite(format!("{kind} failed: {e}")))?;
 
-    let duration_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
-        .unwrap_or(u64::MAX);
+    let duration_us =
+        u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
 
     let details: Vec<String> = rows
         .iter()
@@ -195,10 +199,7 @@ fn run_check(conn: &SqliteConnection, pragma: &str, kind: CheckKind) -> DbResult
 /// Attempt recovery by creating a clean copy via `VACUUM INTO`.
 ///
 /// Returns the path of the clean copy on success.
-pub fn attempt_vacuum_recovery(
-    conn: &SqliteConnection,
-    original_path: &str,
-) -> DbResult<String> {
+pub fn attempt_vacuum_recovery(conn: &SqliteConnection, original_path: &str) -> DbResult<String> {
     let recovery_path = format!("{original_path}.recovery");
 
     // Remove any leftover recovery file.
@@ -238,8 +239,7 @@ pub fn is_full_check_due(interval_hours: u64) -> bool {
         return true;
     }
     let now = crate::now_micros();
-    let elapsed_hours =
-        u64::try_from((now - last).max(0)).unwrap_or(0) / (3_600 * 1_000_000);
+    let elapsed_hours = u64::try_from((now - last).max(0)).unwrap_or(0) / (3_600 * 1_000_000);
     elapsed_hours >= interval_hours
 }
 
@@ -333,19 +333,16 @@ mod tests {
         );
 
         // Verify recovery copy has data.
-        let recovery_conn =
-            SqliteConnection::open_file(&recovery_path).expect("open recovery");
+        let recovery_conn = SqliteConnection::open_file(&recovery_path).expect("open recovery");
         let rows: Vec<Row> = recovery_conn
             .query_sync("SELECT COUNT(*) AS cnt FROM foo", &[])
             .expect("query");
         let cnt = rows
             .first()
-            .and_then(|r| {
-                match r.get_by_name("cnt") {
-                    Some(Value::BigInt(n)) => Some(*n),
-                    Some(Value::Int(n)) => Some(i64::from(*n)),
-                    _ => None,
-                }
+            .and_then(|r| match r.get_by_name("cnt") {
+                Some(Value::BigInt(n)) => Some(*n),
+                Some(Value::Int(n)) => Some(i64::from(*n)),
+                _ => None,
             })
             .unwrap_or(0);
         assert_eq!(cnt, 1, "recovery copy should have the data");

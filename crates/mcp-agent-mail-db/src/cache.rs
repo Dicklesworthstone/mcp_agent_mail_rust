@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 
 use crate::models::{AgentRow, ProjectRow};
-use mcp_agent_mail_core::{LockLevel, OrderedMutex, OrderedRwLock};
+use mcp_agent_mail_core::{InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
 
 const PROJECT_TTL: Duration = Duration::from_secs(300); // 5 min
 const AGENT_TTL: Duration = Duration::from_secs(300); // 5 min
@@ -180,7 +180,7 @@ pub fn cache_metrics() -> &'static CacheMetrics {
 pub struct ReadCache {
     projects_by_slug: OrderedRwLock<IndexMap<String, CacheEntry<ProjectRow>>>,
     projects_by_human_key: OrderedRwLock<IndexMap<String, CacheEntry<ProjectRow>>>,
-    agents_by_key: OrderedRwLock<IndexMap<(i64, String), CacheEntry<AgentRow>>>,
+    agents_by_key: OrderedRwLock<IndexMap<(i64, InternedStr), CacheEntry<AgentRow>>>,
     agents_by_id: OrderedRwLock<IndexMap<i64, CacheEntry<AgentRow>>>,
     /// Sharded deferred touch queue (16 shards, keyed by `agent_id % 16`).
     /// Each shard maps `agent_id` → latest requested timestamp (micros).
@@ -290,7 +290,7 @@ impl ReadCache {
     /// Look up an agent by (`project_id`, name). Returns `None` if not cached or expired.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_agent(&self, project_id: i64, name: &str) -> Option<AgentRow> {
-        let key = (project_id, name.to_string());
+        let key = (project_id, InternedStr::new(name));
         let mut map = self.agents_by_key.write();
         let Some(idx) = map.get_index_of(&key) else {
             CACHE_METRICS.record_agent_miss();
@@ -344,7 +344,7 @@ impl ReadCache {
             let mut map = self.agents_by_key.write();
             lru_evict_if_full_tuple(&mut map, AGENT_TTL);
             map.insert(
-                (agent.project_id, agent.name.clone()),
+                (agent.project_id, InternedStr::new(&agent.name)),
                 CacheEntry::new(agent.clone()),
             );
         }
@@ -364,7 +364,7 @@ impl ReadCache {
             let mut by_key = self.agents_by_key.write();
             for agent in agents {
                 by_key.insert(
-                    (agent.project_id, agent.name.clone()),
+                    (agent.project_id, InternedStr::new(&agent.name)),
                     CacheEntry::new(agent.clone()),
                 );
             }
@@ -398,7 +398,7 @@ impl ReadCache {
     /// Invalidate a specific agent entry (call after `register_agent` update).
     pub fn invalidate_agent(&self, project_id: i64, name: &str) {
         let mut map = self.agents_by_key.write();
-        if let Some(entry) = map.shift_remove(&(project_id, name.to_string())) {
+        if let Some(entry) = map.shift_remove(&(project_id, InternedStr::new(name))) {
             // Also remove from id index
             if let Some(id) = entry.value.id {
                 drop(map); // release key map lock first
@@ -510,8 +510,11 @@ fn lru_evict_if_full<T>(map: &mut IndexMap<String, CacheEntry<T>>, ttl: Duration
     }
 }
 
-/// LRU eviction for `IndexMap<(i64, String), CacheEntry<T>>`.
-fn lru_evict_if_full_tuple<T>(map: &mut IndexMap<(i64, String), CacheEntry<T>>, ttl: Duration) {
+/// LRU eviction for `IndexMap<(i64, InternedStr), CacheEntry<T>>`.
+fn lru_evict_if_full_tuple<T>(
+    map: &mut IndexMap<(i64, InternedStr), CacheEntry<T>>,
+    ttl: Duration,
+) {
     if map.len() < MAX_ENTRIES_PER_CATEGORY {
         return;
     }
@@ -721,9 +724,9 @@ mod tests {
         let (has_agent0, has_agent1, has_new_agent) = {
             let map = cache.agents_by_key.read();
             (
-                map.contains_key(&(1_i64, "Agent0".to_string())),
-                map.contains_key(&(1_i64, "Agent1".to_string())),
-                map.contains_key(&(1_i64, "NewAgent".to_string())),
+                map.contains_key(&(1_i64, InternedStr::new("Agent0"))),
+                map.contains_key(&(1_i64, InternedStr::new("Agent1"))),
+                map.contains_key(&(1_i64, InternedStr::new("NewAgent"))),
             )
         };
         // Agent0 should still be present (was recently accessed, moved to back)
@@ -897,7 +900,7 @@ mod tests {
 
         let access_count = {
             let map = cache.agents_by_key.read();
-            map.get(&(1_i64, "HotAgent".to_string()))
+            map.get(&(1_i64, InternedStr::new("HotAgent")))
                 .map(|entry| entry.access_count)
                 .unwrap_or_default()
         };

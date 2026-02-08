@@ -267,9 +267,8 @@ fn update_max(target: &AtomicU64, candidate: u64) {
 }
 
 fn global_lock_stats() -> &'static [LockStats] {
-    static STATS: std::sync::LazyLock<Vec<LockStats>> = std::sync::LazyLock::new(|| {
-        (0..LockLevel::COUNT).map(|_| LockStats::new()).collect()
-    });
+    static STATS: std::sync::LazyLock<Vec<LockStats>> =
+        std::sync::LazyLock::new(|| (0..LockLevel::COUNT).map(|_| LockStats::new()).collect());
     &STATS
 }
 
@@ -810,7 +809,9 @@ mod tests {
         // Verify that LockStats::reset() works on a single level.
         let level = LockLevel::ToolsBridgedEnv;
         let m = OrderedMutex::new(level, ());
-        { let _g = m.lock(); }
+        {
+            let _g = m.lock();
+        }
         let s = &global_lock_stats()[level.ordinal()];
         assert!(s.acquire_count.load(Ordering::Relaxed) > 0);
         s.reset();
@@ -865,9 +866,7 @@ mod tests {
         // Stats should show some acquires (exact count depends on test ordering
         // and parallel resets, so we just verify > 0).
         let snap = lock_contention_snapshot();
-        let entry = snap
-            .iter()
-            .find(|e| e.lock_name == "StorageCommitQueue");
+        let entry = snap.iter().find(|e| e.lock_name == "StorageCommitQueue");
         // Entry might be missing if another test reset stats, but if present
         // it should have reasonable values.
         if let Some(entry) = entry {

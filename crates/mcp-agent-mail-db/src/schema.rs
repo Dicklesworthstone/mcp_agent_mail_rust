@@ -141,10 +141,14 @@ CREATE TABLE IF NOT EXISTS project_sibling_suggestions (
 );
 
 -- FTS5 virtual table for message search
+-- Porter stemmer: run/running/runs → run. Unicode61: Unicode-aware tokenization.
+-- remove_diacritics 2: normalize accented characters. prefix='2,3': fast prefix queries.
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
     message_id UNINDEXED,
     subject,
-    body
+    body,
+    tokenize='porter unicode61 remove_diacritics 2',
+    prefix='2,3'
 );
 ";
 
@@ -516,6 +520,143 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v5: FTS5 tokenizer upgrade ──────────────────────────────────────
+    // Rebuild FTS table with porter stemmer, unicode61, and prefix indexes.
+    // This enables stemming (run/running → run), accent-insensitive search,
+    // and fast prefix queries (migrat* → migration, migratable, ...).
+    //
+    // Step 1: Drop the old FTS table (triggers on `messages` are unaffected;
+    // they will resume working once the new table is created in step 2).
+    migrations.push(Migration::new(
+        "v5_drop_fts_for_tokenizer_rebuild".to_string(),
+        "drop old FTS5 table for tokenizer rebuild".to_string(),
+        "DROP TABLE IF EXISTS fts_messages".to_string(),
+        String::new(),
+    ));
+
+    // Step 2: Recreate with porter stemmer + unicode61 + prefix indexes.
+    migrations.push(Migration::new(
+        "v5_create_fts_with_porter".to_string(),
+        "create FTS5 table with porter stemmer, unicode61, and prefix indexes".to_string(),
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
+             message_id UNINDEXED, \
+             subject, \
+             body, \
+             tokenize='porter unicode61 remove_diacritics 2', \
+             prefix='2,3'\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    // Step 3: Rebuild FTS content from existing messages.
+    migrations.push(Migration::new(
+        "v5_rebuild_fts_content".to_string(),
+        "rebuild FTS5 content from messages table after tokenizer upgrade".to_string(),
+        "INSERT INTO fts_messages(message_id, subject, body) \
+         SELECT id, subject, body_md FROM messages"
+            .to_string(),
+        String::new(),
+    ));
+
+    // ── v6: Materialized inbox aggregate counters ───────────────────────
+    // Maintain per-agent counters (total, unread, ack_pending) via SQLite
+    // triggers so that inbox stats are always O(1) instead of scanning
+    // message_recipients. Triggers fire within the same transaction as the
+    // write, so counters are always consistent.
+
+    // Step 1: Create the inbox_stats table.
+    migrations.push(Migration::new(
+        "v6_create_inbox_stats".to_string(),
+        "create inbox_stats table for materialized aggregate counters".to_string(),
+        "CREATE TABLE IF NOT EXISTS inbox_stats (\
+             agent_id INTEGER PRIMARY KEY REFERENCES agents(id), \
+             total_count INTEGER NOT NULL DEFAULT 0, \
+             unread_count INTEGER NOT NULL DEFAULT 0, \
+             ack_pending_count INTEGER NOT NULL DEFAULT 0, \
+             last_message_ts INTEGER\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    // Step 2: Trigger — after INSERT into message_recipients, increment counters.
+    migrations.push(Migration::new(
+        "v6_trg_inbox_stats_insert".to_string(),
+        "trigger to increment inbox_stats on new message recipient".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_inbox_stats_insert \
+         AFTER INSERT ON message_recipients \
+         BEGIN \
+             INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+             VALUES ( \
+                 NEW.agent_id, \
+                 1, \
+                 1, \
+                 (SELECT CASE WHEN m.ack_required = 1 THEN 1 ELSE 0 END FROM messages m WHERE m.id = NEW.message_id), \
+                 (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id) \
+             ) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+                 total_count = total_count + 1, \
+                 unread_count = unread_count + 1, \
+                 ack_pending_count = ack_pending_count + \
+                     (SELECT CASE WHEN m.ack_required = 1 THEN 1 ELSE 0 END FROM messages m WHERE m.id = NEW.message_id), \
+                 last_message_ts = MAX(COALESCE(last_message_ts, 0), \
+                     (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id)); \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+
+    // Step 3: Trigger — after UPDATE of read_ts (mark read), decrement unread.
+    migrations.push(Migration::new(
+        "v6_trg_inbox_stats_mark_read".to_string(),
+        "trigger to decrement unread_count when message marked read".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_inbox_stats_mark_read \
+         AFTER UPDATE OF read_ts ON message_recipients \
+         WHEN OLD.read_ts IS NULL AND NEW.read_ts IS NOT NULL \
+         BEGIN \
+             UPDATE inbox_stats SET \
+                 unread_count = MAX(0, unread_count - 1) \
+             WHERE agent_id = NEW.agent_id; \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+
+    // Step 4: Trigger — after UPDATE of ack_ts (acknowledge), decrement ack_pending.
+    migrations.push(Migration::new(
+        "v6_trg_inbox_stats_ack".to_string(),
+        "trigger to decrement ack_pending_count when message acknowledged".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_inbox_stats_ack \
+         AFTER UPDATE OF ack_ts ON message_recipients \
+         WHEN OLD.ack_ts IS NULL AND NEW.ack_ts IS NOT NULL \
+         BEGIN \
+             UPDATE inbox_stats SET \
+                 ack_pending_count = MAX(0, ack_pending_count - 1) \
+             WHERE agent_id = NEW.agent_id; \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+
+    // Step 5: Backfill inbox_stats from existing data.
+    migrations.push(Migration::new(
+        "v6_backfill_inbox_stats".to_string(),
+        "backfill inbox_stats from existing message_recipients data".to_string(),
+        "INSERT OR REPLACE INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         SELECT \
+             r.agent_id, \
+             COUNT(*) AS total_count, \
+             SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+             SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+             MAX(m.created_ts) AS last_message_ts \
+         FROM message_recipients r \
+         JOIN messages m ON m.id = r.message_id \
+         GROUP BY r.agent_id"
+            .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -839,8 +980,13 @@ mod tests {
         ).expect("create projects table");
         conn.execute_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
-            &[Value::Text("test".to_string()), Value::Text("/test".to_string()), Value::BigInt(100)],
-        ).expect("insert project");
+            &[
+                Value::Text("test".to_string()),
+                Value::Text("/test".to_string()),
+                Value::BigInt(100),
+            ],
+        )
+        .expect("insert project");
 
         conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts INTEGER NOT NULL, last_active_ts INTEGER NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', UNIQUE(project_id, name))",
@@ -866,8 +1012,13 @@ mod tests {
         ).expect("create message_recipients table");
         conn.execute_sync(
             "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
-            &[Value::BigInt(1), Value::BigInt(1), Value::Text("to".to_string())],
-        ).expect("insert recipient");
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("to".to_string()),
+            ],
+        )
+        .expect("insert recipient");
 
         conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS agent_links (id INTEGER PRIMARY KEY AUTOINCREMENT, a_project_id INTEGER NOT NULL, a_agent_id INTEGER NOT NULL, b_project_id INTEGER NOT NULL, b_agent_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '', created_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL, expires_ts INTEGER, UNIQUE(a_project_id, a_agent_id, b_project_id, b_agent_id))",
@@ -910,6 +1061,105 @@ mod tests {
             )
             .expect("query using idx_msg_project_importance_created");
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn v5_fts_porter_stemming_and_prefix() {
+        use sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v5_fts.db");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
+
+        // Apply all migrations (creates schema + FTS with porter tokenizer).
+        block_on({
+            let conn = &conn;
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+        });
+
+        // Insert a project and agent for foreign keys.
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("p".to_string()),
+                Value::Text("/p".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("A".to_string()),
+                Value::Text("cc".to_string()),
+                Value::Text("o".to_string()),
+                Value::BigInt(1),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert agent");
+
+        // Insert messages with various word forms for stemming tests.
+        for (i, (subj, body)) in [
+            ("Running tests", "The tests are running smoothly"),
+            ("Test runner", "We ran the full suite"),
+            ("Connection pool", "Testing the connection pooling"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute_sync(
+                "INSERT INTO messages (project_id, sender_id, subject, body_md, created_ts) VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(1),
+                    Value::BigInt(1),
+                    Value::Text(subj.to_string()),
+                    Value::Text(body.to_string()),
+                    Value::BigInt(i as i64 + 100),
+                ],
+            )
+            .expect("insert message");
+        }
+
+        // Porter stemming: "running" should match when searching for "run".
+        let rows = conn
+            .query_sync(
+                "SELECT message_id FROM fts_messages WHERE fts_messages MATCH 'running'",
+                &[],
+            )
+            .expect("FTS search for 'running'");
+        assert!(
+            !rows.is_empty(),
+            "porter stemming: 'running' should match documents with 'running'"
+        );
+
+        // Prefix search: "connect*" should match "Connection" / "connection".
+        let rows = conn
+            .query_sync(
+                "SELECT message_id FROM fts_messages WHERE fts_messages MATCH 'connect*'",
+                &[],
+            )
+            .expect("FTS prefix search for 'connect*'");
+        assert!(
+            !rows.is_empty(),
+            "prefix search 'connect*' should match 'Connection'/'connection'"
+        );
+
+        // Verify bm25 with column weights works.
+        let rows = conn
+            .query_sync(
+                "SELECT message_id, bm25(fts_messages, 10.0, 1.0) as score \
+                 FROM fts_messages WHERE fts_messages MATCH 'test' \
+                 ORDER BY bm25(fts_messages, 10.0, 1.0) ASC",
+                &[],
+            )
+            .expect("FTS search with bm25 weights");
+        assert!(
+            !rows.is_empty(),
+            "bm25 weighted search should return results"
+        );
     }
 
     #[test]

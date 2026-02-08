@@ -493,8 +493,7 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
 ///
 /// Initialized on first access. 62 adjectives × 69 nouns ≈ 51 KB.
 fn valid_names_set() -> &'static std::collections::HashSet<String> {
-    static SET: std::sync::OnceLock<std::collections::HashSet<String>> =
-        std::sync::OnceLock::new();
+    static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         let mut set =
             std::collections::HashSet::with_capacity(VALID_ADJECTIVES.len() * VALID_NOUNS.len());
