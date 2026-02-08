@@ -1177,6 +1177,7 @@ pub struct ToolingMetricsCoreResponse {
     pub generated_at: Option<String>,
     pub health_level: String,
     pub metrics: mcp_agent_mail_core::GlobalMetricsSnapshot,
+    pub lock_contention: Vec<mcp_agent_mail_core::LockContentionEntry>,
 }
 
 /// Get core system metrics (HTTP/DB/Storage).
@@ -1189,6 +1190,7 @@ pub fn tooling_metrics_core(_ctx: &McpContext) -> McpResult<String> {
         generated_at: None,
         health_level: mcp_agent_mail_core::cached_health_level().to_string(),
         metrics: mcp_agent_mail_core::global_metrics().snapshot(),
+        lock_contention: mcp_agent_mail_core::lock_contention_snapshot(),
     };
 
     serde_json::to_string(&response)

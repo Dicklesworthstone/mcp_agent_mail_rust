@@ -226,7 +226,7 @@ PRAGMA journal_size_limit = 67108864;
 /// `max_connections` increases.
 const TOTAL_CACHE_BUDGET_KB: usize = 512 * 1024;
 
-/// Build per-connection PRAGMAs with a cache_size that respects the total
+/// Build per-connection PRAGMAs with a `cache_size` that respects the total
 /// memory budget.
 ///
 /// `max_connections` is the pool's maximum size. The per-connection cache
@@ -235,11 +235,10 @@ const TOTAL_CACHE_BUDGET_KB: usize = 512 * 1024;
 /// Returns a SQL string suitable for `execute_raw()`.
 #[must_use]
 pub fn build_conn_pragmas(max_connections: usize) -> String {
-    let per_conn_kb = if max_connections == 0 {
-        8192 // fallback: 8 MB
-    } else {
-        (TOTAL_CACHE_BUDGET_KB / max_connections).clamp(2048, 65536)
-    };
+    let per_conn_kb = (TOTAL_CACHE_BUDGET_KB
+        .checked_div(max_connections)
+        .unwrap_or(8192))
+    .clamp(2048, 65536);
 
     format!(
         "\

@@ -376,7 +376,7 @@ pub async fn fetch_inbox_product(
         .as_deref()
         .and_then(mcp_agent_mail_db::iso_to_micros);
 
-    let mut items: Vec<(i64, i64, InboxMessage)> = Vec::with_capacity(limit.unwrap_or(20) as usize); // (created_ts, id, msg)
+    let mut items: Vec<(i64, i64, InboxMessage)> = Vec::with_capacity(usize::try_from(limit.unwrap_or(20)).unwrap_or(20)); // (created_ts, id, msg)
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         // Skip if agent doesn't exist in this project.
@@ -465,7 +465,7 @@ pub async fn summarize_thread_product(
     )?;
 
     let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> =
-        Vec::with_capacity(per_thread_limit.unwrap_or(50) as usize);
+        Vec::with_capacity(usize::try_from(per_thread_limit.unwrap_or(50)).unwrap_or(50));
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         let limit = per_thread_limit.and_then(|v| usize::try_from(v).ok());

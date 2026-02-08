@@ -1381,11 +1381,13 @@ fn stress_pool_acquire_latency_budget() {
     let pool = DbPool::new(&config).expect("create pool");
     std::mem::forget(dir);
 
-    // Warmup phase: pre-open connections so first-acquire cost is excluded
+    // Warmup phase: pre-open enough connections so that connection-creation
+    // cost (file open + PRAGMA application) doesn't skew the measurement.
+    // Warm up at least as many as the thread count to avoid cold-start outliers.
     block_on(|cx| {
         let p = pool.clone();
         async move {
-            let _ = p.warmup(&cx, 10, std::time::Duration::from_secs(10)).await;
+            let _ = p.warmup(&cx, 50, std::time::Duration::from_secs(30)).await;
         }
     });
 

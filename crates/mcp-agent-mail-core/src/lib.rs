@@ -30,7 +30,10 @@ pub use config::{
 };
 pub use error::{Error as MailError, Result as MailResult};
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
-pub use lock_order::{LockLevel, OrderedMutex, OrderedRwLock};
+pub use lock_order::{
+    LockContentionEntry, LockLevel, OrderedMutex, OrderedRwLock, lock_contention_reset,
+    lock_contention_snapshot,
+};
 pub use metrics::{
     Counter, DbMetricsSnapshot, GaugeI64, GaugeU64, GlobalMetricsSnapshot, HistogramSnapshot,
     HttpMetricsSnapshot, Log2Histogram, StorageMetricsSnapshot, ToolsMetricsSnapshot,

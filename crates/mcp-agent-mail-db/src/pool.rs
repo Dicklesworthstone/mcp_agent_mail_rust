@@ -633,10 +633,10 @@ impl DbPool {
             .first()
             .and_then(|r| match r.get_by_name("checkpointed") {
                 Some(sqlmodel_core::Value::BigInt(n)) => {
-                    if *n >= 0 { Some(*n as u64) } else { Some(0) }
+                    Some(u64::try_from(*n).unwrap_or(0))
                 }
                 Some(sqlmodel_core::Value::Int(n)) => {
-                    if *n >= 0 { Some(*n as u64) } else { Some(0) }
+                    Some(u64::try_from(*n).unwrap_or(0))
                 }
                 _ => None,
             })
@@ -994,5 +994,50 @@ mod tests {
             sql.contains("cache_size = -8192"),
             "0 conns should fallback to 8MB: {sql}"
         );
+    }
+
+    /// Verify explicit WAL checkpoint works on a file-backed DB.
+    #[test]
+    fn wal_checkpoint_succeeds_on_file_db() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ckpt_test.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        // Write some data through the pool to generate WAL entries.
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let pool2 = pool.clone();
+        rt.block_on(async move {
+            let conn = pool2.acquire(&cx).await.unwrap();
+            conn.execute_raw("CREATE TABLE IF NOT EXISTS ckpt_test (id INTEGER PRIMARY KEY)")
+                .ok();
+            conn.execute_raw("INSERT INTO ckpt_test VALUES (1)").ok();
+            conn.execute_raw("INSERT INTO ckpt_test VALUES (2)").ok();
+        });
+
+        // Checkpoint should succeed without error.
+        let frames = pool.wal_checkpoint().expect("checkpoint should succeed");
+        // frames can be 0 if autocheckpoint already ran, but it shouldn't error.
+        assert!(frames <= 1000, "reasonable frame count: {frames}");
+    }
+
+    /// Verify WAL checkpoint on :memory: is a no-op.
+    #[test]
+    fn wal_checkpoint_noop_for_memory_db() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+        let frames = pool.wal_checkpoint().expect("memory checkpoint should succeed");
+        assert_eq!(frames, 0, "memory DB checkpoint should return 0");
     }
 }
