@@ -8434,6 +8434,34 @@ mod tests {
         paths.into_iter().collect()
     }
 
+    /// Deterministic Fisher-Yates shuffle driven by a simple LCG seed.
+    ///
+    /// Kept local to tests to avoid extra dev-dependencies (`rand`) while still
+    /// supporting reproducible stress permutations and seed replay.
+    fn seeded_permutation(inputs: &[String], seed: u64) -> Vec<String> {
+        let mut out = inputs.to_vec();
+        if out.len() <= 1 {
+            return out;
+        }
+        let mut state = seed;
+        for i in (1..out.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let j = (state % (i as u64 + 1)) as usize;
+            out.swap(i, j);
+        }
+        out
+    }
+
+    fn spill_drain_paths_owned(inputs: &[String]) -> Vec<String> {
+        let mut paths = BTreeSet::new();
+        for p in inputs {
+            paths.insert(p.clone());
+        }
+        paths.into_iter().collect()
+    }
+
     #[test]
     fn spill_drain_produces_sorted_paths() {
         let result = spill_drain_paths(&["z.md", "a.md", "m.md"]);
@@ -8562,5 +8590,79 @@ mod tests {
             test_paths.is_empty(),
             "paths should be cleared on dirty_all"
         );
+    }
+
+    #[test]
+    fn spill_drain_repeated_seeded_permutations_are_stable() {
+        let base_paths: Vec<String> = vec![
+            "messages/2026/01/0001.md".to_string(),
+            "messages/2026/01/0002.md".to_string(),
+            "messages/2026/02/0101.md".to_string(),
+            "agents/BlueLake/profile.json".to_string(),
+            "agents/GreenCastle/profile.json".to_string(),
+            "agents/RedHarbor/profile.json".to_string(),
+            "file_reservations/01-alpha.json".to_string(),
+            "file_reservations/02-beta.json".to_string(),
+            "attachments/2026/02/a.webp".to_string(),
+            "attachments/2026/02/b.webp".to_string(),
+            "threads/br-1i11.1.4/index.md".to_string(),
+            "threads/br-1i11.1.4/events/0001.md".to_string(),
+        ];
+
+        let mut expected_set = BTreeSet::new();
+        for path in &base_paths {
+            expected_set.insert(path.clone());
+        }
+        let expected: Vec<String> = expected_set.into_iter().collect();
+
+        const ITERATIONS: u64 = 512;
+        const BASE_SEED: u64 = 0xA11C_E5ED_1234_5678;
+        for iteration in 0..ITERATIONS {
+            let seed = BASE_SEED.wrapping_add(iteration);
+            let shuffled = seeded_permutation(&base_paths, seed);
+            let observed = spill_drain_paths_owned(&shuffled);
+
+            assert_eq!(
+                observed, expected,
+                "spill determinism mismatch at iteration={iteration}, seed={seed}. replay with: cargo test -p mcp-agent-mail-storage spill_drain_seed_replay_contract -- --nocapture\ninput_order={shuffled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spill_drain_seed_replay_contract() {
+        // If a stress run reports this seed, rerun this test directly to verify
+        // deterministic reproduction of the exact ordering behavior.
+        const REPLAY_SEED: u64 = 0xA11C_E5ED_1234_56FF;
+        let base_paths: Vec<String> = vec![
+            "messages/2026/01/0001.md".to_string(),
+            "messages/2026/01/0002.md".to_string(),
+            "messages/2026/02/0101.md".to_string(),
+            "agents/BlueLake/profile.json".to_string(),
+            "agents/GreenCastle/profile.json".to_string(),
+            "agents/RedHarbor/profile.json".to_string(),
+            "file_reservations/01-alpha.json".to_string(),
+            "file_reservations/02-beta.json".to_string(),
+            "attachments/2026/02/a.webp".to_string(),
+            "attachments/2026/02/b.webp".to_string(),
+            "threads/br-1i11.1.4/index.md".to_string(),
+            "threads/br-1i11.1.4/events/0001.md".to_string(),
+        ];
+
+        let input_a = seeded_permutation(&base_paths, REPLAY_SEED);
+        let input_b = seeded_permutation(&base_paths, REPLAY_SEED);
+        assert_eq!(
+            input_a, input_b,
+            "same seed must produce identical permutation"
+        );
+
+        let drained_a = spill_drain_paths_owned(&input_a);
+        let drained_b = spill_drain_paths_owned(&input_b);
+        assert_eq!(
+            drained_a, drained_b,
+            "drain output must be replay-stable for seed {REPLAY_SEED}"
+        );
+
+        eprintln!("spill replay seed={REPLAY_SEED} input={input_a:?} output={drained_a:?}");
     }
 }

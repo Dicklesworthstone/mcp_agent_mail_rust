@@ -187,6 +187,79 @@ pub enum Commands {
         #[command(subcommand)]
         action: MacroCommand,
     },
+    /// Contact request/approve/reject/policy lifecycle.
+    #[command(name = "contacts")]
+    Contacts {
+        #[command(subcommand)]
+        action: ContactsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ContactsCommand {
+    /// Request contact with another agent.
+    Request {
+        /// Project key (slug or human_key).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Requester agent name.
+        #[arg(long = "from")]
+        from_agent: String,
+        /// Target agent name.
+        #[arg(long = "to")]
+        to_agent: String,
+        /// Reason for the contact request.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// TTL in seconds (default: 7 days).
+        #[arg(long, default_value_t = 604_800)]
+        ttl_seconds: i64,
+    },
+    /// Approve or reject a contact request.
+    Respond {
+        /// Project key.
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Your agent name (recipient).
+        #[arg(long = "agent", short = 'a')]
+        agent_name: String,
+        /// Requesting agent name.
+        #[arg(long = "from")]
+        from_agent: String,
+        /// Accept the request (default: true).
+        #[arg(long, default_value_t = true)]
+        accept: bool,
+        /// Reject the request.
+        #[arg(long, conflicts_with = "accept")]
+        reject: bool,
+        /// TTL in seconds for approved link (default: 30 days).
+        #[arg(long, default_value_t = 2_592_000)]
+        ttl_seconds: i64,
+    },
+    /// List contacts for an agent.
+    #[command(name = "list")]
+    ListContacts {
+        /// Project key.
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent name.
+        #[arg(long = "agent", short = 'a')]
+        agent_name: String,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Set contact policy for an agent.
+    Policy {
+        /// Project key.
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Agent name.
+        #[arg(long = "agent", short = 'a')]
+        agent_name: String,
+        /// Policy: open, auto, contacts_only, block_all.
+        policy: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -344,6 +417,7 @@ pub enum GuardCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum FileReservationsCommand {
+    /// List reservations (default: active only).
     List {
         project: String,
         #[arg(long)]
@@ -351,15 +425,69 @@ pub enum FileReservationsCommand {
         #[arg(long = "all", default_value_t = false)]
         all: bool,
     },
+    /// Show active reservations with lock type.
     Active {
         project: String,
         #[arg(long)]
         limit: Option<i64>,
     },
+    /// Show reservations expiring soon.
     Soon {
         project: String,
         #[arg(long)]
         minutes: Option<i64>,
+    },
+    /// Create file reservations for an agent.
+    Reserve {
+        project: String,
+        agent: String,
+        /// Path patterns to reserve (one or more).
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// TTL in seconds (default: 3600).
+        #[arg(long, default_value_t = 3600)]
+        ttl: i64,
+        /// Request exclusive lock (default: true).
+        #[arg(long, default_value_t = true)]
+        exclusive: bool,
+        /// Request shared (non-exclusive) lock.
+        #[arg(long, conflicts_with = "exclusive")]
+        shared: bool,
+        /// Reason for the reservation.
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Renew (extend TTL) of existing reservations.
+    Renew {
+        project: String,
+        agent: String,
+        /// Extension time in seconds (default: 1800).
+        #[arg(long, default_value_t = 1800)]
+        extend_seconds: i64,
+        /// Restrict renewal to specific paths.
+        #[arg(long)]
+        paths: Vec<String>,
+        /// Restrict renewal to specific reservation IDs.
+        #[arg(long)]
+        ids: Vec<i64>,
+    },
+    /// Release file reservations.
+    Release {
+        project: String,
+        agent: String,
+        /// Restrict release to specific paths.
+        #[arg(long)]
+        paths: Vec<String>,
+        /// Restrict release to specific reservation IDs.
+        #[arg(long)]
+        ids: Vec<i64>,
+    },
+    /// Check for conflicts on proposed paths without creating reservations.
+    Conflicts {
+        project: String,
+        /// Path patterns to check for conflicts.
+        #[arg(required = true)]
+        paths: Vec<String>,
     },
 }
 
@@ -1023,6 +1151,7 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Agents { action } => handle_agents(action),
         Commands::Tooling { action } => handle_tooling(action),
         Commands::Macros { action } => handle_macros(action),
+        Commands::Contacts { action } => handle_contacts(action),
     }
 }
 
@@ -1658,6 +1787,412 @@ fn handle_file_reservations_with_conn(
             table.render();
             Ok(())
         }
+        FileReservationsCommand::Reserve {
+            project,
+            agent,
+            paths,
+            ttl,
+            exclusive,
+            shared,
+            reason,
+        } => {
+            let exclusive_val = if shared { false } else { exclusive };
+            let ttl = ttl.max(60); // Min 60s
+
+            // Resolve project_id and agent_id.
+            let proj_rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(project.clone())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let project_id: i64 = proj_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("project not found: {project}"))
+                })?;
+
+            let agent_rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::Text(agent.clone()),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let agent_id: i64 = agent_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {agent}")))?;
+
+            // Check conflicts: find active exclusive reservations that overlap.
+            let mut conflicts: Vec<serde_json::Value> = Vec::new();
+            for path in &paths {
+                let overlap_rows = conn
+                    .query_sync(
+                        "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                                fr.expires_ts, a.name AS agent_name \
+                         FROM file_reservations fr \
+                         JOIN agents a ON a.id = fr.agent_id \
+                         WHERE fr.project_id = ? AND fr.released_ts IS NULL \
+                           AND fr.expires_ts > ? AND fr.agent_id != ? \
+                           AND (fr.exclusive = 1 OR ? = 1) \
+                           AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
+                                OR ? LIKE fr.path_pattern)",
+                        &[
+                            sqlmodel_core::Value::BigInt(project_id),
+                            sqlmodel_core::Value::BigInt(now_us),
+                            sqlmodel_core::Value::BigInt(agent_id),
+                            sqlmodel_core::Value::BigInt(if exclusive_val { 1 } else { 0 }),
+                            sqlmodel_core::Value::Text(path.clone()),
+                            sqlmodel_core::Value::Text(format!("{}%", path)),
+                            sqlmodel_core::Value::Text(path.clone()),
+                        ],
+                    )
+                    .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+                for r in &overlap_rows {
+                    let holder: String = r.get_named("agent_name").unwrap_or_default();
+                    let pattern: String = r.get_named("path_pattern").unwrap_or_default();
+                    let rid: i64 = r.get_named("id").unwrap_or(0);
+                    conflicts.push(serde_json::json!({
+                        "path": path,
+                        "holder": holder,
+                        "holder_pattern": pattern,
+                        "reservation_id": rid,
+                    }));
+                }
+            }
+
+            // Create reservations.
+            let expires_us = now_us + ttl.saturating_mul(1_000_000);
+            let mut granted: Vec<serde_json::Value> = Vec::new();
+            for path in &paths {
+                conn.query_sync(
+                    "INSERT INTO file_reservations \
+                     (project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(agent_id),
+                        sqlmodel_core::Value::Text(path.clone()),
+                        sqlmodel_core::Value::BigInt(if exclusive_val { 1 } else { 0 }),
+                        sqlmodel_core::Value::Text(reason.clone()),
+                        sqlmodel_core::Value::BigInt(now_us),
+                        sqlmodel_core::Value::BigInt(expires_us),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("insert failed: {e}")))?;
+
+                // Get the inserted ID.
+                let id_rows = conn
+                    .query_sync("SELECT last_insert_rowid() AS id", &[])
+                    .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+                let rid: i64 = id_rows
+                    .first()
+                    .and_then(|r| r.get_named("id").ok())
+                    .unwrap_or(0);
+
+                granted.push(serde_json::json!({
+                    "id": rid,
+                    "path": path,
+                    "exclusive": exclusive_val,
+                    "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires_us),
+                }));
+            }
+
+            // Output.
+            let result = serde_json::json!({
+                "granted": granted,
+                "conflicts": conflicts,
+            });
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+            if !conflicts.is_empty() {
+                output::warn(&format!(
+                    "{} conflict(s) detected — reservations created but may overlap.",
+                    conflicts.len()
+                ));
+            }
+            Ok(())
+        }
+        FileReservationsCommand::Renew {
+            project,
+            agent,
+            extend_seconds,
+            paths,
+            ids,
+        } => {
+            let extend = extend_seconds.max(60);
+            let extend_us = extend.saturating_mul(1_000_000);
+
+            // Resolve project_id and agent_id.
+            let proj_rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(project.clone())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let project_id: i64 = proj_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("project not found: {project}"))
+                })?;
+
+            let agent_rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::Text(agent.clone()),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let agent_id: i64 = agent_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {agent}")))?;
+
+            // Build WHERE clause for renewal.
+            let base_where =
+                "project_id = ? AND agent_id = ? AND released_ts IS NULL AND expires_ts > ?";
+            let (sql, params) = if !ids.is_empty() {
+                let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "UPDATE file_reservations SET expires_ts = expires_ts + ? \
+                     WHERE {base_where} AND id IN ({placeholders}) \
+                     RETURNING id, path_pattern, expires_ts"
+                );
+                let mut params: Vec<sqlmodel_core::Value> = vec![
+                    sqlmodel_core::Value::BigInt(extend_us),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(agent_id),
+                    sqlmodel_core::Value::BigInt(now_us),
+                ];
+                for id in &ids {
+                    params.push(sqlmodel_core::Value::BigInt(*id));
+                }
+                (sql, params)
+            } else if !paths.is_empty() {
+                let placeholders: String = paths.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "UPDATE file_reservations SET expires_ts = expires_ts + ? \
+                     WHERE {base_where} AND path_pattern IN ({placeholders}) \
+                     RETURNING id, path_pattern, expires_ts"
+                );
+                let mut params: Vec<sqlmodel_core::Value> = vec![
+                    sqlmodel_core::Value::BigInt(extend_us),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(agent_id),
+                    sqlmodel_core::Value::BigInt(now_us),
+                ];
+                for p in &paths {
+                    params.push(sqlmodel_core::Value::Text(p.clone()));
+                }
+                (sql, params)
+            } else {
+                let sql = format!(
+                    "UPDATE file_reservations SET expires_ts = expires_ts + ? \
+                     WHERE {base_where} \
+                     RETURNING id, path_pattern, expires_ts"
+                );
+                let params = vec![
+                    sqlmodel_core::Value::BigInt(extend_us),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(agent_id),
+                    sqlmodel_core::Value::BigInt(now_us),
+                ];
+                (sql, params)
+            };
+
+            let rows = conn
+                .query_sync(&sql, &params)
+                .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
+
+            if rows.is_empty() {
+                output::empty_result(false, "No matching reservations to renew.");
+                return Ok(());
+            }
+
+            let mut table = output::CliTable::new(vec!["ID", "PATTERN", "NEW EXPIRES"]);
+            for r in &rows {
+                let id: i64 = r.get_named("id").unwrap_or(0);
+                let pattern: String = r.get_named("path_pattern").unwrap_or_default();
+                let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+                let expires_str = mcp_agent_mail_db::timestamps::micros_to_iso(expires);
+                table.add_row(vec![
+                    id.to_string(),
+                    pattern,
+                    expires_str.get(..20).unwrap_or(&expires_str).to_string(),
+                ]);
+            }
+            output::success(&format!("Renewed {} reservation(s).", rows.len()));
+            table.render();
+            Ok(())
+        }
+        FileReservationsCommand::Release {
+            project,
+            agent,
+            paths,
+            ids,
+        } => {
+            let proj_rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(project.clone())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let project_id: i64 = proj_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("project not found: {project}"))
+                })?;
+
+            let agent_rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::Text(agent.clone()),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let agent_id: i64 = agent_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {agent}")))?;
+
+            let base_where = "project_id = ? AND agent_id = ? AND released_ts IS NULL";
+            let (sql, params) = if !ids.is_empty() {
+                let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "UPDATE file_reservations SET released_ts = ? \
+                     WHERE {base_where} AND id IN ({placeholders})"
+                );
+                let mut params: Vec<sqlmodel_core::Value> = vec![
+                    sqlmodel_core::Value::BigInt(now_us),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(agent_id),
+                ];
+                for id in &ids {
+                    params.push(sqlmodel_core::Value::BigInt(*id));
+                }
+                (sql, params)
+            } else if !paths.is_empty() {
+                let placeholders: String = paths.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "UPDATE file_reservations SET released_ts = ? \
+                     WHERE {base_where} AND path_pattern IN ({placeholders})"
+                );
+                let mut params: Vec<sqlmodel_core::Value> = vec![
+                    sqlmodel_core::Value::BigInt(now_us),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(agent_id),
+                ];
+                for p in &paths {
+                    params.push(sqlmodel_core::Value::Text(p.clone()));
+                }
+                (sql, params)
+            } else {
+                // Release all active reservations for this agent.
+                let sql =
+                    format!("UPDATE file_reservations SET released_ts = ? WHERE {base_where}");
+                let params = vec![
+                    sqlmodel_core::Value::BigInt(now_us),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(agent_id),
+                ];
+                (sql, params)
+            };
+
+            let rows = conn
+                .query_sync(&sql, &params)
+                .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
+
+            let released_count = rows.len();
+            output::success(&format!(
+                "Released {} reservation(s) for {} in {}.",
+                released_count, agent, project
+            ));
+            Ok(())
+        }
+        FileReservationsCommand::Conflicts { project, paths } => {
+            let proj_rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(project.clone())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let project_id: i64 = proj_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("project not found: {project}"))
+                })?;
+
+            let mut conflicts: Vec<serde_json::Value> = Vec::new();
+            for path in &paths {
+                let overlap_rows = conn
+                    .query_sync(
+                        "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.reason, \
+                                fr.expires_ts, a.name AS agent_name \
+                         FROM file_reservations fr \
+                         JOIN agents a ON a.id = fr.agent_id \
+                         WHERE fr.project_id = ? AND fr.released_ts IS NULL \
+                           AND fr.expires_ts > ? AND fr.exclusive = 1 \
+                           AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
+                                OR ? LIKE fr.path_pattern)",
+                        &[
+                            sqlmodel_core::Value::BigInt(project_id),
+                            sqlmodel_core::Value::BigInt(now_us),
+                            sqlmodel_core::Value::Text(path.clone()),
+                            sqlmodel_core::Value::Text(format!("{}%", path)),
+                            sqlmodel_core::Value::Text(path.clone()),
+                        ],
+                    )
+                    .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+                for r in &overlap_rows {
+                    let holder: String = r.get_named("agent_name").unwrap_or_default();
+                    let pattern: String = r.get_named("path_pattern").unwrap_or_default();
+                    let rid: i64 = r.get_named("id").unwrap_or(0);
+                    let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+                    conflicts.push(serde_json::json!({
+                        "path": path,
+                        "holder": holder,
+                        "holder_pattern": pattern,
+                        "reservation_id": rid,
+                        "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires),
+                    }));
+                }
+            }
+
+            if conflicts.is_empty() {
+                output::success("No conflicts detected.");
+            } else {
+                let mut table = output::CliTable::new(vec!["PATH", "HOLDER", "PATTERN", "EXPIRES"]);
+                for c in &conflicts {
+                    table.add_row(vec![
+                        c["path"].as_str().unwrap_or("").to_string(),
+                        c["holder"].as_str().unwrap_or("").to_string(),
+                        c["holder_pattern"].as_str().unwrap_or("").to_string(),
+                        c["expires_ts"]
+                            .as_str()
+                            .unwrap_or("")
+                            .get(..20)
+                            .unwrap_or("")
+                            .to_string(),
+                    ]);
+                }
+                output::warn(&format!("{} conflict(s) found:", conflicts.len()));
+                table.render();
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1818,6 +2353,383 @@ fn handle_acks_with_conn(
                 ]);
             }
             table.render();
+            Ok(())
+        }
+    }
+}
+
+fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
+    let conn = open_db_sync()?;
+    handle_contacts_with_conn(&conn, action)
+}
+
+fn handle_contacts_with_conn(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    action: ContactsCommand,
+) -> CliResult<()> {
+    let now_us = mcp_agent_mail_db::timestamps::now_micros();
+
+    match action {
+        ContactsCommand::Request {
+            project_key,
+            from_agent,
+            to_agent,
+            reason,
+            ttl_seconds,
+        } => {
+            let ttl = ttl_seconds.max(60);
+            let expires_us = now_us + ttl.saturating_mul(1_000_000);
+
+            // Resolve project and agents.
+            let proj_rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(project_key.clone())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let project_id: i64 = proj_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("project not found: {project_key}"))
+                })?;
+
+            let from_rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::Text(from_agent.clone()),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let from_id: i64 = from_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("agent not found: {from_agent}"))
+                })?;
+
+            let to_rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::Text(to_agent.clone()),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let to_id: i64 = to_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {to_agent}")))?;
+
+            // Upsert agent_links: set status to 'pending'.
+            conn.query_sync(
+                "INSERT INTO agent_links \
+                 (from_project_id, from_agent_id, to_project_id, to_agent_id, \
+                  status, reason, created_ts, updated_ts, expires_ts) \
+                 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?) \
+                 ON CONFLICT(from_project_id, from_agent_id, to_project_id, to_agent_id) \
+                 DO UPDATE SET status = 'pending', reason = excluded.reason, \
+                    updated_ts = excluded.updated_ts, expires_ts = excluded.expires_ts",
+                &[
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(from_id),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(to_id),
+                    sqlmodel_core::Value::Text(reason.clone()),
+                    sqlmodel_core::Value::BigInt(now_us),
+                    sqlmodel_core::Value::BigInt(now_us),
+                    sqlmodel_core::Value::BigInt(expires_us),
+                ],
+            )
+            .map_err(|e| CliError::Other(format!("insert failed: {e}")))?;
+
+            let result = serde_json::json!({
+                "from": from_agent,
+                "to": to_agent,
+                "status": "pending",
+                "reason": reason,
+                "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires_us),
+            });
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+            output::success(&format!("Contact request sent: {from_agent} → {to_agent}"));
+            Ok(())
+        }
+        ContactsCommand::Respond {
+            project_key,
+            agent_name,
+            from_agent,
+            accept,
+            reject,
+            ttl_seconds,
+        } => {
+            let approved = if reject { false } else { accept };
+            let new_status = if approved { "approved" } else { "blocked" };
+            let ttl = ttl_seconds.max(60);
+            let expires_us = now_us + ttl.saturating_mul(1_000_000);
+
+            let proj_rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(project_key.clone())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let project_id: i64 = proj_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("project not found: {project_key}"))
+                })?;
+
+            let from_rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::Text(from_agent.clone()),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let from_id: i64 = from_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("agent not found: {from_agent}"))
+                })?;
+
+            let to_rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::Text(agent_name.clone()),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let to_id: i64 = to_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("agent not found: {agent_name}"))
+                })?;
+
+            let updated = conn
+                .query_sync(
+                    "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? \
+                     WHERE from_project_id = ? AND from_agent_id = ? \
+                       AND to_project_id = ? AND to_agent_id = ?",
+                    &[
+                        sqlmodel_core::Value::Text(new_status.to_string()),
+                        sqlmodel_core::Value::BigInt(now_us),
+                        sqlmodel_core::Value::BigInt(expires_us),
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(from_id),
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(to_id),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
+
+            let result = serde_json::json!({
+                "from": from_agent,
+                "to": agent_name,
+                "approved": approved,
+                "status": new_status,
+                "updated": !updated.is_empty() || true,
+            });
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+            let verb = if approved { "Approved" } else { "Rejected" };
+            output::success(&format!(
+                "{verb} contact request: {from_agent} → {agent_name}"
+            ));
+            Ok(())
+        }
+        ContactsCommand::ListContacts {
+            project_key,
+            agent_name,
+            json,
+        } => {
+            let proj_rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(project_key.clone())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let project_id: i64 = proj_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("project not found: {project_key}"))
+                })?;
+
+            let agent_rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::Text(agent_name.clone()),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let agent_id: i64 = agent_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("agent not found: {agent_name}"))
+                })?;
+
+            // Outgoing links.
+            let outgoing = conn
+                .query_sync(
+                    "SELECT al.status, al.reason, al.updated_ts, al.expires_ts, \
+                            a.name AS to_name \
+                     FROM agent_links al \
+                     JOIN agents a ON a.id = al.to_agent_id \
+                     WHERE al.from_project_id = ? AND al.from_agent_id = ? \
+                     ORDER BY al.updated_ts DESC",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(agent_id),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            // Incoming links.
+            let incoming = conn
+                .query_sync(
+                    "SELECT al.status, al.reason, al.updated_ts, al.expires_ts, \
+                            a.name AS from_name \
+                     FROM agent_links al \
+                     JOIN agents a ON a.id = al.from_agent_id \
+                     WHERE al.to_project_id = ? AND al.to_agent_id = ? \
+                     ORDER BY al.updated_ts DESC",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(agent_id),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            if json {
+                let mut entries: Vec<serde_json::Value> = Vec::new();
+                for r in &outgoing {
+                    let to: String = r.get_named("to_name").unwrap_or_default();
+                    let status: String = r.get_named("status").unwrap_or_default();
+                    let reason: String = r.get_named("reason").unwrap_or_default();
+                    let updated: i64 = r.get_named("updated_ts").unwrap_or(0);
+                    let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+                    entries.push(serde_json::json!({
+                        "direction": "outgoing",
+                        "to": to,
+                        "status": status,
+                        "reason": reason,
+                        "updated_ts": mcp_agent_mail_db::timestamps::micros_to_iso(updated),
+                        "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires),
+                    }));
+                }
+                for r in &incoming {
+                    let from: String = r.get_named("from_name").unwrap_or_default();
+                    let status: String = r.get_named("status").unwrap_or_default();
+                    let reason: String = r.get_named("reason").unwrap_or_default();
+                    let updated: i64 = r.get_named("updated_ts").unwrap_or(0);
+                    let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+                    entries.push(serde_json::json!({
+                        "direction": "incoming",
+                        "from": from,
+                        "status": status,
+                        "reason": reason,
+                        "updated_ts": mcp_agent_mail_db::timestamps::micros_to_iso(updated),
+                        "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires),
+                    }));
+                }
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&entries).unwrap_or_default()
+                );
+            } else {
+                if outgoing.is_empty() && incoming.is_empty() {
+                    output::empty_result(false, "No contacts found.");
+                    return Ok(());
+                }
+                if !outgoing.is_empty() {
+                    output::section("Outgoing contacts:");
+                    let mut table = output::CliTable::new(vec!["TO", "STATUS", "REASON"]);
+                    for r in &outgoing {
+                        let to: String = r.get_named("to_name").unwrap_or_default();
+                        let status: String = r.get_named("status").unwrap_or_default();
+                        let reason: String = r.get_named("reason").unwrap_or_default();
+                        table.add_row(vec![to, status, reason]);
+                    }
+                    table.render();
+                }
+                if !incoming.is_empty() {
+                    output::section("Incoming contacts:");
+                    let mut table = output::CliTable::new(vec!["FROM", "STATUS", "REASON"]);
+                    for r in &incoming {
+                        let from: String = r.get_named("from_name").unwrap_or_default();
+                        let status: String = r.get_named("status").unwrap_or_default();
+                        let reason: String = r.get_named("reason").unwrap_or_default();
+                        table.add_row(vec![from, status, reason]);
+                    }
+                    table.render();
+                }
+            }
+            Ok(())
+        }
+        ContactsCommand::Policy {
+            project_key,
+            agent_name,
+            policy,
+        } => {
+            // Validate policy.
+            let valid = ["open", "auto", "contacts_only", "block_all"];
+            if !valid.contains(&policy.as_str()) {
+                return Err(CliError::InvalidArgument(format!(
+                    "invalid policy: {policy}. Valid: {}",
+                    valid.join(", ")
+                )));
+            }
+
+            let proj_rows = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[sqlmodel_core::Value::Text(project_key.clone())],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let project_id: i64 = proj_rows
+                .first()
+                .and_then(|r| r.get_named("id").ok())
+                .ok_or_else(|| {
+                    CliError::InvalidArgument(format!("project not found: {project_key}"))
+                })?;
+
+            conn.query_sync(
+                "UPDATE agents SET contact_policy = ? WHERE project_id = ? AND name = ?",
+                &[
+                    sqlmodel_core::Value::Text(policy.clone()),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::Text(agent_name.clone()),
+                ],
+            )
+            .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
+
+            let result = serde_json::json!({
+                "agent": agent_name,
+                "policy": policy,
+            });
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+            output::success(&format!("Contact policy set: {agent_name} → {policy}"));
             Ok(())
         }
     }
@@ -7476,6 +8388,250 @@ sys.exit(7)
         }
     }
 
+    // ── br-21gj.4.4: file-reservation lifecycle commands ──────────────
+
+    #[test]
+    fn clap_parses_file_reservations_reserve_minimal() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "reserve",
+            "proj",
+            "BlueLake",
+            "src/main.rs",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::Reserve {
+                        project,
+                        agent,
+                        paths,
+                        ttl,
+                        exclusive,
+                        shared,
+                        reason,
+                    },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(paths, vec!["src/main.rs"]);
+                assert_eq!(ttl, 3600);
+                assert!(exclusive);
+                assert!(!shared);
+                assert_eq!(reason, "");
+            }
+            other => panic!("expected Reserve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_reserve_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "reserve",
+            "proj",
+            "BlueLake",
+            "src/**",
+            "Cargo.toml",
+            "--ttl",
+            "7200",
+            "--shared",
+            "--reason",
+            "br-123 work",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::Reserve {
+                        project,
+                        agent,
+                        paths,
+                        ttl,
+                        shared,
+                        reason,
+                        ..
+                    },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(paths, vec!["src/**", "Cargo.toml"]);
+                assert_eq!(ttl, 7200);
+                assert!(shared);
+                assert_eq!(reason, "br-123 work");
+            }
+            other => panic!("expected Reserve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_renew_minimal() {
+        let cli =
+            Cli::try_parse_from(["am", "file_reservations", "renew", "proj", "BlueLake"]).unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::Renew {
+                        project,
+                        agent,
+                        extend_seconds,
+                        paths,
+                        ids,
+                    },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(extend_seconds, 1800);
+                assert!(paths.is_empty());
+                assert!(ids.is_empty());
+            }
+            other => panic!("expected Renew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_renew_with_filters() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "renew",
+            "proj",
+            "BlueLake",
+            "--extend-seconds",
+            "3600",
+            "--paths",
+            "src/**",
+            "--ids",
+            "42",
+            "--ids",
+            "99",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::Renew {
+                        extend_seconds,
+                        paths,
+                        ids,
+                        ..
+                    },
+            } => {
+                assert_eq!(extend_seconds, 3600);
+                assert_eq!(paths, vec!["src/**"]);
+                assert_eq!(ids, vec![42, 99]);
+            }
+            other => panic!("expected Renew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_release_all() {
+        let cli = Cli::try_parse_from(["am", "file_reservations", "release", "proj", "BlueLake"])
+            .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::Release {
+                        project,
+                        agent,
+                        paths,
+                        ids,
+                    },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(agent, "BlueLake");
+                assert!(paths.is_empty());
+                assert!(ids.is_empty());
+            }
+            other => panic!("expected Release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_release_by_paths() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "release",
+            "proj",
+            "BlueLake",
+            "--paths",
+            "src/main.rs",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action: FileReservationsCommand::Release { paths, .. },
+            } => {
+                assert_eq!(paths, vec!["src/main.rs"]);
+            }
+            other => panic!("expected Release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_release_by_ids() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "release",
+            "proj",
+            "BlueLake",
+            "--ids",
+            "10",
+            "--ids",
+            "20",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action: FileReservationsCommand::Release { ids, .. },
+            } => {
+                assert_eq!(ids, vec![10, 20]);
+            }
+            other => panic!("expected Release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_conflicts() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "conflicts",
+            "proj",
+            "src/**",
+            "Cargo.toml",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::FileReservations {
+                action: FileReservationsCommand::Conflicts { project, paths },
+            } => {
+                assert_eq!(project, "proj");
+                assert_eq!(paths, vec!["src/**", "Cargo.toml"]);
+            }
+            other => panic!("expected Conflicts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_reserve_without_paths() {
+        let result =
+            Cli::try_parse_from(["am", "file_reservations", "reserve", "proj", "BlueLake"]);
+        assert!(result.is_err(), "reserve requires at least one path");
+    }
+
+    #[test]
+    fn clap_rejects_conflicts_without_paths() {
+        let result = Cli::try_parse_from(["am", "file_reservations", "conflicts", "proj"]);
+        assert!(result.is_err(), "conflicts requires at least one path");
+    }
+
     #[test]
     fn clap_parses_acks_pending() {
         let cli = Cli::try_parse_from(["am", "acks", "pending", "proj", "BlueLake"]).unwrap();
@@ -7948,6 +9104,10 @@ sys.exit(7)
             "docs",
             "doctor",
             "macros",
+            "contacts",
+            "file_reservations",
+            "agents",
+            "tooling",
         ];
         for cmd in expected {
             assert!(
@@ -8728,6 +9888,242 @@ sys.exit(7)
             output.contains("No file reservations"),
             "expected empty result, got: {output}"
         );
+    }
+
+    #[test]
+    fn integration_file_reservations_reserve_creates_entries() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Reserve {
+                project: "test-proj".to_string(),
+                agent: "RedFox".to_string(),
+                paths: vec!["lib/**".to_string(), "tests/**".to_string()],
+                ttl: 7200,
+                exclusive: true,
+                shared: false,
+                reason: "br-123".to_string(),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "reserve failed: {result:?}");
+        assert!(
+            output.contains("\"granted\"") && output.contains("lib/**"),
+            "expected granted output, got: {output}"
+        );
+
+        // Verify reservations exist in DB.
+        let rows = conn
+            .query_sync(
+                "SELECT path_pattern FROM file_reservations WHERE agent_id = 2 AND released_ts IS NULL",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            rows.len() >= 2,
+            "expected at least 2 reservations for RedFox"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_reserve_detects_conflicts() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        // BlueLake already has src/api/*.rs exclusive — RedFox requesting overlapping path.
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Reserve {
+                project: "test-proj".to_string(),
+                agent: "RedFox".to_string(),
+                paths: vec!["src/api/*.rs".to_string()],
+                ttl: 3600,
+                exclusive: true,
+                shared: false,
+                reason: "overlap test".to_string(),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "reserve with conflict failed: {result:?}");
+        assert!(
+            output.contains("\"conflicts\"") && output.contains("BlueLake"),
+            "expected conflict with BlueLake, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_renew_extends_ttl() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        // Get original expiry.
+        let before = conn
+            .query_sync("SELECT expires_ts FROM file_reservations WHERE id = 1", &[])
+            .unwrap();
+        let orig_expires: i64 = before.first().unwrap().get_named("expires_ts").unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 1800,
+                paths: vec![],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "renew failed: {result:?}");
+        assert!(
+            output.contains("Renewed") && output.contains("src/api/*.rs"),
+            "expected renewed output, got: {output}"
+        );
+
+        // Verify expiry was extended.
+        let after = conn
+            .query_sync("SELECT expires_ts FROM file_reservations WHERE id = 1", &[])
+            .unwrap();
+        let new_expires: i64 = after.first().unwrap().get_named("expires_ts").unwrap();
+        assert!(
+            new_expires > orig_expires,
+            "expires must increase: {orig_expires} -> {new_expires}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_release_sets_released_ts() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["src/api/*.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "release failed: {result:?}");
+        assert!(
+            output.contains("Released"),
+            "expected released output, got: {output}"
+        );
+
+        // Verify released_ts is set.
+        let rows = conn
+            .query_sync(
+                "SELECT released_ts FROM file_reservations WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let released: Option<i64> = rows.first().unwrap().get_named("released_ts").ok();
+        assert!(released.is_some(), "released_ts must be set");
+    }
+
+    #[test]
+    fn integration_file_reservations_conflicts_detects_overlap() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Conflicts {
+                project: "test-proj".to_string(),
+                paths: vec!["src/api/*.rs".to_string()],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "conflicts check failed: {result:?}");
+        assert!(
+            output.contains("conflict") && output.contains("BlueLake"),
+            "expected conflict with BlueLake, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_conflicts_no_overlap() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Conflicts {
+                project: "test-proj".to_string(),
+                paths: vec!["docs/README.md".to_string()],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "conflicts check failed: {result:?}");
+        assert!(
+            output.contains("No conflicts"),
+            "expected no conflicts, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_reserve_invalid_project() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Reserve {
+                project: "nonexistent".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["src/**".to_string()],
+                ttl: 3600,
+                exclusive: true,
+                shared: false,
+                reason: String::new(),
+            },
+        );
+        assert!(result.is_err(), "should fail for invalid project");
+    }
+
+    #[test]
+    fn integration_file_reservations_reserve_invalid_agent() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Reserve {
+                project: "test-proj".to_string(),
+                agent: "NonexistentAgent".to_string(),
+                paths: vec!["src/**".to_string()],
+                ttl: 3600,
+                exclusive: true,
+                shared: false,
+                reason: String::new(),
+            },
+        );
+        assert!(result.is_err(), "should fail for invalid agent");
     }
 
     #[test]

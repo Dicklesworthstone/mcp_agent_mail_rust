@@ -7426,9 +7426,8 @@ mod tests {
                             let mut buf = [0u8; 512];
                             loop {
                                 match stream.read(&mut buf) {
-                                    Ok(0) => break,
+                                    Ok(0) | Err(_) => break,
                                     Ok(_) => {}
-                                    Err(_) => break,
                                 }
                             }
                             let reason = if status == 200 { "OK" } else { "Error" };
@@ -7477,6 +7476,7 @@ mod tests {
             let cached = state.jwks_cache.lock().unwrap();
             assert!(cached.is_some(), "cache must be populated after bootstrap");
             assert!(!cached.as_ref().unwrap().jwks.keys.is_empty());
+            drop(cached);
         });
     }
 
@@ -7520,7 +7520,9 @@ mod tests {
         {
             let mut cache = state.jwks_cache.lock().unwrap();
             *cache = Some(JwksCacheEntry {
-                fetched_at: Instant::now() - Duration::from_secs(120),
+                fetched_at: Instant::now()
+                    .checked_sub(Duration::from_secs(120))
+                    .unwrap(),
                 jwks: Arc::clone(&jwks),
             });
         }
@@ -7559,7 +7561,9 @@ mod tests {
             {
                 let mut cache = state.jwks_cache.lock().unwrap();
                 *cache = Some(JwksCacheEntry {
-                    fetched_at: Instant::now() - Duration::from_secs(120),
+                    fetched_at: Instant::now()
+                        .checked_sub(Duration::from_secs(120))
+                        .unwrap(),
                     jwks: Arc::clone(&old_jwks),
                 });
             }
@@ -9858,7 +9862,7 @@ mod tests {
         });
     }
 
-    /// Build test JWKS bytes and a parsed JwkSet for cache seeding.
+    /// Build test JWKS bytes and a parsed `JwkSet` for cache seeding.
     fn test_jwks_material() -> (Vec<u8>, jsonwebtoken::jwk::JwkSet) {
         use base64::Engine as _;
         let k =
@@ -9876,7 +9880,7 @@ mod tests {
         (bytes, set)
     }
 
-    /// Seed the JWKS cache on an HttpState with the given JwkSet and an
+    /// Seed the JWKS cache on an `HttpState` with the given `JwkSet` and an
     /// already-expired timestamp so the next fetch sees stale data.
     fn seed_expired_cache(state: &HttpState, jwks: &jsonwebtoken::jwk::JwkSet) {
         let mut cache = state
@@ -9885,12 +9889,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *cache = Some(JwksCacheEntry {
             // 2 minutes in the past — well beyond the 60s TTL.
-            fetched_at: Instant::now() - Duration::from_secs(120),
+            fetched_at: Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap(),
             jwks: Arc::new(jwks.clone()),
         });
     }
 
-    /// When the JWKS cache is stale and multiple threads call fetch_jwks
+    /// When the JWKS cache is stale and multiple threads call `fetch_jwks`
     /// concurrently, only ONE should actually hit the remote endpoint.
     /// The rest should immediately return the stale cached value.
     #[test]
@@ -10135,6 +10141,338 @@ mod tests {
             let r = rt.block_on(state.fetch_jwks(&url, false));
             assert!(r.is_ok(), "fetch should succeed after prior failure");
             assert_eq!(counter2.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // JWKS E2E load test (br-1i11.4.6)
+    // -----------------------------------------------------------------------
+
+    /// High-concurrency load test: 50 threads hit an expired cache
+    /// simultaneously with a slow JWKS endpoint.  Verifies fan-out
+    /// suppression: exactly 1 HTTP request, all 50 threads succeed, and
+    /// the majority complete instantly via stale cache.
+    #[test]
+    fn jwks_load_test_fan_out_suppression() {
+        let (jwks_bytes, jwks_set) = test_jwks_material();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+
+        // Slow JWKS endpoint (1 second response time).
+        with_counted_delayed_jwks_server(
+            &jwks_bytes,
+            60,
+            Duration::from_secs(1),
+            &counter,
+            |url| {
+                let state = build_state(mcp_agent_mail_core::Config {
+                    http_jwt_enabled: true,
+                    http_jwt_algorithms: vec!["HS256".to_string()],
+                    http_jwt_jwks_url: Some(url.clone()),
+                    http_rbac_enabled: false,
+                    ..Default::default()
+                });
+                seed_expired_cache(&state, &jwks_set);
+
+                let timings = std::sync::Mutex::new(Vec::new());
+                let results = std::sync::Mutex::new(Vec::new());
+
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..50)
+                        .map(|_| {
+                            s.spawn(|| {
+                                let rt =
+                                    RuntimeBuilder::current_thread().build().expect("runtime");
+                                let start = Instant::now();
+                                let result = rt.block_on(state.fetch_jwks(&url, false));
+                                let elapsed = start.elapsed();
+                                timings.lock().unwrap().push(elapsed);
+                                results.lock().unwrap().push(result.is_ok());
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                });
+
+                let timings = timings.into_inner().unwrap();
+                let results = results.into_inner().unwrap();
+
+                // All 50 must succeed.
+                let ok_count = results.iter().filter(|&&ok| ok).count();
+                assert_eq!(ok_count, 50, "all 50 threads must succeed");
+
+                // Fan-out suppression: exactly 1 HTTP request.
+                let requests = counter.load(std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(requests, 1, "fan-out suppression: expected 1 request, got {requests}");
+
+                // Timing distribution: at least 45 threads under 250ms.
+                let fast = timings.iter().filter(|t| t.as_millis() < 250).count();
+                assert!(
+                    fast >= 45,
+                    "at least 45/50 threads must be fast (stale-serving), got {fast}; \
+                     timings: {timings:?}"
+                );
+
+                // At most 2 threads should take longer than 500ms (the
+                // refresher plus possibly one spinning on the CAS).
+                let slow = timings.iter().filter(|t| t.as_millis() > 500).count();
+                assert!(slow <= 2, "at most 2 slow threads expected, got {slow}");
+            },
+        );
+    }
+
+    /// Load test with varying JWKS endpoint latencies: verify stampede
+    /// protection works consistently across fast/medium/slow responses.
+    #[test]
+    fn jwks_load_test_varying_latencies() {
+        let (jwks_bytes, jwks_set) = test_jwks_material();
+
+        for delay_ms in [0u64, 200, 800] {
+            let counter = std::sync::atomic::AtomicUsize::new(0);
+            with_counted_delayed_jwks_server(
+                &jwks_bytes,
+                30,
+                Duration::from_millis(delay_ms),
+                &counter,
+                |url| {
+                    let state = build_state(mcp_agent_mail_core::Config {
+                        http_jwt_enabled: true,
+                        http_jwt_algorithms: vec!["HS256".to_string()],
+                        http_jwt_jwks_url: Some(url.clone()),
+                        http_rbac_enabled: false,
+                        ..Default::default()
+                    });
+                    seed_expired_cache(&state, &jwks_set);
+
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = (0..20)
+                            .map(|_| {
+                                s.spawn(|| {
+                                    let rt = RuntimeBuilder::current_thread()
+                                        .build()
+                                        .expect("runtime");
+                                    rt.block_on(state.fetch_jwks(&url, false))
+                                })
+                            })
+                            .collect();
+                        let ok_count = handles
+                            .into_iter()
+                            .filter_map(|h| h.join().unwrap().ok())
+                            .count();
+                        assert_eq!(ok_count, 20, "all 20 must succeed at delay={delay_ms}ms");
+                    });
+
+                    let reqs = counter.load(std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(
+                        reqs, 1,
+                        "single refresh at delay={delay_ms}ms, got {reqs}"
+                    );
+                },
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // JWKS security regression tests (br-1i11.4.7)
+    // -----------------------------------------------------------------------
+
+    /// After a key rotation (JWKS endpoint returns new key set), the old
+    /// cached keys should be replaced.  A forced refresh must pick up
+    /// the new key set.
+    #[test]
+    fn jwks_key_rotation_replaces_cached_keys() {
+        use base64::Engine as _;
+
+        // Phase 1: Serve initial JWKS with kid-1.
+        let k1 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"secret-key-1");
+        let jwks1 = serde_json::json!({
+            "keys": [{"kty": "oct", "alg": "HS256", "kid": "kid-1", "k": k1}]
+        });
+        let jwks1_set: jsonwebtoken::jwk::JwkSet = serde_json::from_value(jwks1).unwrap();
+
+        // Phase 2: Rotated JWKS with kid-2 only (kid-1 removed).
+        let k2 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"secret-key-2");
+        let jwks2 = serde_json::json!({
+            "keys": [{"kty": "oct", "alg": "HS256", "kid": "kid-2", "k": k2}]
+        });
+        let jwks2_bytes = serde_json::to_vec(&jwks2).unwrap();
+
+        // Serve the rotated JWKS from the mock server.
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        with_counted_delayed_jwks_server(&jwks2_bytes, 5, Duration::ZERO, &counter, |url| {
+            let state = build_state(mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_jwks_url: Some(url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            });
+
+            // Seed cache with old key set (kid-1).
+            {
+                let mut cache = state
+                    .jwks_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *cache = Some(JwksCacheEntry {
+                    fetched_at: Instant::now(),
+                    jwks: Arc::new(jwks1_set),
+                });
+            }
+
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+
+            // Fresh cache: still has kid-1.
+            let jwks = rt.block_on(state.fetch_jwks(&url, false)).unwrap();
+            assert!(jwks.find("kid-1").is_some(), "fresh cache has kid-1");
+            assert!(jwks.find("kid-2").is_none(), "fresh cache lacks kid-2");
+
+            // Force refresh: picks up rotated key set with kid-2.
+            let jwks = rt.block_on(state.fetch_jwks(&url, true)).unwrap();
+            assert!(jwks.find("kid-2").is_some(), "rotated set has kid-2");
+            assert!(jwks.find("kid-1").is_none(), "rotated set dropped kid-1");
+
+            // Subsequent non-forced fetches use the new cache.
+            let jwks = rt.block_on(state.fetch_jwks(&url, false)).unwrap();
+            assert!(jwks.find("kid-2").is_some(), "cache updated to kid-2");
+        });
+    }
+
+    /// During a JWKS endpoint outage, stale keys continue to serve
+    /// requests (fail-open for availability).  But invalid tokens must
+    /// still be rejected — stale cache doesn't weaken authentication.
+    #[test]
+    fn jwks_outage_stale_cache_preserves_auth_security() {
+        use base64::Engine as _;
+
+        let secret = b"outage-test-secret";
+        let k = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+        let jwks_json = serde_json::json!({
+            "keys": [{"kty": "oct", "alg": "HS256", "kid": "kid-outage", "k": k}]
+        });
+        let jwks_set: jsonwebtoken::jwk::JwkSet =
+            serde_json::from_value(jwks_json).unwrap();
+
+        // Mock server is unreachable (use a port that won't connect).
+        let state = build_state(mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_algorithms: vec!["HS256".to_string()],
+            http_jwt_jwks_url: Some("http://127.0.0.1:1/unreachable".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        });
+
+        // Seed with stale but valid keys.
+        seed_expired_cache(&state, &jwks_set);
+
+        // Simulate another task already refreshing (so we get stale data).
+        state
+            .jwks_refreshing
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+
+        // Stale-while-revalidate: should return cached JWKS despite outage.
+        let result = rt.block_on(state.fetch_jwks("http://127.0.0.1:1/unreachable", false));
+        assert!(result.is_ok(), "stale cache should be served during outage");
+        let jwks = result.unwrap();
+        assert!(
+            jwks.find("kid-outage").is_some(),
+            "stale cache has the original key"
+        );
+
+        // Reset the refreshing flag for the next assertion.
+        state
+            .jwks_refreshing
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        // Valid token with correct secret: should be verifiable against stale cache.
+        let claims = serde_json::json!({"sub": "user-1", "role": "reader"});
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some("kid-outage".to_string());
+        let valid_token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+
+        // Verify with the cached (stale) key.
+        let decoding_key =
+            jsonwebtoken::DecodingKey::from_secret(secret);
+        let validation = HttpState::jwt_validation(vec![jsonwebtoken::Algorithm::HS256]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(&valid_token, &decoding_key, &validation);
+        assert!(decoded.is_ok(), "valid token verifiable with correct key");
+
+        // Invalid token (wrong secret): must be rejected even with stale cache.
+        let wrong_token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"wrong-secret"),
+        )
+        .unwrap();
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &wrong_token,
+            &decoding_key,
+            &validation,
+        );
+        assert!(
+            decoded.is_err(),
+            "invalid token must be rejected even with stale cache"
+        );
+    }
+
+    /// Cache freshness boundary: tokens are validated against fresh cache
+    /// (not refetched) when TTL has not expired.
+    #[test]
+    fn jwks_cache_freshness_boundary() {
+        let (jwks_bytes, jwks_set) = test_jwks_material();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+
+        with_counted_delayed_jwks_server(&jwks_bytes, 10, Duration::ZERO, &counter, |url| {
+            let state = build_state(mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_jwks_url: Some(url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            });
+
+            // Seed with fresh cache.
+            {
+                let mut cache = state
+                    .jwks_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *cache = Some(JwksCacheEntry {
+                    fetched_at: Instant::now(),
+                    jwks: Arc::new(jwks_set.clone()),
+                });
+            }
+
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+
+            // Multiple non-forced fetches should all hit cache (0 requests).
+            for _ in 0..10 {
+                let r = rt.block_on(state.fetch_jwks(&url, false));
+                assert!(r.is_ok());
+            }
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "fresh cache should never trigger network fetch"
+            );
+
+            // Expire cache, then fetch should trigger exactly 1 request.
+            seed_expired_cache(&state, &jwks_set);
+            let r = rt.block_on(state.fetch_jwks(&url, false));
+            assert!(r.is_ok());
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "expired cache should trigger exactly 1 network fetch"
+            );
         });
     }
 }
