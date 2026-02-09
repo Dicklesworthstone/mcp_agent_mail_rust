@@ -6,6 +6,7 @@
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+*.db
 storage.sqlite3
 
 # Temp dirs
