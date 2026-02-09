@@ -4112,6 +4112,56 @@ mod query_param_tests {
         assert_eq!(query.get("project").unwrap(), "/data/projects/my-app");
     }
 
+    // -----------------------------------------------------------------------
+    // Edge cases: multiple question marks, Unicode, deeply nested params
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_multiple_question_marks() {
+        // Only the first `?` should split; the rest belong to the query value.
+        let (base, params) = split_param_and_query("agent?key=val?ue&other=ok");
+        assert_eq!(base, "agent");
+        assert_eq!(params.get("key").unwrap(), "val?ue");
+        assert_eq!(params.get("other").unwrap(), "ok");
+    }
+
+    #[test]
+    fn split_unicode_agent_name() {
+        let (base, params) = split_param_and_query("Blue%C3%9Cber?project=/data/proj");
+        // %C3%9C is the UTF-8 encoding for Ü
+        assert_eq!(base, "BlueÜber");
+        assert_eq!(params.get("project").unwrap(), "/data/proj");
+    }
+
+    #[test]
+    fn parse_query_duplicate_keys_last_wins() {
+        // HashMap semantics: last insert wins for duplicate keys.
+        let params = parse_query("key=first&key=second");
+        assert_eq!(params.get("key").unwrap(), "second");
+    }
+
+    #[test]
+    fn parse_query_equals_in_value() {
+        // Values can contain `=` signs (e.g. base64).
+        let params = parse_query("token=abc=def==");
+        assert_eq!(params.get("token").unwrap(), "abc=def==");
+    }
+
+    #[test]
+    fn split_empty_string() {
+        let (base, params) = split_param_and_query("");
+        assert_eq!(base, "");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn inbox_limit_zero_means_no_limit() {
+        let input = "RedFox?project=/data/proj&limit=0";
+        let (_agent, query) = split_param_and_query(input);
+        let limit: usize = query.get("limit").unwrap().parse().unwrap();
+        assert_eq!(limit, 0);
+    }
+
     #[test]
     fn workspace_root_prefers_workspace_manifest() {
         let tmp = tempfile::tempdir().expect("tempdir");
