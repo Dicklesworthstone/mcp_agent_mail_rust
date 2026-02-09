@@ -2906,9 +2906,9 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
         )?;
     }
 
-    // Initial commit
-    commit_paths(
-        &repo,
+    // Initial commit (retry-enabled for consistency with other archive writes)
+    commit_paths_with_retry(
+        root,
         config,
         "chore: initialize archive",
         &[".gitattributes"],
