@@ -3,6 +3,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,7 +35,8 @@ struct RegenArgs {
 
     /// Output path for the generated fixtures JSON.
     ///
-    /// Defaults to `tests/conformance/fixtures/python_reference.json` under this crate.
+    /// Defaults to a timestamped path under the OS temp dir (so running `regen` does not
+    /// implicitly dirty the repo). To update the tracked fixtures, pass `--output` explicitly.
     #[arg(long)]
     output: Option<PathBuf>,
 
@@ -42,6 +44,13 @@ struct RegenArgs {
     /// Sets `AM_FIXTURE_REPO_ROOT` for the child Python process.
     #[arg(long)]
     fixture_repo_root: Option<PathBuf>,
+
+    /// Optional scratch root for the Python fixture generator run dir.
+    ///
+    /// This sets `MCP_AGENT_MAIL_CONFORMANCE_SCRATCH_ROOT` for the child Python process.
+    /// By default, the generator uses the OS temp dir (never inside the repo).
+    #[arg(long)]
+    scratch_root: Option<PathBuf>,
 
     /// Print the command/environment without executing.
     #[arg(long)]
@@ -94,9 +103,10 @@ fn run_regen(args: RegenArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let output = args
-        .output
-        .unwrap_or_else(|| crate_dir.join(mcp_agent_mail_conformance::FIXTURE_PATH));
+    let output = match &args.output {
+        Some(v) => v.clone(),
+        None => default_regen_output_path(),
+    };
     let output = absolute_path(&output)?;
 
     let fixture_repo_root = args
@@ -104,11 +114,27 @@ fn run_regen(args: RegenArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map(|p| absolute_path(&p))
         .transpose()?;
 
+    let scratch_root = args.scratch_root.map(|p| absolute_path(&p)).transpose()?;
+
     eprintln!("[conformance] python:  {python}");
     eprintln!("[conformance] script:  {}", script.display());
     eprintln!("[conformance] output:  {}", output.display());
+    if args.output.is_none() {
+        eprintln!(
+            "[conformance] note: default output is a temp file; to update the tracked fixtures, pass: --output {}",
+            crate_dir
+                .join(mcp_agent_mail_conformance::FIXTURE_PATH)
+                .display()
+        );
+    }
     if let Some(root) = &fixture_repo_root {
         eprintln!("[conformance] AM_FIXTURE_REPO_ROOT: {}", root.display());
+    }
+    if let Some(root) = &scratch_root {
+        eprintln!(
+            "[conformance] MCP_AGENT_MAIL_CONFORMANCE_SCRATCH_ROOT: {}",
+            root.display()
+        );
     }
 
     if args.dry_run {
@@ -134,6 +160,12 @@ fn run_regen(args: RegenArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(root) = &fixture_repo_root {
         cmd.env("AM_FIXTURE_REPO_ROOT", root.to_string_lossy().to_string());
+    }
+    if let Some(root) = &scratch_root {
+        cmd.env(
+            "MCP_AGENT_MAIL_CONFORMANCE_SCRATCH_ROOT",
+            root.to_string_lossy().to_string(),
+        );
     }
 
     let status = cmd.status()?;
@@ -162,6 +194,18 @@ fn absolute_path(path: &Path) -> Result<PathBuf, std::io::Error> {
     Ok(std::env::current_dir()?.join(path))
 }
 
+fn default_regen_output_path() -> PathBuf {
+    let now_ms: u128 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let pid = std::process::id();
+
+    std::env::temp_dir()
+        .join("mcp-agent-mail-conformance")
+        .join(format!("python_reference_{now_ms}_{pid}.json"))
+}
+
 fn other_error(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
 }
@@ -176,6 +220,28 @@ mod tests {
         match cli.command {
             Commands::Regen(args) => assert!(args.dry_run),
         }
+    }
+
+    #[test]
+    fn python_generator_defaults_to_os_temp_scratch() {
+        // Guard against regressions where the generator writes into the committed
+        // fixture tree under `tests/conformance/python_reference`.
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let script = crate_dir.join("tests/conformance/python_reference/generate_fixtures.py");
+        let content = std::fs::read_to_string(&script).expect("read python generator");
+
+        assert!(
+            content.contains("MCP_AGENT_MAIL_CONFORMANCE_SCRATCH_ROOT"),
+            "generator should support MCP_AGENT_MAIL_CONFORMANCE_SCRATCH_ROOT override"
+        );
+        assert!(
+            content.contains("tempfile.mkdtemp"),
+            "generator should default scratch outputs to the OS temp dir"
+        );
+        assert!(
+            !content.contains("/ \"_scratch\""),
+            "generator must not default to writing into repo python_reference/_scratch"
+        );
     }
 
     #[test]
@@ -218,6 +284,7 @@ print(f"Wrote fixtures to {out}")
             script: Some(script),
             output: Some(out.clone()),
             fixture_repo_root: None,
+            scratch_root: None,
             dry_run: false,
         })
         .expect("run regen");

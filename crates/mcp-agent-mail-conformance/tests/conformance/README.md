@@ -61,13 +61,30 @@ Preferred (Rust wrapper, still runs the Python generator under the hood):
 cargo run -p mcp-agent-mail-conformance -- regen
 ```
 
-Write fixtures to a temp file (useful for testing without touching tracked fixtures):
+By default, `regen` writes fixtures to a timestamped path under the OS temp dir
+(so it does not implicitly dirty the repo).
+
+To update the tracked fixtures in-repo, pass `--output` explicitly:
+
+```bash
+cargo run -p mcp-agent-mail-conformance -- regen \
+  --output crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json
+```
+
+Write fixtures to an explicit temp file path:
 
 ```bash
 cargo run -p mcp-agent-mail-conformance -- regen --output /tmp/python_reference.json
 ```
 
 The wrapper sets `MCP_AGENT_MAIL_CONFORMANCE_FIXTURE_PATH` for the Python generator.
+
+Scratch outputs (legacy server storage + DB) are also written outside the repo by default.
+To keep scratch artifacts in a known location for debugging, use:
+
+```bash
+cargo run -p mcp-agent-mail-conformance -- regen --scratch-root /tmp/am-conformance-scratch
+```
 
 Direct (legacy venv):
 

@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -111,11 +112,47 @@ def _null_volatile_fields_inplace(value: Any) -> list[str]:
 
 
 def _mk_run_dir() -> Path:
-    scratch_root = Path(__file__).resolve().parent / "_scratch"
-    scratch_root.mkdir(parents=True, exist_ok=True)
-    run_dir = scratch_root / f"run_{uuid.uuid4().hex}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+    """Create a writable per-run directory for storage + DB.
+
+    IMPORTANT: Do not write scratch outputs into the committed fixture tree under this repo.
+    The conformance fixtures are tracked and must remain immutable unless explicitly updated.
+
+    Override (for debugging only):
+    - Set `MCP_AGENT_MAIL_CONFORMANCE_SCRATCH_ROOT` to force the run dir base.
+    - If you intentionally want scratch outputs *inside the repo*, also set
+      `MCP_AGENT_MAIL_CONFORMANCE_ALLOW_REPO_SCRATCH=1`.
+    """
+
+    scratch_root_env = os.environ.get("MCP_AGENT_MAIL_CONFORMANCE_SCRATCH_ROOT", "").strip()
+    allow_repo_scratch = os.environ.get("MCP_AGENT_MAIL_CONFORMANCE_ALLOW_REPO_SCRATCH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    python_reference_dir = Path(__file__).resolve().parent
+
+    if scratch_root_env:
+        scratch_root = Path(scratch_root_env).expanduser().resolve()
+        try:
+            scratch_root.relative_to(python_reference_dir)
+        except Exception:
+            pass
+        else:
+            if not allow_repo_scratch:
+                raise RuntimeError(
+                    "Refusing to write conformance scratch outputs under the committed fixture tree. "
+                    "Set MCP_AGENT_MAIL_CONFORMANCE_ALLOW_REPO_SCRATCH=1 to override."
+                )
+
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        run_dir = scratch_root / f"run_{uuid.uuid4().hex}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    # Default: OS temp dir (never inside the repo).
+    return Path(tempfile.mkdtemp(prefix="am-conformance-python_reference-run_"))
 
 
 def _init_git_repo(path: Path) -> Path:
