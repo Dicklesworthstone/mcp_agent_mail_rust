@@ -99,21 +99,84 @@ pub fn normalize_contact_policy(raw: &str) -> String {
     }
 }
 
+/// Resolve the sender agent, optionally auto-registering if missing.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_or_register_sender(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    from_agent: &str,
+    register_if_missing: bool,
+    program: Option<String>,
+    model: Option<String>,
+    task_description: Option<&str>,
+) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    match resolve_agent(ctx, pool, project_id, from_agent).await {
+        Ok(a) => Ok(a),
+        Err(e) if !register_if_missing => Err(e),
+        Err(_) => {
+            let program = program.ok_or_else(|| {
+                legacy_tool_error(
+                    "MISSING_FIELD",
+                    "program is required when register_if_missing=true",
+                    true,
+                    serde_json::json!({ "field": "program" }),
+                )
+            })?;
+            let model = model.ok_or_else(|| {
+                legacy_tool_error(
+                    "MISSING_FIELD",
+                    "model is required when register_if_missing=true",
+                    true,
+                    serde_json::json!({ "field": "model" }),
+                )
+            })?;
+
+            let out = mcp_agent_mail_db::queries::register_agent(
+                ctx.cx(),
+                pool,
+                project_id,
+                from_agent,
+                &program,
+                &model,
+                task_description,
+                Some("auto"),
+            )
+            .await;
+            Ok(db_outcome_to_mcp_result(out)?)
+        }
+    }
+}
+
+/// Parse `project:<slug>#<Name>` shorthand into a `(project_key, agent_name)` tuple.
+/// Falls back to the default project and raw agent name if no shorthand match.
+fn parse_contact_target(
+    to_agent: &str,
+    to_project: Option<String>,
+    default_project: &str,
+) -> (String, String) {
+    if let Some(tp) = to_project {
+        return (tp, to_agent.to_string());
+    }
+    if to_agent.starts_with("project:") && to_agent.contains('#') {
+        if let Some((slug, agent)) = to_agent.split_once(':').and_then(|(_, rest)| {
+            let (slug, agent) = rest.split_once('#')?;
+            let agent = agent.trim();
+            if slug.is_empty() || agent.is_empty() {
+                None
+            } else {
+                Some((slug.to_string(), agent.to_string()))
+            }
+        }) {
+            return (slug, agent);
+        }
+    }
+    (default_project.to_string(), to_agent.to_string())
+}
+
 /// Request contact approval to message another agent.
 ///
 /// Creates or refreshes a pending `AgentLink` and sends a small `ack_required` intro message.
-///
-/// # Parameters
-/// - `project_key`: Your project identifier
-/// - `from_agent`: Your agent name
-/// - `to_agent`: Target agent name
-/// - `to_project`: Target project if different (for cross-project)
-/// - `reason`: Explanation for the contact request
-/// - `ttl_seconds`: Time to live for request (default: 7 days)
-/// - `register_if_missing`: Auto-register `from_agent` if not exists
-/// - `program`: Program for auto-registration
-/// - `model`: Model for auto-registration
-/// - `task_description`: Task description for auto-registration
 #[allow(clippy::too_many_arguments)]
 #[tool(description = "Request contact approval to message another agent.")]
 pub async fn request_contact(
@@ -134,67 +197,20 @@ pub async fn request_contact(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    // Resolve/ensure from_agent (optional auto-register).
-    let from_row = match resolve_agent(ctx, &pool, project_id, &from_agent).await {
-        Ok(a) => a,
-        Err(e) => {
-            let should_register = register_if_missing.unwrap_or(true);
-            if !should_register {
-                return Err(e);
-            }
-            let program = program.ok_or_else(|| {
-                legacy_tool_error(
-                    "MISSING_FIELD",
-                    "program is required when register_if_missing=true",
-                    true,
-                    serde_json::json!({ "field": "program" }),
-                )
-            })?;
-            let model = model.ok_or_else(|| {
-                legacy_tool_error(
-                    "MISSING_FIELD",
-                    "model is required when register_if_missing=true",
-                    true,
-                    serde_json::json!({ "field": "model" }),
-                )
-            })?;
+    let from_row = resolve_or_register_sender(
+        ctx,
+        &pool,
+        project_id,
+        &from_agent,
+        register_if_missing.unwrap_or(true),
+        program,
+        model,
+        task_description.as_deref(),
+    )
+    .await?;
 
-            let out = mcp_agent_mail_db::queries::register_agent(
-                ctx.cx(),
-                &pool,
-                project_id,
-                &from_agent,
-                &program,
-                &model,
-                task_description.as_deref(),
-                Some("auto"),
-            )
-            .await;
-            db_outcome_to_mcp_result(out)?
-        }
-    };
-
-    // Target project defaults to same project_key.
-    // Support `project:<slug>#<Name>` shorthand in to_agent (Python parity).
-    #[allow(clippy::option_if_let_else)]
-    let (target_project_key, target_agent_name) = if let Some(tp) = to_project {
-        (tp, to_agent.clone())
-    } else if to_agent.starts_with("project:") && to_agent.contains('#') {
-        match to_agent.split_once(':').and_then(|(_, rest)| {
-            let (slug, agent) = rest.split_once('#')?;
-            let agent = agent.trim();
-            if slug.is_empty() || agent.is_empty() {
-                None
-            } else {
-                Some((slug.to_string(), agent.to_string()))
-            }
-        }) {
-            Some((slug, agent)) => (slug, agent),
-            None => (project_key.clone(), to_agent.clone()),
-        }
-    } else {
-        (project_key.clone(), to_agent.clone())
-    };
+    let (target_project_key, target_agent_name) =
+        parse_contact_target(&to_agent, to_project, &project_key);
     let target_project_row = resolve_project(ctx, &pool, &target_project_key).await?;
     let target_project_id = target_project_row.id.unwrap_or(0);
 
@@ -216,7 +232,6 @@ pub async fn request_contact(
     )?;
 
     // Send an intro mail (ack_required) so the recipient sees the request in their inbox.
-    // This matches legacy Python fixture semantics.
     let subject = format!("Contact request from {from_agent}");
     let body_md = format!("{from_agent} requests permission to contact {target_agent_name}.");
 
@@ -586,5 +601,43 @@ mod tests {
     fn default_respond_ttl_is_thirty_days() {
         let ttl: i64 = 2_592_000;
         assert_eq!(ttl, 30 * 24 * 3600);
+    }
+
+    // ── parse_contact_target ──
+
+    #[test]
+    fn parse_contact_target_explicit_project() {
+        let (proj, agent) =
+            parse_contact_target("BlueLake", Some("other-project".into()), "/default");
+        assert_eq!(proj, "other-project");
+        assert_eq!(agent, "BlueLake");
+    }
+
+    #[test]
+    fn parse_contact_target_shorthand() {
+        let (proj, agent) = parse_contact_target("project:my-proj#RedFox", None, "/default");
+        assert_eq!(proj, "my-proj");
+        assert_eq!(agent, "RedFox");
+    }
+
+    #[test]
+    fn parse_contact_target_shorthand_with_whitespace() {
+        let (proj, agent) = parse_contact_target("project:my-proj# RedFox ", None, "/default");
+        assert_eq!(proj, "my-proj");
+        assert_eq!(agent, "RedFox");
+    }
+
+    #[test]
+    fn parse_contact_target_invalid_shorthand_falls_back() {
+        let (proj, agent) = parse_contact_target("project:#", None, "/default");
+        assert_eq!(proj, "/default");
+        assert_eq!(agent, "project:#");
+    }
+
+    #[test]
+    fn parse_contact_target_plain_name() {
+        let (proj, agent) = parse_contact_target("BlueLake", None, "/my/project");
+        assert_eq!(proj, "/my/project");
+        assert_eq!(agent, "BlueLake");
     }
 }

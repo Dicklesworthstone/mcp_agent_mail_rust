@@ -224,7 +224,9 @@ fn main() {
         }
 
         // Route to the CLI surface with the correct invocation name for help/usage.
-        std::process::exit(mcp_agent_mail_cli::run_with_invocation_name("mcp-agent-mail"));
+        std::process::exit(mcp_agent_mail_cli::run_with_invocation_name(
+            "mcp-agent-mail",
+        ));
     }
 
     // MCP mode: initialize logging and proceed with the server binary behavior.

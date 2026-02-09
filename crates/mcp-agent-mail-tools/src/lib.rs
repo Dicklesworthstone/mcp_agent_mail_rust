@@ -293,6 +293,124 @@ pub(crate) mod tool_util {
             assert_eq!(data["error"]["recoverable"], true);
             assert_eq!(data["error"]["data"]["entity"], "Agent");
         }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_duplicate() {
+            let err = db_error_to_mcp_error(DbError::duplicate("Agent", "BlueLake"));
+            assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+            assert!(err.message.contains("already exists"));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+            assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(data["error"]["data"]["entity"], "Agent");
+            assert_eq!(data["error"]["data"]["identifier"], "BlueLake");
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_invalid_argument() {
+            let err =
+                db_error_to_mcp_error(DbError::invalid("agent_name", "must be adjective+noun"));
+            assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+            assert!(err.message.contains("agent_name"));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+            assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_pool_error() {
+            let err = db_error_to_mcp_error(DbError::Pool("timeout".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_POOL_EXHAUSTED");
+            assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_pool_exhausted() {
+            let err = db_error_to_mcp_error(DbError::PoolExhausted {
+                message: "all connections in use".into(),
+                pool_size: 10,
+                max_overflow: 5,
+            });
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_POOL_EXHAUSTED");
+            assert_eq!(data["error"]["data"]["pool_size"], 10);
+            assert_eq!(data["error"]["data"]["max_overflow"], 5);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_sqlite() {
+            let err = db_error_to_mcp_error(DbError::Sqlite("constraint violation".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+            assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_schema() {
+            let err = db_error_to_mcp_error(DbError::Schema("migration v4 failed".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_serialization() {
+            let err = db_error_to_mcp_error(DbError::Serialization("invalid JSON".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "TYPE_ERROR");
+            assert!(data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("type mismatch"));
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_resource_busy() {
+            let err = db_error_to_mcp_error(DbError::ResourceBusy("SQLITE_BUSY".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_circuit_breaker() {
+            let err = db_error_to_mcp_error(DbError::CircuitBreakerOpen {
+                message: "sustained failures".into(),
+                failures: 5,
+                reset_after_secs: 30.0,
+            });
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(data["error"]["data"]["failures"], 5);
+            assert!(data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("30"));
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_integrity_corruption() {
+            let err = db_error_to_mcp_error(DbError::IntegrityCorruption {
+                message: "page checksum mismatch".into(),
+                details: vec!["page 42".into(), "page 99".into()],
+            });
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
+            assert_eq!(data["error"]["recoverable"], false);
+            assert!(data["error"]["data"]["corruption_details"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 2);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_internal() {
+            let err = db_error_to_mcp_error(DbError::Internal("unexpected state".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "UNHANDLED_EXCEPTION");
+            assert_eq!(data["error"]["recoverable"], false);
+        }
     }
 }
 

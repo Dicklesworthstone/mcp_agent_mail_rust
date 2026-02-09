@@ -8738,9 +8738,7 @@ mod tests {
         const ITERATIONS: u64 = 100;
         const BASE_SEED: u64 = 0xBEEF_CAFE_0000_0001;
 
-        let base_paths: Vec<String> = (0..SIZE)
-            .map(|i| format!("path/{:04}.md", i))
-            .collect();
+        let base_paths: Vec<String> = (0..SIZE).map(|i| format!("path/{:04}.md", i)).collect();
 
         let mut times = Vec::with_capacity(ITERATIONS as usize);
         for iteration in 0..ITERATIONS {
@@ -8753,11 +8751,7 @@ mod tests {
         }
 
         let mean = times.iter().sum::<f64>() / ITERATIONS as f64;
-        let variance = times
-            .iter()
-            .map(|t| (t - mean).powi(2))
-            .sum::<f64>()
-            / ITERATIONS as f64;
+        let variance = times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / ITERATIONS as f64;
         let stddev = variance.sqrt();
         let cv = stddev / mean.max(1.0);
 

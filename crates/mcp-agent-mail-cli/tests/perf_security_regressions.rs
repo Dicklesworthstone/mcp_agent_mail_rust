@@ -964,7 +964,12 @@ fn mode_cli_allows_cli_commands() {
     };
 
     // These commands are denied in MCP mode but should be allowed in CLI mode.
-    let cli_commands = &["share --help", "guard --help", "mail --help", "agents --help"];
+    let cli_commands = &[
+        "share --help",
+        "guard --help",
+        "mail --help",
+        "agents --help",
+    ];
 
     for entry in cli_commands {
         let args: Vec<&str> = entry.split_whitespace().collect();

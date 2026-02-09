@@ -5375,10 +5375,18 @@ mod tests {
         assert_eq!(body["detail"], "Unauthorized");
 
         // Health routes must bypass bearer auth.
-        for path in &["/health/liveness", "/health/readiness", "/health", "/healthz"] {
+        for path in &[
+            "/health/liveness",
+            "/health/readiness",
+            "/health",
+            "/healthz",
+        ] {
             let req_health = make_request(Http1Method::Get, path, &[]);
             let resp_health = block_on(state.handle(req_health));
-            assert_eq!(resp_health.status, 200, "health path should bypass auth: {path}");
+            assert_eq!(
+                resp_health.status, 200,
+                "health path should bypass auth: {path}"
+            );
         }
     }
 
@@ -10279,8 +10287,7 @@ mod tests {
                     let handles: Vec<_> = (0..50)
                         .map(|_| {
                             s.spawn(|| {
-                                let rt =
-                                    RuntimeBuilder::current_thread().build().expect("runtime");
+                                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
                                 let start = Instant::now();
                                 let result = rt.block_on(state.fetch_jwks(&url, false));
                                 let elapsed = start.elapsed();
@@ -10303,7 +10310,10 @@ mod tests {
 
                 // Fan-out suppression: exactly 1 HTTP request.
                 let requests = counter.load(std::sync::atomic::Ordering::SeqCst);
-                assert_eq!(requests, 1, "fan-out suppression: expected 1 request, got {requests}");
+                assert_eq!(
+                    requests, 1,
+                    "fan-out suppression: expected 1 request, got {requests}"
+                );
 
                 // Timing distribution: at least 45 threads under 250ms.
                 let fast = timings.iter().filter(|t| t.as_millis() < 250).count();
@@ -10348,9 +10358,8 @@ mod tests {
                         let handles: Vec<_> = (0..20)
                             .map(|_| {
                                 s.spawn(|| {
-                                    let rt = RuntimeBuilder::current_thread()
-                                        .build()
-                                        .expect("runtime");
+                                    let rt =
+                                        RuntimeBuilder::current_thread().build().expect("runtime");
                                     rt.block_on(state.fetch_jwks(&url, false))
                                 })
                             })
@@ -10363,10 +10372,7 @@ mod tests {
                     });
 
                     let reqs = counter.load(std::sync::atomic::Ordering::SeqCst);
-                    assert_eq!(
-                        reqs, 1,
-                        "single refresh at delay={delay_ms}ms, got {reqs}"
-                    );
+                    assert_eq!(reqs, 1, "single refresh at delay={delay_ms}ms, got {reqs}");
                 },
             );
         }
@@ -10450,8 +10456,7 @@ mod tests {
         let jwks_json = serde_json::json!({
             "keys": [{"kty": "oct", "alg": "HS256", "kid": "kid-outage", "k": k}]
         });
-        let jwks_set: jsonwebtoken::jwk::JwkSet =
-            serde_json::from_value(jwks_json).unwrap();
+        let jwks_set: jsonwebtoken::jwk::JwkSet = serde_json::from_value(jwks_json).unwrap();
 
         // Mock server is unreachable (use a port that won't connect).
         let state = build_state(mcp_agent_mail_core::Config {
@@ -10498,10 +10503,10 @@ mod tests {
         .unwrap();
 
         // Verify with the cached (stale) key.
-        let decoding_key =
-            jsonwebtoken::DecodingKey::from_secret(secret);
+        let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret);
         let validation = HttpState::jwt_validation(vec![jsonwebtoken::Algorithm::HS256]);
-        let decoded = jsonwebtoken::decode::<serde_json::Value>(&valid_token, &decoding_key, &validation);
+        let decoded =
+            jsonwebtoken::decode::<serde_json::Value>(&valid_token, &decoding_key, &validation);
         assert!(decoded.is_ok(), "valid token verifiable with correct key");
 
         // Invalid token (wrong secret): must be rejected even with stale cache.
@@ -10511,11 +10516,8 @@ mod tests {
             &jsonwebtoken::EncodingKey::from_secret(b"wrong-secret"),
         )
         .unwrap();
-        let decoded = jsonwebtoken::decode::<serde_json::Value>(
-            &wrong_token,
-            &decoding_key,
-            &validation,
-        );
+        let decoded =
+            jsonwebtoken::decode::<serde_json::Value>(&wrong_token, &decoding_key, &validation);
         assert!(
             decoded.is_err(),
             "invalid token must be rejected even with stale cache"

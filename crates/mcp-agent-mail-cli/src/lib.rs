@@ -1132,7 +1132,9 @@ pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
 }
 
 fn parse_with_invocation_name(invocation_name: &'static str) -> Result<Cli, i32> {
-    let cmd = Cli::command().name(invocation_name).bin_name(invocation_name);
+    let cmd = Cli::command()
+        .name(invocation_name)
+        .bin_name(invocation_name);
 
     // Ensure argv0 matches the name we want clap to render, regardless of how this
     // library was invoked.
@@ -1225,7 +1227,9 @@ mod invocation_name_tests {
 
     #[test]
     fn cli_help_can_render_under_mcp_agent_mail_name() {
-        let cmd = Cli::command().name("mcp-agent-mail").bin_name("mcp-agent-mail");
+        let cmd = Cli::command()
+            .name("mcp-agent-mail")
+            .bin_name("mcp-agent-mail");
         let help = long_help_text(cmd);
         assert!(
             help.contains("mcp-agent-mail"),

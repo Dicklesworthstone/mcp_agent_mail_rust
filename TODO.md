@@ -5,8 +5,8 @@
 - [x] Register with MCP Agent Mail and announce to active agents.
 - [x] Check inbox from other agents at least once per session.
 - [x] Reserve files before edits (Agent Mail leases) and release on completion.
-- [ ] Keep `FEATURE_PARITY.md` aligned with completed work.
-- [ ] Keep `TODO.md` updated after each batch of changes.
+- [x] Keep `FEATURE_PARITY.md` aligned with completed work.
+- [x] Keep `TODO.md` updated after each batch of changes.
 - [ ] Confirm MCP Agent Mail server stability (health check path, lock handling).
 
 ## 1. Workspace & Crate Scaffolding
@@ -29,10 +29,10 @@
 - [x] Tool-filter fixtures (profiles + include/exclude).
 - [x] Archive artifact assertions (profiles, messages, inbox/outbox, reservations).
 - [x] Notification signal conformance (to/cc signals, bcc excluded, fetch_inbox clears).
-- [ ] Conformance CLI helper to regenerate fixtures (Rust wrapper or script).
-- [ ] CI step for conformance tests (ensure fixtures are current).
+- [x] Conformance CLI helper to regenerate fixtures (Rust wrapper or script).
+- [x] CI step for conformance tests (ensure fixtures are current).
 - [x] Add missing error-case fixtures (invalid params, unknown project/agent, malformed inputs).
-- [ ] Add resource query-param fixtures (format/filter params for static resources).
+- [x] Add resource query-param fixtures (format/filter params for static resources).
 
 ## 3. DB Layer (sqlmodel_rust) — Models & Schema
 - [x] SQLModel structs for all tables (`src/models.rs`).
@@ -63,7 +63,7 @@
 - [x] TOON output handling for tool + resource responses.
 - [x] Instrumentation wrapper for per-tool query stats logging.
 - [ ] Validate resource query matching behavior against fastmcp router (edge cases).
-- [ ] Implement query parsing for static resources (`resource://projects?format=...`).
+- [x] Implement query parsing for static resources (`resource://projects?format=...`).
 
 ## 5. Storage Layer (Git Archive)
 - [x] Archive root creation + `.gitattributes`.

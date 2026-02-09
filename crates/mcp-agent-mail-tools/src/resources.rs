@@ -1608,6 +1608,66 @@ pub struct ProjectListEntry {
     pub created_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectsListQueryOptions {
+    limit: Option<usize>,
+    contains: Option<String>,
+}
+
+fn parse_projects_list_query_options(
+    params: &HashMap<String, String>,
+) -> McpResult<ProjectsListQueryOptions> {
+    if let Some(format) = params.get("format") {
+        let normalized = format.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && normalized != "json" {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                format!("Unsupported projects format '{format}'. Supported values: json"),
+            ));
+        }
+    }
+
+    let limit = params
+        .get("limit")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|raw| {
+            raw.parse::<usize>().map_err(|_| {
+                McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!("Invalid limit '{raw}'. Expected a non-negative integer."),
+                )
+            })
+        })
+        .transpose()?;
+
+    let contains = params
+        .get("contains")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_ascii_lowercase);
+
+    Ok(ProjectsListQueryOptions { limit, contains })
+}
+
+fn apply_projects_list_query_options(
+    mut projects: Vec<ProjectListEntry>,
+    options: &ProjectsListQueryOptions,
+) -> Vec<ProjectListEntry> {
+    if let Some(contains) = options.contains.as_deref() {
+        projects.retain(|project| {
+            project.slug.to_ascii_lowercase().contains(contains)
+                || project.human_key.to_ascii_lowercase().contains(contains)
+        });
+    }
+
+    if let Some(limit) = options.limit {
+        projects.truncate(limit);
+    }
+
+    projects
+}
+
 /// List all projects.
 #[resource(uri = "resource://projects", description = "All projects")]
 pub async fn projects_list(ctx: &McpContext) -> McpResult<String> {
@@ -1635,8 +1695,26 @@ pub async fn projects_list(ctx: &McpContext) -> McpResult<String> {
     description = "All projects (with query)"
 )]
 pub async fn projects_list_query(ctx: &McpContext, query: String) -> McpResult<String> {
-    let _query = parse_query(&query);
-    projects_list(ctx).await
+    let params = parse_query(&query);
+    let query_opts = parse_projects_list_query_options(&params)?;
+
+    let pool = get_db_pool()?;
+    let rows =
+        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
+
+    let projects = rows
+        .into_iter()
+        .map(|p| ProjectListEntry {
+            id: p.id.unwrap_or(0),
+            slug: p.slug,
+            human_key: p.human_key,
+            created_at: Some(micros_to_iso(p.created_at)),
+        })
+        .collect();
+    let projects = apply_projects_list_query_options(projects, &query_opts);
+
+    serde_json::to_string(&projects)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
 /// Agent entry for project detail
@@ -3814,6 +3892,75 @@ mod query_param_tests {
     fn parse_query_trailing_ampersand() {
         let params = parse_query("a=1&b=2&");
         assert_eq!(params.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // projects_list query options
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn projects_query_options_accepts_json_format() {
+        let params = parse_query("format=json");
+        let opts = parse_projects_list_query_options(&params).expect("json format should be valid");
+        assert_eq!(opts.limit, None);
+        assert_eq!(opts.contains, None);
+    }
+
+    #[test]
+    fn projects_query_options_rejects_unknown_format() {
+        let params = parse_query("format=xml");
+        let err = parse_projects_list_query_options(&params).expect_err("xml format must fail");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("Unsupported projects format"));
+    }
+
+    #[test]
+    fn projects_query_options_parses_limit_and_contains() {
+        let params = parse_query("limit=2&contains=Mail");
+        let opts = parse_projects_list_query_options(&params).expect("query params should parse");
+        assert_eq!(opts.limit, Some(2));
+        assert_eq!(opts.contains.as_deref(), Some("mail"));
+    }
+
+    #[test]
+    fn projects_query_options_rejects_invalid_limit() {
+        let params = parse_query("limit=abc");
+        let err =
+            parse_projects_list_query_options(&params).expect_err("non-numeric limit must fail");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("Invalid limit"));
+    }
+
+    #[test]
+    fn apply_projects_query_options_filters_and_limits() {
+        let projects = vec![
+            ProjectListEntry {
+                id: 1,
+                slug: "alpha-service".to_string(),
+                human_key: "/data/projects/alpha-service".to_string(),
+                created_at: None,
+            },
+            ProjectListEntry {
+                id: 2,
+                slug: "beta-mail".to_string(),
+                human_key: "/data/projects/beta-mail".to_string(),
+                created_at: None,
+            },
+            ProjectListEntry {
+                id: 3,
+                slug: "gamma-mailer".to_string(),
+                human_key: "/data/projects/gamma-mailer".to_string(),
+                created_at: None,
+            },
+        ];
+
+        let opts = ProjectsListQueryOptions {
+            limit: Some(1),
+            contains: Some("mail".to_string()),
+        };
+        let filtered = apply_projects_list_query_options(projects, &opts);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].slug, "beta-mail");
     }
 
     // -----------------------------------------------------------------------

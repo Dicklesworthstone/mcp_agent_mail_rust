@@ -471,7 +471,8 @@ pub fn schema_migrations() -> Vec<Migration> {
     // product_project_links.created_at
     migrations.push(Migration::new(
         "v3_fix_product_project_links_text_timestamps".to_string(),
-        "convert legacy TEXT created_at to INTEGER microseconds in product_project_links".to_string(),
+        "convert legacy TEXT created_at to INTEGER microseconds in product_project_links"
+            .to_string(),
         format!(
             "UPDATE product_project_links SET created_at = ({}) WHERE typeof(created_at) = 'text'",
             ts_conversion("created_at")
@@ -902,7 +903,8 @@ mod tests {
                 Value::Text("MyProduct".to_string()),
                 Value::Text("2026-02-04 22:30:00.999999".to_string()),
             ],
-        ).expect("insert legacy product");
+        )
+        .expect("insert legacy product");
 
         // Create legacy product_project_links table with TEXT timestamps.
         conn.execute_sync(
