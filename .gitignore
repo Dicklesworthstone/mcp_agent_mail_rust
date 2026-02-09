@@ -41,3 +41,6 @@ benches/results/
 
 # Conformance scratch runs (legacy python reference generator)
 crates/mcp-agent-mail-conformance/tests/conformance/python_reference/_scratch/
+
+# Legacy Python reference code (local-only, not part of Rust workspace)
+legacy_python_mcp_agent_mail_code/

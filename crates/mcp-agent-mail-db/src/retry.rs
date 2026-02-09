@@ -333,7 +333,12 @@ impl CircuitBreaker {
 
 /// Log a circuit state transition at WARN level.
 fn log_transition(subsystem: &str, from: CircuitState, to: CircuitState) {
-    eprintln!("[WARN] circuit_breaker[{subsystem}]: {from} -> {to}",);
+    tracing::warn!(
+        subsystem,
+        %from,
+        %to,
+        "circuit breaker state transition",
+    );
 }
 
 /// Convert a [`Duration`] to microseconds as `u64`, saturating on overflow.

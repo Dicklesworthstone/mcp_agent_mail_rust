@@ -429,7 +429,7 @@ impl ChromePalette {
     /// Resolve the palette from accessibility settings.
     ///
     /// When high-contrast mode is active, uses the dedicated HC constants.
-    /// Otherwise delegates to the theme-aware [`TuiThemePalette`].
+    /// Otherwise delegates to the theme-aware `TuiThemePalette`.
     #[must_use]
     pub fn from_settings(settings: &AccessibilitySettings) -> Self {
         if settings.high_contrast {

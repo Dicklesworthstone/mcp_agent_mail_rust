@@ -192,7 +192,7 @@ impl DockLayout {
 
     /// Test whether a mouse coordinate (x, y) is on the dock border
     /// for the given area. Returns `true` if the coordinate is within
-    /// [`BORDER_HIT_TOLERANCE`] cells of the split boundary.
+    /// `BORDER_HIT_TOLERANCE` cells of the split boundary.
     #[must_use]
     pub fn hit_test_border(&self, area: Rect, x: u16, y: u16) -> bool {
         if !self.visible {

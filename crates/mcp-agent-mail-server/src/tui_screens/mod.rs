@@ -104,7 +104,7 @@ pub struct HelpEntry {
 
 /// The screen abstraction for `AgentMailTUI`.
 ///
-/// Each screen implements this trait and plugs into [`MailAppModel`].
+/// Each screen implements this trait and plugs into [`crate::tui_app::MailAppModel`].
 /// The trait closely mirrors the ftui-demo-showcase `Screen` trait,
 /// diverging only where `AgentMailTUI` semantics require (passing
 /// `TuiSharedState` to `view` and `update`).

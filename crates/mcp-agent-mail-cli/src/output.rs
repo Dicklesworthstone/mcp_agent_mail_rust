@@ -87,7 +87,7 @@ impl CliTable {
     }
 
     /// Render the table to a `String`, with TTY-awareness controlled by the
-    /// caller. This is the testable core of [`render`].
+    /// caller. This is the testable core of [`Self::render`].
     pub fn render_to_string(&self, tty: bool) -> String {
         if self.rows.is_empty() {
             return String::new();

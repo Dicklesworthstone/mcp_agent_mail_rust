@@ -6,7 +6,7 @@
 //! - Advisory file locks (`.archive.lock`) and commit locks
 //! - Commit queue with batching to reduce lock contention
 //! - Message write pipeline (canonical + inbox/outbox copies)
-//! - File reservation artifact writes (sha1(pattern).json + id-<id>.json)
+//! - File reservation artifact writes (`sha1(pattern).json` + `id-{id}.json`)
 //! - Agent profile writes
 //! - Notification signals
 
@@ -3828,7 +3828,7 @@ pub fn store_attachment(
 /// Process attachment paths and store them in the archive.
 ///
 /// Resolves paths sequentially (fast), then converts up to
-/// [`MAX_CONCURRENT_CONVERSIONS`] attachments in parallel using
+/// `MAX_CONCURRENT_CONVERSIONS` attachments in parallel using
 /// `std::thread::scope` with chunk-based concurrency limiting.
 ///
 /// Returns a list of attachment metadata and all relative paths written.
@@ -3880,7 +3880,7 @@ fn image_pattern_re() -> &'static Regex {
 /// Process inline image references in Markdown body.
 ///
 /// Finds `![alt](path)` references and converts them in parallel (up to
-/// [`MAX_CONCURRENT_CONVERSIONS`] at a time) with either:
+/// `MAX_CONCURRENT_CONVERSIONS` at a time) with either:
 /// - Inline base64 data URI: `![alt](data:image/webp;base64,...)`
 /// - Archive file path: `![alt](attachments/ab/ab1234...webp)`
 ///

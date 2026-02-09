@@ -7,7 +7,7 @@
 //! # Debouncing
 //!
 //! Layout changes during drag or rapid key-presses are debounced so
-//! the envfile is written at most once per [`SAVE_DEBOUNCE`] interval.
+//! the envfile is written at most once per `SAVE_DEBOUNCE` interval.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -162,7 +162,7 @@ impl PreferencePersister {
 
     /// Mark the current preferences as dirty (changed).
     ///
-    /// The actual write happens on the next [`flush_if_due`] call
+    /// The actual write happens on the next [`Self::flush_if_due`] call
     /// after the debounce interval.
     pub fn mark_dirty(&mut self) {
         if self.dirty_since.is_none() {

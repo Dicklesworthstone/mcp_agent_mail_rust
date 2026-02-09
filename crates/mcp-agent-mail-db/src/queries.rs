@@ -3878,10 +3878,7 @@ mod tests {
             "\"foo-bar\" 日本語"
         );
         // 4-byte UTF-8 (emoji) must survive
-        assert_eq!(
-            quote_hyphenated_tokens("test-case 🎉"),
-            "\"test-case\" 🎉"
-        );
+        assert_eq!(quote_hyphenated_tokens("test-case 🎉"), "\"test-case\" 🎉");
     }
 
     #[test]
