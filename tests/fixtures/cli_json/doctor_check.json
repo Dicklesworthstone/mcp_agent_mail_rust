@@ -9,6 +9,16 @@
       "check": "storage_root",
       "detail": "<TMP_ROOT>/storage_root",
       "status": "warn"
+    },
+    {
+      "check": "installed_agents",
+      "detail": "<INSTALLED_AGENTS_SUMMARY>",
+      "status": "ok"
+    },
+    {
+      "check": "beads_issue_awareness",
+      "detail": "<BEADS_ISSUE_AWARENESS_SUMMARY>",
+      "status": "ok"
     }
   ],
   "healthy": true

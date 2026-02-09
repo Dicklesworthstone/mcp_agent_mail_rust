@@ -15,6 +15,7 @@
 | Tool registry + tool clusters | Verified (Conformance) | `crates/mcp-agent-mail-server/src/lib.rs` |
 | Resource URI system (`resource://...`) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Static projects resource query handling (`format`, `limit`, `contains`) | Verified (Tests) | `crates/mcp-agent-mail-tools/src/resources.rs` (`projects_list_query`, query option parser + unit tests in `query_param_tests`) |
+| FastMCP resource query routing edge cases (`resource://projects?...`) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` (`resource_query_router_projects_limit_and_contains_are_honored`, `resource_query_router_projects_invalid_query_values_surface_errors`) |
 | Tool filtering profiles (full/core/minimal/messaging/custom) | Verified (Tests) | `crates/mcp-agent-mail-core/src/config.rs`, `crates/mcp-agent-mail-tools/src/lib.rs`, `crates/mcp-agent-mail-server/src/lib.rs`, `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
 | Tool metrics snapshot | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Recent tool usage tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
@@ -88,6 +89,7 @@
 | Lock status diagnostics | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` (4 tests: nonexistent root, empty root, finds locks, owner metadata) |
 | Thread digest (append-only) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Storage-to-tools wiring | Verified (Tests) | identity.rs, messaging.rs, reservations.rs, resources.rs |
+| DB↔storage consistency integration (message + reservation pipelines) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` (`db_and_storage_message_pipeline_consistent`, `db_and_storage_reservation_pipeline_consistent`) |
 | Query tracking + slow queries | Verified (Tests) | `crates/mcp-agent-mail-db/src/tracking.rs` (11 tests, 40 fixture vectors), `crates/mcp-agent-mail-db/src/queries.rs` (TrackedConnection, all calls instrumented), `crates/mcp-agent-mail-server/src/lib.rs` (auto-enable) |
 
 ## CLI & Ops
@@ -107,11 +109,14 @@
 | lint / typecheck | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs`, `scripts/e2e_cli.sh` (typecheck passes, lint runs clippy) |
 | projects (mark-identity/discovery-init/adopt) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs`, `tests/integration_runs.rs` (5 tests: mark-identity, discovery-init, adopt dry-run, adopt apply, adopt cross-repo) |
 | doctor check (--verbose, --json) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (integration test), `tests/cli_json_snapshots.rs` (JSON snapshot) |
+| beads_rust integration (issue/task awareness) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (`beads_issue_awareness_counts`, `doctor check` `beads_issue_awareness` probe + integration test) |
+| coding_agent_session_search integration (installed agent detection) | Verified (Tests) | `crates/mcp-agent-mail-core/src/agent_detect.rs`, `crates/mcp-agent-mail-core/tests/agent_detect_integration.rs`, `crates/mcp-agent-mail-cli/src/lib.rs` (`doctor check` `installed_agents` probe + integration test) |
 | Guard install/uninstall + conflict detection | Verified (Tests) | `crates/mcp-agent-mail-guard/src/lib.rs`, `tests/e2e/test_guard.sh` (32 E2E assertions: install, check, uninstall, conflict detection, case-insensitive, advisory mode) |
 | Guard status / guard check (Rust native) | Verified (Tests) | `crates/mcp-agent-mail-guard/src/lib.rs`, `tests/e2e/test_guard.sh` (status, check with stdin-nul, advisory mode) |
 | Doctor repair/backups/restore | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (repair, backups, restore commands; backups integration test), `tests/cli_json_snapshots.rs` (backups JSON snapshot) |
 | Share export/update/verify/decrypt/preview | Verified (Tests) | `crates/mcp-agent-mail-share/src/` (8 modules, 62 tests), `crates/mcp-agent-mail-cli/src/lib.rs` |
 | Archive save/list/restore | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (roundtrip smoke test), `tests/cli_json_snapshots.rs` (archive list JSON snapshots), `tests/e2e/test_archive.sh` (16 E2E assertions) |
+| Crates.io publish workflow (tag-gated, ordered workspace publish) | Implemented | `.github/workflows/publish.yml` |
 
 ## Conformance & Benchmarks
 | Feature | Status | Evidence |

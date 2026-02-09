@@ -6,12 +6,29 @@
 #![forbid(unsafe_code)]
 
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::disk::DiskPressure;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+const STARTUP_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1GiB
+
+#[inline]
+fn monitor_interval_seconds(seconds: u64) -> Duration {
+    Duration::from_secs(seconds.max(5))
+}
+
+#[inline]
+fn should_emit_startup_warning(effective_free_bytes: Option<u64>) -> bool {
+    effective_free_bytes.is_some_and(|free| free < STARTUP_WARN_BYTES)
+}
+
+#[inline]
+fn should_emit_pressure_change_alert(previous: DiskPressure, current: DiskPressure) -> bool {
+    previous != current
+}
 
 pub fn start(config: &Config) {
     if !config.disk_space_monitor_enabled {
@@ -37,9 +54,7 @@ pub fn shutdown() {
 }
 
 fn monitor_loop(config: &Config) {
-    const STARTUP_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1GiB
-
-    let interval = Duration::from_secs(config.disk_space_check_interval_seconds.max(5));
+    let interval = monitor_interval_seconds(config.disk_space_check_interval_seconds);
     tracing::info!(
         interval_secs = interval.as_secs(),
         "disk monitor worker started"
@@ -47,14 +62,12 @@ fn monitor_loop(config: &Config) {
 
     let first = mcp_agent_mail_core::disk::sample_and_record(config);
     let mut last_pressure = first.pressure;
-    if let Some(free) = first.effective_free_bytes {
-        if free < STARTUP_WARN_BYTES {
-            tracing::warn!(
-                free_bytes = free,
-                pressure = last_pressure.label(),
-                "low disk space detected (startup warning threshold)"
-            );
-        }
+    if should_emit_startup_warning(first.effective_free_bytes) {
+        tracing::warn!(
+            free_bytes = first.effective_free_bytes,
+            pressure = last_pressure.label(),
+            "low disk space detected (startup warning threshold)"
+        );
     }
 
     loop {
@@ -66,7 +79,7 @@ fn monitor_loop(config: &Config) {
         let sample = mcp_agent_mail_core::disk::sample_and_record(config);
         let pressure = sample.pressure;
 
-        if pressure != last_pressure {
+        if should_emit_pressure_change_alert(last_pressure, pressure) {
             tracing::warn!(
                 from = last_pressure.label(),
                 to = pressure.label(),
@@ -88,5 +101,47 @@ fn monitor_loop(config: &Config) {
             std::thread::sleep(chunk);
             remaining = remaining.saturating_sub(chunk);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_interval_seconds_enforces_minimum() {
+        assert_eq!(monitor_interval_seconds(0), Duration::from_secs(5));
+        assert_eq!(monitor_interval_seconds(1), Duration::from_secs(5));
+        assert_eq!(monitor_interval_seconds(4), Duration::from_secs(5));
+        assert_eq!(monitor_interval_seconds(5), Duration::from_secs(5));
+        assert_eq!(monitor_interval_seconds(7), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn startup_warning_threshold_behavior() {
+        assert!(should_emit_startup_warning(Some(STARTUP_WARN_BYTES - 1)));
+        assert!(!should_emit_startup_warning(Some(STARTUP_WARN_BYTES)));
+        assert!(!should_emit_startup_warning(Some(STARTUP_WARN_BYTES + 1)));
+        assert!(!should_emit_startup_warning(None));
+    }
+
+    #[test]
+    fn pressure_change_alert_only_when_level_changes() {
+        assert!(!should_emit_pressure_change_alert(
+            DiskPressure::Ok,
+            DiskPressure::Ok
+        ));
+        assert!(!should_emit_pressure_change_alert(
+            DiskPressure::Warning,
+            DiskPressure::Warning
+        ));
+        assert!(should_emit_pressure_change_alert(
+            DiskPressure::Ok,
+            DiskPressure::Warning
+        ));
+        assert!(should_emit_pressure_change_alert(
+            DiskPressure::Critical,
+            DiskPressure::Fatal
+        ));
     }
 }

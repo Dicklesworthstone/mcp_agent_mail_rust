@@ -5686,6 +5686,10 @@ fn parse_year_month(iso: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::{Cx, Outcome};
+    use mcp_agent_mail_db::{DbPool, DbPoolConfig, micros_to_iso, queries};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
     fn test_config(root: &Path) -> Config {
@@ -5693,6 +5697,26 @@ mod tests {
             storage_root: root.to_path_buf(),
             ..Config::default()
         }
+    }
+
+    fn block_on<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce(Cx) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let cx = Cx::for_testing();
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(f(cx))
+    }
+
+    fn unique_human_key(prefix: &str) -> String {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+        format!("/tmp/{prefix}-{suffix}")
     }
 
     #[test]
@@ -5777,6 +5801,262 @@ mod tests {
 
         let id_path = res_dir.join("id-42.json");
         assert!(id_path.exists());
+    }
+
+    #[test]
+    fn db_and_storage_message_pipeline_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let db_path = tmp.path().join("message_pipeline.db");
+        let pool_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            max_connections: 8,
+            min_connections: 2,
+            acquire_timeout_ms: 60_000,
+            max_lifetime_ms: 3_600_000,
+            run_migrations: true,
+            warmup_connections: 0,
+        };
+        let pool = DbPool::new(&pool_config).expect("create db pool");
+        let pool_for_setup = pool.clone();
+
+        let sender_name = "BlueLake";
+        let recipient_name = "RedHarbor";
+        let (project_slug, project_id, recipient_id, message_id, created_ts_iso) =
+            block_on(|cx| async move {
+                let human_key = unique_human_key("storage-msg-pipeline");
+                let project = match queries::ensure_project(&cx, &pool_for_setup, &human_key).await
+                {
+                    Outcome::Ok(row) => row,
+                    other => panic!("ensure_project failed: {other:?}"),
+                };
+                let project_id = project.id.expect("project id");
+
+                let sender = match queries::register_agent(
+                    &cx,
+                    &pool_for_setup,
+                    project_id,
+                    sender_name,
+                    "test",
+                    "test-model",
+                    Some("message pipeline sender"),
+                    None,
+                )
+                .await
+                {
+                    Outcome::Ok(row) => row,
+                    other => panic!("register sender failed: {other:?}"),
+                };
+                let recipient = match queries::register_agent(
+                    &cx,
+                    &pool_for_setup,
+                    project_id,
+                    recipient_name,
+                    "test",
+                    "test-model",
+                    Some("message pipeline recipient"),
+                    None,
+                )
+                .await
+                {
+                    Outcome::Ok(row) => row,
+                    other => panic!("register recipient failed: {other:?}"),
+                };
+                let recipient_id = recipient.id.expect("recipient id");
+
+                let message = match queries::create_message_with_recipients(
+                    &cx,
+                    &pool_for_setup,
+                    project_id,
+                    sender.id.expect("sender id"),
+                    "Pipeline Message",
+                    "pipeline message body",
+                    Some("br-p1mi"),
+                    "normal",
+                    false,
+                    "[]",
+                    &[(recipient_id, "to")],
+                )
+                .await
+                {
+                    Outcome::Ok(row) => row,
+                    other => panic!("create_message_with_recipients failed: {other:?}"),
+                };
+
+                (
+                    project.slug,
+                    project_id,
+                    recipient_id,
+                    message.id.expect("message id"),
+                    micros_to_iso(message.created_ts),
+                )
+            });
+
+        let archive = ensure_archive(&config, &project_slug).expect("ensure archive");
+        let message_json = serde_json::json!({
+            "id": message_id,
+            "subject": "Pipeline Message",
+            "thread_id": "br-p1mi",
+            "created_ts": created_ts_iso,
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &message_json,
+            "pipeline message body",
+            sender_name,
+            &[recipient_name.to_string()],
+            &[],
+            None,
+        )
+        .expect("write message bundle");
+
+        let inbox = list_agent_inbox(&archive, recipient_name).expect("list inbox");
+        let outbox = list_agent_outbox(&archive, sender_name).expect("list outbox");
+        assert_eq!(inbox.len(), 1, "expected one inbox file");
+        assert_eq!(outbox.len(), 1, "expected one outbox file");
+
+        let inbox_body = std::fs::read_to_string(&inbox[0]).expect("read inbox file");
+        assert!(inbox_body.contains("\"id\":"));
+        assert!(inbox_body.contains("pipeline message body"));
+
+        let pool_for_verify = pool.clone();
+        block_on(|cx| async move {
+            let fetched = match queries::get_message(&cx, &pool_for_verify, message_id).await {
+                Outcome::Ok(row) => row,
+                other => panic!("get_message failed: {other:?}"),
+            };
+            assert_eq!(fetched.subject, "Pipeline Message");
+
+            let inbox_rows = match queries::fetch_inbox(
+                &cx,
+                &pool_for_verify,
+                project_id,
+                recipient_id,
+                false,
+                None,
+                20,
+            )
+            .await
+            {
+                Outcome::Ok(rows) => rows,
+                other => panic!("fetch_inbox failed: {other:?}"),
+            };
+            assert_eq!(inbox_rows.len(), 1, "recipient inbox should have one row");
+            assert_eq!(inbox_rows[0].message.id, Some(message_id));
+        });
+    }
+
+    #[test]
+    fn db_and_storage_reservation_pipeline_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let db_path = tmp.path().join("reservation_pipeline.db");
+        let pool_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            max_connections: 8,
+            min_connections: 2,
+            acquire_timeout_ms: 60_000,
+            max_lifetime_ms: 3_600_000,
+            run_migrations: true,
+            warmup_connections: 0,
+        };
+        let pool = DbPool::new(&pool_config).expect("create db pool");
+        let pool_for_setup = pool.clone();
+
+        let agent_name = "GreenCastle";
+        let (project_slug, project_id, reservation_rows) = block_on(|cx| async move {
+            let human_key = unique_human_key("storage-res-pipeline");
+            let project = match queries::ensure_project(&cx, &pool_for_setup, &human_key).await {
+                Outcome::Ok(row) => row,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let project_id = project.id.expect("project id");
+
+            let agent = match queries::register_agent(
+                &cx,
+                &pool_for_setup,
+                project_id,
+                agent_name,
+                "test",
+                "test-model",
+                Some("reservation pipeline agent"),
+                None,
+            )
+            .await
+            {
+                Outcome::Ok(row) => row,
+                other => panic!("register agent failed: {other:?}"),
+            };
+            let agent_id = agent.id.expect("agent id");
+
+            let reservations = match queries::create_file_reservations(
+                &cx,
+                &pool_for_setup,
+                project_id,
+                agent_id,
+                &["src/**", "docs/*.md"],
+                3600,
+                true,
+                "br-p1mi",
+            )
+            .await
+            {
+                Outcome::Ok(rows) => rows,
+                other => panic!("create_file_reservations failed: {other:?}"),
+            };
+
+            (project.slug, project_id, reservations)
+        });
+
+        let archive = ensure_archive(&config, &project_slug).expect("ensure archive");
+        let reservation_json: Vec<serde_json::Value> = reservation_rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.id.unwrap_or(0),
+                    "agent": agent_name,
+                    "path_pattern": row.path_pattern,
+                    "exclusive": row.exclusive != 0,
+                    "reason": row.reason,
+                    "created_ts": micros_to_iso(row.created_ts),
+                    "expires_ts": micros_to_iso(row.expires_ts),
+                })
+            })
+            .collect();
+
+        write_file_reservation_records(&archive, &config, &reservation_json)
+            .expect("write reservation artifacts");
+
+        let reservation_dir = archive.root.join("file_reservations");
+        for row in &reservation_rows {
+            let id = row.id.expect("reservation id");
+            let id_path = reservation_dir.join(format!("id-{id}.json"));
+            assert!(
+                id_path.exists(),
+                "expected reservation artifact {id_path:?}"
+            );
+
+            let artifact = std::fs::read_to_string(&id_path).expect("read reservation artifact");
+            assert!(artifact.contains(&row.path_pattern));
+        }
+
+        let pool_for_verify = pool.clone();
+        let expected_reservation_count = reservation_rows.len();
+        block_on(|cx| async move {
+            let active = match queries::list_file_reservations(
+                &cx,
+                &pool_for_verify,
+                project_id,
+                true,
+            )
+            .await
+            {
+                Outcome::Ok(rows) => rows,
+                other => panic!("list_file_reservations failed: {other:?}"),
+            };
+            assert_eq!(active.len(), expected_reservation_count);
+        });
     }
 
     #[test]

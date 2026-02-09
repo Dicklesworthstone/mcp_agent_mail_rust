@@ -5142,7 +5142,11 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                             report.summary.detected_count, report.summary.total_count
                         ));
                         for entry in &report.installed_agents {
-                            let status = if entry.detected { "detected" } else { "not found" };
+                            let status = if entry.detected {
+                                "detected"
+                            } else {
+                                "not found"
+                            };
                             ftui_runtime::ftui_println!("  {} ({})", entry.slug, status);
                             for path in &entry.root_paths {
                                 ftui_runtime::ftui_println!("    root: {path}");
@@ -10361,9 +10365,7 @@ sys.exit(7)
             Commands::Beads {
                 action:
                     BeadsCommand::List {
-                        status,
-                        priority,
-                        ..
+                        status, priority, ..
                     },
             } => {
                 assert_eq!(status.as_deref(), Some("open"));

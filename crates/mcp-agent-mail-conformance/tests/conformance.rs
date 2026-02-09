@@ -6,7 +6,7 @@ use fastmcp_core::SessionState;
 use mcp_agent_mail_conformance::{Case, ExpectedError, Fixtures, Normalize};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
@@ -1277,6 +1277,266 @@ fn tool_filter_profiles_match_fixtures() {
     }
 }
 
+#[test]
+fn product_bus_tools_end_to_end_across_linked_projects() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("product-bus-e2e.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage = tmp.path().join("archive");
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
+        ("WORKTREES_ENABLED", "1"),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("LLM_ENABLED", "0"),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+    ]);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+
+    let mut call_tool_json = |name: &str, arguments: Value| -> Value {
+        let params = CallToolParams {
+            name: name.to_string(),
+            arguments: Some(arguments),
+            meta: None,
+        };
+        let result = router
+            .handle_tools_call(
+                &cx,
+                req_id,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        req_id += 1;
+        assert!(
+            !result.is_error,
+            "{name} returned error: {:?}",
+            result.content
+        );
+        decode_json_from_tool_content(&result.content)
+            .unwrap_or_else(|e| panic!("{name} returned non-JSON content: {e}"))
+    };
+
+    let project_a_dir = tmp.path().join("project-alpha");
+    let project_b_dir = tmp.path().join("project-beta");
+    let project_c_dir = tmp.path().join("project-gamma-unlinked");
+    std::fs::create_dir_all(&project_a_dir).expect("create project alpha dir");
+    std::fs::create_dir_all(&project_b_dir).expect("create project beta dir");
+    std::fs::create_dir_all(&project_c_dir).expect("create project gamma dir");
+    let project_a_key = project_a_dir.to_string_lossy().to_string();
+    let project_b_key = project_b_dir.to_string_lossy().to_string();
+    let project_c_key = project_c_dir.to_string_lossy().to_string();
+
+    let project_a = call_tool_json(
+        "ensure_project",
+        serde_json::json!({ "human_key": project_a_key }),
+    );
+    let project_b = call_tool_json(
+        "ensure_project",
+        serde_json::json!({ "human_key": project_b_key }),
+    );
+    let project_c = call_tool_json(
+        "ensure_project",
+        serde_json::json!({ "human_key": project_c_key }),
+    );
+    let project_a_id = project_a
+        .get("id")
+        .and_then(Value::as_i64)
+        .expect("ensure_project alpha should include numeric id");
+    let project_b_id = project_b
+        .get("id")
+        .and_then(Value::as_i64)
+        .expect("ensure_project beta should include numeric id");
+    let project_c_id = project_c
+        .get("id")
+        .and_then(Value::as_i64)
+        .expect("ensure_project gamma should include numeric id");
+
+    for (project_key, agent_name) in [
+        (project_a_key.as_str(), "BlueLake"),
+        (project_a_key.as_str(), "GreenCastle"),
+        (project_b_key.as_str(), "BlueLake"),
+        (project_b_key.as_str(), "RedHarbor"),
+        (project_c_key.as_str(), "BlueLake"),
+        (project_c_key.as_str(), "PurpleBear"),
+    ] {
+        let _ = call_tool_json(
+            "register_agent",
+            serde_json::json!({
+                "project_key": project_key,
+                "program": "test",
+                "model": "test-model",
+                "name": agent_name
+            }),
+        );
+    }
+
+    let shared_thread = "product-bus-thread-e2e";
+    let _ = call_tool_json(
+        "send_message",
+        serde_json::json!({
+            "project_key": project_a_key,
+            "sender_name": "GreenCastle",
+            "to": ["BlueLake"],
+            "subject": "product-bus-e2e alpha",
+            "body_md": "- [ ] ACTION alpha follow-up",
+            "thread_id": shared_thread
+        }),
+    );
+    let _ = call_tool_json(
+        "send_message",
+        serde_json::json!({
+            "project_key": project_b_key,
+            "sender_name": "RedHarbor",
+            "to": ["BlueLake"],
+            "subject": "product-bus-e2e beta",
+            "body_md": "- [ ] ACTION beta follow-up",
+            "thread_id": shared_thread
+        }),
+    );
+    let _ = call_tool_json(
+        "send_message",
+        serde_json::json!({
+            "project_key": project_c_key,
+            "sender_name": "PurpleBear",
+            "to": ["BlueLake"],
+            "subject": "product-bus-e2e gamma unlinked",
+            "body_md": "- [ ] ACTION gamma follow-up",
+            "thread_id": shared_thread
+        }),
+    );
+
+    let product_key = "a1b2c3d4e5f6a7b8c9d0";
+    let ensured = call_tool_json(
+        "ensure_product",
+        serde_json::json!({
+            "product_key": product_key,
+            "name": "ProductBusE2E"
+        }),
+    );
+    assert_eq!(
+        ensured.get("product_uid").and_then(Value::as_str),
+        Some(product_key),
+        "ensure_product should keep explicit hex product key"
+    );
+
+    let _ = call_tool_json(
+        "products_link",
+        serde_json::json!({
+            "product_key": product_key,
+            "project_key": project_a_key
+        }),
+    );
+    let _ = call_tool_json(
+        "products_link",
+        serde_json::json!({
+            "product_key": product_key,
+            "project_key": project_b_key
+        }),
+    );
+
+    let search = call_tool_json(
+        "search_messages_product",
+        serde_json::json!({
+            "product_key": product_key,
+            "query": "product-bus-e2e",
+            "limit": 20
+        }),
+    );
+    let search_rows = search
+        .get("result")
+        .and_then(Value::as_array)
+        .expect("search_messages_product response must include result array");
+    assert!(
+        search_rows.len() >= 2,
+        "expected at least two linked-project hits, got {search_rows:?}"
+    );
+    let mut search_project_ids = BTreeSet::new();
+    for row in search_rows {
+        if let Some(project_id) = row.get("project_id").and_then(Value::as_i64) {
+            search_project_ids.insert(project_id);
+        }
+    }
+    assert!(search_project_ids.contains(&project_a_id));
+    assert!(search_project_ids.contains(&project_b_id));
+    assert!(
+        !search_project_ids.contains(&project_c_id),
+        "unlinked project should not be included in product search"
+    );
+
+    let inbox = call_tool_json(
+        "fetch_inbox_product",
+        serde_json::json!({
+            "product_key": product_key,
+            "agent_name": "BlueLake",
+            "limit": 20,
+            "include_bodies": true
+        }),
+    );
+    let inbox_rows = inbox
+        .as_array()
+        .expect("fetch_inbox_product should return array response");
+    assert!(
+        inbox_rows.len() >= 2,
+        "expected at least two inbox rows from linked projects"
+    );
+    let mut inbox_project_ids = BTreeSet::new();
+    for row in inbox_rows {
+        if let Some(project_id) = row.get("project_id").and_then(Value::as_i64) {
+            inbox_project_ids.insert(project_id);
+        }
+    }
+    assert!(inbox_project_ids.contains(&project_a_id));
+    assert!(inbox_project_ids.contains(&project_b_id));
+    assert!(
+        !inbox_project_ids.contains(&project_c_id),
+        "unlinked project should not be included in product inbox"
+    );
+
+    let summary = call_tool_json(
+        "summarize_thread_product",
+        serde_json::json!({
+            "product_key": product_key,
+            "thread_id": shared_thread,
+            "include_examples": true,
+            "llm_mode": false
+        }),
+    );
+    assert_eq!(
+        summary.get("thread_id").and_then(Value::as_str),
+        Some(shared_thread)
+    );
+    let participants = summary
+        .pointer("/summary/participants")
+        .and_then(Value::as_array)
+        .expect("summary.participants must be an array");
+    let participant_names: BTreeSet<&str> = participants.iter().filter_map(Value::as_str).collect();
+    assert!(participant_names.contains("GreenCastle"));
+    assert!(participant_names.contains("RedHarbor"));
+    assert!(
+        !participant_names.contains("PurpleBear"),
+        "unlinked project participant should not appear in summary"
+    );
+    let examples = summary
+        .get("examples")
+        .and_then(Value::as_array)
+        .expect("summary examples must be an array");
+    assert!(
+        examples.len() >= 2,
+        "expected examples from linked projects in thread summary"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Archive artifact conformance tests
 // ---------------------------------------------------------------------------
@@ -1412,6 +1672,284 @@ fn fixture_resource_identity_coverage() {
         has_identity,
         "fixtures must include at least one resource://identity/{{project}} case"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Resource query routing edge cases (fastmcp matching behavior)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resource_query_router_projects_limit_and_contains_are_honored() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("projects-query-routing.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage = tmp.path().join("archive");
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+    ]);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+
+    // Seed multiple projects so filtering/limits are observable.
+    let project_keys = [
+        "/tmp/router-query-alpha",
+        "/tmp/router-query-mail-one",
+        "/tmp/router-query-mail-two",
+    ];
+    for human_key in project_keys {
+        let params = CallToolParams {
+            name: "ensure_project".to_string(),
+            arguments: Some(serde_json::json!({ "human_key": human_key })),
+            meta: None,
+        };
+        let result = router.handle_tools_call(
+            &cx,
+            req_id,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        );
+        req_id += 1;
+        let call_result = result.unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
+        assert!(!call_result.is_error, "ensure_project returned error");
+    }
+
+    // Critical assertion: query URI must route to query-aware resource behavior.
+    let params = ReadResourceParams {
+        uri: "resource://projects?contains=mail&limit=1".to_string(),
+        meta: None,
+    };
+    let result = router.handle_resources_read(
+        &cx,
+        req_id,
+        &params,
+        &budget,
+        SessionState::new(),
+        None,
+        None,
+    );
+    req_id += 1;
+    let read_result = result.expect("projects query read should succeed");
+    let json = decode_json_from_resource_contents(&params.uri, &read_result.contents)
+        .expect("projects query response should decode");
+    let projects = json
+        .as_array()
+        .unwrap_or_else(|| panic!("expected projects array, got: {json}"));
+    assert_eq!(
+        projects.len(),
+        1,
+        "expected limit=1 to be honored for resource://projects query route"
+    );
+
+    let first = &projects[0];
+    let slug_has_mail = first
+        .get("slug")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.to_ascii_lowercase().contains("mail"));
+    let human_key_has_mail = first
+        .get("human_key")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.to_ascii_lowercase().contains("mail"));
+    assert!(
+        slug_has_mail || human_key_has_mail,
+        "expected contains=mail filter to be honored, got row: {first}"
+    );
+
+    let zero_params = ReadResourceParams {
+        uri: "resource://projects?limit=0".to_string(),
+        meta: None,
+    };
+    let zero_result = router
+        .handle_resources_read(
+            &cx,
+            req_id,
+            &zero_params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        )
+        .expect("projects limit=0 read should succeed");
+    let zero_json = decode_json_from_resource_contents(&zero_params.uri, &zero_result.contents)
+        .expect("projects limit=0 response should decode");
+    let zero_projects = zero_json
+        .as_array()
+        .unwrap_or_else(|| panic!("expected projects array, got: {zero_json}"));
+    assert!(
+        zero_projects.is_empty(),
+        "expected limit=0 to return empty list, got: {zero_json}"
+    );
+}
+
+#[test]
+fn resource_query_router_projects_invalid_query_values_surface_errors() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("projects-query-errors.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage = tmp.path().join("archive");
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+    ]);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+
+    let invalid_cases = [
+        ("resource://projects?limit=NaN", "Invalid limit"),
+        (
+            "resource://projects?format=xml",
+            "Unsupported projects format",
+        ),
+    ];
+
+    for (idx, (uri, expected_substr)) in invalid_cases.into_iter().enumerate() {
+        let params = ReadResourceParams {
+            uri: uri.to_string(),
+            meta: None,
+        };
+        let result = router.handle_resources_read(
+            &cx,
+            u64::try_from(idx + 1).expect("request id"),
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        );
+
+        match result {
+            Err(err) => {
+                assert!(
+                    err.message.contains(expected_substr),
+                    "expected router error to contain {:?}, got {:?} for URI {}",
+                    expected_substr,
+                    err.message,
+                    uri
+                );
+            }
+            Ok(read_result) => {
+                let text = read_result
+                    .contents
+                    .first()
+                    .and_then(|c| c.text.as_deref())
+                    .unwrap_or("<non-text>");
+                assert!(
+                    text.contains(expected_substr),
+                    "expected query validation error containing {:?}, got successful content {:?} for URI {}",
+                    expected_substr,
+                    text,
+                    uri
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("resource-error-cases.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage = tmp.path().join("archive");
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+    ]);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "resource://project/does-not-exist",
+            &["Project not found", "project not found"],
+        ),
+        (
+            "resource://message/not-a-number",
+            &["Invalid message ID", "invalid message id"],
+        ),
+        (
+            "resource://message/1",
+            &["project query parameter is required"],
+        ),
+        (
+            "resource://definitely-not-real/123",
+            &["Unknown resource", "unknown resource", "not found"],
+        ),
+    ];
+
+    for (idx, (uri, expected_any)) in cases.into_iter().enumerate() {
+        let params = ReadResourceParams {
+            uri: uri.to_string(),
+            meta: None,
+        };
+        let result = router.handle_resources_read(
+            &cx,
+            u64::try_from(idx + 1).expect("request id"),
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        );
+
+        let contains_any = |text: &str| -> bool {
+            let lower = text.to_ascii_lowercase();
+            expected_any
+                .iter()
+                .any(|needle| text.contains(needle) || lower.contains(&needle.to_ascii_lowercase()))
+        };
+
+        match result {
+            Err(err) => {
+                assert!(
+                    contains_any(&err.message),
+                    "expected one of {:?}, got error {:?} for URI {}",
+                    expected_any,
+                    err.message,
+                    uri
+                );
+            }
+            Ok(read_result) => {
+                let text = read_result
+                    .contents
+                    .first()
+                    .and_then(|c| c.text.as_deref())
+                    .unwrap_or("<non-text>");
+                assert!(
+                    contains_any(text),
+                    "expected one of {:?}, got successful content {:?} for URI {}",
+                    expected_any,
+                    text,
+                    uri
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -30,8 +30,7 @@ mod feature_enabled {
     fn write_failure_artifact(filename: &str, content: &str) {
         let ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis());
         let run_id = format!("{}_{}", ts_ms, std::process::id());
         let dir = repo_root()
             .join("tests")

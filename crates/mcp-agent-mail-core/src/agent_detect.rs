@@ -93,7 +93,7 @@ fn build_overrides_map(overrides: &[AgentDetectRootOverride]) -> HashMap<String,
 #[cfg(feature = "agent-detect")]
 fn validate_known_connectors(
     available: &HashSet<&'static str>,
-    only: &Option<HashSet<String>>,
+    only: Option<&HashSet<String>>,
     overrides: &HashMap<String, Vec<PathBuf>>,
 ) -> Result<(), AgentDetectError> {
     let mut unknown: Vec<String> = Vec::new();
@@ -180,7 +180,7 @@ fn detect_installed_agents_enabled(
         .as_ref()
         .map(|slugs| slugs.iter().filter_map(|s| normalize_slug(s)).collect());
 
-    validate_known_connectors(&available, &only, &overrides)?;
+    validate_known_connectors(&available, only.as_ref(), &overrides)?;
 
     let mut all_entries: Vec<InstalledAgentDetectionEntry> = factories
         .into_iter()
@@ -268,7 +268,7 @@ mod tests {
             root_overrides: vec![
                 AgentDetectRootOverride {
                     slug: "codex".to_string(),
-                    root: codex_root.clone(),
+                    root: codex_root,
                 },
                 AgentDetectRootOverride {
                     slug: "gemini".to_string(),
@@ -320,7 +320,9 @@ mod tests {
             AgentDetectError::UnknownConnectors { connectors } => {
                 assert_eq!(connectors, vec!["not-a-real-connector".to_string()]);
             }
-            other => panic!("unexpected error: {other:?}"),
+            AgentDetectError::FeatureDisabled => {
+                panic!("unexpected error: FeatureDisabled")
+            }
         }
     }
 
@@ -341,7 +343,9 @@ mod tests {
             AgentDetectError::UnknownConnectors { connectors } => {
                 assert_eq!(connectors, vec!["definitely-unknown".to_string()]);
             }
-            other => panic!("unexpected error: {other:?}"),
+            AgentDetectError::FeatureDisabled => {
+                panic!("unexpected error: FeatureDisabled")
+            }
         }
     }
 }

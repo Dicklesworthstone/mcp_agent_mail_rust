@@ -7,7 +7,7 @@
 - [x] Reserve files before edits (Agent Mail leases) and release on completion.
 - [x] Keep `FEATURE_PARITY.md` aligned with completed work.
 - [x] Keep `TODO.md` updated after each batch of changes.
-- [ ] Confirm MCP Agent Mail server stability (health check path, lock handling).
+- [x] Confirm MCP Agent Mail server stability (health check path, lock handling).
 
 ## 1. Workspace & Crate Scaffolding
 - [x] Workspace `Cargo.toml` with required path deps.
@@ -62,7 +62,7 @@
 - [x] Macros: start_session/prepare_thread/file_reservation_cycle/contact_handshake.
 - [x] TOON output handling for tool + resource responses.
 - [x] Instrumentation wrapper for per-tool query stats logging.
-- [ ] Validate resource query matching behavior against fastmcp router (edge cases).
+- [x] Validate resource query matching behavior against fastmcp router (edge cases).
 - [x] Implement query parsing for static resources (`resource://projects?format=...`).
 
 ## 5. Storage Layer (Git Archive)
@@ -123,16 +123,16 @@
 - [x] Capture hyperfine baselines for CLI commands (serve + send_message + fetch_inbox).
 - [x] Run `cargo flamegraph` for hot paths (search + send_message + storage writes).
 - [x] Record golden outputs + checksums for optimization validation.
-- [ ] Maintain perf regression notes in `FEATURE_PARITY.md` or dedicated doc.
+- [x] Maintain perf regression notes in `FEATURE_PARITY.md` or dedicated doc.
 
 ## 10. Dependency Integration (Local /dp Crates)
 - [x] Confirm zero direct `tokio` usage in code paths (only via optional deps).
 - [x] Use `sqlmodel_rust` for SQLite access (no direct `rusqlite`).
 - [x] Use `asupersync` for HTTP + async runtime.
 - [x] Use `frankentui` (`ftui`) for CLI rendering.
-- [ ] Integrate `beads_rust` for issue/task awareness in CLI or server.
-- [ ] Integrate `coding_agent_session_search` for agent detection (or port logic to avoid tokio).
-- [ ] Evaluate fastmcp resource query param handling; add adapters if needed.
+- [x] Integrate `beads_rust` for issue/task awareness in CLI or server.
+- [x] Integrate `coding_agent_session_search` for agent detection (or port logic to avoid tokio).
+- [x] Evaluate fastmcp resource query param handling; add adapters if needed (validated by router-level conformance tests; no adapter required).
 
 ## 11. Testing & QA
 - [x] Unit tests for tool validation rules (input constraints, error messages).
@@ -143,7 +143,7 @@
 
 ## 12. Publishing & Release (Crates.io + CI)
 - [x] Confirm Cargo metadata (license/readme/repository) for publishable crates.
-- [ ] Add crates.io publish workflow gated by tags (`CARGO_REGISTRY_TOKEN`).
+- [x] Add crates.io publish workflow gated by tags (`CARGO_REGISTRY_TOKEN`).
 - [x] Document publish order for workspace crates (`cargo publish -p ...`).
 
 ### Publish Order (dependency-respecting)

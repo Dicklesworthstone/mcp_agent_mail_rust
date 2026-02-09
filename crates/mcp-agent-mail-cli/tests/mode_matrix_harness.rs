@@ -146,6 +146,7 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["tooling", "--help"],
     &["macros", "--help"],
     &["contacts", "--help"],
+    &["beads", "--help"],
     &["file_reservations", "--help"],
 ];
 
@@ -168,6 +169,7 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["projects"],
     &["products"],
     &["file_reservations"],
+    &["beads"],
 ];
 
 /// Commands that MCP binary should allow (not deny).
@@ -572,6 +574,14 @@ fn matrix_coverage_complete() {
             let trimmed = line.trim();
             let first_word = trimmed.split_whitespace().next()?;
             if first_word.starts_with('-') || first_word.is_empty() {
+                return None;
+            }
+            // Ignore wrapped description continuation lines (e.g. "handshake", "cycles,").
+            // Command names are strictly [a-z0-9_-]+ in clap output.
+            if !first_word
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
                 return None;
             }
             Some(first_word)

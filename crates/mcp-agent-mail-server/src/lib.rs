@@ -5800,6 +5800,89 @@ mod tests {
     }
 
     #[test]
+    fn http_post_bad_jsonrpc_shape_returns_bad_request_error() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        // Missing required "method" field => malformed JSON-RPC request shape.
+        let mut req = make_request(Http1Method::Post, "/api", &[]);
+        req.body = br#"{"jsonrpc":"2.0","id":1,"params":{}}"#.to_vec();
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json")
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["error"]["code"], -32600);
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("missing field") && message.contains("method"),
+            "unexpected malformed-request message: {message}"
+        );
+    }
+
+    #[test]
+    fn http_post_unknown_jsonrpc_method_returns_method_not_found() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let mut req = make_request(Http1Method::Post, "/api", &[]);
+        let json_rpc = JsonRpcRequest::new("wrong/method", None, 73_i64);
+        req.body = serde_json::to_vec(&json_rpc).expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 73);
+        assert_eq!(body["error"]["code"], -32601);
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("Method not found"),
+            "unexpected method-not-found message: {message}"
+        );
+    }
+
+    #[test]
+    fn http_post_jsonrpc_extra_fields_are_ignored() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let mut req = make_request(Http1Method::Post, "/api", &[]);
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 91,
+            "method": "tools/list",
+            "params": {},
+            "unexpected_field": "ignored",
+            "nested": { "extra": true }
+        });
+        req.body = serde_json::to_vec(&payload).expect("serialize payload");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 91);
+        assert!(
+            body.get("error").is_none(),
+            "extra fields should not force protocol error: {body}"
+        );
+        assert!(
+            body.get("result")
+                .and_then(|v| v.get("tools"))
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "expected tools/list result despite extra fields"
+        );
+    }
+
+    #[test]
     fn rate_limit_identity_prefers_jwt_sub() {
         let req = make_request_with_peer_addr(
             Http1Method::Post,

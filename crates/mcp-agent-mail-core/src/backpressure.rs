@@ -474,11 +474,16 @@ mod tests {
         assert!(is_shedable_tool("whois"));
         assert!(is_shedable_tool("search_messages"));
         assert!(is_shedable_tool("summarize_thread"));
+        assert!(is_shedable_tool("install_precommit_guard"));
+        assert!(is_shedable_tool("uninstall_precommit_guard"));
         assert!(!is_shedable_tool("send_message"));
         assert!(!is_shedable_tool("fetch_inbox"));
         assert!(!is_shedable_tool("register_agent"));
         assert!(!is_shedable_tool("ensure_project"));
         assert!(!is_shedable_tool("file_reservation_paths"));
+        assert!(!is_shedable_tool("Health_Check"));
+        assert!(!is_shedable_tool("health_check "));
+        assert!(!is_shedable_tool(""));
     }
 
     #[test]

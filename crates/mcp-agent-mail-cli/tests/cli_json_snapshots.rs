@@ -83,6 +83,25 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                 for (k, val) in map {
                     out.insert(k, walk(val, tmp));
                 }
+                if let Some(check_name) = out.get("check").and_then(Value::as_str) {
+                    match check_name {
+                        // Environment-dependent connector inventory.
+                        "installed_agents" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("<INSTALLED_AGENTS_SUMMARY>".to_string()),
+                            );
+                        }
+                        // Depends on live .beads state in the repository under test.
+                        "beads_issue_awareness" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("<BEADS_ISSUE_AWARENESS_SUMMARY>".to_string()),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 Value::Object(out)
             }
             other => other,

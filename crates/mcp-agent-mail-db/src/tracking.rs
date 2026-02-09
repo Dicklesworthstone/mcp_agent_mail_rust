@@ -1045,13 +1045,33 @@ mod tests {
         assert_eq!(per_table["file_reservations"].as_u64(), Some(2));
         assert_eq!(per_table["projects"].as_u64(), Some(1));
 
-        // serde_json::Map (backed by BTreeMap) sorts keys alphabetically,
-        // so we verify counts are correct rather than insertion order.
-        let keys: Vec<&String> = per_table.keys().collect();
-        assert_eq!(
-            keys,
-            vec!["agents", "file_reservations", "messages", "projects"]
-        );
+        let keys: Vec<&str> = per_table.keys().map(std::string::String::as_str).collect();
+
+        // serde_json::Map backend depends on feature unification:
+        // - BTreeMap backend iterates in key order.
+        // - IndexMap backend iterates in insertion order.
+        //
+        // We keep this test robust under both while still checking that insertion
+        // order reflects count-desc, name-asc sorting when preserve_order is enabled.
+        let mut order_probe = serde_json::Map::new();
+        order_probe.insert("b".to_string(), serde_json::Value::Null);
+        order_probe.insert("a".to_string(), serde_json::Value::Null);
+        let preserves_insertion_order = order_probe
+            .keys()
+            .map(std::string::String::as_str)
+            .eq(["b", "a"]);
+
+        if preserves_insertion_order {
+            assert_eq!(
+                keys,
+                vec!["messages", "agents", "file_reservations", "projects"]
+            );
+        } else {
+            assert_eq!(
+                keys,
+                vec!["agents", "file_reservations", "messages", "projects"]
+            );
+        }
     }
 
     // ── Thread-local tracker isolation ───────────────────────────────────

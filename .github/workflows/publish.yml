@@ -1,0 +1,184 @@
+name: Publish Crates
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run cargo publish in dry-run mode only"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish workspace crates to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify release context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main --depth=1
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release commit $GITHUB_SHA is not reachable from origin/main"
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Tag '$TAG' is not a supported release tag (expected vX.Y.Z)"
+              exit 1
+            fi
+          elif [[ "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "workflow_dispatch must run from main (got: $GITHUB_REF_NAME)"
+            exit 1
+          fi
+
+      - name: Verify workspace version matches tag
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          WORKSPACE_VERSION="$(python - <<'PY'
+          import pathlib
+          import tomllib
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          print(cargo["workspace"]["package"]["version"])
+          PY
+          )"
+
+          if [[ "$WORKSPACE_VERSION" != "$TAG_VERSION" ]]; then
+            echo "Workspace version ($WORKSPACE_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Determine publish mode
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            echo "mode=publish" >> "$GITHUB_OUTPUT"
+            echo "flag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DRY_RUN="$(jq -r '.inputs.dry_run // "true"' "$GITHUB_EVENT_PATH")"
+          if [[ "$DRY_RUN" != "true" ]]; then
+            echo "Manual non-dry-run publish is blocked; push a release tag instead."
+            exit 1
+          fi
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "mode=dry-run" >> "$GITHUB_OUTPUT"
+            echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Preflight package validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          crates=(
+            mcp-agent-mail-core
+            mcp-agent-mail-db
+            mcp-agent-mail-storage
+            mcp-agent-mail-guard
+            mcp-agent-mail-share
+            mcp-agent-mail-tools
+            mcp-agent-mail-server
+            mcp-agent-mail-cli
+            mcp-agent-mail
+          )
+
+          for crate in "${crates[@]}"; do
+            echo "Preflight: $crate"
+            cargo publish -p "$crate" --locked --dry-run
+          done
+
+      - name: Publish crates to crates.io
+        if: steps.mode.outputs.mode == 'publish'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is required for publish mode"
+            exit 1
+          fi
+
+          publish_with_retry() {
+            local crate="$1"
+            local attempt
+
+            for attempt in 1 2 3; do
+              echo "Publishing $crate (attempt $attempt/3)"
+              set +e
+              output="$(cargo publish -p "$crate" --locked 2>&1)"
+              status=$?
+              set -e
+              echo "$output"
+
+              if [[ $status -eq 0 ]]; then
+                return 0
+              fi
+
+              if grep -qi "already uploaded" <<<"$output"; then
+                echo "Crate $crate already uploaded; continuing."
+                return 0
+              fi
+
+              if [[ $attempt -lt 3 ]]; then
+                sleep $((attempt * 20))
+              fi
+            done
+
+            echo "Failed to publish $crate after retries"
+            return 1
+          }
+
+          crates=(
+            mcp-agent-mail-core
+            mcp-agent-mail-db
+            mcp-agent-mail-storage
+            mcp-agent-mail-guard
+            mcp-agent-mail-share
+            mcp-agent-mail-tools
+            mcp-agent-mail-server
+            mcp-agent-mail-cli
+            mcp-agent-mail
+          )
+
+          for crate in "${crates[@]}"; do
+            publish_with_retry "$crate"
+            sleep 15
+          done

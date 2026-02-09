@@ -793,12 +793,18 @@ mod tests {
 
     #[test]
     fn parse_http_status_401() {
-        assert_eq!(parse_http_status(b"HTTP/1.1 401 Unauthorized\r\n"), Some(401));
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 401 Unauthorized\r\n"),
+            Some(401)
+        );
     }
 
     #[test]
     fn parse_http_status_500() {
-        assert_eq!(parse_http_status(b"HTTP/1.1 500 Internal Server Error\r\n"), Some(500));
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 500 Internal Server Error\r\n"),
+            Some(500)
+        );
     }
 
     #[test]
@@ -934,7 +940,11 @@ mod tests {
         }
     }
 
-    fn make_probe(kind: ProbeAuthKind, status: Option<u16>, body_has_tools: Option<bool>) -> PathProbe {
+    fn make_probe(
+        kind: ProbeAuthKind,
+        status: Option<u16>,
+        body_has_tools: Option<bool>,
+    ) -> PathProbe {
         PathProbe {
             path: "/mcp/".into(),
             kind,
@@ -1042,13 +1052,28 @@ mod tests {
         let mut out = DiagnosticsSnapshot {
             configured_path: "/mcp/".into(),
             path_probes: vec![
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
-                PathProbe { path: "/api/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
+                PathProbe {
+                    path: "/mcp/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(200),
+                    body_has_tools: Some(true),
+                    ..Default::default()
+                },
+                PathProbe {
+                    path: "/api/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(200),
+                    body_has_tools: Some(true),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
         add_base_path_findings(&mut out);
-        assert!(out.lines.is_empty(), "no findings when configured path works");
+        assert!(
+            out.lines.is_empty(),
+            "no findings when configured path works"
+        );
     }
 
     #[test]
@@ -1056,14 +1081,34 @@ mod tests {
         let mut out = DiagnosticsSnapshot {
             configured_path: "/custom/".into(),
             path_probes: vec![
-                PathProbe { path: "/custom/".into(), kind: ProbeAuthKind::Unauth, status: Some(404), ..Default::default() },
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
-                PathProbe { path: "/api/".into(), kind: ProbeAuthKind::Unauth, status: Some(404), ..Default::default() },
+                PathProbe {
+                    path: "/custom/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(404),
+                    ..Default::default()
+                },
+                PathProbe {
+                    path: "/mcp/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(200),
+                    body_has_tools: Some(true),
+                    ..Default::default()
+                },
+                PathProbe {
+                    path: "/api/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(404),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
         add_base_path_findings(&mut out);
-        assert!(out.lines.iter().any(|l| l.name == "base-path" && l.level == Level::Fail));
+        assert!(
+            out.lines
+                .iter()
+                .any(|l| l.name == "base-path" && l.level == Level::Fail)
+        );
         assert!(out.lines.iter().any(|l| l.detail.contains("/mcp/")));
     }
 
@@ -1072,15 +1117,34 @@ mod tests {
         let mut out = DiagnosticsSnapshot {
             configured_path: "/mcp/".into(),
             path_probes: vec![
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(404), ..Default::default() },
-                PathProbe { path: "/api/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
+                PathProbe {
+                    path: "/mcp/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(404),
+                    ..Default::default()
+                },
+                PathProbe {
+                    path: "/api/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(200),
+                    body_has_tools: Some(true),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
         add_base_path_findings(&mut out);
         // Should have both a base-path FAIL and a base-path-alias WARN
-        assert!(out.lines.iter().any(|l| l.name == "base-path" && l.level == Level::Fail));
-        assert!(out.lines.iter().any(|l| l.name == "base-path-alias" && l.level == Level::Warn));
+        assert!(
+            out.lines
+                .iter()
+                .any(|l| l.name == "base-path" && l.level == Level::Fail)
+        );
+        assert!(
+            out.lines
+                .iter()
+                .any(|l| l.name == "base-path-alias" && l.level == Level::Warn)
+        );
     }
 
     #[test]
@@ -1088,13 +1152,28 @@ mod tests {
         let mut out = DiagnosticsSnapshot {
             configured_path: "/mcp/".into(),
             path_probes: vec![
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
-                PathProbe { path: "/api/".into(), kind: ProbeAuthKind::Unauth, status: Some(404), ..Default::default() },
+                PathProbe {
+                    path: "/mcp/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(200),
+                    body_has_tools: Some(true),
+                    ..Default::default()
+                },
+                PathProbe {
+                    path: "/api/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(404),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
         add_base_path_findings(&mut out);
-        assert!(out.lines.iter().any(|l| l.name == "base-path-alias" && l.detail.contains("/api/")));
+        assert!(
+            out.lines
+                .iter()
+                .any(|l| l.name == "base-path-alias" && l.detail.contains("/api/"))
+        );
     }
 
     // --- add_auth_findings ---
@@ -1125,13 +1204,20 @@ mod tests {
         let mut out = DiagnosticsSnapshot {
             auth_enabled: true,
             localhost_unauth_allowed: false,
-            path_probes: vec![
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), ..Default::default() },
-            ],
+            path_probes: vec![PathProbe {
+                path: "/mcp/".into(),
+                kind: ProbeAuthKind::Unauth,
+                status: Some(200),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         add_auth_findings(&mut out);
-        assert!(out.lines.iter().any(|l| l.name == "auth" && l.level == Level::Warn));
+        assert!(
+            out.lines
+                .iter()
+                .any(|l| l.name == "auth" && l.level == Level::Warn)
+        );
     }
 
     #[test]
@@ -1139,14 +1225,19 @@ mod tests {
         let mut out = DiagnosticsSnapshot {
             auth_enabled: true,
             localhost_unauth_allowed: false,
-            path_probes: vec![
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(401), ..Default::default() },
-            ],
+            path_probes: vec![PathProbe {
+                path: "/mcp/".into(),
+                kind: ProbeAuthKind::Unauth,
+                status: Some(401),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         add_auth_findings(&mut out);
         // Should NOT have the "all 200" warning
-        assert!(!out.lines.iter().any(|l| l.name == "auth" && l.level == Level::Warn && l.detail.contains("200 everywhere")));
+        assert!(!out.lines.iter().any(|l| l.name == "auth"
+            && l.level == Level::Warn
+            && l.detail.contains("200 everywhere")));
     }
 
     #[test]
@@ -1157,13 +1248,25 @@ mod tests {
             token_present: true,
             configured_path: "/mcp/".into(),
             path_probes: vec![
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(401), ..Default::default() },
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Auth, status: Some(403), ..Default::default() },
+                PathProbe {
+                    path: "/mcp/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(401),
+                    ..Default::default()
+                },
+                PathProbe {
+                    path: "/mcp/".into(),
+                    kind: ProbeAuthKind::Auth,
+                    status: Some(403),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
         add_auth_findings(&mut out);
-        assert!(out.lines.iter().any(|l| l.name == "auth" && l.level == Level::Fail && l.detail.contains("Authenticated probe did not succeed")));
+        assert!(out.lines.iter().any(|l| l.name == "auth"
+            && l.level == Level::Fail
+            && l.detail.contains("Authenticated probe did not succeed")));
     }
 
     #[test]
@@ -1174,14 +1277,28 @@ mod tests {
             token_present: true,
             configured_path: "/mcp/".into(),
             path_probes: vec![
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(401), ..Default::default() },
-                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Auth, status: Some(200), ..Default::default() },
+                PathProbe {
+                    path: "/mcp/".into(),
+                    kind: ProbeAuthKind::Unauth,
+                    status: Some(401),
+                    ..Default::default()
+                },
+                PathProbe {
+                    path: "/mcp/".into(),
+                    kind: ProbeAuthKind::Auth,
+                    status: Some(200),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
         add_auth_findings(&mut out);
         // No auth failure finding
-        assert!(!out.lines.iter().any(|l| l.name == "auth" && l.level == Level::Fail));
+        assert!(
+            !out.lines
+                .iter()
+                .any(|l| l.name == "auth" && l.level == Level::Fail)
+        );
     }
 
     // --- parse_http_endpoint edge cases ---

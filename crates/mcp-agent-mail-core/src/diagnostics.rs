@@ -106,8 +106,13 @@ pub fn init_process_start() {
     let _ = &*PROCESS_START;
 }
 
+#[inline]
+fn process_uptime() -> std::time::Duration {
+    PROCESS_START.elapsed()
+}
+
 fn system_info() -> SystemInfo {
-    let uptime = PROCESS_START.elapsed();
+    let uptime = process_uptime();
     SystemInfo {
         uptime_secs: uptime.as_secs(),
         rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("nightly"),
@@ -359,6 +364,21 @@ impl DiagnosticReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_process_start_is_idempotent() {
+        init_process_start();
+        let before = process_uptime();
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        init_process_start();
+        let after = process_uptime();
+
+        assert!(
+            after >= before + std::time::Duration::from_millis(10),
+            "process uptime appears to have been reset: before={before:?} after={after:?}"
+        );
+    }
 
     #[test]
     fn report_builds_without_panic() {

@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn style_tags_stripped() {
-        let html = render_markdown_to_safe_html("<style>body{color:red}</style>");
+        let html = render_markdown_to_safe_html(&format!("<style>body{}</style>", "{color:red}"));
         assert!(!html.contains("<style>"));
     }
 
@@ -217,24 +217,21 @@ mod tests {
 
     #[test]
     fn javascript_url_stripped() {
-        let html =
-            render_markdown_to_safe_html("<a href=\"javascript:alert(1)\">bad</a>");
+        let html = render_markdown_to_safe_html("<a href=\"javascript:alert(1)\">bad</a>");
         assert!(!html.contains("javascript:"));
     }
 
     #[test]
     fn allowed_style_properties() {
-        let html = render_markdown_to_safe_html(
-            "<span style=\"color:red;text-align:center\">ok</span>",
-        );
+        let html =
+            render_markdown_to_safe_html("<span style=\"color:red;text-align:center\">ok</span>");
         assert!(html.contains("color:red"));
     }
 
     #[test]
     fn disallowed_style_properties_stripped() {
-        let html = render_markdown_to_safe_html(
-            "<span style=\"position:absolute;top:0\">bad</span>",
-        );
+        let html =
+            render_markdown_to_safe_html("<span style=\"position:absolute;top:0\">bad</span>");
         assert!(!html.contains("position"));
     }
 
@@ -274,9 +271,8 @@ mod tests {
 
     #[test]
     fn data_uri_images_allowed() {
-        let html = render_markdown_to_safe_html(
-            "<img src=\"data:image/png;base64,abc123\" alt=\"pic\">",
-        );
+        let html =
+            render_markdown_to_safe_html("<img src=\"data:image/png;base64,abc123\" alt=\"pic\">");
         assert!(html.contains("data:image/png"));
     }
 }
