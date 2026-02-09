@@ -5756,6 +5756,26 @@ mod tests {
 
     #[test]
     fn http_post_base_path_without_slash_matches_base_with_slash() {
+        fn normalize_tools_list(value: &mut serde_json::Value) {
+            if let Some(tools) = value
+                .get_mut("result")
+                .and_then(|result| result.get_mut("tools"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.sort_by(|a, b| {
+                    let a_name = a
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let b_name = b
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    a_name.cmp(b_name)
+                });
+            }
+        }
+
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
 
@@ -5771,8 +5791,14 @@ mod tests {
         let resp_slash = block_on(state.handle(req_slash));
 
         assert_eq!(resp_base.status, resp_slash.status);
+        let mut base_body: serde_json::Value =
+            serde_json::from_slice(&resp_base.body).expect("parse /api JSON body");
+        let mut slash_body: serde_json::Value =
+            serde_json::from_slice(&resp_slash.body).expect("parse /api/ JSON body");
+        normalize_tools_list(&mut base_body);
+        normalize_tools_list(&mut slash_body);
         assert_eq!(
-            resp_base.body, resp_slash.body,
+            base_body, slash_body,
             "POST /api passthrough must behave identically to POST /api/"
         );
     }

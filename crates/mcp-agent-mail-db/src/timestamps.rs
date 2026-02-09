@@ -164,6 +164,14 @@ pub fn iso_to_micros(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn skew_test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK.get_or_init(|| Mutex::new(()));
+        lock.lock()
+            .unwrap_or_else(|poisoned| panic!("timestamp skew test lock poisoned: {poisoned}"))
+    }
 
     #[test]
     fn test_round_trip() {
@@ -178,6 +186,9 @@ mod tests {
 
     #[test]
     fn test_now_micros() {
+        let _guard = skew_test_guard();
+        clock_skew_reset();
+
         let before = Utc::now().timestamp_micros();
         let now = now_micros();
         let after = Utc::now().timestamp_micros();
@@ -253,6 +264,7 @@ mod tests {
 
     #[test]
     fn clock_skew_metrics_initially_zero() {
+        let _guard = skew_test_guard();
         // Reset to isolate from parallel tests.
         clock_skew_reset();
         let m = clock_skew_metrics();
@@ -262,6 +274,7 @@ mod tests {
 
     #[test]
     fn now_micros_monotonic_under_normal_conditions() {
+        let _guard = skew_test_guard();
         // Reset to clean state.
         clock_skew_reset();
 
@@ -276,6 +289,7 @@ mod tests {
 
     #[test]
     fn backward_jump_returns_last_seen() {
+        let _guard = skew_test_guard();
         clock_skew_reset();
 
         // Prime the global with a known "future" value.
@@ -295,6 +309,7 @@ mod tests {
 
     #[test]
     fn forward_jump_detected_and_counted() {
+        let _guard = skew_test_guard();
         clock_skew_reset();
 
         // Prime the global with a value far in the past (>5min ago).
@@ -316,6 +331,7 @@ mod tests {
 
     #[test]
     fn now_micros_raw_unaffected_by_skew() {
+        let _guard = skew_test_guard();
         clock_skew_reset();
 
         // Prime global far in the future.
@@ -332,6 +348,7 @@ mod tests {
 
     #[test]
     fn small_backward_drift_allowed() {
+        let _guard = skew_test_guard();
         clock_skew_reset();
 
         // Set LAST to just slightly in the future (< 1s), simulating normal jitter.

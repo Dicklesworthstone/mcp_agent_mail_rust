@@ -593,9 +593,16 @@ mod tests {
                 exp["ack_required"].as_i64().unwrap(),
                 "ack_required mismatch for msg {id}"
             );
+            let actual_attachments: serde_json::Value =
+                serde_json::from_str(&attachments).expect("attachments JSON should be valid");
+            let expected_attachments: serde_json::Value = serde_json::from_str(
+                exp["attachments"]
+                    .as_str()
+                    .expect("fixture attachments should be a JSON string"),
+            )
+            .expect("fixture attachments JSON should be valid");
             assert_eq!(
-                attachments,
-                exp["attachments"].as_str().unwrap(),
+                actual_attachments, expected_attachments,
                 "attachments mismatch for msg {id}"
             );
         }
