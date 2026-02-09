@@ -3145,6 +3145,9 @@ pub async fn project_ids_with_active_reservations(
 ///
 /// Sets `released_ts = now` for all unreleased reservations whose `expires_ts`
 /// has elapsed. Returns the IDs of released reservations.
+const EXPIRED_RESERVATIONS_WHERE_SQL: &str =
+    "project_id = ? AND released_ts IS NULL AND expires_ts <= ?";
+
 pub async fn release_expired_reservations(
     cx: &Cx,
     pool: &DbPool,
@@ -3162,10 +3165,10 @@ pub async fn release_expired_reservations(
     let tracked = tracked(&*conn);
 
     // First, collect the IDs to be released.
-    let select_sql = "SELECT id FROM file_reservations \
-                      WHERE project_id = ? AND released_ts IS NULL AND expires_ts < ?";
+    let select_sql =
+        format!("SELECT id FROM file_reservations WHERE {EXPIRED_RESERVATIONS_WHERE_SQL}");
     let params = [Value::BigInt(project_id), Value::BigInt(now)];
-    let ids = match map_sql_outcome(traw_query(cx, &tracked, select_sql, &params).await) {
+    let ids = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
         Outcome::Ok(rows) => {
             let mut ids = Vec::with_capacity(rows.len());
             for row in rows {
@@ -3185,14 +3188,15 @@ pub async fn release_expired_reservations(
     }
 
     // Update them all at once.
-    let update_sql = "UPDATE file_reservations SET released_ts = ? \
-                      WHERE project_id = ? AND released_ts IS NULL AND expires_ts < ?";
+    let update_sql = format!(
+        "UPDATE file_reservations SET released_ts = ? WHERE {EXPIRED_RESERVATIONS_WHERE_SQL}"
+    );
     let update_params = [
         Value::BigInt(now),
         Value::BigInt(project_id),
         Value::BigInt(now),
     ];
-    match map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await) {
+    match map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &update_params).await) {
         Outcome::Ok(_) => Outcome::Ok(ids),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -3678,5 +3682,11 @@ mod tests {
             quote_hyphenated_tokens("\"already-quoted\""),
             "\"already-quoted\""
         );
+    }
+
+    #[test]
+    fn expired_reservations_where_clause_is_inclusive() {
+        assert!(EXPIRED_RESERVATIONS_WHERE_SQL.contains("expires_ts <= ?"));
+        assert!(!EXPIRED_RESERVATIONS_WHERE_SQL.contains("expires_ts < ?"));
     }
 }
