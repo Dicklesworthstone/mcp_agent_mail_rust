@@ -881,7 +881,9 @@ where
     F: FnOnce() -> Result<T>,
 {
     let process_lock = archive_process_lock(&archive.slug);
-    let _guard = process_lock.lock().expect("archive process lock poisoned");
+    let _guard = process_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let mut lock = FileLock::new(archive.lock_path.clone());
     let lock_start = std::time::Instant::now();
