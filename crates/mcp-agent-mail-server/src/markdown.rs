@@ -134,3 +134,149 @@ pub fn render_markdown_to_safe_html(markdown: &str) -> String {
     let html = markdown_to_html(markdown, &COMRAK_OPTIONS);
     HTML_SANITIZER.clean(&html).to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert_eq!(render_markdown_to_safe_html(""), "");
+        assert_eq!(render_markdown_to_safe_html("   "), "");
+        assert_eq!(render_markdown_to_safe_html("\n\n"), "");
+    }
+
+    #[test]
+    fn basic_paragraph() {
+        let html = render_markdown_to_safe_html("Hello world");
+        assert!(html.contains("<p>"));
+        assert!(html.contains("Hello world"));
+    }
+
+    #[test]
+    fn bold_and_italic() {
+        let html = render_markdown_to_safe_html("**bold** and *italic*");
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("<em>italic</em>"));
+    }
+
+    #[test]
+    fn fenced_code_block() {
+        let html = render_markdown_to_safe_html("```rust\nfn main() {}\n```");
+        assert!(html.contains("<code"));
+        assert!(html.contains("fn main()"));
+    }
+
+    #[test]
+    fn table_rendering() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let html = render_markdown_to_safe_html(md);
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<td>"));
+    }
+
+    #[test]
+    fn strikethrough() {
+        let html = render_markdown_to_safe_html("~~deleted~~");
+        assert!(html.contains("deleted"));
+    }
+
+    #[test]
+    fn links_preserved() {
+        let html = render_markdown_to_safe_html("[click](https://example.com)");
+        assert!(html.contains("<a"));
+        assert!(html.contains("href=\"https://example.com\""));
+    }
+
+    #[test]
+    fn images_preserved() {
+        let html = render_markdown_to_safe_html("![alt](https://example.com/img.png)");
+        assert!(html.contains("<img"));
+        assert!(html.contains("src=\"https://example.com/img.png\""));
+    }
+
+    #[test]
+    fn script_tags_stripped() {
+        let html = render_markdown_to_safe_html("<script>alert('xss')</script>");
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("alert"));
+    }
+
+    #[test]
+    fn style_tags_stripped() {
+        let html = render_markdown_to_safe_html("<style>body{color:red}</style>");
+        assert!(!html.contains("<style>"));
+    }
+
+    #[test]
+    fn onclick_stripped() {
+        let html = render_markdown_to_safe_html("<a onclick=\"alert(1)\" href=\"#\">x</a>");
+        assert!(!html.contains("onclick"));
+        assert!(html.contains("<a"));
+    }
+
+    #[test]
+    fn javascript_url_stripped() {
+        let html =
+            render_markdown_to_safe_html("<a href=\"javascript:alert(1)\">bad</a>");
+        assert!(!html.contains("javascript:"));
+    }
+
+    #[test]
+    fn allowed_style_properties() {
+        let html = render_markdown_to_safe_html(
+            "<span style=\"color:red;text-align:center\">ok</span>",
+        );
+        assert!(html.contains("color:red"));
+    }
+
+    #[test]
+    fn disallowed_style_properties_stripped() {
+        let html = render_markdown_to_safe_html(
+            "<span style=\"position:absolute;top:0\">bad</span>",
+        );
+        assert!(!html.contains("position"));
+    }
+
+    #[test]
+    fn class_attribute_allowed() {
+        let html = render_markdown_to_safe_html("<p class=\"foo\">text</p>");
+        assert!(html.contains("class=\"foo\""));
+    }
+
+    #[test]
+    fn unordered_list() {
+        let html = render_markdown_to_safe_html("- one\n- two\n- three");
+        assert!(html.contains("<ul>"));
+        assert!(html.contains("<li>"));
+    }
+
+    #[test]
+    fn ordered_list() {
+        let html = render_markdown_to_safe_html("1. one\n2. two");
+        assert!(html.contains("<ol>"));
+        assert!(html.contains("<li>"));
+    }
+
+    #[test]
+    fn headings() {
+        let html = render_markdown_to_safe_html("# H1\n## H2\n### H3");
+        assert!(html.contains("<h1>"));
+        assert!(html.contains("<h2>"));
+        assert!(html.contains("<h3>"));
+    }
+
+    #[test]
+    fn blockquote() {
+        let html = render_markdown_to_safe_html("> quoted text");
+        assert!(html.contains("<blockquote>"));
+    }
+
+    #[test]
+    fn data_uri_images_allowed() {
+        let html = render_markdown_to_safe_html(
+            "<img src=\"data:image/png;base64,abc123\" alt=\"pic\">",
+        );
+        assert!(html.contains("data:image/png"));
+    }
+}

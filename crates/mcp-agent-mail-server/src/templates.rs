@@ -122,3 +122,129 @@ pub fn render_template<T: serde::Serialize>(name: &str, ctx: T) -> Result<String
     let tpl = ENV.get_template(name)?;
     tpl.render(ctx)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- striptags ---
+
+    #[test]
+    fn striptags_removes_html_tags() {
+        let result = striptags(Value::from("<b>bold</b> and <i>italic</i>"));
+        assert_eq!(result.to_string(), "bold and italic");
+    }
+
+    #[test]
+    fn striptags_handles_no_tags() {
+        let result = striptags(Value::from("plain text"));
+        assert_eq!(result.to_string(), "plain text");
+    }
+
+    #[test]
+    fn striptags_handles_nested_tags() {
+        let result = striptags(Value::from("<div><p>hello</p></div>"));
+        assert_eq!(result.to_string(), "hello");
+    }
+
+    #[test]
+    fn striptags_handles_empty() {
+        let result = striptags(Value::from(""));
+        assert_eq!(result.to_string(), "");
+    }
+
+    #[test]
+    fn striptags_handles_self_closing() {
+        let result = striptags(Value::from("text<br>more<hr>end"));
+        assert_eq!(result.to_string(), "textmoreend");
+    }
+
+    // --- truncate ---
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        let result = truncate(Value::from("hello"), Some(100));
+        assert_eq!(result.to_string(), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        let result = truncate(Value::from("this is a long string for testing"), Some(15));
+        let s = result.to_string();
+        assert!(s.ends_with("..."));
+        assert!(s.len() <= 15);
+    }
+
+    #[test]
+    fn truncate_at_word_boundary() {
+        let result = truncate(Value::from("one two three four five"), Some(12));
+        let s = result.to_string();
+        assert!(s.ends_with("..."));
+        // Should truncate at a word boundary, not mid-word
+        assert!(!s.contains("thre"));
+    }
+
+    #[test]
+    fn truncate_default_length() {
+        // Default is 255
+        let short = "short text";
+        let result = truncate(Value::from(short), None);
+        assert_eq!(result.to_string(), short);
+    }
+
+    #[test]
+    fn truncate_exact_length() {
+        let s = "abcde";
+        let result = truncate(Value::from(s), Some(5));
+        assert_eq!(result.to_string(), "abcde");
+    }
+
+    // --- tojson ---
+
+    #[test]
+    fn tojson_string_value() {
+        let result = tojson(Value::from("hello")).expect("tojson");
+        let s = result.to_string();
+        assert_eq!(s, "\"hello\"");
+    }
+
+    #[test]
+    fn tojson_number_value() {
+        let result = tojson(Value::from(42)).expect("tojson");
+        assert_eq!(result.to_string(), "42");
+    }
+
+    #[test]
+    fn tojson_escapes_html_chars() {
+        let result = tojson(Value::from("<script>&'test'</script>")).expect("tojson");
+        let s = result.to_string();
+        assert!(!s.contains('<'));
+        assert!(!s.contains('>'));
+        assert!(s.contains("\\u003c"));
+        assert!(s.contains("\\u003e"));
+        assert!(s.contains("\\u0026"));
+        assert!(s.contains("\\u0027"));
+    }
+
+    #[test]
+    fn tojson_bool_value() {
+        let result = tojson(Value::from(true)).expect("tojson");
+        assert_eq!(result.to_string(), "true");
+    }
+
+    // --- render_template ---
+
+    #[test]
+    fn render_missing_template_returns_error() {
+        let err = render_template("nonexistent.html", serde_json::json!({}));
+        assert!(err.is_err());
+    }
+
+    // --- ENV initialization ---
+
+    #[test]
+    fn env_initializes_without_panic() {
+        // Force lazy initialization
+        let _ = &*ENV;
+    }
+}

@@ -157,6 +157,115 @@ mod query_decode_tests {
     }
 }
 
+#[cfg(test)]
+mod utility_tests {
+    use super::*;
+
+    // --- extract_query_str ---
+
+    #[test]
+    fn extract_query_str_found() {
+        assert_eq!(
+            extract_query_str("page=2&q=hello", "q"),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_query_str_not_found() {
+        assert_eq!(extract_query_str("page=2&q=hello", "missing"), None);
+    }
+
+    #[test]
+    fn extract_query_str_empty_value_returns_none() {
+        assert_eq!(extract_query_str("q=", "q"), None);
+    }
+
+    #[test]
+    fn extract_query_str_with_encoding() {
+        assert_eq!(
+            extract_query_str("q=hello+world", "q"),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_query_str_first_match() {
+        assert_eq!(
+            extract_query_str("q=first&q=second", "q"),
+            Some("first".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_query_str_empty_query() {
+        assert_eq!(extract_query_str("", "q"), None);
+    }
+
+    // --- extract_query_int ---
+
+    #[test]
+    fn extract_query_int_found() {
+        assert_eq!(extract_query_int("page=5&limit=20", "limit", 10), 20);
+    }
+
+    #[test]
+    fn extract_query_int_not_found_returns_default() {
+        assert_eq!(extract_query_int("page=5", "limit", 10), 10);
+    }
+
+    #[test]
+    fn extract_query_int_invalid_number_returns_default() {
+        assert_eq!(extract_query_int("limit=abc", "limit", 10), 10);
+    }
+
+    // --- truncate_body ---
+
+    #[test]
+    fn truncate_body_short_unchanged() {
+        assert_eq!(truncate_body("hello", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_body_long_truncated() {
+        let result = truncate_body("hello world this is a long body", 10);
+        assert!(result.ends_with('…'));
+        assert!(result.len() <= 14); // 10 bytes + ellipsis char
+    }
+
+    #[test]
+    fn truncate_body_at_char_boundary() {
+        // "café" is 5 bytes (é is 2 bytes), max=4 should not split the é
+        let result = truncate_body("café latte", 4);
+        assert!(result.ends_with('…'));
+        assert!(!result.contains('é')); // Should truncate before the multibyte char
+    }
+
+    #[test]
+    fn truncate_body_exact_length() {
+        assert_eq!(truncate_body("hello", 5), "hello");
+    }
+
+    // --- ts_display / ts_display_opt ---
+
+    #[test]
+    fn ts_display_formats_micros() {
+        let result = ts_display(1_700_000_000_000_000); // ~2023-11-14
+        assert!(result.contains("2023"));
+    }
+
+    #[test]
+    fn ts_display_opt_none_returns_empty() {
+        assert_eq!(ts_display_opt(None), "");
+    }
+
+    #[test]
+    fn ts_display_opt_some_returns_formatted() {
+        let result = ts_display_opt(Some(1_700_000_000_000_000));
+        assert!(!result.is_empty());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Timestamp formatting for templates
 // ---------------------------------------------------------------------------
