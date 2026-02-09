@@ -938,7 +938,10 @@ pub async fn set_agent_contact_policy(
                     .first(cx, &tracked)
                     .await,
             ) {
-                Outcome::Ok(Some(row)) => Outcome::Ok(row),
+                Outcome::Ok(Some(row)) => {
+                    crate::cache::read_cache().put_agent(&row);
+                    Outcome::Ok(row)
+                }
                 Outcome::Ok(None) => {
                     Outcome::Err(DbError::not_found("Agent", agent_id.to_string()))
                 }
@@ -2890,6 +2893,8 @@ pub async fn link_product_to_projects(
 
     let tracked = tracked(&*conn);
 
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
     let mut linked = 0usize;
     let now = now_micros();
     for &project_id in project_ids {
@@ -2900,19 +2905,17 @@ pub async fn link_product_to_projects(
             Value::BigInt(project_id),
             Value::BigInt(now),
         ];
-        let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
-
-        match out {
-            Outcome::Ok(n) => {
-                if n > 0 {
-                    linked += 1;
-                }
-            }
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        let n = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
+        if n > 0 {
+            linked += 1;
         }
     }
+
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
     Outcome::Ok(linked)
 }

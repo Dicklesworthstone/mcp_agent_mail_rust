@@ -120,12 +120,14 @@ fn ts_f64_to_rfc3339(t: f64) -> Option<String> {
     if !t.is_finite() {
         return None;
     }
-    let trunc = t.trunc();
-    if !(I64_MIN_F64..=I64_MAX_F64).contains(&trunc) {
+    // Use floor decomposition so negative fractional timestamps map correctly.
+    // Example: -0.5 => 1969-12-31T23:59:59.5+00:00 (not 1970-01-01T00:00:00.5+00:00).
+    let secs_f = t.floor();
+    if !(I64_MIN_F64..=I64_MAX_F64).contains(&secs_f) {
         return None;
     }
-    let secs = trunc as i64;
-    let nanos = ((t.fract().abs() * 1e9) as u32).min(999_999_999);
+    let secs = secs_f as i64;
+    let nanos = ((t - secs_f) * 1e9).clamp(0.0, 999_999_999.0) as u32;
     chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
 }
 
@@ -3416,7 +3418,7 @@ mod reservation_activity_tests {
             .arg(repo_root)
             .args(args)
             .output()
-            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+            .expect("failed to run git in reservation activity test helper");
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
@@ -3477,6 +3479,13 @@ pub struct FileReservationResourceEntry {
     pub last_mail_activity_ts: Option<String>,
     pub last_git_activity_ts: Option<String>,
     pub last_filesystem_activity_ts: Option<String>,
+}
+
+fn retain_active_file_reservations(
+    rows: &mut Vec<mcp_agent_mail_db::FileReservationRow>,
+    now_micros: i64,
+) {
+    rows.retain(|row| row.released_ts.is_none() && row.expires_ts > now_micros);
 }
 
 /// Get file reservations for a project.
@@ -3689,6 +3698,11 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         )
         .await,
     )?;
+    if active_only {
+        // Defense in depth: enforce active-only semantics here too, so older DB
+        // backends/query drift cannot leak released or expired reservations.
+        retain_active_file_reservations(&mut rows, now_micros);
+    }
 
     // Match Python ordering: created_ts asc (id is usually insertion order but not guaranteed).
     rows.sort_by_key(|r| r.created_ts);
@@ -4095,6 +4109,39 @@ mod query_param_tests {
         assert!(!active_only, "active_only=false should be honored");
     }
 
+    fn reservation_row(
+        id: i64,
+        released_ts: Option<i64>,
+        expires_ts: i64,
+    ) -> mcp_agent_mail_db::FileReservationRow {
+        mcp_agent_mail_db::FileReservationRow {
+            id: Some(id),
+            project_id: 1,
+            agent_id: 1,
+            path_pattern: "src/**".to_string(),
+            exclusive: 1,
+            reason: String::new(),
+            created_ts: 1,
+            expires_ts,
+            released_ts,
+        }
+    }
+
+    #[test]
+    fn retain_active_file_reservations_excludes_released_and_expired_rows() {
+        let now_micros = 1000;
+        let mut rows = vec![
+            reservation_row(1, None, 2_000),
+            reservation_row(2, Some(500), 2_000),
+            reservation_row(3, None, 999),
+        ];
+
+        retain_active_file_reservations(&mut rows, now_micros);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, Some(1));
+    }
+
     #[test]
     fn outbox_since_ts_parsed() {
         let input = "RedFox?project=/data/proj&since_ts=2026-01-01T00:00:00Z&include_bodies=1";
@@ -4143,8 +4190,8 @@ mod query_param_tests {
     #[test]
     fn parse_query_equals_in_value() {
         // Values can contain `=` signs (e.g. base64).
-        let params = parse_query("token=abc=def==");
-        assert_eq!(params.get("token").unwrap(), "abc=def==");
+        let params = parse_query("payload=abc=def==");
+        assert_eq!(params.get("payload").unwrap(), "abc=def==");
     }
 
     #[test]
@@ -4271,6 +4318,13 @@ mod redact_and_timestamp_tests {
     fn ts_f64_fractional_seconds() {
         let result = ts_f64_to_rfc3339(1_735_689_600.5);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn ts_f64_negative_fractional_seconds() {
+        let result = ts_f64_to_rfc3339(-0.5).unwrap();
+        assert!(result.starts_with("1969-12-31T23:59:59"));
+        assert!(result.contains(".5"));
     }
 
     #[test]

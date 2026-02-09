@@ -3140,3 +3140,79 @@ fn chaos_global_circuits_isolated() {
     CIRCUIT_SIGNAL.reset();
     CIRCUIT_LLM.reset();
 }
+
+// -- Test: set_agent_contact_policy updates the global cache ----------------
+
+#[test]
+fn set_contact_policy_updates_cache() {
+    let (pool, _dir) = make_pool();
+
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            // 1. Create project + agent (register_agent populates cache with policy="auto")
+            let u = unique_suffix();
+            let project = queries::ensure_project(&cx, &pool, &format!("/tmp/cache_policy_{u}"))
+                .await
+                .unwrap();
+
+            let agent = queries::register_agent(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                &format!("Red{}", noun_for(u)),
+                "test",
+                "test",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let agent_id = agent.id.unwrap();
+
+            // 2. Verify initial cache has policy="auto"
+            let cached = read_cache().get_agent_by_id(agent_id);
+            assert!(cached.is_some(), "agent should be cached after register");
+            assert_eq!(cached.unwrap().contact_policy, "auto");
+
+            // 3. Change policy to "contacts_only"
+            let updated = queries::set_agent_contact_policy(&cx, &pool, agent_id, "contacts_only")
+                .await
+                .unwrap();
+            assert_eq!(updated.contact_policy, "contacts_only");
+
+            // 4. Verify cache was updated (this was the bug — cache was stale before the fix)
+            let cached2 = read_cache().get_agent_by_id(agent_id);
+            assert!(cached2.is_some(), "agent should still be in cache");
+            assert_eq!(
+                cached2.unwrap().contact_policy,
+                "contacts_only",
+                "cache must reflect updated policy"
+            );
+
+            // 5. Change again to "block_all"
+            let updated2 = queries::set_agent_contact_policy(&cx, &pool, agent_id, "block_all")
+                .await
+                .unwrap();
+            assert_eq!(updated2.contact_policy, "block_all");
+
+            let cached3 = read_cache().get_agent_by_id(agent_id);
+            assert_eq!(
+                cached3.unwrap().contact_policy,
+                "block_all",
+                "cache must track successive policy changes"
+            );
+        }
+    });
+}
+
+/// Helper: pick a valid noun based on index to avoid name collisions in tests.
+fn noun_for(idx: u64) -> &'static str {
+    const NOUNS: &[&str] = &[
+        "Lake", "Peak", "Stone", "Creek", "Pond", "Grove", "Ridge", "Brook", "Cliff", "Glen",
+        "Hill", "Cove", "Marsh", "Castle", "River", "Forest", "Valley", "Canyon", "Meadow",
+        "Prairie",
+    ];
+    NOUNS[(idx as usize) % NOUNS.len()]
+}
