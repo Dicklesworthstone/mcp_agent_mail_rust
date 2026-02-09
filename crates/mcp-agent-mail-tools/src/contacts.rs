@@ -235,8 +235,10 @@ pub async fn request_contact(
     let subject = format!("Contact request from {from_agent}");
     let body_md = format!("{from_agent} requests permission to contact {target_agent_name}.");
 
-    let msg_row = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::create_message(
+    let to_id = to_row.id.unwrap_or(0);
+    let recipients: &[(i64, &str)] = &[(to_id, "to")];
+    db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::create_message_with_recipients(
             ctx.cx(),
             &pool,
             project_id,
@@ -247,16 +249,7 @@ pub async fn request_contact(
             "normal",
             true,
             "[]",
-        )
-        .await,
-    )?;
-    let msg_id = msg_row.id.unwrap_or(0);
-    db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::add_recipients(
-            ctx.cx(),
-            &pool,
-            msg_id,
-            &[(to_row.id.unwrap_or(0), "to")],
+            recipients,
         )
         .await,
     )?;
