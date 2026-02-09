@@ -433,6 +433,8 @@ mod tests {
         let result = verify_bundle(dir.path(), None).unwrap();
         assert!(result.signature_checked);
         assert!(result.signature_verified);
+        // Without explicit public key, falls back to embedded key
+        assert_eq!(result.key_source.as_deref(), Some("embedded"));
     }
 
     #[test]
@@ -530,6 +532,7 @@ mod tests {
         assert!(!result.signature_checked);
         assert!(!result.signature_verified);
         assert!(!result.sri_checked);
+        assert!(result.key_source.is_none());
     }
 
     #[test]

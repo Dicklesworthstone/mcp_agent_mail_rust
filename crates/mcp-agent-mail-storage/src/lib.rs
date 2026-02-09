@@ -990,9 +990,8 @@ impl CommitQueue {
         if queue.len() >= self.max_queue_size {
             // Queue full - fall back to direct commit
             drop(queue);
-            let repo = Repository::open(&repo_root)?;
             let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
-            commit_paths(&repo, config, &message, &refs)?;
+            commit_paths_with_retry(&repo_root, config, &message, &refs)?;
             return Ok(());
         }
 
@@ -1073,9 +1072,8 @@ impl CommitQueue {
             if requests.len() == 1 {
                 // Single request - commit directly
                 let req = &requests[0];
-                let repo = Repository::open(&repo_root)?;
                 let refs: Vec<&str> = req.rel_paths.iter().map(String::as_str).collect();
-                commit_paths(&repo, config, &req.message, &refs)?;
+                commit_paths_with_retry(&repo_root, config, &req.message, &refs)?;
                 self.record_commit(1);
             } else {
                 // Multiple requests - try to batch non-conflicting ones
@@ -1111,16 +1109,14 @@ impl CommitQueue {
                         merged_messages.join("\n")
                     );
 
-                    let repo = Repository::open(&repo_root)?;
                     let refs: Vec<&str> = merged_paths.iter().map(String::as_str).collect();
-                    commit_paths(&repo, config, &combined, &refs)?;
+                    commit_paths_with_retry(&repo_root, config, &combined, &refs)?;
                     self.record_commit(requests.len());
                 } else {
                     // Conflicts or large batch - process sequentially
                     for req in &requests {
-                        let repo = Repository::open(&repo_root)?;
                         let refs: Vec<&str> = req.rel_paths.iter().map(String::as_str).collect();
-                        commit_paths(&repo, config, &req.message, &refs)?;
+                        commit_paths_with_retry(&repo_root, config, &req.message, &refs)?;
                         self.record_commit(1);
                     }
                 }
@@ -3104,7 +3100,7 @@ fn sanitize_thread_id(thread_id: &str) -> String {
         .trim_matches(|c: char| c == '-' || c == '_')
         .to_lowercase();
     let truncated = if trimmed.len() > 120 {
-        trimmed[..120].to_string()
+        truncate_utf8(&trimmed, 120).to_string()
     } else {
         trimmed
     };
@@ -3212,7 +3208,7 @@ pub fn message_paths(
             .trim_matches(|c: char| c == '-' || c == '_')
             .to_lowercase();
         let truncated = if trimmed.len() > 80 {
-            trimmed[..80].to_string()
+            truncate_utf8(&trimmed, 80).to_string()
         } else {
             trimmed
         };
@@ -6657,6 +6653,54 @@ mod tests {
 
         let signals = list_pending_signals(&config, None);
         assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_signal_path_traversal_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0; // disable debounce for test isolation
+        config.notifications_signals_dir = tmp.path().join("signals");
+
+        // Use unique names to avoid interference from parallel tests sharing
+        // the global debounce map.
+        let slug = "trav_proj";
+        let agent = "TravAgent";
+
+        // Slash in project_slug
+        assert!(!emit_notification_signal(&config, "../evil", agent, None));
+        assert!(!emit_notification_signal(&config, "proj/sub", agent, None));
+
+        // Backslash in project_slug
+        assert!(!emit_notification_signal(&config, "proj\\sub", agent, None));
+
+        // Dot-dot in project_slug
+        assert!(!emit_notification_signal(&config, "proj..", agent, None));
+        assert!(!emit_notification_signal(&config, "..proj", agent, None));
+
+        // Slash in agent_name
+        assert!(!emit_notification_signal(&config, slug, "../evil", None));
+        assert!(!emit_notification_signal(&config, slug, "Agent/sub", None));
+
+        // Backslash in agent_name
+        assert!(!emit_notification_signal(&config, slug, "Agent\\sub", None));
+
+        // clear_notification_signal rejects the same patterns
+        assert!(!clear_notification_signal(&config, "../evil", agent));
+        assert!(!clear_notification_signal(&config, slug, "../evil"));
+        assert!(!clear_notification_signal(&config, "proj\\sub", agent));
+        assert!(!clear_notification_signal(&config, slug, "Agent\\sub"));
+
+        // list_pending_signals rejects traversal in slug
+        assert!(list_pending_signals(&config, Some("../evil")).is_empty());
+        assert!(list_pending_signals(&config, Some("proj/sub")).is_empty());
+        assert!(list_pending_signals(&config, Some("proj\\sub")).is_empty());
+
+        // Legitimate names still work
+        assert!(emit_notification_signal(&config, slug, agent, None));
+        assert_eq!(list_pending_signals(&config, Some(slug)).len(), 1);
+        assert!(clear_notification_signal(&config, slug, agent));
     }
 
     // -----------------------------------------------------------------------

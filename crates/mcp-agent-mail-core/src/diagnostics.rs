@@ -350,8 +350,13 @@ impl DiagnosticReport {
                         truncated.locks.truncate(5);
                         locks_truncated = true;
                     } else {
-                        // Give up and return truncated raw JSON.
-                        return json[..MAX_REPORT_BYTES].to_string();
+                        // Give up and return truncated raw JSON (safe on
+                        // UTF-8 boundary).
+                        let mut end = MAX_REPORT_BYTES;
+                        while end > 0 && !json.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        return json[..end].to_string();
                     }
                 }
                 serde_json::to_string_pretty(&truncated).unwrap_or(json)

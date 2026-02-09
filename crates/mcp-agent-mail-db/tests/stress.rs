@@ -2043,7 +2043,9 @@ fn acknowledge_message(pool: &DbPool, agent_id: i64, message_id: i64) -> (i64, i
 
 #[test]
 fn stress_inbox_stats_cache_miss_read_through_and_hit() {
-    let _cache_guard = INBOX_STATS_TEST_MUTEX.lock().expect("mutex lock");
+    let _cache_guard = INBOX_STATS_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (pool, _dir) = make_pool();
     let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
 
@@ -2127,7 +2129,9 @@ fn stress_inbox_stats_cache_miss_read_through_and_hit() {
 
 #[test]
 fn stress_inbox_stats_cache_short_circuits_db_on_hit() {
-    let _cache_guard = INBOX_STATS_TEST_MUTEX.lock().expect("mutex lock");
+    let _cache_guard = INBOX_STATS_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (pool, _dir) = make_pool();
     let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
 
@@ -2162,20 +2166,30 @@ fn stress_inbox_stats_cache_short_circuits_db_on_hit() {
         ack_pending_count: 777,
         last_message_ts: Some(db_stats.last_message_ts.unwrap_or(0) + 1),
     };
-    read_cache().put_inbox_stats(&sentinel);
 
-    let cached = get_inbox_stats(&pool, receiver_id);
-    assert_eq!(
-        cached.total_count, sentinel.total_count,
-        "cache hit should return cached total_count instead of DB value"
-    );
-    assert_eq!(
-        cached.unread_count, sentinel.unread_count,
-        "cache hit should return cached unread_count instead of DB value"
-    );
-    assert_eq!(
-        cached.ack_pending_count, sentinel.ack_pending_count,
-        "cache hit should return cached ack_pending_count instead of DB value"
+    // Retry: parallel tests may invalidate the global cache via
+    // create_message_with_recipients for recipients with the same
+    // auto-increment agent_id in their own DBs.
+    let mut cache_hit = false;
+    for _ in 0..20 {
+        read_cache().put_inbox_stats(&sentinel);
+        let cached = get_inbox_stats(&pool, receiver_id);
+        if cached.total_count == sentinel.total_count {
+            assert_eq!(
+                cached.unread_count, sentinel.unread_count,
+                "cache hit should return cached unread_count instead of DB value"
+            );
+            assert_eq!(
+                cached.ack_pending_count, sentinel.ack_pending_count,
+                "cache hit should return cached ack_pending_count instead of DB value"
+            );
+            cache_hit = true;
+            break;
+        }
+    }
+    assert!(
+        cache_hit,
+        "cache hit should return cached total_count instead of DB value after retries"
     );
 
     read_cache().invalidate_inbox_stats(receiver_id);
@@ -2198,7 +2212,9 @@ fn stress_inbox_stats_cache_short_circuits_db_on_hit() {
 
 #[test]
 fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
-    let _cache_guard = INBOX_STATS_TEST_MUTEX.lock().expect("mutex lock");
+    let _cache_guard = INBOX_STATS_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (pool, _dir) = make_pool();
     let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
 

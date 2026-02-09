@@ -1328,6 +1328,28 @@ mod tests {
         );
         assert_eq!(normalize_path("\\app\\api", false), "app/api");
         assert_eq!(normalize_path("already/clean", false), "already/clean");
+
+        // Dot-dot collapse
+        assert_eq!(normalize_path("app/../api/users.py", false), "api/users.py");
+        assert_eq!(
+            normalize_path("app/models/../../api/users.py", false),
+            "api/users.py"
+        );
+        // Leading .. can't go above root, so collapses to nothing
+        assert_eq!(normalize_path("../evil", false), "evil");
+        assert_eq!(normalize_path("../../evil", false), "evil");
+        // Single dot removal
+        assert_eq!(
+            normalize_path("./app/./api/./file.py", false),
+            "app/api/file.py"
+        );
+        // Mixed
+        assert_eq!(
+            normalize_path("/./app/../src/./lib.rs", false),
+            "src/lib.rs"
+        );
+        // Case-insensitive mode
+        assert_eq!(normalize_path("App/../SRC/Lib.rs", true), "src/lib.rs");
     }
 
     // -----------------------------------------------------------------------

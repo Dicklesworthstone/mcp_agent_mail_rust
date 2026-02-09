@@ -2434,4 +2434,38 @@ mod tests {
 
     // No resolver tests: mode is a binary-level decision (see ADR-001), and
     // Config::from_env does not consult any INTERFACE_MODE env var.
+
+    #[test]
+    fn redact_db_url_strips_credentials() {
+        assert_eq!(
+            redact_db_url("postgres://user:pass@localhost/db"),
+            "postgres://****@localhost/db"
+        );
+        assert_eq!(
+            redact_db_url("postgres://admin:s3cret@host:5432/mydb?sslmode=require"),
+            "postgres://****@host:5432/mydb?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn redact_db_url_preserves_no_credential_urls() {
+        assert_eq!(
+            redact_db_url("sqlite:///path/to/db.sqlite3"),
+            "sqlite:///path/to/db.sqlite3"
+        );
+        assert_eq!(redact_db_url("sqlite:///:memory:"), "sqlite:///:memory:");
+    }
+
+    #[test]
+    fn redact_db_url_handles_edge_cases() {
+        // No scheme at all
+        assert_eq!(redact_db_url("/just/a/path"), "/just/a/path");
+        // Empty string
+        assert_eq!(redact_db_url(""), "");
+        // Scheme but no @ (no credentials)
+        assert_eq!(
+            redact_db_url("postgres://localhost/db"),
+            "postgres://localhost/db"
+        );
+    }
 }
