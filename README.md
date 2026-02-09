@@ -39,28 +39,30 @@ cargo run -p mcp-agent-mail-cli -- --help
 
 ### Dual-Mode Interface (MCP Server vs CLI)
 
-This repo intentionally exposes **two disjoint command surfaces**:
+This repo exposes **two command surfaces** from a single `mcp-agent-mail` binary:
 
 | Use case | Entry point | Notes |
 |---------|-------------|-------|
 | MCP server (default) | `mcp-agent-mail` | Default is MCP stdio transport. HTTP is `serve`. |
 | CLI (operator + agent-first) | `am` | Built from the `mcp-agent-mail-cli` crate. |
+| CLI via single binary | `AM_INTERFACE_MODE=cli mcp-agent-mail` | Same CLI surface, one binary. |
 
-Common footgun: running CLI-only commands via the MCP server binary.
-The MCP binary will **deny** unknown subcommands with a deterministic message
-on `stderr` and exit code `2`:
+**Default behavior (MCP mode):** Running CLI-only commands via the MCP binary
+produces a deterministic denial on `stderr` with exit code `2`:
 
 ```bash
 cargo run -p mcp-agent-mail -- share export
 # Error: "share" is not an MCP server command.
 # Agent Mail MCP server accepts: serve, config
-# For operator CLI commands, use: mcp-agent-mail-cli share
+# For operator CLI commands, use: am share
+# Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail share ...
 ```
 
-To use the CLI surface during development:
+**Optional CLI mode:** Set `AM_INTERFACE_MODE=cli` to use the full CLI
+surface through the `mcp-agent-mail` binary:
 
 ```bash
-cargo run -p mcp-agent-mail-cli -- mail send \
+AM_INTERFACE_MODE=cli mcp-agent-mail mail send \
   --project /abs/path/to/project \
   --from RedHarbor \
   --to OrangeFinch \
@@ -68,12 +70,18 @@ cargo run -p mcp-agent-mail-cli -- mail send \
   --body "test"
 ```
 
+In CLI mode, MCP-only commands (`serve`, `config`) are denied with an equally
+deterministic message pointing back to MCP mode.
+
+The `am` binary remains unchanged and is the recommended CLI entry point.
+
 Note: `scripts/am` is a dev convenience wrapper around `mcp-agent-mail serve`.
 It is not the `am` CLI binary.
 
 For the canonical contract/specs:
 - `docs/ADR-001-dual-mode-invariants.md`
-- `docs/SPEC-meta-command-allowlist.md`
+- `docs/ADR-002-single-binary-cli-opt-in.md`
+- `docs/SPEC-interface-mode-switch.md`
 - `docs/SPEC-denial-ux-contract.md`
 - `docs/SPEC-parity-matrix.md`
 
@@ -100,16 +108,17 @@ Key bindings: `?` help, `Ctrl+P` command palette, `m` toggle MCP/API,
 All configuration is via environment variables. The server reads them at
 startup via `Config::from_env()`. Key variables:
 
-| Variable            | Default            | Description               |
-|---------------------|--------------------|---------------------------|
-| `HTTP_HOST`         | `127.0.0.1`        | Bind address              |
-| `HTTP_PORT`         | `8765`             | Bind port                 |
-| `HTTP_PATH`         | `/mcp/`            | MCP base path             |
-| `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token                |
-| `DATABASE_URL`      | `sqlite:///:memory:`| SQLite connection URL    |
-| `STORAGE_ROOT`      | `~/.mcp_agent_mail`| Archive root directory    |
-| `LOG_LEVEL`         | `info`             | Minimum log level         |
-| `TUI_HIGH_CONTRAST` | `false`            | Accessibility mode        |
+| Variable              | Default            | Description               |
+|-----------------------|--------------------|---------------------------|
+| `AM_INTERFACE_MODE`   | (unset = MCP)      | `mcp` or `cli` (ADR-002)  |
+| `HTTP_HOST`           | `127.0.0.1`        | Bind address              |
+| `HTTP_PORT`           | `8765`             | Bind port                 |
+| `HTTP_PATH`           | `/mcp/`            | MCP base path             |
+| `HTTP_BEARER_TOKEN`   | (from `.env` file) | Auth token                |
+| `DATABASE_URL`        | `sqlite:///:memory:`| SQLite connection URL    |
+| `STORAGE_ROOT`        | `~/.mcp_agent_mail`| Archive root directory    |
+| `LOG_LEVEL`           | `info`             | Minimum log level         |
+| `TUI_HIGH_CONTRAST`   | `false`            | Accessibility mode        |
 
 For the full list of 100+ env vars, see
 `crates/mcp-agent-mail-core/src/config.rs`.

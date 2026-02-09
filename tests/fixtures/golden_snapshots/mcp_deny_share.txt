@@ -1,4 +1,5 @@
 Error: "share" is not an MCP server command.
 
 Agent Mail MCP server accepts: serve, config
-For operator CLI commands, use: mcp-agent-mail-cli share
+For operator CLI commands, use: am share
+Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail share ...

@@ -212,7 +212,7 @@ fn main() {
     if mode.is_cli() {
         // Deterministic wrong-mode denial for MCP-only commands that users commonly try.
         if let Some(cmd) = env::args().nth(1) {
-            if cmd == "serve" || cmd == "config" {
+            if cmd == "serve" {
                 render_cli_mode_denial(&cmd);
                 std::process::exit(2);
             }

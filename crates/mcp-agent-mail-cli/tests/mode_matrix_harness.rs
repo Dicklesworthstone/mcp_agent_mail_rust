@@ -359,7 +359,7 @@ fn matrix_mcp_denial_message_contains_remediation() {
             "denial stderr for '{cmd}' should mention the command: {serr}"
         );
         assert!(
-            serr.contains("mcp-agent-mail-cli"),
+            serr.contains("use: am "),
             "denial stderr for '{cmd}' should mention the CLI binary: {serr}"
         );
     }
@@ -372,7 +372,7 @@ fn matrix_mcp_denial_message_contains_remediation() {
 const DENIAL_CANONICAL_PREFIX: &str = "Error: \"";
 const DENIAL_CANONICAL_MIDDLE: &str = "\" is not an MCP server command.";
 const DENIAL_CANONICAL_REMEDIATION: &str = "Agent Mail MCP server accepts: serve, config";
-const DENIAL_CANONICAL_CLI_HINT: &str = "For operator CLI commands, use: mcp-agent-mail-cli ";
+const DENIAL_CANONICAL_CLI_HINT: &str = "For operator CLI commands, use: am ";
 
 /// Load a golden snapshot file from tests/fixtures/golden_snapshots/.
 fn load_golden_snapshot(name: &str) -> Option<String> {

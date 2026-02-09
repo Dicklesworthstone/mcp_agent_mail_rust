@@ -887,7 +887,8 @@ fn mode_cli_help_renders_with_mcp_agent_mail_name() {
     );
 }
 
-/// MODE-3: CLI mode denies MCP-only commands (serve, config) with exit 2.
+/// MODE-3: CLI mode denies MCP-only commands (serve) with exit 2.
+/// Note: `config` is NOT denied because the CLI surface has its own config subcommand.
 #[test]
 fn mode_cli_denies_mcp_only_commands() {
     let mcp = match mcp_bin() {
@@ -898,24 +899,32 @@ fn mode_cli_denies_mcp_only_commands() {
         }
     };
 
-    for cmd in &["serve", "config"] {
-        let out = run_binary_with_env(&mcp, &[cmd], &[("AM_INTERFACE_MODE", "cli")]);
-        let serr = String::from_utf8_lossy(&out.stderr).to_string();
+    // `serve` is MCP-only and must be denied in CLI mode.
+    let out = run_binary_with_env(&mcp, &["serve"], &[("AM_INTERFACE_MODE", "cli")]);
+    let serr = String::from_utf8_lossy(&out.stderr).to_string();
 
-        assert_eq!(
-            out.status.code(),
-            Some(2),
-            "CLI mode must deny `{cmd}` with exit 2, stderr:\n{serr}"
-        );
-        assert!(
-            serr.contains("not available in CLI mode"),
-            "CLI denial for `{cmd}` must contain canonical phrase, got:\n{serr}"
-        );
-        assert!(
-            serr.contains("AM_INTERFACE_MODE=cli"),
-            "CLI denial for `{cmd}` must reference current mode, got:\n{serr}"
-        );
-    }
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "CLI mode must deny `serve` with exit 2, stderr:\n{serr}"
+    );
+    assert!(
+        serr.contains("not available in CLI mode"),
+        "CLI denial for `serve` must contain canonical phrase, got:\n{serr}"
+    );
+    assert!(
+        serr.contains("AM_INTERFACE_MODE=cli"),
+        "CLI denial for `serve` must reference current mode, got:\n{serr}"
+    );
+
+    // `config` exists in the CLI surface, so it should be allowed (exit 0).
+    let out_config =
+        run_binary_with_env(&mcp, &["config", "--help"], &[("AM_INTERFACE_MODE", "cli")]);
+    assert_eq!(
+        out_config.status.code(),
+        Some(0),
+        "CLI mode must allow `config --help` (it exists in CLI surface)"
+    );
 }
 
 /// MODE-4: Invalid AM_INTERFACE_MODE value produces exit 2 with deterministic error.

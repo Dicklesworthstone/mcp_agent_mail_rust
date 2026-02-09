@@ -199,10 +199,10 @@ cli_serve_msg=0
 echo "$cli_serve_output" | grep -q "not available in CLI mode" || cli_serve_msg=1
 e2e_assert_eq "CLI mode denial contains canonical phrase" "0" "$cli_serve_msg"
 
-# CLI mode: config should be denied (MCP-only command)
+# CLI mode: config --help should be ALLOWED (config exists in CLI surface)
 cli_config_exit=0
-AM_INTERFACE_MODE=cli "$MCP_BIN" config > /dev/null 2>&1 || cli_config_exit=$?
-e2e_assert_eq "CLI mode denies config (exit 2)" "2" "$cli_config_exit"
+AM_INTERFACE_MODE=cli "$MCP_BIN" config --help > /dev/null 2>&1 || cli_config_exit=$?
+e2e_assert_eq "CLI mode allows config --help" "0" "$cli_config_exit"
 
 # Invalid AM_INTERFACE_MODE value: should exit 2
 invalid_mode_exit=0
