@@ -159,6 +159,9 @@ start_server() {
         export STORAGE_ROOT="${storage_root}"
         export HTTP_HOST="127.0.0.1"
         export HTTP_PORT="${port}"
+        # Hermeticity: override any user-global ~/.mcp_agent_mail/.env bearer token.
+        # This suite validates JWT behavior, so we must ensure static bearer auth is disabled.
+        export HTTP_BEARER_TOKEN=""
         export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
         export HTTP_RBAC_ENABLED="0"
         export HTTP_RATE_LIMIT_ENABLED="0"
@@ -202,7 +205,7 @@ BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
 PORT1="$(pick_port)"
 PID1="$(start_server "base" "${PORT1}" "${DB_PATH}" "${STORAGE_ROOT}" "${BIN}")"
-trap "stop_server ${PID1} || true" EXIT
+trap 'stop_server "${PID1}" || true' EXIT
 
 if ! e2e_wait_port 127.0.0.1 "${PORT1}" 10; then
     e2e_fail "server failed to start (port not open)"
@@ -276,7 +279,7 @@ trap - EXIT
 
 PORT2="$(pick_port)"
 PID2="$(start_server "aud" "${PORT2}" "${DB_PATH}" "${STORAGE_ROOT}" "${BIN}" "HTTP_JWT_AUDIENCE=aud-expected")"
-trap "stop_server ${PID2} || true" EXIT
+trap 'stop_server "${PID2}" || true' EXIT
 
 if ! e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
     e2e_fail "server (aud) failed to start (port not open)"
@@ -312,7 +315,7 @@ trap - EXIT
 
 PORT3="$(pick_port)"
 PID3="$(start_server "iss" "${PORT3}" "${DB_PATH}" "${STORAGE_ROOT}" "${BIN}" "HTTP_JWT_ISSUER=issuer-expected")"
-trap "stop_server ${PID3} || true" EXIT
+trap 'stop_server "${PID3}" || true' EXIT
 
 if ! e2e_wait_port 127.0.0.1 "${PORT3}" 10; then
     e2e_fail "server (iss) failed to start (port not open)"

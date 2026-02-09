@@ -65,7 +65,7 @@ _e2e_color_blue='\033[0;34m'
 _e2e_color_dim='\033[0;90m'
 
 e2e_log() {
-    echo -e "${_e2e_color_dim}[e2e]${_e2e_color_reset} $*"
+    echo -e "${_e2e_color_dim}[e2e]${_e2e_color_reset} $*" >&2
 }
 
 e2e_banner() {

@@ -280,6 +280,9 @@ start_server() {
         export HTTP_RATE_LIMIT_ENABLED="0"
         export HTTP_JWT_ENABLED="0"
         export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
+        # Ensure the suite is hermetic even if the developer has a token in
+        # ~/.mcp_agent_mail/.env (full_env_value() would otherwise pick it up).
+        export HTTP_BEARER_TOKEN=""
 
         # Optional overrides passed as KEY=VALUE pairs in remaining args.
         while [ $# -gt 0 ]; do
@@ -390,6 +393,16 @@ e2e_case_banner "GET /health/readiness bypasses auth"
 http_request "run1_health_readiness" "GET" "${URL_BASE}/health/readiness"
 e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run1_health_readiness_status.txt")"
 e2e_assert_contains "body has ready" "$(cat "${E2E_ARTIFACT_DIR}/run1_health_readiness_body.txt" 2>/dev/null || true)" "ready"
+
+e2e_case_banner "GET /health bypasses auth (alias)"
+http_request "run1_health_root" "GET" "${URL_BASE}/health"
+e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run1_health_root_status.txt")"
+e2e_assert_contains "body has ready" "$(cat "${E2E_ARTIFACT_DIR}/run1_health_root_body.txt" 2>/dev/null || true)" "ready"
+
+e2e_case_banner "GET /healthz bypasses auth (alias)"
+http_request "run1_healthz" "GET" "${URL_BASE}/healthz"
+e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run1_healthz_status.txt")"
+e2e_assert_contains "body has alive" "$(cat "${E2E_ARTIFACT_DIR}/run1_healthz_body.txt" 2>/dev/null || true)" "alive"
 
 e2e_case_banner "OPTIONS /api/ bypasses auth and includes CORS headers"
 http_request "run1_options_api" "OPTIONS" "${API_URL}" \
