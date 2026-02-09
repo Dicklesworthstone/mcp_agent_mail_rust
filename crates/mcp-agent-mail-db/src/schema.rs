@@ -440,17 +440,41 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
-    // file_reservations.created_ts + expires_ts
+    // file_reservations.created_ts + expires_ts + released_ts
     migrations.push(Migration::new(
         "v3_fix_file_reservations_text_timestamps".to_string(),
         "convert legacy TEXT timestamps to INTEGER microseconds in file_reservations".to_string(),
         format!(
             "UPDATE file_reservations SET \
              created_ts = CASE WHEN typeof(created_ts) = 'text' THEN ({}) ELSE created_ts END, \
-             expires_ts = CASE WHEN typeof(expires_ts) = 'text' THEN ({}) ELSE expires_ts END \
-             WHERE typeof(created_ts) = 'text' OR typeof(expires_ts) = 'text'",
+             expires_ts = CASE WHEN typeof(expires_ts) = 'text' THEN ({}) ELSE expires_ts END, \
+             released_ts = CASE WHEN typeof(released_ts) = 'text' THEN ({}) ELSE released_ts END \
+             WHERE typeof(created_ts) = 'text' OR typeof(expires_ts) = 'text' OR typeof(released_ts) = 'text'",
             ts_conversion("created_ts"),
-            ts_conversion("expires_ts")
+            ts_conversion("expires_ts"),
+            ts_conversion("released_ts")
+        ),
+        String::new(),
+    ));
+
+    // products.created_at
+    migrations.push(Migration::new(
+        "v3_fix_products_text_timestamps".to_string(),
+        "convert legacy TEXT created_at to INTEGER microseconds in products".to_string(),
+        format!(
+            "UPDATE products SET created_at = ({}) WHERE typeof(created_at) = 'text'",
+            ts_conversion("created_at")
+        ),
+        String::new(),
+    ));
+
+    // product_project_links.created_at
+    migrations.push(Migration::new(
+        "v3_fix_product_project_links_text_timestamps".to_string(),
+        "convert legacy TEXT created_at to INTEGER microseconds in product_project_links".to_string(),
+        format!(
+            "UPDATE product_project_links SET created_at = ({}) WHERE typeof(created_at) = 'text'",
+            ts_conversion("created_at")
         ),
         String::new(),
     ));
@@ -855,15 +879,44 @@ mod tests {
             &[],
         ).expect("create legacy file_reservations table");
         conn.execute_sync(
-            "INSERT INTO file_reservations (project_id, agent_id, path_pattern, created_ts, expires_ts) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO file_reservations (project_id, agent_id, path_pattern, created_ts, expires_ts, released_ts) VALUES (?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(1),
                 Value::BigInt(1),
                 Value::Text("src/**".to_string()),
                 Value::Text("2026-02-04 22:20:00.123456".to_string()),
                 Value::Text("2026-02-04 23:20:00.654321".to_string()),
+                Value::Text("2026-02-04 23:25:00.000000".to_string()),
             ],
         ).expect("insert legacy file_reservation");
+
+        // Create legacy products table with TEXT timestamps.
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, product_uid TEXT NOT NULL UNIQUE, name TEXT NOT NULL UNIQUE, created_at DATETIME NOT NULL)",
+            &[],
+        ).expect("create legacy products table");
+        conn.execute_sync(
+            "INSERT INTO products (product_uid, name, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("uid-001".to_string()),
+                Value::Text("MyProduct".to_string()),
+                Value::Text("2026-02-04 22:30:00.999999".to_string()),
+            ],
+        ).expect("insert legacy product");
+
+        // Create legacy product_project_links table with TEXT timestamps.
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS product_project_links (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, project_id INTEGER NOT NULL, created_at DATETIME NOT NULL, UNIQUE(product_id, project_id))",
+            &[],
+        ).expect("create legacy product_project_links table");
+        conn.execute_sync(
+            "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("2026-02-04 22:35:00.500000".to_string()),
+            ],
+        ).expect("insert legacy product_project_link");
 
         // Run migrations (v3 should convert TEXT timestamps).
         block_on({
@@ -901,15 +954,44 @@ mod tests {
             .expect("query messages");
         assert_eq!(rows[0].get_named::<String>("t").unwrap(), "integer");
 
-        // Verify file_reservations timestamps are now INTEGER
+        // Verify file_reservations timestamps are now INTEGER (including released_ts)
         let rows = conn
             .query_sync(
-                "SELECT typeof(created_ts) as t1, typeof(expires_ts) as t2 FROM file_reservations",
+                "SELECT typeof(created_ts) as t1, typeof(expires_ts) as t2, typeof(released_ts) as t3 FROM file_reservations",
                 &[],
             )
             .expect("query file_reservations");
         assert_eq!(rows[0].get_named::<String>("t1").unwrap(), "integer");
         assert_eq!(rows[0].get_named::<String>("t2").unwrap(), "integer");
+        assert_eq!(rows[0].get_named::<String>("t3").unwrap(), "integer");
+
+        // Verify products.created_at is now INTEGER
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) as t, created_at FROM products",
+                &[],
+            )
+            .expect("query products");
+        assert_eq!(rows[0].get_named::<String>("t").unwrap(), "integer");
+        let products_created: i64 = rows[0].get_named("created_at").unwrap();
+        assert!(
+            products_created > 1_700_000_000_000_000,
+            "products.created_at should be microseconds: {products_created}"
+        );
+
+        // Verify product_project_links.created_at is now INTEGER
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) as t, created_at FROM product_project_links",
+                &[],
+            )
+            .expect("query product_project_links");
+        assert_eq!(rows[0].get_named::<String>("t").unwrap(), "integer");
+        let link_created: i64 = rows[0].get_named("created_at").unwrap();
+        assert!(
+            link_created > 1_700_000_000_000_000,
+            "product_project_links.created_at should be microseconds: {link_created}"
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {
 #[command(
     version,
     about = "MCP Agent Mail server (HTTP/MCP runtime + TUI)",
-    after_help = "Operator CLI commands (guard/archive/share/etc) live in the `am` binary:\n  cargo run -p mcp-agent-mail-cli -- --help"
+    after_help = "Operator CLI commands live in `am`:\n  am --help\n\nOr enable the CLI surface on this same binary:\n  AM_INTERFACE_MODE=cli mcp-agent-mail --help"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -210,12 +210,17 @@ fn main() {
     };
 
     if mode.is_cli() {
+        let Some(cmd) = env::args().nth(1) else {
+            render_cli_mode_missing_command();
+            std::process::exit(2);
+        };
+
         // Deterministic wrong-mode denial for MCP-only commands that users commonly try.
-        if let Some(cmd) = env::args().nth(1) {
-            if cmd == "serve" {
-                render_cli_mode_denial(&cmd);
-                std::process::exit(2);
-            }
+        //
+        // Note: `config` is NOT denied because the CLI surface has its own `config` command.
+        if cmd == "serve" {
+            render_cli_mode_denial(&cmd);
+            std::process::exit(2);
         }
 
         // Route to the CLI surface with the correct invocation name for help/usage.
@@ -313,15 +318,28 @@ fn main() {
 fn render_denial(command: &str) {
     eprintln!(
         "Error: \"{command}\" is not an MCP server command.\n\n\
+         Agent Mail is not a CLI.\n\
          Agent Mail MCP server accepts: serve, config\n\
          For operator CLI commands, use: am {command}\n\
          Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ..."
     );
 
     // Show tip only when a TTY is detected (human, not agent)
-    if std::io::stderr().is_terminal() {
+    let no_color = env::var_os("NO_COLOR").is_some();
+    if std::io::stderr().is_terminal() && !no_color {
         eprintln!("\nTip: Run `am --help` for the full command list.");
     }
+}
+
+fn render_cli_mode_missing_command() {
+    eprintln!(
+        "Error: CLI mode is enabled (AM_INTERFACE_MODE=cli) but no subcommand was provided.\n\n\
+         To run the CLI:\n\
+           mcp-agent-mail --help\n\n\
+         To start the MCP server:\n\
+           unset AM_INTERFACE_MODE   # (or set AM_INTERFACE_MODE=mcp)\n\
+           mcp-agent-mail serve ..."
+    );
 }
 
 /// CLI-mode denial renderer for MCP-only commands.
@@ -332,7 +350,10 @@ fn render_cli_mode_denial(command: &str) {
         "Error: \"{command}\" is not available in CLI mode (AM_INTERFACE_MODE=cli).\n\n\
          To start the MCP server:\n\
            unset AM_INTERFACE_MODE   # (or set AM_INTERFACE_MODE=mcp)\n\
-           mcp-agent-mail serve ..."
+           mcp-agent-mail serve ...\n\n\
+         CLI equivalents:\n\
+           mcp-agent-mail serve-http ...\n\
+           mcp-agent-mail serve-stdio ..."
     );
 }
 

@@ -1,5 +1,6 @@
 Error: "migrate" is not an MCP server command.
 
+Agent Mail is not a CLI.
 Agent Mail MCP server accepts: serve, config
 For operator CLI commands, use: am migrate
 Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail migrate ...
