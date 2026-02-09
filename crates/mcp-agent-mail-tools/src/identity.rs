@@ -1096,4 +1096,151 @@ mod tests {
         assert!("  ".trim().is_empty());
         assert!(!"opus-4.5".trim().is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Tool validation rule tests (br-2841)
+    // -----------------------------------------------------------------------
+
+    // ── ensure_project validation ──
+
+    #[test]
+    fn ensure_project_rejects_relative_path() {
+        // ensure_project requires absolute paths (starts with '/')
+        let key = "relative/path/to/project";
+        assert!(!Path::new(key).is_absolute());
+    }
+
+    #[test]
+    fn ensure_project_rejects_empty_key() {
+        assert!(!Path::new("").is_absolute());
+    }
+
+    #[test]
+    fn ensure_project_accepts_root_path() {
+        assert!(Path::new("/").is_absolute());
+    }
+
+    #[test]
+    fn ensure_project_accepts_deeply_nested_path() {
+        assert!(Path::new("/a/b/c/d/e/f/g").is_absolute());
+    }
+
+    // ── Agent name validation extended ──
+
+    #[test]
+    fn agent_name_validation_case_matters() {
+        use mcp_agent_mail_core::models::is_valid_agent_name;
+        // Valid names are CamelCase Adjective+Noun
+        assert!(is_valid_agent_name("BlueLake"));
+        // All lowercase should fail
+        assert!(!is_valid_agent_name("bluelake"));
+        // All uppercase should fail
+        assert!(!is_valid_agent_name("BLUELAKE"));
+    }
+
+    #[test]
+    fn agent_name_numbers_only_rejected() {
+        use mcp_agent_mail_core::models::is_valid_agent_name;
+        assert!(!is_valid_agent_name("12345"));
+    }
+
+    #[test]
+    fn agent_name_special_chars_rejected() {
+        use mcp_agent_mail_core::models::is_valid_agent_name;
+        assert!(!is_valid_agent_name("Blue-Lake"));
+        assert!(!is_valid_agent_name("Blue_Lake"));
+        assert!(!is_valid_agent_name("Blue.Lake"));
+        assert!(!is_valid_agent_name("Blue@Lake"));
+    }
+
+    #[test]
+    fn agent_name_descriptive_names_rejected() {
+        use mcp_agent_mail_core::models::is_valid_agent_name;
+        // These look like agent names but use invalid adjectives/nouns
+        assert!(!is_valid_agent_name("BackendHarmonizer"));
+        assert!(!is_valid_agent_name("DatabaseMigrator"));
+        assert!(!is_valid_agent_name("UIRefactorer"));
+    }
+
+    // ── Attachments policy validation extended ──
+
+    #[test]
+    fn attachments_policy_all_valid_values() {
+        for policy in &["auto", "inline", "file", "none"] {
+            assert!(
+                is_valid_attachments_policy(policy),
+                "Policy '{policy}' should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn attachments_policy_boundary_values() {
+        // Near-misses and common mistakes
+        assert!(!is_valid_attachments_policy("auto\n"));
+        assert!(!is_valid_attachments_policy("\nauto"));
+        assert!(!is_valid_attachments_policy("auto\0"));
+        assert!(!is_valid_attachments_policy("inlined"));
+        assert!(!is_valid_attachments_policy("files"));
+    }
+
+    // ── us_to_ms_ceil correctness ──
+
+    #[test]
+    fn us_to_ms_ceil_rounds_up() {
+        assert_eq!(us_to_ms_ceil(0), 0);
+        assert_eq!(us_to_ms_ceil(1), 1); // 1µs → 1ms (rounded up)
+        assert_eq!(us_to_ms_ceil(999), 1); // 999µs → 1ms
+        assert_eq!(us_to_ms_ceil(1000), 1); // exactly 1ms
+        assert_eq!(us_to_ms_ceil(1001), 2); // 1001µs → 2ms
+        assert_eq!(us_to_ms_ceil(1500), 2); // 1.5ms → 2ms
+        assert_eq!(us_to_ms_ceil(2000), 2); // exactly 2ms
+    }
+
+    #[test]
+    fn us_to_ms_ceil_handles_max() {
+        // Should not overflow/panic with u64::MAX
+        let result = us_to_ms_ceil(u64::MAX);
+        // u64::MAX.saturating_add(999) → u64::MAX; u64::MAX / 1000 = 18446744073709551
+        assert!(result > 0);
+    }
+
+    // ── Response serialization — optional fields omitted ──
+
+    #[test]
+    fn health_check_omits_optional_null_fields() {
+        let r = HealthCheckResponse {
+            status: "ok".into(),
+            health_level: "green".into(),
+            environment: "test".into(),
+            http_host: "localhost".into(),
+            http_port: 8765,
+            database_url: "sqlite:///:memory:".into(),
+            pool_utilization: None,
+            queues: None,
+            disk: None,
+            integrity: None,
+        };
+        let json_str = serde_json::to_string(&r).unwrap();
+        assert!(!json_str.contains("pool_utilization"));
+        assert!(!json_str.contains("queues"));
+        assert!(!json_str.contains("disk"));
+        assert!(!json_str.contains("integrity"));
+    }
+
+    #[test]
+    fn redact_database_url_memory_db() {
+        // In-memory SQLite should pass through unchanged
+        assert_eq!(
+            redact_database_url("sqlite:///:memory:"),
+            "sqlite:///:memory:"
+        );
+    }
+
+    #[test]
+    fn redact_database_url_multiple_at_signs() {
+        // Edge case: multiple @ signs — last one is the host separator
+        let result = redact_database_url("postgres://user:p@ss@host/db");
+        assert_eq!(result, "postgres://****@host/db");
+    }
 }

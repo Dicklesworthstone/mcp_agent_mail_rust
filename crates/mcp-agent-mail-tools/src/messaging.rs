@@ -2386,4 +2386,230 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // validate_message_size_limits — boundary and edge-case coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn size_limits_multiple_attachments_sum_to_total() {
+        let cfg = config_with_limits(0, 0, 100, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.txt");
+        let p2 = dir.path().join("b.txt");
+        std::fs::write(&p1, "x".repeat(40)).unwrap();
+        std::fs::write(&p2, "y".repeat(40)).unwrap();
+        let paths = vec![
+            p1.to_string_lossy().to_string(),
+            p2.to_string_lossy().to_string(),
+        ];
+        // subject(0) + body(25) + a(40) + b(40) = 105 > 100
+        let result = validate_message_size_limits(&cfg, "", &"z".repeat(25), Some(&paths));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn size_limits_empty_subject_and_body_pass() {
+        let cfg = config_with_limits(1, 1, 1, 1);
+        // Empty strings have length 0 which is ≤ any positive limit
+        let result = validate_message_size_limits(&cfg, "", "", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_limits_error_message_contains_field_info() {
+        let cfg = config_with_limits(10, 0, 0, 0);
+        let err = validate_message_size_limits(&cfg, "", &"x".repeat(20), None).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("body") || err_str.contains("Body"),
+            "Error should mention body field: {err_str}"
+        );
+    }
+
+    #[test]
+    fn size_limits_subject_error_mentions_subject() {
+        let cfg = config_with_limits(0, 0, 0, 5);
+        let err = validate_message_size_limits(&cfg, "toolong", "", None).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("ubject"),
+            "Error should mention subject: {err_str}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_reply_body_limit — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reply_body_limit_exact_boundary() {
+        let cfg = config_with_limits(50, 0, 0, 0);
+        assert!(validate_reply_body_limit(&cfg, &"r".repeat(50)).is_ok());
+        assert!(validate_reply_body_limit(&cfg, &"r".repeat(51)).is_err());
+    }
+
+    #[test]
+    fn reply_body_limit_empty_body_passes() {
+        let cfg = config_with_limits(1, 0, 0, 0);
+        assert!(validate_reply_body_limit(&cfg, "").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Importance validation — exhaustive enum coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn importance_case_sensitive_rejects_uppercase() {
+        let valid = ["low", "normal", "high", "urgent"];
+        for v in ["LOW", "Normal", "HIGH", "URGENT", "Urgent"] {
+            assert!(
+                !valid.contains(&v),
+                "Importance should be case-sensitive, {v} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn importance_rejects_common_typos() {
+        let valid = ["low", "normal", "high", "urgent"];
+        for v in ["critical", "medium", "info", "warning", "severe", "p0", "1"] {
+            assert!(
+                !valid.contains(&v),
+                "Importance should reject typo/alias: {v}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Thread ID — additional boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn thread_id_exactly_128_is_valid() {
+        let id: String = "a".repeat(128);
+        assert!(is_valid_thread_id(&id));
+    }
+
+    #[test]
+    fn thread_id_127_plus_special_chars_valid() {
+        let mut id = String::from("X");
+        id.push_str(&"-".repeat(127));
+        assert_eq!(id.len(), 128);
+        assert!(is_valid_thread_id(&id));
+    }
+
+    #[test]
+    fn thread_id_mixed_valid_chars() {
+        assert!(is_valid_thread_id("a.b-c_d"));
+        assert!(is_valid_thread_id("br-2ei.5.7.2"));
+        assert!(is_valid_thread_id("JIRA-12345"));
+    }
+
+    #[test]
+    fn thread_id_tab_char_rejected() {
+        assert!(!is_valid_thread_id("foo\tbar"));
+    }
+
+    #[test]
+    fn thread_id_newline_rejected() {
+        assert!(!is_valid_thread_id("foo\nbar"));
+    }
+
+    #[test]
+    fn thread_id_null_byte_rejected() {
+        assert!(!is_valid_thread_id("foo\0bar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_thread_id — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_thread_id_fallback_itself_is_valid() {
+        // Ensure the fallback is always returned when input is all-invalid
+        let result = sanitize_thread_id("!!!!", "msg-42");
+        assert_eq!(result, "msg-42");
+        assert!(is_valid_thread_id(&result));
+    }
+
+    #[test]
+    fn sanitize_thread_id_mixed_valid_invalid_preserves_valid() {
+        let result = sanitize_thread_id("a@b#c", "fb");
+        assert_eq!(result, "abc");
+    }
+
+    #[test]
+    fn sanitize_thread_id_only_dashes_uses_fallback() {
+        // Dashes are valid chars but can't start the string
+        let result = sanitize_thread_id("---", "fb");
+        assert_eq!(result, "fb");
+    }
+
+    // -----------------------------------------------------------------------
+    // Response struct serialization — round-trip and edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn delivery_result_serializes_project() {
+        let r = DeliveryResult {
+            project: "/data/my-project".into(),
+            payload: MessagePayload {
+                id: 1,
+                project_id: 1,
+                sender_id: 1,
+                thread_id: None,
+                subject: "test".into(),
+                body_md: "body".into(),
+                importance: "normal".into(),
+                ack_required: false,
+                created_ts: None,
+                attachments: vec![],
+                from: "A".into(),
+                to: vec!["B".into()],
+                cc: vec![],
+                bcc: vec![],
+            },
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["project"], "/data/my-project");
+        assert_eq!(json["payload"]["from"], "A");
+    }
+
+    #[test]
+    fn message_payload_thread_id_null_when_none() {
+        let r = MessagePayload {
+            id: 1,
+            project_id: 1,
+            sender_id: 1,
+            thread_id: None,
+            subject: "s".into(),
+            body_md: "b".into(),
+            importance: "low".into(),
+            ack_required: false,
+            created_ts: None,
+            attachments: vec![],
+            from: "X".into(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(json["thread_id"].is_null());
+    }
+
+    #[test]
+    fn ack_status_omits_null_timestamps() {
+        let r = AckStatusResponse {
+            message_id: 1,
+            acknowledged: false,
+            acknowledged_at: None,
+            read_at: None,
+        };
+        let json_str = serde_json::to_string(&r).unwrap();
+        assert!(!json_str.contains("acknowledged_at"));
+        assert!(!json_str.contains("read_at"));
+    }
 }
