@@ -130,11 +130,22 @@ pub fn verify_bundle(
                                 sri_valid: false,
                                 signature_checked: false,
                                 signature_verified: false,
+                                key_source: None,
                                 error: Some(format!(
                                     "SRI mismatch for {relative_path}: expected {expected}, got {actual_hash}"
                                 )),
                             });
                         }
+                    } else {
+                        return Ok(VerifyResult {
+                            bundle: bundle_root.display().to_string(),
+                            sri_checked: true,
+                            sri_valid: false,
+                            signature_checked: false,
+                            signature_verified: false,
+                            key_source: None,
+                            error: Some(format!("SRI-referenced file missing: {relative_path}")),
+                        });
                     }
                 }
             }
@@ -145,6 +156,7 @@ pub fn verify_bundle(
     let sig_path = bundle_root.join("manifest.sig.json");
     let mut signature_checked = false;
     let mut signature_verified = false;
+    let mut key_source: Option<String> = None;
 
     if sig_path.exists() {
         signature_checked = true;
@@ -156,13 +168,23 @@ pub fn verify_bundle(
                 }
             })?;
 
-        // Explicit public key takes precedence over the one embedded in the sig file
-        let pub_key_str = public_key_b64.map(|s| s.to_string()).or_else(|| {
-            sig_json
+        // Explicit public key takes precedence over the one embedded in the sig file.
+        // NOTE: When falling back to the embedded key, verification only proves internal
+        // consistency (the manifest matches *some* key), not authenticity. An attacker
+        // can re-sign with their own key. Callers requiring trust should pass an explicit
+        // public_key_b64.
+        let (pub_key_str, ks) = if let Some(explicit) = public_key_b64 {
+            (Some(explicit.to_string()), Some("explicit".to_string()))
+        } else {
+            let embedded = sig_json
                 .get("public_key")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        });
+                .map(|s| s.to_string());
+            let source = embedded.as_ref().map(|_| "embedded".to_string());
+            (embedded, source)
+        };
+        key_source = ks;
+
         let sig_str = sig_json.get("signature").and_then(|v| v.as_str());
 
         if let (Some(pk_b64), Some(sig_b64)) = (pub_key_str, sig_str) {
@@ -187,6 +209,7 @@ pub fn verify_bundle(
         sri_valid: sri_checked,
         signature_checked,
         signature_verified,
+        key_source,
         error: None,
     })
 }
@@ -199,6 +222,9 @@ pub struct VerifyResult {
     pub sri_valid: bool,
     pub signature_checked: bool,
     pub signature_verified: bool,
+    /// Where the public key came from: `"explicit"` (caller-provided),
+    /// `"embedded"` (from sig file itself — self-signed, no trust anchor), or `null`.
+    pub key_source: Option<String>,
     pub error: Option<String>,
 }
 

@@ -607,7 +607,7 @@ impl std::fmt::Debug for Config {
         // Redact secret fields to prevent accidental credential leakage in logs.
         f.debug_struct("Config")
             .field("app_environment", &self.app_environment)
-            .field("database_url", &self.database_url)
+            .field("database_url", &redact_db_url(&self.database_url))
             .field("http_host", &self.http_host)
             .field("http_port", &self.http_port)
             .field("http_path", &self.http_path)
@@ -1234,7 +1234,7 @@ impl Config {
         });
         lines.push(BootstrapLine {
             key: "db",
-            value: self.database_url.clone(),
+            value: redact_db_url(&self.database_url),
             source: detect_source("DATABASE_URL"),
         });
         lines.push(BootstrapLine {
@@ -1356,6 +1356,25 @@ pub fn mask_secret(value: &str) -> String {
         let suffix: String = suffix_rev.chars().rev().collect();
         format!("****{suffix}")
     }
+}
+
+/// Redact credentials from a database URL while preserving the scheme and path.
+///
+/// Handles standard URL formats like `postgres://user:pass@host/db` and
+/// `SQLite` paths like `sqlite:///path/to/db.sqlite3`.
+fn redact_db_url(url: &str) -> String {
+    // If it contains `://` with a `@`, there may be embedded credentials.
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            // Everything between `://` and `@` is userinfo — redact it.
+            let before = &url[..scheme_end + 3];
+            let after = &after_scheme[at_pos..];
+            return format!("{before}****{after}");
+        }
+    }
+    // No credentials detected; return as-is.
+    url.to_string()
 }
 
 /// Detect which config source tier provided a given key.

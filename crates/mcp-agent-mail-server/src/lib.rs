@@ -3510,8 +3510,7 @@ impl HttpState {
                 .any(|r| self.config.http_rbac_reader_roles.contains(r));
             let is_writer = roles
                 .iter()
-                .any(|r| self.config.http_rbac_writer_roles.contains(r))
-                || roles.is_empty();
+                .any(|r| self.config.http_rbac_writer_roles.contains(r));
 
             if kind == RequestKind::Resources {
                 // Legacy python allows resources regardless of role membership.
@@ -4568,7 +4567,9 @@ fn is_local_peer_addr(peer_addr: Option<SocketAddr>) -> bool {
 fn is_loopback_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4().is_some_and(|v4| v4.is_loopback()),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
     }
 }
 

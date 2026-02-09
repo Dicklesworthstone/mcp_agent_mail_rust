@@ -25,12 +25,25 @@ const ATTACHMENT_REDACT_KEYS: &[&str] = &[
 /// Compiled secret-detection regexes (built once, reused).
 static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
+        // GitHub tokens
         Regex::new(r"(?i)ghp_[A-Za-z0-9]{36,}").unwrap(),
         Regex::new(r"(?i)github_pat_[A-Za-z0-9_]{20,}").unwrap(),
+        // Slack tokens
         Regex::new(r"(?i)xox[baprs]-[A-Za-z0-9\-]{10,}").unwrap(),
+        // OpenAI / generic sk- keys
         Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap(),
+        // Bearer tokens
         Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{16,}").unwrap(),
+        // JWTs (three base64url segments)
         Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+").unwrap(),
+        // AWS access key IDs (always start with AKIA)
+        Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+        // PEM private keys
+        Regex::new(r"-----BEGIN[A-Z ]* PRIVATE KEY-----").unwrap(),
+        // Anthropic API keys
+        Regex::new(r"(?i)sk-ant-[A-Za-z0-9\-]{20,}").unwrap(),
+        // GitLab tokens
+        Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap(),
     ]
 });
 

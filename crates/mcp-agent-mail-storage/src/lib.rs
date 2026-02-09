@@ -19,7 +19,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use git2::{IndexAddOption, Repository, Signature};
+use git2::{ErrorCode, IndexAddOption, Repository, Signature};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha1::Digest as Sha1Digest;
@@ -2464,7 +2464,9 @@ fn commit_paths_lockfree(
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
     // Get parent commit and its tree
-    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let parent = resolve_head_commit_oid(repo)?
+        .map(|oid| repo.find_commit(oid))
+        .transpose()?;
     let base_tree = parent.as_ref().and_then(|p| p.tree().ok());
 
     // Create blob objects for each file
@@ -2497,6 +2499,12 @@ fn commit_paths_lockfree(
         None => {
             repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[])?;
         }
+    }
+
+    // Lock-free commits bypass the index by design; sync index to HEAD so
+    // status/porcelain views remain clean for tooling and tests.
+    if let Err(err) = try_restore_index_to_head(repo) {
+        tracing::debug!("[git-lockfree] failed to sync index after commit: {err}");
     }
 
     Ok(())
@@ -4094,6 +4102,17 @@ pub fn emit_notification_signal(
         return false;
     }
 
+    // Reject path-traversal characters to prevent writing outside the signals dir.
+    if project_slug.contains('/')
+        || project_slug.contains('\\')
+        || project_slug.contains("..")
+        || agent_name.contains('/')
+        || agent_name.contains('\\')
+        || agent_name.contains("..")
+    {
+        return false;
+    }
+
     let debounce_ms = config.notifications_debounce_ms as u128;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4149,6 +4168,17 @@ pub fn clear_notification_signal(config: &Config, project_slug: &str, agent_name
         return false;
     }
 
+    // Reject path-traversal characters.
+    if project_slug.contains('/')
+        || project_slug.contains('\\')
+        || project_slug.contains("..")
+        || agent_name.contains('/')
+        || agent_name.contains('\\')
+        || agent_name.contains("..")
+    {
+        return false;
+    }
+
     let signal_path = config
         .notifications_signals_dir
         .join("projects")
@@ -4176,6 +4206,10 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
 
     let mut results = Vec::new();
     let dirs: Vec<PathBuf> = if let Some(slug) = project_slug {
+        // Reject path-traversal characters.
+        if slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+            return Vec::new();
+        }
         let d = projects_root.join(slug);
         if d.exists() { vec![d] } else { vec![] }
     } else {
@@ -5303,6 +5337,76 @@ pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
 // Core git operations
 // ---------------------------------------------------------------------------
 
+fn resolve_head_commit_oid(repo: &Repository) -> Result<Option<git2::Oid>> {
+    fn load_head_commit_oid(repo: &Repository) -> std::result::Result<git2::Oid, git2::Error> {
+        let head = repo.head()?;
+        let commit = head.peel_to_commit()?;
+        Ok(commit.id())
+    }
+
+    match load_head_commit_oid(repo) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(err) if matches!(err.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            // Some long-lived repo handles can transiently lose HEAD resolution.
+            match Repository::open(repo.path()).and_then(|reopened| load_head_commit_oid(&reopened))
+            {
+                Ok(oid) => Ok(Some(oid)),
+                Err(err2)
+                    if matches!(err2.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) =>
+                {
+                    Ok(None)
+                }
+                Err(err2) => Err(err2.into()),
+            }
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Refresh an index from `HEAD` so stale index state cannot leak between commits.
+fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<()> {
+    if let Some(commit_oid) = resolve_head_commit_oid(repo)? {
+        let commit = repo.find_commit(commit_oid)?;
+        let tree_oid = commit.tree_id();
+        let tree = repo.find_tree(tree_oid)?;
+        index.read_tree(&tree)?;
+    } else {
+        // Truly unborn repository with no commits yet.
+        index.clear()?;
+    }
+    Ok(())
+}
+
+/// Best-effort cleanup of staged/index state after a failed commit attempt.
+fn try_restore_index_to_head(repo: &Repository) -> Result<()> {
+    if let Some(workdir) = repo.workdir() {
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("read-tree")
+            .arg("HEAD")
+            .status()
+        {
+            Ok(status) if status.success() => return Ok(()),
+            _ => {
+                // Fall through to libgit2-based recovery path.
+            }
+        }
+    }
+
+    // Re-open to avoid stale ref views from long-lived handles.
+    let reopened = Repository::open(repo.path())?;
+    let mut index = reopened.index()?;
+    reset_index_to_head(&reopened, &mut index)?;
+    index.write()?;
+    Ok(())
+}
+
+/// Best-effort cleanup of staged/index state after a failed commit attempt.
+fn try_restore_index(repo: &Repository) {
+    let _ = try_restore_index_to_head(repo);
+}
+
 /// Add files to the git index and create a commit.
 ///
 /// This is the core commit function used by all write operations.
@@ -5319,6 +5423,8 @@ fn commit_paths(
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
     let mut index = repo.index()?;
+    reset_index_to_head(repo, &mut index)?;
+    let mut any_added = false;
 
     for path in rel_paths {
         let path = validate_repo_relative_path("commit path", path)?;
@@ -5328,7 +5434,12 @@ fn commit_paths(
         let full = repo.workdir().ok_or(StorageError::NotInitialized)?.join(p);
         if full.exists() {
             index.add_path(p)?;
+            any_added = true;
         }
+    }
+
+    if !any_added {
+        return Ok(());
     }
 
     index.write()?;
@@ -5339,15 +5450,18 @@ fn commit_paths(
     let final_message = append_trailers(message);
 
     // Find parent commit (if any)
-    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let parent = resolve_head_commit_oid(repo)?
+        .map(|oid| repo.find_commit(oid))
+        .transpose()?;
 
-    match parent {
-        Some(ref p) => {
-            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p])?;
-        }
-        None => {
-            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[])?;
-        }
+    let commit_result = match parent {
+        Some(ref p) => repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p]),
+        None => repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[]),
+    };
+
+    if let Err(err) = commit_result {
+        try_restore_index(repo);
+        return Err(err.into());
     }
 
     Ok(())
@@ -5363,6 +5477,7 @@ fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
     let mut index = repo.index()?;
+    reset_index_to_head(repo, &mut index)?;
 
     // Respect .gitignore, add all changes under the workdir.
     index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
@@ -5372,15 +5487,18 @@ fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
     let tree = repo.find_tree(tree_oid)?;
 
     let final_message = append_trailers(message);
-    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let parent = resolve_head_commit_oid(repo)?
+        .map(|oid| repo.find_commit(oid))
+        .transpose()?;
 
-    match parent {
-        Some(ref p) => {
-            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p])?;
-        }
-        None => {
-            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[])?;
-        }
+    let commit_result = match parent {
+        Some(ref p) => repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p]),
+        None => repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[]),
+    };
+
+    if let Err(err) = commit_result {
+        try_restore_index(repo);
+        return Err(err.into());
     }
 
     Ok(())

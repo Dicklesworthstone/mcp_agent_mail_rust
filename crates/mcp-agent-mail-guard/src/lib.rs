@@ -732,9 +732,23 @@ fn check_path_conflicts(
     conflicts
 }
 
-/// Normalize a path for matching: forward slashes, strip leading slash.
+/// Normalize a path for matching: forward slashes, strip leading `./` and `/`,
+/// and collapse `..` segments to prevent path traversal mismatches.
 fn normalize_path(path: &str, ignorecase: bool) -> String {
-    let normalized = path.replace('\\', "/").trim_start_matches('/').to_string();
+    let slashed = path.replace('\\', "/");
+    // Collapse redundant components: strip leading `./`, resolve `..`
+    let mut parts: Vec<&str> = Vec::new();
+    for component in slashed.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                // Pop the previous segment if possible (don't go above root)
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let normalized = parts.join("/");
     if ignorecase {
         normalized.to_ascii_lowercase()
     } else {
