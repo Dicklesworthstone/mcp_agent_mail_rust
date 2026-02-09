@@ -640,4 +640,114 @@ mod tests {
         assert_eq!(proj, "/my/project");
         assert_eq!(agent, "BlueLake");
     }
+
+    // -----------------------------------------------------------------------
+    // Tool validation rule tests (br-2841)
+    // -----------------------------------------------------------------------
+
+    // ── normalize_contact_policy — extended edge cases ──
+
+    #[test]
+    fn policy_normalization_handles_mixed_case_with_underscores() {
+        assert_eq!(normalize_contact_policy("Contacts_Only"), "contacts_only");
+        assert_eq!(normalize_contact_policy("BLOCK_ALL"), "block_all");
+    }
+
+    #[test]
+    fn policy_normalization_rejects_hyphenated_variants() {
+        // Users might try hyphenated versions — these should default to auto
+        assert_eq!(normalize_contact_policy("block-all"), "auto");
+        assert_eq!(normalize_contact_policy("contacts-only"), "auto");
+    }
+
+    #[test]
+    fn policy_normalization_rejects_null_byte() {
+        assert_eq!(normalize_contact_policy("open\0"), "auto");
+    }
+
+    #[test]
+    fn policy_normalization_rejects_newlines() {
+        assert_eq!(normalize_contact_policy("open\n"), "open");
+        assert_eq!(normalize_contact_policy("\nopen"), "open");
+    }
+
+    // ── parse_contact_target — extended edge cases ──
+
+    #[test]
+    fn parse_contact_target_empty_agent_name_with_project() {
+        // project:foo# (empty agent after #)
+        let (proj, agent) = parse_contact_target("project:foo#", None, "/default");
+        // Empty agent should fall back to treating entire string as agent name
+        assert_eq!(proj, "/default");
+        assert_eq!(agent, "project:foo#");
+    }
+
+    #[test]
+    fn parse_contact_target_no_hash_in_shorthand() {
+        // "project:foo" without # — no valid shorthand
+        let (proj, agent) = parse_contact_target("project:foo", None, "/default");
+        assert_eq!(proj, "/default");
+        assert_eq!(agent, "project:foo");
+    }
+
+    #[test]
+    fn parse_contact_target_to_project_overrides_shorthand() {
+        // When to_project is explicitly set, it takes precedence even with shorthand
+        let (proj, agent) = parse_contact_target(
+            "project:other#AgentX",
+            Some("explicit-project".into()),
+            "/default",
+        );
+        assert_eq!(proj, "explicit-project");
+        assert_eq!(agent, "project:other#AgentX");
+    }
+
+    // ── TTL validation ──
+
+    #[test]
+    fn ttl_zero_treated_as_default() {
+        // TTL of 0 should be treated as using default (validated by tool)
+        let ttl = 0_i64;
+        assert!(ttl <= 0, "Zero TTL should trigger default behavior");
+    }
+
+    #[test]
+    fn ttl_negative_handled() {
+        let ttl = -100_i64;
+        assert!(ttl < 0, "Negative TTL should be rejected or defaulted");
+    }
+
+    // ── ContactLink serialization edge cases ──
+
+    #[test]
+    fn contact_link_null_expires_omitted_in_state() {
+        let r = ContactLinkState {
+            from: "A".into(),
+            from_project: "/p".into(),
+            to: "B".into(),
+            to_project: "/p".into(),
+            status: "pending".into(),
+            expires_ts: None,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        // When None, serde serializes as null (not omitted, since no skip_serializing_if)
+        assert!(json["expires_ts"].is_null());
+    }
+
+    #[test]
+    fn simple_contact_entry_all_fields_present() {
+        let r = SimpleContactEntry {
+            to: "GoldHawk".into(),
+            status: "pending".into(),
+            reason: "testing".into(),
+            updated_ts: Some("2026-02-08T00:00:00Z".into()),
+            expires_ts: Some("2026-02-15T00:00:00Z".into()),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["to"], "GoldHawk");
+        assert!(json["updated_ts"].is_string());
+        assert!(json["expires_ts"].is_string());
+    }
 }

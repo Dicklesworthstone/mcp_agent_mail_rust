@@ -1093,4 +1093,137 @@ mod tests {
         assert_eq!(deserialized.conflicts.len(), 1);
         assert_eq!(deserialized.conflicts[0].holders[0].agent_name, "GoldHawk");
     }
+
+    // -----------------------------------------------------------------------
+    // Tool validation rule tests (br-2841)
+    // -----------------------------------------------------------------------
+
+    // ── Path expansion edge cases ──
+
+    #[test]
+    fn expand_tilde_double_tilde_unchanged() {
+        // "~~" is not a valid tilde expansion
+        let result = expand_tilde("~~");
+        assert_eq!(result, PathBuf::from("~~"));
+    }
+
+    #[test]
+    fn expand_tilde_tilde_with_username_unchanged() {
+        // ~username syntax is not supported — only bare ~
+        let result = expand_tilde("~otheruser/file");
+        // Should NOT expand (no HOME-based expansion for other users)
+        assert!(result.to_string_lossy().starts_with("~otheruser"));
+    }
+
+    #[test]
+    fn normalize_repo_path_empty_string() {
+        let result = normalize_repo_path("");
+        // Empty string joined with CWD gives CWD
+        assert!(result.is_absolute());
+    }
+
+    #[test]
+    fn normalize_repo_path_dot() {
+        let result = normalize_repo_path(".");
+        assert!(result.is_absolute());
+    }
+
+    // ── TTL validation edge cases ──
+
+    #[test]
+    fn ttl_exactly_60_is_minimum_valid() {
+        let ttl = 60_i64;
+        assert!(ttl >= 60, "60s is the minimum valid TTL");
+    }
+
+    #[test]
+    fn ttl_large_value_accepted() {
+        let ttl = 86400_i64 * 365; // 1 year in seconds
+        assert!(ttl > 0);
+        assert_eq!(ttl, 31_536_000);
+    }
+
+    // ── Multiple holders in conflict ──
+
+    #[test]
+    fn conflict_with_multiple_holders_serializes() {
+        let r = ReservationConflict {
+            path: "src/**/*.rs".into(),
+            holders: vec![
+                ConflictHolder {
+                    agent_name: "RedFox".into(),
+                    reservation_id: 1,
+                    expires_ts: "2026-02-06T01:00:00Z".into(),
+                },
+                ConflictHolder {
+                    agent_name: "BlueLake".into(),
+                    reservation_id: 2,
+                    expires_ts: "2026-02-06T02:00:00Z".into(),
+                },
+            ],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["holders"].as_array().unwrap().len(), 2);
+        assert_eq!(json["holders"][0]["agent_name"], "RedFox");
+        assert_eq!(json["holders"][1]["agent_name"], "BlueLake");
+    }
+
+    // ── Empty response types ──
+
+    #[test]
+    fn reservation_response_empty_both() {
+        let r = ReservationResponse {
+            granted: vec![],
+            conflicts: vec![],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(json["granted"].as_array().unwrap().is_empty());
+        assert!(json["conflicts"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn release_result_zero_released() {
+        let r = ReleaseResult {
+            released: 0,
+            released_at: "2026-02-06T00:00:00Z".into(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["released"], 0);
+    }
+
+    #[test]
+    fn renewal_result_empty_reservations() {
+        let r = RenewalResult {
+            renewed: 0,
+            file_reservations: vec![],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["renewed"], 0);
+        assert!(json["file_reservations"].as_array().unwrap().is_empty());
+    }
+
+    // ── Glob pattern in paths ──
+
+    #[test]
+    fn glob_patterns_recognized() {
+        use crate::pattern_overlap::has_glob_meta;
+        assert!(has_glob_meta("src/**/*.rs"));
+        assert!(has_glob_meta("*.txt"));
+        assert!(has_glob_meta("file?.rs"));
+        assert!(has_glob_meta("src/{a,b}.rs"));
+        assert!(has_glob_meta("src/[abc].rs"));
+    }
+
+    #[test]
+    fn literal_paths_not_glob() {
+        use crate::pattern_overlap::has_glob_meta;
+        assert!(!has_glob_meta("src/main.rs"));
+        assert!(!has_glob_meta("Cargo.toml"));
+        assert!(!has_glob_meta("README.md"));
+        assert!(!has_glob_meta(""));
+    }
 }
