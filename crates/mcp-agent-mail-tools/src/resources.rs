@@ -3565,10 +3565,10 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             .await,
     )?;
 
-    // Expire TTL-elapsed reservations (released_ts=NULL AND expires_ts < now).
+    // Expire TTL-elapsed reservations (released_ts=NULL AND expires_ts <= now).
     for row in all_rows
         .iter()
-        .filter(|r| r.released_ts.is_none() && r.expires_ts < now_micros)
+        .filter(|r| r.released_ts.is_none() && r.expires_ts <= now_micros)
     {
         let Some(id) = row.id else { continue };
         let updated = db_outcome_to_mcp_result(
@@ -3597,7 +3597,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     // Release stale reservations (unreleased + agent inactive + no recent mail/fs/git).
     for row in all_rows
         .iter()
-        .filter(|r| r.released_ts.is_none() && r.expires_ts >= now_micros)
+        .filter(|r| r.released_ts.is_none() && r.expires_ts > now_micros)
     {
         let Some(id) = row.id else { continue };
         let Some(agent) = agent_by_id.get(&row.agent_id) else {

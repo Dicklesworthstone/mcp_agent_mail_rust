@@ -1,7 +1,7 @@
 //! Background worker for file reservation cleanup.
 //!
 //! Mirrors legacy Python `_worker_cleanup` in `http.py`:
-//! - Phase 1: release expired reservations (`expires_ts < now`)
+//! - Phase 1: release expired reservations (`expires_ts <= now`)
 //! - Phase 2: release stale reservations by inactivity heuristics
 //! - Logs via structlog + optional rich panel
 //!
@@ -174,10 +174,8 @@ fn detect_and_release_stale(
         };
 
     // Filter to only non-expired ones (expired were handled in phase 1).
-    let active: Vec<&FileReservationRow> = reservations
-        .iter()
-        .filter(|r| r.expires_ts >= now)
-        .collect();
+    let active: Vec<&FileReservationRow> =
+        reservations.iter().filter(|r| r.expires_ts > now).collect();
 
     if active.is_empty() {
         return Ok(0);

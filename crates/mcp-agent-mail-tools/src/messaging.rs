@@ -451,10 +451,14 @@ pub async fn send_message(
         ));
     }
 
+    // Normalize thread_id: trim whitespace and convert blank to None.
+    let thread_id = thread_id
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+
     // Validate thread_id format if provided
     if let Some(ref tid) = thread_id {
-        let tid = tid.trim();
-        if !tid.is_empty() && !is_valid_thread_id(tid) {
+        if !is_valid_thread_id(tid) {
             return Err(legacy_tool_error(
                 "INVALID_THREAD_ID",
                 format!(

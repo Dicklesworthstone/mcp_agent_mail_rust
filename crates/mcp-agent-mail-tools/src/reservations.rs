@@ -639,7 +639,7 @@ pub async fn force_release_file_reservation(
     }
 
     // Check if reservation has expired
-    let is_expired = reservation.expires_ts < now_micros;
+    let is_expired = reservation.expires_ts <= now_micros;
 
     // Must be inactive (agent + all signals stale) OR expired to force-release
     let all_signals_stale = agent_inactive && mail_stale && git_stale;

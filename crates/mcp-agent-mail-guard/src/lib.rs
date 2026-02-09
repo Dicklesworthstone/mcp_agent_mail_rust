@@ -892,7 +892,7 @@ fn fnmatch_simple(name: &str, pattern: &str) -> bool {
 ///
 /// Parses each `*.json` file and returns records that are:
 /// - Not released (`released_ts` is null)
-/// - Not expired (expires_ts > now)
+/// - Not expired (`expires_ts > now`; at exact boundary reservation is expired)
 /// - Exclusive
 fn read_active_reservations_from_archive(
     archive_root: &Path,
@@ -967,7 +967,7 @@ fn read_active_reservations_from_archive(
 fn is_expired(ts_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
     // Try parsing ISO-8601 with timezone
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-        return dt < *now;
+        return dt <= *now;
     }
     // Try parsing ISO-8601 without timezone (assume UTC)
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%.f") {

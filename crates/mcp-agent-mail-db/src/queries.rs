@@ -1833,14 +1833,36 @@ pub async fn mark_message_read(
     match out {
         Outcome::Ok(rows) => {
             if rows == 0 {
-                Outcome::Err(DbError::not_found(
+                return Outcome::Err(DbError::not_found(
                     "MessageRecipient",
                     format!("{agent_id}:{message_id}"),
-                ))
-            } else {
-                // Invalidate cached inbox stats (unread_count may have changed).
-                crate::cache::read_cache().invalidate_inbox_stats(agent_id);
-                Outcome::Ok(now)
+                ));
+            }
+            // Invalidate cached inbox stats (unread_count may have changed).
+            crate::cache::read_cache().invalidate_inbox_stats(agent_id);
+
+            // Read back the actual stored timestamp (may differ from `now` on
+            // idempotent calls where COALESCE preserved the original value).
+            let read_sql =
+                "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
+            let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
+            let ts_out = map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await);
+            match ts_out {
+                Outcome::Ok(rows) => {
+                    let ts = rows
+                        .first()
+                        .and_then(|r| r.get(0))
+                        .and_then(|v| match v {
+                            Value::BigInt(n) => Some(*n),
+                            Value::Int(n) => Some(i64::from(*n)),
+                            _ => None,
+                        })
+                        .unwrap_or(now);
+                    Outcome::Ok(ts)
+                }
+                Outcome::Err(_) => Outcome::Ok(now),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
             }
         }
         Outcome::Err(e) => Outcome::Err(e),
@@ -1881,14 +1903,43 @@ pub async fn acknowledge_message(
     match out {
         Outcome::Ok(rows) => {
             if rows == 0 {
-                Outcome::Err(DbError::not_found(
+                return Outcome::Err(DbError::not_found(
                     "MessageRecipient",
                     format!("{agent_id}:{message_id}"),
-                ))
-            } else {
-                // Invalidate cached inbox stats (ack_pending_count may have changed).
-                crate::cache::read_cache().invalidate_inbox_stats(agent_id);
-                Outcome::Ok((now, now))
+                ));
+            }
+            // Invalidate cached inbox stats (ack_pending_count may have changed).
+            crate::cache::read_cache().invalidate_inbox_stats(agent_id);
+
+            // Read back the actual stored timestamps (may differ from `now` on
+            // idempotent calls where COALESCE preserved the original values).
+            let read_sql = "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
+            let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
+            let ts_out = map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await);
+            match ts_out {
+                Outcome::Ok(rows) => {
+                    let row = rows.first();
+                    let read_ts = row
+                        .and_then(|r| r.get(0))
+                        .and_then(|v| match v {
+                            Value::BigInt(n) => Some(*n),
+                            Value::Int(n) => Some(i64::from(*n)),
+                            _ => None,
+                        })
+                        .unwrap_or(now);
+                    let ack_ts = row
+                        .and_then(|r| r.get(1))
+                        .and_then(|v| match v {
+                            Value::BigInt(n) => Some(*n),
+                            Value::Int(n) => Some(i64::from(*n)),
+                            _ => None,
+                        })
+                        .unwrap_or(now);
+                    Outcome::Ok((read_ts, ack_ts))
+                }
+                Outcome::Err(_) => Outcome::Ok((now, now)),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
             }
         }
         Outcome::Err(e) => Outcome::Err(e),
@@ -2742,7 +2793,8 @@ pub async fn list_recent_contact_agent_ids(
 
 /// Check if contact is allowed between two agents.
 ///
-/// Returns true if there's an approved link or if both agents have `auto` contact policy.
+/// Returns true if there's a non-expired approved link, or if the target agent
+/// has an `open` or `auto` contact policy.
 pub async fn is_contact_allowed(
     cx: &Cx,
     pool: &DbPool,
@@ -2751,6 +2803,8 @@ pub async fn is_contact_allowed(
     to_project_id: i64,
     to_agent_id: i64,
 ) -> Outcome<bool, DbError> {
+    let now = now_micros();
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -2759,6 +2813,9 @@ pub async fn is_contact_allowed(
     };
 
     let tracked = tracked(&*conn);
+
+    // Helper: check if an approved link is still valid (not expired).
+    let link_is_valid = |link: &AgentLinkRow| -> bool { link.expires_ts.is_none_or(|ts| ts > now) };
 
     // Check if there's an approved link in either direction
     let link = map_sql_outcome(
@@ -2773,8 +2830,8 @@ pub async fn is_contact_allowed(
     );
 
     match link {
-        Outcome::Ok(Some(_)) => return Outcome::Ok(true),
-        Outcome::Ok(None) => {}
+        Outcome::Ok(Some(ref row)) if link_is_valid(row) => return Outcome::Ok(true),
+        Outcome::Ok(_) => {}
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
@@ -2793,14 +2850,14 @@ pub async fn is_contact_allowed(
     );
 
     match reverse_link {
-        Outcome::Ok(Some(_)) => return Outcome::Ok(true),
-        Outcome::Ok(None) => {}
+        Outcome::Ok(Some(ref row)) if link_is_valid(row) => return Outcome::Ok(true),
+        Outcome::Ok(_) => {}
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
 
-    // Check if target agent has "auto" contact policy (allows all contacts)
+    // Check if target agent has "open" or "auto" contact policy (allows all contacts)
     let target_agent = map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(to_project_id))
@@ -2810,7 +2867,9 @@ pub async fn is_contact_allowed(
     );
 
     match target_agent {
-        Outcome::Ok(Some(agent)) => Outcome::Ok(agent.contact_policy == "auto"),
+        Outcome::Ok(Some(agent)) => {
+            Outcome::Ok(matches!(agent.contact_policy.as_str(), "auto" | "open"))
+        }
         Outcome::Ok(None) => Outcome::Ok(false),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
