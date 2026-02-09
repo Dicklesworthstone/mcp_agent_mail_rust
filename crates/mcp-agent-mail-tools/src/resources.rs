@@ -275,7 +275,7 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
 
     let project = projects
         .into_iter()
-        .find(|p| p.slug == project_key)
+        .find(|p| p.slug == project_key || p.human_key == project_key)
         .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
 
     let project_id = project.id.unwrap_or(0);
@@ -1678,7 +1678,7 @@ pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String
 
     let project = projects
         .into_iter()
-        .find(|p| p.slug == slug)
+        .find(|p| p.slug == slug || p.human_key == slug)
         .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
 
     let project_id = project.id.unwrap_or(0);

@@ -539,7 +539,7 @@ pub async fn macro_contact_handshake(
         let mut to_row =
             crate::tool_util::resolve_agent(ctx, &pool, project_id, &target_agent).await;
         if to_row.is_err() {
-            let should_register = register_if_missing.unwrap_or(false);
+            let should_register = register_if_missing.unwrap_or(true);
             if should_register {
                 let program = program.unwrap_or_else(|| "unknown".to_string());
                 let model = model.unwrap_or_else(|| "unknown".to_string());

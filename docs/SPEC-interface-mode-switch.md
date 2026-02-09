@@ -72,8 +72,9 @@ When `AM_INTERFACE_MODE=cli`:
 
 - The `mcp-agent-mail` binary exposes the **full CLI surface** (equivalent to `am`).
 - `mcp-agent-mail --help` renders CLI help, ideally using `mcp-agent-mail` in usage strings.
-- `mcp-agent-mail` with no args renders CLI help (or a deterministic short usage) and exits with a
-  usage error code per clap defaulting rules (see exit codes).
+- `mcp-agent-mail` with no args prints a deterministic short guidance error and exits with a usage
+  error code (2). This avoids a confusing clap “missing subcommand” error when users forget they
+  enabled CLI mode and were trying to start the server.
 
 ### Help Surface Invariants
 
@@ -104,6 +105,7 @@ Template (exact phrasing can be tuned, but must remain deterministic):
 ```
 Error: "{command}" is not an MCP server command.
 
+Agent Mail is not a CLI.
 Agent Mail MCP server accepts: serve, config
 For operator CLI commands, use: am {command}
 Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ...
@@ -112,7 +114,9 @@ Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ...
 ### CLI mode: MCP-only attempt denial
 
 Trigger: `AM_INTERFACE_MODE=cli` and argv[1] is an MCP-only command that is not part of the CLI
-surface (notably `serve` and `config`, unless explicitly added to the CLI surface).
+surface (notably `serve`).
+
+Note: `config` is **not** denied because the CLI surface has its own `config` command.
 
 Requirements:
 
@@ -132,6 +136,10 @@ Error: "{command}" is not available in CLI mode (AM_INTERFACE_MODE=cli).
 To start the MCP server:
   unset AM_INTERFACE_MODE   # (or set AM_INTERFACE_MODE=mcp)
   mcp-agent-mail serve ...
+
+CLI equivalents:
+  mcp-agent-mail serve-http ...
+  mcp-agent-mail serve-stdio ...
 ```
 
 ## Exit Codes
@@ -155,4 +163,3 @@ E2E:
 
 - Add matrix rows mirroring the vectors above with per-row artifacts (stdout/stderr/exit + command
   line) under `tests/artifacts/<suite>/<timestamp>/`.
-
