@@ -118,6 +118,41 @@ fn normalize_repo_path(input: &str) -> PathBuf {
         .unwrap_or(path)
 }
 
+fn renewal_filter_matches(
+    row: &mcp_agent_mail_db::FileReservationRow,
+    agent_id: i64,
+    paths: Option<&[String]>,
+    reservation_ids: Option<&[i64]>,
+) -> bool {
+    if row.agent_id != agent_id || row.released_ts.is_some() {
+        return false;
+    }
+    if let Some(ids) = reservation_ids {
+        if !ids.is_empty() && !row.id.is_some_and(|id| ids.contains(&id)) {
+            return false;
+        }
+    }
+    if let Some(path_patterns) = paths {
+        if !path_patterns.is_empty() && !path_patterns.iter().any(|path| path == &row.path_pattern)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn collect_previous_expiries(
+    rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_id: i64,
+    paths: Option<&[String]>,
+    reservation_ids: Option<&[i64]>,
+) -> HashMap<i64, i64> {
+    rows.iter()
+        .filter(|row| renewal_filter_matches(row, agent_id, paths, reservation_ids))
+        .filter_map(|row| row.id.map(|id| (id, row.expires_ts)))
+        .collect()
+}
+
 /// Request advisory file reservations on project-relative paths/globs.
 ///
 /// # Parameters
@@ -428,6 +463,17 @@ pub async fn renew_file_reservations(
         .as_ref()
         .map(|p| p.iter().map(String::as_str).collect());
 
+    let existing_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)
+            .await,
+    )?;
+    let previous_expires_by_id = collect_previous_expiries(
+        &existing_rows,
+        agent_id,
+        paths.as_deref(),
+        file_reservation_ids.as_deref(),
+    );
+
     let renewed_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::renew_reservations(
             ctx.cx(),
@@ -441,13 +487,13 @@ pub async fn renew_file_reservations(
         .await,
     )?;
 
+    let extend_micros = extend.saturating_mul(1_000_000);
     let file_reservations: Vec<RenewedReservation> = renewed_rows
         .iter()
         .map(|r| {
-            // Calculate old expiry (current - extend)
-            let old_expires = r
-                .expires_ts
-                .saturating_sub(extend.saturating_mul(1_000_000));
+            let old_expires =
+                r.id.and_then(|id| previous_expires_by_id.get(&id).copied())
+                    .unwrap_or_else(|| r.expires_ts.saturating_sub(extend_micros));
             RenewedReservation {
                 id: r.id.unwrap_or(0),
                 path_pattern: r.path_pattern.clone(),
@@ -948,6 +994,52 @@ mod tests {
             assert!(result.is_absolute());
             assert!(result.to_string_lossy().ends_with("projects/repo"));
         }
+    }
+
+    fn reservation_row(
+        id: i64,
+        agent_id: i64,
+        path_pattern: &str,
+        expires_ts: i64,
+        released_ts: Option<i64>,
+    ) -> mcp_agent_mail_db::FileReservationRow {
+        mcp_agent_mail_db::FileReservationRow {
+            id: Some(id),
+            project_id: 1,
+            agent_id,
+            path_pattern: path_pattern.to_string(),
+            exclusive: 1,
+            reason: String::new(),
+            created_ts: 1,
+            expires_ts,
+            released_ts,
+        }
+    }
+
+    #[test]
+    fn collect_previous_expiries_applies_agent_and_path_filters() {
+        let rows = vec![
+            reservation_row(1, 7, "src/**", 1_000, None),
+            reservation_row(2, 7, "docs/*.md", 2_000, None),
+            reservation_row(3, 9, "src/**", 3_000, None),
+            reservation_row(4, 7, "src/**", 4_000, Some(100)),
+        ];
+
+        let map = collect_previous_expiries(&rows, 7, Some(&["src/**".to_string()]), None);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&1), Some(&1_000));
+    }
+
+    #[test]
+    fn collect_previous_expiries_respects_id_filter() {
+        let rows = vec![
+            reservation_row(10, 5, "src/**", 10_000, None),
+            reservation_row(11, 5, "src/**", 11_000, None),
+        ];
+
+        let map = collect_previous_expiries(&rows, 5, None, Some(&[11]));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&11), Some(&11_000));
     }
 
     // -----------------------------------------------------------------------

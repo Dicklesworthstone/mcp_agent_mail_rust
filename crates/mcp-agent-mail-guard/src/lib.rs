@@ -1113,7 +1113,9 @@ fn parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {
                     }
                     i += 3;
                 } else {
-                    i += 1;
+                    // Incomplete rename/copy entry — skip remaining parts to
+                    // avoid misaligning with subsequent status entries.
+                    break;
                 }
             }
             'A' | 'M' | 'D' | 'T' | 'U' => {

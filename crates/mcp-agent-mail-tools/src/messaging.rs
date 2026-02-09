@@ -245,6 +245,10 @@ fn validate_reply_body_limit(config: &Config, body_md: &str) -> McpResult<()> {
     Ok(())
 }
 
+const fn has_any_recipients(to: &[String], cc: &[String], bcc: &[String]) -> bool {
+    !(to.is_empty() && cc.is_empty() && bcc.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_recipient(
     ctx: &McpContext,
@@ -1207,6 +1211,17 @@ effective_free_bytes={free}"
     let to_names = to.unwrap_or_else(|| vec![original_sender.name.clone()]);
     let cc_names = cc.unwrap_or_default();
     let bcc_names = bcc.unwrap_or_default();
+    if !has_any_recipients(&to_names, &cc_names, &bcc_names) {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "At least one recipient is required. Provide at least one agent name in to/cc/bcc.",
+            true,
+            json!({
+                "field": "to|cc|bcc",
+                "error_detail": "empty recipient list",
+            }),
+        ));
+    }
 
     // Resolve all recipients
     let total_recip = to_names.len() + cc_names.len() + bcc_names.len();
@@ -1798,6 +1813,22 @@ mod tests {
     fn non_empty_to_list_accepted() {
         let to = ["BlueLake".to_string()];
         assert!(!to.is_empty());
+    }
+
+    #[test]
+    fn has_any_recipients_false_when_all_empty() {
+        let to: Vec<String> = vec![];
+        let cc: Vec<String> = vec![];
+        let bcc: Vec<String> = vec![];
+        assert!(!has_any_recipients(&to, &cc, &bcc));
+    }
+
+    #[test]
+    fn has_any_recipients_true_when_cc_or_bcc_present() {
+        let to: Vec<String> = vec![];
+        let cc: Vec<String> = vec!["BlueLake".to_string()];
+        let bcc: Vec<String> = vec![];
+        assert!(has_any_recipients(&to, &cc, &bcc));
     }
 
     // -----------------------------------------------------------------------

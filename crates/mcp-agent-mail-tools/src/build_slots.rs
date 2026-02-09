@@ -86,10 +86,12 @@ fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> V
         let Ok(lease) = serde_json::from_str::<BuildSlotLease>(&text) else {
             continue;
         };
-        if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts) {
-            if exp.with_timezone(&chrono::Utc) <= now {
-                continue;
-            }
+        let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts) else {
+            // Ignore malformed leases: invalid expiration should not block slots forever.
+            continue;
+        };
+        if exp.with_timezone(&chrono::Utc) <= now {
+            continue;
         }
         results.push(lease);
     }
@@ -403,5 +405,41 @@ mod tests {
             dir,
             PathBuf::from("/archive/my-project/build_slots/my_slot_name")
         );
+    }
+
+    #[test]
+    fn read_active_leases_ignores_invalid_expiration() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+
+        let valid = BuildSlotLease {
+            slot: "slot-a".to_string(),
+            agent: "agent-valid".to_string(),
+            branch: Some("main".to_string()),
+            exclusive: true,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            released_ts: None,
+        };
+        std::fs::write(
+            dir.path().join("valid.json"),
+            serde_json::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+
+        let invalid = serde_json::json!({
+            "slot": "slot-a",
+            "agent": "agent-invalid",
+            "branch": "main",
+            "exclusive": true,
+            "acquired_ts": now.to_rfc3339(),
+            "expires_ts": "not-a-timestamp",
+            "released_ts": null
+        });
+        std::fs::write(dir.path().join("invalid.json"), invalid.to_string()).unwrap();
+
+        let leases = read_active_leases(dir.path(), now);
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].agent, "agent-valid");
     }
 }

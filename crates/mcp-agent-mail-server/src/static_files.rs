@@ -70,11 +70,7 @@ pub fn resolve_web_root() -> Option<WebRoot> {
     // Candidate 1: relative to executable (mirrors Python's `Path(__file__).parents[3] / "web"`).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            // The Python source is deeply nested; for Rust we just check a few levels up.
-            for ancestor in [parent, parent.parent().unwrap_or(parent)] {
-                let candidate = ancestor.join("web");
-                candidates.push(candidate);
-            }
+            candidates.extend(executable_web_candidates(parent));
         }
     }
 
@@ -90,6 +86,15 @@ pub fn resolve_web_root() -> Option<WebRoot> {
     }
 
     None
+}
+
+fn executable_web_candidates(exe_parent: &Path) -> Vec<PathBuf> {
+    // Keep parity with legacy path probing: parent/web, ../../web, ../../../web.
+    exe_parent
+        .ancestors()
+        .take(3)
+        .map(|ancestor| ancestor.join("web"))
+        .collect()
 }
 
 /// Determine the MIME type for a file path based on its extension.
@@ -169,6 +174,22 @@ mod tests {
     #[test]
     fn resolve_web_root_does_not_panic() {
         let _ = resolve_web_root();
+    }
+
+    #[test]
+    fn executable_web_candidates_include_third_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&parent).unwrap();
+
+        let candidates = executable_web_candidates(&parent);
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0], parent.join("web"));
+        assert_eq!(candidates[1], parent.parent().unwrap().join("web"));
+        assert_eq!(
+            candidates[2],
+            parent.parent().and_then(Path::parent).unwrap().join("web")
+        );
     }
 
     #[test]
