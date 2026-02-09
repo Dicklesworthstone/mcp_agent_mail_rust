@@ -1594,6 +1594,35 @@ pub fn sanitize_fts_query(query: &str) -> Option<String> {
     }
 }
 
+/// Width of a UTF-8 character based on its leading byte.
+///
+/// Returns 1 for ASCII (0x00–0x7F), 2–4 for multi-byte sequences.
+/// Input must be valid UTF-8 (guaranteed since callers operate on `&str`).
+const fn utf8_char_width(first_byte: u8) -> usize {
+    if first_byte < 0x80 {
+        1
+    } else if first_byte < 0xE0 {
+        2
+    } else if first_byte < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Copy a single UTF-8 character from `src` at byte offset `i` into `out`,
+/// returning the byte width so the caller can advance its index correctly.
+///
+/// This avoids the `bytes[i] as char` anti-pattern which re-encodes each
+/// byte of a multi-byte character individually, corrupting non-ASCII text
+/// (e.g. `é` (0xC3 0xA9) → `Ã©` (0xC3 0x83 0xC2 0xA9)).
+fn push_utf8_char(out: &mut String, src: &str, i: usize) -> usize {
+    let w = utf8_char_width(src.as_bytes()[i]);
+    let end = (i + w).min(src.len());
+    out.push_str(&src[i..end]);
+    end - i
+}
+
 /// Quote hyphenated tokens (e.g. `POL-358` → `"POL-358"`) for FTS5.
 fn quote_hyphenated_tokens(query: &str) -> String {
     if !query.contains('-') {
@@ -1619,8 +1648,7 @@ fn quote_hyphenated_tokens(query: &str) -> String {
             continue;
         }
         if in_quote {
-            out.push(bytes[i] as char);
-            i += 1;
+            i += push_utf8_char(&mut out, query, i);
             continue;
         }
         // Try to match a hyphenated token: [A-Za-z0-9]+(-[A-Za-z0-9]+)+
@@ -1657,8 +1685,7 @@ fn quote_hyphenated_tokens(query: &str) -> String {
                 out.push_str(&query[start..i]);
             }
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            i += push_utf8_char(&mut out, query, i);
         }
     }
     out
@@ -3833,6 +3860,27 @@ mod tests {
         assert_eq!(
             quote_hyphenated_tokens("\"already-quoted\""),
             "\"already-quoted\""
+        );
+    }
+
+    #[test]
+    fn quote_hyphenated_non_ascii() {
+        // Non-ASCII chars break ASCII-alphanumeric token spans, so café-latte
+        // is NOT recognized as a single hyphenated token (FTS5 default tokenizer
+        // also splits on non-ASCII). The important thing is that multi-byte
+        // UTF-8 chars pass through without corruption.
+        assert_eq!(quote_hyphenated_tokens("café-latte"), "café-latte");
+        // Non-ASCII without hyphens should pass through unchanged
+        assert_eq!(quote_hyphenated_tokens("日本語"), "日本語");
+        // Mixed: ASCII hyphenated + non-ASCII plain - UTF-8 must not corrupt
+        assert_eq!(
+            quote_hyphenated_tokens("foo-bar 日本語"),
+            "\"foo-bar\" 日本語"
+        );
+        // 4-byte UTF-8 (emoji) must survive
+        assert_eq!(
+            quote_hyphenated_tokens("test-case 🎉"),
+            "\"test-case\" 🎉"
         );
     }
 
