@@ -272,7 +272,14 @@ async fn push_recipient(
         agent
     };
     let agent_id = agent.id.unwrap_or(0);
-    all_recipients.push((agent_id, kind.to_string()));
+    // Skip if this agent_id is already in the list (e.g., same agent in both
+    // `to` and `cc`).  The first occurrence wins, matching email precedence:
+    // to > cc > bcc.  Without this, the PRIMARY KEY(message_id, agent_id)
+    // constraint in message_recipients would reject the INSERT and roll back
+    // the entire message transaction.
+    if !all_recipients.iter().any(|(id, _)| *id == agent_id) {
+        all_recipients.push((agent_id, kind.to_string()));
+    }
     resolved_list.push(agent.name);
     Ok(())
 }
@@ -1237,17 +1244,26 @@ effective_free_bytes={free}"
 
     for name in &to_names {
         let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "to".to_string()));
+        let aid = agent.id.unwrap_or(0);
+        if !all_recipients.iter().any(|(id, _)| *id == aid) {
+            all_recipients.push((aid, "to".to_string()));
+        }
         resolved_to.push(agent.name);
     }
     for name in &cc_names {
         let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "cc".to_string()));
+        let aid = agent.id.unwrap_or(0);
+        if !all_recipients.iter().any(|(id, _)| *id == aid) {
+            all_recipients.push((aid, "cc".to_string()));
+        }
         resolved_cc_recipients.push(agent.name);
     }
     for name in &bcc_names {
         let agent = resolve_agent(ctx, &pool, project_id, name).await?;
-        all_recipients.push((agent.id.unwrap_or(0), "bcc".to_string()));
+        let aid = agent.id.unwrap_or(0);
+        if !all_recipients.iter().any(|(id, _)| *id == aid) {
+            all_recipients.push((aid, "bcc".to_string()));
+        }
         resolved_bcc_recipients.push(agent.name);
     }
 
