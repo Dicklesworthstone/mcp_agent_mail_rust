@@ -15,7 +15,8 @@
 pub mod context;
 pub mod output;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{
     OnceLock,
@@ -1108,12 +1109,51 @@ pub enum ToolingCommand {
 }
 
 pub fn run() -> i32 {
-    let cli = Cli::parse();
+    run_with_invocation_name("am")
+}
+
+/// Entry point with an explicit invocation name override.
+///
+/// This is used when the CLI surface is invoked through the `mcp-agent-mail` binary
+/// (runtime opt-in via `AM_INTERFACE_MODE=cli`). It ensures `--help` / usage strings
+/// render with the correct program name.
+pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
+    let cli = match parse_with_invocation_name(invocation_name) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
     match execute(cli) {
         Ok(()) => 0,
         Err(err) => {
             emit_error(&err);
             err_exit_code(&err)
+        }
+    }
+}
+
+fn parse_with_invocation_name(invocation_name: &'static str) -> Result<Cli, i32> {
+    let cmd = Cli::command().name(invocation_name).bin_name(invocation_name);
+
+    // Ensure argv0 matches the name we want clap to render, regardless of how this
+    // library was invoked.
+    let mut args: Vec<OsString> = std::env::args_os().collect();
+    if let Some(first) = args.first_mut() {
+        *first = OsString::from(invocation_name);
+    }
+
+    let matches = match cmd.try_get_matches_from(args) {
+        Ok(m) => m,
+        Err(err) => {
+            let _ = err.print();
+            return Err(err.exit_code());
+        }
+    };
+
+    match Cli::from_arg_matches(&matches) {
+        Ok(cli) => Ok(cli),
+        Err(err) => {
+            let _ = err.print();
+            Err(err.exit_code())
         }
     }
 }
@@ -1170,6 +1210,34 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Tooling { action } => handle_tooling(action),
         Commands::Macros { action } => handle_macros(action),
         Commands::Contacts { action } => handle_contacts(action),
+    }
+}
+
+#[cfg(test)]
+mod invocation_name_tests {
+    use super::*;
+
+    fn long_help_text(mut cmd: clap::Command) -> String {
+        let mut buf = Vec::new();
+        cmd.write_long_help(&mut buf).expect("write_long_help");
+        String::from_utf8(buf).expect("help utf8")
+    }
+
+    #[test]
+    fn cli_help_can_render_under_mcp_agent_mail_name() {
+        let cmd = Cli::command().name("mcp-agent-mail").bin_name("mcp-agent-mail");
+        let help = long_help_text(cmd);
+        assert!(
+            help.contains("mcp-agent-mail"),
+            "expected help to reference mcp-agent-mail, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn cli_help_can_render_under_am_name() {
+        let cmd = Cli::command().name("am").bin_name("am");
+        let help = long_help_text(cmd);
+        assert!(help.contains("am"), "expected help to reference am");
     }
 }
 
