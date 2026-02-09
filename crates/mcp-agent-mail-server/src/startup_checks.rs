@@ -327,13 +327,53 @@ fn probe_auth(config: &Config) -> ProbeResult {
         }
     }
 
-    // JWT enabled but no JWKS URL
-    if config.http_jwt_enabled && config.http_jwt_jwks_url.is_none() {
-        return ProbeResult::Fail(ProbeFailure {
-            name: "auth",
-            problem: "JWT authentication is enabled but HTTP_JWT_JWKS_URL is not set".into(),
-            fix: "Set HTTP_JWT_JWKS_URL to your identity provider's JWKS endpoint".into(),
-        });
+    if config.http_jwt_enabled {
+        let jwks_url_present = config
+            .http_jwt_jwks_url
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        let secret_present = config
+            .http_jwt_secret
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+
+        if !jwks_url_present && !secret_present {
+            return ProbeResult::Fail(ProbeFailure {
+                name: "auth",
+                problem:
+                    "JWT authentication is enabled but neither HTTP_JWT_JWKS_URL nor HTTP_JWT_SECRET is set"
+                        .into(),
+                fix: "Set HTTP_JWT_SECRET for HS256/HS384/HS512, or set HTTP_JWT_JWKS_URL for JWKS-backed verification"
+                    .into(),
+            });
+        }
+
+        // If we're using a static secret without JWKS, only HS* algorithms make sense.
+        if secret_present && !jwks_url_present {
+            let mut algorithms: Vec<jsonwebtoken::Algorithm> = config
+                .http_jwt_algorithms
+                .iter()
+                .filter_map(|s| s.parse::<jsonwebtoken::Algorithm>().ok())
+                .collect();
+            if algorithms.is_empty() {
+                algorithms.push(jsonwebtoken::Algorithm::HS256);
+            }
+            let has_non_hs = algorithms.iter().any(|a| {
+                !matches!(
+                    a,
+                    jsonwebtoken::Algorithm::HS256
+                        | jsonwebtoken::Algorithm::HS384
+                        | jsonwebtoken::Algorithm::HS512
+                )
+            });
+            if has_non_hs {
+                return ProbeResult::Fail(ProbeFailure {
+                    name: "auth",
+                    problem: "HTTP_JWT_SECRET is set but HTTP_JWT_ALGORITHMS includes non-HS* algorithms".into(),
+                    fix: "Either restrict HTTP_JWT_ALGORITHMS to HS256/HS384/HS512 when using HTTP_JWT_SECRET, or set HTTP_JWT_JWKS_URL for asymmetric algorithms (RS*/ES*)".into(),
+                });
+            }
+        }
     }
 
     ProbeResult::Ok { name: "auth" }
@@ -599,10 +639,42 @@ mod tests {
     }
 
     #[test]
-    fn jwt_without_jwks_fails() {
+    fn jwt_without_jwks_or_secret_fails() {
         let mut config = default_config();
         config.http_jwt_enabled = true;
         config.http_jwt_jwks_url = None;
+        config.http_jwt_secret = None;
+        let result = probe_auth(&config);
+        assert!(matches!(result, ProbeResult::Fail(_)));
+    }
+
+    #[test]
+    fn jwt_with_secret_passes() {
+        let mut config = default_config();
+        config.http_jwt_enabled = true;
+        config.http_jwt_jwks_url = None;
+        config.http_jwt_secret = Some("e2e-secret".into());
+        let result = probe_auth(&config);
+        assert!(matches!(result, ProbeResult::Ok { .. }));
+    }
+
+    #[test]
+    fn jwt_with_jwks_passes() {
+        let mut config = default_config();
+        config.http_jwt_enabled = true;
+        config.http_jwt_jwks_url = Some("http://127.0.0.1:1/jwks".into());
+        config.http_jwt_secret = None;
+        let result = probe_auth(&config);
+        assert!(matches!(result, ProbeResult::Ok { .. }));
+    }
+
+    #[test]
+    fn jwt_secret_with_rs256_fails() {
+        let mut config = default_config();
+        config.http_jwt_enabled = true;
+        config.http_jwt_secret = Some("secret".into());
+        config.http_jwt_jwks_url = None;
+        config.http_jwt_algorithms = vec!["RS256".into()];
         let result = probe_auth(&config);
         assert!(matches!(result, ProbeResult::Fail(_)));
     }

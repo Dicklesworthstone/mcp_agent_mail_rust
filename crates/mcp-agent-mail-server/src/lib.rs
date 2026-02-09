@@ -2877,9 +2877,12 @@ impl HttpState {
         }
 
         let (path, _query) = split_path_query(&req.uri);
-        // Legacy parity: `/health/*` bypasses bearer auth even when configured.
-        // BearerAuthMiddleware in the legacy FastAPI stack checks only this prefix.
-        if path.starts_with("/health/") {
+        // Legacy parity: health routes bypass bearer auth even when configured.
+        //
+        // Note: the legacy FastAPI stack used a `/health/` prefix check, but this
+        // server also exposes `/health` + `/healthz` aliases for operator tooling
+        // and common probe conventions.
+        if path == "/health" || path == "/healthz" || path.starts_with("/health/") {
             if let Some(resp) = self.handle_special_routes(&req, &path) {
                 return resp;
             }
@@ -3042,13 +3045,13 @@ impl HttpState {
 
     fn handle_special_routes(&self, req: &Http1Request, path: &str) -> Option<Http1Response> {
         match path {
-            "/health/liveness" => {
+            "/healthz" | "/health/liveness" => {
                 if !matches!(req.method, Http1Method::Get) {
                     return Some(self.error_response(req, 405, "Method Not Allowed"));
                 }
                 return Some(self.json_response(req, 200, &serde_json::json!({"status":"alive"})));
             }
-            "/health/readiness" => {
+            "/health" | "/health/readiness" => {
                 if !matches!(req.method, Http1Method::Get) {
                     return Some(self.error_response(req, 405, "Method Not Allowed"));
                 }
@@ -5371,10 +5374,12 @@ mod tests {
             serde_json::from_slice(&resp.body).expect("bearer auth response json");
         assert_eq!(body["detail"], "Unauthorized");
 
-        // `/health/*` must bypass bearer auth.
-        let req_health = make_request(Http1Method::Get, "/health/liveness", &[]);
-        let resp_health = block_on(state.handle(req_health));
-        assert_eq!(resp_health.status, 200);
+        // Health routes must bypass bearer auth.
+        for path in &["/health/liveness", "/health/readiness", "/health", "/healthz"] {
+            let req_health = make_request(Http1Method::Get, path, &[]);
+            let resp_health = block_on(state.handle(req_health));
+            assert_eq!(resp_health.status, 200, "health path should bypass auth: {path}");
+        }
     }
 
     #[test]
@@ -8640,10 +8645,33 @@ mod tests {
     }
 
     #[test]
+    fn healthz_alias_returns_alive_json() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/healthz", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body, serde_json::json!({"status": "alive"}));
+    }
+
+    #[test]
     fn health_liveness_has_json_content_type() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/health/liveness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn healthz_alias_has_json_content_type() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/healthz", &[]);
         let resp = block_on(state.handle(req));
         assert_eq!(
             response_header(&resp, "content-type"),
@@ -8663,10 +8691,32 @@ mod tests {
     }
 
     #[test]
+    fn healthz_alias_rejects_post_with_405() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Post, "/healthz", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 405);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["detail"], "Method Not Allowed");
+    }
+
+    #[test]
     fn health_readiness_returns_ready_json() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body, serde_json::json!({"status": "ready"}));
+    }
+
+    #[test]
+    fn health_root_alias_returns_ready_json() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/health", &[]);
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
@@ -8686,10 +8736,31 @@ mod tests {
     }
 
     #[test]
+    fn health_root_alias_has_json_content_type() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/health", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json")
+        );
+    }
+
+    #[test]
     fn health_readiness_rejects_post_with_405() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(Http1Method::Post, "/health/readiness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 405);
+    }
+
+    #[test]
+    fn health_root_alias_rejects_post_with_405() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Post, "/health", &[]);
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 405);
     }
@@ -8793,6 +8864,20 @@ mod tests {
     }
 
     #[test]
+    fn healthz_alias_bypasses_bearer_auth() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret-token".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/healthz", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["status"], "alive");
+    }
+
+    #[test]
     fn health_readiness_bypasses_bearer_auth() {
         let config = mcp_agent_mail_core::Config {
             http_bearer_token: Some("secret-token".to_string()),
@@ -8800,6 +8885,20 @@ mod tests {
         };
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["status"], "ready");
+    }
+
+    #[test]
+    fn health_root_alias_bypasses_bearer_auth() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret-token".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/health", &[]);
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
