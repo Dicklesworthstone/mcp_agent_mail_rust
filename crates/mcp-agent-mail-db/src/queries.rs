@@ -625,60 +625,135 @@ pub async fn register_agent(
 
     let tracked = tracked(&*conn);
 
-    // Check for existing agent (project_id, name) unique.
-    let existing = map_sql_outcome(
-        select!(AgentRow)
-            .filter(Expr::col("project_id").eq(project_id))
-            .filter(Expr::col("name").eq(name))
-            .first(cx, &tracked)
-            .await,
-    );
+    // Atomic upsert: INSERT ... ON CONFLICT(project_id, name) DO UPDATE.
+    // Avoids TOCTOU race between SELECT and INSERT that could trigger a
+    // UNIQUE constraint violation under concurrent registration.
+    let task_desc = task_description.unwrap_or_default();
+    let attach_pol = attachments_policy.unwrap_or("auto");
 
-    match existing {
-        Outcome::Ok(Some(mut row)) => {
-            row.program = program.to_string();
-            row.model = model.to_string();
-            row.task_description = task_description.unwrap_or_default().to_string();
-            row.last_active_ts = now;
-            row.attachments_policy = attachments_policy.unwrap_or("auto").to_string();
+    let upsert_sql = "\
+        INSERT INTO agents (project_id, name, program, model, task_description, \
+                            inception_ts, last_active_ts, attachments_policy, contact_policy) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto') \
+        ON CONFLICT(project_id, name) DO UPDATE SET \
+            program = excluded.program, \
+            model = excluded.model, \
+            task_description = excluded.task_description, \
+            last_active_ts = excluded.last_active_ts, \
+            attachments_policy = excluded.attachments_policy \
+        RETURNING *";
+    let params = [
+        Value::BigInt(project_id),
+        Value::Text(name.to_string()),
+        Value::Text(program.to_string()),
+        Value::Text(model.to_string()),
+        Value::Text(task_desc.to_string()),
+        Value::BigInt(now),
+        Value::BigInt(now),
+        Value::Text(attach_pol.to_string()),
+    ];
 
-            // Keep inception_ts stable.
-            let updated = map_sql_outcome(update!(&row).execute(cx, &tracked).await);
-            match updated {
-                Outcome::Ok(_) => {
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, upsert_sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => rows.into_iter().next().map_or_else(
+            || {
+                Outcome::Err(DbError::Internal(
+                    "register_agent: upsert RETURNING produced no rows".to_string(),
+                ))
+            },
+            |r| match AgentRow::from_row(&r) {
+                Ok(row) => {
                     crate::cache::read_cache().put_agent(&row);
                     Outcome::Ok(row)
                 }
-                Outcome::Err(e) => Outcome::Err(e),
-                Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                Outcome::Panicked(p) => Outcome::Panicked(p),
-            }
-        }
-        Outcome::Ok(None) => {
-            let mut row = AgentRow {
-                id: None,
-                project_id,
-                name: name.to_string(),
-                program: program.to_string(),
-                model: model.to_string(),
-                task_description: task_description.unwrap_or_default().to_string(),
-                inception_ts: now,
-                last_active_ts: now,
-                attachments_policy: attachments_policy.unwrap_or("auto").to_string(),
-                contact_policy: "auto".to_string(),
-            };
+                Err(e) => Outcome::Err(map_sql_error(&e)),
+            },
+        ),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
 
-            let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
-            match id_out {
-                Outcome::Ok(id) => {
-                    row.id = Some(id);
-                    crate::cache::read_cache().put_agent(&row);
-                    Outcome::Ok(row)
-                }
-                Outcome::Err(e) => Outcome::Err(e),
-                Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                Outcome::Panicked(p) => Outcome::Panicked(p),
-            }
+/// Create a new agent identity, failing if the name is already taken.
+///
+/// Unlike `register_agent` (which does an upsert), this function uses
+/// `INSERT ... ON CONFLICT DO NOTHING` to atomically check uniqueness
+/// and insert in a single statement, eliminating the TOCTOU race between
+/// a separate `get_agent` check and `register_agent` upsert.
+///
+/// Returns `DbError::Duplicate` if the name already exists.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_agent(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+    program: &str,
+    model: &str,
+    task_description: Option<&str>,
+    attachments_policy: Option<&str>,
+) -> Outcome<AgentRow, DbError> {
+    // Validate agent name
+    if !mcp_agent_mail_core::models::is_valid_agent_name(name) {
+        return Outcome::Err(DbError::invalid(
+            "name",
+            format!("Invalid agent name '{name}'. Must be adjective+noun format"),
+        ));
+    }
+
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let task_desc = task_description.unwrap_or_default();
+    let attach_pol = attachments_policy.unwrap_or("auto");
+
+    // Atomic insert-if-absent: ON CONFLICT DO NOTHING means no row is
+    // returned when the name already exists in this project.
+    let insert_sql = "\
+        INSERT INTO agents (project_id, name, program, model, task_description, \
+                            inception_ts, last_active_ts, attachments_policy, contact_policy) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto') \
+        ON CONFLICT(project_id, name) DO NOTHING \
+        RETURNING *";
+    let params = [
+        Value::BigInt(project_id),
+        Value::Text(name.to_string()),
+        Value::Text(program.to_string()),
+        Value::Text(model.to_string()),
+        Value::Text(task_desc.to_string()),
+        Value::BigInt(now),
+        Value::BigInt(now),
+        Value::Text(attach_pol.to_string()),
+    ];
+
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, insert_sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            rows.into_iter().next().map_or_else(
+                // No rows returned: name already exists (ON CONFLICT DO NOTHING)
+                || {
+                    Outcome::Err(DbError::duplicate(
+                        "agent",
+                        format!("{name} (project {project_id})"),
+                    ))
+                },
+                |r| match AgentRow::from_row(&r) {
+                    Ok(row) => {
+                        crate::cache::read_cache().put_agent(&row);
+                        Outcome::Ok(row)
+                    }
+                    Err(e) => Outcome::Err(map_sql_error(&e)),
+                },
+            )
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -2201,6 +2276,10 @@ pub async fn renew_reservations(
 
     let tracked = tracked(&*conn);
 
+    // Wrap entire read-modify-write in a transaction so partial renewals
+    // cannot occur if the process crashes or is cancelled mid-loop.
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
     // Fetch candidate reservations first (so tools can report old/new expiry).
     let mut sql = String::from(
         "SELECT * FROM file_reservations \
@@ -2243,20 +2322,33 @@ pub async fn renew_reservations(
             for r in rows {
                 match FileReservationRow::from_row(&r) {
                     Ok(row) => out.push(row),
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 }
             }
             out
         }
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+        Outcome::Err(e) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(e);
+        }
+        Outcome::Cancelled(r) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(r);
+        }
+        Outcome::Panicked(p) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Panicked(p);
+        }
     };
 
     for row in &mut reservations {
         let base = row.expires_ts.max(now);
         row.expires_ts = base.saturating_add(extend);
         let Some(id) = row.id else {
+            rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::Internal(
                 "renew_reservations: expected id to be populated".to_string(),
             ));
@@ -2264,15 +2356,14 @@ pub async fn renew_reservations(
 
         let sql = "UPDATE file_reservations SET expires_ts = ? WHERE id = ?";
         let params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
-        let updated = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
-        match updated {
-            Outcome::Ok(_) => {}
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
     }
 
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     Outcome::Ok(reservations)
 }
 

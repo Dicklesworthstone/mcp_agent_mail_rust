@@ -663,9 +663,24 @@ Check that all parameters have valid values."
         ));
     }
 
-    // Enforce uniqueness: this tool must never update an existing identity.
-    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, &agent_name).await {
-        Outcome::Ok(_) => {
+    // Atomic insert-if-absent: eliminates TOCTOU race between a separate
+    // get_agent check and register_agent upsert. Returns Duplicate if the
+    // name was taken between validation and insert.
+    let agent_out = mcp_agent_mail_db::queries::create_agent(
+        ctx.cx(),
+        &pool,
+        project_id,
+        &agent_name,
+        &program,
+        &model,
+        task_description.as_deref(),
+        Some(&policy),
+    )
+    .await;
+
+    let row = match agent_out {
+        Outcome::Ok(row) => row,
+        Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
             return Err(legacy_tool_error(
                 "INVALID_ARGUMENT",
                 format!(
@@ -679,10 +694,7 @@ Choose a different name (or omit the name to auto-generate one)."
                 }),
             ));
         }
-        Outcome::Err(e) => match e {
-            mcp_agent_mail_db::DbError::NotFound { .. } => {}
-            other => return Err(db_error_to_mcp_error(other)),
-        },
+        Outcome::Err(other) => return Err(db_error_to_mcp_error(other)),
         Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
         Outcome::Panicked(p) => {
             return Err(McpError::internal_error(format!(
@@ -690,21 +702,7 @@ Choose a different name (or omit the name to auto-generate one)."
                 p.message()
             )));
         }
-    }
-
-    let agent_out = mcp_agent_mail_db::queries::register_agent(
-        ctx.cx(),
-        &pool,
-        project_id,
-        &agent_name,
-        &program,
-        &model,
-        task_description.as_deref(),
-        Some(&policy),
-    )
-    .await;
-
-    let row = db_outcome_to_mcp_result(agent_out)?;
+    };
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);

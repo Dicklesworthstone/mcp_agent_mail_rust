@@ -969,14 +969,16 @@ fn is_expired(ts_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
         return dt <= *now;
     }
-    // Try parsing ISO-8601 without timezone (assume UTC)
+    // Try parsing ISO-8601 without timezone (assume UTC).
+    // Use `<=` to match the RFC3339 branch and the DB layer's `expires_ts > now`
+    // semantics (i.e., expired means expires_ts <= now).
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%.f") {
         let utc = dt.and_utc();
-        return utc < *now;
+        return utc <= *now;
     }
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S") {
         let utc = dt.and_utc();
-        return utc < *now;
+        return utc <= *now;
     }
     // If we can't parse, treat as not expired (conservative)
     false
