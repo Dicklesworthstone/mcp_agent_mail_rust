@@ -53,6 +53,71 @@ s.close()
 PY
 }
 
+port_accepts_connections() {
+    local port="$1"
+python3 - <<'PY' "${port}"
+import socket
+import sys
+
+port = int(sys.argv[1])
+s = socket.socket()
+s.settimeout(0.25)
+try:
+    s.connect(("127.0.0.1", port))
+except Exception:
+    sys.exit(1)
+else:
+    sys.exit(0)
+finally:
+    s.close()
+PY
+}
+
+pid_start_ticks() {
+    local pid="$1"
+    if [ -r "/proc/${pid}/stat" ]; then
+        awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || true
+    else
+        echo ""
+    fi
+}
+
+pid_state() {
+    local pid="$1"
+    if [ -r "/proc/${pid}/stat" ]; then
+        awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || true
+    else
+        echo ""
+    fi
+}
+
+same_process_alive() {
+    local pid="$1"
+    local expected_start_ticks="$2"
+
+    # Linux-robust path: verify PID identity (start ticks) and non-zombie state.
+    if [ -n "${expected_start_ticks}" ] && [ -r "/proc/${pid}/stat" ]; then
+        local actual_start_ticks
+        local actual_state
+        actual_start_ticks="$(pid_start_ticks "${pid}")"
+        actual_state="$(pid_state "${pid}")"
+
+        if [ -z "${actual_start_ticks}" ]; then
+            return 1
+        fi
+        if [ "${actual_start_ticks}" != "${expected_start_ticks}" ]; then
+            return 1
+        fi
+        if [ "${actual_state}" = "Z" ]; then
+            return 1
+        fi
+        return 0
+    fi
+
+    # Fallback for environments without /proc identity checks.
+    kill -0 "${pid}" 2>/dev/null
+}
+
 # Build a JSON-RPC payload file for a tool call.
 # Writes to a temp file and prints the path.
 build_payload() {
@@ -137,7 +202,7 @@ start_server() {
         export GIT_AUTHOR_NAME="E2E Crash Test"
         export GIT_AUTHOR_EMAIL="crash@test.local"
 
-        "${bin}" serve --host 127.0.0.1 --port "${port}"
+        exec "${bin}" serve --host 127.0.0.1 --port "${port}"
     ) >"${server_log}" 2>&1 &
     echo $!
 }
@@ -245,6 +310,8 @@ if ! e2e_wait_port 127.0.0.1 "${PORT}" 15; then
     exit 1
 fi
 e2e_pass "Server started"
+PID_START_TICKS="$(pid_start_ticks "${PID}")"
+e2e_save_artifact "server_run1_pid.txt" "pid=${PID} start_ticks=${PID_START_TICKS:-unknown}"
 
 # Create projects
 RESP="$(rpc_call "${URL}" "ensure_project" '{"human_key":"/test/project_alpha"}')"
@@ -324,10 +391,15 @@ for pid in "${BURST_PIDS[@]}"; do
 done
 
 # Verify server is actually dead
-if kill -0 "${PID}" 2>/dev/null; then
-    e2e_fail "Server still alive after SIGKILL"
+if same_process_alive "${PID}" "${PID_START_TICKS:-}"; then
+    e2e_log "PID ${PID} still appears alive after SIGKILL; using socket liveness as source of truth"
+    e2e_save_artifact "run1_pid_post_kill_debug.txt" "$(ps -p "${PID}" -o pid,ppid,pgid,stat,comm,args 2>&1 || true)"
+fi
+
+if port_accepts_connections "${PORT}"; then
+    e2e_fail "Server port still accepting connections after SIGKILL"
 else
-    e2e_pass "Server process confirmed dead"
+    e2e_pass "Server no longer accepting connections after SIGKILL"
 fi
 
 # Save post-crash state

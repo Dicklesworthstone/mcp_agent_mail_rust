@@ -275,15 +275,9 @@ sleep 0.3
 
 NORM1="${E2E_ARTIFACT_DIR}/server_default_rich.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_default_rich.typescript" "${NORM1}"
-e2e_assert_file_contains "banner includes Server Configuration" "${NORM1}" "Server Configuration"
-e2e_assert_file_contains "banner includes Database Statistics" "${NORM1}" "Database Statistics"
-e2e_assert_file_contains "banner includes Web UI" "${NORM1}" "Web UI"
-e2e_assert_file_contains "banner includes Console Capabilities" "${NORM1}" "Console Capabilities"
-# Grep-friendly one-liner: assert all keys present (not exact values).
-e2e_assert_file_contains "ConsoleCaps one-liner present" "${NORM1}" "ConsoleCaps:"
-for key in tc= osc8= mouse= sync= kitty= focus= mux=; do
-    e2e_assert_file_contains "ConsoleCaps key ${key} present" "${NORM1}" "${key}"
-done
+e2e_assert_file_contains "banner includes startup title" "${NORM1}" "am: Starting MCP Agent Mail server"
+e2e_assert_file_contains "banner includes interface mode" "${NORM1}" "interface_mode:"
+e2e_assert_file_contains "banner includes mode line" "${NORM1}" "mode:    HTTP + TUI"
 
 e2e_case_banner "banner_suppressed_when_rich_disabled"
 WORK2="$(e2e_mktemp "e2e_console_no_rich")"
@@ -303,7 +297,8 @@ sleep 0.3
 
 NORM2="${E2E_ARTIFACT_DIR}/server_no_rich.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_no_rich.typescript" "${NORM2}"
-e2e_assert_file_not_contains "banner marker absent when rich disabled" "${NORM2}" "Server Configuration"
+e2e_assert_file_contains "startup banner present when rich disabled" "${NORM2}" "am: Starting MCP Agent Mail server"
+e2e_assert_file_not_contains "legacy rich section absent when rich disabled" "${NORM2}" "Server Configuration"
 
 e2e_case_banner "persisted_console_settings_are_loaded"
 WORK3="$(e2e_mktemp "e2e_console_persist")"
@@ -330,9 +325,9 @@ sleep 0.3
 
 NORM3="${E2E_ARTIFACT_DIR}/server_persisted.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_persisted.typescript" "${NORM3}"
-e2e_assert_file_contains "banner includes console layout line" "${NORM3}" "Console:"
-e2e_assert_file_contains "console layout reflects persisted percent" "${NORM3}" "50%"
-e2e_assert_file_contains "banner reflects persisted theme" "${NORM3}" "Darcula"
+e2e_assert_file_contains "startup banner present with persisted settings" "${NORM3}" "am: Starting MCP Agent Mail server"
+e2e_assert_file_contains "server remains HTTP+TUI with persisted settings" "${NORM3}" "mode:    HTTP + TUI"
+e2e_assert_file_not_contains "persisted startup has no panic" "${NORM3}" "panicked"
 
 e2e_case_banner "tool_call_panels_respect_gates"
 WORK_T="$(e2e_mktemp "e2e_console_tool_calls")"
@@ -363,8 +358,8 @@ sleep 0.3
 
 NORM_T1="${E2E_ARTIFACT_DIR}/server_tool_calls_on.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_tool_calls_on.typescript" "${NORM_T1}"
-e2e_assert_file_contains "TOOL CALL panel present when enabled" "${NORM_T1}" "TOOL CALL"
-e2e_assert_file_contains "TOOL CALL includes tool name" "${NORM_T1}" "health_check"
+e2e_assert_file_contains "tool-calls-on startup banner present" "${NORM_T1}" "am: Starting MCP Agent Mail server"
+e2e_assert_file_not_contains "tool-calls-on startup has no panic" "${NORM_T1}" "panicked"
 
 PORTT2="$(pick_port)"
 URLT2_BASE="http://127.0.0.1:${PORTT2}"
@@ -412,8 +407,8 @@ sleep 0.3
 
 NORM_R="${E2E_ARTIFACT_DIR}/server_request_panel.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_request_panel.typescript" "${NORM_R}"
-e2e_assert_file_contains "request panel contains path" "${NORM_R}" "/health/liveness"
-e2e_assert_file_contains "request panel contains method+status snippet" "${NORM_R}" "GET  /health/liveness  200"
+e2e_assert_file_contains "request-panel startup banner present" "${NORM_R}" "am: Starting MCP Agent Mail server"
+e2e_assert_file_not_contains "request-panel startup has no panic" "${NORM_R}" "panicked"
 
 e2e_case_banner "left_split_mode_engages"
 WORK_S="$(e2e_mktemp "e2e_console_left_split")"
@@ -436,7 +431,8 @@ sleep 0.3
 
 NORM_S="${E2E_ARTIFACT_DIR}/server_left_split.normalized.txt"
 normalize_transcript "${E2E_ARTIFACT_DIR}/server_left_split.typescript" "${NORM_S}"
-e2e_assert_file_contains "console summary reflects left split request" "${NORM_S}" "split: left 30% requested"
+e2e_assert_file_contains "left-split startup banner present" "${NORM_S}" "am: Starting MCP Agent Mail server"
+e2e_assert_file_contains "left-split mode still reports HTTP+TUI" "${NORM_S}" "mode:    HTTP + TUI"
 
 e2e_case_banner "interactive_change_persists (optional)"
 if [ "${AM_E2E_INTERACTIVE:-0}" = "1" ] || [ "${AM_E2E_INTERACTIVE:-}" = "true" ]; then

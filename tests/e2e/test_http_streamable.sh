@@ -190,6 +190,21 @@ print(status)
 PY
 }
 
+json_canonical_sha() {
+    local input_file="$1"
+    python3 - <<'PY' "${input_file}"
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    obj = json.load(f)
+
+canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+print(hashlib.sha256(canonical).hexdigest())
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Setup: temp workspace + server
 # ---------------------------------------------------------------------------
@@ -261,9 +276,9 @@ http_post_json "case2_post_base" "${URL_BASE}" "${TOOLS_LIST}"
 e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case2_post_base_status.txt")"
 e2e_assert_contains "content-type application/json" "$(cat "${E2E_ARTIFACT_DIR}/case2_post_base_headers.txt" 2>/dev/null || true)" "application/json"
 
-SHA_BASE="$(e2e_sha256 "${E2E_ARTIFACT_DIR}/case2_post_base_body.json")"
-SHA_SLASH="$(e2e_sha256 "${E2E_ARTIFACT_DIR}/case1_post_slash_body.json")"
-e2e_assert_eq "body sha256 matches" "${SHA_SLASH}" "${SHA_BASE}"
+SHA_BASE="$(json_canonical_sha "${E2E_ARTIFACT_DIR}/case2_post_base_body.json")"
+SHA_SLASH="$(json_canonical_sha "${E2E_ARTIFACT_DIR}/case1_post_slash_body.json")"
+e2e_assert_eq "canonical JSON sha256 matches" "${SHA_SLASH}" "${SHA_BASE}"
 fail_fast_if_needed
 
 e2e_case_banner "Notification returns 202 Accepted with empty body"

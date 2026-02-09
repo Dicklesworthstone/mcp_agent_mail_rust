@@ -245,7 +245,7 @@ for cmd in "${DENIAL_TEST_CMDS[@]}"; do
 
     # Contract: must contain command name in error line
     e2e_assert_contains "denial[$cmd] mentions command" "$denial_stderr" "\"${cmd}\""
-    e2e_assert_contains "denial[$cmd] has remediation" "$denial_stderr" "mcp-agent-mail-cli ${cmd}"
+    e2e_assert_contains "denial[$cmd] has remediation" "$denial_stderr" "am ${cmd}"
     e2e_assert_contains "denial[$cmd] lists accepted" "$denial_stderr" "serve, config"
     e2e_assert_not_contains "denial[$cmd] no panic" "$denial_stderr" "panicked"
     e2e_assert_not_contains "denial[$cmd] no backtrace" "$denial_stderr" "stack backtrace"

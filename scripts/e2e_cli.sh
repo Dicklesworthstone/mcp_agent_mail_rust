@@ -77,17 +77,18 @@ else
 fi
 
 # ===========================================================================
-# Case 3: mcp-agent-mail --help lists expected subcommands
+# Case 3: mcp-agent-mail --help lists server-only subcommands
 # ===========================================================================
 e2e_case_banner "mcp-agent-mail --help lists expected subcommands"
 
 MCP_HELP="$(mcp-agent-mail --help 2>&1)" || true
 e2e_save_artifact "case_03_mcp_help.txt" "$MCP_HELP"
 
-MCP_EXPECTED_CMDS=(serve guard file-reservations acks share archive mail projects products doctor config)
+MCP_EXPECTED_CMDS=(serve config help)
 for cmd in "${MCP_EXPECTED_CMDS[@]}"; do
     e2e_assert_contains "mcp help lists '$cmd'" "$MCP_HELP" "$cmd"
 done
+e2e_assert_contains "mcp help points to am CLI" "$MCP_HELP" "am --help"
 
 # ===========================================================================
 # Case 4: Per-subcommand --help exits 0 and produces output
@@ -539,7 +540,7 @@ set -e
 
 e2e_save_artifact "case_25_server2_bind_failure.txt" "$SERVER2_OUT"
 e2e_assert_exit_code "secondary server exits non-zero on bind collision" "1" "$SERVER2_RC"
-e2e_assert_contains "bind failure includes address-in-use" "$SERVER2_OUT" "Address already in use"
+e2e_assert_contains "bind failure includes address-in-use" "$SERVER2_OUT" "already in use"
 
 if kill -0 "${SERVER1_PID}" 2>/dev/null; then
     kill "${SERVER1_PID}" 2>/dev/null || true
