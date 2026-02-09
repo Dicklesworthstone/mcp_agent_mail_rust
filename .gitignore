@@ -32,6 +32,7 @@ crates/**/tests/artifacts/
 
 # Profiling artifacts
 perf.data
+perf.data.*
 flamegraph.svg
 
 # Benchmark results (generated per-run by scripts/bench_cli.sh)
