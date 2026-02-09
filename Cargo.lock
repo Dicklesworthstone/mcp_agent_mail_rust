@@ -4165,6 +4165,7 @@ dependencies = [
  "fastmcp-rust",
  "ftui-runtime 0.1.1",
  "hex",
+ "mcp-agent-mail-cli",
  "mcp-agent-mail-conformance",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",

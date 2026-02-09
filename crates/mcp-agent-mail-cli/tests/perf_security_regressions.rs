@@ -390,7 +390,10 @@ fn sec_denial_gate_unicode_and_control_chars() {
         ("🚀share", "emoji prefix"),
         ("serve\t--help", "tab injection"),
         ("share\nserve", "newline injection"),
-        ("serve\u{200B}guard", "zero-width space between serve and guard"),
+        (
+            "serve\u{200B}guard",
+            "zero-width space between serve and guard",
+        ),
         ("‒help", "en-dash instead of hyphen"),
     ];
 

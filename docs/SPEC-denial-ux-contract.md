@@ -1,8 +1,9 @@
 # Spec: MCP-Mode CLI Denial UX Contract and Exit-Code Policy
 
 **Bead:** br-21gj.1.2
-**Depends on:** ADR-001 (br-21gj.1.1)
+**Depends on:** ADR-001 (br-21gj.1.1) (superseded), ADR-002 (br-163x.1)
 **Date:** 2026-02-08
+**Status:** Amended by `docs/SPEC-interface-mode-switch.md` (2026-02-09)
 
 ## Scope
 
@@ -19,9 +20,10 @@ SPEC-meta-command-allowlist.md), it prints the following to **stderr**:
 Error: "{command}" is not an MCP server command.
 
 Agent Mail MCP server accepts: serve, config, version, help
-For operator CLI commands, use: mcp-agent-mail-cli {command}
+For operator CLI commands, use: am {command}
+Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ...
 
-Tip: Run `mcp-agent-mail-cli --help` for the full command list.
+Tip: Run `am --help` for the full command list.
 ```
 
 ### Template Variables

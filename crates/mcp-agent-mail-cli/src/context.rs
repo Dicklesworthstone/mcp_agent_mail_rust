@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{Config, InterfaceMode};
 use mcp_agent_mail_db::DbPoolConfig;
 
 use crate::{CliError, CliResult};
@@ -29,7 +29,8 @@ pub struct CliContext {
 impl CliContext {
     /// Open a sync context using the default env-based config.
     pub fn open() -> CliResult<Self> {
-        let config = Config::from_env();
+        let mut config = Config::from_env();
+        config.interface_mode = InterfaceMode::Cli;
         let pool_cfg = DbPoolConfig::from_env();
         let conn = open_conn(&pool_cfg)?;
         Ok(Self { conn, config })
@@ -37,7 +38,8 @@ impl CliContext {
 
     /// Open with a specific database URL (for testing / overrides).
     pub fn open_with_url(database_url: &str) -> CliResult<Self> {
-        let config = Config::from_env();
+        let mut config = Config::from_env();
+        config.interface_mode = InterfaceMode::Cli;
         let pool_cfg = DbPoolConfig {
             database_url: database_url.to_string(),
             ..Default::default()
@@ -68,7 +70,8 @@ pub struct AsyncCliContext {
 impl AsyncCliContext {
     /// Create an async context using the default env-based config.
     pub fn open() -> CliResult<Self> {
-        let config = Config::from_env();
+        let mut config = Config::from_env();
+        config.interface_mode = InterfaceMode::Cli;
         let pool_cfg = DbPoolConfig::from_env();
         let pool = mcp_agent_mail_db::get_or_create_pool(&pool_cfg)
             .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;

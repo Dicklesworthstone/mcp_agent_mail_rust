@@ -32,10 +32,7 @@ pub use backpressure::{
     HealthLevel, HealthSignals, cached_health_level, compute_health_level,
     compute_health_level_with_signals, is_shedable_tool, level_transitions, refresh_health_level,
 };
-pub use config::{
-    AppEnvironment, Config, InterfaceMode, InterfaceModeResolver, ModeProvenance,
-    ProjectIdentityMode, RateLimitBackend, ResolvedMode,
-};
+pub use config::{AppEnvironment, Config, InterfaceMode, ProjectIdentityMode, RateLimitBackend};
 pub use diagnostics::{
     DiagnosticReport, HealthInfo, Recommendation, SystemInfo, init_process_start,
 };

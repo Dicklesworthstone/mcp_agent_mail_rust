@@ -1,6 +1,6 @@
 # ADR-001: Dual-Mode Interface Invariants (MCP Default, CLI Opt-In)
 
-**Status:** Accepted
+**Status:** Superseded by ADR-002 (2026-02-09)
 **Date:** 2026-02-08
 **Authors:** WildGate (claude-code/opus-4.6)
 **Bead:** br-21gj.1.1

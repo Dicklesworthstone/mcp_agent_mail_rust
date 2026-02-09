@@ -4,12 +4,39 @@
 
 #![forbid(unsafe_code)]
 
+use std::env;
 use std::io::IsTerminal;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, InterfaceModeResolver, env_value};
+use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, env_value};
 use tracing_subscriber::EnvFilter;
+
+/// Runtime interface mode selector for the `mcp-agent-mail` binary.
+///
+/// Default is MCP. `AM_INTERFACE_MODE=cli` opts into routing the process to the CLI surface
+/// (equivalent to the `am` binary). This is defined by ADR-002.
+fn parse_am_interface_mode(raw: Option<&str>) -> Result<InterfaceMode, String> {
+    let Some(raw) = raw else {
+        return Ok(InterfaceMode::Mcp);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(InterfaceMode::Mcp);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "mcp" => Ok(InterfaceMode::Mcp),
+        "cli" => Ok(InterfaceMode::Cli),
+        other => Err(format!(
+            "Invalid AM_INTERFACE_MODE={other:?} (expected \"mcp\" or \"cli\")"
+        )),
+    }
+}
+
+fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {
+    parse_am_interface_mode(env::var("AM_INTERFACE_MODE").ok().as_deref())
+}
 
 #[derive(Parser)]
 #[command(name = "mcp-agent-mail")]
@@ -171,24 +198,40 @@ fn resolve_serve_http_path(
 }
 
 fn main() {
-    // Initialize logging
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Decide runtime mode before setting up logging or parsing the MCP CLI.
+    // This ensures `--help` renders the correct surface and avoids polluting CLI-mode output.
+    let mode = match am_interface_mode_from_env() {
+        Ok(m) => m,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            eprintln!("Usage: AM_INTERFACE_MODE={{mcp|cli}} mcp-agent-mail ...");
+            std::process::exit(2);
+        }
+    };
 
+    if mode.is_cli() {
+        // Deterministic wrong-mode denial for MCP-only commands that users commonly try.
+        if let Some(cmd) = env::args().nth(1) {
+            if cmd == "serve" || cmd == "config" {
+                render_cli_mode_denial(&cmd);
+                std::process::exit(2);
+            }
+        }
+
+        // Route to the CLI surface. (Help/usage still renders as `am` until br-163x.4 adds
+        // invocation-name overrides in the CLI library.)
+        std::process::exit(mcp_agent_mail_cli::run_with_invocation_name("mcp-agent-mail"));
+    }
+
+    // MCP mode: initialize logging and proceed with the server binary behavior.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
 
-    // Resolve interface mode (MCP binary → MCP default per ADR-001)
-    let resolver = InterfaceModeResolver::new(InterfaceMode::Mcp);
-    if let Some(warning) = resolver.validate() {
-        tracing::warn!("{warning}");
-    }
-    let resolved_mode = resolver.resolve();
-    tracing::debug!("Interface mode: {resolved_mode}");
-
-    // Load configuration and stamp it with the resolved mode
+    // Load configuration and stamp interface mode (binary-level, per ADR-001).
     let mut config = Config::from_env();
-    config.interface_mode = resolved_mode.mode;
+    config.interface_mode = InterfaceMode::Mcp;
 
     if cli.verbose {
         tracing::info!("Configuration loaded: {:?}", config);
@@ -279,6 +322,21 @@ fn render_denial(command: &str) {
     if std::io::stderr().is_terminal() {
         eprintln!("\nTip: Run `mcp-agent-mail-cli --help` for the full command list.");
     }
+}
+
+/// CLI-mode denial renderer for MCP-only commands.
+///
+/// CLI mode is enabled by `AM_INTERFACE_MODE=cli` (ADR-002, SPEC-interface-mode-switch).
+fn render_cli_mode_denial(command: &str) {
+    eprintln!(
+        "Error: \"{command}\" is not available in CLI mode (AM_INTERFACE_MODE=cli).\n\n\
+         To start the MCP server:\n\
+           unset AM_INTERFACE_MODE   # (or set AM_INTERFACE_MODE=mcp)\n\
+           mcp-agent-mail serve ...\n\n\
+         CLI equivalents:\n\
+           mcp-agent-mail serve-http ...\n\
+           mcp-agent-mail serve-stdio ..."
+    );
 }
 
 #[cfg(test)]
@@ -411,5 +469,46 @@ mod tests {
     fn no_subcommand_is_none() {
         let cli = Cli::try_parse_from(["mcp-agent-mail"]).expect("should parse");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parse_am_interface_mode_defaults_to_mcp() {
+        assert_eq!(parse_am_interface_mode(None).unwrap(), InterfaceMode::Mcp);
+        assert_eq!(
+            parse_am_interface_mode(Some("")).unwrap(),
+            InterfaceMode::Mcp
+        );
+        assert_eq!(
+            parse_am_interface_mode(Some("   ")).unwrap(),
+            InterfaceMode::Mcp
+        );
+        assert_eq!(
+            parse_am_interface_mode(Some("mcp")).unwrap(),
+            InterfaceMode::Mcp
+        );
+        assert_eq!(
+            parse_am_interface_mode(Some("MCP")).unwrap(),
+            InterfaceMode::Mcp
+        );
+    }
+
+    #[test]
+    fn parse_am_interface_mode_parses_cli() {
+        assert_eq!(
+            parse_am_interface_mode(Some("cli")).unwrap(),
+            InterfaceMode::Cli
+        );
+        assert_eq!(
+            parse_am_interface_mode(Some(" CLI ")).unwrap(),
+            InterfaceMode::Cli
+        );
+    }
+
+    #[test]
+    fn parse_am_interface_mode_rejects_invalid_values() {
+        let err = parse_am_interface_mode(Some("wat")).unwrap_err();
+        assert!(err.contains("AM_INTERFACE_MODE"));
+        assert!(err.contains("mcp"));
+        assert!(err.contains("cli"));
     }
 }

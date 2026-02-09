@@ -15,6 +15,7 @@ mcp-agent-mail-core = { workspace = true }
 mcp-agent-mail-storage = { workspace = true }
 mcp-agent-mail-tools = { workspace = true }
 mcp-agent-mail-server = { workspace = true }
+mcp-agent-mail-cli = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
