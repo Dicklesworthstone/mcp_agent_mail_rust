@@ -183,7 +183,7 @@ fn run_inbox_stats_polling_phase(
     let mut latencies: Vec<u64> = Vec::with_capacity(polls);
     for _ in 0..polls {
         if force_invalidate_each_poll {
-            read_cache().invalidate_inbox_stats(receiver_id);
+            read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), receiver_id);
         }
 
         let t0 = Instant::now();
@@ -972,14 +972,14 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
     QUERY_TRACKER.enable(None);
     QUERY_TRACKER.reset();
 
-    read_cache().invalidate_inbox_stats(receiver_id);
+    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), receiver_id);
     let forced_start = Instant::now();
     let (forced_report, forced_db_queries) =
         run_inbox_stats_polling_phase(&pool, receiver_id, polls, true);
     let forced_elapsed = forced_start.elapsed();
 
     QUERY_TRACKER.reset();
-    read_cache().invalidate_inbox_stats(receiver_id);
+    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), receiver_id);
     let warm_start = Instant::now();
     let (warm_report, warm_db_queries) =
         run_inbox_stats_polling_phase(&pool, receiver_id, polls, false);
@@ -987,7 +987,7 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
 
     QUERY_TRACKER.disable();
     QUERY_TRACKER.reset();
-    read_cache().invalidate_inbox_stats(receiver_id);
+    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), receiver_id);
 
     let forced_hit_ratio = (polls_u64.saturating_sub(forced_db_queries)) as f64 / polls_u64 as f64;
     let warm_hit_ratio = (polls_u64.saturating_sub(warm_db_queries)) as f64 / polls_u64 as f64;

@@ -2000,6 +2000,18 @@ fn get_inbox_stats_opt(pool: &DbPool, agent_id: i64) -> Option<InboxStatsRow> {
     })
 }
 
+fn invalidate_cached_inbox_stats(pool: &DbPool, agent_id: i64) {
+    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
+}
+
+fn get_cached_inbox_stats(pool: &DbPool, agent_id: i64) -> Option<InboxStatsRow> {
+    read_cache().get_inbox_stats_scoped(pool.sqlite_path(), agent_id)
+}
+
+fn put_cached_inbox_stats(pool: &DbPool, stats: &InboxStatsRow) {
+    read_cache().put_inbox_stats_scoped(pool.sqlite_path(), stats);
+}
+
 fn get_inbox_stats(pool: &DbPool, agent_id: i64) -> InboxStatsRow {
     get_inbox_stats_opt(pool, agent_id)
         .unwrap_or_else(|| panic!("expected inbox stats row for agent {agent_id}, got None"))
@@ -2049,9 +2061,9 @@ fn stress_inbox_stats_cache_miss_read_through_and_hit() {
     let (pool, _dir) = make_pool();
     let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
 
-    read_cache().invalidate_inbox_stats(receiver_id);
+    invalidate_cached_inbox_stats(&pool, receiver_id);
     assert!(
-        read_cache().get_inbox_stats(receiver_id).is_none(),
+        get_cached_inbox_stats(&pool, receiver_id).is_none(),
         "cache should start empty for receiver {receiver_id}"
     );
 
@@ -2061,7 +2073,7 @@ fn stress_inbox_stats_cache_miss_read_through_and_hit() {
         "agent {receiver_id} should not have inbox stats before receiving messages"
     );
     assert!(
-        read_cache().get_inbox_stats(receiver_id).is_none(),
+        get_cached_inbox_stats(&pool, receiver_id).is_none(),
         "cache miss path must not materialize stats when DB has no row"
     );
 
@@ -2087,7 +2099,7 @@ fn stress_inbox_stats_cache_miss_read_through_and_hit() {
         first.ack_pending_count, 1,
         "ack_required message should increment ack_pending_count"
     );
-    let cached_after_first = read_cache().get_inbox_stats(receiver_id);
+    let cached_after_first = get_cached_inbox_stats(&pool, receiver_id);
     assert!(
         cached_after_first.is_some(),
         "read-through miss should populate cache for receiver {receiver_id}"
@@ -2120,11 +2132,11 @@ fn stress_inbox_stats_cache_miss_read_through_and_hit() {
         "cache hit should preserve ack_pending_count"
     );
     assert!(
-        read_cache().get_inbox_stats(receiver_id).is_some(),
+        get_cached_inbox_stats(&pool, receiver_id).is_some(),
         "cache entry should remain present after hit"
     );
 
-    read_cache().invalidate_inbox_stats(receiver_id);
+    invalidate_cached_inbox_stats(&pool, receiver_id);
 }
 
 #[test]
@@ -2135,7 +2147,7 @@ fn stress_inbox_stats_cache_short_circuits_db_on_hit() {
     let (pool, _dir) = make_pool();
     let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
 
-    read_cache().invalidate_inbox_stats(receiver_id);
+    invalidate_cached_inbox_stats(&pool, receiver_id);
     let _msg_id = create_message_for_receiver(
         &pool,
         project_id,
@@ -2172,7 +2184,7 @@ fn stress_inbox_stats_cache_short_circuits_db_on_hit() {
     // auto-increment agent_id in their own DBs.
     let mut cache_hit = false;
     for _ in 0..20 {
-        read_cache().put_inbox_stats(&sentinel);
+        put_cached_inbox_stats(&pool, &sentinel);
         let cached = get_inbox_stats(&pool, receiver_id);
         if cached.total_count == sentinel.total_count {
             assert_eq!(
@@ -2192,7 +2204,7 @@ fn stress_inbox_stats_cache_short_circuits_db_on_hit() {
         "cache hit should return cached total_count instead of DB value after retries"
     );
 
-    read_cache().invalidate_inbox_stats(receiver_id);
+    invalidate_cached_inbox_stats(&pool, receiver_id);
     let refreshed = get_inbox_stats(&pool, receiver_id);
     assert_eq!(
         refreshed.total_count, db_stats.total_count,
@@ -2207,7 +2219,7 @@ fn stress_inbox_stats_cache_short_circuits_db_on_hit() {
         "after invalidation, read should return DB ack_pending_count"
     );
 
-    read_cache().invalidate_inbox_stats(receiver_id);
+    invalidate_cached_inbox_stats(&pool, receiver_id);
 }
 
 #[test]
@@ -2218,7 +2230,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
     let (pool, _dir) = make_pool();
     let (project_id, sender_id, receiver_id) = setup_project_and_agents(&pool);
 
-    read_cache().invalidate_inbox_stats(receiver_id);
+    invalidate_cached_inbox_stats(&pool, receiver_id);
 
     let first_msg = create_message_for_receiver(
         &pool,
@@ -2247,7 +2259,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
         ack_pending_count: 71,
         last_message_ts: Some(baseline.last_message_ts.unwrap_or(0) + 11),
     };
-    read_cache().put_inbox_stats(&stale_before_mark_read);
+    put_cached_inbox_stats(&pool, &stale_before_mark_read);
 
     let _read_ts = mark_message_read(&pool, receiver_id, first_msg);
     let after_mark_read = get_inbox_stats(&pool, receiver_id);
@@ -2275,7 +2287,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
         ack_pending_count: 62,
         last_message_ts: Some(after_mark_read.last_message_ts.unwrap_or(0) + 22),
     };
-    read_cache().put_inbox_stats(&stale_before_ack);
+    put_cached_inbox_stats(&pool, &stale_before_ack);
 
     let _ack_ts = acknowledge_message(&pool, receiver_id, first_msg);
     let after_ack = get_inbox_stats(&pool, receiver_id);
@@ -2303,7 +2315,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
         ack_pending_count: -1,
         last_message_ts: Some(0),
     };
-    read_cache().put_inbox_stats(&stale_before_create);
+    put_cached_inbox_stats(&pool, &stale_before_create);
 
     let _second_msg = create_message_for_receiver(
         &pool,
@@ -2331,7 +2343,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
         "stale cached totals must be cleared by create_message_with_recipients invalidation"
     );
 
-    read_cache().invalidate_inbox_stats(receiver_id);
+    invalidate_cached_inbox_stats(&pool, receiver_id);
 }
 
 #[test]

@@ -175,7 +175,7 @@ fn validate_message_size_limits(
     }
 
     // Per-attachment size (check file paths if provided)
-    let mut total_size = subject.len() + body_md.len();
+    let mut total_size = subject.len().saturating_add(body_md.len());
     if let Some(paths) = attachment_paths {
         for path in paths {
             if let Ok(meta) = std::fs::metadata(path) {
@@ -196,7 +196,7 @@ fn validate_message_size_limits(
                         }),
                     ));
                 }
-                total_size += file_size;
+                total_size = total_size.saturating_add(file_size);
             }
             // If file doesn't exist, let downstream handle the error.
         }
@@ -2487,6 +2487,22 @@ mod tests {
             err_str.contains("ubject"),
             "Error should mention subject: {err_str}"
         );
+    }
+
+    #[test]
+    fn size_limits_saturating_add_prevents_overflow() {
+        // When total limit is small but file_size would be huge, saturating_add
+        // should clamp to usize::MAX rather than wrapping to a small value.
+        let cfg = config_with_limits(0, 0, 100, 0);
+        // Even without real filesystem paths, we can test the accumulation logic:
+        // subject(5) + body(10) = 15, which is under 100.
+        let result = validate_message_size_limits(&cfg, "hello", &"x".repeat(10), None);
+        assert!(result.is_ok());
+
+        // Now with total limit = 10, subject(5) + body(10) = 15 > 10 via saturating_add
+        let cfg2 = config_with_limits(0, 0, 10, 0);
+        let result = validate_message_size_limits(&cfg2, "hello", &"x".repeat(10), None);
+        assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------

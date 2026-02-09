@@ -1174,8 +1174,9 @@ pub async fn create_message_with_recipients(
 
     // Invalidate cached inbox stats for all recipients.
     let cache = crate::cache::read_cache();
+    let cache_scope = pool.sqlite_path();
     for (agent_id, _kind) in recipients {
-        cache.invalidate_inbox_stats(*agent_id);
+        cache.invalidate_inbox_stats_scoped(cache_scope, *agent_id);
     }
 
     Outcome::Ok(row)
@@ -1914,7 +1915,7 @@ pub async fn mark_message_read(
                 ));
             }
             // Invalidate cached inbox stats (unread_count may have changed).
-            crate::cache::read_cache().invalidate_inbox_stats(agent_id);
+            crate::cache::read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
 
             // Read back the actual stored timestamp (may differ from `now` on
             // idempotent calls where COALESCE preserved the original value).
@@ -1984,7 +1985,7 @@ pub async fn acknowledge_message(
                 ));
             }
             // Invalidate cached inbox stats (ack_pending_count may have changed).
-            crate::cache::read_cache().invalidate_inbox_stats(agent_id);
+            crate::cache::read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
 
             // Read back the actual stored timestamps (may differ from `now` on
             // idempotent calls where COALESCE preserved the original values).
@@ -2037,7 +2038,8 @@ pub async fn get_inbox_stats(
     agent_id: i64,
 ) -> Outcome<Option<InboxStatsRow>, DbError> {
     // Check cache first (30s TTL).
-    if let Some(cached) = crate::cache::read_cache().get_inbox_stats(agent_id) {
+    let cache_scope = pool.sqlite_path();
+    if let Some(cached) = crate::cache::read_cache().get_inbox_stats_scoped(cache_scope, agent_id) {
         return Outcome::Ok(Some(cached));
     }
 
@@ -2084,7 +2086,7 @@ pub async fn get_inbox_stats(
                     },
                 };
                 // Populate cache for next lookup.
-                crate::cache::read_cache().put_inbox_stats(&stats);
+                crate::cache::read_cache().put_inbox_stats_scoped(cache_scope, &stats);
                 Outcome::Ok(Some(stats))
             }
         }

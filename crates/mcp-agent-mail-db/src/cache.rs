@@ -29,6 +29,7 @@
 //! Call `cache_metrics()` to get a snapshot.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -50,6 +51,15 @@ const ADAPTIVE_TTL_THRESHOLD: u32 = 5;
 /// Shard key: `agent_id % NUM_TOUCH_SHARDS`. Reduces contention 16×
 /// compared to a single mutex at 100+ concurrent tool calls/sec.
 const NUM_TOUCH_SHARDS: usize = 16;
+
+#[inline]
+fn scope_fingerprint(scope: &str) -> u64 {
+    // Per-process deterministic hashing for cache namespacing.
+    // Prevents collisions between multiple sqlite databases loaded in one process.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scope.hash(&mut hasher);
+    hasher.finish()
+}
 
 struct CacheEntry<T> {
     value: T,
@@ -183,8 +193,8 @@ pub struct ReadCache {
     projects_by_human_key: OrderedRwLock<IndexMap<String, CacheEntry<ProjectRow>>>,
     agents_by_key: OrderedRwLock<IndexMap<(i64, InternedStr), CacheEntry<AgentRow>>>,
     agents_by_id: OrderedRwLock<IndexMap<i64, CacheEntry<AgentRow>>>,
-    /// Cached inbox aggregate counters keyed by `agent_id` (30s TTL).
-    inbox_stats: OrderedRwLock<IndexMap<i64, CacheEntry<InboxStatsRow>>>,
+    /// Cached inbox aggregate counters keyed by `(db_scope, agent_id)` (30s TTL).
+    inbox_stats: OrderedRwLock<IndexMap<(u64, i64), CacheEntry<InboxStatsRow>>>,
     /// Sharded deferred touch queue (16 shards, keyed by `agent_id % 16`).
     /// Each shard maps `agent_id` → latest requested timestamp (micros).
     deferred_touch_shards: [OrderedMutex<HashMap<i64, i64>>; NUM_TOUCH_SHARDS],
@@ -427,8 +437,15 @@ impl ReadCache {
     /// or expired (30s TTL).
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_inbox_stats(&self, agent_id: i64) -> Option<InboxStatsRow> {
+        self.get_inbox_stats_scoped("", agent_id)
+    }
+
+    /// Look up cached inbox stats for an agent in a specific DB scope.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn get_inbox_stats_scoped(&self, scope: &str, agent_id: i64) -> Option<InboxStatsRow> {
+        let key = (scope_fingerprint(scope), agent_id);
         let mut map = self.inbox_stats.write();
-        let idx = map.get_index_of(&agent_id)?;
+        let idx = map.get_index_of(&key)?;
         let (expired, value) = {
             let (_, entry) = map.get_index(idx).unwrap();
             (entry.is_expired(INBOX_STATS_TTL), entry.value.clone())
@@ -449,18 +466,27 @@ impl ReadCache {
 
     /// Insert or update cached inbox stats for an agent.
     pub fn put_inbox_stats(&self, stats: &InboxStatsRow) {
+        self.put_inbox_stats_scoped("", stats);
+    }
+
+    /// Insert or update cached inbox stats for an agent in a specific DB scope.
+    pub fn put_inbox_stats_scoped(&self, scope: &str, stats: &InboxStatsRow) {
+        let key = (scope_fingerprint(scope), stats.agent_id);
         let mut map = self.inbox_stats.write();
-        if map.len() >= self.capacity {
-            // Evict oldest entry (front of IndexMap)
-            map.shift_remove_index(0);
-        }
-        map.insert(stats.agent_id, CacheEntry::new(stats.clone()));
+        lru_evict_if_full_u64_i64(&mut map, INBOX_STATS_TTL, self.capacity);
+        map.insert(key, CacheEntry::new(stats.clone()));
     }
 
     /// Invalidate cached inbox stats for an agent.
     pub fn invalidate_inbox_stats(&self, agent_id: i64) {
+        self.invalidate_inbox_stats_scoped("", agent_id);
+    }
+
+    /// Invalidate cached inbox stats for an agent in a specific DB scope.
+    pub fn invalidate_inbox_stats_scoped(&self, scope: &str, agent_id: i64) {
+        let key = (scope_fingerprint(scope), agent_id);
         let mut map = self.inbox_stats.write();
-        map.shift_remove(&agent_id);
+        map.shift_remove(&key);
     }
 
     // -------------------------------------------------------------------------
@@ -542,6 +568,7 @@ impl ReadCache {
         self.projects_by_human_key.write().clear();
         self.agents_by_key.write().clear();
         self.agents_by_id.write().clear();
+        self.inbox_stats.write().clear();
         for shard in &self.deferred_touch_shards {
             shard.lock().clear();
         }
@@ -576,6 +603,21 @@ fn lru_evict_if_full<T>(map: &mut IndexMap<String, CacheEntry<T>>, ttl: Duration
 /// LRU eviction for `IndexMap<(i64, InternedStr), CacheEntry<T>>`.
 fn lru_evict_if_full_tuple<T>(
     map: &mut IndexMap<(i64, InternedStr), CacheEntry<T>>,
+    ttl: Duration,
+    capacity: usize,
+) {
+    if map.len() < capacity {
+        return;
+    }
+    map.retain(|_, entry| !entry.is_expired(ttl));
+    while map.len() >= capacity {
+        map.shift_remove_index(0);
+    }
+}
+
+/// LRU eviction for `IndexMap<(u64, i64), CacheEntry<T>>`.
+fn lru_evict_if_full_u64_i64<T>(
+    map: &mut IndexMap<(u64, i64), CacheEntry<T>>,
     ttl: Duration,
     capacity: usize,
 ) {
@@ -1023,5 +1065,40 @@ mod tests {
                 "proj-{i} should be cached by human_key"
             );
         }
+    }
+
+    #[test]
+    fn inbox_stats_scope_isolation_prevents_cross_db_collisions() {
+        let cache = ReadCache::new();
+        let row_a = InboxStatsRow {
+            agent_id: 2,
+            total_count: 1,
+            unread_count: 1,
+            ack_pending_count: 1,
+            last_message_ts: Some(10),
+        };
+        let row_b = InboxStatsRow {
+            agent_id: 2,
+            total_count: 99,
+            unread_count: 88,
+            ack_pending_count: 77,
+            last_message_ts: Some(20),
+        };
+
+        cache.put_inbox_stats_scoped("/tmp/a.sqlite3", &row_a);
+        cache.put_inbox_stats_scoped("/tmp/b.sqlite3", &row_b);
+
+        let got_a = cache
+            .get_inbox_stats_scoped("/tmp/a.sqlite3", 2)
+            .expect("scope a value");
+        let got_b = cache
+            .get_inbox_stats_scoped("/tmp/b.sqlite3", 2)
+            .expect("scope b value");
+        assert_eq!(got_a.total_count, 1);
+        assert_eq!(got_b.total_count, 99);
+
+        cache.invalidate_inbox_stats_scoped("/tmp/a.sqlite3", 2);
+        assert!(cache.get_inbox_stats_scoped("/tmp/a.sqlite3", 2).is_none());
+        assert!(cache.get_inbox_stats_scoped("/tmp/b.sqlite3", 2).is_some());
     }
 }
