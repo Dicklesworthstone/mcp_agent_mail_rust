@@ -1128,14 +1128,13 @@ mod tests {
     // ── Agent name validation extended ──
 
     #[test]
-    fn agent_name_validation_case_matters() {
+    fn agent_name_validation_case_insensitive() {
         use mcp_agent_mail_core::models::is_valid_agent_name;
-        // Valid names are CamelCase Adjective+Noun
+        // Validation is case-insensitive (lowercases before checking)
         assert!(is_valid_agent_name("BlueLake"));
-        // All lowercase should fail
-        assert!(!is_valid_agent_name("bluelake"));
-        // All uppercase should fail
-        assert!(!is_valid_agent_name("BLUELAKE"));
+        assert!(is_valid_agent_name("bluelake"));
+        assert!(is_valid_agent_name("BLUELAKE"));
+        assert!(is_valid_agent_name("bLuElAkE"));
     }
 
     #[test]

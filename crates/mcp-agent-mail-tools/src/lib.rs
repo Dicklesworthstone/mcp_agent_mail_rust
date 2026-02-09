@@ -358,10 +358,12 @@ pub(crate) mod tool_util {
             let err = db_error_to_mcp_error(DbError::Serialization("invalid JSON".into()));
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "TYPE_ERROR");
-            assert!(data["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("type mismatch"));
+            assert!(
+                data["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("type mismatch")
+            );
         }
 
         #[test]
@@ -382,10 +384,7 @@ pub(crate) mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
             assert_eq!(data["error"]["data"]["failures"], 5);
-            assert!(data["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("30"));
+            assert!(data["error"]["message"].as_str().unwrap().contains("30"));
         }
 
         #[test]
@@ -397,11 +396,13 @@ pub(crate) mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
             assert_eq!(data["error"]["recoverable"], false);
-            assert!(data["error"]["data"]["corruption_details"]
-                .as_array()
-                .unwrap()
-                .len()
-                == 2);
+            assert!(
+                data["error"]["data"]["corruption_details"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+                    == 2
+            );
         }
 
         #[test]
