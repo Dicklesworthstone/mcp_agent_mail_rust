@@ -673,6 +673,9 @@ pub struct FileLock {
     stale_timeout: Duration,
     max_retries: usize,
     held: bool,
+    /// Retained file handle that holds the OS-level flock.
+    /// Must live as long as the lock is held; dropping releases the flock.
+    lock_file: Option<fs::File>,
 }
 
 impl FileLock {
@@ -691,6 +694,7 @@ impl FileLock {
             stale_timeout: Duration::from_secs(180),
             max_retries: 5,
             held: false,
+            lock_file: None,
         }
     }
 
@@ -735,8 +739,9 @@ impl FileLock {
 
             match file.try_lock_exclusive() {
                 Ok(()) => {
-                    // Lock acquired - write owner metadata
+                    // Lock acquired - retain file handle to hold the OS-level flock
                     self.write_metadata()?;
+                    self.lock_file = Some(file);
                     self.held = true;
                     return Ok(());
                 }
@@ -782,7 +787,9 @@ impl FileLock {
         }
         self.held = false;
 
-        // Remove metadata file first
+        // Drop the file handle to release the OS-level flock
+        self.lock_file = None;
+        // Remove metadata file
         let _ = fs::remove_file(&self.metadata_path);
         // Remove lock file
         let _ = fs::remove_file(&self.path);
