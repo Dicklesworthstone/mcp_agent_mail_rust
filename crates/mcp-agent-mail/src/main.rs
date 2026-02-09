@@ -218,8 +218,7 @@ fn main() {
             }
         }
 
-        // Route to the CLI surface. (Help/usage still renders as `am` until br-163x.4 adds
-        // invocation-name overrides in the CLI library.)
+        // Route to the CLI surface with the correct invocation name for help/usage.
         std::process::exit(mcp_agent_mail_cli::run_with_invocation_name("mcp-agent-mail"));
     }
 
@@ -315,12 +314,13 @@ fn render_denial(command: &str) {
     eprintln!(
         "Error: \"{command}\" is not an MCP server command.\n\n\
          Agent Mail MCP server accepts: serve, config\n\
-         For operator CLI commands, use: mcp-agent-mail-cli {command}"
+         For operator CLI commands, use: am {command}\n\
+         Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ..."
     );
 
     // Show tip only when a TTY is detected (human, not agent)
     if std::io::stderr().is_terminal() {
-        eprintln!("\nTip: Run `mcp-agent-mail-cli --help` for the full command list.");
+        eprintln!("\nTip: Run `am --help` for the full command list.");
     }
 }
 
@@ -332,10 +332,7 @@ fn render_cli_mode_denial(command: &str) {
         "Error: \"{command}\" is not available in CLI mode (AM_INTERFACE_MODE=cli).\n\n\
          To start the MCP server:\n\
            unset AM_INTERFACE_MODE   # (or set AM_INTERFACE_MODE=mcp)\n\
-           mcp-agent-mail serve ...\n\n\
-         CLI equivalents:\n\
-           mcp-agent-mail serve-http ...\n\
-           mcp-agent-mail serve-stdio ..."
+           mcp-agent-mail serve ..."
     );
 }
 

@@ -824,3 +824,216 @@ fn sec_denial_exit_code_contract() {
         non_two.join("\n  ")
     );
 }
+
+// ── Mode-Switch Tests (br-163x.5 / br-163x.6) ──────────────────────
+
+/// MODE-1: MCP denial message includes both `am` and `AM_INTERFACE_MODE=cli`
+/// remediation paths per SPEC-interface-mode-switch.md.
+#[test]
+fn mode_mcp_denial_includes_both_remediation_paths() {
+    let mcp = match mcp_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MCP binary not found.");
+            return;
+        }
+    };
+
+    let out = run_binary(&mcp, &["share"]);
+    let serr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert_eq!(out.status.code(), Some(2), "denial must exit 2");
+
+    // Spec requires: "For operator CLI commands, use: am {command}"
+    assert!(
+        serr.contains("am share"),
+        "denial must mention `am share` remediation, got:\n{serr}"
+    );
+
+    // Spec requires: "Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ..."
+    assert!(
+        serr.contains("AM_INTERFACE_MODE=cli"),
+        "denial must mention AM_INTERFACE_MODE=cli remediation, got:\n{serr}"
+    );
+}
+
+/// MODE-2: CLI mode via AM_INTERFACE_MODE=cli renders help with correct binary name.
+#[test]
+fn mode_cli_help_renders_with_mcp_agent_mail_name() {
+    let mcp = match mcp_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MCP binary not found.");
+            return;
+        }
+    };
+
+    let out = run_binary_with_env(&mcp, &["--help"], &[("AM_INTERFACE_MODE", "cli")]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "CLI mode --help must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("mcp-agent-mail"),
+        "CLI mode help should reference mcp-agent-mail, got:\n{combined}"
+    );
+}
+
+/// MODE-3: CLI mode denies MCP-only commands (serve, config) with exit 2.
+#[test]
+fn mode_cli_denies_mcp_only_commands() {
+    let mcp = match mcp_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MCP binary not found.");
+            return;
+        }
+    };
+
+    for cmd in &["serve", "config"] {
+        let out = run_binary_with_env(&mcp, &[cmd], &[("AM_INTERFACE_MODE", "cli")]);
+        let serr = String::from_utf8_lossy(&out.stderr).to_string();
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "CLI mode must deny `{cmd}` with exit 2, stderr:\n{serr}"
+        );
+        assert!(
+            serr.contains("not available in CLI mode"),
+            "CLI denial for `{cmd}` must contain canonical phrase, got:\n{serr}"
+        );
+        assert!(
+            serr.contains("AM_INTERFACE_MODE=cli"),
+            "CLI denial for `{cmd}` must reference current mode, got:\n{serr}"
+        );
+    }
+}
+
+/// MODE-4: Invalid AM_INTERFACE_MODE value produces exit 2 with deterministic error.
+#[test]
+fn mode_invalid_value_exit_2() {
+    let mcp = match mcp_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MCP binary not found.");
+            return;
+        }
+    };
+
+    let out = run_binary_with_env(&mcp, &["--help"], &[("AM_INTERFACE_MODE", "wat")]);
+    let serr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid mode must exit 2, stderr:\n{serr}"
+    );
+    assert!(
+        serr.contains("AM_INTERFACE_MODE"),
+        "error must mention the env var, got:\n{serr}"
+    );
+}
+
+/// MODE-5: CLI mode allows CLI-only commands that MCP mode denies.
+#[test]
+fn mode_cli_allows_cli_commands() {
+    let mcp = match mcp_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MCP binary not found.");
+            return;
+        }
+    };
+
+    // These commands are denied in MCP mode but should be allowed in CLI mode.
+    let cli_commands = &["share --help", "guard --help", "mail --help", "agents --help"];
+
+    for entry in cli_commands {
+        let args: Vec<&str> = entry.split_whitespace().collect();
+        let out = run_binary_with_env(&mcp, &args, &[("AM_INTERFACE_MODE", "cli")]);
+
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "CLI mode must allow `{entry}`, stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// MODE-6: Default (no AM_INTERFACE_MODE) is MCP mode — denies CLI commands.
+#[test]
+fn mode_default_is_mcp() {
+    let mcp = match mcp_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MCP binary not found.");
+            return;
+        }
+    };
+
+    // Explicitly unset to ensure default behavior.
+    let mut cmd = std::process::Command::new(&mcp);
+    cmd.arg("share")
+        .env_remove("AM_INTERFACE_MODE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().expect("spawn binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "default mode must deny CLI commands with exit 2"
+    );
+}
+
+/// MODE-7: AM_INTERFACE_MODE=mcp explicitly is equivalent to default.
+#[test]
+fn mode_explicit_mcp_denies_cli() {
+    let mcp = match mcp_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MCP binary not found.");
+            return;
+        }
+    };
+
+    let out = run_binary_with_env(&mcp, &["share"], &[("AM_INTERFACE_MODE", "mcp")]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "explicit MCP mode must deny CLI commands with exit 2"
+    );
+}
+
+/// MODE-8: AM_INTERFACE_MODE is case-insensitive.
+#[test]
+fn mode_case_insensitive() {
+    let mcp = match mcp_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MCP binary not found.");
+            return;
+        }
+    };
+
+    for val in &["CLI", "Cli", "cLi", " cli ", "MCP", "Mcp"] {
+        let out = run_binary_with_env(&mcp, &["--help"], &[("AM_INTERFACE_MODE", val)]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "AM_INTERFACE_MODE={val:?} should be accepted (exit 0), stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

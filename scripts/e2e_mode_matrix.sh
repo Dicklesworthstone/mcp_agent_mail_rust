@@ -149,19 +149,77 @@ config_exit=0
 e2e_assert_eq "MCP allows config" "0" "$config_exit"
 
 # ---------------------------------------------------------------------------
-# MCP denial message quality
+# MCP denial message quality (SPEC-interface-mode-switch.md)
 # ---------------------------------------------------------------------------
 
-e2e_banner "MCP denial message: remediation hint"
+e2e_banner "MCP denial message: remediation hints"
 
 denial_output=$("$MCP_BIN" share 2>&1) || true
-hint_ok=0
-echo "$denial_output" | grep -q "mcp-agent-mail-cli" || hint_ok=1
-e2e_assert_eq "MCP denial mentions CLI binary" "0" "$hint_ok"
+
+# Must mention `am` as the CLI binary remediation
+hint_am=0
+echo "$denial_output" | grep -q "am share" || hint_am=1
+e2e_assert_eq "MCP denial mentions 'am' CLI binary" "0" "$hint_am"
+
+# Must mention AM_INTERFACE_MODE=cli as the second remediation path
+hint_mode=0
+echo "$denial_output" | grep -q "AM_INTERFACE_MODE=cli" || hint_mode=1
+e2e_assert_eq "MCP denial mentions AM_INTERFACE_MODE=cli" "0" "$hint_mode"
 
 cmd_ok=0
 echo "$denial_output" | grep -q "share" || cmd_ok=1
 e2e_assert_eq "MCP denial mentions command name" "0" "$cmd_ok"
+
+# ---------------------------------------------------------------------------
+# AM_INTERFACE_MODE=cli: CLI mode via env var (br-163x)
+# ---------------------------------------------------------------------------
+
+e2e_banner "AM_INTERFACE_MODE=cli: CLI mode via MCP binary"
+
+# CLI mode: --help should render CLI surface with exit 0
+cli_help_exit=0
+cli_help_output=$(AM_INTERFACE_MODE=cli "$MCP_BIN" --help 2>&1) || cli_help_exit=$?
+e2e_assert_eq "CLI mode --help exits 0" "0" "$cli_help_exit"
+
+cli_help_name=0
+echo "$cli_help_output" | grep -q "mcp-agent-mail" || cli_help_name=1
+e2e_assert_eq "CLI mode --help shows mcp-agent-mail name" "0" "$cli_help_name"
+
+# CLI mode: share --help should be allowed
+cli_share_exit=0
+AM_INTERFACE_MODE=cli "$MCP_BIN" share --help > /dev/null 2>&1 || cli_share_exit=$?
+e2e_assert_eq "CLI mode allows share --help" "0" "$cli_share_exit"
+
+# CLI mode: serve should be denied (MCP-only command)
+cli_serve_exit=0
+cli_serve_output=$(AM_INTERFACE_MODE=cli "$MCP_BIN" serve 2>&1) || cli_serve_exit=$?
+e2e_assert_eq "CLI mode denies serve (exit 2)" "2" "$cli_serve_exit"
+
+cli_serve_msg=0
+echo "$cli_serve_output" | grep -q "not available in CLI mode" || cli_serve_msg=1
+e2e_assert_eq "CLI mode denial contains canonical phrase" "0" "$cli_serve_msg"
+
+# CLI mode: config should be denied (MCP-only command)
+cli_config_exit=0
+AM_INTERFACE_MODE=cli "$MCP_BIN" config > /dev/null 2>&1 || cli_config_exit=$?
+e2e_assert_eq "CLI mode denies config (exit 2)" "2" "$cli_config_exit"
+
+# Invalid AM_INTERFACE_MODE value: should exit 2
+invalid_mode_exit=0
+AM_INTERFACE_MODE=wat "$MCP_BIN" --help > /dev/null 2>&1 || invalid_mode_exit=$?
+e2e_assert_eq "Invalid AM_INTERFACE_MODE exits 2" "2" "$invalid_mode_exit"
+
+# Explicit AM_INTERFACE_MODE=mcp: same as default (denies CLI)
+explicit_mcp_exit=0
+AM_INTERFACE_MODE=mcp "$MCP_BIN" share > /dev/null 2>&1 || explicit_mcp_exit=$?
+e2e_assert_eq "Explicit MCP mode denies share" "2" "$explicit_mcp_exit"
+
+# Case insensitive: CLI/Cli/cLi should all work
+for val in CLI Cli cLi; do
+    ci_exit=0
+    AM_INTERFACE_MODE=$val "$MCP_BIN" --help > /dev/null 2>&1 || ci_exit=$?
+    e2e_assert_eq "AM_INTERFACE_MODE=$val accepted" "0" "$ci_exit"
+done
 
 # ---------------------------------------------------------------------------
 # Summary
