@@ -25,7 +25,7 @@ use std::sync::{
 
 use chrono::{DateTime, Utc};
 
-use mcp_agent_mail_core::{Config, resolve_project_identity};
+use mcp_agent_mail_core::{AgentDetectError, AgentDetectOptions, Config, resolve_project_identity};
 use mcp_agent_mail_share as share;
 use serde::{Deserialize, Serialize};
 
@@ -194,6 +194,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: ContactsCommand,
     },
+    /// Query beads (issue tracker) status for the current project.
+    #[command(name = "beads")]
+    Beads {
+        #[command(subcommand)]
+        action: BeadsCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -260,6 +266,61 @@ pub enum ContactsCommand {
         agent_name: String,
         /// Policy: open, auto, contacts_only, block_all.
         policy: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BeadsCommand {
+    /// List issues ready to work on (unblocked, not deferred).
+    Ready {
+        /// Path to the project root containing .beads/ (default: current directory).
+        #[arg(long, short = 'p')]
+        path: Option<PathBuf>,
+        /// Maximum number of issues to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// List issues with optional status/priority filters.
+    #[command(name = "list")]
+    List {
+        /// Path to the project root containing .beads/.
+        #[arg(long, short = 'p')]
+        path: Option<PathBuf>,
+        /// Filter by status (open, in_progress, closed, blocked).
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by priority (0-4).
+        #[arg(long)]
+        priority: Option<u8>,
+        /// Maximum number of issues to show.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show details for a specific issue.
+    Show {
+        /// Issue ID (e.g. "br-abc123").
+        id: String,
+        /// Path to the project root containing .beads/.
+        #[arg(long, short = 'p')]
+        path: Option<PathBuf>,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Summary counts: open, in_progress, blocked, closed.
+    Status {
+        /// Path to the project root containing .beads/.
+        #[arg(long, short = 'p')]
+        path: Option<PathBuf>,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -901,6 +962,18 @@ pub enum AgentsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Detect installed coding agents on this system.
+    Detect {
+        /// Restrict detection to specific connector slugs (comma-separated).
+        #[arg(long)]
+        only: Option<String>,
+        /// Include undetected agents in the report.
+        #[arg(long, default_value_t = false)]
+        include_undetected: bool,
+        /// Output as JSON (default: true).
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1212,6 +1285,7 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Tooling { action } => handle_tooling(action),
         Commands::Macros { action } => handle_macros(action),
         Commands::Contacts { action } => handle_contacts(action),
+        Commands::Beads { action } => handle_beads(action),
     }
 }
 
@@ -2825,6 +2899,273 @@ fn handle_contacts_with_conn(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Beads integration
+// ---------------------------------------------------------------------------
+
+fn resolve_beads_db(path: Option<&Path>) -> CliResult<PathBuf> {
+    let root = match path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()
+            .map_err(|e| CliError::Other(format!("cannot determine cwd: {e}")))?,
+    };
+    let db_path = root.join(".beads").join("beads.db");
+    if !db_path.exists() {
+        return Err(CliError::InvalidArgument(format!(
+            "no beads database found at {}",
+            db_path.display()
+        )));
+    }
+    Ok(db_path)
+}
+
+fn handle_beads(action: BeadsCommand) -> CliResult<()> {
+    match action {
+        BeadsCommand::Ready { path, limit, json } => handle_beads_ready(path, limit, json),
+        BeadsCommand::List {
+            path,
+            status,
+            priority,
+            limit,
+            json,
+        } => handle_beads_list(path, status, priority, limit, json),
+        BeadsCommand::Show { id, path, json } => handle_beads_show(id, path, json),
+        BeadsCommand::Status { path, json } => handle_beads_status(path, json),
+    }
+}
+
+fn handle_beads_ready(path: Option<PathBuf>, limit: usize, json: bool) -> CliResult<()> {
+    use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+
+    let db_path = resolve_beads_db(path.as_deref())?;
+    let storage = SqliteStorage::open(&db_path)
+        .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
+
+    let filters = ReadyFilters {
+        limit: Some(limit),
+        ..ReadyFilters::default()
+    };
+    let issues = storage
+        .get_ready_issues(&filters, ReadySortPolicy::Hybrid)
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+    if json {
+        let items: Vec<serde_json::Value> = issues
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "id": i.id,
+                    "title": i.title,
+                    "status": i.status.as_str(),
+                    "priority": format!("P{}", i.priority.0),
+                    "type": i.issue_type.as_str(),
+                    "labels": i.labels,
+                })
+            })
+            .collect();
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string_pretty(&items).unwrap_or_default()
+        );
+    } else {
+        if issues.is_empty() {
+            ftui_runtime::ftui_println!("No ready issues.");
+            return Ok(());
+        }
+        output::section(&format!("Ready issues ({}):", issues.len()));
+        for issue in &issues {
+            ftui_runtime::ftui_println!(
+                "  {} [P{}] {} ({})",
+                issue.id,
+                issue.priority.0,
+                issue.title,
+                issue.status.as_str(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_beads_list(
+    path: Option<PathBuf>,
+    status: Option<String>,
+    priority: Option<u8>,
+    limit: usize,
+    json: bool,
+) -> CliResult<()> {
+    use beads_rust::model::{Priority, Status};
+    use beads_rust::storage::{ListFilters, SqliteStorage};
+
+    let db_path = resolve_beads_db(path.as_deref())?;
+    let storage = SqliteStorage::open(&db_path)
+        .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
+
+    let statuses = status.map(|s| {
+        s.split(',')
+            .map(|v| match v.trim() {
+                "open" => Status::Open,
+                "in_progress" => Status::InProgress,
+                "blocked" => Status::Blocked,
+                "closed" => Status::Closed,
+                "deferred" => Status::Deferred,
+                other => Status::Custom(other.to_string()),
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let priorities = priority.map(|p| vec![Priority(i32::from(p))]);
+
+    let include_closed = statuses
+        .as_ref()
+        .is_some_and(|ss| ss.iter().any(|s| matches!(s, Status::Closed)));
+
+    let filters = ListFilters {
+        statuses,
+        priorities,
+        include_closed,
+        limit: Some(limit),
+        ..ListFilters::default()
+    };
+    let issues = storage
+        .list_issues(&filters)
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+    if json {
+        let items: Vec<serde_json::Value> = issues
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "id": i.id,
+                    "title": i.title,
+                    "status": i.status.as_str(),
+                    "priority": format!("P{}", i.priority.0),
+                    "type": i.issue_type.as_str(),
+                    "labels": i.labels,
+                })
+            })
+            .collect();
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string_pretty(&items).unwrap_or_default()
+        );
+    } else {
+        if issues.is_empty() {
+            ftui_runtime::ftui_println!("No matching issues.");
+            return Ok(());
+        }
+        output::section(&format!("Issues ({}):", issues.len()));
+        for issue in &issues {
+            ftui_runtime::ftui_println!(
+                "  {} [P{}] {} ({})",
+                issue.id,
+                issue.priority.0,
+                issue.title,
+                issue.status.as_str(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_beads_show(id: String, path: Option<PathBuf>, json: bool) -> CliResult<()> {
+    use beads_rust::storage::SqliteStorage;
+
+    let db_path = resolve_beads_db(path.as_deref())?;
+    let storage = SqliteStorage::open(&db_path)
+        .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
+
+    let issue = storage
+        .get_issue(&id)
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?
+        .ok_or_else(|| CliError::InvalidArgument(format!("issue not found: {id}")))?;
+
+    if json {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string_pretty(&issue).unwrap_or_default()
+        );
+    } else {
+        output::section(&format!("{}: {}", issue.id, issue.title));
+        output::kv("Status", issue.status.as_str());
+        output::kv("Priority", &format!("P{}", issue.priority.0));
+        output::kv("Type", issue.issue_type.as_str());
+        if let Some(ref a) = issue.assignee {
+            output::kv("Assignee", a);
+        }
+        if !issue.labels.is_empty() {
+            output::kv("Labels", &issue.labels.join(", "));
+        }
+        if let Some(ref desc) = issue.description {
+            ftui_runtime::ftui_println!("\n{desc}");
+        }
+        if !issue.dependencies.is_empty() {
+            output::section("Dependencies:");
+            for dep in &issue.dependencies {
+                ftui_runtime::ftui_println!("  {} {}", dep.dep_type, dep.depends_on_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_beads_status(path: Option<PathBuf>, json: bool) -> CliResult<()> {
+    use beads_rust::model::Status;
+    use beads_rust::storage::{ListFilters, SqliteStorage};
+
+    let db_path = resolve_beads_db(path.as_deref())?;
+    let storage = SqliteStorage::open(&db_path)
+        .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
+
+    // Count all non-closed
+    let all = storage
+        .list_issues(&ListFilters::default())
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+    let closed = storage
+        .list_issues(&ListFilters {
+            statuses: Some(vec![Status::Closed]),
+            include_closed: true,
+            ..ListFilters::default()
+        })
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+    let open = all
+        .iter()
+        .filter(|i| matches!(i.status, Status::Open))
+        .count();
+    let in_progress = all
+        .iter()
+        .filter(|i| matches!(i.status, Status::InProgress))
+        .count();
+    let blocked = all
+        .iter()
+        .filter(|i| matches!(i.status, Status::Blocked))
+        .count();
+    let closed_count = closed.len();
+    let total = all.len() + closed_count;
+
+    if json {
+        let result = serde_json::json!({
+            "open": open,
+            "in_progress": in_progress,
+            "blocked": blocked,
+            "closed": closed_count,
+            "total": total,
+        });
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
+        output::section("Beads Status:");
+        output::kv("Open", &open.to_string());
+        output::kv("In Progress", &in_progress.to_string());
+        output::kv("Blocked", &blocked.to_string());
+        output::kv("Closed", &closed_count.to_string());
+        output::kv("Total", &total.to_string());
+    }
+    Ok(())
+}
+
 fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResult<()> {
     let conn = open_db_sync()?;
     handle_list_acks_with_conn(&conn, project_key, agent_name, limit)
@@ -3811,6 +4152,44 @@ fn handle_doctor_check(project: Option<String>, verbose: bool, json: bool) -> Cl
     )
 }
 
+fn beads_issue_awareness_counts_from(
+    start: Option<&Path>,
+) -> Result<(usize, usize, usize), String> {
+    let beads_dir = beads_rust::config::discover_beads_dir(start).map_err(|e| e.to_string())?;
+    let (storage, _paths) =
+        beads_rust::config::open_storage(&beads_dir, None, None).map_err(|e| e.to_string())?;
+
+    let ready = storage
+        .get_ready_issues(
+            &beads_rust::storage::ReadyFilters::default(),
+            beads_rust::storage::ReadySortPolicy::Hybrid,
+        )
+        .map_err(|e| e.to_string())?
+        .len();
+
+    let open = storage
+        .list_issues(&beads_rust::storage::ListFilters {
+            statuses: Some(vec![beads_rust::model::Status::Open]),
+            ..Default::default()
+        })
+        .map_err(|e| e.to_string())?
+        .len();
+
+    let in_progress = storage
+        .list_issues(&beads_rust::storage::ListFilters {
+            statuses: Some(vec![beads_rust::model::Status::InProgress]),
+            ..Default::default()
+        })
+        .map_err(|e| e.to_string())?
+        .len();
+
+    Ok((ready, open, in_progress))
+}
+
+fn beads_issue_awareness_counts() -> Result<(usize, usize, usize), String> {
+    beads_issue_awareness_counts_from(None)
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -3836,7 +4215,59 @@ fn handle_doctor_check_with(
         "detail": format!("{}", storage_root.display()),
     }));
 
-    // Check 3: Project-specific checks
+    // Check 3: Installed coding-agent connectors (coding_agent_session_search integration)
+    let detect_opts = AgentDetectOptions {
+        only_connectors: None,
+        include_undetected: true,
+        root_overrides: Vec::new(),
+    };
+    match mcp_agent_mail_core::detect_installed_agents(&detect_opts) {
+        Ok(report) => {
+            checks.push(serde_json::json!({
+                "check": "installed_agents",
+                "status": "ok",
+                "detail": format!(
+                    "{} detected of {} connector(s)",
+                    report.summary.detected_count,
+                    report.summary.total_count
+                ),
+            }));
+        }
+        Err(AgentDetectError::FeatureDisabled) => {
+            checks.push(serde_json::json!({
+                "check": "installed_agents",
+                "status": "warn",
+                "detail": "Agent detection feature disabled at compile time",
+            }));
+        }
+        Err(err) => {
+            checks.push(serde_json::json!({
+                "check": "installed_agents",
+                "status": "warn",
+                "detail": format!("Agent detection unavailable: {err}"),
+            }));
+        }
+    }
+
+    // Check 4: Beads issue awareness (ready/open/in-progress)
+    match beads_issue_awareness_counts() {
+        Ok((ready, open, in_progress)) => {
+            checks.push(serde_json::json!({
+                "check": "beads_issue_awareness",
+                "status": "ok",
+                "detail": format!("{ready} ready / {open} open / {in_progress} in_progress"),
+            }));
+        }
+        Err(err) => {
+            checks.push(serde_json::json!({
+                "check": "beads_issue_awareness",
+                "status": "warn",
+                "detail": format!("Unavailable: {err}"),
+            }));
+        }
+    }
+
+    // Check 5: Project-specific checks
     if let Some(ref slug) = project {
         if let Ok(conn) = open_db_sync_with_database_url(database_url) {
             let rows = conn
@@ -4678,6 +5109,50 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             output::kv("Inception", &context::format_ts(row.inception_ts));
             output::kv("Last Active", &context::format_ts(row.last_active_ts));
             Ok(())
+        }
+
+        AgentsCommand::Detect {
+            only,
+            include_undetected,
+            json,
+        } => {
+            let only_connectors = only.map(|s| {
+                s.split(',')
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect::<Vec<_>>()
+            });
+
+            let opts = mcp_agent_mail_core::AgentDetectOptions {
+                only_connectors,
+                include_undetected,
+                ..Default::default()
+            };
+
+            match mcp_agent_mail_core::detect_installed_agents(&opts) {
+                Ok(report) => {
+                    if json {
+                        ftui_runtime::ftui_println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).unwrap_or_default()
+                        );
+                    } else {
+                        output::section(&format!(
+                            "Installed Agents ({}/{} detected):",
+                            report.summary.detected_count, report.summary.total_count
+                        ));
+                        for entry in &report.installed_agents {
+                            let status = if entry.detected { "detected" } else { "not found" };
+                            ftui_runtime::ftui_println!("  {} ({})", entry.slug, status);
+                            for path in &entry.root_paths {
+                                ftui_runtime::ftui_println!("    root: {path}");
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(CliError::Other(format!("agent detection failed: {e}"))),
+            }
         }
     }
 }
@@ -9747,6 +10222,252 @@ sys.exit(7)
             let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
             assert!(parsed["healthy"].is_boolean());
         }
+    }
+
+    #[test]
+    fn integration_doctor_check_reports_installed_agents_probe() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, true);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "doctor check failed: {result:?}");
+
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).expect("json");
+        let checks = parsed["checks"].as_array().expect("checks array");
+        assert!(
+            checks
+                .iter()
+                .any(|c| c["check"].as_str() == Some("installed_agents")),
+            "doctor check should include installed_agents probe"
+        );
+    }
+
+    #[test]
+    fn integration_doctor_check_reports_beads_issue_awareness_probe() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, true);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "doctor check failed: {result:?}");
+
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).expect("json");
+        let checks = parsed["checks"].as_array().expect("checks array");
+        let bead_check = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("beads_issue_awareness"))
+            .expect("beads_issue_awareness check should be present");
+        let status = bead_check["status"].as_str().unwrap_or_default();
+        assert!(
+            matches!(status, "ok" | "warn"),
+            "unexpected status for beads_issue_awareness: {status}"
+        );
+    }
+
+    #[test]
+    fn beads_issue_awareness_counts_from_missing_beads_dir_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err =
+            beads_issue_awareness_counts_from(Some(dir.path())).expect_err("expected no .beads");
+        assert!(
+            !err.trim().is_empty(),
+            "error message should not be empty for missing .beads"
+        );
+    }
+
+    #[test]
+    fn beads_issue_awareness_counts_from_temp_beads_dir_reports_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let beads_dir = dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create .beads");
+
+        let (mut storage, _paths) =
+            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
+
+        let open_issue = beads_rust::model::Issue {
+            id: "br-test-open".to_string(),
+            title: "Open issue".to_string(),
+            status: beads_rust::model::Status::Open,
+            ..Default::default()
+        };
+        storage
+            .create_issue(&open_issue, "test")
+            .expect("insert open issue");
+
+        let in_progress_issue = beads_rust::model::Issue {
+            id: "br-test-progress".to_string(),
+            title: "In progress issue".to_string(),
+            status: beads_rust::model::Status::InProgress,
+            ..Default::default()
+        };
+        storage
+            .create_issue(&in_progress_issue, "test")
+            .expect("insert in-progress issue");
+
+        let (ready, open, in_progress) =
+            beads_issue_awareness_counts_from(Some(dir.path())).expect("counts");
+        assert_eq!(open, 1);
+        assert_eq!(in_progress, 1);
+        assert_eq!(
+            ready, 2,
+            "open + in-progress unblocked issues should be ready under default filters"
+        );
+    }
+
+    #[test]
+    fn clap_parses_beads_status_flags() {
+        let cli = Cli::try_parse_from(["am", "beads", "status", "--json"])
+            .expect("failed to parse beads status");
+        match cli.command {
+            Commands::Beads {
+                action: BeadsCommand::Status { json, .. },
+            } => assert!(json),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_beads_ready_with_limit() {
+        let cli = Cli::try_parse_from(["am", "beads", "ready", "--limit", "5", "--json"])
+            .expect("failed to parse beads ready");
+        match cli.command {
+            Commands::Beads {
+                action: BeadsCommand::Ready { limit, json, .. },
+            } => {
+                assert_eq!(limit, 5);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_beads_list_with_status_filter() {
+        let cli =
+            Cli::try_parse_from(["am", "beads", "list", "--status", "open", "--priority", "2"])
+                .expect("failed to parse beads list");
+        match cli.command {
+            Commands::Beads {
+                action:
+                    BeadsCommand::List {
+                        status,
+                        priority,
+                        ..
+                    },
+            } => {
+                assert_eq!(status.as_deref(), Some("open"));
+                assert_eq!(priority, Some(2));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_beads_show_with_id() {
+        let cli = Cli::try_parse_from(["am", "beads", "show", "br-123", "--json"])
+            .expect("failed to parse beads show");
+        match cli.command {
+            Commands::Beads {
+                action: BeadsCommand::Show { id, json, .. },
+            } => {
+                assert_eq!(id, "br-123");
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_agents_detect_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "agents",
+            "detect",
+            "--only",
+            "claude,codex",
+            "--include-undetected",
+        ])
+        .expect("failed to parse agents detect");
+        match cli.command {
+            Commands::Agents {
+                action:
+                    AgentsCommand::Detect {
+                        only,
+                        include_undetected,
+                        ..
+                    },
+            } => {
+                assert_eq!(only.as_deref(), Some("claude,codex"));
+                assert!(include_undetected);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_beads_db_returns_error_for_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_beads_db(Some(dir.path()));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no beads database"),
+            "expected 'no beads database' in: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn handle_beads_status_on_fresh_db() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create .beads");
+
+        // Initialize a fresh beads storage (creates the DB)
+        let _storage =
+            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_beads_status(Some(dir.path().to_path_buf()), true);
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "beads status failed: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("should be valid JSON");
+        assert_eq!(parsed["open"], 0);
+        assert_eq!(parsed["closed"], 0);
+        assert_eq!(parsed["total"], 0);
+    }
+
+    #[test]
+    fn handle_beads_ready_on_fresh_db_shows_empty() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create .beads");
+
+        let _storage =
+            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_beads_ready(Some(dir.path().to_path_buf()), 20, true);
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "beads ready failed: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("should be valid JSON");
+        assert!(parsed.as_array().expect("should be array").is_empty());
     }
 
     #[test]
