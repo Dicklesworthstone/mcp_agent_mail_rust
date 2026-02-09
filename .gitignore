@@ -17,8 +17,9 @@ a.out
 # Local env (developer machine / CI)
 .env
 
-# Local server logs
-agent-mail-server*.log
+# Local server logs and PID files
+agent-mail-*.log
+agent-mail-*.pid
 
 # E2E test artifacts (generated per-run)
 tests/artifacts/
@@ -31,6 +32,10 @@ crates/**/tests/artifacts/
 
 # Profiling artifacts
 perf.data
+flamegraph.svg
+
+# Benchmark results (generated per-run by scripts/bench_cli.sh)
+benches/results/
 
 # Conformance scratch runs (legacy python reference generator)
 crates/mcp-agent-mail-conformance/tests/conformance/python_reference/_scratch/

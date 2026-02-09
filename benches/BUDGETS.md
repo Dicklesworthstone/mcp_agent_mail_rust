@@ -44,6 +44,21 @@ Targets based on initial baseline (2026-02-05). Budgets are 2x the measured base
 | `am lint` | < 50ms | Static analysis |
 | `am typecheck` | < 50ms | Type checking |
 
+## CLI Operational Budgets
+
+Baseline captured via `scripts/bench_cli.sh --quick` (2026-02-09). Seeded with 60 messages (50 BlueLake→RedFox + 10 RedFox→BlueLake).
+
+| Command | Baseline (mean) | Budget | Notes |
+|---------|----------------|--------|-------|
+| `am --help` | 4.2ms | < 10ms | Pure startup, no DB |
+| `am mail inbox` (50 msgs) | 11.5ms | < 25ms | Read path, default limit=20 |
+| `am mail inbox --include-bodies` | 11.7ms | < 25ms | Bodies add negligible overhead |
+| `am mail send` (single) | 27.1ms | < 50ms | Full write path (DB + archive commit) |
+| `am doctor check` | 5.8ms | < 15ms | Diagnostic checks |
+| `am list-projects` | 6.2ms | < 15ms | Lightweight query |
+| `am lint` | 457ms | < 1000ms | Heavy static analysis |
+| `am typecheck` | 399ms | < 800ms | Heavy type checking |
+
 ## Archive Write Budgets
 
 Baseline numbers are taken from the bench harness artifacts emitted by:

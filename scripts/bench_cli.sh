@@ -129,6 +129,119 @@ print(json.dumps(d))
 fi
 
 # ---------------------------------------------------------------------------
+# Benchmark 5: Operational commands (require seeded DB)
+# ---------------------------------------------------------------------------
+log ""
+log "=== Operational Benchmarks (seeded DB) ==="
+
+BENCH_DB="${WORK}/bench.db"
+BENCH_ARCHIVE="${WORK}/archive"
+mkdir -p "${BENCH_ARCHIVE}"
+export MCP_AGENT_MAIL_DB="${BENCH_DB}"
+export MCP_AGENT_MAIL_ARCHIVE_ROOT="${BENCH_ARCHIVE}"
+
+# Seed the DB with a project, 2 agents, and 50 messages
+log "Seeding benchmark database..."
+SEED_OK=true
+
+# Register project and agents first
+"${AM_RELEASE}" agents register \
+    --project /tmp/bench --name BlueLake \
+    --program bench --model bench --json >/dev/null 2>&1 || SEED_OK=false
+"${AM_RELEASE}" agents register \
+    --project /tmp/bench --name RedFox \
+    --program bench --model bench --json >/dev/null 2>&1 || SEED_OK=false
+
+# Send first message
+if [ "$SEED_OK" = true ]; then
+    "${AM_RELEASE}" mail send \
+        --project /tmp/bench --from BlueLake --to RedFox \
+        --subject "seed-0" --body "initial seed" --json >/dev/null 2>&1 || SEED_OK=false
+fi
+
+if [ "$SEED_OK" = true ]; then
+    # Send 49 more messages to create a realistic inbox
+    for i in $(seq 1 49); do
+        "${AM_RELEASE}" mail send \
+            --project /tmp/bench --from BlueLake --to RedFox \
+            --subject "bench message $i" --body "body of message $i for benchmarking" \
+            --json >/dev/null 2>&1 || true
+    done
+
+    # Send some in the other direction for outbox variety
+    for i in $(seq 1 10); do
+        "${AM_RELEASE}" mail send \
+            --project /tmp/bench --from RedFox --to BlueLake \
+            --subject "reply $i" --body "reply body $i" \
+            --json >/dev/null 2>&1 || true
+    done
+
+    log "Seeded: 60 messages (50 + 10 replies)"
+
+    # 5a: mail inbox (cold - first read from DB)
+    log "Benchmark: mail inbox (50 messages)"
+    hyperfine \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        --export-json "${RESULTS_DIR}/mail_inbox_${TIMESTAMP}.json" \
+        "${AM_RELEASE} mail inbox --project /tmp/bench --agent RedFox --json"
+
+    # 5b: mail inbox with bodies
+    log "Benchmark: mail inbox --include-bodies"
+    hyperfine \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        --export-json "${RESULTS_DIR}/mail_inbox_bodies_${TIMESTAMP}.json" \
+        "${AM_RELEASE} mail inbox --project /tmp/bench --agent RedFox --include-bodies --json"
+
+    # 5c: mail send (single message - measures full write path)
+    log "Benchmark: mail send (single message)"
+    hyperfine \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        --export-json "${RESULTS_DIR}/mail_send_${TIMESTAMP}.json" \
+        "${AM_RELEASE} mail send --project /tmp/bench --from BlueLake --to RedFox --subject bench-msg --body bench-body --json"
+
+    # 5d: mail search (FTS5 query)
+    log "Benchmark: mail search"
+    hyperfine \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        --export-json "${RESULTS_DIR}/mail_search_${TIMESTAMP}.json" \
+        "${AM_RELEASE} mail search --project /tmp/bench --json bench" 2>/dev/null \
+        || log "mail search benchmark skipped"
+
+    # 5e: doctor check
+    log "Benchmark: doctor check"
+    hyperfine \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        --export-json "${RESULTS_DIR}/doctor_check_${TIMESTAMP}.json" \
+        "${AM_RELEASE} doctor check --json" 2>/dev/null \
+        || log "doctor check benchmark skipped"
+
+    # 5f: list-projects
+    log "Benchmark: list-projects"
+    hyperfine \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        --export-json "${RESULTS_DIR}/list_projects_${TIMESTAMP}.json" \
+        "${AM_RELEASE} list-projects --json" 2>/dev/null \
+        || log "list-projects benchmark skipped"
+
+    # 5g: agents list
+    log "Benchmark: agents list"
+    hyperfine \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        --export-json "${RESULTS_DIR}/agents_list_${TIMESTAMP}.json" \
+        "${AM_RELEASE} agents list --project /tmp/bench --json" 2>/dev/null \
+        || log "agents list benchmark skipped"
+else
+    log "WARNING: Could not seed DB; operational benchmarks skipped"
+fi
+
+# ---------------------------------------------------------------------------
 # Aggregate results
 # ---------------------------------------------------------------------------
 log "Aggregating results..."

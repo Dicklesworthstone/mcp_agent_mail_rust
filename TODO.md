@@ -41,7 +41,7 @@
 - [x] Error types (`error.rs`).
 - [x] Explicit indexes + unique constraints matching legacy.
 - [x] FTS triggers installed and validated.
-- [ ] Schema migration story using `sqlmodel_schema::MigrationRunner`.
+- [x] Schema migration story using `sqlmodel_schema::MigrationRunner`.
 - [x] WAL PRAGMA setup SQL (`schema.rs`).
 - [x] Pool config defaults (`pool.rs`).
 - [x] Pool wired to `sqlmodel_pool` + `sqlmodel_sqlite`.
@@ -119,10 +119,10 @@
 - [x] Bench suite reusing conformance fixtures.
 - [x] Tool latency baseline (8 representative tools).
 - [x] Initial baseline recorded (most tools sub-100µs).
-- [ ] Add archive write throughput benchmarks (send_message + commit queue).
-- [ ] Capture hyperfine baselines for CLI commands (serve + send_message + fetch_inbox).
+- [x] Add archive write throughput benchmarks (send_message + commit queue).
+- [x] Capture hyperfine baselines for CLI commands (serve + send_message + fetch_inbox).
 - [ ] Run `cargo flamegraph` for hot paths (search + send_message + storage writes).
-- [ ] Record golden outputs + checksums for optimization validation.
+- [x] Record golden outputs + checksums for optimization validation.
 - [ ] Maintain perf regression notes in `FEATURE_PARITY.md` or dedicated doc.
 
 ## 10. Dependency Integration (Local /dp Crates)
@@ -135,10 +135,10 @@
 - [ ] Evaluate fastmcp resource query param handling; add adapters if needed.
 
 ## 11. Testing & QA
-- [ ] Unit tests for tool validation rules (input constraints, error messages).
-- [ ] Integration tests for DB + storage pipelines (archive + SQLite consistency).
-- [ ] E2E tests for MCP tool calls (stdio + HTTP).
-- [ ] Guard tests for conflict detection (pathspec + rename + advisory).
+- [x] Unit tests for tool validation rules (input constraints, error messages).
+- [x] Integration tests for DB + storage pipelines (archive + SQLite consistency).
+- [x] E2E tests for MCP tool calls (stdio + HTTP).
+- [x] Guard tests for conflict detection (pathspec + rename + advisory).
 - [x] Run full toolchain: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test`.
 
 ## 12. Publishing & Release (Crates.io + CI)
