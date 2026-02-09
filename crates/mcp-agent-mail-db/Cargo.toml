@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Database layer for MCP Agent Mail"
 
 [dependencies]

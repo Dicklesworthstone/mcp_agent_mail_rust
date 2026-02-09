@@ -142,6 +142,35 @@
 - [x] Run full toolchain: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test`.
 
 ## 12. Publishing & Release (Crates.io + CI)
-- [ ] Confirm Cargo metadata (license/readme/repository) for publishable crates.
+- [x] Confirm Cargo metadata (license/readme/repository) for publishable crates.
 - [ ] Add crates.io publish workflow gated by tags (`CARGO_REGISTRY_TOKEN`).
-- [ ] Document publish order for workspace crates (`cargo publish -p ...`).
+- [x] Document publish order for workspace crates (`cargo publish -p ...`).
+
+### Publish Order (dependency-respecting)
+
+```bash
+# Phase 1: Foundation (no internal deps)
+cargo publish -p mcp-agent-mail-core
+
+# Phase 2: Database + storage layers
+cargo publish -p mcp-agent-mail-db
+cargo publish -p mcp-agent-mail-storage
+
+# Phase 3: Utilities
+cargo publish -p mcp-agent-mail-guard
+cargo publish -p mcp-agent-mail-share
+
+# Phase 4: High-level APIs
+cargo publish -p mcp-agent-mail-tools
+cargo publish -p mcp-agent-mail-server
+cargo publish -p mcp-agent-mail-cli
+
+# Phase 5: Binaries
+cargo publish -p mcp-agent-mail
+
+# Not published: mcp-agent-mail-conformance (publish = false)
+```
+
+**Note**: All external deps (fastmcp, sqlmodel, asupersync, ftui) are path dependencies
+and must be published to crates.io first or replaced with registry versions before
+workspace crates can be published.

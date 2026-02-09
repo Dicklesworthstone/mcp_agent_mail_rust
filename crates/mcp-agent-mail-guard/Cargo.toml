@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pre-commit/pre-push guard for file reservation conflicts"
 
 [dependencies]
 serde.workspace = true

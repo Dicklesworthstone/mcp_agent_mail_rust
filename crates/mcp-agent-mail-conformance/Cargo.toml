@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Conformance test harness for MCP Agent Mail"
+publish = false
 
 [dependencies]
 serde.workspace = true
