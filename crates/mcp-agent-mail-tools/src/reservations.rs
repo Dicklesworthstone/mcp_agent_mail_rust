@@ -712,7 +712,9 @@ pub async fn force_release_file_reservation(
             },
         );
 
-        let result = mcp_agent_mail_db::queries::create_message(
+        let holder_id = holder_agent.id.unwrap_or(0);
+        let recipients: &[(i64, &str)] = &[(holder_id, "to")];
+        let result = mcp_agent_mail_db::queries::create_message_with_recipients(
             ctx.cx(),
             &pool,
             project_id,
@@ -726,6 +728,7 @@ pub async fn force_release_file_reservation(
             "normal",
             false,
             "[]",
+            recipients,
         )
         .await;
         matches!(result, asupersync::Outcome::Ok(_))
