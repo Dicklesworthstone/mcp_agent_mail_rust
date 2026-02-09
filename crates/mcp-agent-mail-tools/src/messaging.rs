@@ -1256,6 +1256,26 @@ effective_free_bytes={free}"
 
     let reply_id = reply.id.unwrap_or(0);
 
+    // Emit notification signals for to/cc recipients only (never bcc).
+    // Mirrors the send_message notification logic for parity with Python.
+    let notification_meta = mcp_agent_mail_storage::NotificationMessage {
+        id: Some(reply_id),
+        from: Some(sender_name.clone()),
+        subject: Some(reply.subject.clone()),
+        importance: Some(reply.importance.clone()),
+    };
+    let mut notified = HashSet::new();
+    for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
+        if notified.insert(name.clone()) {
+            let _ = mcp_agent_mail_storage::emit_notification_signal(
+                config,
+                &project.slug,
+                name,
+                Some(&notification_meta),
+            );
+        }
+    }
+
     // Write reply message bundle to git archive (best-effort)
     {
         let mut all_recipient_names: SmallVec<[String; 12]> = SmallVec::new();

@@ -138,7 +138,7 @@ pub async fn request_contact(
     let from_row = match resolve_agent(ctx, &pool, project_id, &from_agent).await {
         Ok(a) => a,
         Err(e) => {
-            let should_register = register_if_missing.unwrap_or(false);
+            let should_register = register_if_missing.unwrap_or(true);
             if !should_register {
                 return Err(e);
             }
@@ -175,13 +175,32 @@ pub async fn request_contact(
     };
 
     // Target project defaults to same project_key.
-    let target_project_key = to_project.unwrap_or_else(|| project_key.clone());
+    // Support `project:<slug>#<Name>` shorthand in to_agent (Python parity).
+    let (target_project_key, target_agent_name) = if to_project.is_some() {
+        (to_project.unwrap(), to_agent.clone())
+    } else if to_agent.starts_with("project:") && to_agent.contains('#') {
+        match to_agent.splitn(2, ':').nth(1).and_then(|rest| {
+            let mut parts = rest.splitn(2, '#');
+            let slug = parts.next()?;
+            let agent = parts.next()?.trim();
+            if slug.is_empty() || agent.is_empty() {
+                None
+            } else {
+                Some((slug.to_string(), agent.to_string()))
+            }
+        }) {
+            Some((slug, agent)) => (slug, agent),
+            None => (project_key.clone(), to_agent.clone()),
+        }
+    } else {
+        (project_key.clone(), to_agent.clone())
+    };
     let target_project_row = resolve_project(ctx, &pool, &target_project_key).await?;
     let target_project_id = target_project_row.id.unwrap_or(0);
 
-    let to_row = resolve_agent(ctx, &pool, target_project_id, &to_agent).await?;
+    let to_row = resolve_agent(ctx, &pool, target_project_id, &target_agent_name).await?;
 
-    let ttl = ttl_seconds.unwrap_or(604_800).max(0); // 7 days default; clamp negative to 0
+    let ttl = ttl_seconds.unwrap_or(604_800).max(60); // 7 days default; min 60s
     let link_row = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::request_contact(
             ctx.cx(),
@@ -199,7 +218,7 @@ pub async fn request_contact(
     // Send an intro mail (ack_required) so the recipient sees the request in their inbox.
     // This matches legacy Python fixture semantics.
     let subject = format!("Contact request from {from_agent}");
-    let body_md = format!("{from_agent} requests permission to contact {to_agent}.");
+    let body_md = format!("{from_agent} requests permission to contact {target_agent_name}.");
 
     let msg_row = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::create_message(
@@ -230,7 +249,7 @@ pub async fn request_contact(
     let response = ContactLinkState {
         from: from_agent,
         from_project: project.human_key,
-        to: to_agent,
+        to: target_agent_name,
         to_project: target_project_row.human_key,
         status: link_row.status,
         expires_ts: link_row.expires_ts.map(micros_to_iso),
@@ -271,7 +290,7 @@ pub async fn respond_contact(
     let from_row = resolve_agent(ctx, &pool, source_project_id, &from_agent).await?;
     let to_row = resolve_agent(ctx, &pool, project_id, &to_agent).await?;
 
-    let ttl = ttl_seconds.unwrap_or(2_592_000).max(0); // 30 days default; clamp negative to 0
+    let ttl = ttl_seconds.unwrap_or(2_592_000).max(60); // 30 days default; min 60s
     let (updated, link_row) = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::respond_contact(
             ctx.cx(),
