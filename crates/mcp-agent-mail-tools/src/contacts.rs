@@ -176,13 +176,13 @@ pub async fn request_contact(
 
     // Target project defaults to same project_key.
     // Support `project:<slug>#<Name>` shorthand in to_agent (Python parity).
-    let (target_project_key, target_agent_name) = if to_project.is_some() {
-        (to_project.unwrap(), to_agent.clone())
+    #[allow(clippy::option_if_let_else)]
+    let (target_project_key, target_agent_name) = if let Some(tp) = to_project {
+        (tp, to_agent.clone())
     } else if to_agent.starts_with("project:") && to_agent.contains('#') {
-        match to_agent.splitn(2, ':').nth(1).and_then(|rest| {
-            let mut parts = rest.splitn(2, '#');
-            let slug = parts.next()?;
-            let agent = parts.next()?.trim();
+        match to_agent.split_once(':').and_then(|(_, rest)| {
+            let (slug, agent) = rest.split_once('#')?;
+            let agent = agent.trim();
             if slug.is_empty() || agent.is_empty() {
                 None
             } else {

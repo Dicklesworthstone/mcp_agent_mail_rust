@@ -539,9 +539,10 @@ pub async fn force_release_file_reservation(
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }
 
-    // Configurable thresholds
-    let inactivity_seconds: i64 = 30 * 60; // 30 minutes
-    let grace_seconds: i64 = 15 * 60; // 15 minutes
+    // Read thresholds from config (env-overridable, matching Python parity)
+    let config = Config::get();
+    let inactivity_seconds = i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(1800);
+    let grace_seconds = i64::try_from(config.file_reservation_activity_grace_seconds).unwrap_or(900);
     let inactivity_micros = inactivity_seconds.saturating_mul(1_000_000);
     let grace_micros = grace_seconds.saturating_mul(1_000_000);
 
