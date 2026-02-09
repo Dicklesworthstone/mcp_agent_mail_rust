@@ -138,6 +138,20 @@ Baseline (2026-02-06): ~13 chunks; total p95 ~1.88s; zip p95 ~0.16s.
 Age encryption (`share::encrypt_with_age`) depends on the external `age` CLI being installed.
 The baseline run above did not include encryption timings (`age` not found).
 
+## Flamegraph Profiles (2026-02-09)
+
+Generated via `cargo flamegraph --root` with `CARGO_PROFILE_RELEASE_DEBUG=true`.
+
+| Profile | File | Samples | Key Finding |
+|---------|------|---------|-------------|
+| Tool handlers | `benches/flamegraph_bench_tools.svg` | 45,056 | 65% kernel (btrfs fdatasync), syscall cancel dominates userspace |
+| Archive writes | `benches/flamegraph_bench_archive.svg` | 44,948 | Same pattern — I/O bound, not CPU bound |
+
+**Interpretation**: Both profiles confirm the strace analysis below. The Rust userspace code is
+highly optimized; the bottleneck is kernel-side I/O (btrfs journal sync via `fdatasync`).
+Optimization effort should target reducing sync frequency (commit batching) rather than
+CPU-side code changes.
+
 ## Syscall Profile (strace, 2026-02-08)
 
 Collected via `strace -c -f` on `mcp_agent_mail_tools/health_check` benchmark (representative of all tool paths).

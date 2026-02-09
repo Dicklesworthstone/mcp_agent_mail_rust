@@ -121,7 +121,7 @@
 - [x] Initial baseline recorded (most tools sub-100µs).
 - [x] Add archive write throughput benchmarks (send_message + commit queue).
 - [x] Capture hyperfine baselines for CLI commands (serve + send_message + fetch_inbox).
-- [ ] Run `cargo flamegraph` for hot paths (search + send_message + storage writes).
+- [x] Run `cargo flamegraph` for hot paths (search + send_message + storage writes).
 - [x] Record golden outputs + checksums for optimization validation.
 - [ ] Maintain perf regression notes in `FEATURE_PARITY.md` or dedicated doc.
 
