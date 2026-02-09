@@ -336,15 +336,19 @@ impl DiagnosticReport {
             Ok(json) => {
                 // Truncate tools_detail to fit within budget.
                 let mut truncated = self.clone();
+                let mut tools_truncated = false;
+                let mut locks_truncated = false;
                 while serde_json::to_string(&truncated).map_or(0, |s| s.len()) > MAX_REPORT_BYTES {
-                    if truncated.tools_detail.len() > 5 {
+                    if !tools_truncated && truncated.tools_detail.len() > 5 {
                         truncated.tools_detail.truncate(5);
                         truncated.tools_detail.push(serde_json::json!({
                             "_truncated": true,
                             "_message": "tools_detail truncated to fit 100KB report limit"
                         }));
-                    } else if truncated.locks.len() > 5 {
+                        tools_truncated = true;
+                    } else if !locks_truncated && truncated.locks.len() > 5 {
                         truncated.locks.truncate(5);
+                        locks_truncated = true;
                     } else {
                         // Give up and return truncated raw JSON.
                         return json[..MAX_REPORT_BYTES].to_string();

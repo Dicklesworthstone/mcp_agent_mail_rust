@@ -2201,7 +2201,7 @@ pub async fn renew_reservations(
 
     for row in &mut reservations {
         let base = row.expires_ts.max(now);
-        row.expires_ts = base + extend;
+        row.expires_ts = base.saturating_add(extend);
         let Some(id) = row.id else {
             return Outcome::Err(DbError::Internal(
                 "renew_reservations: expected id to be populated".to_string(),
