@@ -763,4 +763,481 @@ mod tests {
         assert_eq!(normalize_path("/api"), "/api/");
         assert_eq!(normalize_path("/api/"), "/api/");
     }
+
+    #[test]
+    fn normalize_path_root() {
+        assert_eq!(normalize_path("/"), "/");
+    }
+
+    #[test]
+    fn normalize_path_nested() {
+        assert_eq!(normalize_path("a/b/c"), "/a/b/c/");
+        assert_eq!(normalize_path("/a/b/c"), "/a/b/c/");
+        assert_eq!(normalize_path("/a/b/c/"), "/a/b/c/");
+    }
+
+    // --- parse_http_status ---
+
+    #[test]
+    fn parse_http_status_200_ok() {
+        assert_eq!(parse_http_status(b"HTTP/1.1 200 OK\r\n"), Some(200));
+    }
+
+    #[test]
+    fn parse_http_status_404_not_found() {
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"),
+            Some(404)
+        );
+    }
+
+    #[test]
+    fn parse_http_status_401() {
+        assert_eq!(parse_http_status(b"HTTP/1.1 401 Unauthorized\r\n"), Some(401));
+    }
+
+    #[test]
+    fn parse_http_status_500() {
+        assert_eq!(parse_http_status(b"HTTP/1.1 500 Internal Server Error\r\n"), Some(500));
+    }
+
+    #[test]
+    fn parse_http_status_no_crlf() {
+        // No \r\n — line_end falls to buf.len(), still parseable
+        assert_eq!(parse_http_status(b"HTTP/1.1 200 OK"), Some(200));
+    }
+
+    #[test]
+    fn parse_http_status_empty() {
+        assert_eq!(parse_http_status(b""), None);
+    }
+
+    #[test]
+    fn parse_http_status_garbage() {
+        assert_eq!(parse_http_status(b"not http at all\r\n"), None);
+    }
+
+    #[test]
+    fn parse_http_status_invalid_code() {
+        assert_eq!(parse_http_status(b"HTTP/1.1 XYZ Oops\r\n"), None);
+    }
+
+    // --- resolve_socket_addr ---
+
+    #[test]
+    fn resolve_socket_addr_localhost() {
+        let addr = resolve_socket_addr("localhost", 8766).expect("resolve");
+        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8766));
+    }
+
+    #[test]
+    fn resolve_socket_addr_ipv4() {
+        let addr = resolve_socket_addr("192.168.1.1", 9000).expect("resolve");
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(addr.port(), 9000);
+    }
+
+    #[test]
+    fn resolve_socket_addr_ipv6() {
+        let addr = resolve_socket_addr("::1", 80).expect("resolve");
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 80);
+    }
+
+    #[test]
+    fn resolve_socket_addr_invalid_host() {
+        let err = resolve_socket_addr("not-an-ip", 80).unwrap_err();
+        assert!(err.contains("unsupported host"));
+    }
+
+    // --- parse_authority_host_port ---
+
+    #[test]
+    fn parse_authority_ipv4_with_port() {
+        let (host, port) = parse_authority_host_port("127.0.0.1:8766").expect("parse");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8766);
+    }
+
+    #[test]
+    fn parse_authority_host_only_defaults_port_80() {
+        let (host, port) = parse_authority_host_port("example.com").expect("parse");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn parse_authority_ipv6_bracketed_with_port() {
+        let (host, port) = parse_authority_host_port("[::1]:9090").expect("parse");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 9090);
+    }
+
+    #[test]
+    fn parse_authority_ipv6_bracketed_no_port() {
+        let (host, port) = parse_authority_host_port("[::1]").expect("parse");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn parse_authority_invalid_port() {
+        let err = parse_authority_host_port("127.0.0.1:notaport").unwrap_err();
+        assert!(err.contains("invalid port"));
+    }
+
+    #[test]
+    fn parse_authority_ipv6_unclosed_bracket() {
+        let err = parse_authority_host_port("[::1").unwrap_err();
+        assert!(err.contains("invalid IPv6"));
+    }
+
+    // --- push_unique_path ---
+
+    #[test]
+    fn push_unique_path_deduplicates() {
+        let mut paths = Vec::new();
+        push_unique_path(&mut paths, "/mcp/");
+        push_unique_path(&mut paths, "/api/");
+        push_unique_path(&mut paths, "/mcp/");
+        assert_eq!(paths, vec!["/mcp/", "/api/"]);
+    }
+
+    #[test]
+    fn push_unique_path_empty_list() {
+        let mut paths = Vec::new();
+        push_unique_path(&mut paths, "/");
+        assert_eq!(paths.len(), 1);
+    }
+
+    // --- Level and ProbeAuthKind labels ---
+
+    #[test]
+    fn level_labels() {
+        assert_eq!(Level::Ok.label(), "OK");
+        assert_eq!(Level::Warn.label(), "WARN");
+        assert_eq!(Level::Fail.label(), "FAIL");
+    }
+
+    #[test]
+    fn probe_auth_kind_labels() {
+        assert_eq!(ProbeAuthKind::Unauth.label(), "unauth");
+        assert_eq!(ProbeAuthKind::Auth.label(), "auth");
+    }
+
+    // --- classify_http_probe ---
+
+    fn make_snap(auth_enabled: bool) -> DiagnosticsSnapshot {
+        DiagnosticsSnapshot {
+            auth_enabled,
+            ..Default::default()
+        }
+    }
+
+    fn make_probe(kind: ProbeAuthKind, status: Option<u16>, body_has_tools: Option<bool>) -> PathProbe {
+        PathProbe {
+            path: "/mcp/".into(),
+            kind,
+            status,
+            body_has_tools,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classify_no_status_is_fail() {
+        let snap = make_snap(false);
+        let probe = make_probe(ProbeAuthKind::Unauth, None, None);
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Fail);
+    }
+
+    #[test]
+    fn classify_auth_200_with_tools_is_ok() {
+        let snap = make_snap(true);
+        let probe = make_probe(ProbeAuthKind::Auth, Some(200), Some(true));
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Ok);
+    }
+
+    #[test]
+    fn classify_auth_200_no_tools_is_warn() {
+        let snap = make_snap(true);
+        let probe = make_probe(ProbeAuthKind::Auth, Some(200), Some(false));
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Warn);
+    }
+
+    #[test]
+    fn classify_auth_404_is_fail() {
+        let snap = make_snap(true);
+        let probe = make_probe(ProbeAuthKind::Auth, Some(404), None);
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Fail);
+    }
+
+    #[test]
+    fn classify_auth_500_is_fail() {
+        let snap = make_snap(true);
+        let probe = make_probe(ProbeAuthKind::Auth, Some(500), None);
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Fail);
+    }
+
+    #[test]
+    fn classify_auth_302_is_warn() {
+        let snap = make_snap(true);
+        let probe = make_probe(ProbeAuthKind::Auth, Some(302), None);
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Warn);
+    }
+
+    #[test]
+    fn classify_unauth_401_auth_enabled_is_ok() {
+        let snap = make_snap(true);
+        let probe = make_probe(ProbeAuthKind::Unauth, Some(401), None);
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Ok);
+    }
+
+    #[test]
+    fn classify_unauth_403_auth_enabled_is_ok() {
+        let snap = make_snap(true);
+        let probe = make_probe(ProbeAuthKind::Unauth, Some(403), None);
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Ok);
+    }
+
+    #[test]
+    fn classify_unauth_200_auth_disabled_with_tools_is_ok() {
+        let snap = make_snap(false);
+        let probe = make_probe(ProbeAuthKind::Unauth, Some(200), Some(true));
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Ok);
+    }
+
+    #[test]
+    fn classify_unauth_200_auth_disabled_no_tools_is_warn() {
+        let snap = make_snap(false);
+        let probe = make_probe(ProbeAuthKind::Unauth, Some(200), Some(false));
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Warn);
+    }
+
+    #[test]
+    fn classify_unauth_200_auth_enabled_is_warn() {
+        let snap = make_snap(true);
+        let probe = make_probe(ProbeAuthKind::Unauth, Some(200), Some(true));
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Warn);
+    }
+
+    #[test]
+    fn classify_unauth_404_is_fail() {
+        let snap = make_snap(false);
+        let probe = make_probe(ProbeAuthKind::Unauth, Some(404), None);
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Fail);
+    }
+
+    #[test]
+    fn classify_unauth_503_is_fail() {
+        let snap = make_snap(false);
+        let probe = make_probe(ProbeAuthKind::Unauth, Some(503), None);
+        assert_eq!(classify_http_probe(&snap, &probe), Level::Fail);
+    }
+
+    // --- add_base_path_findings ---
+
+    #[test]
+    fn base_path_findings_configured_ok_no_finding() {
+        let mut out = DiagnosticsSnapshot {
+            configured_path: "/mcp/".into(),
+            path_probes: vec![
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
+                PathProbe { path: "/api/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        add_base_path_findings(&mut out);
+        assert!(out.lines.is_empty(), "no findings when configured path works");
+    }
+
+    #[test]
+    fn base_path_findings_configured_fails_mcp_works() {
+        let mut out = DiagnosticsSnapshot {
+            configured_path: "/custom/".into(),
+            path_probes: vec![
+                PathProbe { path: "/custom/".into(), kind: ProbeAuthKind::Unauth, status: Some(404), ..Default::default() },
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
+                PathProbe { path: "/api/".into(), kind: ProbeAuthKind::Unauth, status: Some(404), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        add_base_path_findings(&mut out);
+        assert!(out.lines.iter().any(|l| l.name == "base-path" && l.level == Level::Fail));
+        assert!(out.lines.iter().any(|l| l.detail.contains("/mcp/")));
+    }
+
+    #[test]
+    fn base_path_findings_mcp_down_api_up_warns() {
+        let mut out = DiagnosticsSnapshot {
+            configured_path: "/mcp/".into(),
+            path_probes: vec![
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(404), ..Default::default() },
+                PathProbe { path: "/api/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        add_base_path_findings(&mut out);
+        // Should have both a base-path FAIL and a base-path-alias WARN
+        assert!(out.lines.iter().any(|l| l.name == "base-path" && l.level == Level::Fail));
+        assert!(out.lines.iter().any(|l| l.name == "base-path-alias" && l.level == Level::Warn));
+    }
+
+    #[test]
+    fn base_path_findings_api_down_mcp_up_warns() {
+        let mut out = DiagnosticsSnapshot {
+            configured_path: "/mcp/".into(),
+            path_probes: vec![
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), body_has_tools: Some(true), ..Default::default() },
+                PathProbe { path: "/api/".into(), kind: ProbeAuthKind::Unauth, status: Some(404), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        add_base_path_findings(&mut out);
+        assert!(out.lines.iter().any(|l| l.name == "base-path-alias" && l.detail.contains("/api/")));
+    }
+
+    // --- add_auth_findings ---
+
+    #[test]
+    fn auth_findings_disabled_no_findings() {
+        let mut out = DiagnosticsSnapshot {
+            auth_enabled: false,
+            ..Default::default()
+        };
+        add_auth_findings(&mut out);
+        assert!(out.lines.is_empty());
+    }
+
+    #[test]
+    fn auth_findings_localhost_unauth_allowed_no_findings() {
+        let mut out = DiagnosticsSnapshot {
+            auth_enabled: true,
+            localhost_unauth_allowed: true,
+            ..Default::default()
+        };
+        add_auth_findings(&mut out);
+        assert!(out.lines.is_empty());
+    }
+
+    #[test]
+    fn auth_findings_all_200_warns() {
+        let mut out = DiagnosticsSnapshot {
+            auth_enabled: true,
+            localhost_unauth_allowed: false,
+            path_probes: vec![
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(200), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        add_auth_findings(&mut out);
+        assert!(out.lines.iter().any(|l| l.name == "auth" && l.level == Level::Warn));
+    }
+
+    #[test]
+    fn auth_findings_401_no_all200_warn() {
+        let mut out = DiagnosticsSnapshot {
+            auth_enabled: true,
+            localhost_unauth_allowed: false,
+            path_probes: vec![
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(401), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        add_auth_findings(&mut out);
+        // Should NOT have the "all 200" warning
+        assert!(!out.lines.iter().any(|l| l.name == "auth" && l.level == Level::Warn && l.detail.contains("200 everywhere")));
+    }
+
+    #[test]
+    fn auth_findings_token_present_auth_probe_fails() {
+        let mut out = DiagnosticsSnapshot {
+            auth_enabled: true,
+            localhost_unauth_allowed: false,
+            token_present: true,
+            configured_path: "/mcp/".into(),
+            path_probes: vec![
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(401), ..Default::default() },
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Auth, status: Some(403), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        add_auth_findings(&mut out);
+        assert!(out.lines.iter().any(|l| l.name == "auth" && l.level == Level::Fail && l.detail.contains("Authenticated probe did not succeed")));
+    }
+
+    #[test]
+    fn auth_findings_token_present_auth_probe_ok() {
+        let mut out = DiagnosticsSnapshot {
+            auth_enabled: true,
+            localhost_unauth_allowed: false,
+            token_present: true,
+            configured_path: "/mcp/".into(),
+            path_probes: vec![
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Unauth, status: Some(401), ..Default::default() },
+                PathProbe { path: "/mcp/".into(), kind: ProbeAuthKind::Auth, status: Some(200), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        add_auth_findings(&mut out);
+        // No auth failure finding
+        assert!(!out.lines.iter().any(|l| l.name == "auth" && l.level == Level::Fail));
+    }
+
+    // --- parse_http_endpoint edge cases ---
+
+    #[test]
+    fn parse_http_endpoint_no_path() {
+        let cfg = ConfigSnapshot {
+            endpoint: "http://127.0.0.1:8766".into(),
+            http_path: "/".into(),
+            web_ui_url: String::new(),
+            app_environment: String::new(),
+            auth_enabled: false,
+            database_url: String::new(),
+            storage_root: String::new(),
+            console_theme: String::new(),
+            tool_filter_profile: String::new(),
+        };
+        let parsed = parse_http_endpoint(&cfg).expect("parse");
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 8766);
+        assert_eq!(parsed.path, "/");
+    }
+
+    #[test]
+    fn parse_http_endpoint_https_rejected() {
+        let cfg = ConfigSnapshot {
+            endpoint: "https://127.0.0.1:8766/mcp/".into(),
+            http_path: "/mcp/".into(),
+            web_ui_url: String::new(),
+            app_environment: String::new(),
+            auth_enabled: false,
+            database_url: String::new(),
+            storage_root: String::new(),
+            console_theme: String::new(),
+            tool_filter_profile: String::new(),
+        };
+        let err = parse_http_endpoint(&cfg).unwrap_err();
+        assert!(err.contains("unsupported endpoint scheme"));
+    }
+
+    #[test]
+    fn parse_http_endpoint_trims_whitespace() {
+        let cfg = ConfigSnapshot {
+            endpoint: "  http://127.0.0.1:8766/api/  ".into(),
+            http_path: "/api/".into(),
+            web_ui_url: String::new(),
+            app_environment: String::new(),
+            auth_enabled: false,
+            database_url: String::new(),
+            storage_root: String::new(),
+            console_theme: String::new(),
+            tool_filter_profile: String::new(),
+        };
+        let parsed = parse_http_endpoint(&cfg).expect("parse");
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 8766);
+        assert_eq!(parsed.path, "/api/");
+    }
 }
