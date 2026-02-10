@@ -1388,24 +1388,23 @@ mod tests {
 
         // Should have macro actions for thread, agents
         assert!(
-            ids.iter()
-                .any(|id| *id == "macro:summarize_thread:thread-1"),
+            ids.contains(&"macro:summarize_thread:thread-1"),
             "missing summarize thread macro: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| *id == "macro:view_thread:thread-1"),
+            ids.contains(&"macro:view_thread:thread-1"),
             "missing view thread macro: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| *id == "macro:fetch_inbox:RedFox"),
+            ids.contains(&"macro:fetch_inbox:RedFox"),
             "missing fetch inbox macro: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| *id == "macro:view_reservations:RedFox"),
+            ids.contains(&"macro:view_reservations:RedFox"),
             "missing view reservations macro: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| *id == "macro:view_message:42"),
+            ids.contains(&"macro:view_message:42"),
             "missing view message macro: {ids:?}"
         );
     }
@@ -1422,12 +1421,11 @@ mod tests {
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
 
         assert!(
-            ids.iter()
-                .any(|id| *id == "macro:tool_history:send_message"),
+            ids.contains(&"macro:tool_history:send_message"),
             "missing tool history macro: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| *id == "macro:fetch_inbox:RedFox"),
+            ids.contains(&"macro:fetch_inbox:RedFox"),
             "missing fetch inbox macro for tool agent: {ids:?}"
         );
     }
@@ -1469,12 +1467,11 @@ mod tests {
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
 
         assert!(
-            ids.iter().any(|id| *id == "macro:fetch_inbox:BlueLake"),
+            ids.contains(&"macro:fetch_inbox:BlueLake"),
             "reservation agent should get fetch_inbox macro: {ids:?}"
         );
         assert!(
-            ids.iter()
-                .any(|id| *id == "macro:view_reservations:BlueLake"),
+            ids.contains(&"macro:view_reservations:BlueLake"),
             "reservation agent should get view_reservations macro: {ids:?}"
         );
     }

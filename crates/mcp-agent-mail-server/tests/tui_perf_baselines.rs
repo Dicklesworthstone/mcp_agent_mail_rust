@@ -602,6 +602,125 @@ fn perf_palette_cycle() {
     }
 }
 
+/// PERF-TUI-9: Search screen interaction cycle.
+/// Simulates switching to the Search screen, typing a query character,
+/// pressing Enter, then rendering — the hot path for interactive search.
+#[test]
+fn perf_search_interaction() {
+    let state = test_state();
+    let mut model = MailAppModel::new(Arc::clone(&state));
+    let _ = model.init();
+
+    // Navigate to the Search screen via Tab cycling until we get there.
+    let tab_event = Event::Key(KeyEvent::new(KeyCode::Tab));
+    for _ in 0..ALL_SCREEN_IDS.len() {
+        if model.active_screen() == MailScreenId::Search {
+            break;
+        }
+        let _ = model.update(MailMsg::Terminal(tab_event.clone()));
+    }
+
+    let warmup = 5;
+    let iterations = 100;
+    let width: u16 = 120;
+    let height: u16 = 40;
+
+    let char_a = Event::Key(KeyEvent::new(KeyCode::Char('a')));
+    let enter = Event::Key(KeyEvent::new(KeyCode::Enter));
+    let slash = Event::Key(KeyEvent::new(KeyCode::Char('/')));
+
+    let sorted = measure(warmup, iterations, || {
+        // Open query bar (/ focuses it)
+        let _ = model.update(MailMsg::Terminal(slash.clone()));
+        // Type a character
+        let _ = model.update(MailMsg::Terminal(char_a.clone()));
+        // Submit search
+        let _ = model.update(MailMsg::Terminal(enter.clone()));
+        // Render
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(width, height, &mut pool);
+        model.view(&mut frame);
+    });
+
+    let sample = make_sample(
+        "search_interaction",
+        "Search: / → type → Enter → render",
+        warmup,
+        iterations,
+        &sorted,
+        BUDGET_SCREEN_SWITCH_P95_US,
+    );
+
+    eprintln!(
+        "search_interaction: p50={:.1}µs p95={:.1}µs p99={:.1}µs budget={:.1}ms {}",
+        sample.p50_us as f64,
+        sample.p95_us as f64,
+        sample.p99_us as f64,
+        sample.budget_p95_us as f64 / 1000.0,
+        if sample.within_budget { "OK" } else { "OVER" },
+    );
+
+    if enforce_budgets() {
+        assert!(
+            sample.within_budget,
+            "search_interaction p95 {:.1}µs exceeds budget",
+            sample.p95_us as f64,
+        );
+    }
+}
+
+/// PERF-TUI-10: Rapid key navigation (arrow keys scrolling through list).
+/// Simulates Up/Down key presses on the Messages screen to measure
+/// navigation responsiveness.
+#[test]
+fn perf_key_navigation() {
+    let state = test_state();
+    let mut model = MailAppModel::new(Arc::clone(&state));
+    let _ = model.init();
+
+    let warmup = 5;
+    let iterations = 200;
+    let width: u16 = 120;
+    let height: u16 = 40;
+
+    let down = Event::Key(KeyEvent::new(KeyCode::Down));
+    let up = Event::Key(KeyEvent::new(KeyCode::Up));
+
+    let sorted = measure(warmup, iterations, || {
+        let _ = model.update(MailMsg::Terminal(down.clone()));
+        let _ = model.update(MailMsg::Terminal(up.clone()));
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(width, height, &mut pool);
+        model.view(&mut frame);
+    });
+
+    let sample = make_sample(
+        "key_navigation",
+        "Down + Up + render",
+        warmup,
+        iterations,
+        &sorted,
+        BUDGET_SCREEN_SWITCH_P95_US,
+    );
+
+    eprintln!(
+        "key_navigation: p50={:.1}µs p95={:.1}µs p99={:.1}µs budget={:.1}ms {}",
+        sample.p50_us as f64,
+        sample.p95_us as f64,
+        sample.p99_us as f64,
+        sample.budget_p95_us as f64 / 1000.0,
+        if sample.within_budget { "OK" } else { "OVER" },
+    );
+
+    if enforce_budgets() {
+        assert!(
+            sample.within_budget,
+            "key_navigation p95 {:.1}µs exceeds budget",
+            sample.p95_us as f64,
+        );
+    }
+}
+
 /// PERF-TUI-REPORT: Aggregated baseline report (emits JSON artifact).
 /// This test runs last and produces the summary artifact.
 #[test]
@@ -704,6 +823,61 @@ fn z_perf_baseline_report() {
             iterations,
             &sorted,
             BUDGET_TICK_CYCLE_P95_US,
+        ));
+    }
+
+    // Search interaction
+    {
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        let _ = model.init();
+        let tab_event = Event::Key(KeyEvent::new(KeyCode::Tab));
+        for _ in 0..ALL_SCREEN_IDS.len() {
+            if model.active_screen() == MailScreenId::Search {
+                break;
+            }
+            let _ = model.update(MailMsg::Terminal(tab_event.clone()));
+        }
+        let slash = Event::Key(KeyEvent::new(KeyCode::Char('/')));
+        let char_a = Event::Key(KeyEvent::new(KeyCode::Char('a')));
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter));
+        let sorted = measure(warmup, iterations, || {
+            let _ = model.update(MailMsg::Terminal(slash.clone()));
+            let _ = model.update(MailMsg::Terminal(char_a.clone()));
+            let _ = model.update(MailMsg::Terminal(enter.clone()));
+            let mut pool = GraphemePool::new();
+            let mut frame = Frame::new(width, height, &mut pool);
+            model.view(&mut frame);
+        });
+        samples.push(make_sample(
+            "search_interaction",
+            "/ → type → Enter → render",
+            warmup,
+            iterations,
+            &sorted,
+            BUDGET_SCREEN_SWITCH_P95_US,
+        ));
+    }
+
+    // Key navigation
+    {
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        let _ = model.init();
+        let down = Event::Key(KeyEvent::new(KeyCode::Down));
+        let up = Event::Key(KeyEvent::new(KeyCode::Up));
+        let sorted = measure(warmup, iterations, || {
+            let _ = model.update(MailMsg::Terminal(down.clone()));
+            let _ = model.update(MailMsg::Terminal(up.clone()));
+            let mut pool = GraphemePool::new();
+            let mut frame = Frame::new(width, height, &mut pool);
+            model.view(&mut frame);
+        });
+        samples.push(make_sample(
+            "key_navigation",
+            "Down + Up + render",
+            warmup,
+            iterations,
+            &sorted,
+            BUDGET_SCREEN_SWITCH_P95_US,
         ));
     }
 
