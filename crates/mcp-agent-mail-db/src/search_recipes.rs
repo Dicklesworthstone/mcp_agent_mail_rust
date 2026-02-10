@@ -15,6 +15,11 @@ use sqlmodel_sqlite::SqliteConnection;
 
 use crate::timestamps::now_micros;
 
+/// Maximum number of saved search recipes returned by [`list_recipes`].
+///
+/// Prevents unbounded memory growth when many recipes accumulate in the DB.
+pub const MAX_RECIPES: usize = 200;
+
 // ─────────────────────────────────────────────────────────────────────
 // Scope mode
 // ─────────────────────────────────────────────────────────────────────
@@ -356,15 +361,21 @@ pub fn delete_recipe(conn: &SqliteConnection, recipe_id: i64) -> Result<(), Stri
     Ok(())
 }
 
-/// List all recipes, ordered by pinned (desc) then name (asc).
+/// List recipes, ordered by pinned (desc) then name (asc).
+///
+/// Returns at most [`MAX_RECIPES`] entries to prevent unbounded memory growth.
 pub fn list_recipes(conn: &SqliteConnection) -> Result<Vec<SearchRecipe>, String> {
+    let limit_val = i64::try_from(MAX_RECIPES).unwrap_or(200);
     let sql = "SELECT id, name, description, query_text, doc_kind, scope_mode, \
         scope_id, importance_filter, ack_filter, sort_mode, thread_filter, \
         created_ts, updated_ts, pinned, use_count \
         FROM search_recipes \
-        ORDER BY pinned DESC, name ASC";
+        ORDER BY pinned DESC, name ASC \
+        LIMIT ?";
 
-    let rows = conn.query_sync(sql, &[]).map_err(|e| e.to_string())?;
+    let rows = conn
+        .query_sync(sql, &[Value::BigInt(limit_val)])
+        .map_err(|e| e.to_string())?;
     Ok(rows.iter().map(row_to_recipe).collect())
 }
 
@@ -390,6 +401,30 @@ pub fn touch_recipe(conn: &SqliteConnection, recipe_id: i64) -> Result<(), Strin
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Prune old recipes, keeping pinned recipes plus the most recently updated
+/// `keep` non-pinned recipes. Returns the number of deleted rows.
+pub fn prune_recipes(conn: &SqliteConnection, keep: usize) -> Result<u64, String> {
+    let keep_val = i64::try_from(keep.min(10_000)).unwrap_or(200);
+    // Keep all pinned recipes unconditionally, plus the `keep` most recently
+    // updated non-pinned recipes.
+    let sql = "DELETE FROM search_recipes WHERE pinned = 0 AND id NOT IN ( \
+        SELECT id FROM search_recipes WHERE pinned = 0 \
+        ORDER BY updated_ts DESC LIMIT ? \
+    )";
+    conn.execute_sync(sql, &[Value::BigInt(keep_val)])
+        .map_err(|e| e.to_string())
+}
+
+/// Count total recipes.
+pub fn count_recipes(conn: &SqliteConnection) -> Result<i64, String> {
+    let rows = conn
+        .query_sync("SELECT COUNT(*) AS cnt FROM search_recipes", &[])
+        .map_err(|e| e.to_string())?;
+    rows.first()
+        .and_then(|r| r.get_named::<i64>("cnt").ok())
+        .ok_or_else(|| "failed to count recipes".to_string())
 }
 
 /// Record a query execution in history.
@@ -929,5 +964,106 @@ mod tests {
         let result = update_recipe(&conn, &recipe);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no ID"));
+    }
+
+    // ── Capacity / pruning ───────────────────────────────────────
+
+    #[test]
+    fn list_recipes_respects_limit() {
+        let conn = open_test_db();
+        // Insert MAX_RECIPES + 10 recipes.
+        for i in 0..(MAX_RECIPES + 10) {
+            insert_recipe(
+                &conn,
+                &SearchRecipe {
+                    name: format!("r{i:04}"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let recipes = list_recipes(&conn).expect("list");
+        assert_eq!(recipes.len(), MAX_RECIPES);
+    }
+
+    #[test]
+    fn count_recipes_works() {
+        let conn = open_test_db();
+        assert_eq!(count_recipes(&conn).unwrap(), 0);
+
+        insert_recipe(
+            &conn,
+            &SearchRecipe {
+                name: "one".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(count_recipes(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn prune_recipes_keeps_pinned_and_recent() {
+        let conn = open_test_db();
+
+        // Insert 5 non-pinned recipes with staggered timestamps.
+        for i in 0..5 {
+            let mut r = SearchRecipe {
+                name: format!("np{i}"),
+                ..Default::default()
+            };
+            r.updated_ts = i64::from(i) * 1_000_000;
+            insert_recipe(&conn, &r).unwrap();
+        }
+
+        // Insert 2 pinned recipes.
+        for i in 0..2 {
+            insert_recipe(
+                &conn,
+                &SearchRecipe {
+                    name: format!("pinned{i}"),
+                    pinned: true,
+                    updated_ts: 100_000, // old timestamp
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        // Prune keeping only the 2 most recent non-pinned.
+        let deleted = prune_recipes(&conn, 2).expect("prune");
+        assert_eq!(deleted, 3); // 5 - 2 = 3 old non-pinned
+
+        let remaining = list_recipes(&conn).expect("list");
+        // 2 pinned + 2 non-pinned = 4
+        assert_eq!(remaining.len(), 4);
+        // Pinned recipes must survive regardless of age.
+        let pinned_count = remaining.iter().filter(|r| r.pinned).count();
+        assert_eq!(pinned_count, 2);
+        // The surviving non-pinned should be the newest (np3, np4).
+        let non_pinned: Vec<_> = remaining.iter().filter(|r| !r.pinned).collect();
+        assert_eq!(non_pinned.len(), 2);
+        assert!(non_pinned.iter().any(|r| r.name == "np3"));
+        assert!(non_pinned.iter().any(|r| r.name == "np4"));
+    }
+
+    #[test]
+    fn prune_recipes_noop_when_within_limit() {
+        let conn = open_test_db();
+        for i in 0..3 {
+            insert_recipe(
+                &conn,
+                &SearchRecipe {
+                    name: format!("r{i}"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let deleted = prune_recipes(&conn, 10).expect("prune");
+        assert_eq!(deleted, 0);
+        assert_eq!(count_recipes(&conn).unwrap(), 3);
     }
 }

@@ -19,8 +19,8 @@ use mcp_agent_mail_db::search_planner::{
     DocKind, Importance, RankingMode, SearchQuery, plan_search,
 };
 use mcp_agent_mail_db::search_recipes::{
-    QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe, list_recent_history,
-    list_recipes, touch_recipe,
+    MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
+    list_recent_history, list_recipes, touch_recipe,
 };
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
@@ -973,6 +973,18 @@ impl SearchCockpitScreen {
                 let mut saved = recipe;
                 saved.id = Some(id);
                 self.saved_recipes.insert(0, saved);
+                // Evict oldest non-pinned recipes when over the cap.
+                while self.saved_recipes.len() > MAX_RECIPES {
+                    if let Some(pos) = self
+                        .saved_recipes
+                        .iter()
+                        .rposition(|r| !r.pinned)
+                    {
+                        self.saved_recipes.remove(pos);
+                    } else {
+                        break; // all remaining are pinned
+                    }
+                }
             }
         }
     }
