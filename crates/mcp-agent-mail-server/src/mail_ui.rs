@@ -814,57 +814,307 @@ fn render_thread(
 struct SearchCtx {
     project: ProjectView,
     q: String,
-    results: Vec<SearchResult>,
+    results: Vec<WebSearchResult>,
+    // Facet state (round-trips through URL params)
+    order: String,
+    scope: String,
+    boost: bool,
+    importance: Vec<String>,
+    agent: String,
+    thread: String,
+    ack: String,
+    direction: String,
+    from_date: String,
+    to_date: String,
+    // Pagination
+    next_cursor: String,
+    cursor: String,
+    result_count: usize,
+    // Agent list for facet dropdown
+    agents: Vec<AgentView>,
+    // Saved recipes
+    recipes: Vec<RecipeView>,
+    // Deep link for current search state
+    deep_link: String,
 }
 
 #[derive(Serialize)]
-struct SearchResult {
+struct WebSearchResult {
     id: i64,
     subject: String,
-    body_snippet: String,
-    sender_name: String,
+    snippet: String,
+    #[serde(rename = "from")]
+    from_name: String,
     created: String,
+    created_relative: String,
     importance: String,
     thread_id: String,
+    ack_required: bool,
+    score: String,
 }
 
+#[derive(Serialize)]
+struct RecipeView {
+    id: i64,
+    name: String,
+    description: String,
+    route: String,
+    pinned: bool,
+    use_count: i64,
+}
+
+/// Extract all values for a repeated query param (e.g. `imp=high&imp=urgent`).
+fn extract_query_str_all(query: &str, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key && !v.is_empty() {
+                out.push(percent_decode_component(v));
+            }
+        }
+    }
+    out
+}
+
+/// Build the deep-link URL for the current search state.
+fn build_search_deep_link(project_slug: &str, query_str: &str) -> String {
+    if query_str.is_empty() {
+        return format!("/mail/{project_slug}/search");
+    }
+    format!("/mail/{project_slug}/search?{query_str}")
+}
+
+/// Highlight matched terms in a snippet by wrapping them in `<mark>` tags.
+///
+/// Uses a simple case-insensitive substring approach. The input body is
+/// first HTML-escaped, then highlight `<mark>` tags are inserted.
+fn highlight_snippet(body: &str, query: &str, max_len: usize) -> String {
+    // Extract search terms from the query (strip field prefixes, quotes, operators).
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .filter(|t| !matches!(t.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT"))
+        .map(|t| {
+            // Strip field prefix like "subject:" or "body:"
+            let t = t.split_once(':').map_or(t, |(_, v)| v);
+            // Strip quotes
+            t.trim_matches('"').to_string()
+        })
+        .filter(|t| t.len() >= 2)
+        .collect();
+
+    if terms.is_empty() {
+        return html_escape(&truncate_body(body, max_len));
+    }
+
+    // Find the best window: center on the first matching term.
+    let body_lower = body.to_ascii_lowercase();
+    let mut best_pos = 0usize;
+    for term in &terms {
+        if let Some(pos) = body_lower.find(&term.to_ascii_lowercase()) {
+            best_pos = pos;
+            break;
+        }
+    }
+
+    // Extract window around best_pos.
+    let half = max_len / 2;
+    let start = best_pos.saturating_sub(half);
+    let mut end = (start + max_len).min(body.len());
+    // Ensure char boundary.
+    while end > start && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut s_start = start;
+    while s_start < end && !body.is_char_boundary(s_start) {
+        s_start += 1;
+    }
+
+    let window = &body[s_start..end];
+    let prefix = if s_start > 0 { "…" } else { "" };
+    let suffix = if end < body.len() { "…" } else { "" };
+
+    // HTML-escape the window first, then insert <mark> tags.
+    let escaped = html_escape(&format!("{prefix}{window}{suffix}"));
+
+    // Apply highlighting (case-insensitive replace on the escaped text).
+    let mut result = escaped;
+    for term in &terms {
+        let escaped_term = html_escape(term);
+        if escaped_term.is_empty() {
+            continue;
+        }
+        // Case-insensitive replacement.
+        let lower = result.to_ascii_lowercase();
+        let pattern = escaped_term.to_ascii_lowercase();
+        let mut out = String::with_capacity(result.len() + 30);
+        let mut last = 0;
+        for (idx, _) in lower.match_indices(&pattern) {
+            out.push_str(&result[last..idx]);
+            out.push_str("<mark>");
+            out.push_str(&result[idx..idx + pattern.len()]);
+            out.push_str("</mark>");
+            last = idx + pattern.len();
+        }
+        out.push_str(&result[last..]);
+        result = out;
+    }
+
+    result
+}
+
+/// Minimal HTML escaping for untrusted text (before inserting <mark> tags).
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_lines)]
 fn render_search(
     cx: &Cx,
     pool: &DbPool,
     project_slug: &str,
     query_str: &str,
 ) -> Result<Option<String>, (u16, String)> {
+    use mcp_agent_mail_db::search_planner::{
+        Direction, Importance, RankingMode, SearchQuery, TimeRange,
+    };
+
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
 
+    // ── Parse all query parameters ──────────────────────────────────
     let q = extract_query_str(query_str, "q").unwrap_or_default();
     let limit = extract_query_int(query_str, "limit", 50);
+    let order = extract_query_str(query_str, "order").unwrap_or_else(|| "relevance".to_string());
+    let scope = extract_query_str(query_str, "scope").unwrap_or_default();
+    let boost = extract_query_str(query_str, "boost").is_some();
+    let cursor = extract_query_str(query_str, "cursor").unwrap_or_default();
 
-    let results = if q.is_empty() {
-        Vec::new()
-    } else {
-        let search_query = mcp_agent_mail_db::search_planner::SearchQuery::messages(&q, pid);
-        let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
-            limit: Some(limit),
-            ..search_query
+    // Facets
+    let imp_strs = extract_query_str_all(query_str, "imp");
+    let importance_filter: Vec<Importance> = imp_strs
+        .iter()
+        .filter_map(|s| Importance::parse(s))
+        .collect();
+
+    let agent_filter = extract_query_str(query_str, "agent").unwrap_or_default();
+    let thread_filter = extract_query_str(query_str, "thread").unwrap_or_default();
+    let ack_filter = extract_query_str(query_str, "ack").unwrap_or_else(|| "any".to_string());
+    let direction_filter = extract_query_str(query_str, "direction").unwrap_or_default();
+    let from_date = extract_query_str(query_str, "from_date").unwrap_or_default();
+    let to_date = extract_query_str(query_str, "to_date").unwrap_or_default();
+
+    // ── Build search query ──────────────────────────────────────────
+    let has_any_filter = !q.is_empty()
+        || !importance_filter.is_empty()
+        || !agent_filter.is_empty()
+        || !thread_filter.is_empty()
+        || ack_filter != "any"
+        || !direction_filter.is_empty()
+        || !from_date.is_empty()
+        || !to_date.is_empty();
+
+    let (results, next_cursor_val) = if has_any_filter {
+        let time_range = TimeRange {
+            min_ts: parse_date_to_micros(&from_date),
+            max_ts: parse_date_to_micros_end(&to_date),
         };
+
+        let ranking = if order == "time" {
+            RankingMode::Recency
+        } else {
+            RankingMode::Relevance
+        };
+
+        let direction = match direction_filter.as_str() {
+            "inbox" => Some(Direction::Inbox),
+            "outbox" => Some(Direction::Outbox),
+            _ => None,
+        };
+
+        let ack_required = match ack_filter.as_str() {
+            "required" => Some(true),
+            "not_required" => Some(false),
+            _ => None,
+        };
+
+        let search_query = SearchQuery {
+            text: q.clone(),
+            doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
+            project_id: Some(pid),
+            product_id: None,
+            importance: importance_filter,
+            direction,
+            agent_name: if agent_filter.is_empty() {
+                None
+            } else {
+                Some(agent_filter.clone())
+            },
+            thread_id: if thread_filter.is_empty() {
+                None
+            } else {
+                Some(thread_filter.clone())
+            },
+            ack_required,
+            time_range,
+            ranking,
+            limit: Some(limit),
+            cursor: if cursor.is_empty() {
+                None
+            } else {
+                Some(cursor.clone())
+            },
+            explain: false,
+            ..Default::default()
+        };
+
         let resp = block_on_outcome(
             cx,
             mcp_agent_mail_db::search_service::execute_search_simple(cx, pool, &search_query),
         )?;
-        resp.results
+
+        let web_results: Vec<WebSearchResult> = resp
+            .results
             .iter()
-            .map(|r| SearchResult {
+            .map(|r| WebSearchResult {
                 id: r.id,
                 subject: r.title.clone(),
-                body_snippet: truncate_body(&r.body, 200),
-                sender_name: r.from_agent.clone().unwrap_or_default(),
+                snippet: highlight_snippet(&r.body, &q, 250),
+                from_name: r.from_agent.clone().unwrap_or_default(),
                 created: r.created_ts.map_or_else(String::new, ts_display),
+                created_relative: r.created_ts.map_or_else(String::new, ts_display_relative),
                 importance: r.importance.clone().unwrap_or_default(),
                 thread_id: r.thread_id.clone().unwrap_or_default(),
+                ack_required: r.ack_required.unwrap_or(false),
+                score: r.score.map_or_else(String::new, |s| format!("{s:.2}")),
             })
-            .collect()
+            .collect();
+
+        let nc = resp.next_cursor.unwrap_or_default();
+        (web_results, nc)
+    } else {
+        (Vec::new(), String::new())
     };
+
+    // ── Load agents for facet dropdown ──────────────────────────────
+    let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
+    let agents: Vec<AgentView> = agents_rows.iter().map(agent_view).collect();
+
+    // ── Load saved recipes ──────────────────────────────────────────
+    let recipes = load_recipes(pool);
+
+    let result_count = results.len();
+    let deep_link = build_search_deep_link(project_slug, query_str);
 
     render(
         "mail_search.html",
@@ -872,8 +1122,70 @@ fn render_search(
             project: project_view(&p),
             q,
             results,
+            order,
+            scope,
+            boost,
+            importance: imp_strs,
+            agent: agent_filter,
+            thread: thread_filter,
+            ack: ack_filter,
+            direction: direction_filter,
+            from_date,
+            to_date,
+            next_cursor: next_cursor_val,
+            cursor,
+            result_count,
+            agents,
+            recipes,
+            deep_link,
         },
     )
+}
+
+/// Load saved search recipes from the DB (best-effort, returns empty on error).
+fn load_recipes(pool: &DbPool) -> Vec<RecipeView> {
+    let path = pool.sqlite_path();
+    if path == ":memory:" {
+        return Vec::new();
+    }
+    let Ok(conn) = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(path) else {
+        return Vec::new();
+    };
+    let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();
+    recipes
+        .iter()
+        .map(|r| RecipeView {
+            id: r.id.unwrap_or(0),
+            name: r.name.clone(),
+            description: r.description.clone(),
+            route: r.route_string(),
+            pinned: r.pinned,
+            use_count: r.use_count,
+        })
+        .collect()
+}
+
+/// Parse "YYYY-MM-DD" to start-of-day microseconds.
+fn parse_date_to_micros(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    // Parse YYYY-MM-DD
+    let parts: Vec<&str> = s.splitn(3, '-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y: i32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    let dt = chrono::NaiveDate::from_ymd_opt(y, m, d)?;
+    let ts = dt.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
+    Some(ts)
+}
+
+/// Parse "YYYY-MM-DD" to end-of-day microseconds (23:59:59.999999).
+fn parse_date_to_micros_end(s: &str) -> Option<i64> {
+    parse_date_to_micros(s).map(|ts| ts + 86_400_000_000 - 1)
 }
 
 fn truncate_body(body: &str, max: usize) -> String {

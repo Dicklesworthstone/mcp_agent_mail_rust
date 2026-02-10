@@ -251,14 +251,14 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/{project}/search",
       "rust_path": "/mail/{project}/search",
       "policy": "must_match",
-      "status": "partial",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.4", "br-3vwi.13.8"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_search_page, test_mail_search_with_query)",
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_search)",
         "crates/mcp-agent-mail-server/templates/mail_search.html"
       ],
-      "notes": "Route exists; advanced search UX semantics (facets/snippets/highlights) need explicit parity contract + tests."
+      "notes": "Full parity: faceted filtering (importance, agent, direction, ack state, thread, date range), BM25 relevance + recency ranking, cursor pagination, snippet highlighting with <mark> tags, saved recipes sidebar, deep link copy, scope toggles, boost checkbox, query help panel."
     },
     {
       "id": "mail_file_reservations_html_get",
