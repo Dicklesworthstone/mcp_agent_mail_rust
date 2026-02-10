@@ -24,6 +24,8 @@ pub mod queries;
 pub mod retry;
 pub mod schema;
 pub mod search_planner;
+pub mod search_scope;
+pub mod search_service;
 pub mod timestamps;
 pub mod tracking;
 

@@ -130,9 +130,7 @@ pub enum ScopePolicy {
 
     /// Restrict to an explicit set of project IDs.
     /// Useful for pre-computed access lists.
-    ProjectSet {
-        allowed_project_ids: Vec<i64>,
-    },
+    ProjectSet { allowed_project_ids: Vec<i64> },
 }
 
 impl ScopePolicy {
@@ -652,7 +650,10 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     }
 
     // ── Visibility scope enforcement ──────────────────────────────
-    if let ScopePolicy::ProjectSet { ref allowed_project_ids } = query.scope {
+    if let ScopePolicy::ProjectSet {
+        ref allowed_project_ids,
+    } = query.scope
+    {
         if !allowed_project_ids.is_empty() {
             let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
             where_clauses.push(format!("m.project_id IN ({})", placeholders.join(", ")));
@@ -829,7 +830,10 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     }
 
     // Scope enforcement for ProjectSet
-    if let ScopePolicy::ProjectSet { ref allowed_project_ids } = query.scope {
+    if let ScopePolicy::ProjectSet {
+        ref allowed_project_ids,
+    } = query.scope
+    {
         if !allowed_project_ids.is_empty() {
             let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
             where_clauses.push(format!("a.project_id IN ({})", placeholders.join(", ")));
@@ -921,7 +925,10 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     };
 
     // Scope enforcement for ProjectSet
-    if let ScopePolicy::ProjectSet { ref allowed_project_ids } = query.scope {
+    if let ScopePolicy::ProjectSet {
+        ref allowed_project_ids,
+    } = query.scope
+    {
         if !allowed_project_ids.is_empty() {
             let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
             where_clauses.push(format!("p.id IN ({})", placeholders.join(", ")));
@@ -1020,12 +1027,10 @@ impl VisibilityContext {
     pub fn can_see_project(&self, project_id: i64) -> bool {
         match &self.policy {
             ScopePolicy::Unrestricted => true,
-            ScopePolicy::CallerScoped { .. } => {
-                self.caller_project_ids.contains(&project_id)
-            }
-            ScopePolicy::ProjectSet { allowed_project_ids } => {
-                allowed_project_ids.contains(&project_id)
-            }
+            ScopePolicy::CallerScoped { .. } => self.caller_project_ids.contains(&project_id),
+            ScopePolicy::ProjectSet {
+                allowed_project_ids,
+            } => allowed_project_ids.contains(&project_id),
         }
     }
 }
@@ -1110,7 +1115,9 @@ fn scope_policy_label(policy: &ScopePolicy) -> String {
         ScopePolicy::CallerScoped { caller_agent } => {
             format!("caller_scoped:{caller_agent}")
         }
-        ScopePolicy::ProjectSet { allowed_project_ids } => {
+        ScopePolicy::ProjectSet {
+            allowed_project_ids,
+        } => {
             format!("project_set:{}", allowed_project_ids.len())
         }
     }
@@ -1623,7 +1630,10 @@ mod tests {
         assert_eq!(plan.method, PlanMethod::Fts);
         assert!(plan.sql.contains("m.project_id IN (?, ?, ?)"));
         assert!(plan.scope_enforced);
-        assert!(plan.facets_applied.contains(&"scope_project_set".to_string()));
+        assert!(
+            plan.facets_applied
+                .contains(&"scope_project_set".to_string())
+        );
     }
 
     #[test]
@@ -1775,11 +1785,7 @@ mod tests {
 
     #[test]
     fn visibility_project_set_filters_by_allowed_ids() {
-        let results = vec![
-            make_result(1, 10),
-            make_result(2, 20),
-            make_result(3, 30),
-        ];
+        let results = vec![make_result(1, 10), make_result(2, 20), make_result(3, 30)];
         let ctx = VisibilityContext {
             caller_project_ids: vec![],
             approved_contact_ids: vec![],
