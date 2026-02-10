@@ -297,8 +297,7 @@ impl MailAppModel {
         }
         if let Some(pair) = id.strip_prefix(palette_action_ids::CONTACT_PREFIX) {
             if let Some((from, to)) = pair.split_once(':') {
-                let target =
-                    DeepLinkTarget::ContactByPair(from.to_string(), to.to_string());
+                let target = DeepLinkTarget::ContactByPair(from.to_string(), to.to_string());
                 self.active_screen = MailScreenId::Contacts;
                 if let Some(screen) = self.screens.get_mut(&MailScreenId::Contacts) {
                     screen.receive_deep_link(&target);
@@ -772,11 +771,7 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
         return;
     };
 
-    for agent in snap
-        .agents_list
-        .into_iter()
-        .take(PALETTE_DYNAMIC_AGENT_CAP)
-    {
+    for agent in snap.agents_list.into_iter().take(PALETTE_DYNAMIC_AGENT_CAP) {
         let crate::tui_events::AgentSummary {
             name,
             program,
@@ -1692,7 +1687,8 @@ mod tests {
     fn extract_reservation_agent_from_events() {
         let ev1 = MailEvent::reservation_granted("TestAgent", vec![], true, 60, "proj");
         let ev2 = MailEvent::reservation_released("OtherAgent", vec![], "proj");
-        let ev3 = MailEvent::tool_call_start("foo", serde_json::json!({}), Some("proj".into()), None);
+        let ev3 =
+            MailEvent::tool_call_start("foo", serde_json::json!({}), Some("proj".into()), None);
         assert_eq!(extract_reservation_agent(&ev1), Some("TestAgent"));
         assert_eq!(extract_reservation_agent(&ev2), Some("OtherAgent"));
         assert_eq!(extract_reservation_agent(&ev3), None);

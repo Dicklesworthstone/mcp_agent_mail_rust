@@ -23,6 +23,7 @@ pub mod pool;
 pub mod queries;
 pub mod retry;
 pub mod schema;
+pub mod search_planner;
 pub mod timestamps;
 pub mod tracking;
 

@@ -1710,7 +1710,8 @@ fn quote_hyphenated_tokens(query: &str) -> String {
 ///
 /// Returns up to `max_terms` alphanumeric tokens (min 2 chars each),
 /// excluding FTS boolean keywords.
-fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
+#[must_use]
+pub fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
     const STOPWORDS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
     let mut terms: Vec<String> = Vec::new();
     for token in query
