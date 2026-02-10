@@ -7,6 +7,7 @@
 pub mod agents;
 pub mod contacts;
 pub mod dashboard;
+pub mod explorer;
 pub mod inspector;
 pub mod messages;
 pub mod projects;
@@ -43,6 +44,7 @@ pub enum MailScreenId {
     Timeline,
     Projects,
     Contacts,
+    Explorer,
 }
 
 /// All screen IDs in display order.
@@ -58,6 +60,7 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::Timeline,
     MailScreenId::Projects,
     MailScreenId::Contacts,
+    MailScreenId::Explorer,
 ];
 
 impl MailScreenId {
@@ -213,6 +216,8 @@ pub enum DeepLinkTarget {
     ReservationByAgent(String),
     /// Jump to a contact link between two agents.
     ContactByPair(String, String),
+    /// Jump to the Explorer filtered for a specific agent.
+    ExplorerForAgent(String),
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -317,6 +322,13 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         category: ScreenCategory::Communication,
         description: "Cross-agent contact links and policy display",
     },
+    MailScreenMeta {
+        id: MailScreenId::Explorer,
+        title: "Explorer",
+        short_label: "Explore",
+        category: ScreenCategory::Communication,
+        description: "Unified inbox/outbox explorer with direction, grouping, and ack filters",
+    },
 ];
 
 /// Look up metadata for a screen ID.
@@ -394,7 +406,7 @@ mod tests {
     #[test]
     fn screen_count_matches() {
         assert_eq!(ALL_SCREEN_IDS.len(), MAIL_SCREEN_REGISTRY.len());
-        assert_eq!(ALL_SCREEN_IDS.len(), 11);
+        assert_eq!(ALL_SCREEN_IDS.len(), 12);
     }
 
     #[test]
@@ -429,7 +441,7 @@ mod tests {
 
     #[test]
     fn from_number_invalid() {
-        assert_eq!(MailScreenId::from_number(12), None);
+        assert_eq!(MailScreenId::from_number(13), None);
         assert_eq!(MailScreenId::from_number(100), None);
     }
 
@@ -555,6 +567,7 @@ mod tests {
         let _ = DeepLinkTarget::ProjectBySlug(String::new());
         let _ = DeepLinkTarget::ReservationByAgent(String::new());
         let _ = DeepLinkTarget::ContactByPair(String::new(), String::new());
+        let _ = DeepLinkTarget::ExplorerForAgent(String::new());
     }
 
     #[test]

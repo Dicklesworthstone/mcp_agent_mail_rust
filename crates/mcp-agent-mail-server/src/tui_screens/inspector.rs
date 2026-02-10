@@ -190,6 +190,7 @@ pub fn build_quick_actions(event: &MailEvent) -> Vec<QuickAction> {
                 DeepLinkTarget::TimelineAtTime(ts) => ("timeline", &*format!("{ts}")),
                 DeepLinkTarget::ReservationByAgent(agent) => ("reservations", agent.as_str()),
                 DeepLinkTarget::ContactByPair(from, _to) => ("contact", from.as_str()),
+                DeepLinkTarget::ExplorerForAgent(agent) => ("explorer", agent.as_str()),
             };
             let id = format!("quick:{prefix}:{entity_name}");
             let label = format!("Go to {}", link.label);
