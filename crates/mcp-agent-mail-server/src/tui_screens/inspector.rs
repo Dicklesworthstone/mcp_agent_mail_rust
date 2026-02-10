@@ -189,6 +189,7 @@ pub fn build_quick_actions(event: &MailEvent) -> Vec<QuickAction> {
                 DeepLinkTarget::ProjectBySlug(slug) => ("project", slug.as_str()),
                 DeepLinkTarget::TimelineAtTime(ts) => ("timeline", &*format!("{ts}")),
                 DeepLinkTarget::ReservationByAgent(agent) => ("reservations", agent.as_str()),
+                DeepLinkTarget::ContactByPair(from, _to) => ("contact", from.as_str()),
             };
             let id = format!("quick:{prefix}:{entity_name}");
             let label = format!("Go to {}", link.label);
@@ -722,6 +723,7 @@ mod tests {
             ack_pending: 1,
             agents_list: vec![],
             timestamp_micros: 0,
+            ..Default::default()
         });
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(60, 20, &mut pool);

@@ -21,9 +21,10 @@ use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
-    agents::AgentsScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen,
-    reservations::ReservationsScreen, screen_meta, system_health::SystemHealthScreen,
-    threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+    agents::AgentsScreen, contacts::ContactsScreen, dashboard::DashboardScreen,
+    messages::MessageBrowserScreen, projects::ProjectsScreen, reservations::ReservationsScreen,
+    screen_meta, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
+    timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -102,6 +103,10 @@ impl MailAppModel {
                 screens.insert(id, Box::new(ToolMetricsScreen::new()));
             } else if id == MailScreenId::Reservations {
                 screens.insert(id, Box::new(ReservationsScreen::new()));
+            } else if id == MailScreenId::Projects {
+                screens.insert(id, Box::new(ProjectsScreen::new()));
+            } else if id == MailScreenId::Contacts {
+                screens.insert(id, Box::new(ContactsScreen::new()));
             }
         }
         let mut command_palette = CommandPalette::new().with_max_visible(PALETTE_MAX_VISIBLE);
@@ -464,8 +469,9 @@ impl Model for MailAppModel {
                     DeepLinkTarget::MessageById(_) => MailScreenId::Messages,
                     DeepLinkTarget::AgentByName(_) => MailScreenId::Agents,
                     DeepLinkTarget::ToolByName(_) => MailScreenId::ToolMetrics,
-                    DeepLinkTarget::ProjectBySlug(_) => MailScreenId::Dashboard,
+                    DeepLinkTarget::ProjectBySlug(_) => MailScreenId::Projects,
                     DeepLinkTarget::ReservationByAgent(_) => MailScreenId::Reservations,
+                    DeepLinkTarget::ContactByPair(_, _) => MailScreenId::Contacts,
                 };
                 self.active_screen = target_screen;
                 if let Some(screen) = self.screens.get_mut(&target_screen) {
@@ -583,6 +589,8 @@ mod palette_action_ids {
     pub const SCREEN_RESERVATIONS: &str = "screen:reservations";
     pub const SCREEN_TOOL_METRICS: &str = "screen:tool_metrics";
     pub const SCREEN_SYSTEM_HEALTH: &str = "screen:system_health";
+    pub const SCREEN_PROJECTS: &str = "screen:projects";
+    pub const SCREEN_CONTACTS: &str = "screen:contacts";
 }
 
 fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
@@ -595,6 +603,8 @@ fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
         palette_action_ids::SCREEN_RESERVATIONS => Some(MailScreenId::Reservations),
         palette_action_ids::SCREEN_TOOL_METRICS => Some(MailScreenId::ToolMetrics),
         palette_action_ids::SCREEN_SYSTEM_HEALTH => Some(MailScreenId::SystemHealth),
+        palette_action_ids::SCREEN_PROJECTS => Some(MailScreenId::Projects),
+        palette_action_ids::SCREEN_CONTACTS => Some(MailScreenId::Contacts),
         _ => None,
     }
 }
@@ -609,6 +619,8 @@ const fn screen_palette_action_id(id: MailScreenId) -> &'static str {
         MailScreenId::Reservations => palette_action_ids::SCREEN_RESERVATIONS,
         MailScreenId::ToolMetrics => palette_action_ids::SCREEN_TOOL_METRICS,
         MailScreenId::SystemHealth => palette_action_ids::SCREEN_SYSTEM_HEALTH,
+        MailScreenId::Projects => palette_action_ids::SCREEN_PROJECTS,
+        MailScreenId::Contacts => palette_action_ids::SCREEN_CONTACTS,
     }
 }
 
@@ -1096,7 +1108,9 @@ mod tests {
     #[test]
     fn number_keys_switch_screens() {
         let mut model = test_model();
-        for (i, &expected_id) in ALL_SCREEN_IDS.iter().enumerate() {
+        // Keys 1..9 map to screens 1..9; key 0 maps to screen 10.
+        // Only iterate the first 9 screens with digit keys 1-9.
+        for (i, &expected_id) in ALL_SCREEN_IDS.iter().enumerate().take(9) {
             let n = u32::try_from(i + 1).expect("screen index should fit in u32");
             let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char(
                 char::from_digit(n, 10).unwrap(),
@@ -1108,23 +1122,33 @@ mod tests {
                 "key {n} -> {expected_id:?}"
             );
         }
+        // Key 0 maps to the 10th screen (Contacts).
+        if ALL_SCREEN_IDS.len() >= 10 {
+            let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('0')));
+            model.update(MailMsg::Terminal(key));
+            assert_eq!(
+                model.active_screen(),
+                ALL_SCREEN_IDS[9],
+                "key 0 -> screen 10"
+            );
+        }
     }
 
     #[test]
-    fn number_key_zero_does_not_switch() {
+    fn number_key_zero_switches_to_contacts() {
         let mut model = test_model();
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('0')));
         model.update(MailMsg::Terminal(key));
-        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        // 0 maps to screen 10 (Contacts)
+        assert_eq!(model.active_screen(), MailScreenId::Contacts);
     }
 
     #[test]
-    fn number_key_out_of_range_does_not_switch() {
+    fn number_key_nine_switches_to_projects() {
         let mut model = test_model();
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('9')));
         model.update(MailMsg::Terminal(key));
-        // 9 > 8 screens, so should stay on Dashboard
-        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        assert_eq!(model.active_screen(), MailScreenId::Projects);
     }
 
     #[test]
@@ -1213,13 +1237,13 @@ mod tests {
     }
 
     #[test]
-    fn deep_link_project_switches_to_dashboard() {
+    fn deep_link_project_switches_to_projects() {
         use crate::tui_screens::DeepLinkTarget;
         let mut model = test_model();
         model.update(MailMsg::Screen(MailScreenMsg::DeepLink(
             DeepLinkTarget::ProjectBySlug("my-proj".to_string()),
         )));
-        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        assert_eq!(model.active_screen(), MailScreenId::Projects);
     }
 
     #[test]

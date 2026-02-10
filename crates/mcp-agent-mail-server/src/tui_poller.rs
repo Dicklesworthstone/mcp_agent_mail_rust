@@ -15,13 +15,19 @@ use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use mcp_agent_mail_db::timestamps::now_micros;
 
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_events::{AgentSummary, DbStatSnapshot, MailEvent};
+use crate::tui_events::{AgentSummary, ContactSummary, DbStatSnapshot, MailEvent, ProjectSummary};
 
 /// Default polling interval (2 seconds).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Maximum agents to fetch per poll cycle.
 const MAX_AGENTS: usize = 50;
+
+/// Maximum projects to fetch per poll cycle.
+const MAX_PROJECTS: usize = 100;
+
+/// Maximum contact links to fetch per poll cycle.
+const MAX_CONTACTS: usize = 200;
 
 // ──────────────────────────────────────────────────────────────────────
 // DbPoller
@@ -148,6 +154,8 @@ fn fetch_db_stats(database_url: &str) -> DbStatSnapshot {
     };
 
     let agents_list = fetch_agents_list(&conn);
+    let projects_list = fetch_projects_list(&conn);
+    let contacts_list = fetch_contacts_list(&conn);
 
     DbStatSnapshot {
         projects: count_query(&conn, "SELECT COUNT(*) AS c FROM projects"),
@@ -165,6 +173,8 @@ fn fetch_db_stats(database_url: &str) -> DbStatSnapshot {
              WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
         ),
         agents_list,
+        projects_list,
+        contacts_list,
         timestamp_micros: now_micros(),
     }
 }
@@ -213,6 +223,96 @@ fn fetch_agents_list(conn: &SqliteConnection) -> Vec<AgentSummary> {
     .unwrap_or_default()
 }
 
+/// Fetch the project list with per-project agent/message/reservation counts.
+fn fetch_projects_list(conn: &SqliteConnection) -> Vec<ProjectSummary> {
+    conn.query_sync(
+        &format!(
+            "SELECT p.id, p.slug, p.human_key, p.created_at, \
+             COALESCE(ac.cnt, 0) AS agent_count, \
+             COALESCE(mc.cnt, 0) AS message_count, \
+             COALESCE(rc.cnt, 0) AS reservation_count \
+             FROM projects p \
+             LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM agents GROUP BY project_id) ac \
+               ON ac.project_id = p.id \
+             LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM messages GROUP BY project_id) mc \
+               ON mc.project_id = p.id \
+             LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM file_reservations \
+               WHERE released_ts IS NULL GROUP BY project_id) rc \
+               ON rc.project_id = p.id \
+             ORDER BY p.created_at DESC \
+             LIMIT {MAX_PROJECTS}"
+        ),
+        &[],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| {
+                Some(ProjectSummary {
+                    id: row.get_named::<i64>("id").ok()?,
+                    slug: row.get_named::<String>("slug").ok()?,
+                    human_key: row.get_named::<String>("human_key").ok()?,
+                    agent_count: row
+                        .get_named::<i64>("agent_count")
+                        .ok()
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(0),
+                    message_count: row
+                        .get_named::<i64>("message_count")
+                        .ok()
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(0),
+                    reservation_count: row
+                        .get_named::<i64>("reservation_count")
+                        .ok()
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(0),
+                    created_at: row.get_named::<i64>("created_at").ok().unwrap_or(0),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Fetch the contact links list with agent names resolved.
+fn fetch_contacts_list(conn: &SqliteConnection) -> Vec<ContactSummary> {
+    conn.query_sync(
+        &format!(
+            "SELECT \
+             a1.name AS from_agent, a2.name AS to_agent, \
+             p1.slug AS from_project, p2.slug AS to_project, \
+             al.status, al.reason, al.updated_ts, al.expires_ts \
+             FROM agent_links al \
+             JOIN agents a1 ON a1.id = al.a_agent_id \
+             JOIN agents a2 ON a2.id = al.b_agent_id \
+             JOIN projects p1 ON p1.id = al.a_project_id \
+             JOIN projects p2 ON p2.id = al.b_project_id \
+             ORDER BY al.updated_ts DESC \
+             LIMIT {MAX_CONTACTS}"
+        ),
+        &[],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| {
+                Some(ContactSummary {
+                    from_agent: row.get_named::<String>("from_agent").ok()?,
+                    to_agent: row.get_named::<String>("to_agent").ok()?,
+                    from_project_slug: row.get_named::<String>("from_project").ok()?,
+                    to_project_slug: row.get_named::<String>("to_project").ok()?,
+                    status: row.get_named::<String>("status").ok()?,
+                    reason: row.get_named::<String>("reason").ok().unwrap_or_default(),
+                    updated_ts: row.get_named::<i64>("updated_ts").ok().unwrap_or(0),
+                    expires_ts: row.get_named::<i64>("expires_ts").ok(),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Read `CONSOLE_POLL_INTERVAL_MS` from environment, default 2000ms.
 fn poll_interval_from_env() -> Duration {
     std::env::var("CONSOLE_POLL_INTERVAL_MS")
@@ -236,6 +336,8 @@ pub fn snapshot_delta(prev: &DbStatSnapshot, curr: &DbStatSnapshot) -> SnapshotD
         contacts_changed: prev.contact_links != curr.contact_links,
         ack_changed: prev.ack_pending != curr.ack_pending,
         agents_list_changed: prev.agents_list != curr.agents_list,
+        projects_list_changed: prev.projects_list != curr.projects_list,
+        contacts_list_changed: prev.contacts_list != curr.contacts_list,
     }
 }
 
@@ -250,6 +352,8 @@ pub struct SnapshotDelta {
     pub contacts_changed: bool,
     pub ack_changed: bool,
     pub agents_list_changed: bool,
+    pub projects_list_changed: bool,
+    pub contacts_list_changed: bool,
 }
 
 impl SnapshotDelta {
@@ -263,6 +367,8 @@ impl SnapshotDelta {
             || self.contacts_changed
             || self.ack_changed
             || self.agents_list_changed
+            || self.projects_list_changed
+            || self.contacts_list_changed
     }
 
     /// Count of changed fields.
@@ -276,6 +382,8 @@ impl SnapshotDelta {
             self.contacts_changed,
             self.ack_changed,
             self.agents_list_changed,
+            self.projects_list_changed,
+            self.contacts_list_changed,
         ]
         .iter()
         .filter(|&&b| b)
@@ -326,6 +434,7 @@ mod tests {
             ack_pending: 0,
             agents_list: vec![],
             timestamp_micros: 100,
+            ..Default::default()
         };
         let b = DbStatSnapshot {
             projects: 2,
@@ -336,6 +445,7 @@ mod tests {
             ack_pending: 1,
             agents_list: vec![],
             timestamp_micros: 200,
+            ..Default::default()
         };
         let d = snapshot_delta(&a, &b);
         assert!(d.projects_changed);
@@ -378,10 +488,20 @@ mod tests {
                 program: "Y".into(),
                 last_active_ts: 1,
             }],
+            projects_list: vec![ProjectSummary {
+                id: 1,
+                slug: "p".into(),
+                ..Default::default()
+            }],
+            contacts_list: vec![ContactSummary {
+                from_agent: "A".into(),
+                to_agent: "B".into(),
+                ..Default::default()
+            }],
             timestamp_micros: 1,
         };
         let d = snapshot_delta(&a, &b);
-        assert_eq!(d.changed_count(), 7);
+        assert_eq!(d.changed_count(), 9);
     }
 
     // ── Poll interval ────────────────────────────────────────────────

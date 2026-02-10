@@ -208,6 +208,31 @@ pub struct AgentSummary {
     pub last_active_ts: i64,
 }
 
+/// Per-project summary for the Projects screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProjectSummary {
+    pub id: i64,
+    pub slug: String,
+    pub human_key: String,
+    pub agent_count: u64,
+    pub message_count: u64,
+    pub reservation_count: u64,
+    pub created_at: i64,
+}
+
+/// A contact link entry for the Contacts screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ContactSummary {
+    pub from_agent: String,
+    pub to_agent: String,
+    pub from_project_slug: String,
+    pub to_project_slug: String,
+    pub status: String,
+    pub reason: String,
+    pub updated_ts: i64,
+    pub expires_ts: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DbStatSnapshot {
     pub projects: u64,
@@ -217,6 +242,8 @@ pub struct DbStatSnapshot {
     pub contact_links: u64,
     pub ack_pending: u64,
     pub agents_list: Vec<AgentSummary>,
+    pub projects_list: Vec<ProjectSummary>,
+    pub contacts_list: Vec<ContactSummary>,
     pub timestamp_micros: i64,
 }
 
@@ -1294,6 +1321,7 @@ mod tests {
                         last_active_ts: 99,
                     }],
                     timestamp_micros: 109,
+                    ..Default::default()
                 },
             },
             MailEvent::ServerStarted {
@@ -1457,6 +1485,7 @@ mod tests {
                 },
             ],
             timestamp_micros: 500_000,
+            ..Default::default()
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let round: DbStatSnapshot = serde_json::from_str(&json).expect("deserialize");

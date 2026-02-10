@@ -5,9 +5,11 @@
 //! metadata used by the chrome shell (tab bar, help overlay).
 
 pub mod agents;
+pub mod contacts;
 pub mod dashboard;
 pub mod inspector;
 pub mod messages;
+pub mod projects;
 pub mod reservations;
 pub mod system_health;
 pub mod threads;
@@ -37,6 +39,8 @@ pub enum MailScreenId {
     ToolMetrics,
     SystemHealth,
     Timeline,
+    Projects,
+    Contacts,
 }
 
 /// All screen IDs in display order.
@@ -49,6 +53,8 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::ToolMetrics,
     MailScreenId::SystemHealth,
     MailScreenId::Timeline,
+    MailScreenId::Projects,
+    MailScreenId::Contacts,
 ];
 
 impl MailScreenId {
@@ -76,13 +82,16 @@ impl MailScreenId {
         ALL_SCREEN_IDS[(idx + len - 1) % len]
     }
 
-    /// Look up a screen by 1-based number key (1..=N).
+    /// Look up a screen by number key (1..=9, 0=10).
+    ///
+    /// Keys 1-9 map to screens 1-9; key 0 maps to screen 10.
     #[must_use]
     pub fn from_number(n: usize) -> Option<Self> {
-        if n == 0 || n > ALL_SCREEN_IDS.len() {
+        let idx = if n == 0 { 10 } else { n };
+        if idx == 0 || idx > ALL_SCREEN_IDS.len() {
             None
         } else {
-            Some(ALL_SCREEN_IDS[n - 1])
+            Some(ALL_SCREEN_IDS[idx - 1])
         }
     }
 }
@@ -199,6 +208,8 @@ pub enum DeepLinkTarget {
     ProjectBySlug(String),
     /// Jump to a specific file reservation in the Reservations screen.
     ReservationByAgent(String),
+    /// Jump to a contact link between two agents.
+    ContactByPair(String, String),
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -282,6 +293,20 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         category: ScreenCategory::Overview,
         description: "Chronological event timeline with cursor + inspector",
     },
+    MailScreenMeta {
+        id: MailScreenId::Projects,
+        title: "Projects",
+        short_label: "Proj",
+        category: ScreenCategory::Overview,
+        description: "Project browser with per-project stats and detail",
+    },
+    MailScreenMeta {
+        id: MailScreenId::Contacts,
+        title: "Contacts",
+        short_label: "Links",
+        category: ScreenCategory::Communication,
+        description: "Cross-agent contact links and policy display",
+    },
 ];
 
 /// Look up metadata for a screen ID.
@@ -359,13 +384,13 @@ mod tests {
     #[test]
     fn screen_count_matches() {
         assert_eq!(ALL_SCREEN_IDS.len(), MAIL_SCREEN_REGISTRY.len());
-        assert_eq!(ALL_SCREEN_IDS.len(), 8);
+        assert_eq!(ALL_SCREEN_IDS.len(), 10);
     }
 
     #[test]
     fn next_prev_wraps() {
         let first = MailScreenId::Dashboard;
-        let last = MailScreenId::Timeline;
+        let last = MailScreenId::Contacts;
 
         assert_eq!(last.next(), first);
         assert_eq!(first.prev(), last);
@@ -387,12 +412,14 @@ mod tests {
             Some(MailScreenId::SystemHealth)
         );
         assert_eq!(MailScreenId::from_number(8), Some(MailScreenId::Timeline));
+        assert_eq!(MailScreenId::from_number(9), Some(MailScreenId::Projects));
+        // 0 maps to screen 10
+        assert_eq!(MailScreenId::from_number(0), Some(MailScreenId::Contacts));
     }
 
     #[test]
     fn from_number_invalid() {
-        assert_eq!(MailScreenId::from_number(0), None);
-        assert_eq!(MailScreenId::from_number(9), None);
+        assert_eq!(MailScreenId::from_number(11), None);
         assert_eq!(MailScreenId::from_number(100), None);
     }
 
@@ -517,6 +544,7 @@ mod tests {
         let _ = DeepLinkTarget::ToolByName(String::new());
         let _ = DeepLinkTarget::ProjectBySlug(String::new());
         let _ = DeepLinkTarget::ReservationByAgent(String::new());
+        let _ = DeepLinkTarget::ContactByPair(String::new(), String::new());
     }
 
     #[test]
