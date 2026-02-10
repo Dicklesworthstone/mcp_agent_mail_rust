@@ -405,6 +405,16 @@ impl MailScreen for ThreadExplorerScreen {
                             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                                 self.focus = Focus::DetailPanel;
                             }
+                            // Deep-link: jump to timeline at thread last activity.
+                            KeyCode::Char('t') => {
+                                if let Some(thread) = self.threads.get(self.cursor) {
+                                    return Cmd::msg(MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::TimelineAtTime(
+                                            thread.last_timestamp_micros,
+                                        ),
+                                    ));
+                                }
+                            }
                             // Search/filter
                             KeyCode::Char('/') => {
                                 self.filter_editing = true;
@@ -457,6 +467,16 @@ impl MailScreen for ThreadExplorerScreen {
                                 if let Some(msg) = self.detail_messages.first() {
                                     return Cmd::msg(MailScreenMsg::DeepLink(
                                         DeepLinkTarget::MessageById(msg.id),
+                                    ));
+                                }
+                            }
+                            // Deep-link: jump to timeline at thread last activity.
+                            KeyCode::Char('t') => {
+                                if let Some(thread) = self.threads.get(self.cursor) {
+                                    return Cmd::msg(MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::TimelineAtTime(
+                                            thread.last_timestamp_micros,
+                                        ),
                                     ));
                                 }
                             }
@@ -614,6 +634,10 @@ impl MailScreen for ThreadExplorerScreen {
             HelpEntry {
                 key: "Enter/l",
                 action: "Open thread detail",
+            },
+            HelpEntry {
+                key: "t",
+                action: "Timeline at last activity",
             },
             HelpEntry {
                 key: "Esc/h",
@@ -1166,6 +1190,32 @@ mod tests {
         assert!(matches!(screen.focus, Focus::DetailPanel));
     }
 
+    #[test]
+    fn t_key_deep_links_to_timeline_at_last_activity() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let t = Event::Key(ftui::KeyEvent::new(KeyCode::Char('t')));
+
+        let cmd = screen.update(&t, &state);
+        assert!(matches!(
+            cmd,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::TimelineAtTime(
+                1_700_000_000_000_000
+            )))
+        ));
+
+        // Same behavior from the detail panel.
+        screen.focus = Focus::DetailPanel;
+        let cmd2 = screen.update(&t, &state);
+        assert!(matches!(
+            cmd2,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::TimelineAtTime(
+                1_700_000_000_000_000
+            )))
+        ));
+    }
+
     // ── Cursor navigation ───────────────────────────────────────────
 
     #[test]
@@ -1683,6 +1733,7 @@ mod tests {
         let bindings = screen.keybindings();
         assert!(bindings.iter().any(|b| b.key == "s"));
         assert!(bindings.iter().any(|b| b.key == "v"));
+        assert!(bindings.iter().any(|b| b.key == "t"));
     }
 
     fn make_message(id: i64) -> ThreadMessage {

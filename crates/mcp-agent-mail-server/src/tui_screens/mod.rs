@@ -6,6 +6,7 @@
 
 pub mod agents;
 pub mod analytics;
+pub mod attachments;
 pub mod contacts;
 pub mod dashboard;
 pub mod explorer;
@@ -47,6 +48,7 @@ pub enum MailScreenId {
     Contacts,
     Explorer,
     Analytics,
+    Attachments,
 }
 
 /// All screen IDs in display order.
@@ -64,6 +66,7 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::Contacts,
     MailScreenId::Explorer,
     MailScreenId::Analytics,
+    MailScreenId::Attachments,
 ];
 
 impl MailScreenId {
@@ -339,6 +342,13 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         category: ScreenCategory::System,
         description: "Anomaly insight feed with confidence scoring and actionable next steps",
     },
+    MailScreenMeta {
+        id: MailScreenId::Attachments,
+        title: "Attachments",
+        short_label: "Attach",
+        category: ScreenCategory::Communication,
+        description: "Attachment browser with inline preview and source provenance trails",
+    },
 ];
 
 /// Look up metadata for a screen ID.
@@ -416,7 +426,7 @@ mod tests {
     #[test]
     fn screen_count_matches() {
         assert_eq!(ALL_SCREEN_IDS.len(), MAIL_SCREEN_REGISTRY.len());
-        assert_eq!(ALL_SCREEN_IDS.len(), 13);
+        assert_eq!(ALL_SCREEN_IDS.len(), 14);
     }
 
     #[test]
@@ -451,7 +461,7 @@ mod tests {
 
     #[test]
     fn from_number_invalid() {
-        assert_eq!(MailScreenId::from_number(14), None);
+        assert_eq!(MailScreenId::from_number(15), None);
         assert_eq!(MailScreenId::from_number(100), None);
     }
 

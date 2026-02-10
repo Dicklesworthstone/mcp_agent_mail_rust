@@ -19,13 +19,14 @@ use ftui_runtime::program::{Cmd, Model};
 
 use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
+use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
-    agents::AgentsScreen, analytics::AnalyticsScreen, contacts::ContactsScreen,
-    dashboard::DashboardScreen, explorer::MailExplorerScreen, messages::MessageBrowserScreen,
-    projects::ProjectsScreen, reservations::ReservationsScreen, screen_meta,
-    search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
-    timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+    agents::AgentsScreen, analytics::AnalyticsScreen, attachments::AttachmentExplorerScreen,
+    contacts::ContactsScreen, dashboard::DashboardScreen, explorer::MailExplorerScreen,
+    messages::MessageBrowserScreen, projects::ProjectsScreen, reservations::ReservationsScreen,
+    screen_meta, search::SearchCockpitScreen, system_health::SystemHealthScreen,
+    threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -85,6 +86,7 @@ pub struct MailAppModel {
     last_toast_seq: u64,
     tick_count: u64,
     accessibility: crate::tui_persist::AccessibilitySettings,
+    macro_engine: MacroEngine,
 }
 
 impl MailAppModel {
@@ -119,6 +121,8 @@ impl MailAppModel {
                 screens.insert(id, Box::new(MailExplorerScreen::new()));
             } else if id == MailScreenId::Analytics {
                 screens.insert(id, Box::new(AnalyticsScreen::new()));
+            } else if id == MailScreenId::Attachments {
+                screens.insert(id, Box::new(AttachmentExplorerScreen::new()));
             }
         }
         let mut command_palette = CommandPalette::new().with_max_visible(PALETTE_MAX_VISIBLE);
@@ -135,6 +139,7 @@ impl MailAppModel {
             last_toast_seq: 0,
             tick_count: 0,
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
+            macro_engine: MacroEngine::new(),
         }
     }
 
@@ -187,6 +192,12 @@ impl MailAppModel {
         &self.keymap
     }
 
+    /// Read-only access to the macro engine.
+    #[must_use]
+    pub const fn macro_engine(&self) -> &MacroEngine {
+        &self.macro_engine
+    }
+
     /// Whether the active screen is consuming text input.
     fn consumes_text_input(&self) -> bool {
         if self.command_palette.is_visible() {
@@ -217,12 +228,69 @@ impl MailAppModel {
             }
         }
 
+        // Inject saved macro entries (play, step-by-step, preview, delete).
+        for name in self.macro_engine.list_macros() {
+            let steps = self
+                .macro_engine
+                .get_macro(name)
+                .map(|d| d.len())
+                .unwrap_or(0);
+            actions.push(
+                ActionItem::new(
+                    format!("{}{name}", macro_ids::PLAY_PREFIX),
+                    format!("Play macro: {name}"),
+                )
+                .with_description(&format!("{steps} steps, continuous"))
+                .with_tags(&["macro", "play", "automation"])
+                .with_category("Macros"),
+            );
+            actions.push(
+                ActionItem::new(
+                    format!("{}{name}", macro_ids::PLAY_STEP_PREFIX),
+                    format!("Step-through: {name}"),
+                )
+                .with_description(&format!("{steps} steps, confirm each"))
+                .with_tags(&["macro", "step", "automation"])
+                .with_category("Macros"),
+            );
+            actions.push(
+                ActionItem::new(
+                    format!("{}{name}", macro_ids::DRY_RUN_PREFIX),
+                    format!("Preview macro: {name}"),
+                )
+                .with_description(&format!("{steps} steps, dry run"))
+                .with_tags(&["macro", "preview", "dry-run"])
+                .with_category("Macros"),
+            );
+            actions.push(
+                ActionItem::new(
+                    format!("{}{name}", macro_ids::DELETE_PREFIX),
+                    format!("Delete macro: {name}"),
+                )
+                .with_description("Permanently remove this macro")
+                .with_tags(&["macro", "delete"])
+                .with_category("Macros"),
+            );
+        }
+
         self.command_palette.replace_actions(actions);
         self.command_palette.open();
     }
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_palette_action(&mut self, id: &str) -> Cmd<MailMsg> {
+        // ── Macro engine controls (never recorded) ────────────────
+        if let Some(cmd) = self.handle_macro_control(id) {
+            return cmd;
+        }
+
+        // ── Record this action if the recorder is active ──────────
+        if self.macro_engine.recorder_state().is_recording() {
+            // Derive a label from the action ID for readability.
+            let label = palette_action_label(id);
+            self.macro_engine.record_step(id, &label);
+        }
+
         // ── App controls ───────────────────────────────────────────
         match id {
             palette_action_ids::APP_TOGGLE_HELP => {
@@ -471,6 +539,145 @@ impl MailAppModel {
 
         Cmd::none()
     }
+
+    /// Handle macro engine control actions (record, play, stop, delete).
+    ///
+    /// Returns `Some(Cmd)` if the action was handled, `None` otherwise.
+    fn handle_macro_control(&mut self, id: &str) -> Option<Cmd<MailMsg>> {
+        match id {
+            macro_ids::RECORD_START => {
+                self.macro_engine.start_recording();
+                self.notifications.notify(
+                    Toast::new("Recording macro... (use palette to stop)")
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                Some(Cmd::none())
+            }
+            macro_ids::RECORD_STOP => {
+                // Generate an auto-name based on timestamp.
+                let name = format!(
+                    "macro-{}",
+                    chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                );
+                if let Some(def) = self.macro_engine.stop_recording(&name) {
+                    self.notifications.notify(
+                        Toast::new(format!(
+                            "Saved \"{}\" ({} steps)",
+                            def.name,
+                            def.len()
+                        ))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(4)),
+                    );
+                } else {
+                    self.notifications.notify(
+                        Toast::new("No steps recorded")
+                            .icon(ToastIcon::Warning)
+                            .duration(Duration::from_secs(3)),
+                    );
+                }
+                Some(Cmd::none())
+            }
+            macro_ids::RECORD_CANCEL => {
+                self.macro_engine.cancel_recording();
+                self.notifications.notify(
+                    Toast::new("Recording cancelled")
+                        .icon(ToastIcon::Warning)
+                        .duration(Duration::from_secs(2)),
+                );
+                Some(Cmd::none())
+            }
+            macro_ids::PLAYBACK_STOP => {
+                self.macro_engine.stop_playback();
+                self.notifications.notify(
+                    Toast::new("Playback stopped")
+                        .icon(ToastIcon::Warning)
+                        .duration(Duration::from_secs(2)),
+                );
+                Some(Cmd::none())
+            }
+            _ => {
+                // Prefixed macro control actions.
+                if let Some(name) = id.strip_prefix(macro_ids::PLAY_PREFIX) {
+                    if self.macro_engine.start_playback(name, PlaybackMode::Continuous) {
+                        self.notifications.notify(
+                            Toast::new(format!("Playing \"{name}\"..."))
+                                .icon(ToastIcon::Info)
+                                .duration(Duration::from_secs(2)),
+                        );
+                        // Execute all steps immediately.
+                        self.execute_macro_steps();
+                    }
+                    return Some(Cmd::none());
+                }
+                if let Some(name) = id.strip_prefix(macro_ids::PLAY_STEP_PREFIX) {
+                    if self.macro_engine.start_playback(name, PlaybackMode::StepByStep) {
+                        self.notifications.notify(
+                            Toast::new(format!(
+                                "Step-by-step: \"{name}\" (Enter=next, Esc=stop)"
+                            ))
+                            .icon(ToastIcon::Info)
+                            .duration(Duration::from_secs(4)),
+                        );
+                    }
+                    return Some(Cmd::none());
+                }
+                if let Some(name) = id.strip_prefix(macro_ids::DRY_RUN_PREFIX) {
+                    if let Some(steps) = self.macro_engine.preview(name) {
+                        let preview: Vec<String> = steps
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| format!("{}. {}", i + 1, s.label))
+                            .collect();
+                        self.notifications.notify(
+                            Toast::new(format!(
+                                "Preview \"{name}\":\n{}",
+                                preview.join("\n")
+                            ))
+                            .icon(ToastIcon::Info)
+                            .duration(Duration::from_secs(8)),
+                        );
+                    }
+                    return Some(Cmd::none());
+                }
+                if let Some(name) = id.strip_prefix(macro_ids::DELETE_PREFIX) {
+                    if self.macro_engine.delete_macro(name) {
+                        self.notifications.notify(
+                            Toast::new(format!("Deleted macro \"{name}\""))
+                                .icon(ToastIcon::Info)
+                                .duration(Duration::from_secs(3)),
+                        );
+                    }
+                    return Some(Cmd::none());
+                }
+                None
+            }
+        }
+    }
+
+    /// Execute all remaining steps in a continuous-mode macro.
+    fn execute_macro_steps(&mut self) {
+        loop {
+            match self.macro_engine.next_step() {
+                Some((action_id, PlaybackMode::DryRun)) => {
+                    // Dry run: just log, don't execute.
+                    let _ = action_id;
+                }
+                Some((action_id, _)) => {
+                    // Execute the action via the normal dispatch path.
+                    // Temporarily disable recording to avoid re-recording played steps.
+                    let was_recording = self.macro_engine.recorder_state().is_recording();
+                    if was_recording {
+                        // Should not happen, but guard against it.
+                        break;
+                    }
+                    let _ = self.dispatch_palette_action(&action_id);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 impl Model for MailAppModel {
@@ -516,6 +723,40 @@ impl Model for MailAppModel {
                         }
                     }
                     return Cmd::none();
+                }
+
+                // Step-by-step macro playback: Enter=confirm, Esc=stop.
+                if matches!(self.macro_engine.playback_state(), PlaybackState::Paused { .. }) {
+                    if let Event::Key(key) = event {
+                        if key.kind == KeyEventKind::Press {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if let Some(action_id) = self.macro_engine.confirm_step() {
+                                        let _ = self.dispatch_palette_action(&action_id);
+                                        // Show progress toast.
+                                        if let Some(label) = self.macro_engine.playback_state().status_label() {
+                                            self.notifications.notify(
+                                                Toast::new(label)
+                                                    .icon(ToastIcon::Info)
+                                                    .duration(Duration::from_secs(3)),
+                                            );
+                                        }
+                                    }
+                                    return Cmd::none();
+                                }
+                                KeyCode::Escape => {
+                                    self.macro_engine.stop_playback();
+                                    self.notifications.notify(
+                                        Toast::new("Playback cancelled")
+                                            .icon(ToastIcon::Warning)
+                                            .duration(Duration::from_secs(2)),
+                                    );
+                                    return Cmd::none();
+                                }
+                                _ => {} // Other keys pass through normally
+                            }
+                        }
+                    }
                 }
 
                 // Global keybindings (checked before screen dispatch)
@@ -741,6 +982,7 @@ mod palette_action_ids {
     pub const SCREEN_CONTACTS: &str = "screen:contacts";
     pub const SCREEN_EXPLORER: &str = "screen:explorer";
     pub const SCREEN_ANALYTICS: &str = "screen:analytics";
+    pub const SCREEN_ATTACHMENTS: &str = "screen:attachments";
 }
 
 fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
@@ -758,6 +1000,7 @@ fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
         palette_action_ids::SCREEN_CONTACTS => Some(MailScreenId::Contacts),
         palette_action_ids::SCREEN_EXPLORER => Some(MailScreenId::Explorer),
         palette_action_ids::SCREEN_ANALYTICS => Some(MailScreenId::Analytics),
+        palette_action_ids::SCREEN_ATTACHMENTS => Some(MailScreenId::Attachments),
         _ => None,
     }
 }
@@ -777,6 +1020,7 @@ const fn screen_palette_action_id(id: MailScreenId) -> &'static str {
         MailScreenId::Contacts => palette_action_ids::SCREEN_CONTACTS,
         MailScreenId::Explorer => palette_action_ids::SCREEN_EXPLORER,
         MailScreenId::Analytics => palette_action_ids::SCREEN_ANALYTICS,
+        MailScreenId::Attachments => palette_action_ids::SCREEN_ATTACHMENTS,
     }
 }
 
@@ -874,6 +1118,32 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
             .with_description("Exit AgentMailTUI (requests shutdown)")
             .with_tags(&["quit", "exit"])
             .with_category("App"),
+    );
+
+    // ── Macro controls ────────────────────────────────────────────
+    out.push(
+        ActionItem::new(macro_ids::RECORD_START, "Record Macro")
+            .with_description("Start recording a new operator macro")
+            .with_tags(&["macro", "record", "automation"])
+            .with_category("Macros"),
+    );
+    out.push(
+        ActionItem::new(macro_ids::RECORD_STOP, "Stop Recording")
+            .with_description("Stop recording and save the macro")
+            .with_tags(&["macro", "record", "stop"])
+            .with_category("Macros"),
+    );
+    out.push(
+        ActionItem::new(macro_ids::RECORD_CANCEL, "Cancel Recording")
+            .with_description("Discard the current recording")
+            .with_tags(&["macro", "record", "cancel"])
+            .with_category("Macros"),
+    );
+    out.push(
+        ActionItem::new(macro_ids::PLAYBACK_STOP, "Stop Macro Playback")
+            .with_description("Cancel the currently playing macro")
+            .with_tags(&["macro", "playback", "stop"])
+            .with_category("Macros"),
     );
 
     out
@@ -1019,6 +1289,40 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
             break;
         }
     }
+}
+
+/// Derive a human-readable label from a palette action ID.
+///
+/// Used when recording macros to give each step a meaningful name.
+fn palette_action_label(id: &str) -> String {
+    // Screen navigation
+    if let Some(screen_id) = screen_from_palette_action_id(id) {
+        return format!("Go to {}", screen_name_from_id(screen_id));
+    }
+    // Quick actions
+    if id.starts_with("quick:") || id.starts_with("macro:") {
+        // Keep the original ID as label — it's already descriptive.
+        return id.to_string();
+    }
+    // Named palette actions
+    match id {
+        palette_action_ids::APP_TOGGLE_HELP => "Toggle Help".into(),
+        palette_action_ids::APP_QUIT => "Quit".into(),
+        palette_action_ids::TRANSPORT_TOGGLE => "Toggle Transport".into(),
+        palette_action_ids::THEME_CYCLE => "Cycle Theme".into(),
+        palette_action_ids::LAYOUT_RESET => "Reset Layout".into(),
+        _ => id.to_string(),
+    }
+}
+
+/// Short screen name from ID for labels.
+fn screen_name_from_id(id: MailScreenId) -> &'static str {
+    for meta in MAIL_SCREEN_REGISTRY {
+        if meta.id == id {
+            return meta.title;
+        }
+    }
+    "Unknown"
 }
 
 /// Generate a toast notification for high-priority events.

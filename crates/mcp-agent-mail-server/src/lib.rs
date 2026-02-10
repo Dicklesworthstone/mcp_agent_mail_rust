@@ -47,11 +47,22 @@ pub mod tui_chrome;
 pub mod tui_events;
 pub mod tui_keymap;
 pub mod tui_layout;
+#[allow(
+    clippy::doc_markdown,
+    clippy::map_unwrap_or,
+    clippy::redundant_closure,
+    clippy::needless_borrow,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
+pub mod tui_macro;
 pub mod tui_markdown;
 pub mod tui_persist;
 pub mod tui_poller;
 pub mod tui_screens;
 pub mod tui_theme;
+pub mod tui_widgets;
 
 use asupersync::http::h1::HttpClient;
 use asupersync::http::h1::listener::Http1Listener;

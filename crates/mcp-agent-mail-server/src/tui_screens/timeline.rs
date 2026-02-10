@@ -586,7 +586,7 @@ impl MailScreen for TimelineScreen {
 // Filter cycling
 // ──────────────────────────────────────────────────────────────────────
 
-/// Cycle kind filter: empty → Tool → Message → Http → Reservation → clear.
+/// Cycle kind filter: empty → Tool → Message → Http → Reservation → Health → Lifecycle → clear.
 fn cycle_kind_filter(filter: &mut HashSet<MailEventKind>) {
     if filter.is_empty() {
         filter.insert(MailEventKind::ToolCallStart);
@@ -602,12 +602,20 @@ fn cycle_kind_filter(filter: &mut HashSet<MailEventKind>) {
         filter.clear();
         filter.insert(MailEventKind::ReservationGranted);
         filter.insert(MailEventKind::ReservationReleased);
+    } else if filter.contains(&MailEventKind::ReservationGranted) {
+        filter.clear();
+        filter.insert(MailEventKind::HealthPulse);
+    } else if filter.contains(&MailEventKind::HealthPulse) {
+        filter.clear();
+        filter.insert(MailEventKind::AgentRegistered);
+        filter.insert(MailEventKind::ServerStarted);
+        filter.insert(MailEventKind::ServerShutdown);
     } else {
         filter.clear();
     }
 }
 
-/// Cycle source filter: empty → Tooling → Http → Mail → clear.
+/// Cycle source filter: empty → Tooling → Http → Mail → Reservations → Lifecycle → Database → clear.
 fn cycle_source_filter(filter: &mut HashSet<EventSource>) {
     if filter.is_empty() {
         filter.insert(EventSource::Tooling);
@@ -620,6 +628,12 @@ fn cycle_source_filter(filter: &mut HashSet<EventSource>) {
     } else if filter.contains(&EventSource::Mail) {
         filter.clear();
         filter.insert(EventSource::Reservations);
+    } else if filter.contains(&EventSource::Reservations) {
+        filter.clear();
+        filter.insert(EventSource::Lifecycle);
+    } else if filter.contains(&EventSource::Lifecycle) {
+        filter.clear();
+        filter.insert(EventSource::Database);
     } else {
         filter.clear();
     }
@@ -867,6 +881,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: crate::tui_events::EventSeverity::Debug,
+                seq: 1,
+                timestamp_micros: 1_000_000,
                 timestamp: "00:00:00.000".to_string(),
                 icon: '↔',
                 summary: "GET /x".to_string(),
@@ -881,6 +897,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::MessageSent,
                 severity: crate::tui_events::EventSeverity::Info,
+                seq: 2,
+                timestamp_micros: 2_000_000,
                 timestamp: "00:00:01.000".to_string(),
                 icon: '✉',
                 summary: "msg sent".to_string(),
@@ -908,6 +926,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: crate::tui_events::EventSeverity::Debug,
+                seq: 1,
+                timestamp_micros: 1_000_000,
                 timestamp: "00:00:00.000".to_string(),
                 icon: '↔',
                 summary: "GET /x".to_string(),
@@ -922,6 +942,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::ToolCallEnd,
                 severity: crate::tui_events::EventSeverity::Debug,
+                seq: 2,
+                timestamp_micros: 2_000_000,
                 timestamp: "00:00:01.000".to_string(),
                 icon: '⚙',
                 summary: "tool done".to_string(),
@@ -1038,7 +1060,13 @@ mod tests {
         // Http → Reservation
         cycle_kind_filter(&mut filter);
         assert!(filter.contains(&MailEventKind::ReservationGranted));
-        // Reservation → clear
+        // Reservation → Health
+        cycle_kind_filter(&mut filter);
+        assert!(filter.contains(&MailEventKind::HealthPulse));
+        // Health → Lifecycle
+        cycle_kind_filter(&mut filter);
+        assert!(filter.contains(&MailEventKind::AgentRegistered));
+        // Lifecycle → clear
         cycle_kind_filter(&mut filter);
         assert!(filter.is_empty());
     }
@@ -1054,6 +1082,10 @@ mod tests {
         assert!(filter.contains(&EventSource::Mail));
         cycle_source_filter(&mut filter);
         assert!(filter.contains(&EventSource::Reservations));
+        cycle_source_filter(&mut filter);
+        assert!(filter.contains(&EventSource::Lifecycle));
+        cycle_source_filter(&mut filter);
+        assert!(filter.contains(&EventSource::Database));
         cycle_source_filter(&mut filter);
         assert!(filter.is_empty());
     }
@@ -1217,6 +1249,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::HealthPulse,
                 severity: EventSeverity::Trace,
+                seq: 1,
+                timestamp_micros: 1_000_000,
                 timestamp: "00:00:00.000".to_string(),
                 icon: '♥',
                 summary: "pulse".to_string(),
@@ -1231,6 +1265,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: EventSeverity::Debug,
+                seq: 2,
+                timestamp_micros: 2_000_000,
                 timestamp: "00:00:00.001".to_string(),
                 icon: '↔',
                 summary: "GET / 200".to_string(),
@@ -1245,6 +1281,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::MessageSent,
                 severity: EventSeverity::Info,
+                seq: 3,
+                timestamp_micros: 3_000_000,
                 timestamp: "00:00:00.002".to_string(),
                 icon: '✉',
                 summary: "msg".to_string(),
@@ -1259,6 +1297,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: EventSeverity::Error,
+                seq: 4,
+                timestamp_micros: 4_000_000,
                 timestamp: "00:00:00.003".to_string(),
                 icon: '↔',
                 summary: "POST / 500".to_string(),
@@ -1328,6 +1368,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::MessageSent,
                 severity: EventSeverity::Info,
+                seq: 1,
+                timestamp_micros: 1_000_000,
                 timestamp: "00:00:00.000".to_string(),
                 icon: '✉',
                 summary: "msg".to_string(),
@@ -1342,6 +1384,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: EventSeverity::Debug,
+                seq: 2,
+                timestamp_micros: 2_000_000,
                 timestamp: "00:00:00.001".to_string(),
                 icon: '↔',
                 summary: "GET /".to_string(),
@@ -1590,6 +1634,8 @@ mod tests {
                 display: EventEntry {
                     kind: MailEventKind::HttpRequest,
                     severity: EventSeverity::Debug,
+                    seq: i,
+                    timestamp_micros: i_i64 * 1_000_000,
                     timestamp: format!("00:00:0{i}.000"),
                     icon: '↔',
                     summary: format!("GET /{i}"),
@@ -1607,6 +1653,8 @@ mod tests {
                 display: EventEntry {
                     kind: MailEventKind::MessageSent,
                     severity: EventSeverity::Info,
+                    seq: i,
+                    timestamp_micros: i_i64 * 1_000_000,
                     timestamp: format!("00:00:0{i}.000"),
                     icon: '✉',
                     summary: format!("msg {i}"),
@@ -1638,6 +1686,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: EventSeverity::Debug,
+                seq: 1,
+                timestamp_micros: 1_000_000,
                 timestamp: "00:00:00.000".to_string(),
                 icon: '↔',
                 summary: "GET /".to_string(),
@@ -1653,6 +1703,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::ToolCallEnd,
                 severity: EventSeverity::Debug,
+                seq: 2,
+                timestamp_micros: 2_000_000,
                 timestamp: "00:00:00.001".to_string(),
                 icon: '⚙',
                 summary: "tool done".to_string(),
@@ -1668,6 +1720,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::MessageSent,
                 severity: EventSeverity::Info,
+                seq: 3,
+                timestamp_micros: 3_000_000,
                 timestamp: "00:00:00.002".to_string(),
                 icon: '✉',
                 summary: "msg".to_string(),
@@ -1703,6 +1757,8 @@ mod tests {
             display: EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: EventSeverity::Debug,
+                seq: 1,
+                timestamp_micros: 1_000_000,
                 timestamp: "00:00:00.000".to_string(),
                 icon: '↔',
                 summary: "GET /".to_string(),

@@ -2085,6 +2085,7 @@ dependencies = [
  "unicode-display-width",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]
@@ -2108,12 +2109,14 @@ dependencies = [
  "ftui-render 0.1.1",
  "ftui-style 0.1.1",
  "ftui-text 0.1.1",
+ "ftui-widgets 0.1.1",
  "math-text-transform",
  "pulldown-cmark",
  "serde_json",
  "unicode-display-width",
  "unicode-segmentation",
  "unicodeit",
+ "web-time",
 ]
 
 [[package]]
@@ -2186,6 +2189,7 @@ dependencies = [
  "memchr",
  "smallvec",
  "unicode-segmentation",
+ "web-time",
 ]
 
 [[package]]
@@ -2216,6 +2220,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]
@@ -2297,6 +2302,7 @@ dependencies = [
  "ftui-text 0.1.1",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]

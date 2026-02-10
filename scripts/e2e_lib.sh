@@ -44,11 +44,23 @@ E2E_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 E2E_TIMESTAMP="$(date -u '+%Y%m%d_%H%M%S')"
 E2E_ARTIFACT_DIR="${E2E_PROJECT_ROOT}/tests/artifacts/${E2E_SUITE}/${E2E_TIMESTAMP}"
 
+# Run timing (used for artifact bundle metadata/metrics)
+E2E_RUN_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+E2E_RUN_START_EPOCH_S="$(date +%s)"
+E2E_RUN_ENDED_AT=""
+E2E_RUN_END_EPOCH_S="0"
+
 # Counters
 _E2E_PASS=0
 _E2E_FAIL=0
 _E2E_SKIP=0
 _E2E_TOTAL=0
+
+# Current case (for trace correlation)
+_E2E_CURRENT_CASE=""
+
+# Trace file (initialized by e2e_init_artifacts)
+_E2E_TRACE_FILE=""
 
 # Temp dirs to clean up
 _E2E_TMP_DIRS=()
@@ -79,6 +91,8 @@ e2e_banner() {
 e2e_case_banner() {
     local case_name="$1"
     (( _E2E_TOTAL++ )) || true
+    _E2E_CURRENT_CASE="$case_name"
+    _e2e_trace_event "case_start" "" "$case_name"
     echo ""
     echo -e "${_e2e_color_blue}── Case: ${case_name} ──${_e2e_color_reset}"
 }
@@ -86,18 +100,21 @@ e2e_case_banner() {
 e2e_pass() {
     local msg="${1:-}"
     (( _E2E_PASS++ )) || true
+    _e2e_trace_event "assert_pass" "$msg"
     echo -e "  ${_e2e_color_green}PASS${_e2e_color_reset} ${msg}"
 }
 
 e2e_fail() {
     local msg="${1:-}"
     (( _E2E_FAIL++ )) || true
+    _e2e_trace_event "assert_fail" "$msg"
     echo -e "  ${_e2e_color_red}FAIL${_e2e_color_reset} ${msg}"
 }
 
 e2e_skip() {
     local msg="${1:-}"
     (( _E2E_SKIP++ )) || true
+    _e2e_trace_event "assert_skip" "$msg"
     echo -e "  ${_e2e_color_yellow}SKIP${_e2e_color_reset} ${msg}"
 }
 
@@ -223,7 +240,10 @@ trap _e2e_cleanup EXIT
 
 # Initialize the artifact directory for this run
 e2e_init_artifacts() {
-    mkdir -p "$E2E_ARTIFACT_DIR"
+    mkdir -p "$E2E_ARTIFACT_DIR"/{diagnostics,trace,transcript}
+    _E2E_TRACE_FILE="${E2E_ARTIFACT_DIR}/trace/events.jsonl"
+    touch "$_E2E_TRACE_FILE"
+    _e2e_trace_event "suite_start" ""
     e2e_log "Artifacts: $E2E_ARTIFACT_DIR"
 }
 
@@ -243,6 +263,562 @@ e2e_copy_artifact() {
     local dest="${E2E_ARTIFACT_DIR}/${dest_name}"
     mkdir -p "$(dirname "$dest")"
     cp -r "$src" "$dest" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Artifact bundle schema (br-3vwi.10.18)
+# ---------------------------------------------------------------------------
+
+_e2e_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    echo -n "$s"
+}
+
+_e2e_stat_bytes() {
+    local file="$1"
+    stat --format='%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null || echo "0"
+}
+
+_e2e_now_rfc3339() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+_e2e_trace_event() {
+    local kind="$1"
+    local msg="${2:-}"
+    local case_name="${3:-${_E2E_CURRENT_CASE:-}}"
+
+    if [ -z "${_E2E_TRACE_FILE:-}" ]; then
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$_E2E_TRACE_FILE")"
+
+    local ts
+    ts="$(_e2e_now_rfc3339)"
+
+    local safe_suite safe_run_ts safe_ts safe_kind safe_case safe_msg
+    safe_suite="$(_e2e_json_escape "$E2E_SUITE")"
+    safe_run_ts="$(_e2e_json_escape "$E2E_TIMESTAMP")"
+    safe_ts="$(_e2e_json_escape "$ts")"
+    safe_kind="$(_e2e_json_escape "$kind")"
+    safe_case="$(_e2e_json_escape "$case_name")"
+    safe_msg="$(_e2e_json_escape "$msg")"
+
+    echo "{\"schema_version\":1,\"suite\":\"${safe_suite}\",\"run_timestamp\":\"${safe_run_ts}\",\"ts\":\"${safe_ts}\",\"kind\":\"${safe_kind}\",\"case\":\"${safe_case}\",\"message\":\"${safe_msg}\",\"counters\":{\"total\":${_E2E_TOTAL},\"pass\":${_E2E_PASS},\"fail\":${_E2E_FAIL},\"skip\":${_E2E_SKIP}}}" >>"$_E2E_TRACE_FILE"
+}
+
+e2e_write_summary_json() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    cat > "${artifact_dir}/summary.json" <<EOJSON
+{
+  "schema_version": 1,
+  "suite": "$( _e2e_json_escape "$E2E_SUITE" )",
+  "timestamp": "$( _e2e_json_escape "$E2E_TIMESTAMP" )",
+  "started_at": "$( _e2e_json_escape "$E2E_RUN_STARTED_AT" )",
+  "ended_at": "$( _e2e_json_escape "$E2E_RUN_ENDED_AT" )",
+  "total": ${_E2E_TOTAL},
+  "pass": ${_E2E_PASS},
+  "fail": ${_E2E_FAIL},
+  "skip": ${_E2E_SKIP}
+}
+EOJSON
+}
+
+e2e_write_meta_json() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+
+    local git_commit=""
+    local git_branch=""
+    local git_dirty="false"
+    git_commit="$(git -C "$E2E_PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")"
+    git_branch="$(git -C "$E2E_PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+    if ! git -C "$E2E_PROJECT_ROOT" diff --quiet 2>/dev/null || ! git -C "$E2E_PROJECT_ROOT" diff --cached --quiet 2>/dev/null; then
+        git_dirty="true"
+    fi
+
+    local user host os arch bash_ver py_ver
+    user="$(whoami 2>/dev/null || echo "")"
+    host="$(hostname 2>/dev/null || echo "")"
+    os="$(uname -s 2>/dev/null || echo "")"
+    arch="$(uname -m 2>/dev/null || echo "")"
+    bash_ver="${BASH_VERSION:-}"
+    py_ver=""
+    if command -v python3 >/dev/null 2>&1; then
+        py_ver="$(python3 --version 2>&1 || true)"
+    elif command -v python >/dev/null 2>&1; then
+        py_ver="$(python --version 2>&1 || true)"
+    fi
+
+    cat > "${artifact_dir}/meta.json" <<EOJSON
+{
+  "schema_version": 1,
+  "suite": "$( _e2e_json_escape "$E2E_SUITE" )",
+  "timestamp": "$( _e2e_json_escape "$E2E_TIMESTAMP" )",
+  "started_at": "$( _e2e_json_escape "$E2E_RUN_STARTED_AT" )",
+  "ended_at": "$( _e2e_json_escape "$E2E_RUN_ENDED_AT" )",
+  "git": {
+    "commit": "$( _e2e_json_escape "$git_commit" )",
+    "branch": "$( _e2e_json_escape "$git_branch" )",
+    "dirty": ${git_dirty}
+  },
+  "runner": {
+    "user": "$( _e2e_json_escape "$user" )",
+    "hostname": "$( _e2e_json_escape "$host" )",
+    "os": "$( _e2e_json_escape "$os" )",
+    "arch": "$( _e2e_json_escape "$arch" )",
+    "bash": "$( _e2e_json_escape "$bash_ver" )",
+    "python": "$( _e2e_json_escape "$py_ver" )"
+  },
+  "paths": {
+    "project_root": "$( _e2e_json_escape "$E2E_PROJECT_ROOT" )",
+    "artifact_dir": "$( _e2e_json_escape "$artifact_dir" )"
+  }
+}
+EOJSON
+}
+
+e2e_write_metrics_json() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+
+    local duration_s=0
+    if [ "$E2E_RUN_END_EPOCH_S" -ge "$E2E_RUN_START_EPOCH_S" ] 2>/dev/null; then
+        duration_s=$(( E2E_RUN_END_EPOCH_S - E2E_RUN_START_EPOCH_S ))
+    fi
+
+    cat > "${artifact_dir}/metrics.json" <<EOJSON
+{
+  "schema_version": 1,
+  "suite": "$( _e2e_json_escape "$E2E_SUITE" )",
+  "timestamp": "$( _e2e_json_escape "$E2E_TIMESTAMP" )",
+  "timing": {
+    "start_epoch_s": ${E2E_RUN_START_EPOCH_S},
+    "end_epoch_s": ${E2E_RUN_END_EPOCH_S},
+    "duration_s": ${duration_s}
+  },
+  "counts": {
+    "total": ${_E2E_TOTAL},
+    "pass": ${_E2E_PASS},
+    "fail": ${_E2E_FAIL},
+    "skip": ${_E2E_SKIP}
+  }
+}
+EOJSON
+}
+
+e2e_write_diagnostics_files() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    local diag_dir="${artifact_dir}/diagnostics"
+    mkdir -p "$diag_dir"
+
+    local env_file="${diag_dir}/env_redacted.txt"
+    {
+        echo "Environment (redacted):"
+        e2e_dump_env 2>/dev/null || true
+    } >"$env_file"
+
+    local tree_file="${diag_dir}/tree.txt"
+    local td
+    td="$(e2e_mktemp "e2e_tree")"
+    e2e_tree "$artifact_dir" > "${td}/tree.txt"
+    cp "${td}/tree.txt" "$tree_file"
+}
+
+e2e_write_transcript_summary() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    local out="${artifact_dir}/transcript/summary.txt"
+    mkdir -p "$(dirname "$out")"
+
+    local git_commit="" git_branch="" git_dirty="false"
+    git_commit="$(git -C "$E2E_PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")"
+    git_branch="$(git -C "$E2E_PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+    if ! git -C "$E2E_PROJECT_ROOT" diff --quiet 2>/dev/null || ! git -C "$E2E_PROJECT_ROOT" diff --cached --quiet 2>/dev/null; then
+        git_dirty="true"
+    fi
+
+    {
+        echo "suite: ${E2E_SUITE}"
+        echo "timestamp: ${E2E_TIMESTAMP}"
+        echo "started_at: ${E2E_RUN_STARTED_AT}"
+        echo "ended_at: ${E2E_RUN_ENDED_AT}"
+        echo "counts: total=${_E2E_TOTAL} pass=${_E2E_PASS} fail=${_E2E_FAIL} skip=${_E2E_SKIP}"
+        echo "git: commit=${git_commit} branch=${git_branch} dirty=${git_dirty}"
+        echo "artifacts_dir: ${artifact_dir}"
+        echo "files:"
+        echo "  bundle: bundle.json"
+        echo "  summary: summary.json"
+        echo "  meta: meta.json"
+        echo "  metrics: metrics.json"
+        echo "  trace: trace/events.jsonl"
+        echo "  env: diagnostics/env_redacted.txt"
+        echo "  tree: diagnostics/tree.txt"
+    } >"$out"
+}
+
+e2e_write_bundle_manifest() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    if [ ! -d "$artifact_dir" ]; then
+        return 0
+    fi
+
+    local manifest="${artifact_dir}/bundle.json"
+    local generated_at
+    generated_at="$(_e2e_now_rfc3339)"
+
+    local git_commit=""
+    local git_branch=""
+    local git_dirty="false"
+    git_commit="$(git -C "$E2E_PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")"
+    git_branch="$(git -C "$E2E_PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+    if ! git -C "$E2E_PROJECT_ROOT" diff --quiet 2>/dev/null || ! git -C "$E2E_PROJECT_ROOT" diff --cached --quiet 2>/dev/null; then
+        git_dirty="true"
+    fi
+
+    {
+        echo "{"
+        echo "  \"schema\": {\"name\": \"mcp-agent-mail-artifacts\", \"major\": 1, \"minor\": 0},"
+        echo "  \"suite\": \"$( _e2e_json_escape "$E2E_SUITE" )\","
+        echo "  \"timestamp\": \"$( _e2e_json_escape "$E2E_TIMESTAMP" )\","
+        echo "  \"generated_at\": \"$( _e2e_json_escape "$generated_at" )\","
+        echo "  \"started_at\": \"$( _e2e_json_escape "$E2E_RUN_STARTED_AT" )\","
+        echo "  \"ended_at\": \"$( _e2e_json_escape "$E2E_RUN_ENDED_AT" )\","
+        echo "  \"counts\": {\"total\": ${_E2E_TOTAL}, \"pass\": ${_E2E_PASS}, \"fail\": ${_E2E_FAIL}, \"skip\": ${_E2E_SKIP}},"
+        echo "  \"git\": {\"commit\": \"$( _e2e_json_escape "$git_commit" )\", \"branch\": \"$( _e2e_json_escape "$git_branch" )\", \"dirty\": ${git_dirty}},"
+        echo "  \"artifacts\": {"
+        echo "    \"metadata\": {\"path\": \"meta.json\", \"schema\": \"meta.v1\"},"
+        echo "    \"metrics\": {\"path\": \"metrics.json\", \"schema\": \"metrics.v1\"},"
+        echo "    \"summary\": {\"path\": \"summary.json\", \"schema\": \"summary.v1\"},"
+        echo "    \"diagnostics\": {"
+        echo "      \"env_redacted\": {\"path\": \"diagnostics/env_redacted.txt\"},"
+        echo "      \"tree\": {\"path\": \"diagnostics/tree.txt\"}"
+        echo "    },"
+        echo "    \"trace\": {\"events\": {\"path\": \"trace/events.jsonl\", \"schema\": \"trace-events.v1\"}},"
+        echo "    \"transcript\": {\"summary\": {\"path\": \"transcript/summary.txt\"}}"
+        echo "  },"
+        echo "  \"files\": ["
+
+        local first=1
+        while IFS= read -r f; do
+            local rel="${f#"$artifact_dir"/}"
+            local sha
+            sha="$(e2e_sha256 "$f")"
+            local bytes
+            bytes="$(_e2e_stat_bytes "$f")"
+
+            local kind="opaque"
+            local schema_json="null"
+            case "$rel" in
+                summary.json)
+                    kind="metrics"
+                    schema_json="\"summary.v1\""
+                    ;;
+                meta.json)
+                    kind="metadata"
+                    schema_json="\"meta.v1\""
+                    ;;
+                metrics.json)
+                    kind="metrics"
+                    schema_json="\"metrics.v1\""
+                    ;;
+                trace/events.jsonl)
+                    kind="trace"
+                    schema_json="\"trace-events.v1\""
+                    ;;
+                diagnostics/*)
+                    kind="diagnostics"
+                    ;;
+                transcript/*)
+                    kind="transcript"
+                    ;;
+                steps/step_*.json)
+                    kind="trace"
+                    schema_json="\"step.v1\""
+                    ;;
+                failures/fail_*.json)
+                    kind="diagnostics"
+                    schema_json="\"failure.v1\""
+                    ;;
+            esac
+
+            if [ "$first" -eq 1 ]; then
+                first=0
+            else
+                echo "    ,"
+            fi
+            echo "    {\"path\": \"$( _e2e_json_escape "$rel" )\", \"sha256\": \"$( _e2e_json_escape "$sha" )\", \"bytes\": ${bytes}, \"kind\": \"$( _e2e_json_escape "$kind" )\", \"schema\": ${schema_json}}"
+        done < <(find "$artifact_dir" -type f ! -name "bundle.json" | sort)
+
+        echo "  ]"
+        echo "}"
+    } >"$manifest"
+}
+
+e2e_validate_bundle_manifest() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    local manifest="${artifact_dir}/bundle.json"
+    if [ ! -f "$manifest" ]; then
+        e2e_log "bundle.json missing at ${manifest}"
+        return 1
+    fi
+
+    # Prefer python3 for strict structural validation; fall back to python.
+    local py="python3"
+    if ! command -v "$py" >/dev/null 2>&1; then
+        py="python"
+    fi
+    if command -v "$py" >/dev/null 2>&1; then
+        "$py" - "$artifact_dir" <<'PY'
+import json
+import os
+import re
+import sys
+
+artifact_dir = sys.argv[1]
+manifest_path = os.path.join(artifact_dir, "bundle.json")
+
+with open(manifest_path, "r", encoding="utf-8") as f:
+    bundle = json.load(f)
+
+def fail(msg: str) -> None:
+    raise SystemExit(msg)
+
+def require(obj, key, kind=None):
+    if not isinstance(obj, dict):
+        fail("expected object")
+    if key not in obj:
+        fail(f"missing key: {key}")
+    val = obj[key]
+    if kind is not None and not isinstance(val, kind):
+        fail(f"bad type for {key}: expected {kind.__name__}")
+    return val
+
+def require_bool(obj, key):
+    val = require(obj, key)
+    if type(val) is not bool:
+        fail(f"bad type for {key}: expected bool")
+    return val
+
+schema = require(bundle, "schema", dict)
+name = require(schema, "name", str)
+major = require(schema, "major", int)
+minor = require(schema, "minor", int)
+if name != "mcp-agent-mail-artifacts":
+    fail(f"unsupported schema.name={name}")
+if major != 1:
+    fail(f"unsupported schema.major={major}")
+if minor < 0:
+    fail("schema.minor must be >= 0")
+
+suite = require(bundle, "suite", str)
+timestamp = require(bundle, "timestamp", str)
+require(bundle, "generated_at", str)
+require(bundle, "started_at", str)
+require(bundle, "ended_at", str)
+
+counts = require(bundle, "counts", dict)
+for k in ("total", "pass", "fail", "skip"):
+    require(counts, k, int)
+
+git = require(bundle, "git", dict)
+require(git, "commit", str)
+require(git, "branch", str)
+require_bool(git, "dirty")
+
+artifacts = require(bundle, "artifacts", dict)
+required_artifact_paths = []
+
+def req_path(obj, key, require_schema=False):
+    ent = require(obj, key, dict)
+    path = require(ent, "path", str)
+    if require_schema:
+        require(ent, "schema", str)
+    required_artifact_paths.append(path)
+    return ent
+
+req_path(artifacts, "metadata", True)
+req_path(artifacts, "metrics", True)
+req_path(artifacts, "summary", True)
+
+diag = require(artifacts, "diagnostics", dict)
+req_path(diag, "env_redacted")
+req_path(diag, "tree")
+
+trace = require(artifacts, "trace", dict)
+events = require(trace, "events", dict)
+required_artifact_paths.append(require(events, "path", str))
+require(events, "schema", str)
+
+transcript = require(artifacts, "transcript", dict)
+req_path(transcript, "summary")
+
+files = require(bundle, "files", list)
+file_map = {}
+allowed_kinds = {"metadata", "metrics", "diagnostics", "trace", "transcript", "opaque"}
+sha_re = re.compile(r"^[0-9a-f]{64}$")
+
+for i, ent in enumerate(files):
+    if not isinstance(ent, dict):
+        fail(f"files[{i}] must be object")
+    path = require(ent, "path", str)
+    if path.startswith("/") or path.startswith("\\"):
+        fail(f"files[{i}].path must be relative")
+    if ".." in path.split("/"):
+        fail(f"files[{i}].path must not contain ..")
+    if path in file_map:
+        fail(f"duplicate path in files: {path}")
+    sha = require(ent, "sha256", str)
+    if not sha_re.match(sha):
+        fail(f"files[{i}].sha256 must be 64 lowercase hex chars")
+    b = require(ent, "bytes", int)
+    if b < 0:
+        fail(f"files[{i}].bytes must be >= 0")
+    kind = require(ent, "kind", str)
+    if kind not in allowed_kinds:
+        fail(f"files[{i}].kind invalid: {kind}")
+    schema_val = ent.get("schema", None)
+    if schema_val is not None and not isinstance(schema_val, str):
+        fail(f"files[{i}].schema must be string or null")
+
+    file_map[path] = ent
+
+for p in required_artifact_paths:
+    if p not in file_map:
+        fail(f"required file missing from bundle.files: {p}")
+
+# Verify referenced files exist and bytes match.
+for path, ent in file_map.items():
+    abs_path = os.path.join(artifact_dir, path)
+    if not os.path.isfile(abs_path):
+        fail(f"missing file on disk: {path}")
+    actual_bytes = os.path.getsize(abs_path)
+    if actual_bytes != ent["bytes"]:
+        fail(f"bytes mismatch for {path}: manifest={ent['bytes']} actual={actual_bytes}")
+
+def load_json(rel_path: str):
+    with open(os.path.join(artifact_dir, rel_path), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# Required JSON artifacts (schema checks)
+summary = load_json("summary.json")
+require(summary, "schema_version", int)
+if require(summary, "suite", str) != suite:
+    fail("summary.json suite mismatch")
+if require(summary, "timestamp", str) != timestamp:
+    fail("summary.json timestamp mismatch")
+require(summary, "started_at", str)
+require(summary, "ended_at", str)
+for k in ("total", "pass", "fail", "skip"):
+    require(summary, k, int)
+
+meta = load_json("meta.json")
+require(meta, "schema_version", int)
+if require(meta, "suite", str) != suite:
+    fail("meta.json suite mismatch")
+if require(meta, "timestamp", str) != timestamp:
+    fail("meta.json timestamp mismatch")
+require(meta, "started_at", str)
+require(meta, "ended_at", str)
+require(require(meta, "git", dict), "commit", str)
+require(require(meta, "git", dict), "branch", str)
+require_bool(require(meta, "git", dict), "dirty")
+
+metrics = load_json("metrics.json")
+require(metrics, "schema_version", int)
+if require(metrics, "suite", str) != suite:
+    fail("metrics.json suite mismatch")
+if require(metrics, "timestamp", str) != timestamp:
+    fail("metrics.json timestamp mismatch")
+timing = require(metrics, "timing", dict)
+require(timing, "start_epoch_s", int)
+require(timing, "end_epoch_s", int)
+require(timing, "duration_s", int)
+mc = require(metrics, "counts", dict)
+for k in ("total", "pass", "fail", "skip"):
+    require(mc, k, int)
+    if mc[k] != counts[k]:
+        fail(f"metrics.json counts.{k} mismatch")
+
+# Parse and validate trace events JSONL
+events_path = os.path.join(artifact_dir, "trace", "events.jsonl")
+seen_start = False
+seen_end = False
+with open(events_path, "r", encoding="utf-8") as f:
+    for ln, line in enumerate(f, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception as e:
+            fail(f"trace/events.jsonl invalid JSON at line {ln}: {e}")
+        if not isinstance(ev, dict):
+            fail(f"trace/events.jsonl line {ln}: expected object")
+        if ev.get("schema_version") != 1:
+            fail(f"trace/events.jsonl line {ln}: schema_version must be 1")
+        if ev.get("suite") != suite:
+            fail(f"trace/events.jsonl line {ln}: suite mismatch")
+        if ev.get("run_timestamp") != timestamp:
+            fail(f"trace/events.jsonl line {ln}: run_timestamp mismatch")
+        if not isinstance(ev.get("ts"), str):
+            fail(f"trace/events.jsonl line {ln}: ts must be string")
+        kind = ev.get("kind")
+        if not isinstance(kind, str):
+            fail(f"trace/events.jsonl line {ln}: kind must be string")
+        if kind == "suite_start":
+            seen_start = True
+        if kind == "suite_end":
+            seen_end = True
+        if not isinstance(ev.get("case"), str):
+            fail(f"trace/events.jsonl line {ln}: case must be string")
+        if not isinstance(ev.get("message"), str):
+            fail(f"trace/events.jsonl line {ln}: message must be string")
+        ctr = ev.get("counters")
+        if not isinstance(ctr, dict):
+            fail(f"trace/events.jsonl line {ln}: counters must be object")
+        for k in ("total", "pass", "fail", "skip"):
+            if not isinstance(ctr.get(k), int):
+                fail(f"trace/events.jsonl line {ln}: counters.{k} must be int")
+
+if not seen_start:
+    fail("trace/events.jsonl missing suite_start")
+if not seen_end:
+    fail("trace/events.jsonl missing suite_end")
+
+# Generic parseability checks for JSON/JSONL artifacts.
+for path in file_map.keys():
+    abs_path = os.path.join(artifact_dir, path)
+    if path.endswith(".json"):
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                txt = f.read()
+            # Some suites intentionally capture empty bodies into *.json artifacts.
+            # Treat empty/whitespace-only files as valid "no payload" transcripts.
+            if not txt.strip():
+                continue
+            json.loads(txt)
+        except Exception as e:
+            fail(f"{path} invalid JSON: {e}")
+    if path.endswith(".jsonl") or path.endswith(".ndjson"):
+        with open(abs_path, "r", encoding="utf-8") as f:
+            for ln, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    json.loads(line)
+                except Exception as e:
+                    fail(f"{path} invalid JSONL at line {ln}: {e}")
+PY
+        return $?
+    fi
+
+    # Fallback: shallow sanity check (no JSON parser available).
+    grep -q '"schema"' "$manifest" && grep -q '"files"' "$manifest" && grep -q '"artifacts"' "$manifest"
 }
 
 # ---------------------------------------------------------------------------
@@ -397,18 +973,25 @@ e2e_summary() {
     echo -e "  Artifacts: ${E2E_ARTIFACT_DIR}"
     echo -e "${_e2e_color_blue}════════════════════════════════════════════════════════════${_e2e_color_reset}"
 
+    E2E_RUN_ENDED_AT="$(_e2e_now_rfc3339)"
+    E2E_RUN_END_EPOCH_S="$(date +%s)"
+    _e2e_trace_event "suite_end" ""
+
     # Save summary to artifacts
     if [ -d "$E2E_ARTIFACT_DIR" ]; then
-        cat > "${E2E_ARTIFACT_DIR}/summary.json" <<EOJSON
-{
-  "suite": "${E2E_SUITE}",
-  "timestamp": "${E2E_TIMESTAMP}",
-  "total": ${_E2E_TOTAL},
-  "pass": ${_E2E_PASS},
-  "fail": ${_E2E_FAIL},
-  "skip": ${_E2E_SKIP}
-}
-EOJSON
+        e2e_write_summary_json
+        e2e_write_meta_json
+        e2e_write_metrics_json
+        e2e_write_diagnostics_files
+        e2e_write_transcript_summary
+
+        # Emit a versioned bundle manifest and validate it. This provides
+        # artifact-contract enforcement for CI regression triage (br-3vwi.10.18).
+        e2e_write_bundle_manifest
+        if ! e2e_validate_bundle_manifest; then
+            e2e_log "Artifact bundle manifest validation failed"
+            return 1
+        fi
     fi
 
     if [ "$_E2E_FAIL" -gt 0 ]; then

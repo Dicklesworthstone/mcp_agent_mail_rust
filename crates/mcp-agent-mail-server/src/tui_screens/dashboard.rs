@@ -19,7 +19,7 @@ use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{DbStatSnapshot, EventSeverity, MailEvent, MailEventKind, VerbosityTier};
-use crate::tui_screens::{HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -63,6 +63,8 @@ pub struct DashboardScreen {
 pub(crate) struct EventEntry {
     pub(crate) kind: MailEventKind,
     pub(crate) severity: EventSeverity,
+    pub(crate) seq: u64,
+    pub(crate) timestamp_micros: i64,
     pub(crate) timestamp: String,
     pub(crate) icon: char,
     pub(crate) summary: String,
@@ -147,6 +149,16 @@ impl MailScreen for DashboardScreen {
                         self.auto_follow = !self.auto_follow;
                         if self.auto_follow {
                             self.scroll_offset = 0;
+                        }
+                    }
+                    // Deep-link: jump to Timeline at focused event timestamp.
+                    KeyCode::Enter => {
+                        let visible = self.visible_entries();
+                        let idx = visible.len().saturating_sub(1 + self.scroll_offset);
+                        if let Some(entry) = visible.get(idx) {
+                            return Cmd::msg(MailScreenMsg::DeepLink(
+                                DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
+                            ));
                         }
                     }
                     // Cycle verbosity tier
@@ -235,6 +247,10 @@ impl MailScreen for DashboardScreen {
                 action: "Scroll event log",
             },
             HelpEntry {
+                key: "Enter",
+                action: "Timeline at event",
+            },
+            HelpEntry {
                 key: "f",
                 action: "Toggle auto-follow",
             },
@@ -308,7 +324,9 @@ fn format_ts(micros: i64) -> String {
 pub(crate) fn format_event(event: &MailEvent) -> EventEntry {
     let kind = event.kind();
     let icon = event_icon(kind);
-    let timestamp = format_ts(event.timestamp_micros());
+    let seq = event.seq();
+    let timestamp_micros = event.timestamp_micros();
+    let timestamp = format_ts(timestamp_micros);
 
     let summary = match event {
         MailEvent::ToolCallStart {
@@ -405,6 +423,8 @@ pub(crate) fn format_event(event: &MailEvent) -> EventEntry {
     EventEntry {
         kind,
         severity: event.severity(),
+        seq,
+        timestamp_micros,
         timestamp,
         icon,
         summary,
@@ -586,17 +606,29 @@ fn render_event_log(
     let end = (start + visible_height).min(total);
     let viewport = &entries[start..end];
 
+    // Focused entry is the one at the bottom of the viewport (most recent in view).
+    let focused_abs_idx = if total == 0 {
+        None
+    } else {
+        Some(total.saturating_sub(1 + scroll_offset))
+    };
+    let focus_style = Style::default().reverse().bold();
+
     // Build styled text lines with colored severity badges
     let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len());
-    for entry in viewport {
+    for (view_idx, entry) in viewport.iter().enumerate() {
+        let abs_idx = start + view_idx;
         let sev = entry.severity;
-        let line = Line::from_spans([
-            Span::raw(format!("{} ", entry.timestamp)),
+        let mut line = Line::from_spans([
+            Span::raw(format!("{:>6} {} ", entry.seq, entry.timestamp)),
             sev.styled_badge(),
             Span::raw(" "),
             Span::styled(format!("{}", entry.icon), sev.style()),
             Span::raw(format!(" {}", entry.summary)),
         ]);
+        if Some(abs_idx) == focused_abs_idx {
+            line.apply_base_style(focus_style);
+        }
         text_lines.push(line);
     }
     let text = Text::from_lines(text_lines);
@@ -990,6 +1022,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::HttpRequest,
             severity: EventSeverity::Debug,
+            seq: 1,
+            timestamp_micros: 0,
             timestamp: "00:00:00.000".to_string(),
             icon: '↔',
             summary: "GET /".to_string(),
@@ -997,6 +1031,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,
+            seq: 2,
+            timestamp_micros: 1_000,
             timestamp: "00:00:00.001".to_string(),
             icon: '⚙',
             summary: "send_message 5ms".to_string(),
@@ -1017,9 +1053,63 @@ mod tests {
         let bindings = screen.keybindings();
         assert!(bindings.len() >= 4);
         assert!(bindings.iter().any(|b| b.key == "j/k"));
+        assert!(bindings.iter().any(|b| b.key == "Enter"));
         assert!(bindings.iter().any(|b| b.key == "f"));
         assert!(bindings.iter().any(|b| b.key == "v"));
         assert!(bindings.iter().any(|b| b.key == "t"));
+    }
+
+    #[test]
+    fn enter_deep_links_to_timeline_at_focused_event() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.verbosity = VerbosityTier::All;
+
+        screen.event_log.push(EventEntry {
+            kind: MailEventKind::HttpRequest,
+            severity: EventSeverity::Debug,
+            seq: 1,
+            timestamp_micros: 111,
+            timestamp: "00:00:00.000".to_string(),
+            icon: '↔',
+            summary: "GET /".to_string(),
+        });
+        screen.event_log.push(EventEntry {
+            kind: MailEventKind::ToolCallEnd,
+            severity: EventSeverity::Debug,
+            seq: 2,
+            timestamp_micros: 222,
+            timestamp: "00:00:00.001".to_string(),
+            icon: '⚙',
+            summary: "tool".to_string(),
+        });
+
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        let cmd = screen.update(&enter, &state);
+        assert!(matches!(
+            cmd,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::TimelineAtTime(222)))
+        ));
+
+        // Scroll up one row (focus moves to older entry).
+        screen.auto_follow = false;
+        screen.scroll_offset = 1;
+        let cmd2 = screen.update(&enter, &state);
+        assert!(matches!(
+            cmd2,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::TimelineAtTime(111)))
+        ));
+    }
+
+    #[test]
+    fn enter_on_empty_dashboard_is_noop() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        let cmd = screen.update(&enter, &state);
+        assert!(matches!(cmd, Cmd::None));
     }
 
     #[test]
@@ -1029,6 +1119,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::HealthPulse,
             severity: EventSeverity::Trace,
+            seq: 1,
+            timestamp_micros: 0,
             timestamp: "00:00:00.000".to_string(),
             icon: '♥',
             summary: "pulse".to_string(),
@@ -1036,6 +1128,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,
+            seq: 2,
+            timestamp_micros: 1_000,
             timestamp: "00:00:00.001".to_string(),
             icon: '⚙',
             summary: "tool done".to_string(),
@@ -1043,6 +1137,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::MessageSent,
             severity: EventSeverity::Info,
+            seq: 3,
+            timestamp_micros: 2_000,
             timestamp: "00:00:00.002".to_string(),
             icon: '✉',
             summary: "msg sent".to_string(),
@@ -1050,6 +1146,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::ServerShutdown,
             severity: EventSeverity::Warn,
+            seq: 4,
+            timestamp_micros: 3_000,
             timestamp: "00:00:00.003".to_string(),
             icon: '⏹',
             summary: "shutdown".to_string(),
@@ -1057,6 +1155,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::HttpRequest,
             severity: EventSeverity::Error,
+            seq: 5,
+            timestamp_micros: 4_000,
             timestamp: "00:00:00.004".to_string(),
             icon: '↔',
             summary: "500 error".to_string(),
@@ -1115,6 +1215,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::MessageSent,
             severity: EventSeverity::Info,
+            seq: 1,
+            timestamp_micros: 0,
             timestamp: "00:00:00.000".to_string(),
             icon: '✉',
             summary: "msg".to_string(),
@@ -1122,6 +1224,8 @@ mod tests {
         screen.event_log.push(EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,
+            seq: 2,
+            timestamp_micros: 1_000,
             timestamp: "00:00:00.001".to_string(),
             icon: '⚙',
             summary: "tool".to_string(),
@@ -1201,6 +1305,8 @@ mod tests {
             screen.event_log.push(EventEntry {
                 kind: MailEventKind::HttpRequest,
                 severity: EventSeverity::Debug,
+                seq: 0,
+                timestamp_micros: 0,
                 timestamp: "00:00:00.000".to_string(),
                 icon: '↔',
                 summary: "GET /".to_string(),

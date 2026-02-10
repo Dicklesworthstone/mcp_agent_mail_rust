@@ -888,7 +888,7 @@ mod tests {
     #[test]
     fn tab_count_matches_screens() {
         assert_eq!(MAIL_SCREEN_REGISTRY.len(), ALL_SCREEN_IDS.len());
-        assert_eq!(MAIL_SCREEN_REGISTRY.len(), 13);
+        assert_eq!(MAIL_SCREEN_REGISTRY.len(), 14);
     }
 
     #[test]

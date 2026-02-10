@@ -2617,7 +2617,23 @@ pub async fn list_file_reservations(
         )
     } else {
         (
-            "SELECT * FROM file_reservations WHERE project_id = ? ORDER BY id".to_string(),
+            // Legacy Python schema stored released_ts as TEXT (e.g. "2026-02-05 02:21:37.212634").
+            // Coerce it to INTEGER microseconds so listing historical reservations can't crash.
+            "SELECT \
+                 id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, \
+                 CASE \
+                     WHEN released_ts IS NULL THEN NULL \
+                     WHEN typeof(released_ts) = 'text' THEN CAST(strftime('%s', released_ts) AS INTEGER) * 1000000 + \
+                         CASE WHEN instr(released_ts, '.') > 0 \
+                              THEN CAST(substr(released_ts || '000000', instr(released_ts, '.') + 1, 6) AS INTEGER) \
+                              ELSE 0 \
+                         END \
+                     ELSE released_ts \
+                 END AS released_ts \
+             FROM file_reservations \
+             WHERE project_id = ? \
+             ORDER BY id"
+                .to_string(),
             vec![Value::BigInt(project_id)],
         )
     };

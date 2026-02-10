@@ -975,11 +975,7 @@ impl SearchCockpitScreen {
                 self.saved_recipes.insert(0, saved);
                 // Evict oldest non-pinned recipes when over the cap.
                 while self.saved_recipes.len() > MAX_RECIPES {
-                    if let Some(pos) = self
-                        .saved_recipes
-                        .iter()
-                        .rposition(|r| !r.pinned)
-                    {
+                    if let Some(pos) = self.saved_recipes.iter().rposition(|r| !r.pinned) {
                         self.saved_recipes.remove(pos);
                     } else {
                         break; // all remaining are pinned
