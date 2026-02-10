@@ -243,6 +243,59 @@ Key finding: **futex (86.3%) + sched_yield (8.0%)** = 94.3% of wall time is lock
 7. **#7** access() pattern optimization (Score 6.0) — EAFP over LBYL
 8. **#11** toon subprocess optimization (Score 5.0) — medium effort, subprocess elimination
 
+## TUI V2 Performance Budgets (br-3vwi.9.1)
+
+Baseline captured via `cargo test -p mcp-agent-mail-server --test tui_perf_baselines` (2026-02-10).
+Headless rendering using `ftui-harness` with `Frame::new()` (no terminal I/O).
+
+### Model Initialization
+
+| Surface | Baseline p50 | Baseline p95 | Budget p95 | Notes |
+|---------|-------------|-------------|------------|-------|
+| `MailAppModel::new()` | ~135µs | ~60ms | < 100ms | One-time startup; cold-cache outliers dominate p95 |
+
+### Per-Tick Update
+
+| Surface | Baseline p50 | Baseline p95 | Budget p95 | Notes |
+|---------|-------------|-------------|------------|-------|
+| `update(Event::Tick)` | ~0µs | ~1µs | < 2ms | Ticks all 13 screens; generates toasts from events |
+
+### Per-Screen Render (120×40)
+
+| Screen | Baseline p50 | Baseline p95 | Budget p95 | Notes |
+|--------|-------------|-------------|------------|-------|
+| Dashboard | ~15µs | ~28µs | < 10ms | Overview with summary stats |
+| Messages | ~5µs | ~6µs | < 10ms | Empty message browser |
+| Threads | ~6µs | ~7µs | < 10ms | Empty thread list |
+| Agents | ~44µs | ~61µs | < 10ms | Agent list with columns |
+| Search | ~21µs | ~41µs | < 10ms | Search cockpit with facets |
+| Reservations | ~45µs | ~59µs | < 10ms | File reservation table |
+| ToolMetrics | ~44µs | ~49µs | < 10ms | Tool metrics dashboard |
+| SystemHealth | ~10µs | ~15µs | < 10ms | System health indicators |
+| Timeline | ~2µs | ~3µs | < 10ms | Lightest screen |
+| Projects | ~30µs | ~42µs | < 10ms | Project list with stats |
+| Contacts | ~32µs | ~35µs | < 10ms | Contact matrix |
+| Explorer | ~12µs | ~12µs | < 10ms | Mail explorer tree |
+| Analytics | ~9µs | ~9µs | < 10ms | Analytics overview |
+
+### Full App Render + Tick Cycle
+
+| Surface | Baseline p50 | Baseline p95 | Budget p95 | Notes |
+|---------|-------------|-------------|------------|-------|
+| Full app render (120×40) | ~30µs | ~57µs | < 15ms | Chrome + screen + status + overlays |
+| Screen switch + re-render | ~29µs | ~47µs | < 2ms | Tab key + full re-render |
+| Tick cycle (update + view) | ~30µs | ~40µs | < 20ms | Must stay under 100ms tick interval |
+| Palette open/type/close | ~14µs | ~20µs | < 2ms | Ctrl+P → type → Esc |
+
+### Budget Enforcement
+
+```bash
+MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1 \
+  cargo test -p mcp-agent-mail-server --test tui_perf_baselines --release
+```
+
+Artifacts: `tests/artifacts/tui/perf_baselines/<timestamp>/summary.json`
+
 ## Isomorphism Invariants
 
 Properties that must be preserved across optimizations:
