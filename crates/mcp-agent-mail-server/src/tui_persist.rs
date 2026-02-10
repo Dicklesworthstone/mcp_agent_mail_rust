@@ -54,6 +54,13 @@ pub struct TuiPreferences {
     pub accessibility: AccessibilitySettings,
     #[serde(default)]
     pub keymap_profile: KeymapProfile,
+    /// Active dashboard preset name (e.g. "default", "incident-triage").
+    #[serde(default = "default_preset_name")]
+    pub active_dashboard_preset: String,
+}
+
+fn default_preset_name() -> String {
+    "default".to_string()
 }
 
 impl TuiPreferences {
@@ -84,6 +91,7 @@ impl TuiPreferences {
                 key_hints: config.tui_key_hints,
             },
             keymap_profile,
+            active_dashboard_preset: config.tui_active_preset.clone(),
         }
     }
 
@@ -138,6 +146,7 @@ impl TuiPreferences {
             "TUI_KEYMAP_PROFILE",
             self.keymap_profile.label().to_ascii_lowercase(),
         );
+        map.insert("TUI_ACTIVE_PRESET", self.active_dashboard_preset.clone());
         map
     }
 }

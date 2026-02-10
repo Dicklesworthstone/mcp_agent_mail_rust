@@ -218,6 +218,7 @@ pub struct Config {
     pub tui_high_contrast: bool,
     pub tui_key_hints: bool,
     pub tui_keymap_profile: String,
+    pub tui_active_preset: String,
 }
 
 /// Application environment
@@ -570,6 +571,7 @@ impl Default for Config {
             tui_high_contrast: false,
             tui_key_hints: true,
             tui_keymap_profile: "default".to_string(),
+            tui_active_preset: "default".to_string(),
         }
     }
 }
@@ -1100,6 +1102,12 @@ impl Config {
                 "default" | "vim" | "emacs" | "minimal" | "custom"
             ) {
                 config.tui_keymap_profile = lower;
+            }
+        }
+        if let Some(v) = console_value("TUI_ACTIVE_PRESET") {
+            let trimmed = v.trim().to_string();
+            if !trimmed.is_empty() {
+                config.tui_active_preset = trimmed;
             }
         }
 

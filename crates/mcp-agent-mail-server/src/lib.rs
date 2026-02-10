@@ -60,6 +60,7 @@ pub mod tui_macro;
 pub mod tui_markdown;
 pub mod tui_persist;
 pub mod tui_poller;
+pub mod tui_preset;
 pub mod tui_screens;
 pub mod tui_theme;
 pub mod tui_widgets;
