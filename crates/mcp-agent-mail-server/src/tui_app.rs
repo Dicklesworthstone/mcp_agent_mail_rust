@@ -34,6 +34,9 @@ const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
 const PALETTE_DYNAMIC_THREAD_CAP: usize = 50;
 const PALETTE_DYNAMIC_TOOL_CAP: usize = 50;
+const PALETTE_DYNAMIC_PROJECT_CAP: usize = 30;
+const PALETTE_DYNAMIC_CONTACT_CAP: usize = 30;
+const PALETTE_DYNAMIC_RESERVATION_CAP: usize = 30;
 const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -284,6 +287,35 @@ impl MailAppModel {
             self.active_screen = MailScreenId::ToolMetrics;
             return Cmd::none();
         }
+        if let Some(slug) = id.strip_prefix(palette_action_ids::PROJECT_PREFIX) {
+            let target = DeepLinkTarget::ProjectBySlug(slug.to_string());
+            self.active_screen = MailScreenId::Projects;
+            if let Some(screen) = self.screens.get_mut(&MailScreenId::Projects) {
+                screen.receive_deep_link(&target);
+            }
+            return Cmd::none();
+        }
+        if let Some(pair) = id.strip_prefix(palette_action_ids::CONTACT_PREFIX) {
+            if let Some((from, to)) = pair.split_once(':') {
+                let target =
+                    DeepLinkTarget::ContactByPair(from.to_string(), to.to_string());
+                self.active_screen = MailScreenId::Contacts;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Contacts) {
+                    screen.receive_deep_link(&target);
+                }
+            } else {
+                self.active_screen = MailScreenId::Contacts;
+            }
+            return Cmd::none();
+        }
+        if let Some(agent) = id.strip_prefix(palette_action_ids::RESERVATION_PREFIX) {
+            let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
+            self.active_screen = MailScreenId::Reservations;
+            if let Some(screen) = self.screens.get_mut(&MailScreenId::Reservations) {
+                screen.receive_deep_link(&target);
+            }
+            return Cmd::none();
+        }
 
         // ── Quick actions (context-aware from focused entity) ────
         if let Some(rest) = id.strip_prefix("quick:") {
@@ -323,8 +355,8 @@ impl MailAppModel {
             }
             if let Some(slug) = rest.strip_prefix("project:") {
                 let target = DeepLinkTarget::ProjectBySlug(slug.to_string());
-                self.active_screen = MailScreenId::Dashboard;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Dashboard) {
+                self.active_screen = MailScreenId::Projects;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Projects) {
                     screen.receive_deep_link(&target);
                 }
                 return Cmd::none();
@@ -580,6 +612,9 @@ mod palette_action_ids {
     pub const AGENT_PREFIX: &str = "agent:";
     pub const THREAD_PREFIX: &str = "thread:";
     pub const TOOL_PREFIX: &str = "tool:";
+    pub const PROJECT_PREFIX: &str = "project:";
+    pub const CONTACT_PREFIX: &str = "contact:";
+    pub const RESERVATION_PREFIX: &str = "reservation:";
 
     pub const SCREEN_DASHBOARD: &str = "screen:dashboard";
     pub const SCREEN_MESSAGES: &str = "screen:messages";
@@ -726,38 +761,90 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
 #[must_use]
 fn build_palette_actions(state: &TuiSharedState) -> Vec<ActionItem> {
     let mut out = build_palette_actions_static();
+    build_palette_actions_from_snapshot(state, &mut out);
+    build_palette_actions_from_events(state, &mut out);
+    out
+}
 
-    // ── Agents (top-N most recently active from DB snapshot) ───────
-    if let Some(stats) = state.db_stats_snapshot() {
-        for agent in stats
-            .agents_list
-            .into_iter()
-            .take(PALETTE_DYNAMIC_AGENT_CAP)
-        {
-            let crate::tui_events::AgentSummary {
-                name,
-                program,
-                last_active_ts,
-            } = agent;
-            let title = format!("Agent: {name}");
-            let desc = format!("{program} (last_active_ts: {last_active_ts})");
-            out.push(
-                ActionItem::new(
-                    format!("{}{}", palette_action_ids::AGENT_PREFIX, name),
-                    title,
-                )
-                .with_description(desc)
-                .with_tags(&["agent"])
-                .with_category("Agents"),
-            );
-        }
+/// Append palette entries derived from the periodic DB snapshot (agents, projects, contacts).
+fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<ActionItem>) {
+    let Some(snap) = state.db_stats_snapshot() else {
+        return;
+    };
+
+    for agent in snap
+        .agents_list
+        .into_iter()
+        .take(PALETTE_DYNAMIC_AGENT_CAP)
+    {
+        let crate::tui_events::AgentSummary {
+            name,
+            program,
+            last_active_ts,
+        } = agent;
+        let desc = format!("{program} (last_active_ts: {last_active_ts})");
+        out.push(
+            ActionItem::new(
+                format!("{}{}", palette_action_ids::AGENT_PREFIX, name),
+                format!("Agent: {name}"),
+            )
+            .with_description(desc)
+            .with_tags(&["agent"])
+            .with_category("Agents"),
+        );
     }
 
-    // ── Threads + tools (from recent MailEvent stream) ─────────────
+    for proj in snap
+        .projects_list
+        .into_iter()
+        .take(PALETTE_DYNAMIC_PROJECT_CAP)
+    {
+        let desc = format!(
+            "{} — {} agents, {} msgs",
+            proj.human_key, proj.agent_count, proj.message_count
+        );
+        out.push(
+            ActionItem::new(
+                format!("{}{}", palette_action_ids::PROJECT_PREFIX, proj.slug),
+                format!("Project: {}", proj.slug),
+            )
+            .with_description(desc)
+            .with_tags(&["project"])
+            .with_category("Projects"),
+        );
+    }
+
+    for contact in snap
+        .contacts_list
+        .into_iter()
+        .take(PALETTE_DYNAMIC_CONTACT_CAP)
+    {
+        let pair = format!("{} → {}", contact.from_agent, contact.to_agent);
+        let desc = format!("{} ({})", contact.status, contact.reason);
+        out.push(
+            ActionItem::new(
+                format!(
+                    "{}{}:{}",
+                    palette_action_ids::CONTACT_PREFIX,
+                    contact.from_agent,
+                    contact.to_agent
+                ),
+                format!("Contact: {pair}"),
+            )
+            .with_description(desc)
+            .with_tags(&["contact"])
+            .with_category("Contacts"),
+        );
+    }
+}
+
+/// Append palette entries derived from the recent event stream (threads, tools, reservations).
+fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<ActionItem>) {
     let events = state.recent_events(PALETTE_DYNAMIC_EVENT_SCAN);
 
     let mut threads_seen: HashSet<String> = HashSet::new();
     let mut tools_seen: HashSet<String> = HashSet::new();
+    let mut reservations_seen: HashSet<String> = HashSet::new();
 
     for ev in events.iter().rev() {
         if threads_seen.len() < PALETTE_DYNAMIC_THREAD_CAP {
@@ -792,14 +879,29 @@ fn build_palette_actions(state: &TuiSharedState) -> Vec<ActionItem> {
             }
         }
 
+        if reservations_seen.len() < PALETTE_DYNAMIC_RESERVATION_CAP {
+            if let Some(agent) = extract_reservation_agent(ev) {
+                if reservations_seen.insert(agent.to_string()) {
+                    out.push(
+                        ActionItem::new(
+                            format!("{}{}", palette_action_ids::RESERVATION_PREFIX, agent),
+                            format!("Reservation: {agent}"),
+                        )
+                        .with_description("View file reservations for this agent")
+                        .with_tags(&["reservation", "file", "lock"])
+                        .with_category("Reservations"),
+                    );
+                }
+            }
+        }
+
         if threads_seen.len() >= PALETTE_DYNAMIC_THREAD_CAP
             && tools_seen.len() >= PALETTE_DYNAMIC_TOOL_CAP
+            && reservations_seen.len() >= PALETTE_DYNAMIC_RESERVATION_CAP
         {
             break;
         }
     }
-
-    out
 }
 
 /// Generate a toast notification for high-priority events.
@@ -860,6 +962,14 @@ fn extract_thread(event: &MailEvent) -> Option<(&str, &str)> {
         | MailEvent::MessageReceived {
             thread_id, subject, ..
         } => Some((thread_id, subject)),
+        _ => None,
+    }
+}
+
+fn extract_reservation_agent(event: &MailEvent) -> Option<&str> {
+    match event {
+        MailEvent::ReservationGranted { agent, .. }
+        | MailEvent::ReservationReleased { agent, .. } => Some(agent),
         _ => None,
     }
 }
@@ -1537,10 +1647,10 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_quick_project_navigates_to_dashboard() {
+    fn dispatch_quick_project_navigates_to_projects() {
         let mut model = test_model();
         model.dispatch_palette_action("quick:project:my_proj");
-        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        assert_eq!(model.active_screen(), MailScreenId::Projects);
     }
 
     #[test]
@@ -1548,5 +1658,43 @@ mod tests {
         let mut model = test_model();
         model.dispatch_palette_action("quick:unknown:foo");
         assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+    }
+
+    #[test]
+    fn dispatch_palette_project_prefix_goes_to_projects() {
+        let mut model = test_model();
+        model.dispatch_palette_action("project:my-proj");
+        assert_eq!(model.active_screen(), MailScreenId::Projects);
+    }
+
+    #[test]
+    fn dispatch_palette_contact_prefix_goes_to_contacts() {
+        let mut model = test_model();
+        model.dispatch_palette_action("contact:BlueLake:RedFox");
+        assert_eq!(model.active_screen(), MailScreenId::Contacts);
+    }
+
+    #[test]
+    fn dispatch_palette_contact_no_colon_goes_to_contacts() {
+        let mut model = test_model();
+        model.dispatch_palette_action("contact:malformed");
+        assert_eq!(model.active_screen(), MailScreenId::Contacts);
+    }
+
+    #[test]
+    fn dispatch_palette_reservation_prefix_goes_to_reservations() {
+        let mut model = test_model();
+        model.dispatch_palette_action("reservation:BlueLake");
+        assert_eq!(model.active_screen(), MailScreenId::Reservations);
+    }
+
+    #[test]
+    fn extract_reservation_agent_from_events() {
+        let ev1 = MailEvent::reservation_granted("TestAgent", vec![], true, 60, "proj");
+        let ev2 = MailEvent::reservation_released("OtherAgent", vec![], "proj");
+        let ev3 = MailEvent::tool_call_start("foo", serde_json::json!({}), Some("proj".into()), None);
+        assert_eq!(extract_reservation_agent(&ev1), Some("TestAgent"));
+        assert_eq!(extract_reservation_agent(&ev2), Some("OtherAgent"));
+        assert_eq!(extract_reservation_agent(&ev3), None);
     }
 }
