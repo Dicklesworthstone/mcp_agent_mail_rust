@@ -30,6 +30,7 @@ fastmcp-server.workspace = true
 fastmcp-transport.workspace = true
 chrono.workspace = true
 glob.workspace = true
+sha2.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "../mcp-agent-mail-db" }
 mcp-agent-mail-storage = { path = "../mcp-agent-mail-storage" }
