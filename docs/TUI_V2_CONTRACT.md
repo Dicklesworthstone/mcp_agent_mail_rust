@@ -103,6 +103,9 @@ The Rust HTTP server already exposes a web UI under `/mail/*`. V2 deep-link
 copying should preserve this shape (or evolve it with explicit, intentional
 deltas) so links round-trip across **TUI ↔ web UI ↔ static export**.
 
+Legacy Python -> Rust web parity contract (route-by-route + CI guard):
+- `docs/SPEC-web-ui-parity-contract.md` (br-3vwi.13.1)
+
 Current baseline routes (see `crates/mcp-agent-mail-server/src/mail_ui.rs`):
 
 - `/mail` (project index)
