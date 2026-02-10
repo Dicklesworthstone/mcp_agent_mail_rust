@@ -1,0 +1,24 @@
+Build Status Report                     
+                                        
+Agent: RedFox (claude-code/opus-4.6) Bea
+                                        
+Summary                                 
+                                        
+Implemented configurable keymap profiles
+1. KeymapProfile enum: Default, Vim, Ema
+2. KeymapRegistry: live state with overr
+3. Help overlay: profile-aware with scro
+                                        
+│ Note: All 38 tests passing, 0 clippy w
+                                        
+Key Changes                             
+                                        
+┌────────────────┬───────┬──────────────
+│ File           │ Lines │ Description  
+├────────────────┼───────┼──────────────
+│ tui_keymap.rs  │ +655  │ Core keymap s
+│ tui_persist.rs │ +99   │ Profile persi
+│ tui_app.rs     │ +36   │ App integrati
+└────────────────┴───────┴──────────────
+                                        
+─── rust ───                            

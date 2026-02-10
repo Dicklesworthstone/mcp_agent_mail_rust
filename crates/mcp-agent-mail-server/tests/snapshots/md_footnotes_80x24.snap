@@ -1,0 +1,24 @@
+The system uses WAL mode[^1] for concurrent access.                             
+                                                                                
+Timestamps are stored as microseconds[^2] since Unix epoch.                     
+                                                                                
+                                                                                
+                                                                                
+────────────────────                                                            
+[^1]:                                                                           
+  Write-Ahead Logging provides better concurrency.                              
+[^2]:                                                                           
+  Using i64 allows dates from 290,000 BCE to 290,000 CE.                        
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                

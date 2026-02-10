@@ -1,0 +1,24 @@
+Some text before.                                                               
+                                                                                
+─── python ───                                                                  
+  def leaked():                                                                 
+      return 'never closed'                                                     
+                                                                                
+  This line appears inside the fence because it was never closed.               
+  And this one too.                                                             
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                

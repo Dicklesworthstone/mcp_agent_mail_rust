@@ -1,0 +1,40 @@
+Build Status Report                                                                                                     
+                                                                                                                        
+Agent: RedFox (claude-code/opus-4.6) Bead: br-3vwi.8.3 — Keymap customization                                           
+                                                                                                                        
+Summary                                                                                                                 
+                                                                                                                        
+Implemented configurable keymap profiles with full persistence:                                                         
+1. KeymapProfile enum: Default, Vim, Emacs, Minimal, Custom                                                             
+2. KeymapRegistry: live state with override support                                                                     
+3. Help overlay: profile-aware with scroll                                                                              
+                                                                                                                        
+│ Note: All 38 tests passing, 0 clippy warnings.                                                                        
+                                                                                                                        
+Key Changes                                                                                                             
+                                                                                                                        
+┌────────────────┬───────┬─────────────────────┐                                                                        
+│ File           │ Lines │ Description         │                                                                        
+├────────────────┼───────┼─────────────────────┤                                                                        
+│ tui_keymap.rs  │ +655  │ Core keymap system  │                                                                        
+│ tui_persist.rs │ +99   │ Profile persistence │                                                                        
+│ tui_app.rs     │ +36   │ App integration     │                                                                        
+└────────────────┴───────┴─────────────────────┘                                                                        
+                                                                                                                        
+─── rust ───                                                                                                            
+  pub enum KeymapProfile {                                                                                              
+      Default, Vim, Emacs, Minimal, Custom,                                                                             
+  }                                                                                                                     
+                                                                                                                        
+Next Steps                                                                                                              
+✓ Core implementation                                                                                                   
+✓ Persistence layer                                                                                                     
+☐ User documentation                                                                                                    
+☐ Migration guide                                                                                                       
+                                                                                                                        
+────────────────────────────────────────                                                                                
+                                                                                                                        
+Commit: `be76157`                                                                                                       
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        

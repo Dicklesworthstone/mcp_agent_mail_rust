@@ -1,0 +1,24 @@
+─── rust ───                            
+  fn main() {                           
+      let items = vec![1, 2, 3];        
+      for item in &items {              
+          println!("Item: {item}");     
+      }                                 
+  }                                     
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
