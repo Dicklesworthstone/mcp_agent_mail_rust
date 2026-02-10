@@ -329,6 +329,16 @@ pub fn scrub_snapshot(
     }
 }
 
+/// Scan text for secret patterns and replace with `[REDACTED]`.
+///
+/// Returns `(scrubbed_text, replacement_count)`.
+///
+/// This is the same scanner used by `scrub_snapshot` but exposed for
+/// use by the static rendering pipeline as a defense-in-depth measure.
+pub fn scan_for_secrets(input: &str) -> (String, i64) {
+    scrub_text(input)
+}
+
 /// Replace secret patterns in text with `[REDACTED]`.
 /// Returns `(scrubbed_text, replacement_count)`.
 fn scrub_text(input: &str) -> (String, i64) {

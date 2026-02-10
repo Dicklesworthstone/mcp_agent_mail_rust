@@ -22,6 +22,7 @@ use asupersync::Cx;
 use fastmcp_core::block_on;
 use mcp_agent_mail_db::pool::DbPool;
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
+use mcp_agent_mail_share::scan_for_secrets;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -391,11 +392,15 @@ fn emit_search_index(
                 if entries.iter().any(|e| e.id == mid) {
                     continue;
                 }
+                // Defense-in-depth: scan subject and body excerpt for leaked secrets
+                let (safe_subject, _) = scan_for_secrets(&msg.subject);
+                let excerpt = truncate(&msg.body_md, 300);
+                let (safe_excerpt, _) = scan_for_secrets(&excerpt);
                 entries.push(SearchIndexEntry {
                     id: mid,
                     project: slug.clone(),
-                    subject: msg.subject.clone(),
-                    body_excerpt: truncate(&msg.body_md, 300),
+                    subject: safe_subject,
+                    body_excerpt: safe_excerpt,
                     from_agent: row.sender_name.clone(),
                     thread_id: msg.thread_id.clone().unwrap_or_default(),
                     importance: msg.importance.clone(),

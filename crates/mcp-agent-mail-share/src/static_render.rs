@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value as SqlValue;
 use sqlmodel_sqlite::SqliteConnection;
 
-use crate::{ShareError, ShareResult};
+use crate::{ExportRedactionPolicy, RedactionAuditLog, RedactionReason, ShareError, ShareResult};
 
 // ── Configuration ───────────────────────────────────────────────────────
 
@@ -38,6 +38,9 @@ pub struct StaticRenderConfig {
     pub include_bodies: bool,
     /// Title prefix for HTML pages.
     pub site_title: String,
+    /// Export-time redaction policy. Controls defense-in-depth secret scanning,
+    /// body redaction enforcement, and recipient visibility.
+    pub redaction: ExportRedactionPolicy,
 }
 
 impl Default for StaticRenderConfig {
@@ -48,6 +51,7 @@ impl Default for StaticRenderConfig {
             base_path: ".".to_string(),
             include_bodies: true,
             site_title: "MCP Agent Mail".to_string(),
+            redaction: ExportRedactionPolicy::default(),
         }
     }
 }
@@ -69,6 +73,8 @@ pub struct StaticRenderResult {
     pub search_index_entries: usize,
     /// Paths of all generated files (relative to output dir).
     pub generated_files: Vec<String>,
+    /// Audit log of all redaction actions taken during this render.
+    pub redaction_audit: RedactionAuditLog,
 }
 
 /// A single entry in the sitemap.
@@ -131,6 +137,89 @@ struct ThreadInfo {
     latest_ts: String,
 }
 
+// ── Redaction helpers ────────────────────────────────────────────────────
+
+const BODY_REDACTED_PLACEHOLDER: &str = "[Message body redacted]";
+
+/// Check if a message body appears to be a redacted placeholder.
+fn is_redacted_body(body: &str) -> bool {
+    let trimmed = body.trim();
+    trimmed == BODY_REDACTED_PLACEHOLDER || trimmed.starts_with("[Message body redacted")
+}
+
+/// Apply defense-in-depth secret scanning to a string.
+/// Returns the sanitized string and whether any secrets were found.
+fn defense_scan(input: &str, policy: &ExportRedactionPolicy) -> (String, bool) {
+    if !policy.scan_secrets {
+        return (input.to_string(), false);
+    }
+    let (result, count) = crate::scrub::scan_for_secrets(input);
+    (result, count > 0)
+}
+
+/// Apply the redaction policy to a message, returning the display body
+/// and whether it was redacted.
+fn apply_body_redaction(
+    body: &str,
+    policy: &ExportRedactionPolicy,
+    audit: &mut RedactionAuditLog,
+    msg_id: i64,
+) -> (String, bool) {
+    // If no redaction policy is active, pass through unchanged.
+    if !policy.is_active() {
+        return (body.to_string(), false);
+    }
+
+    // If the body was already redacted by the scrub pass, preserve the placeholder.
+    if is_redacted_body(body) {
+        audit.record(
+            RedactionReason::ScrubPreset,
+            format!("message {msg_id}: body was redacted by scrub pass"),
+            Some(msg_id),
+        );
+        return (BODY_REDACTED_PLACEHOLDER.to_string(), true);
+    }
+
+    // If the policy says to redact all bodies (strict mode), replace it.
+    if policy.redact_bodies {
+        audit.record(
+            RedactionReason::BodyRedacted,
+            format!("message {msg_id}: body hidden per strict export policy"),
+            Some(msg_id),
+        );
+        return (policy.body_placeholder.clone(), true);
+    }
+
+    // Defense-in-depth: scan for any remaining secrets.
+    let (sanitized, had_secrets) = defense_scan(body, policy);
+    if had_secrets {
+        audit.record(
+            RedactionReason::SecretDetected,
+            format!("message {msg_id}: secret pattern detected in body"),
+            Some(msg_id),
+        );
+    }
+    (sanitized, had_secrets)
+}
+
+/// Apply redaction to a subject line (defense-in-depth scanning only).
+fn apply_subject_redaction(
+    subject: &str,
+    policy: &ExportRedactionPolicy,
+    audit: &mut RedactionAuditLog,
+    msg_id: i64,
+) -> String {
+    let (sanitized, had_secrets) = defense_scan(subject, policy);
+    if had_secrets {
+        audit.record(
+            RedactionReason::SecretDetected,
+            format!("message {msg_id}: secret pattern detected in subject"),
+            Some(msg_id),
+        );
+    }
+    sanitized
+}
+
 // ── Main pipeline ───────────────────────────────────────────────────────
 
 /// Run the full static rendering pipeline.
@@ -138,6 +227,12 @@ struct ThreadInfo {
 /// Opens the exported database at `snapshot_path`, discovers all routes,
 /// renders HTML pages, and writes them along with sitemap and search index
 /// to `output_dir/viewer/pages/`.
+///
+/// The pipeline enforces the configured [`ExportRedactionPolicy`]:
+/// - Defense-in-depth secret scanning on all rendered text
+/// - Body redaction enforcement for strict presets
+/// - Recipient list hiding for strict presets
+/// - Audit log of all redaction actions taken
 pub fn render_static_site(
     snapshot_path: &Path,
     output_dir: &Path,
@@ -154,10 +249,48 @@ pub fn render_static_site(
     let mut generated_files = Vec::new();
     let mut sitemap: Vec<SitemapEntry> = Vec::new();
     let mut search_index: Vec<SearchIndexEntry> = Vec::new();
+    let mut audit = RedactionAuditLog::default();
 
     // ── Discover data ───────────────────────────────────────────────
     let projects = discover_projects(&conn)?;
-    let messages = discover_messages(&conn, config)?;
+    let raw_messages = discover_messages(&conn, config)?;
+
+    // ── Apply redaction to all messages before any rendering ────────
+    // This ensures all surfaces (project pages, inbox, thread views,
+    // search index, sitemap) use redacted content consistently.
+    let messages: Vec<MessageInfo> = raw_messages
+        .iter()
+        .map(|msg| {
+            let (display_body, _body_redacted) =
+                apply_body_redaction(&msg.body_md, &config.redaction, &mut audit, msg.id);
+            let display_subject =
+                apply_subject_redaction(&msg.subject, &config.redaction, &mut audit, msg.id);
+            let display_recipients = if config.redaction.redact_recipients {
+                if !msg.recipients.is_empty() {
+                    audit.record(
+                        RedactionReason::RecipientsHidden,
+                        format!("message {}: recipients hidden", msg.id),
+                        Some(msg.id),
+                    );
+                }
+                Vec::new()
+            } else {
+                msg.recipients.clone()
+            };
+            MessageInfo {
+                id: msg.id,
+                subject: display_subject,
+                body_md: display_body,
+                importance: msg.importance.clone(),
+                created_ts: msg.created_ts.clone(),
+                sender_name: msg.sender_name.clone(),
+                project_slug: msg.project_slug.clone(),
+                thread_id: msg.thread_id.clone(),
+                recipients: display_recipients,
+            }
+        })
+        .collect();
+
     let threads = build_thread_index(&messages);
 
     // ── Render index page ───────────────────────────────────────────
@@ -219,7 +352,8 @@ pub fn render_static_site(
     std::fs::create_dir_all(&msg_pages_dir)?;
 
     for msg in &messages {
-        let msg_html = render_message_page(msg, config);
+        let body_was_redacted = is_redacted_body(&msg.body_md);
+        let msg_html = render_message_page(msg, body_was_redacted, config);
         let filename = format!("{}.html", msg.id);
         write_page(&msg_pages_dir, &filename, &msg_html)?;
         generated_files.push(format!("viewer/pages/messages/{filename}"));
@@ -230,8 +364,15 @@ pub fn render_static_site(
             entry_type: "message".to_string(),
         });
 
-        // Build search index entry
-        let snippet = if msg.body_md.len() > config.search_snippet_len {
+        // Build search index entry — exclude redacted bodies from snippets
+        let snippet = if body_was_redacted {
+            audit.record(
+                RedactionReason::SnippetExcluded,
+                format!("message {}: search snippet excluded", msg.id),
+                Some(msg.id),
+            );
+            config.redaction.snippet_placeholder.clone()
+        } else if msg.body_md.len() > config.search_snippet_len {
             let end = find_char_boundary(&msg.body_md, config.search_snippet_len);
             format!("{}...", &msg.body_md[..end])
         } else {
@@ -300,6 +441,14 @@ pub fn render_static_site(
 
     generated_files.sort();
 
+    // ── Write redaction audit log ──────────────────────────────────
+    if audit.total() > 0 {
+        let audit_json = serde_json::to_string_pretty(&audit).unwrap_or_else(|_| "{}".to_string());
+        std::fs::write(data_dir.join("redaction_audit.json"), &audit_json)?;
+        generated_files.push("viewer/data/redaction_audit.json".to_string());
+        generated_files.sort();
+    }
+
     Ok(StaticRenderResult {
         pages_generated: sitemap.len(),
         projects_count: projects.len(),
@@ -307,6 +456,7 @@ pub fn render_static_site(
         threads_count: threads.len(),
         search_index_entries: sorted_index.len(),
         generated_files,
+        redaction_audit: audit,
     })
 }
 
@@ -692,7 +842,11 @@ fn render_inbox_page(
     )
 }
 
-fn render_message_page(msg: &MessageInfo, config: &StaticRenderConfig) -> String {
+fn render_message_page(
+    msg: &MessageInfo,
+    body_was_redacted: bool,
+    config: &StaticRenderConfig,
+) -> String {
     let thread_link = msg
         .thread_id
         .as_ref()
@@ -705,13 +859,28 @@ fn render_message_page(msg: &MessageInfo, config: &StaticRenderConfig) -> String
         })
         .unwrap_or_default();
 
-    let recipients_str = if msg.recipients.is_empty() {
+    let recipients_str = if config.redaction.redact_recipients {
+        "<p class=\"meta redaction-notice\" data-redaction-reason=\"recipients_hidden\">\
+         To: <em>[Recipients hidden per export policy]</em></p>"
+            .to_string()
+    } else if msg.recipients.is_empty() {
         String::new()
     } else {
         format!(
             "<p class=\"meta\">To: {}</p>",
             html_escape(&msg.recipients.join(", "))
         )
+    };
+
+    // Render body with redaction notice if applicable
+    let body_html = if body_was_redacted {
+        format!(
+            "<div class=\"body redaction-notice\" data-redaction-reason=\"body_redacted\">\
+             <em>{}</em></div>",
+            html_escape(&msg.body_md)
+        )
+    } else {
+        format!("<div class=\"body\">{}</div>", html_escape(&msg.body_md))
     };
 
     let body = format!(
@@ -723,14 +892,14 @@ fn render_message_page(msg: &MessageInfo, config: &StaticRenderConfig) -> String
   <p>Importance: {badge}</p>
   {thread_link}
 </div>
-<div class="body">{body_content}</div>"#,
+{body_html}"#,
         sender = html_escape(&msg.sender_name),
         recipients = recipients_str,
         project = html_escape(&msg.project_slug),
         ts = html_escape(&msg.created_ts),
         badge = importance_badge(&msg.importance),
         thread_link = thread_link,
-        body_content = html_escape(&msg.body_md),
+        body_html = body_html,
     );
 
     page_wrapper(
@@ -769,16 +938,27 @@ fn render_thread_page(
         latest = html_escape(&info.latest_ts),
         cards = messages
             .iter()
-            .map(|m| format!(
-                "<div class=\"card\"><h3><a href=\"../messages/{id}.html\">{subj}</a></h3>\
-                 <div class=\"meta\">{sender} &middot; {ts}</div>\
-                 <div class=\"body\">{body}</div></div>",
-                id = m.id,
-                subj = html_escape(&m.subject),
-                sender = html_escape(&m.sender_name),
-                ts = html_escape(&m.created_ts),
-                body = html_escape(&truncate_str(&m.body_md, 500)),
-            ))
+            .map(|m| {
+                // Apply redaction to body snippets in thread view
+                let body_snippet = if config.redaction.redact_bodies || is_redacted_body(&m.body_md)
+                {
+                    format!("<em>{}</em>", html_escape(BODY_REDACTED_PLACEHOLDER))
+                } else {
+                    let truncated = truncate_str(&m.body_md, 500);
+                    let (sanitized, _) = defense_scan(&truncated, &config.redaction);
+                    html_escape(&sanitized)
+                };
+                format!(
+                    "<div class=\"card\"><h3><a href=\"../messages/{id}.html\">{subj}</a></h3>\
+                     <div class=\"meta\">{sender} &middot; {ts}</div>\
+                     <div class=\"body\">{body}</div></div>",
+                    id = m.id,
+                    subj = html_escape(&m.subject),
+                    sender = html_escape(&m.sender_name),
+                    ts = html_escape(&m.created_ts),
+                    body = body_snippet,
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n"),
     );
@@ -1096,6 +1276,35 @@ mod tests {
         assert_eq!(config.messages_per_page, 200);
         assert_eq!(config.search_snippet_len, 300);
         assert!(config.include_bodies);
+        assert!(config.redaction.scan_secrets);
+        assert!(!config.redaction.redact_bodies);
+    }
+
+    // ── Redaction policy helpers ──────────────────────────────────────
+
+    #[test]
+    fn is_redacted_body_detects_placeholder() {
+        assert!(is_redacted_body("[Message body redacted]"));
+        assert!(is_redacted_body("  [Message body redacted]  "));
+        assert!(!is_redacted_body("Normal message body"));
+    }
+
+    #[test]
+    fn defense_scan_catches_github_token() {
+        let policy = ExportRedactionPolicy::default();
+        let (result, found) = defense_scan("Use ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789", &policy);
+        assert!(found);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("ghp_"));
+    }
+
+    #[test]
+    fn defense_scan_noop_when_disabled() {
+        let policy = ExportRedactionPolicy::none();
+        let input = "Use ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
+        let (result, found) = defense_scan(input, &policy);
+        assert!(!found);
+        assert_eq!(result, input);
     }
 
     // ── Integration: render with in-memory DB ───────────────────────
@@ -1266,6 +1475,428 @@ mod tests {
         assert!(msg_html.contains("Hello World"));
         assert!(msg_html.contains("RedFox"));
         assert!(msg_html.contains("test-project"));
+    }
+
+    // ── Threat-model negative fixture tests ──────────────────────────
+    //
+    // These tests verify that secrets and sensitive content never leak
+    // through any export artifact (HTML, search index, sitemap, navigation).
+
+    /// Helper: create a fixture DB with messages containing secrets.
+    fn create_secret_fixture_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let db_path = dir.join("secrets.sqlite3");
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/p')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'RedFox')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'BlueLake')",
+            &[],
+        )
+        .unwrap();
+
+        // Message 1: GitHub token in body
+        conn.execute_sync(
+            "INSERT INTO messages VALUES (1, 1, 1, 'Setup instructions', \
+             'Use token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 for auth', \
+             'normal', '2024-01-01T00:00:00Z', 'setup-thread')",
+            &[],
+        )
+        .unwrap();
+
+        // Message 2: AWS key in subject
+        conn.execute_sync(
+            "INSERT INTO messages VALUES (2, 1, 2, 'AWS key AKIAIOSFODNN7EXAMPLE found in config', \
+             'Please rotate this key immediately.', \
+             'high', '2024-01-01T01:00:00Z', 'setup-thread')",
+            &[],
+        )
+        .unwrap();
+
+        // Message 3: Bearer token in body
+        conn.execute_sync(
+            "INSERT INTO messages VALUES (3, 1, 1, 'API integration', \
+             'Set header: bearer MySecretTokenABCDEF1234567890', \
+             'normal', '2024-01-02T00:00:00Z', NULL)",
+            &[],
+        )
+        .unwrap();
+
+        // Message 4: Already-redacted body (simulating scrub pass)
+        conn.execute_sync(
+            "INSERT INTO messages VALUES (4, 1, 2, 'Credential rotation', \
+             '[Message body redacted]', \
+             'normal', '2024-01-03T00:00:00Z', 'setup-thread')",
+            &[],
+        )
+        .unwrap();
+
+        // Message 5: JWT in body
+        conn.execute_sync(
+            "INSERT INTO messages VALUES (5, 1, 1, 'Session token', \
+             'Token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U', \
+             'normal', '2024-01-04T00:00:00Z', NULL)",
+            &[],
+        )
+        .unwrap();
+
+        // Add recipients (id, message_id, agent_id, read_ts, ack_ts)
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (1, 1, 2, NULL, NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (2, 2, 1, NULL, NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (3, 3, 2, NULL, NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (4, 4, 1, NULL, NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (5, 5, 2, NULL, NULL)",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+        db_path
+    }
+
+    /// Collect all text content from all generated files.
+    fn collect_all_output_text(output_dir: &std::path::Path) -> String {
+        let mut all_text = String::new();
+        for entry in walkdir(output_dir) {
+            if let Ok(content) = std::fs::read_to_string(&entry) {
+                all_text.push_str(&content);
+                all_text.push('\n');
+            }
+        }
+        all_text
+    }
+
+    /// Simple directory walker (no external dep needed).
+    fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    files.extend(walkdir(&path));
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    /// THREAT: GitHub tokens must not appear in any generated HTML page.
+    #[test]
+    fn negative_github_token_not_in_html() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+        let config = StaticRenderConfig::default(); // standard: scan_secrets=true
+
+        let result = render_static_site(&db_path, &output, &config).unwrap();
+
+        // The message page for msg 1 must not contain the raw token
+        let msg1_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/1.html")).unwrap();
+        assert!(
+            !msg1_html.contains("ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"),
+            "GitHub token leaked into message HTML"
+        );
+        assert!(
+            msg1_html.contains("[REDACTED]"),
+            "Token should be replaced with [REDACTED]"
+        );
+        assert!(result.redaction_audit.secrets_caught > 0);
+    }
+
+    /// THREAT: AWS access key IDs must not appear in any generated output.
+    #[test]
+    fn negative_aws_key_not_in_any_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+        let config = StaticRenderConfig::default();
+        render_static_site(&db_path, &output, &config).unwrap();
+
+        let all_text = collect_all_output_text(&output);
+        assert!(
+            !all_text.contains("AKIAIOSFODNN7EXAMPLE"),
+            "AWS key leaked into generated output"
+        );
+    }
+
+    /// THREAT: Bearer tokens must not appear in search index.
+    #[test]
+    fn negative_bearer_token_not_in_search_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+        let config = StaticRenderConfig::default();
+        render_static_site(&db_path, &output, &config).unwrap();
+
+        let search_json =
+            std::fs::read_to_string(output.join("viewer/data/search_index.json")).unwrap();
+        assert!(
+            !search_json.contains("MySecretTokenABCDEF1234567890"),
+            "Bearer token leaked into search index"
+        );
+    }
+
+    /// THREAT: JWTs must not appear in thread page body snippets.
+    #[test]
+    fn negative_jwt_not_in_thread_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+        let config = StaticRenderConfig::default();
+        render_static_site(&db_path, &output, &config).unwrap();
+
+        // The setup-thread page has messages with secrets
+        let thread_html =
+            std::fs::read_to_string(output.join("viewer/pages/threads/setup-thread.html")).unwrap();
+        assert!(
+            !thread_html.contains("eyJhbGciOiJIUzI1NiJ9"),
+            "JWT fragment leaked into thread HTML"
+        );
+    }
+
+    /// THREAT: Strict preset must redact ALL message bodies.
+    #[test]
+    fn negative_strict_preset_redacts_all_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+
+        let config = StaticRenderConfig {
+            redaction: ExportRedactionPolicy::from_preset(crate::ScrubPreset::Strict),
+            ..StaticRenderConfig::default()
+        };
+        let result = render_static_site(&db_path, &output, &config).unwrap();
+
+        // All message pages should contain the redaction notice
+        let msg3_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/3.html")).unwrap();
+        assert!(
+            msg3_html.contains("data-redaction-reason"),
+            "Strict preset message should have redaction reason attribute"
+        );
+        assert!(
+            !msg3_html.contains("Set header:"),
+            "Body content leaked despite strict preset"
+        );
+
+        // Search index should have placeholder snippets
+        let search_json =
+            std::fs::read_to_string(output.join("viewer/data/search_index.json")).unwrap();
+        assert!(
+            !search_json.contains("rotate this key"),
+            "Body content leaked into search index under strict preset"
+        );
+        assert!(
+            search_json.contains("Content hidden per export policy"),
+            "Strict preset should use snippet placeholder"
+        );
+
+        // Audit log should reflect redaction counts
+        assert!(result.redaction_audit.bodies_redacted > 0);
+        assert!(result.redaction_audit.snippets_filtered > 0);
+    }
+
+    /// THREAT: Strict preset must hide recipient lists.
+    #[test]
+    fn negative_strict_preset_hides_recipients() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+
+        let config = StaticRenderConfig {
+            redaction: ExportRedactionPolicy::from_preset(crate::ScrubPreset::Strict),
+            ..StaticRenderConfig::default()
+        };
+        let result = render_static_site(&db_path, &output, &config).unwrap();
+
+        let msg1_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/1.html")).unwrap();
+        assert!(
+            msg1_html.contains("Recipients hidden per export policy"),
+            "Strict preset should hide recipient names"
+        );
+        assert!(result.redaction_audit.recipients_hidden > 0);
+    }
+
+    /// THREAT: Already-redacted bodies must not be re-exposed.
+    #[test]
+    fn negative_pre_redacted_body_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+        let config = StaticRenderConfig::default();
+        let result = render_static_site(&db_path, &output, &config).unwrap();
+
+        // Message 4 had "[Message body redacted]" in the DB
+        let msg4_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/4.html")).unwrap();
+        assert!(
+            msg4_html.contains("data-redaction-reason=\"body_redacted\""),
+            "Pre-redacted body should carry a redaction reason"
+        );
+        // Search index for msg 4 should have placeholder
+        let search_json =
+            std::fs::read_to_string(output.join("viewer/data/search_index.json")).unwrap();
+        let entries: Vec<SearchIndexEntry> = serde_json::from_str(&search_json).unwrap();
+        let msg4_entry = entries.iter().find(|e| e.id == 4).unwrap();
+        assert!(
+            msg4_entry
+                .snippet
+                .contains("Content hidden per export policy"),
+            "Pre-redacted body should have placeholder snippet, got: {}",
+            msg4_entry.snippet
+        );
+    }
+
+    /// THREAT: Archive preset must NOT redact (preserves everything).
+    #[test]
+    fn negative_archive_preset_preserves_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+
+        let config = StaticRenderConfig {
+            redaction: ExportRedactionPolicy::none(),
+            ..StaticRenderConfig::default()
+        };
+        let result = render_static_site(&db_path, &output, &config).unwrap();
+
+        // With archive/none policy, secrets are NOT scanned
+        assert_eq!(result.redaction_audit.secrets_caught, 0);
+        assert_eq!(result.redaction_audit.bodies_redacted, 0);
+
+        // Bodies should appear as-is (including secrets — this is archive mode)
+        let msg1_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/1.html")).unwrap();
+        assert!(
+            msg1_html.contains("ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"),
+            "Archive mode should preserve original content"
+        );
+    }
+
+    /// THREAT: Redaction audit log must be generated when events occur.
+    #[test]
+    fn negative_audit_log_generated_with_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+        let config = StaticRenderConfig::default();
+        let result = render_static_site(&db_path, &output, &config).unwrap();
+
+        assert!(result.redaction_audit.total() > 0);
+        assert!(
+            output.join("viewer/data/redaction_audit.json").exists(),
+            "Audit log file should be generated when redaction events occur"
+        );
+
+        let audit_json =
+            std::fs::read_to_string(output.join("viewer/data/redaction_audit.json")).unwrap();
+        let audit: RedactionAuditLog = serde_json::from_str(&audit_json).unwrap();
+        assert!(audit.total() > 0);
+    }
+
+    /// THREAT: No audit log file when archive mode (no events).
+    #[test]
+    fn negative_no_audit_log_in_archive_mode() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a DB without secrets
+        let db_path = dir.path().join("clean.sqlite3");
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync("INSERT INTO projects VALUES (1, 'p', '/tmp/p')", &[])
+            .unwrap();
+        conn.execute_sync("INSERT INTO agents VALUES (1, 1, 'AgentA')", &[])
+            .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages VALUES (1, 1, 1, 'Clean', 'No secrets here', 'normal', '2024-01-01T00:00:00Z', NULL)",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("output");
+        let config = StaticRenderConfig {
+            redaction: ExportRedactionPolicy::none(),
+            ..StaticRenderConfig::default()
+        };
+        let result = render_static_site(&db_path, &output, &config).unwrap();
+
+        assert_eq!(result.redaction_audit.total(), 0);
+        assert!(
+            !output.join("viewer/data/redaction_audit.json").exists(),
+            "No audit log should be created when there are no redaction events"
+        );
     }
 
     #[test]

@@ -30,12 +30,13 @@ pub use finalize::{
 };
 pub use hosting::{HostingHint, detect_hosting_hints, generate_headers_file};
 pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
-pub use scrub::{ScrubSummary, scrub_snapshot};
+pub use scrub::{ScrubSummary, scan_for_secrets, scrub_snapshot};
 pub use snapshot::{SnapshotContext, create_snapshot_context, create_sqlite_snapshot};
 pub use static_render::{
     SearchIndexEntry, SitemapEntry, StaticRenderConfig, StaticRenderResult, render_static_site,
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -72,6 +73,149 @@ impl ScrubPreset {
 impl std::fmt::Display for ScrubPreset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+// ── Export redaction policy ──────────────────────────────────────────────
+
+/// Export-time redaction policy derived from the scrub preset.
+///
+/// Controls what the static renderer enforces beyond the DB-level scrub pass.
+/// Defense-in-depth: even after scrubbing, the renderer re-scans output for
+/// any secret patterns and applies visibility rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportRedactionPolicy {
+    /// Whether to scan and replace any remaining secret patterns in rendered output.
+    pub scan_secrets: bool,
+    /// Whether message bodies are treated as redacted (strict preset).
+    pub redact_bodies: bool,
+    /// Whether recipient lists are hidden in rendered output.
+    pub redact_recipients: bool,
+    /// Placeholder text for redacted message bodies.
+    pub body_placeholder: String,
+    /// Placeholder text for redacted search snippets.
+    pub snippet_placeholder: String,
+}
+
+impl ExportRedactionPolicy {
+    /// Create a redaction policy from a scrub preset.
+    #[must_use]
+    pub fn from_preset(preset: ScrubPreset) -> Self {
+        match preset {
+            ScrubPreset::Standard => Self {
+                scan_secrets: true,
+                redact_bodies: false,
+                redact_recipients: false,
+                body_placeholder: "[Message body redacted]".to_string(),
+                snippet_placeholder: "[Content hidden per export policy]".to_string(),
+            },
+            ScrubPreset::Strict => Self {
+                scan_secrets: true,
+                redact_bodies: true,
+                redact_recipients: true,
+                body_placeholder: "[Message body redacted]".to_string(),
+                snippet_placeholder: "[Content hidden per export policy]".to_string(),
+            },
+            ScrubPreset::Archive => Self::none(),
+        }
+    }
+
+    /// No redaction applied (archive/operator mode).
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            scan_secrets: false,
+            redact_bodies: false,
+            redact_recipients: false,
+            body_placeholder: String::new(),
+            snippet_placeholder: String::new(),
+        }
+    }
+
+    /// Returns `true` if any redaction rules are active.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.scan_secrets || self.redact_bodies || self.redact_recipients
+    }
+}
+
+impl Default for ExportRedactionPolicy {
+    fn default() -> Self {
+        Self::from_preset(ScrubPreset::Standard)
+    }
+}
+
+/// Reason code explaining why content was hidden or redacted in export output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RedactionReason {
+    /// Content was redacted by the scrub preset during DB-level pass.
+    ScrubPreset,
+    /// A secret pattern was detected and replaced during render.
+    SecretDetected,
+    /// Message body replaced per strict export policy.
+    BodyRedacted,
+    /// Recipients list hidden per strict export policy.
+    RecipientsHidden,
+    /// Search snippet excluded to prevent content leakage.
+    SnippetExcluded,
+}
+
+impl RedactionReason {
+    /// Operator-facing description of why content was hidden.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ScrubPreset => "Content removed during scrub pass (preset policy)",
+            Self::SecretDetected => "Secret pattern detected and replaced",
+            Self::BodyRedacted => "Message body hidden per strict export policy",
+            Self::RecipientsHidden => "Recipient list hidden per strict export policy",
+            Self::SnippetExcluded => "Search snippet excluded to prevent content leakage",
+        }
+    }
+}
+
+/// A single redaction event recorded during the export pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionEvent {
+    pub reason: RedactionReason,
+    /// Human-readable context (e.g. "message 42", "search index entry 7").
+    pub context: String,
+    /// Optional entity ID (message ID, etc.).
+    pub entity_id: Option<i64>,
+}
+
+/// Audit log summarizing all redaction actions during a static export.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RedactionAuditLog {
+    pub events: Vec<RedactionEvent>,
+    pub secrets_caught: usize,
+    pub bodies_redacted: usize,
+    pub snippets_filtered: usize,
+    pub recipients_hidden: usize,
+}
+
+impl RedactionAuditLog {
+    /// Record a redaction event.
+    pub fn record(&mut self, reason: RedactionReason, context: String, entity_id: Option<i64>) {
+        match reason {
+            RedactionReason::SecretDetected => self.secrets_caught += 1,
+            RedactionReason::BodyRedacted | RedactionReason::ScrubPreset => {
+                self.bodies_redacted += 1;
+            }
+            RedactionReason::SnippetExcluded => self.snippets_filtered += 1,
+            RedactionReason::RecipientsHidden => self.recipients_hidden += 1,
+        }
+        self.events.push(RedactionEvent {
+            reason,
+            context,
+            entity_id,
+        });
+    }
+
+    /// Total number of redaction actions taken.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.events.len()
     }
 }
 

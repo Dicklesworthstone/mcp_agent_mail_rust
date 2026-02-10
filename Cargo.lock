@@ -4437,6 +4437,7 @@ dependencies = [
  "jsonwebtoken",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
+ "mcp-agent-mail-share",
  "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",
  "minijinja",
