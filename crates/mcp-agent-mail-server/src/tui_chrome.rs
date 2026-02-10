@@ -439,10 +439,7 @@ pub fn render_help_overlay_sections(
                     .bg(tp.help_bg)
                     .bold(),
             );
-            header.render(
-                Rect::new(inner.x + 1, inner.y + y_pos, col_width, 1),
-                frame,
-            );
+            header.render(Rect::new(inner.x + 1, inner.y + y_pos, col_width, 1), frame);
             y_pos += 1;
         }
         line_idx += 1;

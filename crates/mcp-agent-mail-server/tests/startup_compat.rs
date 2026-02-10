@@ -235,11 +235,7 @@ fn compat_health_liveness_payload() {
     // Legacy Python: GET /health/liveness → {"status": "alive"}
     let expected = serde_json::json!({"status": "alive"});
     assert_eq!(
-        expected
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>(),
+        expected.as_object().unwrap().keys().collect::<Vec<_>>(),
         vec!["status"],
         "COMPAT LOCK: Liveness payload must have exactly one key 'status'"
     );
@@ -427,8 +423,7 @@ fn compat_initialize_returns_server_info() {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let caps = fastmcp_protocol::ServerCapabilities::default();
-    let mut session =
-        fastmcp_server::Session::new(info, caps);
+    let mut session = fastmcp_server::Session::new(info, caps);
 
     let params = fastmcp_protocol::InitializeParams {
         protocol_version: "2024-11-05".to_string(),
@@ -467,8 +462,7 @@ fn compat_initialize_protocol_version() {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let caps = fastmcp_protocol::ServerCapabilities::default();
-    let mut session =
-        fastmcp_server::Session::new(info, caps);
+    let mut session = fastmcp_server::Session::new(info, caps);
 
     let params = fastmcp_protocol::InitializeParams {
         protocol_version: "2024-11-05".to_string(),

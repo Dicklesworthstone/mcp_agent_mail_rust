@@ -10888,16 +10888,14 @@ mod tests {
                 "COMPAT LOCK: Initialize must succeed on '{alias}'"
             );
 
-            let resp_body: serde_json::Value =
-                serde_json::from_slice(&resp.body).expect("json");
+            let resp_body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
             assert_eq!(resp_body["jsonrpc"], "2.0");
             assert!(
                 resp_body.get("result").is_some(),
                 "COMPAT LOCK: Initialize on '{alias}' must return result, got: {resp_body}"
             );
             assert_eq!(
-                resp_body["result"]["serverInfo"]["name"],
-                COMPAT_SERVER_NAME,
+                resp_body["result"]["serverInfo"]["name"], COMPAT_SERVER_NAME,
                 "COMPAT LOCK: Server name in initialize response must match"
             );
         }

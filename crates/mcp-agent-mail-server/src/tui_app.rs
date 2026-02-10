@@ -24,8 +24,8 @@ use crate::tui_screens::{
     agents::AgentsScreen, analytics::AnalyticsScreen, contacts::ContactsScreen,
     dashboard::DashboardScreen, explorer::MailExplorerScreen, messages::MessageBrowserScreen,
     projects::ProjectsScreen, reservations::ReservationsScreen, screen_meta,
-    search::SearchCockpitScreen, system_health::SystemHealthScreen,
-    threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+    search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
+    timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -462,7 +462,7 @@ impl Model for MailAppModel {
                             }
                             KeyCode::Char('?') if !text_mode => {
                                 self.help_visible = !self.help_visible;
-                self.help_scroll = 0;
+                                self.help_scroll = 0;
                                 return Cmd::none();
                             }
                             KeyCode::Char('m') if !text_mode => {

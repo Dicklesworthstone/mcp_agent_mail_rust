@@ -450,9 +450,7 @@ impl KeymapRegistry {
     /// Look up whether an action is text-suppressible.
     #[must_use]
     pub fn is_suppressible(&self, action_id: &str) -> bool {
-        self.resolved
-            .get(action_id)
-            .is_some_and(|(_, _, s)| *s)
+        self.resolved.get(action_id).is_some_and(|(_, _, s)| *s)
     }
 
     /// Generate global binding entries in display order for the help overlay.
@@ -502,7 +500,10 @@ impl KeymapRegistry {
 
     /// Check for conflicts between this registry's bindings and screen bindings.
     #[must_use]
-    pub fn conflicts_with(&self, screen_bindings: &[(&str, &str)]) -> Vec<(String, String, String)> {
+    pub fn conflicts_with(
+        &self,
+        screen_bindings: &[(&str, &str)],
+    ) -> Vec<(String, String, String)> {
         let mut conflicts = Vec::new();
         for (action_id, (label, _action, suppressible)) in &self.resolved {
             if !suppressible {
@@ -513,11 +514,7 @@ impl KeymapRegistry {
                 let screen_codes = label_to_keycodes(screen_label);
                 for gc in &global_codes {
                     if screen_codes.contains(gc) {
-                        conflicts.push((
-                            action_id.clone(),
-                            label.clone(),
-                            format!("{gc:?}"),
-                        ));
+                        conflicts.push((action_id.clone(), label.clone(), format!("{gc:?}")));
                     }
                 }
             }
@@ -531,7 +528,11 @@ impl KeymapRegistry {
         for b in self.profile.bindings() {
             self.resolved.insert(
                 b.action_id.to_string(),
-                (b.label.to_string(), b.action.to_string(), b.text_suppressible),
+                (
+                    b.label.to_string(),
+                    b.action.to_string(),
+                    b.text_suppressible,
+                ),
             );
         }
         // Apply overrides (label only, preserving action desc + suppressibility).

@@ -1774,7 +1774,7 @@ mod tests {
         let db_path = create_secret_fixture_db(dir.path());
         let output = dir.path().join("output");
         let config = StaticRenderConfig::default();
-        let result = render_static_site(&db_path, &output, &config).unwrap();
+        render_static_site(&db_path, &output, &config).unwrap();
 
         // Message 4 had "[Message body redacted]" in the DB
         let msg4_html =

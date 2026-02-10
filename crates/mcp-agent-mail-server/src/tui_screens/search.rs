@@ -45,6 +45,15 @@ const MAX_SNIPPET_CHARS: usize = 180;
 /// Hard cap on highlight terms to keep rendering predictable.
 const MAX_HIGHLIGHT_TERMS: usize = 8;
 
+/// Minimum title width required before we show a snippet in the results list.
+const RESULTS_MIN_TITLE_CHARS: usize = 18;
+/// Minimum snippet width required before we show it in the results list.
+const RESULTS_MIN_SNIPPET_CHARS: usize = 18;
+/// Max chars allocated to the snippet column in the results list.
+const RESULTS_MAX_SNIPPET_CHARS_IN_LIST: usize = 60;
+/// Separator between title and snippet in the results list.
+const RESULTS_SNIPPET_SEP: &str = " | ";
+
 // ──────────────────────────────────────────────────────────────────────
 // Facet types
 // ──────────────────────────────────────────────────────────────────────
@@ -420,10 +429,10 @@ fn highlight_spans(
         .take(MAX_HIGHLIGHT_TERMS)
         .collect();
     if needles.is_empty() {
-        return vec![match base_style {
-            Some(style) => Span::styled(text.to_string(), style),
-            None => Span::raw(text.to_string()),
-        }];
+        return vec![base_style.map_or_else(
+            || Span::raw(text.to_string()),
+            |style| Span::styled(text.to_string(), style),
+        )];
     }
 
     let hay = text.to_ascii_lowercase();
@@ -449,24 +458,21 @@ fn highlight_spans(
         }
 
         let Some((start, end)) = best else {
-            out.push(match base_style {
-                Some(style) => Span::styled(text[i..].to_string(), style),
-                None => Span::raw(text[i..].to_string()),
-            });
+            out.push(base_style.map_or_else(
+                || Span::raw(text[i..].to_string()),
+                |style| Span::styled(text[i..].to_string(), style),
+            ));
             break;
         };
 
         if start > i {
-            out.push(match base_style {
-                Some(style) => Span::styled(text[i..start].to_string(), style),
-                None => Span::raw(text[i..start].to_string()),
-            });
+            out.push(base_style.map_or_else(
+                || Span::raw(text[i..start].to_string()),
+                |style| Span::styled(text[i..start].to_string(), style),
+            ));
         }
         if end > start {
-            out.push(Span::styled(
-                text[start..end].to_string(),
-                highlight_style,
-            ));
+            out.push(Span::styled(text[start..end].to_string(), highlight_style));
         }
         i = end;
     }
@@ -1358,12 +1364,15 @@ impl MailScreen for SearchCockpitScreen {
                 results_area,
                 &self.results,
                 self.cursor,
+                &self.highlight_terms,
+                self.sort_direction,
             );
             render_detail(
                 frame,
                 detail_area,
                 self.results.get(self.cursor),
                 self.detail_scroll,
+                &self.highlight_terms,
             );
         } else {
             // Narrow: facet rail + results only
@@ -1379,6 +1388,8 @@ impl MailScreen for SearchCockpitScreen {
                 results_area,
                 &self.results,
                 self.cursor,
+                &self.highlight_terms,
+                self.sort_direction,
             );
         }
     }
@@ -1804,6 +1815,128 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
     }
 }
 
+fn created_time_hms(created_ts: Option<i64>) -> String {
+    created_ts
+        .map(|ts| {
+            let iso = micros_to_iso(ts);
+            if iso.len() >= 19 {
+                iso[11..19].to_string()
+            } else {
+                iso
+            }
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy)]
+struct ResultListRenderCfg<'a> {
+    width: usize,
+    highlight_terms: &'a [QueryTerm],
+    sort_direction: SortDirection,
+    meta_style: Style,
+    cursor_style: Style,
+    snippet_style: Style,
+    highlight_style: Style,
+}
+
+#[allow(clippy::too_many_lines)]
+fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRenderCfg<'_>) -> Line {
+    let marker = if is_cursor { '>' } else { ' ' };
+
+    let kind_badge = match entry.doc_kind {
+        DocKind::Message => "M",
+        DocKind::Agent => "A",
+        DocKind::Project => "P",
+    };
+
+    let imp_badge = match entry.importance.as_deref() {
+        Some("urgent") => "!!",
+        Some("high") => "!",
+        _ => " ",
+    };
+
+    let time = created_time_hms(entry.created_ts);
+    let proj = entry
+        .project_id
+        .map_or_else(|| "-".to_string(), |pid| format!("p#{pid}"));
+
+    let score_col = if cfg.sort_direction == SortDirection::Relevance {
+        entry
+            .score
+            .map_or_else(|| "      ".to_string(), |s| format!("{s:>6.2}"))
+    } else {
+        String::new()
+    };
+
+    let mut prefix = if cfg.sort_direction == SortDirection::Relevance {
+        format!(
+            "{marker} {kind_badge} {imp_badge:>2} {proj} #{:<5} {time:>8} {score_col} ",
+            entry.id
+        )
+    } else {
+        format!(
+            "{marker} {kind_badge} {imp_badge:>2} {proj} #{:<5} {time:>8} ",
+            entry.id
+        )
+    };
+
+    // Ensure we don't overrun tiny viewports.
+    prefix = truncate_str(&prefix, cfg.width);
+    let remaining = cfg.width.saturating_sub(prefix.len());
+
+    let sep_len = RESULTS_SNIPPET_SEP.len();
+    let mut include_snippet = !entry.body_preview.is_empty();
+    let (title_w, snippet_w) = if include_snippet
+        && remaining >= RESULTS_MIN_TITLE_CHARS + sep_len + RESULTS_MIN_SNIPPET_CHARS
+    {
+        let mut snippet_w = (remaining / 2).min(RESULTS_MAX_SNIPPET_CHARS_IN_LIST);
+        // Leave space for the title.
+        snippet_w = snippet_w.min(remaining.saturating_sub(RESULTS_MIN_TITLE_CHARS + sep_len));
+        let title_w = remaining.saturating_sub(sep_len + snippet_w);
+        if title_w < RESULTS_MIN_TITLE_CHARS || snippet_w < RESULTS_MIN_SNIPPET_CHARS {
+            include_snippet = false;
+            (remaining, 0)
+        } else {
+            (title_w, snippet_w)
+        }
+    } else {
+        include_snippet = false;
+        (remaining, 0)
+    };
+
+    let title = truncate_str(&entry.title, title_w);
+    let snippet = if include_snippet {
+        truncate_str(&entry.body_preview, snippet_w)
+    } else {
+        String::new()
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let line_meta_style = if is_cursor {
+        cfg.cursor_style
+    } else {
+        cfg.meta_style
+    };
+    spans.push(Span::styled(prefix, line_meta_style));
+    spans.extend(highlight_spans(
+        &title,
+        cfg.highlight_terms,
+        None,
+        cfg.highlight_style,
+    ));
+    if include_snippet && !snippet.is_empty() && remaining > 0 {
+        spans.push(Span::styled(RESULTS_SNIPPET_SEP, cfg.meta_style));
+        spans.extend(highlight_spans(
+            &snippet,
+            cfg.highlight_terms,
+            Some(cfg.snippet_style),
+            cfg.highlight_style,
+        ));
+    }
+
+    Line::from_spans(spans)
+}
+
 fn render_results(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1840,113 +1973,22 @@ fn render_results(
     let snippet_style = Style::default().fg(FACET_LABEL_FG);
     let highlight_style = Style::default().fg(RESULT_CURSOR_FG).bold();
 
+    let cfg = ResultListRenderCfg {
+        width: w,
+        highlight_terms,
+        sort_direction,
+        meta_style,
+        cursor_style,
+        snippet_style,
+        highlight_style,
+    };
+
     let mut lines: Vec<Line> = Vec::with_capacity(viewport.len());
 
     for (vi, entry) in viewport.iter().enumerate() {
         let abs_idx = start + vi;
         let is_cursor = abs_idx == cursor_clamped;
-        let marker = if is_cursor { '>' } else { ' ' };
-
-        let kind_badge = match entry.doc_kind {
-            DocKind::Message => "M",
-            DocKind::Agent => "A",
-            DocKind::Project => "P",
-        };
-
-        let imp_badge = match entry.importance.as_deref() {
-            Some("urgent") => "!!",
-            Some("high") => "!",
-            _ => " ",
-        };
-
-        let time = entry
-            .created_ts
-            .map(|ts| {
-                let iso = micros_to_iso(ts);
-                if iso.len() >= 19 {
-                    iso[11..19].to_string()
-                } else {
-                    iso
-                }
-            })
-            .unwrap_or_default();
-
-        let proj = entry
-            .project_id
-            .map(|pid| format!("p#{pid}"))
-            .unwrap_or_else(|| "-".to_string());
-
-        let score_col = if sort_direction == SortDirection::Relevance {
-            entry
-                .score
-                .map(|s| format!("{s:>6.2}"))
-                .unwrap_or_else(|| "      ".to_string())
-        } else {
-            String::new()
-        };
-
-        let mut prefix = if sort_direction == SortDirection::Relevance {
-            format!(
-                "{marker} {kind_badge} {imp_badge:>2} {proj} #{:<5} {time:>8} {score_col} ",
-                entry.id
-            )
-        } else {
-            format!(
-                "{marker} {kind_badge} {imp_badge:>2} {proj} #{:<5} {time:>8} ",
-                entry.id
-            )
-        };
-
-        // Ensure we don't overrun tiny viewports.
-        prefix = truncate_str(&prefix, w);
-        let remaining = w.saturating_sub(prefix.len());
-
-        const MIN_TITLE_CHARS: usize = 18;
-        const MIN_SNIPPET_CHARS: usize = 18;
-        const MAX_SNIPPET_CHARS_IN_LIST: usize = 60;
-        let sep = " | ";
-        let sep_len = sep.len();
-
-        let mut include_snippet = !entry.body_preview.is_empty();
-        let (title_w, snippet_w) = if include_snippet
-            && remaining >= MIN_TITLE_CHARS + sep_len + MIN_SNIPPET_CHARS
-        {
-            let mut snippet_w = (remaining / 2).min(MAX_SNIPPET_CHARS_IN_LIST);
-            // Leave space for the title.
-            snippet_w = snippet_w.min(remaining.saturating_sub(MIN_TITLE_CHARS + sep_len));
-            let title_w = remaining.saturating_sub(sep_len + snippet_w);
-            if title_w < MIN_TITLE_CHARS || snippet_w < MIN_SNIPPET_CHARS {
-                include_snippet = false;
-                (remaining, 0)
-            } else {
-                (title_w, snippet_w)
-            }
-        } else {
-            include_snippet = false;
-            (remaining, 0)
-        };
-
-        let title = truncate_str(&entry.title, title_w);
-        let snippet = if include_snippet {
-            truncate_str(&entry.body_preview, snippet_w)
-        } else {
-            String::new()
-        };
-
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let line_meta_style = if is_cursor { cursor_style } else { meta_style };
-        spans.push(Span::styled(prefix, line_meta_style));
-        spans.extend(highlight_spans(&title, highlight_terms, None, highlight_style));
-        if include_snippet && !snippet.is_empty() && remaining > 0 {
-            spans.push(Span::styled(sep.to_string(), meta_style));
-            spans.extend(highlight_spans(
-                &snippet,
-                highlight_terms,
-                Some(snippet_style),
-                highlight_style,
-            ));
-        }
-        lines.push(Line::from_spans(spans));
+        lines.push(result_entry_line(entry, is_cursor, &cfg));
     }
 
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
@@ -2556,7 +2598,15 @@ mod tests {
 
         let plain: String = spans.iter().map(|s| s.as_str()).collect();
         assert_eq!(plain, "xxNEEDLEyy");
-        assert!(spans.iter().any(|s| s.as_str() == "NEEDLE" && s.style == Some(highlight)));
-        assert!(spans.iter().any(|s| s.as_str() == "xx" && s.style == Some(base)));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.as_str() == "NEEDLE" && s.style == Some(highlight))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.as_str() == "xx" && s.style == Some(base))
+        );
     }
 }

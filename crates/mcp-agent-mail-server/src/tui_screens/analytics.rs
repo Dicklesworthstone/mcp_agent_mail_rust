@@ -4,12 +4,12 @@
 //! badges, confidence scores, rationale, and actionable next steps.
 
 use ftui::layout::{Constraint, Flex, Rect};
+use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::widgets::StatefulWidget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::{AnomalySeverity, InsightCard, InsightFeed, quick_insight_feed};
@@ -52,6 +52,7 @@ impl AnalyticsScreen {
         self.feed.cards.get(self.selected)
     }
 
+    #[allow(clippy::missing_const_for_fn)] // stateful runtime helper
     fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
@@ -66,10 +67,12 @@ impl AnalyticsScreen {
         }
     }
 
+    #[allow(clippy::missing_const_for_fn)] // stateful runtime helper
     fn scroll_detail_up(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_sub(1);
     }
 
+    #[allow(clippy::missing_const_for_fn)] // stateful runtime helper
     fn scroll_detail_down(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_add(1);
     }
@@ -124,6 +127,12 @@ impl AnalyticsScreen {
     }
 }
 
+impl Default for AnalyticsScreen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Rendering helpers ──────────────────────────────────────────────────
 
 fn severity_style(severity: AnomalySeverity) -> Style {
@@ -135,7 +144,7 @@ fn severity_style(severity: AnomalySeverity) -> Style {
     }
 }
 
-fn severity_badge(severity: AnomalySeverity) -> &'static str {
+const fn severity_badge(severity: AnomalySeverity) -> &'static str {
     match severity {
         AnomalySeverity::Critical => "CRIT",
         AnomalySeverity::High => "HIGH",
@@ -145,9 +154,17 @@ fn severity_badge(severity: AnomalySeverity) -> &'static str {
 }
 
 fn confidence_bar(confidence: f64) -> String {
+    let confidence = confidence.clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to [0, 1]
     let filled = (confidence * 10.0).round() as usize;
+    let filled = filled.min(10);
     let empty = 10_usize.saturating_sub(filled);
-    format!("[{}{}] {:3.0}%", "█".repeat(filled), "░".repeat(empty), confidence * 100.0)
+    format!(
+        "[{}{}] {:3.0}%",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        confidence * 100.0
+    )
 }
 
 fn render_card_list(
@@ -157,11 +174,8 @@ fn render_card_list(
     selected: usize,
     table_state: &mut TableState,
 ) {
-    let header = Row::new(vec!["Sev", "Conf", "Headline"]).style(
-        Style::default()
-            .fg(PackedRgba::rgb(180, 180, 220))
-            .bold(),
-    );
+    let header = Row::new(vec!["Sev", "Conf", "Headline"])
+        .style(Style::default().fg(PackedRgba::rgb(180, 180, 220)).bold());
 
     let rows: Vec<Row> = feed
         .cards
@@ -203,12 +217,7 @@ fn render_card_list(
     StatefulWidget::render(&table, area, frame, table_state);
 }
 
-fn render_card_detail(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    card: &InsightCard,
-    scroll: u16,
-) {
+fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scroll: u16) {
     use ftui::text::{Line, Span, Text};
 
     let mut lines = Vec::new();
@@ -235,10 +244,7 @@ fn render_card_detail(
     lines.push(Line::raw(""));
 
     // Rationale
-    lines.push(Line::styled(
-        "Rationale:",
-        Style::default().bold(),
-    ));
+    lines.push(Line::styled("Rationale:", Style::default().bold()));
     for line in card.rationale.lines() {
         lines.push(Line::raw(format!("  {line}")));
     }
@@ -247,7 +253,10 @@ fn render_card_detail(
     // Likely cause
     if let Some(ref cause) = card.likely_cause {
         lines.push(Line::from_spans(vec![
-            Span::styled("Likely Cause: ", Style::default().fg(PackedRgba::rgb(255, 200, 100)).bold()),
+            Span::styled(
+                "Likely Cause: ",
+                Style::default().fg(PackedRgba::rgb(255, 200, 100)).bold(),
+            ),
             Span::raw(cause),
         ]));
         lines.push(Line::raw(""));
@@ -296,7 +305,10 @@ fn render_card_detail(
 
     if !card.supporting_correlations.is_empty() {
         lines.push(Line::styled(
-            format!("Supporting Correlations ({})", card.supporting_correlations.len()),
+            format!(
+                "Supporting Correlations ({})",
+                card.supporting_correlations.len()
+            ),
             Style::default().fg(PackedRgba::rgb(160, 160, 200)),
         ));
         for corr in &card.supporting_correlations {
@@ -308,13 +320,11 @@ fn render_card_detail(
     }
 
     let text = Text::from_lines(lines);
-    let para = Paragraph::new(text)
-        .scroll((scroll, 0))
-        .block(
-            Block::new()
-                .title(" Card Detail ")
-                .border_type(BorderType::Rounded),
-        );
+    let para = Paragraph::new(text).scroll((scroll, 0)).block(
+        Block::new()
+            .title(" Card Detail ")
+            .border_type(BorderType::Rounded),
+    );
     para.render(area, frame);
 }
 
@@ -388,14 +398,17 @@ impl MailScreen for AnalyticsScreen {
 
         // Split: top half for card list, bottom half for detail.
         let chunks = Flex::vertical()
-            .constraints([
-                Constraint::Percentage(40.0),
-                Constraint::Percentage(60.0),
-            ])
+            .constraints([Constraint::Percentage(40.0), Constraint::Percentage(60.0)])
             .split(area);
 
         let mut table_state = self.table_state.clone();
-        render_card_list(frame, chunks[0], &self.feed, self.selected, &mut table_state);
+        render_card_list(
+            frame,
+            chunks[0],
+            &self.feed,
+            self.selected,
+            &mut table_state,
+        );
 
         if let Some(card) = self.selected_card() {
             render_card_detail(frame, chunks[1], card, self.detail_scroll);
@@ -506,10 +519,14 @@ mod tests {
     #[test]
     fn parse_deep_link_entity_targets() {
         let msg = AnalyticsScreen::parse_deep_link("thread:abc-123");
-        assert!(matches!(msg, Some(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(ref id))) if id == "abc-123"));
+        assert!(
+            matches!(msg, Some(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(ref id))) if id == "abc-123")
+        );
 
         let msg2 = AnalyticsScreen::parse_deep_link("tool:send_message");
-        assert!(matches!(msg2, Some(MailScreenMsg::DeepLink(DeepLinkTarget::ToolByName(ref n))) if n == "send_message"));
+        assert!(
+            matches!(msg2, Some(MailScreenMsg::DeepLink(DeepLinkTarget::ToolByName(ref n))) if n == "send_message")
+        );
     }
 
     #[test]
