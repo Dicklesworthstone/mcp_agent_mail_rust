@@ -240,13 +240,11 @@ impl AttachmentExplorerScreen {
                 for row in &rows {
                     let message_id: i64 = row.get_named("message_id").unwrap_or(0);
                     let subject: String = row.get_named("subject").unwrap_or_default();
-                    let attachments_json: String =
-                        row.get_named("attachments").unwrap_or_default();
+                    let attachments_json: String = row.get_named("attachments").unwrap_or_default();
                     let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
                     let thread_id: Option<String> = row.get_named("thread_id").ok();
                     let sender_name: String = row.get_named("sender_name").unwrap_or_default();
-                    let project_slug: String =
-                        row.get_named("project_slug").unwrap_or_default();
+                    let project_slug: String = row.get_named("project_slug").unwrap_or_default();
 
                     // Parse attachment JSON array
                     if let Ok(attachments) =
@@ -359,10 +357,7 @@ impl AttachmentExplorerScreen {
                     .sender_name
                     .to_lowercase()
                     .cmp(&eb.sender_name.to_lowercase()),
-                COL_SUBJECT => ea
-                    .subject
-                    .to_lowercase()
-                    .cmp(&eb.subject.to_lowercase()),
+                COL_SUBJECT => ea.subject.to_lowercase().cmp(&eb.subject.to_lowercase()),
                 COL_DATE => ea.created_ts.cmp(&eb.created_ts),
                 COL_PROJECT => ea
                     .project_slug
@@ -483,7 +478,11 @@ impl AttachmentExplorerScreen {
     /// Render the summary header line.
     fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
         let (count, total_bytes) = self.summary();
-        let sort_indicator = if self.sort_asc { "\u{25b2}" } else { "\u{25bc}" };
+        let sort_indicator = if self.sort_asc {
+            "\u{25b2}"
+        } else {
+            "\u{25bc}"
+        };
         let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
         let filter_label = self.media_filter.label();
         let filter_text = if self.text_filter.is_empty() {
@@ -509,12 +508,7 @@ impl AttachmentExplorerScreen {
     }
 
     /// Render the detail panel for the selected attachment.
-    fn render_detail(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        entry: &AttachmentEntry,
-    ) {
+    fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, entry: &AttachmentEntry) {
         if area.height < 2 || area.width < 20 {
             return;
         }
@@ -636,18 +630,18 @@ impl MailScreen for AttachmentExplorerScreen {
                 KeyCode::Enter => {
                     // Deep-link to source message
                     if let Some(entry) = self.selected_entry() {
-                        return Cmd::msg(MailScreenMsg::DeepLink(
-                            DeepLinkTarget::MessageById(entry.message_id),
-                        ));
+                        return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::MessageById(
+                            entry.message_id,
+                        )));
                     }
                 }
                 KeyCode::Char('t') => {
                     // Deep-link to source thread
                     if let Some(entry) = self.selected_entry() {
                         if let Some(tid) = &entry.thread_id {
-                            return Cmd::msg(MailScreenMsg::DeepLink(
-                                DeepLinkTarget::ThreadById(tid.clone()),
-                            ));
+                            return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(
+                                tid.clone(),
+                            )));
                         }
                     }
                 }
@@ -664,7 +658,8 @@ impl MailScreen for AttachmentExplorerScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        if self.data_dirty || tick_count.saturating_sub(self.last_reload_tick) >= RELOAD_INTERVAL_TICKS
+        if self.data_dirty
+            || tick_count.saturating_sub(self.last_reload_tick) >= RELOAD_INTERVAL_TICKS
         {
             self.load_attachments(state);
             self.last_reload_tick = tick_count;
@@ -688,7 +683,10 @@ impl MailScreen for AttachmentExplorerScreen {
         } else {
             0
         };
-        let table_h = area.height.saturating_sub(header_h).saturating_sub(detail_h);
+        let table_h = area
+            .height
+            .saturating_sub(header_h)
+            .saturating_sub(detail_h);
 
         let header_area = Rect::new(area.x, area.y, area.width, header_h);
         let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
@@ -1092,7 +1090,10 @@ mod tests {
         screen.media_filter = MediaFilter::Images;
         screen.rebuild_display();
         assert_eq!(screen.display_indices.len(), 1);
-        assert_eq!(screen.entries[screen.display_indices[0]].media_type, "image/webp");
+        assert_eq!(
+            screen.entries[screen.display_indices[0]].media_type,
+            "image/webp"
+        );
     }
 
     #[test]
