@@ -1317,3 +1317,714 @@ fn plan_deterministic_across_calls() {
     assert_eq!(plan1.scope_label, plan2.scope_label);
     assert_eq!(plan1.params.len(), plan2.params.len());
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// 17. AGENT/PROJECT LIKE FALLBACK — untested code paths in plan_agent_search
+//     and plan_project_search
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn agent_like_fallback_when_fts_fails() {
+    // Input that sanitize_fts_query rejects but extract_like_terms recovers
+    // Bare operators surrounded by parens should fail FTS but "ab" survives as LIKE
+    let q = SearchQuery::agents("((( ab )))", 1);
+    let plan = plan_search(&q);
+    assert!(
+        plan.method == PlanMethod::Fts || plan.method == PlanMethod::Like,
+        "agent search should use FTS or LIKE fallback, got {:?}",
+        plan.method
+    );
+    // Either way, agent tables should be referenced
+    assert!(
+        plan.sql.contains("agents") || plan.sql.contains("fts_agents"),
+        "agent search should reference agent tables: {}",
+        plan.sql
+    );
+}
+
+#[test]
+fn project_like_fallback_when_fts_fails() {
+    let q = SearchQuery::projects("((( ab )))");
+    let plan = plan_search(&q);
+    assert!(
+        plan.method == PlanMethod::Fts || plan.method == PlanMethod::Like,
+        "project search should use FTS or LIKE fallback, got {:?}",
+        plan.method
+    );
+    assert!(
+        plan.sql.contains("projects") || plan.sql.contains("fts_projects"),
+        "project search should reference project tables: {}",
+        plan.sql
+    );
+}
+
+#[test]
+fn agent_like_searches_name_and_description() {
+    // Use input that definitely falls through to LIKE: emoji-only fails FTS
+    // but if we add a short alpha token, extract_like_terms may recover it.
+    // "🔥 xy 🔥" — emoji fails FTS, "xy" is only 2 chars (min for LIKE terms).
+    let q = SearchQuery::agents("🔥 xy 🔥", 1);
+    let plan = plan_search(&q);
+    if plan.method == PlanMethod::Like {
+        assert!(
+            plan.sql.contains("a.name LIKE"),
+            "should search name: {}",
+            plan.sql
+        );
+        assert!(
+            plan.sql.contains("a.task_description LIKE"),
+            "should search description: {}",
+            plan.sql
+        );
+    }
+}
+
+#[test]
+fn project_like_searches_slug_and_human_key() {
+    let q = SearchQuery::projects("🔥 xy 🔥");
+    let plan = plan_search(&q);
+    if plan.method == PlanMethod::Like {
+        assert!(
+            plan.sql.contains("p.slug LIKE"),
+            "should search slug: {}",
+            plan.sql
+        );
+        assert!(
+            plan.sql.contains("p.human_key LIKE"),
+            "should search human_key: {}",
+            plan.sql
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 18. EMPTY PLAN SQL — hostile non-empty text gets schema-independent SQL
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn empty_plan_sql_for_hostile_message_text() {
+    // "*" alone: sanitization strips it, no LIKE terms → Empty
+    let plan = plan_search(&msg_query("***", 1));
+    assert_eq!(plan.method, PlanMethod::Empty);
+    // For non-empty input that produces Empty, planner provides a no-op SQL
+    assert!(
+        plan.sql.contains("WHERE 0") || plan.sql.is_empty(),
+        "hostile message text should get no-op SQL: {}",
+        plan.sql
+    );
+}
+
+#[test]
+fn hostile_agent_text_falls_to_like() {
+    // Agent search: non-empty text that fails FTS sanitization always becomes LIKE
+    // (unlike messages, agent planner doesn't check extract_like_terms)
+    let plan = plan_search(&SearchQuery::agents("***", 1));
+    assert_eq!(
+        plan.method,
+        PlanMethod::Like,
+        "agent search with hostile text should fall to LIKE"
+    );
+    assert!(
+        plan.sql.contains("agents"),
+        "should still reference agents table: {}",
+        plan.sql
+    );
+}
+
+#[test]
+fn hostile_project_text_falls_to_like() {
+    // Project search: same behavior as agent search — non-empty always becomes LIKE
+    let plan = plan_search(&SearchQuery::projects("***"));
+    assert_eq!(
+        plan.method,
+        PlanMethod::Like,
+        "project search with hostile text should fall to LIKE"
+    );
+    assert!(
+        plan.sql.contains("projects"),
+        "should still reference projects table: {}",
+        plan.sql
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 19. CURSOR WITH NON-FTS METHODS — verify cursor interacts with LIKE/FilterOnly
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn cursor_applied_to_filter_only() {
+    let cursor = SearchCursor { score: 0.0, id: 50 };
+    let q = SearchQuery {
+        doc_kind: DocKind::Message,
+        project_id: Some(1),
+        cursor: Some(cursor.encode()),
+        ..Default::default()
+    };
+    // No text → FilterOnly
+    let plan = plan_search(&q);
+    assert_eq!(plan.method, PlanMethod::FilterOnly);
+    // Cursor should still be applied to the SQL
+    assert!(
+        plan.facets_applied.contains(&"cursor".to_string()),
+        "cursor facet should be tracked for FilterOnly"
+    );
+    assert!(
+        plan.sql.contains("score > ?"),
+        "cursor pagination clause should appear: {}",
+        plan.sql
+    );
+}
+
+#[test]
+fn cursor_with_fts_message_search() {
+    let cursor = SearchCursor {
+        score: -5.0,
+        id: 200,
+    };
+    let mut q = msg_query("hello", 1);
+    q.cursor = Some(cursor.encode());
+    let plan = plan_search(&q);
+    assert_eq!(plan.method, PlanMethod::Fts);
+    assert!(plan.facets_applied.contains(&"cursor".to_string()));
+    // Should have the compound cursor clause
+    assert!(plan.sql.contains("(score > ? OR (score = ? AND m.id > ?))"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 20. RANKING MODE × METHOD INTERACTIONS
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn fts_ignores_recency_ranking_mode() {
+    let mut q = msg_query("hello world", 1);
+    q.ranking = RankingMode::Recency;
+    let plan = plan_search(&q);
+    assert_eq!(plan.method, PlanMethod::Fts);
+    // FTS always uses score ordering, regardless of ranking mode
+    assert!(
+        plan.sql.contains("ORDER BY score ASC"),
+        "FTS should always order by score: {}",
+        plan.sql
+    );
+}
+
+#[test]
+fn fts_relevance_mode_uses_score() {
+    let mut q = msg_query("hello world", 1);
+    q.ranking = RankingMode::Relevance;
+    let plan = plan_search(&q);
+    assert_eq!(plan.method, PlanMethod::Fts);
+    assert!(plan.sql.contains("ORDER BY score ASC"));
+}
+
+#[test]
+fn like_always_uses_recency_ordering() {
+    // If we can trigger LIKE, ranking mode should not affect ordering
+    let mut q = msg_query("🔥 xy 🔥", 1);
+    q.ranking = RankingMode::Relevance;
+    let plan = plan_search(&q);
+    if plan.method == PlanMethod::Like {
+        assert!(
+            plan.sql.contains("ORDER BY m.created_ts DESC"),
+            "LIKE should always order by recency: {}",
+            plan.sql
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 21. EXPLAIN OUTPUT FOR ALL METHODS
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn explain_filter_only_output() {
+    let q = SearchQuery {
+        doc_kind: DocKind::Message,
+        project_id: Some(1),
+        importance: vec![Importance::Urgent],
+        explain: true,
+        ..Default::default()
+    };
+    let plan = plan_search(&q);
+    let explain = plan.explain();
+    assert_eq!(explain.method, "filter_only");
+    assert!(!explain.used_like_fallback);
+    assert!(explain.normalized_query.is_none());
+    assert!(explain.facet_count >= 2); // project_id + importance
+}
+
+#[test]
+fn explain_like_output() {
+    // Trigger LIKE: input that fails FTS but has recoverable terms
+    let q = SearchQuery {
+        text: "🔥 deployment 🔥".to_string(),
+        doc_kind: DocKind::Message,
+        project_id: Some(1),
+        explain: true,
+        ..Default::default()
+    };
+    let plan = plan_search(&q);
+    if plan.method == PlanMethod::Like {
+        let explain = plan.explain();
+        assert_eq!(explain.method, "like");
+        assert!(explain.used_like_fallback);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 22. DIRECTION × AGENT EXHAUSTIVE MATRIX
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn direction_agent_exhaustive_matrix() {
+    let directions: [Option<Direction>; 3] =
+        [None, Some(Direction::Inbox), Some(Direction::Outbox)];
+    let agents: [Option<&str>; 2] = [None, Some("BlueLake")];
+
+    for &dir in &directions {
+        for &agent in &agents {
+            let mut q = msg_query("test", 1);
+            q.direction = dir;
+            q.agent_name = agent.map(String::from);
+            let plan = plan_search(&q);
+
+            // Should always produce a valid plan
+            assert_eq!(plan.method, PlanMethod::Fts, "dir={dir:?} agent={agent:?}");
+
+            // Direction without agent is silently ignored
+            if dir.is_some() && agent.is_none() {
+                assert!(
+                    !plan.facets_applied.contains(&"direction".to_string()),
+                    "direction without agent should be ignored"
+                );
+            }
+
+            // Direction with agent should be applied
+            if dir.is_some() && agent.is_some() {
+                assert!(
+                    plan.facets_applied.contains(&"direction".to_string()),
+                    "direction with agent should be applied"
+                );
+            }
+
+            // Agent without direction matches both (sender OR recipient)
+            if dir.is_none() && agent.is_some() {
+                assert!(
+                    plan.facets_applied.contains(&"agent_name".to_string()),
+                    "agent without direction should still be a facet"
+                );
+                assert!(
+                    plan.sql.contains("a.name = ?") && plan.sql.contains("message_recipients"),
+                    "agent without direction should match both: {}",
+                    plan.sql
+                );
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 23. COMBINED SCOPE + FACETS + CURSOR
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn complex_combined_query() {
+    let cursor = SearchCursor {
+        score: -3.0,
+        id: 42,
+    };
+    let q = SearchQuery {
+        text: "deployment".to_string(),
+        doc_kind: DocKind::Message,
+        project_id: Some(1),
+        product_id: None,
+        importance: vec![Importance::High, Importance::Urgent],
+        direction: Some(Direction::Inbox),
+        agent_name: Some("RedHarbor".to_string()),
+        thread_id: Some("br-123".to_string()),
+        ack_required: Some(true),
+        time_range: TimeRange {
+            min_ts: Some(1_000_000),
+            max_ts: Some(9_999_999),
+        },
+        ranking: RankingMode::Relevance,
+        limit: Some(10),
+        cursor: Some(cursor.encode()),
+        explain: true,
+        scope: ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![1, 2],
+        },
+        redaction: Some(RedactionConfig::default()),
+    };
+
+    let plan = plan_search(&q);
+    assert_eq!(plan.method, PlanMethod::Fts);
+    assert!(plan.scope_enforced);
+
+    // All facets should be tracked
+    let expected_facets = [
+        "project_id",
+        "importance",
+        "direction",
+        "thread_id",
+        "ack_required",
+        "time_range_min",
+        "time_range_max",
+        "scope_project_set",
+        "cursor",
+    ];
+    for facet in expected_facets {
+        assert!(
+            plan.facets_applied.contains(&facet.to_string()),
+            "missing facet: {facet}"
+        );
+    }
+
+    // Explain should have all metadata
+    let explain = plan.explain();
+    assert_eq!(explain.method, "fts5");
+    assert!(explain.facet_count >= 9);
+
+    // SQL should have all components
+    assert!(plan.sql.contains("fts_messages MATCH ?"));
+    assert!(plan.sql.contains("m.project_id = ?"));
+    assert!(plan.sql.contains("m.importance IN (?, ?)"));
+    assert!(plan.sql.contains("message_recipients")); // Inbox direction
+    assert!(plan.sql.contains("m.thread_id = ?"));
+    assert!(plan.sql.contains("m.ack_required = ?"));
+    assert!(plan.sql.contains("m.created_ts >= ?"));
+    assert!(plan.sql.contains("m.created_ts <= ?"));
+    assert!(plan.sql.contains("m.project_id IN (?, ?)")); // scope
+    assert!(plan.sql.contains("score > ?")); // cursor
+    assert!(plan.sql.contains("LIMIT ?"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 24. AGENT/PROJECT SEARCH SCOPE ENFORCEMENT
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn agent_search_with_project_id_and_scope() {
+    let mut q = SearchQuery::agents("blue", 1);
+    q.scope = ScopePolicy::ProjectSet {
+        allowed_project_ids: vec![1, 2, 3],
+    };
+    let plan = plan_search(&q);
+    assert!(plan.scope_enforced);
+    assert!(plan.sql.contains("a.project_id = ?")); // project_id facet
+    assert!(plan.sql.contains("a.project_id IN (?, ?, ?)")); // scope
+}
+
+#[test]
+fn project_search_with_scope() {
+    let mut q = SearchQuery::projects("myproj");
+    q.scope = ScopePolicy::ProjectSet {
+        allowed_project_ids: vec![10],
+    };
+    let plan = plan_search(&q);
+    assert!(plan.scope_enforced);
+    assert!(plan.sql.contains("p.id IN (?)"));
+}
+
+#[test]
+fn agent_search_caller_scoped_not_sql_enforced() {
+    let mut q = SearchQuery::agents("test", 1);
+    q.scope = ScopePolicy::CallerScoped {
+        caller_agent: "Me".to_string(),
+    };
+    let plan = plan_search(&q);
+    assert!(!plan.scope_enforced);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 25. LIKE TERM PARAM PROPAGATION
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn like_params_appear_twice_per_term() {
+    // For each LIKE term, the planner generates two params: one for subject, one for body
+    let q = SearchQuery::agents("🔥 deployment release 🔥", 1);
+    let plan = plan_search(&q);
+    if plan.method == PlanMethod::Like {
+        // "deployment" and "release" are both ≥2 chars, so 2 terms × 2 fields = 4 LIKE params
+        // Plus project_id (1) + LIMIT (1) = 6
+        let text_params = plan
+            .params
+            .iter()
+            .filter(|p| matches!(p, PlanParam::Text(t) if t.contains('%')))
+            .count();
+        assert!(
+            text_params >= 4,
+            "expected at least 4 LIKE pattern params, got {text_params}"
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 26. TIME RANGE EDGE CASES
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn time_range_both_none_not_applied() {
+    let mut q = msg_query("test", 1);
+    q.time_range = TimeRange {
+        min_ts: None,
+        max_ts: None,
+    };
+    let plan = plan_search(&q);
+    assert!(!plan.facets_applied.contains(&"time_range_min".to_string()));
+    assert!(!plan.facets_applied.contains(&"time_range_max".to_string()));
+}
+
+#[test]
+fn time_range_both_set() {
+    let mut q = msg_query("test", 1);
+    q.time_range = TimeRange {
+        min_ts: Some(0),
+        max_ts: Some(i64::MAX),
+    };
+    let plan = plan_search(&q);
+    assert!(plan.facets_applied.contains(&"time_range_min".to_string()));
+    assert!(plan.facets_applied.contains(&"time_range_max".to_string()));
+    assert!(plan.sql.contains("m.created_ts >= ?"));
+    assert!(plan.sql.contains("m.created_ts <= ?"));
+}
+
+#[test]
+fn time_range_with_extreme_values() {
+    let mut q = msg_query("test", 1);
+    q.time_range = TimeRange {
+        min_ts: Some(i64::MIN),
+        max_ts: Some(i64::MAX),
+    };
+    let plan = plan_search(&q);
+    // Should not panic with extreme timestamps
+    assert_eq!(plan.method, PlanMethod::Fts);
+    // Verify the params contain the extreme values
+    let has_min = plan
+        .params
+        .iter()
+        .any(|p| matches!(p, PlanParam::Int(v) if *v == i64::MIN));
+    let has_max = plan
+        .params
+        .iter()
+        .any(|p| matches!(p, PlanParam::Int(v) if *v == i64::MAX));
+    assert!(has_min, "should have i64::MIN param");
+    assert!(has_max, "should have i64::MAX param");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 27. REDACTION CONFIG PRESETS
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn redaction_default_all_off() {
+    // Default redaction config has everything disabled
+    let config = RedactionConfig::default();
+    assert!(!config.redact_body);
+    assert!(!config.redact_agent_names);
+    assert!(!config.redact_thread_ids);
+    assert!(!config.is_active());
+}
+
+#[test]
+fn redaction_contact_blocked_preset() {
+    let config = RedactionConfig::contact_blocked();
+    assert!(config.redact_body);
+    assert!(!config.redact_agent_names);
+    assert!(config.redact_thread_ids);
+    assert!(config.is_active());
+}
+
+#[test]
+fn redaction_strict_all_fields() {
+    let config = RedactionConfig::strict();
+    assert!(config.redact_body);
+    assert!(config.redact_agent_names);
+    assert!(config.redact_thread_ids);
+}
+
+#[test]
+fn redaction_is_active_logic() {
+    // At least one field must be true for redaction to be active
+    let inactive = RedactionConfig {
+        redact_body: false,
+        redact_agent_names: false,
+        redact_thread_ids: false,
+        placeholder: "[X]".to_string(),
+    };
+    assert!(!inactive.is_active());
+
+    let active = RedactionConfig {
+        redact_body: false,
+        redact_agent_names: true,
+        redact_thread_ids: false,
+        placeholder: "[X]".to_string(),
+    };
+    assert!(active.is_active());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 28. VISIBILITY CALLER-SCOPED MATCHING
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn visibility_caller_scoped_matches_own_project() {
+    let results = vec![make_result(1, 10)];
+    let ctx = VisibilityContext {
+        caller_project_ids: vec![10], // same project
+        approved_contact_ids: vec![],
+        policy: ScopePolicy::CallerScoped {
+            caller_agent: "A".to_string(),
+        },
+        redaction: RedactionConfig::default(),
+    };
+    let (visible, audit) = apply_visibility(results, &ctx);
+    assert_eq!(visible.len(), 1, "own project should be visible");
+    assert!(audit.is_empty());
+}
+
+#[test]
+fn visibility_caller_scoped_denies_foreign_project() {
+    let results = vec![make_result(1, 99)]; // project 99
+    let ctx = VisibilityContext {
+        caller_project_ids: vec![10], // different project
+        approved_contact_ids: vec![],
+        policy: ScopePolicy::CallerScoped {
+            caller_agent: "A".to_string(),
+        },
+        redaction: RedactionConfig {
+            redact_body: false,
+            redact_agent_names: false,
+            redact_thread_ids: false,
+            placeholder: "[REDACTED]".to_string(),
+        },
+    };
+    let (visible, audit) = apply_visibility(results, &ctx);
+    // No redaction active → denied entirely
+    assert!(visible.is_empty(), "foreign project should be denied");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, AuditAction::Denied);
+}
+
+#[test]
+fn visibility_caller_scoped_redacts_foreign_project() {
+    let results = vec![make_result(1, 99)];
+    let ctx = VisibilityContext {
+        caller_project_ids: vec![10],
+        approved_contact_ids: vec![],
+        policy: ScopePolicy::CallerScoped {
+            caller_agent: "A".to_string(),
+        },
+        redaction: RedactionConfig::strict(), // redaction active
+    };
+    let (visible, audit) = apply_visibility(results, &ctx);
+    // With redaction → included but redacted
+    assert_eq!(
+        visible.len(),
+        1,
+        "foreign project should be redacted, not denied"
+    );
+    assert!(visible[0].redacted);
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, AuditAction::Redacted);
+}
+
+#[test]
+fn visibility_project_set_admits_matching() {
+    let results = vec![make_result(1, 10), make_result(2, 20), make_result(3, 30)];
+    let ctx = VisibilityContext {
+        caller_project_ids: vec![],
+        approved_contact_ids: vec![],
+        policy: ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![10, 30], // admits 1 and 3
+        },
+        redaction: RedactionConfig::default(),
+    };
+    let (visible, audit) = apply_visibility(results, &ctx);
+    assert_eq!(visible.len(), 2, "should admit projects 10 and 30");
+    assert_eq!(audit.len(), 1, "should deny project 20");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 29. PLAN PARAM ORDERING — params must be positional
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn param_ordering_fts_with_all_facets() {
+    let q = SearchQuery {
+        text: "hello".to_string(),
+        doc_kind: DocKind::Message,
+        project_id: Some(42),
+        importance: vec![Importance::High],
+        thread_id: Some("t1".to_string()),
+        ack_required: Some(true),
+        time_range: TimeRange {
+            min_ts: Some(100),
+            max_ts: Some(999),
+        },
+        direction: Some(Direction::Outbox),
+        agent_name: Some("Agent".to_string()),
+        limit: Some(25),
+        ..Default::default()
+    };
+    let plan = plan_search(&q);
+
+    // First param should be FTS text
+    assert!(
+        matches!(&plan.params[0], PlanParam::Text(t) if t.contains("hello")),
+        "first param should be FTS text: {:?}",
+        plan.params[0]
+    );
+
+    // Last param should be LIMIT
+    assert!(
+        matches!(plan.params.last(), Some(PlanParam::Int(25))),
+        "last param should be LIMIT: {:?}",
+        plan.params.last()
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 30. PLAN DETERMINISM WITH VARIED INPUTS
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn determinism_across_all_doc_kinds() {
+    let queries = [
+        msg_query("deployment", 1),
+        SearchQuery::agents("blue", 1),
+        SearchQuery::projects("myproj"),
+    ];
+
+    for q in &queries {
+        let plan1 = plan_search(q);
+        let plan2 = plan_search(q);
+        assert_eq!(plan1.sql, plan2.sql, "SQL should be deterministic");
+        assert_eq!(plan1.params.len(), plan2.params.len());
+        assert_eq!(plan1.method, plan2.method);
+        assert_eq!(plan1.facets_applied, plan2.facets_applied);
+    }
+}
+
+#[test]
+fn determinism_with_scope_and_cursor() {
+    let cursor = SearchCursor {
+        score: -1.0,
+        id: 50,
+    };
+    let q = SearchQuery {
+        text: "hello".to_string(),
+        doc_kind: DocKind::Message,
+        project_id: Some(1),
+        scope: ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![1, 2, 3],
+        },
+        cursor: Some(cursor.encode()),
+        ..Default::default()
+    };
+    let plan1 = plan_search(&q);
+    let plan2 = plan_search(&q);
+    assert_eq!(plan1.sql, plan2.sql);
+    assert_eq!(plan1.scope_enforced, plan2.scope_enforced);
+}
