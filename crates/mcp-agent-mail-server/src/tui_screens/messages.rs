@@ -845,6 +845,7 @@ fn render_results_list(frame: &mut Frame<'_>, area: Rect, results: &[MessageEntr
 }
 
 /// Render the detail panel for the selected message.
+#[allow(clippy::cast_possible_truncation)]
 fn render_detail_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -887,41 +888,59 @@ fn render_detail_panel(
     lines.push(String::new()); // Blank separator
     lines.push("--- Body ---".to_string());
 
-    // Wrap body text to fit panel width
-    let body_width = inner.width as usize;
-    for body_line in msg.body_md.lines() {
-        if body_line.len() <= body_width {
-            lines.push(body_line.to_string());
-        } else {
-            // Simple word-wrap
-            let mut current = String::new();
-            for word in body_line.split_whitespace() {
-                if current.is_empty() {
-                    current = word.to_string();
-                } else if current.len() + 1 + word.len() <= body_width {
-                    current.push(' ');
-                    current.push_str(word);
-                } else {
-                    lines.push(current);
-                    current = word.to_string();
-                }
-            }
-            if !current.is_empty() {
-                lines.push(current);
-            }
-        }
-    }
+    // Render message body with GFM markdown support
+    let theme = ftui_extras::markdown::MarkdownTheme::default();
+    let body_text = crate::tui_markdown::render_body(&msg.body_md, &theme);
+    let body_height = body_text.height();
 
-    // Apply scroll offset
-    let visible_lines: Vec<&str> = lines
-        .iter()
-        .skip(scroll)
-        .take(inner.height as usize)
-        .map(String::as_str)
-        .collect();
-    let text = visible_lines.join("\n");
-    let p = Paragraph::new(text);
-    p.render(inner, frame);
+    // Build header as plain text lines
+    let header_height = lines.len();
+
+    // Apply scroll offset across combined header + body
+    let visible_height = inner.height as usize;
+    if scroll < header_height {
+        // Some header lines visible
+        let header_visible: Vec<&str> = lines
+            .iter()
+            .skip(scroll)
+            .take(visible_height)
+            .map(String::as_str)
+            .collect();
+        let header_text = header_visible.join("\n");
+
+        let header_rows = header_visible.len().min(visible_height);
+        let header_area = Rect::new(inner.x, inner.y, inner.width, header_rows as u16);
+        let p = Paragraph::new(header_text);
+        p.render(header_area, frame);
+
+        // Render body in remaining space
+        let body_rows = visible_height.saturating_sub(header_rows);
+        if body_rows > 0 {
+            let body_area = Rect::new(
+                inner.x,
+                inner.y + header_rows as u16,
+                inner.width,
+                body_rows as u16,
+            );
+            let p = Paragraph::new(body_text);
+            p.render(body_area, frame);
+        }
+    } else {
+        // Scrolled past header — only body visible
+        let body_scroll = scroll - header_height;
+        // Extract visible portion of body text by skipping lines
+        let all_lines = body_text.lines();
+        let visible_body: Vec<_> = all_lines
+            .iter()
+            .skip(body_scroll)
+            .take(visible_height)
+            .cloned()
+            .collect();
+        let _ = body_height; // suppress unused warning
+        let text = ftui::text::Text::from_lines(visible_body);
+        let p = Paragraph::new(text);
+        p.render(inner, frame);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

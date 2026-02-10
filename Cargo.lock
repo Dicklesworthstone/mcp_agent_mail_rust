@@ -2072,9 +2072,16 @@ dependencies = [
 name = "ftui-extras"
 version = "0.1.1"
 dependencies = [
+ "ftui-core 0.1.1",
  "ftui-render 0.1.1",
  "ftui-style 0.1.1",
  "ftui-text 0.1.1",
+ "math-text-transform",
+ "pulldown-cmark",
+ "serde_json",
+ "unicode-display-width",
+ "unicode-segmentation",
+ "unicodeit",
 ]
 
 [[package]]
