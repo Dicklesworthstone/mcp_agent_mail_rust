@@ -15,7 +15,7 @@ use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
-use crate::tui_screens::{HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 const COL_AGENT: usize = 0;
 const COL_PATH: usize = 1;
@@ -379,6 +379,21 @@ impl MailScreen for ReservationsScreen {
         ]
     }
 
+    fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
+        if let DeepLinkTarget::ReservationByAgent(agent) = target {
+            // Find the first reservation for this agent and select it
+            if let Some(pos) = self.sorted_keys.iter().position(|key| {
+                self.reservations
+                    .get(key)
+                    .is_some_and(|r| r.agent == *agent)
+            }) {
+                self.table_state.selected = Some(pos);
+                return true;
+            }
+        }
+        false
+    }
+
     fn title(&self) -> &'static str {
         "Reservations"
     }
@@ -601,5 +616,43 @@ mod tests {
     fn default_impl() {
         let screen = ReservationsScreen::default();
         assert!(screen.reservations.is_empty());
+    }
+
+    #[test]
+    fn deep_link_reservation_by_agent() {
+        use crate::tui_screens::DeepLinkTarget;
+
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+
+        // Add some reservations
+        let _ = state.push_event(MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/**/*.rs".to_string()],
+            true,
+            3600,
+            "proj",
+        ));
+        let _ = state.push_event(MailEvent::reservation_granted(
+            "RedStone",
+            vec!["tests/*.rs".to_string()],
+            false,
+            1800,
+            "proj",
+        ));
+
+        screen.ingest_events(&state);
+        screen.rebuild_sorted();
+
+        // Deep-link to RedStone's reservation
+        let handled =
+            screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("RedStone".into()));
+        assert!(handled);
+        assert!(screen.table_state.selected.is_some());
+
+        // Deep-link to unknown agent
+        let handled =
+            screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("Unknown".into()));
+        assert!(!handled);
     }
 }

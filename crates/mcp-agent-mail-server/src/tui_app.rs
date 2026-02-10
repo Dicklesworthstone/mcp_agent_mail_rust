@@ -324,6 +324,14 @@ impl MailAppModel {
                 }
                 return Cmd::none();
             }
+            if let Some(agent) = rest.strip_prefix("reservation:") {
+                let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
+                self.active_screen = MailScreenId::Reservations;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Reservations) {
+                    screen.receive_deep_link(&target);
+                }
+                return Cmd::none();
+            }
         }
 
         Cmd::none()
@@ -457,6 +465,7 @@ impl Model for MailAppModel {
                     DeepLinkTarget::AgentByName(_) => MailScreenId::Agents,
                     DeepLinkTarget::ToolByName(_) => MailScreenId::ToolMetrics,
                     DeepLinkTarget::ProjectBySlug(_) => MailScreenId::Dashboard,
+                    DeepLinkTarget::ReservationByAgent(_) => MailScreenId::Reservations,
                 };
                 self.active_screen = target_screen;
                 if let Some(screen) = self.screens.get_mut(&target_screen) {
@@ -1211,6 +1220,16 @@ mod tests {
             DeepLinkTarget::ProjectBySlug("my-proj".to_string()),
         )));
         assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+    }
+
+    #[test]
+    fn deep_link_reservation_switches_to_reservations() {
+        use crate::tui_screens::DeepLinkTarget;
+        let mut model = test_model();
+        model.update(MailMsg::Screen(MailScreenMsg::DeepLink(
+            DeepLinkTarget::ReservationByAgent("BlueLake".to_string()),
+        )));
+        assert_eq!(model.active_screen(), MailScreenId::Reservations);
     }
 
     #[test]

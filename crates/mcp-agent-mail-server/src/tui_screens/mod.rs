@@ -197,6 +197,8 @@ pub enum DeepLinkTarget {
     ToolByName(String),
     /// Jump to a project in the Dashboard screen.
     ProjectBySlug(String),
+    /// Jump to a specific file reservation in the Reservations screen.
+    ReservationByAgent(String),
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -514,6 +516,7 @@ mod tests {
         let _ = DeepLinkTarget::AgentByName(String::new());
         let _ = DeepLinkTarget::ToolByName(String::new());
         let _ = DeepLinkTarget::ProjectBySlug(String::new());
+        let _ = DeepLinkTarget::ReservationByAgent(String::new());
     }
 
     #[test]

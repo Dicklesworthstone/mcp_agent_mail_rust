@@ -166,8 +166,8 @@ mod tests {
     use crate::tui_screens::{
         ALL_SCREEN_IDS, MailScreen, agents::AgentsScreen, dashboard::DashboardScreen,
         messages::MessageBrowserScreen, reservations::ReservationsScreen,
-        system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
-        timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+        system_health::SystemHealthScreen, threads::ThreadExplorerScreen, timeline::TimelineScreen,
+        tool_metrics::ToolMetricsScreen,
     };
     use std::collections::HashSet;
     use std::sync::Arc;
