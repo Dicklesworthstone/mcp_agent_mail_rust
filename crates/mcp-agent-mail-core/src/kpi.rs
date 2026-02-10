@@ -1357,6 +1357,265 @@ pub fn quick_trend_report() -> Option<TrendReport> {
 }
 
 // ---------------------------------------------------------------------------
+// Insight feed (br-3vwi.7.4)
+// ---------------------------------------------------------------------------
+
+/// A single operator-facing insight card that combines anomaly, trend, and
+/// correlation data into an actionable narrative.
+#[derive(Debug, Clone, Serialize)]
+pub struct InsightCard {
+    /// Unique identifier for this insight (derived from anomaly kind + metric).
+    pub id: String,
+    /// Confidence score (0.0–1.0): how certain we are this is a real issue.
+    pub confidence: f64,
+    /// Severity (inherited from the primary anomaly, boosted by supporting evidence).
+    pub severity: AnomalySeverity,
+    /// One-line headline for the card.
+    pub headline: String,
+    /// Multi-sentence rationale combining anomaly + trend + correlation context.
+    pub rationale: String,
+    /// Inferred likely cause (may be `None` if no correlation data supports it).
+    pub likely_cause: Option<String>,
+    /// Ordered list of concrete next steps for the operator.
+    pub next_steps: Vec<String>,
+    /// Optional deep-link anchors (e.g., `"screen:tool_metrics"`, `"thread:abc"`).
+    pub deep_links: Vec<String>,
+    /// The primary anomaly alert backing this card.
+    pub primary_alert: AnomalyAlert,
+    /// Trend indicators that corroborate the anomaly (may be empty).
+    pub supporting_trends: Vec<TrendIndicator>,
+    /// Correlation pairs that corroborate the anomaly (may be empty).
+    pub supporting_correlations: Vec<CorrelationPair>,
+}
+
+/// A prioritized collection of insight cards.
+#[derive(Debug, Clone, Serialize)]
+pub struct InsightFeed {
+    /// Cards sorted by confidence × severity (most important first).
+    pub cards: Vec<InsightCard>,
+    /// Number of anomaly alerts that were processed.
+    pub alerts_processed: usize,
+    /// Number of alerts that produced cards (some may be filtered out).
+    pub cards_produced: usize,
+}
+
+/// Map an [`AnomalyKind`] to a deep-link anchor for the relevant TUI screen.
+const fn deep_link_for_kind(kind: AnomalyKind) -> &'static str {
+    match kind {
+        AnomalyKind::HighErrorRate | AnomalyKind::LatencySpike => "screen:tool_metrics",
+        AnomalyKind::ThroughputDrop => "screen:dashboard",
+        AnomalyKind::AckBacklog => "screen:messages",
+        AnomalyKind::HighUtilization
+        | AnomalyKind::GitLockPressure
+        | AnomalyKind::WbqBackpressure => "screen:system_health",
+        AnomalyKind::ReservationConflicts => "screen:reservations",
+    }
+}
+
+/// Map an [`AnomalyKind`] to the metric names it primarily concerns.
+const fn metrics_for_kind(kind: AnomalyKind) -> &'static [&'static str] {
+    match kind {
+        AnomalyKind::HighErrorRate => &["error_rate_bps"],
+        AnomalyKind::LatencySpike => &["tool_p95_ms", "tool_p99_ms"],
+        AnomalyKind::ThroughputDrop => &["tool_calls_per_sec"],
+        AnomalyKind::AckBacklog => &["ack_pending", "ack_overdue"],
+        AnomalyKind::HighUtilization => &["pool_utilization_pct", "wbq_utilization_pct"],
+        AnomalyKind::ReservationConflicts => &["reservation_conflicts"],
+        AnomalyKind::GitLockPressure => &["git_lock_retries"],
+        AnomalyKind::WbqBackpressure => &["wbq_utilization_pct"],
+    }
+}
+
+/// Build an insight card from an anomaly alert enriched with trend and
+/// correlation context.
+fn build_card(
+    alert: &AnomalyAlert,
+    trends: &[TrendIndicator],
+    correlations: &[CorrelationPair],
+) -> InsightCard {
+    use std::fmt::Write as _;
+    let relevant_metrics = metrics_for_kind(alert.kind);
+
+    // Collect supporting trends for this anomaly's metrics.
+    let supporting_trends: Vec<TrendIndicator> = trends
+        .iter()
+        .filter(|t| relevant_metrics.contains(&t.metric.as_str()))
+        .cloned()
+        .collect();
+
+    // Collect correlations that involve any of this anomaly's metrics.
+    let supporting_correlations: Vec<CorrelationPair> = correlations
+        .iter()
+        .filter(|c| {
+            relevant_metrics.contains(&c.metric_a.as_str())
+                || relevant_metrics.contains(&c.metric_b.as_str())
+        })
+        .cloned()
+        .collect();
+
+    // -- Confidence scoring --
+    // Base confidence from the anomaly score (0.0–1.0).
+    let mut confidence = alert.score;
+
+    // Boost if trends corroborate (metric is moving in the bad direction).
+    let trend_boost = supporting_trends.iter().any(|t| {
+        // For most anomalies, "Rising" is bad (errors, latency, utilization).
+        // For ThroughputDrop, "Falling" is bad.
+        match alert.kind {
+            AnomalyKind::ThroughputDrop => t.direction == TrendDirection::Falling,
+            _ => t.direction == TrendDirection::Rising,
+        }
+    });
+    if trend_boost {
+        confidence = (confidence + 0.1).min(1.0);
+    }
+
+    // Boost if correlations support a systemic pattern.
+    if !supporting_correlations.is_empty() {
+        #[allow(clippy::cast_precision_loss)]
+        let corr_boost = 0.05_f64 * supporting_correlations.len() as f64;
+        confidence = (confidence + corr_boost).min(1.0);
+    }
+
+    // -- Severity (may be boosted by strong evidence) --
+    let severity = if confidence >= 0.9 && alert.severity < AnomalySeverity::Critical {
+        // Promote to Critical if evidence is very strong.
+        AnomalySeverity::Critical
+    } else if confidence >= 0.7 && alert.severity < AnomalySeverity::High {
+        AnomalySeverity::High
+    } else {
+        alert.severity
+    };
+
+    // -- Headline --
+    let headline = format!("{}: {}", alert.kind, alert.explanation);
+
+    // -- Rationale --
+    let mut rationale = alert.explanation.clone();
+
+    for t in &supporting_trends {
+        let _ = write!(
+            rationale,
+            ". {} is {} (Δ{:+.1}%, current {:.1})",
+            t.metric,
+            t.direction,
+            t.delta_ratio * 100.0,
+            t.current
+        );
+    }
+
+    for c in &supporting_correlations {
+        let _ = write!(rationale, ". Correlated: {}", c.explanation);
+    }
+
+    // -- Likely cause --
+    let likely_cause = if supporting_correlations.is_empty() {
+        None
+    } else {
+        Some(supporting_correlations[0].explanation.clone())
+    };
+
+    // -- Next steps --
+    let mut next_steps = vec![alert.suggested_action.clone()];
+
+    if trend_boost {
+        next_steps.push("Trend confirms degradation is ongoing; prioritize investigation".into());
+    }
+
+    for c in &supporting_correlations {
+        if c.sign_correlation > 0 {
+            next_steps.push(format!(
+                "Both {} and {} are {}: check for common root cause",
+                c.metric_a, c.metric_b, c.direction_a
+            ));
+        }
+    }
+
+    // -- Deep links --
+    let mut deep_links = vec![deep_link_for_kind(alert.kind).into()];
+    // Add links for correlated screens.
+    for c in &supporting_correlations {
+        let link_b = format!("metric:{}", c.metric_b);
+        if !deep_links.contains(&link_b) {
+            deep_links.push(link_b);
+        }
+    }
+
+    InsightCard {
+        id: format!("{}:{:.0}", alert.kind, alert.current_value),
+        confidence,
+        severity,
+        headline,
+        rationale,
+        likely_cause,
+        next_steps,
+        deep_links,
+        primary_alert: alert.clone(),
+        supporting_trends,
+        supporting_correlations,
+    }
+}
+
+/// Build a complete insight feed from anomaly alerts, trends, and correlations.
+///
+/// Cards are sorted by effective priority: `severity` descending, then
+/// `confidence` descending within the same severity.
+#[must_use]
+pub fn build_insight_feed(
+    alerts: &[AnomalyAlert],
+    trends: &[TrendIndicator],
+    correlations: &[CorrelationPair],
+) -> InsightFeed {
+    let cards: Vec<InsightCard> = alerts
+        .iter()
+        .map(|alert| build_card(alert, trends, correlations))
+        .collect();
+
+    let cards_produced = cards.len();
+
+    // Sort: severity descending, then confidence descending.
+    let mut sorted = cards;
+    sorted.sort_by(|a, b| {
+        b.severity.cmp(&a.severity).then(
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+
+    InsightFeed {
+        cards: sorted,
+        alerts_processed: alerts.len(),
+        cards_produced,
+    }
+}
+
+/// Convenience: build the insight feed from global 1-minute vs 5-minute
+/// snapshots with default thresholds.
+#[must_use]
+pub fn quick_insight_feed() -> InsightFeed {
+    let thresholds = AnomalyThresholds::default();
+    let current = snapshot(KpiWindow::OneMin);
+    let baseline = snapshot(KpiWindow::FiveMin);
+
+    let (alerts, trends, correlations) = match (&current, &baseline) {
+        (Some(cur), Some(bl)) => (
+            detect_anomalies(cur, Some(bl), &thresholds),
+            compute_trends(cur, bl),
+            compute_correlations(cur, bl),
+        ),
+        (Some(cur), None) => (
+            detect_anomalies(cur, None, &thresholds),
+            Vec::new(),
+            Vec::new(),
+        ),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    build_insight_feed(&alerts, &trends, &correlations)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2516,5 +2775,295 @@ mod tests {
             .find(|&&(n, _)| n == "tool_calls_per_sec")
             .unwrap();
         assert!((tps.1 - 30.0).abs() < f64::EPSILON);
+    }
+
+    // -- Insight feed tests (br-3vwi.7.4) --
+
+    #[test]
+    fn insight_card_from_single_anomaly() {
+        let alert = AnomalyAlert {
+            kind: AnomalyKind::HighErrorRate,
+            severity: AnomalySeverity::High,
+            score: 0.8,
+            current_value: 50.0,
+            threshold: 10.0,
+            baseline_value: None,
+            explanation: "Error rate is 50.0 basis points".into(),
+            suggested_action: "Investigate failing tool calls".into(),
+        };
+        let card = build_card(&alert, &[], &[]);
+
+        assert!(card.confidence >= 0.7);
+        assert_eq!(card.severity, AnomalySeverity::High);
+        assert!(card.headline.contains("high_error_rate"));
+        assert!(!card.next_steps.is_empty());
+        assert!(card.deep_links.contains(&"screen:tool_metrics".to_string()));
+        assert!(card.likely_cause.is_none());
+    }
+
+    #[test]
+    fn insight_card_boosted_by_trend() {
+        let alert = AnomalyAlert {
+            kind: AnomalyKind::HighErrorRate,
+            severity: AnomalySeverity::Medium,
+            score: 0.5,
+            current_value: 8.0,
+            threshold: 10.0,
+            baseline_value: None,
+            explanation: "Error rate approaching threshold".into(),
+            suggested_action: "Monitor closely".into(),
+        };
+        let trend = TrendIndicator {
+            metric: "error_rate_bps".into(),
+            direction: TrendDirection::Rising,
+            delta: 5.0,
+            delta_ratio: 0.6,
+            current: 8.0,
+            baseline: 3.0,
+        };
+
+        let card_no_trend = build_card(&alert, &[], &[]);
+        let card_with_trend = build_card(&alert, &[trend], &[]);
+
+        assert!(
+            card_with_trend.confidence > card_no_trend.confidence,
+            "trend should boost confidence"
+        );
+        assert!(!card_with_trend.supporting_trends.is_empty());
+        assert!(card_with_trend.rationale.contains("rising"));
+    }
+
+    #[test]
+    fn insight_card_boosted_by_correlation() {
+        let alert = AnomalyAlert {
+            kind: AnomalyKind::HighErrorRate,
+            severity: AnomalySeverity::Medium,
+            score: 0.5,
+            current_value: 8.0,
+            threshold: 10.0,
+            baseline_value: None,
+            explanation: "Error rate approaching threshold".into(),
+            suggested_action: "Monitor closely".into(),
+        };
+        let corr = CorrelationPair {
+            metric_a: "error_rate_bps".into(),
+            metric_b: "tool_p95_ms".into(),
+            direction_a: TrendDirection::Rising,
+            direction_b: TrendDirection::Rising,
+            sign_correlation: 1,
+            explanation: "Error rate and latency rising together".into(),
+        };
+
+        let card_no_corr = build_card(&alert, &[], &[]);
+        let card_with_corr = build_card(&alert, &[], &[corr]);
+
+        assert!(
+            card_with_corr.confidence > card_no_corr.confidence,
+            "correlation should boost confidence"
+        );
+        assert!(card_with_corr.likely_cause.is_some());
+        assert!(!card_with_corr.supporting_correlations.is_empty());
+    }
+
+    #[test]
+    fn insight_feed_sorted_by_priority() {
+        let alerts = vec![
+            AnomalyAlert {
+                kind: AnomalyKind::HighErrorRate,
+                severity: AnomalySeverity::Low,
+                score: 0.3,
+                current_value: 6.0,
+                threshold: 10.0,
+                baseline_value: None,
+                explanation: "low error".into(),
+                suggested_action: "monitor".into(),
+            },
+            AnomalyAlert {
+                kind: AnomalyKind::LatencySpike,
+                severity: AnomalySeverity::Critical,
+                score: 0.95,
+                current_value: 500.0,
+                threshold: 100.0,
+                baseline_value: None,
+                explanation: "critical latency".into(),
+                suggested_action: "investigate".into(),
+            },
+            AnomalyAlert {
+                kind: AnomalyKind::AckBacklog,
+                severity: AnomalySeverity::Medium,
+                score: 0.6,
+                current_value: 15.0,
+                threshold: 20.0,
+                baseline_value: None,
+                explanation: "moderate ack".into(),
+                suggested_action: "check agents".into(),
+            },
+        ];
+
+        let feed = build_insight_feed(&alerts, &[], &[]);
+
+        assert_eq!(feed.cards.len(), 3);
+        assert_eq!(feed.alerts_processed, 3);
+        assert_eq!(feed.cards_produced, 3);
+        // Critical should be first.
+        assert_eq!(feed.cards[0].severity, AnomalySeverity::Critical);
+        // Low should be last.
+        assert_eq!(feed.cards[2].severity, AnomalySeverity::Low);
+    }
+
+    #[test]
+    fn insight_feed_empty_when_no_alerts() {
+        let feed = build_insight_feed(&[], &[], &[]);
+        assert!(feed.cards.is_empty());
+        assert_eq!(feed.alerts_processed, 0);
+        assert_eq!(feed.cards_produced, 0);
+    }
+
+    #[test]
+    fn insight_card_severity_promotion() {
+        // Score 0.5, severity Medium, but with trend + correlation = confidence > 0.7
+        // Should promote to High.
+        let alert = AnomalyAlert {
+            kind: AnomalyKind::HighErrorRate,
+            severity: AnomalySeverity::Medium,
+            score: 0.6,
+            current_value: 12.0,
+            threshold: 10.0,
+            baseline_value: None,
+            explanation: "Error rate breached".into(),
+            suggested_action: "Investigate".into(),
+        };
+        let trend = TrendIndicator {
+            metric: "error_rate_bps".into(),
+            direction: TrendDirection::Rising,
+            delta: 8.0,
+            delta_ratio: 2.0,
+            current: 12.0,
+            baseline: 4.0,
+        };
+        let corr = CorrelationPair {
+            metric_a: "error_rate_bps".into(),
+            metric_b: "tool_p95_ms".into(),
+            direction_a: TrendDirection::Rising,
+            direction_b: TrendDirection::Rising,
+            sign_correlation: 1,
+            explanation: "Systemic overload".into(),
+        };
+
+        let card = build_card(&alert, &[trend], &[corr]);
+        // confidence = 0.6 (base) + 0.1 (trend) + 0.05 (corr) = 0.75 → promote to High
+        assert!(card.confidence >= 0.7);
+        assert!(card.severity >= AnomalySeverity::High);
+    }
+
+    #[test]
+    fn insight_card_throughput_drop_trend_falling() {
+        // For ThroughputDrop, a "Falling" trend should boost confidence.
+        let alert = AnomalyAlert {
+            kind: AnomalyKind::ThroughputDrop,
+            severity: AnomalySeverity::High,
+            score: 0.7,
+            current_value: 5.0,
+            threshold: 25.0,
+            baseline_value: Some(50.0),
+            explanation: "Throughput dropped".into(),
+            suggested_action: "Check upstream".into(),
+        };
+        let trend = TrendIndicator {
+            metric: "tool_calls_per_sec".into(),
+            direction: TrendDirection::Falling,
+            delta: -20.0,
+            delta_ratio: -0.8,
+            current: 5.0,
+            baseline: 25.0,
+        };
+
+        let card = build_card(&alert, &[trend], &[]);
+        assert!(
+            card.confidence > alert.score,
+            "falling trend should boost throughput drop confidence"
+        );
+        assert!(card.rationale.contains("falling"));
+    }
+
+    #[test]
+    fn insight_card_deep_links_present() {
+        let alert = AnomalyAlert {
+            kind: AnomalyKind::ReservationConflicts,
+            severity: AnomalySeverity::Medium,
+            score: 0.5,
+            current_value: 8.0,
+            threshold: 5.0,
+            baseline_value: None,
+            explanation: "Reservation conflicts elevated".into(),
+            suggested_action: "Coordinate agents".into(),
+        };
+        let card = build_card(&alert, &[], &[]);
+        assert!(card.deep_links.contains(&"screen:reservations".to_string()));
+    }
+
+    #[test]
+    fn insight_card_serializable() {
+        let alert = AnomalyAlert {
+            kind: AnomalyKind::HighErrorRate,
+            severity: AnomalySeverity::High,
+            score: 0.8,
+            current_value: 50.0,
+            threshold: 10.0,
+            baseline_value: None,
+            explanation: "High error rate".into(),
+            suggested_action: "Check logs".into(),
+        };
+        let card = build_card(&alert, &[], &[]);
+        let json = serde_json::to_value(&card).expect("InsightCard should serialize");
+        assert!(json.get("id").is_some());
+        assert!(json.get("confidence").is_some());
+        assert!(json.get("severity").is_some());
+        assert!(json.get("headline").is_some());
+        assert!(json.get("rationale").is_some());
+        assert!(json.get("next_steps").is_some());
+        assert!(json.get("deep_links").is_some());
+    }
+
+    #[test]
+    fn insight_feed_serializable() {
+        let feed = build_insight_feed(&[], &[], &[]);
+        let json = serde_json::to_value(&feed).expect("InsightFeed should serialize");
+        assert_eq!(json["alerts_processed"], 0);
+        assert_eq!(json["cards_produced"], 0);
+        assert!(json["cards"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn insight_feed_integration_with_anomaly_detection() {
+        // Full pipeline: KPI → anomalies → trends → correlations → insight feed
+        let baseline = make_kpi(5.0, 30.0, 60.0, 30, 10, 5, 1, 1, 2, 0, 50.0);
+        let current = make_kpi(50.0, 200.0, 400.0, 90, 85, 30, 10, 15, 25, 10, 10.0);
+
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&current, Some(&baseline), &thresholds);
+        let trends = compute_trends(&current, &baseline);
+        let correlations = compute_correlations(&current, &baseline);
+
+        let feed = build_insight_feed(&alerts, &trends, &correlations);
+
+        assert!(
+            !feed.cards.is_empty(),
+            "degraded system should produce insight cards"
+        );
+        assert_eq!(feed.alerts_processed, alerts.len());
+
+        // First card should be highest severity.
+        if feed.cards.len() >= 2 {
+            assert!(feed.cards[0].severity >= feed.cards[1].severity);
+        }
+
+        // At least some cards should have supporting evidence.
+        let with_trends = feed
+            .cards
+            .iter()
+            .filter(|c| !c.supporting_trends.is_empty())
+            .count();
+        assert!(with_trends > 0, "some cards should have supporting trends");
     }
 }

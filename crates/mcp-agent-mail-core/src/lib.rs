@@ -42,12 +42,13 @@ pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identi
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};
 pub use kpi::{
     AckPressureKpi, AnomalyAlert, AnomalyKind, AnomalySeverity, AnomalyThresholds, ContentionKpi,
-    CorrelationPair, ForecastPoint, KpiReport, KpiSnapshot, KpiWindow, LatencyKpi, Sensitivity,
-    ThroughputKpi, TrendDirection, TrendIndicator, TrendReport, compute_correlations,
-    compute_forecasts, compute_trends, detect_anomalies, kpi_gauges, latest_raw as kpi_latest_raw,
-    quick_anomaly_scan, quick_trend_report, record_sample as kpi_record_sample,
-    report as kpi_report, reset_samples as kpi_reset_samples, sample_count as kpi_sample_count,
-    snapshot as kpi_snapshot, trend_report,
+    CorrelationPair, ForecastPoint, InsightCard, InsightFeed, KpiReport, KpiSnapshot, KpiWindow,
+    LatencyKpi, Sensitivity, ThroughputKpi, TrendDirection, TrendIndicator, TrendReport,
+    build_insight_feed, compute_correlations, compute_forecasts, compute_trends, detect_anomalies,
+    kpi_gauges, latest_raw as kpi_latest_raw, quick_anomaly_scan, quick_insight_feed,
+    quick_trend_report, record_sample as kpi_record_sample, report as kpi_report,
+    reset_samples as kpi_reset_samples, sample_count as kpi_sample_count, snapshot as kpi_snapshot,
+    trend_report,
 };
 pub use lock_order::{
     LockContentionEntry, LockLevel, OrderedMutex, OrderedRwLock, lock_contention_reset,

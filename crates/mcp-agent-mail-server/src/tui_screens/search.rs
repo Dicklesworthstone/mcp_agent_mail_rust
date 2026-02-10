@@ -14,7 +14,9 @@ use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::search_planner::{DocKind, Importance, SearchQuery};
+use mcp_agent_mail_db::search_planner::DocKind;
+#[cfg(test)]
+use mcp_agent_mail_db::search_planner::{Importance, SearchQuery};
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
@@ -114,7 +116,8 @@ impl ImportanceFilter {
         }
     }
 
-    const fn importance(&self) -> Option<Importance> {
+    #[cfg(test)]
+    const fn importance(self) -> Option<Importance> {
         match self {
             Self::Any => None,
             Self::Urgent => Some(Importance::Urgent),
@@ -123,7 +126,7 @@ impl ImportanceFilter {
         }
     }
 
-    fn filter_string(&self) -> Option<String> {
+    fn filter_string(self) -> Option<String> {
         match self {
             Self::Any => None,
             Self::Urgent => Some("urgent".to_string()),
@@ -158,7 +161,7 @@ impl AckFilter {
         }
     }
 
-    const fn filter_value(&self) -> Option<bool> {
+    const fn filter_value(self) -> Option<bool> {
         match self {
             Self::Any => None,
             Self::Required => Some(true),
@@ -332,6 +335,7 @@ impl SearchCockpitScreen {
     }
 
     /// Build a `SearchQuery` from the current facet state.
+    #[cfg(test)]
     fn build_query(&self) -> SearchQuery {
         let raw = self.query_input.value().trim().to_string();
         let doc_kind = self.doc_kind_filter.doc_kind().unwrap_or(DocKind::Message);
@@ -472,9 +476,8 @@ impl SearchCockpitScreen {
 
         // LIKE fallback or empty query (recent messages)
         let order_clause = match self.sort_direction {
-            SortDirection::NewestFirst => "m.created_ts DESC",
             SortDirection::OldestFirst => "m.created_ts ASC",
-            SortDirection::Relevance => "m.created_ts DESC",
+            SortDirection::NewestFirst | SortDirection::Relevance => "m.created_ts DESC",
         };
 
         if raw.is_empty() {
@@ -507,6 +510,7 @@ impl SearchCockpitScreen {
 
     /// Search agents.
     fn search_agents(&self, conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
+        let _ = self; // future: may use self for per-project scoping
         if raw.is_empty() {
             let sql = "SELECT id, name, task_description, project_id \
                        FROM agents ORDER BY name LIMIT 100";
@@ -525,6 +529,7 @@ impl SearchCockpitScreen {
 
     /// Search projects.
     fn search_projects(&self, conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
+        let _ = self; // future: may use self for filtering
         if raw.is_empty() {
             let sql = "SELECT id, slug, human_key FROM projects ORDER BY slug LIMIT 100";
             return query_project_rows(conn, sql);
@@ -541,6 +546,7 @@ impl SearchCockpitScreen {
     }
 
     /// Toggle the active facet's value.
+    #[allow(clippy::missing_const_for_fn)] // mutates self through .next() chains
     fn toggle_active_facet(&mut self) {
         match self.active_facet {
             FacetSlot::DocKind => self.doc_kind_filter = self.doc_kind_filter.next(),
@@ -602,10 +608,7 @@ impl MailScreen for SearchCockpitScreen {
                     },
 
                     Focus::FacetRail => match key.code {
-                        KeyCode::Escape | KeyCode::Char('q') => {
-                            self.focus = Focus::ResultList;
-                        }
-                        KeyCode::Tab => {
+                        KeyCode::Escape | KeyCode::Char('q') | KeyCode::Tab => {
                             self.focus = Focus::ResultList;
                         }
                         KeyCode::Char('/') => {
@@ -652,16 +655,12 @@ impl MailScreen for SearchCockpitScreen {
                             self.focus = Focus::QueryBar;
                             self.query_input.set_focused(true);
                         }
-                        KeyCode::Tab => {
-                            self.focus = Focus::FacetRail;
-                        }
-                        KeyCode::Char('f') => {
+                        KeyCode::Tab | KeyCode::Char('f') => {
                             self.focus = Focus::FacetRail;
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
                             if !self.results.is_empty() {
-                                self.cursor =
-                                    (self.cursor + 1).min(self.results.len() - 1);
+                                self.cursor = (self.cursor + 1).min(self.results.len() - 1);
                                 self.detail_scroll = 0;
                             }
                         }
@@ -681,8 +680,7 @@ impl MailScreen for SearchCockpitScreen {
                         }
                         KeyCode::Char('d') | KeyCode::PageDown => {
                             if !self.results.is_empty() {
-                                self.cursor =
-                                    (self.cursor + 20).min(self.results.len() - 1);
+                                self.cursor = (self.cursor + 20).min(self.results.len() - 1);
                                 self.detail_scroll = 0;
                             }
                         }
@@ -903,10 +901,7 @@ fn query_message_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
                         body_preview: preview,
                         score: None,
                         importance: row.get_named("importance").ok(),
-                        ack_required: row
-                            .get_named::<i64>("ack_required")
-                            .ok()
-                            .map(|v| v != 0),
+                        ack_required: row.get_named::<i64>("ack_required").ok().map(|v| v != 0),
                         created_ts: row.get_named("created_ts").ok(),
                         thread_id: row.get_named("thread_id").ok(),
                         from_agent: row.get_named("from_name").ok(),
@@ -1031,9 +1026,7 @@ fn render_query_bar(
         ""
     };
 
-    let title = format!(
-        "Search {kind_label} ({count} results){thread_label}{focus_label}"
-    );
+    let title = format!("Search {kind_label} ({count} results){thread_label}{focus_label}");
 
     let block = Block::default()
         .title(&title)
@@ -1072,6 +1065,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
     ];
 
     for (i, &(slot, label, value)) in facets.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)] // max 4 facets
         let y = inner.y + (i as u16) * 2;
         if y >= inner.y + inner.height {
             break;
@@ -1090,7 +1084,9 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
         let label_text = format!("{marker} {label}");
         let label_line = truncate_str(&label_text, w);
         let label_area = Rect::new(inner.x, y, inner.width, 1);
-        Paragraph::new(label_line).style(label_style).render(label_area, frame);
+        Paragraph::new(label_line)
+            .style(label_style)
+            .render(label_area, frame);
 
         // Value row (indented)
         let value_y = y + 1;
@@ -1103,7 +1099,9 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
             } else {
                 Style::default()
             };
-            Paragraph::new(val_line).style(val_style).render(val_area, frame);
+            Paragraph::new(val_line)
+                .style(val_style)
+                .render(val_area, frame);
         }
     }
 
@@ -1122,7 +1120,11 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
     // Help hint at bottom
     let help_y = inner.y + inner.height - 1;
     if help_y > inner.y + 9 {
-        let hint = if in_rail { "Enter:toggle r:reset" } else { "f:facets" };
+        let hint = if in_rail {
+            "Enter:toggle r:reset"
+        } else {
+            "f:facets"
+        };
         let hint_area = Rect::new(inner.x, help_y, inner.width, 1);
         Paragraph::new(truncate_str(hint, w))
             .style(Style::default().fg(FACET_LABEL_FG))
@@ -1130,12 +1132,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
     }
 }
 
-fn render_results(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    results: &[ResultEntry],
-    cursor: usize,
-) {
+fn render_results(frame: &mut Frame<'_>, area: Rect, results: &[ResultEntry], cursor: usize) {
     let block = Block::default()
         .title("Results")
         .border_type(BorderType::Rounded);
@@ -1163,11 +1160,7 @@ fn render_results(
 
     for (vi, entry) in viewport.iter().enumerate() {
         let abs_idx = start + vi;
-        let marker = if abs_idx == cursor_clamped {
-            '>'
-        } else {
-            ' '
-        };
+        let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
 
         let kind_badge = match entry.doc_kind {
             DocKind::Message => "M",
@@ -1193,7 +1186,10 @@ fn render_results(
             })
             .unwrap_or_default();
 
-        let prefix = format!("{marker} {kind_badge} {imp_badge:>2} #{:<5} {time:>8} ", entry.id);
+        let prefix = format!(
+            "{marker} {kind_badge} {imp_badge:>2} #{:<5} {time:>8} ",
+            entry.id
+        );
         let remaining = w.saturating_sub(prefix.len());
         let title = truncate_str(&entry.title, remaining);
         lines.push(format!("{prefix}{title}"));
@@ -1204,12 +1200,7 @@ fn render_results(
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn render_detail(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    entry: Option<&ResultEntry>,
-    scroll: usize,
-) {
+fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&ResultEntry>, scroll: usize) {
     let block = Block::default()
         .title("Detail")
         .border_type(BorderType::Rounded);
@@ -1409,7 +1400,7 @@ mod tests {
     #[test]
     fn truncate_str_long() {
         let result = truncate_str("hello world", 5);
-        assert!(result.len() <= 6); // 4 chars + ellipsis
+        assert_eq!(result.chars().count(), 5); // 4 chars + 1 ellipsis char
         assert!(result.ends_with('\u{2026}'));
     }
 

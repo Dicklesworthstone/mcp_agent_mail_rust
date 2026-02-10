@@ -1245,20 +1245,20 @@ mod tests {
     }
 
     #[test]
-    fn number_key_zero_switches_to_contacts() {
+    fn number_key_zero_switches_to_projects() {
         let mut model = test_model();
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('0')));
         model.update(MailMsg::Terminal(key));
-        // 0 maps to screen 10 (Contacts)
-        assert_eq!(model.active_screen(), MailScreenId::Contacts);
+        // 0 maps to screen 10 (Projects) — 11th screen (Contacts) needs command palette
+        assert_eq!(model.active_screen(), MailScreenId::Projects);
     }
 
     #[test]
-    fn number_key_nine_switches_to_projects() {
+    fn number_key_nine_switches_to_timeline() {
         let mut model = test_model();
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('9')));
         model.update(MailMsg::Terminal(key));
-        assert_eq!(model.active_screen(), MailScreenId::Projects);
+        assert_eq!(model.active_screen(), MailScreenId::Timeline);
     }
 
     #[test]

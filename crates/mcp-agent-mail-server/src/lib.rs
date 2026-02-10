@@ -4818,9 +4818,12 @@ const fn http_error_status(
     use fastmcp_transport::http::HttpStatus;
     match err {
         HttpError::InvalidMethod(_) => HttpStatus::METHOD_NOT_ALLOWED,
-        HttpError::InvalidContentType(_) | HttpError::JsonError(_) | HttpError::CodecError(_) => {
-            HttpStatus::BAD_REQUEST
-        }
+        HttpError::InvalidContentType(_)
+        | HttpError::JsonError(_)
+        | HttpError::CodecError(_)
+        | HttpError::HeadersTooLarge { .. }
+        | HttpError::BodyTooLarge { .. }
+        | HttpError::UnsupportedTransferEncoding(_) => HttpStatus::BAD_REQUEST,
         HttpError::Timeout | HttpError::Closed => HttpStatus::SERVICE_UNAVAILABLE,
         HttpError::Transport(_) => HttpStatus::INTERNAL_SERVER_ERROR,
     }

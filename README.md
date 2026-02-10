@@ -87,7 +87,7 @@ For the canonical contract/specs:
 
 ## TUI Controls
 
-The interactive TUI has 8 screens navigable with `1`-`8` or `Tab`:
+The interactive TUI has 11 screens. Number keys map to screens 1-10 (`1`-`9`, `0`=10); use `Tab` or `Ctrl+P` to reach any screen:
 
 | # | Screen       | Shows                                              |
 |---|--------------|-----------------------------------------------------|
@@ -95,10 +95,13 @@ The interactive TUI has 8 screens navigable with `1`-`8` or `Tab`:
 | 2 | Messages     | Message browser with search and filtering            |
 | 3 | Threads      | Thread view with correlation                         |
 | 4 | Agents       | Registered agents with activity indicators           |
-| 5 | Reservations | File reservations with TTL countdowns                |
-| 6 | ToolMetrics  | Per-tool latency and call counts                     |
-| 7 | SystemHealth | Connection probes, disk/memory, circuit breakers     |
-| 8 | Timeline     | Chronological event timeline with inspector          |
+| 5 | Search       | Query bar + facets + results + preview               |
+| 6 | Reservations | File reservations with TTL countdowns                |
+| 7 | Tool Metrics | Per-tool latency and call counts                     |
+| 8 | SystemHealth | Connection probes, disk/memory, circuit breakers     |
+| 9 | Timeline     | Chronological event timeline with inspector          |
+| 10 | Projects    | Project list and routing helpers                     |
+| 11 | Contacts    | Contact graph and policy surface                     |
 
 Key bindings: `?` help, `Ctrl+P` command palette, `m` toggle MCP/API,
 `Shift+T` cycle theme, `q` quit.

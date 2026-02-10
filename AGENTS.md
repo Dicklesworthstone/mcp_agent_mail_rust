@@ -302,7 +302,7 @@ mcp-agent-mail-core          (config, models, errors, metrics)
 | `crates/mcp-agent-mail-db/src/queries.rs` | All SQL queries (instrumented) |
 | `crates/mcp-agent-mail-tools/src/` | 34 MCP tool implementations |
 | `crates/mcp-agent-mail-server/src/lib.rs` | Server dispatch, HTTP handler |
-| `crates/mcp-agent-mail-server/src/tui_*.rs` | 8-screen TUI operations console |
+| `crates/mcp-agent-mail-server/src/tui_*.rs` | TUI operations console (11 screens) |
 | `scripts/am` | Dev convenience wrapper (HTTP + TUI) |
 | `tests/e2e/` | 37 E2E test scripts |
 | `rust-toolchain.toml` | Nightly toolchain requirement |
@@ -321,7 +321,7 @@ mcp-agent-mail-core          (config, models, errors, metrics)
 | Product Bus | 5 | ensure_product, products_link, search_messages_product, fetch_inbox_product, summarize_thread_product |
 | Build Slots | 3 | acquire_build_slot, renew_build_slot, release_build_slot |
 
-### 8-Screen TUI
+### 11-Screen TUI
 
 | # | Screen | Shows |
 |---|--------|-------|
@@ -329,10 +329,13 @@ mcp-agent-mail-core          (config, models, errors, metrics)
 | 2 | Messages | Message browser with search and filtering |
 | 3 | Threads | Thread view with correlation |
 | 4 | Agents | Registered agents with activity indicators |
-| 5 | Reservations | File reservations with TTL countdowns |
-| 6 | ToolMetrics | Per-tool latency and call counts |
-| 7 | SystemHealth | Connection probes, disk/memory, circuit breakers |
-| 8 | Timeline | Chronological event timeline with inspector |
+| 5 | Search | Query bar + facets + results + preview |
+| 6 | Reservations | File reservations with TTL countdowns |
+| 7 | Tool Metrics | Per-tool latency and call counts |
+| 8 | SystemHealth | Connection probes, disk/memory, circuit breakers |
+| 9 | Timeline | Chronological event timeline with inspector |
+| 10 | Projects | Project list and routing helpers |
+| 11 | Contacts | Contact graph and policy surface |
 
 Key bindings: `?` help, `Ctrl+P` command palette, `m` toggle MCP/API, `Shift+T` cycle theme, `q` quit.
 
