@@ -218,7 +218,7 @@ impl ThreadExplorerScreen {
         match self.sort_mode {
             SortMode::LastActivity => {
                 self.threads
-                    .sort_by(|a, b| b.last_timestamp_micros.cmp(&a.last_timestamp_micros));
+                    .sort_by_key(|t| std::cmp::Reverse(t.last_timestamp_micros));
             }
             SortMode::Velocity => {
                 self.threads.sort_by(|a, b| {
@@ -229,7 +229,7 @@ impl ThreadExplorerScreen {
             }
             SortMode::ParticipantCount => {
                 self.threads
-                    .sort_by(|a, b| b.participant_count.cmp(&a.participant_count));
+                    .sort_by_key(|t| std::cmp::Reverse(t.participant_count));
             }
             SortMode::EscalationFirst => {
                 self.threads.sort_by(|a, b| {
@@ -681,7 +681,11 @@ fn fetch_threads(conn: &SqliteConnection, filter: &str, limit: usize) -> Vec<Thr
                 .unwrap_or(0);
 
             // Compute velocity: msgs/hour over thread lifetime.
-            let duration_hours = (last_ts - first_ts).max(1) as f64 / (3_600_000_000.0); // micros to hours
+            // Precision loss acceptable: microsecond timestamps and message counts
+            // don't need f64's full mantissa for display purposes.
+            #[allow(clippy::cast_precision_loss)]
+            let duration_hours = (last_ts - first_ts).max(1) as f64 / (3_600_000_000.0);
+            #[allow(clippy::cast_precision_loss)]
             let velocity = if duration_hours > 0.001 {
                 msg_count as f64 / duration_hours
             } else {
@@ -1494,6 +1498,7 @@ mod tests {
             last_timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
             project_slug: "test-proj".to_string(),
             has_escalation: false,
+            #[allow(clippy::cast_precision_loss)]
             velocity_msg_per_hr: msg_count as f64 / 2.0,
             participant_names: "GoldFox,SilverWolf".to_string(),
             first_timestamp_micros: 1_699_993_600_000_000,
