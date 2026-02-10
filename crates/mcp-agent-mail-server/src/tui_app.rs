@@ -21,11 +21,11 @@ use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
-    agents::AgentsScreen, contacts::ContactsScreen, dashboard::DashboardScreen,
-    explorer::MailExplorerScreen, messages::MessageBrowserScreen, projects::ProjectsScreen,
-    reservations::ReservationsScreen, screen_meta, search::SearchCockpitScreen,
-    system_health::SystemHealthScreen, threads::ThreadExplorerScreen, timeline::TimelineScreen,
-    tool_metrics::ToolMetricsScreen,
+    agents::AgentsScreen, analytics::AnalyticsScreen, contacts::ContactsScreen,
+    dashboard::DashboardScreen, explorer::MailExplorerScreen, messages::MessageBrowserScreen,
+    projects::ProjectsScreen, reservations::ReservationsScreen, screen_meta,
+    search::SearchCockpitScreen, system_health::SystemHealthScreen,
+    threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -117,6 +117,8 @@ impl MailAppModel {
                 screens.insert(id, Box::new(ContactsScreen::new()));
             } else if id == MailScreenId::Explorer {
                 screens.insert(id, Box::new(MailExplorerScreen::new()));
+            } else if id == MailScreenId::Analytics {
+                screens.insert(id, Box::new(AnalyticsScreen::new()));
             }
         }
         let mut command_palette = CommandPalette::new().with_max_visible(PALETTE_MAX_VISIBLE);
@@ -665,6 +667,7 @@ mod palette_action_ids {
     pub const SCREEN_PROJECTS: &str = "screen:projects";
     pub const SCREEN_CONTACTS: &str = "screen:contacts";
     pub const SCREEN_EXPLORER: &str = "screen:explorer";
+    pub const SCREEN_ANALYTICS: &str = "screen:analytics";
 }
 
 fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
@@ -681,6 +684,7 @@ fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
         palette_action_ids::SCREEN_PROJECTS => Some(MailScreenId::Projects),
         palette_action_ids::SCREEN_CONTACTS => Some(MailScreenId::Contacts),
         palette_action_ids::SCREEN_EXPLORER => Some(MailScreenId::Explorer),
+        palette_action_ids::SCREEN_ANALYTICS => Some(MailScreenId::Analytics),
         _ => None,
     }
 }
@@ -699,6 +703,7 @@ const fn screen_palette_action_id(id: MailScreenId) -> &'static str {
         MailScreenId::Projects => palette_action_ids::SCREEN_PROJECTS,
         MailScreenId::Contacts => palette_action_ids::SCREEN_CONTACTS,
         MailScreenId::Explorer => palette_action_ids::SCREEN_EXPLORER,
+        MailScreenId::Analytics => palette_action_ids::SCREEN_ANALYTICS,
     }
 }
 

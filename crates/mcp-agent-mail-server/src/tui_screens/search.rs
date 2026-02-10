@@ -5,7 +5,7 @@
 //! composable filtering by document kind, importance, ack status, and more.
 
 use ftui::layout::Rect;
-use ftui::text::Span;
+use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
@@ -40,7 +40,6 @@ const MAX_RESULTS: usize = 200;
 const DEBOUNCE_TICKS: u8 = 3;
 
 /// Max chars for the message snippet shown in the detail pane.
-#[allow(dead_code)] // In-progress: used once results rendering is wired up.
 const MAX_SNIPPET_CHARS: usize = 180;
 
 /// Hard cap on highlight terms to keep rendering predictable.
@@ -357,7 +356,6 @@ fn extract_query_terms(raw: &str) -> Vec<QueryTerm> {
     terms
 }
 
-#[allow(dead_code)] // In-progress: used once results rendering is wired up.
 fn clamp_to_char_boundary(s: &str, mut idx: usize) -> usize {
     idx = idx.min(s.len());
     while idx > 0 && !s.is_char_boundary(idx) {
@@ -366,7 +364,6 @@ fn clamp_to_char_boundary(s: &str, mut idx: usize) -> usize {
     idx
 }
 
-#[allow(dead_code)] // In-progress: used once results rendering is wired up.
 fn extract_snippet(text: &str, terms: &[QueryTerm], max_chars: usize) -> String {
     let mut best_pos: Option<usize> = None;
     let mut best_len: usize = 0;
@@ -409,8 +406,12 @@ fn extract_snippet(text: &str, terms: &[QueryTerm], max_chars: usize) -> String 
     truncate_str(&snippet, max_chars)
 }
 
-#[allow(dead_code)] // In-progress: used once results rendering is wired up.
-fn highlight_spans(text: &str, terms: &[QueryTerm], style: Style) -> Vec<Span<'static>> {
+fn highlight_spans(
+    text: &str,
+    terms: &[QueryTerm],
+    base_style: Option<Style>,
+    highlight_style: Style,
+) -> Vec<Span<'static>> {
     let needles: Vec<String> = terms
         .iter()
         .filter(|t| !t.negated)
@@ -419,7 +420,10 @@ fn highlight_spans(text: &str, terms: &[QueryTerm], style: Style) -> Vec<Span<'s
         .take(MAX_HIGHLIGHT_TERMS)
         .collect();
     if needles.is_empty() {
-        return vec![Span::raw(text.to_string())];
+        return vec![match base_style {
+            Some(style) => Span::styled(text.to_string(), style),
+            None => Span::raw(text.to_string()),
+        }];
     }
 
     let hay = text.to_ascii_lowercase();
@@ -445,15 +449,24 @@ fn highlight_spans(text: &str, terms: &[QueryTerm], style: Style) -> Vec<Span<'s
         }
 
         let Some((start, end)) = best else {
-            out.push(Span::raw(text[i..].to_string()));
+            out.push(match base_style {
+                Some(style) => Span::styled(text[i..].to_string(), style),
+                None => Span::raw(text[i..].to_string()),
+            });
             break;
         };
 
         if start > i {
-            out.push(Span::raw(text[i..start].to_string()));
+            out.push(match base_style {
+                Some(style) => Span::styled(text[i..start].to_string(), style),
+                None => Span::raw(text[i..start].to_string()),
+            });
         }
         if end > start {
-            out.push(Span::styled(text[start..end].to_string(), style));
+            out.push(Span::styled(
+                text[start..end].to_string(),
+                highlight_style,
+            ));
         }
         i = end;
     }
@@ -738,7 +751,7 @@ impl SearchCockpitScreen {
         }
 
         let params: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
-        match query_message_rows(conn, &plan.sql, &params) {
+        match query_message_rows(conn, &plan.sql, &params, &self.highlight_terms) {
             Ok(results) => results,
             Err(e) => {
                 self.last_error = Some(format!("Search failed: {e}"));
@@ -786,7 +799,7 @@ impl SearchCockpitScreen {
         );
         params.push(Value::BigInt(i64::try_from(MAX_RESULTS).unwrap_or(50)));
 
-        match query_message_rows(conn, &sql, &params) {
+        match query_message_rows(conn, &sql, &params, &self.highlight_terms) {
             Ok(results) => results,
             Err(e) => {
                 self.last_error = Some(format!("Search failed: {e}"));
@@ -1340,7 +1353,12 @@ impl MailScreen for SearchCockpitScreen {
             );
 
             render_facet_rail(frame, facet_area, self);
-            render_results(frame, results_area, &self.results, self.cursor);
+            render_results(
+                frame,
+                results_area,
+                &self.results,
+                self.cursor,
+            );
             render_detail(
                 frame,
                 detail_area,
@@ -1356,7 +1374,12 @@ impl MailScreen for SearchCockpitScreen {
                 body_area.height,
             );
             render_facet_rail(frame, facet_area, self);
-            render_results(frame, results_area, &self.results, self.cursor);
+            render_results(
+                frame,
+                results_area,
+                &self.results,
+                self.cursor,
+            );
         }
     }
 
@@ -1472,6 +1495,7 @@ fn query_message_rows(
     conn: &SqliteConnection,
     sql: &str,
     params: &[Value],
+    highlight_terms: &[QueryTerm],
 ) -> Result<Vec<ResultEntry>, String> {
     conn.query_sync(sql, params)
         .map_err(|e| e.to_string())
@@ -1481,7 +1505,12 @@ fn query_message_rows(
                     let id: i64 = row.get_named("id").ok()?;
                     let subject: String = row.get_named("subject").unwrap_or_default();
                     let body: String = row.get_named("body_md").unwrap_or_default();
-                    let preview = truncate_str(&body, 120);
+                    let body = collapse_whitespace(&body);
+                    let preview = if highlight_terms.is_empty() {
+                        truncate_str(&body, 120)
+                    } else {
+                        extract_snippet(&body, highlight_terms, MAX_SNIPPET_CHARS)
+                    };
                     Some(ResultEntry {
                         id,
                         doc_kind: DocKind::Message,
@@ -1509,6 +1538,7 @@ fn query_agent_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> Vec
                     let id: i64 = row.get_named("id").ok()?;
                     let name: String = row.get_named("name").unwrap_or_default();
                     let desc: String = row.get_named("task_description").unwrap_or_default();
+                    let desc = collapse_whitespace(&desc);
                     Some(ResultEntry {
                         id,
                         doc_kind: DocKind::Agent,
@@ -1558,6 +1588,9 @@ fn query_project_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> V
 
 /// Truncate a string to `max_chars`, adding ellipsis if needed.
 fn truncate_str(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     if s.len() <= max_chars {
         s.to_string()
     } else {
@@ -1565,6 +1598,26 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
         t.push('\u{2026}');
         t
     }
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = true; // trim leading whitespace
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(ch);
+            in_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 fn url_encode_component(s: &str) -> String {
@@ -1751,7 +1804,14 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
     }
 }
 
-fn render_results(frame: &mut Frame<'_>, area: Rect, results: &[ResultEntry], cursor: usize) {
+fn render_results(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    results: &[ResultEntry],
+    cursor: usize,
+    highlight_terms: &[QueryTerm],
+    sort_direction: SortDirection,
+) {
     let block = Block::default()
         .title("Results")
         .border_type(BorderType::Rounded);
@@ -1775,11 +1835,17 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, results: &[ResultEntry], cu
     let viewport = &results[start..end];
 
     let w = inner.width as usize;
-    let mut lines = Vec::with_capacity(viewport.len());
+    let meta_style = Style::default().fg(FACET_LABEL_FG);
+    let cursor_style = Style::default().fg(RESULT_CURSOR_FG);
+    let snippet_style = Style::default().fg(FACET_LABEL_FG);
+    let highlight_style = Style::default().fg(RESULT_CURSOR_FG).bold();
+
+    let mut lines: Vec<Line> = Vec::with_capacity(viewport.len());
 
     for (vi, entry) in viewport.iter().enumerate() {
         let abs_idx = start + vi;
-        let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
+        let is_cursor = abs_idx == cursor_clamped;
+        let marker = if is_cursor { '>' } else { ' ' };
 
         let kind_badge = match entry.doc_kind {
             DocKind::Message => "M",
@@ -1805,21 +1871,95 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, results: &[ResultEntry], cu
             })
             .unwrap_or_default();
 
-        let prefix = format!(
-            "{marker} {kind_badge} {imp_badge:>2} #{:<5} {time:>8} ",
-            entry.id
-        );
+        let proj = entry
+            .project_id
+            .map(|pid| format!("p#{pid}"))
+            .unwrap_or_else(|| "-".to_string());
+
+        let score_col = if sort_direction == SortDirection::Relevance {
+            entry
+                .score
+                .map(|s| format!("{s:>6.2}"))
+                .unwrap_or_else(|| "      ".to_string())
+        } else {
+            String::new()
+        };
+
+        let mut prefix = if sort_direction == SortDirection::Relevance {
+            format!(
+                "{marker} {kind_badge} {imp_badge:>2} {proj} #{:<5} {time:>8} {score_col} ",
+                entry.id
+            )
+        } else {
+            format!(
+                "{marker} {kind_badge} {imp_badge:>2} {proj} #{:<5} {time:>8} ",
+                entry.id
+            )
+        };
+
+        // Ensure we don't overrun tiny viewports.
+        prefix = truncate_str(&prefix, w);
         let remaining = w.saturating_sub(prefix.len());
-        let title = truncate_str(&entry.title, remaining);
-        lines.push(format!("{prefix}{title}"));
+
+        const MIN_TITLE_CHARS: usize = 18;
+        const MIN_SNIPPET_CHARS: usize = 18;
+        const MAX_SNIPPET_CHARS_IN_LIST: usize = 60;
+        let sep = " | ";
+        let sep_len = sep.len();
+
+        let mut include_snippet = !entry.body_preview.is_empty();
+        let (title_w, snippet_w) = if include_snippet
+            && remaining >= MIN_TITLE_CHARS + sep_len + MIN_SNIPPET_CHARS
+        {
+            let mut snippet_w = (remaining / 2).min(MAX_SNIPPET_CHARS_IN_LIST);
+            // Leave space for the title.
+            snippet_w = snippet_w.min(remaining.saturating_sub(MIN_TITLE_CHARS + sep_len));
+            let title_w = remaining.saturating_sub(sep_len + snippet_w);
+            if title_w < MIN_TITLE_CHARS || snippet_w < MIN_SNIPPET_CHARS {
+                include_snippet = false;
+                (remaining, 0)
+            } else {
+                (title_w, snippet_w)
+            }
+        } else {
+            include_snippet = false;
+            (remaining, 0)
+        };
+
+        let title = truncate_str(&entry.title, title_w);
+        let snippet = if include_snippet {
+            truncate_str(&entry.body_preview, snippet_w)
+        } else {
+            String::new()
+        };
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let line_meta_style = if is_cursor { cursor_style } else { meta_style };
+        spans.push(Span::styled(prefix, line_meta_style));
+        spans.extend(highlight_spans(&title, highlight_terms, None, highlight_style));
+        if include_snippet && !snippet.is_empty() && remaining > 0 {
+            spans.push(Span::styled(sep.to_string(), meta_style));
+            spans.extend(highlight_spans(
+                &snippet,
+                highlight_terms,
+                Some(snippet_style),
+                highlight_style,
+            ));
+        }
+        lines.push(Line::from_spans(spans));
     }
 
-    let text = lines.join("\n");
-    Paragraph::new(text).render(inner, frame);
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&ResultEntry>, scroll: usize) {
+fn render_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entry: Option<&ResultEntry>,
+    scroll: usize,
+    highlight_terms: &[QueryTerm],
+) {
     let block = Block::default()
         .title("Detail")
         .border_type(BorderType::Rounded);
@@ -1835,42 +1975,61 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&ResultEntry>,
         return;
     };
 
-    let mut lines = Vec::new();
-    lines.push(format!("Type:    {:?}", entry.doc_kind));
-    lines.push(format!("Title:   {}", entry.title));
-    lines.push(format!("ID:      #{}", entry.id));
+    let label_style = Style::default().fg(FACET_LABEL_FG);
+    let highlight_style = Style::default().fg(RESULT_CURSOR_FG).bold();
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw(format!("Type:    {:?}", entry.doc_kind)));
+
+    let mut title_spans: Vec<Span<'static>> = Vec::new();
+    title_spans.push(Span::styled("Title:   ".to_string(), label_style));
+    title_spans.extend(highlight_spans(
+        &entry.title,
+        highlight_terms,
+        None,
+        highlight_style,
+    ));
+    lines.push(Line::from_spans(title_spans));
+
+    lines.push(Line::raw(format!("ID:      #{}", entry.id)));
 
     if let Some(ref agent) = entry.from_agent {
-        lines.push(format!("From:    {agent}"));
+        lines.push(Line::raw(format!("From:    {agent}")));
     }
     if let Some(ref tid) = entry.thread_id {
-        lines.push(format!("Thread:  {tid}"));
+        lines.push(Line::raw(format!("Thread:  {tid}")));
     }
     if let Some(ref imp) = entry.importance {
-        lines.push(format!("Import.: {imp}"));
+        lines.push(Line::raw(format!("Import.: {imp}")));
     }
     if let Some(ack) = entry.ack_required {
-        lines.push(format!("Ack:     {}", if ack { "required" } else { "no" }));
+        lines.push(Line::raw(format!(
+            "Ack:     {}",
+            if ack { "required" } else { "no" }
+        )));
     }
     if let Some(ts) = entry.created_ts {
-        lines.push(format!("Time:    {}", micros_to_iso(ts)));
+        lines.push(Line::raw(format!("Time:    {}", micros_to_iso(ts))));
     }
     if let Some(pid) = entry.project_id {
-        lines.push(format!("Project: #{pid}"));
+        lines.push(Line::raw(format!("Project: #{pid}")));
     }
     if let Some(score) = entry.score {
-        lines.push(format!("Score:   {score:.3}"));
+        lines.push(Line::raw(format!("Score:   {score:.3}")));
     }
 
-    lines.push(String::new());
-    lines.push("--- Preview ---".to_string());
-    lines.push(entry.body_preview.clone());
+    lines.push(Line::raw(String::new()));
+    lines.push(Line::styled("--- Preview ---".to_string(), label_style));
+    lines.push(Line::from_spans(highlight_spans(
+        &entry.body_preview,
+        highlight_terms,
+        None,
+        highlight_style,
+    )));
 
     // Apply scroll
     let skip = scroll.min(lines.len().saturating_sub(1));
-    let visible = &lines[skip..];
-    let text = visible.join("\n");
-    Paragraph::new(text).render(inner, frame);
+    Paragraph::new(Text::from_lines(lines.into_iter().skip(skip))).render(inner, frame);
 }
 
 /// Compute a centered viewport range for scrolling.
@@ -2368,5 +2527,36 @@ mod tests {
         assert!(screen.query_history.is_empty());
         assert!(screen.history_cursor.is_none());
         assert!(!screen.recipes_loaded);
+    }
+
+    #[test]
+    fn extract_snippet_centers_on_match_and_adds_ellipses() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu needle nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
+        let terms = vec![QueryTerm {
+            text: "needle".to_string(),
+            kind: QueryTermKind::Word,
+            negated: false,
+        }];
+        let snippet = extract_snippet(text, &terms, 40);
+        assert!(snippet.contains("needle"));
+        assert!(snippet.starts_with('\u{2026}'));
+        assert!(snippet.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn highlight_spans_preserves_text_and_styles_matches() {
+        let terms = vec![QueryTerm {
+            text: "needle".to_string(),
+            kind: QueryTermKind::Word,
+            negated: false,
+        }];
+        let base = Style::default().fg(FACET_LABEL_FG);
+        let highlight = Style::default().fg(RESULT_CURSOR_FG).bold();
+        let spans = highlight_spans("xxNEEDLEyy", &terms, Some(base), highlight);
+
+        let plain: String = spans.iter().map(|s| s.as_str()).collect();
+        assert_eq!(plain, "xxNEEDLEyy");
+        assert!(spans.iter().any(|s| s.as_str() == "NEEDLE" && s.style == Some(highlight)));
+        assert!(spans.iter().any(|s| s.as_str() == "xx" && s.style == Some(base)));
     }
 }

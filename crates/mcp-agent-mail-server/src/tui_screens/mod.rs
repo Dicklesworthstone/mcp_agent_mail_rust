@@ -5,6 +5,7 @@
 //! metadata used by the chrome shell (tab bar, help overlay).
 
 pub mod agents;
+pub mod analytics;
 pub mod contacts;
 pub mod dashboard;
 pub mod explorer;
@@ -45,6 +46,7 @@ pub enum MailScreenId {
     Projects,
     Contacts,
     Explorer,
+    Analytics,
 }
 
 /// All screen IDs in display order.
@@ -61,6 +63,7 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::Projects,
     MailScreenId::Contacts,
     MailScreenId::Explorer,
+    MailScreenId::Analytics,
 ];
 
 impl MailScreenId {
@@ -329,6 +332,13 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         category: ScreenCategory::Communication,
         description: "Unified inbox/outbox explorer with direction, grouping, and ack filters",
     },
+    MailScreenMeta {
+        id: MailScreenId::Analytics,
+        title: "Analytics",
+        short_label: "Insight",
+        category: ScreenCategory::System,
+        description: "Anomaly insight feed with confidence scoring and actionable next steps",
+    },
 ];
 
 /// Look up metadata for a screen ID.
@@ -406,7 +416,7 @@ mod tests {
     #[test]
     fn screen_count_matches() {
         assert_eq!(ALL_SCREEN_IDS.len(), MAIL_SCREEN_REGISTRY.len());
-        assert_eq!(ALL_SCREEN_IDS.len(), 12);
+        assert_eq!(ALL_SCREEN_IDS.len(), 13);
     }
 
     #[test]
@@ -441,7 +451,7 @@ mod tests {
 
     #[test]
     fn from_number_invalid() {
-        assert_eq!(MailScreenId::from_number(13), None);
+        assert_eq!(MailScreenId::from_number(14), None);
         assert_eq!(MailScreenId::from_number(100), None);
     }
 
