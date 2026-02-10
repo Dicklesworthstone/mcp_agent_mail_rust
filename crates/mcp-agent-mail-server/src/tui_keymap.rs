@@ -164,9 +164,10 @@ pub fn detect_conflicts(
 mod tests {
     use super::*;
     use crate::tui_screens::{
-        ALL_SCREEN_IDS, MailScreen, MailScreenId, PlaceholderScreen, dashboard::DashboardScreen,
-        messages::MessageBrowserScreen, system_health::SystemHealthScreen,
-        timeline::TimelineScreen,
+        ALL_SCREEN_IDS, MailScreen, agents::AgentsScreen, dashboard::DashboardScreen,
+        messages::MessageBrowserScreen, reservations::ReservationsScreen,
+        system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
+        timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
     };
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -266,23 +267,15 @@ mod tests {
         let screens: Vec<(&str, Box<dyn MailScreen>)> = vec![
             ("Dashboard", Box::new(DashboardScreen::new())),
             ("Messages", Box::new(MessageBrowserScreen::new())),
+            ("Threads", Box::new(ThreadExplorerScreen::new())),
             ("Timeline", Box::new(TimelineScreen::new())),
             (
                 "SystemHealth",
                 Box::new(SystemHealthScreen::new(Arc::clone(&state))),
             ),
-            (
-                "Agents",
-                Box::new(PlaceholderScreen::new(MailScreenId::Agents)),
-            ),
-            (
-                "Reservations",
-                Box::new(PlaceholderScreen::new(MailScreenId::Reservations)),
-            ),
-            (
-                "ToolMetrics",
-                Box::new(PlaceholderScreen::new(MailScreenId::ToolMetrics)),
-            ),
+            ("Agents", Box::new(AgentsScreen::new())),
+            ("Reservations", Box::new(ReservationsScreen::new())),
+            ("ToolMetrics", Box::new(ToolMetricsScreen::new())),
         ];
 
         let mut all_conflicts = Vec::new();
