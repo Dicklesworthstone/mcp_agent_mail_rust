@@ -748,15 +748,24 @@ fn render_search(
     let results = if q.is_empty() {
         Vec::new()
     } else {
-        let rows = block_on_outcome(cx, queries::search_messages(cx, pool, pid, &q, limit))?;
-        rows.iter()
+        let search_query = mcp_agent_mail_db::search_planner::SearchQuery::messages(&q, pid);
+        let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
+            limit: Some(limit),
+            ..search_query
+        };
+        let resp = block_on_outcome(
+            cx,
+            mcp_agent_mail_db::search_service::execute_search_simple(cx, pool, &search_query),
+        )?;
+        resp.results
+            .iter()
             .map(|r| SearchResult {
                 id: r.id,
-                subject: r.subject.clone(),
-                body_snippet: truncate_body(&r.body_md, 200),
-                sender_name: r.from.clone(),
-                created: ts_display(r.created_ts),
-                importance: r.importance.clone(),
+                subject: r.title.clone(),
+                body_snippet: truncate_body(&r.body, 200),
+                sender_name: r.from_agent.clone().unwrap_or_default(),
+                created: r.created_ts.map_or_else(String::new, ts_display),
+                importance: r.importance.clone().unwrap_or_default(),
                 thread_id: r.thread_id.clone().unwrap_or_default(),
             })
             .collect()
