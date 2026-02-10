@@ -21,12 +21,12 @@ use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
-    ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
-    agents::AgentsScreen, analytics::AnalyticsScreen, attachments::AttachmentExplorerScreen,
-    contacts::ContactsScreen, dashboard::DashboardScreen, explorer::MailExplorerScreen,
-    messages::MessageBrowserScreen, projects::ProjectsScreen, reservations::ReservationsScreen,
-    screen_meta, search::SearchCockpitScreen, system_health::SystemHealthScreen,
-    threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+    ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg, agents::AgentsScreen,
+    analytics::AnalyticsScreen, attachments::AttachmentExplorerScreen, contacts::ContactsScreen,
+    dashboard::DashboardScreen, explorer::MailExplorerScreen, messages::MessageBrowserScreen,
+    projects::ProjectsScreen, reservations::ReservationsScreen, screen_meta,
+    search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
+    timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -233,14 +233,13 @@ impl MailAppModel {
             let steps = self
                 .macro_engine
                 .get_macro(name)
-                .map(|d| d.len())
-                .unwrap_or(0);
+                .map_or(0, super::tui_macro::MacroDef::len);
             actions.push(
                 ActionItem::new(
                     format!("{}{name}", macro_ids::PLAY_PREFIX),
                     format!("Play macro: {name}"),
                 )
-                .with_description(&format!("{steps} steps, continuous"))
+                .with_description(format!("{steps} steps, continuous"))
                 .with_tags(&["macro", "play", "automation"])
                 .with_category("Macros"),
             );
@@ -249,7 +248,7 @@ impl MailAppModel {
                     format!("{}{name}", macro_ids::PLAY_STEP_PREFIX),
                     format!("Step-through: {name}"),
                 )
-                .with_description(&format!("{steps} steps, confirm each"))
+                .with_description(format!("{steps} steps, confirm each"))
                 .with_tags(&["macro", "step", "automation"])
                 .with_category("Macros"),
             );
@@ -258,7 +257,7 @@ impl MailAppModel {
                     format!("{}{name}", macro_ids::DRY_RUN_PREFIX),
                     format!("Preview macro: {name}"),
                 )
-                .with_description(&format!("{steps} steps, dry run"))
+                .with_description(format!("{steps} steps, dry run"))
                 .with_tags(&["macro", "preview", "dry-run"])
                 .with_category("Macros"),
             );
@@ -543,6 +542,7 @@ impl MailAppModel {
     /// Handle macro engine control actions (record, play, stop, delete).
     ///
     /// Returns `Some(Cmd)` if the action was handled, `None` otherwise.
+    #[allow(clippy::too_many_lines)]
     fn handle_macro_control(&mut self, id: &str) -> Option<Cmd<MailMsg>> {
         match id {
             macro_ids::RECORD_START => {
@@ -556,19 +556,12 @@ impl MailAppModel {
             }
             macro_ids::RECORD_STOP => {
                 // Generate an auto-name based on timestamp.
-                let name = format!(
-                    "macro-{}",
-                    chrono::Utc::now().format("%Y%m%d-%H%M%S")
-                );
+                let name = format!("macro-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
                 if let Some(def) = self.macro_engine.stop_recording(&name) {
                     self.notifications.notify(
-                        Toast::new(format!(
-                            "Saved \"{}\" ({} steps)",
-                            def.name,
-                            def.len()
-                        ))
-                        .icon(ToastIcon::Info)
-                        .duration(Duration::from_secs(4)),
+                        Toast::new(format!("Saved \"{}\" ({} steps)", def.name, def.len()))
+                            .icon(ToastIcon::Info)
+                            .duration(Duration::from_secs(4)),
                     );
                 } else {
                     self.notifications.notify(
@@ -600,7 +593,10 @@ impl MailAppModel {
             _ => {
                 // Prefixed macro control actions.
                 if let Some(name) = id.strip_prefix(macro_ids::PLAY_PREFIX) {
-                    if self.macro_engine.start_playback(name, PlaybackMode::Continuous) {
+                    if self
+                        .macro_engine
+                        .start_playback(name, PlaybackMode::Continuous)
+                    {
                         self.notifications.notify(
                             Toast::new(format!("Playing \"{name}\"..."))
                                 .icon(ToastIcon::Info)
@@ -612,13 +608,14 @@ impl MailAppModel {
                     return Some(Cmd::none());
                 }
                 if let Some(name) = id.strip_prefix(macro_ids::PLAY_STEP_PREFIX) {
-                    if self.macro_engine.start_playback(name, PlaybackMode::StepByStep) {
+                    if self
+                        .macro_engine
+                        .start_playback(name, PlaybackMode::StepByStep)
+                    {
                         self.notifications.notify(
-                            Toast::new(format!(
-                                "Step-by-step: \"{name}\" (Enter=next, Esc=stop)"
-                            ))
-                            .icon(ToastIcon::Info)
-                            .duration(Duration::from_secs(4)),
+                            Toast::new(format!("Step-by-step: \"{name}\" (Enter=next, Esc=stop)"))
+                                .icon(ToastIcon::Info)
+                                .duration(Duration::from_secs(4)),
                         );
                     }
                     return Some(Cmd::none());
@@ -631,12 +628,9 @@ impl MailAppModel {
                             .map(|(i, s)| format!("{}. {}", i + 1, s.label))
                             .collect();
                         self.notifications.notify(
-                            Toast::new(format!(
-                                "Preview \"{name}\":\n{}",
-                                preview.join("\n")
-                            ))
-                            .icon(ToastIcon::Info)
-                            .duration(Duration::from_secs(8)),
+                            Toast::new(format!("Preview \"{name}\":\n{}", preview.join("\n")))
+                                .icon(ToastIcon::Info)
+                                .duration(Duration::from_secs(8)),
                         );
                     }
                     return Some(Cmd::none());
@@ -726,7 +720,10 @@ impl Model for MailAppModel {
                 }
 
                 // Step-by-step macro playback: Enter=confirm, Esc=stop.
-                if matches!(self.macro_engine.playback_state(), PlaybackState::Paused { .. }) {
+                if matches!(
+                    self.macro_engine.playback_state(),
+                    PlaybackState::Paused { .. }
+                ) {
                     if let Event::Key(key) = event {
                         if key.kind == KeyEventKind::Press {
                             match key.code {
@@ -734,7 +731,9 @@ impl Model for MailAppModel {
                                     if let Some(action_id) = self.macro_engine.confirm_step() {
                                         let _ = self.dispatch_palette_action(&action_id);
                                         // Show progress toast.
-                                        if let Some(label) = self.macro_engine.playback_state().status_label() {
+                                        if let Some(label) =
+                                            self.macro_engine.playback_state().status_label()
+                                        {
                                             self.notifications.notify(
                                                 Toast::new(label)
                                                     .icon(ToastIcon::Info)
@@ -887,11 +886,19 @@ impl Model for MailAppModel {
             screen.view(frame, chrome.content, &self.state);
         }
 
+        let screen_bindings = self
+            .screens
+            .get(&self.active_screen)
+            .map(|s| s.keybindings())
+            .unwrap_or_default();
+
         // 3. Status line (z=3)
         tui_chrome::render_status_line(
             &self.state,
             self.active_screen,
             self.help_visible,
+            &self.accessibility,
+            &screen_bindings,
             frame,
             chrome.status_line,
         );
@@ -908,11 +915,6 @@ impl Model for MailAppModel {
 
         // 6. Help overlay (z=6, topmost)
         if self.help_visible {
-            let screen_bindings = self
-                .screens
-                .get(&self.active_screen)
-                .map(|s| s.keybindings())
-                .unwrap_or_default();
             let screen_label = crate::tui_screens::screen_meta(self.active_screen).title;
             let sections = self.keymap.contextual_help(&screen_bindings, screen_label);
             tui_chrome::render_help_overlay_sections(&sections, self.help_scroll, frame, area);
@@ -1034,18 +1036,20 @@ fn screen_palette_category(id: MailScreenId) -> &'static str {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 fn build_palette_actions_static() -> Vec<ActionItem> {
-    let mut out = Vec::with_capacity(MAIL_SCREEN_REGISTRY.len() + 2);
+    let mut out = Vec::with_capacity(ALL_SCREEN_IDS.len() + 8);
 
-    for meta in MAIL_SCREEN_REGISTRY {
+    for &id in ALL_SCREEN_IDS {
+        let meta = screen_meta(id);
         out.push(
             ActionItem::new(
-                screen_palette_action_id(meta.id),
+                screen_palette_action_id(id),
                 format!("Go to {}", meta.title),
             )
             .with_description(meta.description)
             .with_tags(&["screen", "navigate"])
-            .with_category(screen_palette_category(meta.id)),
+            .with_category(screen_palette_category(id)),
         );
     }
 
@@ -1317,12 +1321,7 @@ fn palette_action_label(id: &str) -> String {
 
 /// Short screen name from ID for labels.
 fn screen_name_from_id(id: MailScreenId) -> &'static str {
-    for meta in MAIL_SCREEN_REGISTRY {
-        if meta.id == id {
-            return meta.title;
-        }
-    }
-    "Unknown"
+    screen_meta(id).title
 }
 
 /// Generate a toast notification for high-priority events.

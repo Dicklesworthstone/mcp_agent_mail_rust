@@ -143,10 +143,13 @@ pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Render the status line into a 1-row area.
+#[allow(clippy::too_many_lines)]
 pub fn render_status_line(
     state: &TuiSharedState,
     active: MailScreenId,
     help_visible: bool,
+    accessibility: &AccessibilitySettings,
+    screen_bindings: &[HelpEntry],
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -191,10 +194,38 @@ pub fn render_status_line(
             .unwrap_or(u16::MAX);
     let center_len = u16::try_from(center_str.len()).unwrap_or(u16::MAX);
     let right_len = u16::try_from(1 + help_hint.len() + 1).unwrap_or(u16::MAX);
-    let total_len = left_len
-        .saturating_add(center_len)
-        .saturating_add(right_len);
     let available = area.width;
+
+    // Optional key hints (inserted after counters if we have room).
+    let sep = " | ";
+    let sep_len = u16::try_from(sep.len()).unwrap_or(u16::MAX);
+    let key_hints = if accessibility.key_hints
+        && !screen_bindings.is_empty()
+        && left_len
+            .saturating_add(center_len)
+            .saturating_add(right_len)
+            .saturating_add(sep_len)
+            < available
+    {
+        let reserved = left_len
+            .saturating_add(center_len)
+            .saturating_add(right_len)
+            .saturating_add(sep_len);
+        let max_hint_width = usize::from(available.saturating_sub(reserved));
+        build_key_hints(screen_bindings, 6, max_hint_width)
+    } else {
+        String::new()
+    };
+    let hints_len = u16::try_from(key_hints.len()).unwrap_or(u16::MAX);
+    let center_total_len = if key_hints.is_empty() {
+        center_len
+    } else {
+        center_len.saturating_add(sep_len).saturating_add(hints_len)
+    };
+
+    let total_len = left_len
+        .saturating_add(center_total_len)
+        .saturating_add(right_len);
 
     // Build spans
     let mut spans = Vec::with_capacity(8);
@@ -233,6 +264,41 @@ pub fn render_status_line(
         center_str,
         Style::default().fg(counter_fg).bg(tp.status_bg),
     ));
+
+    if !key_hints.is_empty() {
+        // Separator between counters and key hints.
+        spans.push(Span::styled(
+            sep,
+            Style::default().fg(tp.status_fg).bg(tp.status_bg),
+        ));
+
+        // Parse the hint string into styled spans: keys in accent, text in dim.
+        let mut rest = key_hints.as_str();
+        while let Some(open) = rest.find('[') {
+            if open > 0 {
+                spans.push(Span::styled(
+                    &rest[..open],
+                    Style::default().fg(tp.status_fg).bg(tp.status_bg),
+                ));
+            }
+            rest = &rest[open..];
+            if let Some(close) = rest.find(']') {
+                spans.push(Span::styled(
+                    &rest[..=close],
+                    Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
+                ));
+                rest = &rest[close + 1..];
+            } else {
+                break;
+            }
+        }
+        if !rest.is_empty() {
+            spans.push(Span::styled(
+                rest,
+                Style::default().fg(tp.status_fg).bg(tp.status_bg),
+            ));
+        }
+    }
 
     // Right padding + help hint
     if total_len < available {

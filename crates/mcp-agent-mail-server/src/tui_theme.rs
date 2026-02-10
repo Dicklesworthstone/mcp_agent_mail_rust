@@ -204,6 +204,74 @@ mod tests {
     use super::*;
     use ftui_extras::theme::ScopedThemeLock;
 
+    fn srgb_channel_to_linear(c: u8) -> f64 {
+        let cs = f64::from(c) / 255.0;
+        if cs <= 0.04045 {
+            cs / 12.92
+        } else {
+            ((cs + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn rel_luminance(c: PackedRgba) -> f64 {
+        let r = srgb_channel_to_linear(c.r());
+        let g = srgb_channel_to_linear(c.g());
+        let b = srgb_channel_to_linear(c.b());
+        0.2126_f64.mul_add(r, 0.7152_f64.mul_add(g, 0.0722 * b))
+    }
+
+    fn contrast_ratio(fg: PackedRgba, bg: PackedRgba) -> f64 {
+        let l1 = rel_luminance(fg);
+        let l2 = rel_luminance(bg);
+        let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn theme_palettes_meet_min_contrast_thresholds() {
+        // Terminal UIs can tolerate slightly lower contrast than strict WCAG AA in practice,
+        // but we still enforce a floor to avoid unreadable themes.
+        const MIN_TEXT: f64 = 3.0;
+        const MIN_ACCENT: f64 = 2.2;
+
+        for &id in &ThemeId::ALL {
+            let _guard = ScopedThemeLock::new(id);
+            let p = TuiThemePalette::for_theme(id);
+
+            let tab_active = contrast_ratio(p.tab_active_fg, p.tab_active_bg);
+            let tab_inactive = contrast_ratio(p.tab_inactive_fg, p.tab_inactive_bg);
+            let status = contrast_ratio(p.status_fg, p.status_bg);
+            let help = contrast_ratio(p.help_fg, p.help_bg);
+            let key_hint = contrast_ratio(p.tab_key_fg, p.status_bg);
+
+            // These show up in E2E runs via `cargo test ... -- --nocapture`.
+            eprintln!(
+                "theme={id:?} tab_active={tab_active:.2} tab_inactive={tab_inactive:.2} status={status:.2} help={help:.2} key_hint={key_hint:.2}"
+            );
+
+            assert!(
+                tab_active >= MIN_TEXT,
+                "theme {id:?}: tab_active contrast {tab_active:.2} < {MIN_TEXT:.1}"
+            );
+            assert!(
+                tab_inactive >= MIN_TEXT,
+                "theme {id:?}: tab_inactive contrast {tab_inactive:.2} < {MIN_TEXT:.1}"
+            );
+            assert!(
+                status >= MIN_TEXT,
+                "theme {id:?}: status contrast {status:.2} < {MIN_TEXT:.1}"
+            );
+            assert!(
+                help >= MIN_TEXT,
+                "theme {id:?}: help contrast {help:.2} < {MIN_TEXT:.1}"
+            );
+            assert!(
+                key_hint >= MIN_ACCENT,
+                "theme {id:?}: key_hint contrast {key_hint:.2} < {MIN_ACCENT:.1}"
+            );
+        }
+    }
+
     #[test]
     fn all_themes_produce_valid_palette() {
         for &id in &ThemeId::ALL {

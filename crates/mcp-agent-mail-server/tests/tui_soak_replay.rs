@@ -78,34 +78,34 @@ enum ReplayAction {
     Enter,
     /// Press Escape.
     Escape,
-    /// Render a frame (model.view()).
+    /// Render a frame (`model.view()`).
     Render,
     /// Toggle help overlay (?).
     ToggleHelp,
 }
 
 impl ReplayAction {
-    fn to_msg(self) -> Option<MailMsg> {
+    const fn to_msg(self) -> Option<MailMsg> {
         match self {
             Self::Tick => Some(MailMsg::Terminal(Event::Tick)),
             Self::TabNext => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Tab)))),
             Self::SwitchTo(id) => Some(MailMsg::SwitchScreen(id)),
-            Self::ScrollDown => {
-                Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Down))))
-            }
+            Self::ScrollDown => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Down)))),
             Self::ScrollUp => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Up)))),
-            Self::SearchFocus => {
-                Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char('/')))))
-            }
-            Self::TypeChar(c) => {
-                Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(c)))))
-            }
+            Self::SearchFocus => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+                '/',
+            ))))),
+            Self::TypeChar(c) => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+                c,
+            ))))),
             Self::Enter => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Enter)))),
-            Self::Escape => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Escape)))),
+            Self::Escape => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(
+                KeyCode::Escape,
+            )))),
             Self::Render => None, // handled separately
-            Self::ToggleHelp => {
-                Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char('?')))))
-            }
+            Self::ToggleHelp => Some(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+                '?',
+            ))))),
         }
     }
 }
@@ -484,21 +484,24 @@ fn soak_replay_empty_state() {
     eprintln!("  Renders:      {}", report.total_renders);
     eprintln!(
         "  Action p95:   {:.1}µs (budget: {:.1}µs)",
-        report.action_p95_us as f64,
-        BUDGET_TICK_CYCLE_P95_US as f64,
+        report.action_p95_us as f64, BUDGET_TICK_CYCLE_P95_US as f64,
     );
-    eprintln!(
-        "  Render p95:   {:.1}µs",
-        report.render_p95_us as f64,
-    );
+    eprintln!("  Render p95:   {:.1}µs", report.render_p95_us as f64,);
     eprintln!(
         "  RSS:          {}KB → {}KB ({:.2}x, limit {:.1}x)",
-        report.baseline_rss_kb, report.final_rss_kb, report.rss_growth_factor, MAX_RSS_GROWTH_FACTOR,
+        report.baseline_rss_kb,
+        report.final_rss_kb,
+        report.rss_growth_factor,
+        MAX_RSS_GROWTH_FACTOR,
     );
     eprintln!("  Errors:       {}", report.errors);
     eprintln!("  Verdict:      {}", report.verdict);
 
-    assert_eq!(report.errors, 0, "soak replay encountered {} errors", report.errors);
+    assert_eq!(
+        report.errors, 0,
+        "soak replay encountered {} errors",
+        report.errors
+    );
     assert!(
         report.rss_growth_factor < MAX_RSS_GROWTH_FACTOR,
         "RSS grew {:.2}x (limit {:.1}x): {}KB → {}KB",
@@ -611,7 +614,10 @@ fn soak_per_screen_stability() {
     }
 
     eprintln!("\n=== Per-screen stability ({iterations} cycles each) ===");
-    eprintln!("{:<15} {:>8} {:>8} {:>8}", "Screen", "p50 µs", "p95 µs", "max µs");
+    eprintln!(
+        "{:<15} {:>8} {:>8} {:>8}",
+        "Screen", "p50 µs", "p95 µs", "max µs"
+    );
     eprintln!("{}", "-".repeat(43));
 
     let mut all_pass = true;
@@ -646,7 +652,9 @@ fn soak_search_typing_stress() {
     let _ = model.init();
 
     let _ = model.update(MailMsg::SwitchScreen(MailScreenId::Search));
-    let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char('/')))));
+    let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+        '/',
+    )))));
 
     let queries = [
         "error handling in message delivery pipeline",
@@ -663,7 +671,9 @@ fn soak_search_typing_stress() {
         // Type query character by character
         for c in query.chars() {
             let t0 = Instant::now();
-            let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(c)))));
+            let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+                c,
+            )))));
             latencies.push(t0.elapsed().as_micros() as u64);
         }
 
@@ -676,7 +686,9 @@ fn soak_search_typing_stress() {
         model.view(&mut frame);
 
         // Clear for next query: Ctrl+A to select all, then type over
-        let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char('/')))));
+        let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            '/',
+        )))));
         let _ = model.update(MailMsg::Terminal(Event::Key(
             KeyEvent::new(KeyCode::Char('a')).with_modifiers(Modifiers::CTRL),
         )));
@@ -750,11 +762,7 @@ fn soak_no_degradation() {
 
     eprintln!(
         "degradation: first_p95={:.0}µs last_p95={:.0}µs ratio={:.2}x ({} windows × {})",
-        first_p95 as f64,
-        last_p95 as f64,
-        degradation,
-        num_windows,
-        window_size,
+        first_p95 as f64, last_p95 as f64, degradation, num_windows, window_size,
     );
 
     assert!(
