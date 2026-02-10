@@ -5,8 +5,8 @@
 
 use std::collections::HashSet;
 
-use ftui::layout::Rect;
 use ftui::Style;
+use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Sparkline;
 use ftui::widgets::Widget;
@@ -545,10 +545,7 @@ fn render_stat_tiles(
             .map(|a| {
                 let (dot, color) = activity_indicator(now_us, a.last_active_ts);
                 Line::from_spans([
-                    Span::styled(
-                        format!("{dot} "),
-                        Style::default().fg(color),
-                    ),
+                    Span::styled(format!("{dot} "), Style::default().fg(color)),
                     Span::raw(format!("{} ({})", a.name, a.program)),
                 ])
             })

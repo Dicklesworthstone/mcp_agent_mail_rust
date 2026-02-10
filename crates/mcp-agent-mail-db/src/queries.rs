@@ -1537,6 +1537,20 @@ pub struct SearchRow {
     pub body_md: String,
 }
 
+/// Search result row that includes `project_id` for cross-project queries (e.g. product search).
+#[derive(Debug, Clone)]
+pub struct SearchRowWithProject {
+    pub id: i64,
+    pub subject: String,
+    pub importance: String,
+    pub ack_required: i64,
+    pub created_ts: i64,
+    pub thread_id: Option<String>,
+    pub from: String,
+    pub body_md: String,
+    pub project_id: i64,
+}
+
 // FTS5 unsearchable patterns that cannot produce meaningful results.
 const FTS5_UNSEARCHABLE: &[&str] = &["*", "**", "***", ".", "..", "...", "?", "??", "???"];
 
@@ -1759,6 +1773,40 @@ async fn run_like_fallback(
     map_sql_outcome(traw_query(cx, conn, &sql, &params).await)
 }
 
+/// LIKE fallback for cross-project/product search when FTS5 fails (e.g. malformed query syntax).
+async fn run_like_fallback_product(
+    cx: &Cx,
+    conn: &TrackedConnection<'_>,
+    product_id: i64,
+    terms: &[String],
+    limit: i64,
+) -> Outcome<Vec<sqlmodel_core::Row>, DbError> {
+    // params layout: [product_id, term1_like, term1_like, term2_like, term2_like, ..., limit]
+    let mut params: Vec<Value> = Vec::with_capacity(2 + terms.len() * 2);
+    params.push(Value::BigInt(product_id));
+
+    let mut where_parts: Vec<&str> = Vec::with_capacity(terms.len());
+    for term in terms {
+        let escaped = format!("%{}%", like_escape(term));
+        params.push(Value::Text(escaped.clone()));
+        params.push(Value::Text(escaped));
+        where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
+    }
+    let where_clause = where_parts.join(" AND ");
+    params.push(Value::BigInt(limit));
+
+    let sql = format!(
+        "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md, m.project_id \
+         FROM messages m \
+         JOIN agents a ON a.id = m.sender_id \
+         JOIN product_project_links ppl ON ppl.project_id = m.project_id \
+         WHERE ppl.product_id = ? AND {where_clause} \
+         ORDER BY m.id ASC \
+         LIMIT ?"
+    );
+    map_sql_outcome(traw_query(cx, conn, &sql, &params).await)
+}
+
 pub async fn search_messages(
     cx: &Cx,
     pool: &DbPool,
@@ -1858,6 +1906,125 @@ pub async fn search_messages(
                     thread_id,
                     from,
                     body_md,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Full-text search across all projects linked to a product.
+///
+/// This is the DB-side primitive used by the MCP `search_messages_product` tool to avoid
+/// per-project loops and to ensure global ranking is correct.
+#[allow(clippy::too_many_lines)]
+pub async fn search_messages_for_product(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    query: &str,
+    limit: usize,
+) -> Outcome<Vec<SearchRowWithProject>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+
+    let sanitized = sanitize_fts_query(query);
+    let rows_out = if let Some(ref fts_query) = sanitized {
+        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md, m.project_id \
+                   FROM fts_messages \
+                   JOIN messages m ON m.id = fts_messages.message_id \
+                   JOIN agents a ON a.id = m.sender_id \
+                   JOIN product_project_links ppl ON ppl.project_id = m.project_id \
+                   WHERE ppl.product_id = ? AND fts_messages MATCH ? \
+                   ORDER BY bm25(fts_messages, 10.0, 1.0) ASC, m.id ASC \
+                   LIMIT ?";
+        let params = [
+            Value::BigInt(product_id),
+            Value::Text(fts_query.clone()),
+            Value::BigInt(limit_i64),
+        ];
+        let fts_result = traw_query(cx, &tracked, sql, &params).await;
+
+        match &fts_result {
+            Outcome::Err(_) => {
+                tracing::warn!(
+                    "Product FTS query failed for '{}', attempting LIKE fallback",
+                    query
+                );
+                let terms = extract_like_terms(query, 5);
+                if terms.is_empty() {
+                    Outcome::Ok(Vec::new())
+                } else {
+                    run_like_fallback_product(cx, &tracked, product_id, &terms, limit_i64).await
+                }
+            }
+            _ => map_sql_outcome(fts_result),
+        }
+    } else {
+        Outcome::Ok(Vec::new())
+    };
+
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: i64 = match row.get_named("id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let subject: String = match row.get_named("subject") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let importance: String = match row.get_named("importance") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let ack_required: i64 = match row.get_named("ack_required") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let created_ts: i64 = match row.get_named("created_ts") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let thread_id: Option<String> = match row.get_named("thread_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let from: String = match row.get_named("from_name") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let body_md: String = row.get_named("body_md").unwrap_or_default();
+                let project_id: i64 = match row.get_named("project_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+
+                out.push(SearchRowWithProject {
+                    id,
+                    subject,
+                    importance,
+                    ack_required,
+                    created_ts,
+                    thread_id,
+                    from,
+                    body_md,
+                    project_id,
                 });
             }
             Outcome::Ok(out)
@@ -3882,6 +4049,161 @@ mod tests {
         );
         // 4-byte UTF-8 (emoji) must survive
         assert_eq!(quote_hyphenated_tokens("test-case 🎉"), "\"test-case\" 🎉");
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_lines)]
+    fn search_messages_for_product_ranks_across_projects() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("product_search.db");
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = DbPool::new(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let proj_a = ensure_project(&cx, &pool, &format!("/tmp/am-test-a-{base}"))
+                .await
+                .into_result()
+                .unwrap();
+            let proj_b = ensure_project(&cx, &pool, &format!("/tmp/am-test-b-{base}"))
+                .await
+                .into_result()
+                .unwrap();
+            let proj_c = ensure_project(&cx, &pool, &format!("/tmp/am-test-c-{base}"))
+                .await
+                .into_result()
+                .unwrap();
+
+            let proj_a_id = proj_a.id.unwrap();
+            let proj_b_id = proj_b.id.unwrap();
+            let proj_c_id = proj_c.id.unwrap();
+
+            let agent_a = register_agent(
+                &cx,
+                &pool,
+                proj_a_id,
+                "GreenLake",
+                "codex",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let agent_b = register_agent(
+                &cx, &pool, proj_b_id, "BlueDog", "codex", "gpt-5", None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let agent_c = register_agent(
+                &cx,
+                &pool,
+                proj_c_id,
+                "OrangeFinch",
+                "codex",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+
+            let msg_body_only = create_message(
+                &cx,
+                &pool,
+                proj_a_id,
+                agent_a.id.unwrap(),
+                "unrelated subject",
+                "needle in the body",
+                None,
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .unwrap();
+
+            let msg_subject_match = create_message(
+                &cx,
+                &pool,
+                proj_b_id,
+                agent_b.id.unwrap(),
+                "needle in the subject",
+                "unrelated body",
+                None,
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .unwrap();
+
+            // Project C is deliberately NOT linked to the product.
+            let _msg_unlinked = create_message(
+                &cx,
+                &pool,
+                proj_c_id,
+                agent_c.id.unwrap(),
+                "needle (unlinked project)",
+                "unrelated body",
+                None,
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .unwrap();
+
+            let uid = format!("prod_test_{base}");
+            let product = ensure_product(&cx, &pool, Some(uid.as_str()), Some(uid.as_str()))
+                .await
+                .into_result()
+                .unwrap();
+            let product_id = product.id.unwrap();
+
+            link_product_to_projects(&cx, &pool, product_id, &[proj_a_id, proj_b_id])
+                .await
+                .into_result()
+                .unwrap();
+
+            let rows = search_messages_for_product(&cx, &pool, product_id, "needle", 10)
+                .await
+                .into_result()
+                .unwrap();
+
+            assert_eq!(rows.len(), 2, "expected only linked projects to match");
+            assert_eq!(
+                rows[0].id,
+                msg_subject_match.id.unwrap(),
+                "subject match should outrank body-only match across projects"
+            );
+            assert_eq!(rows[0].project_id, proj_b_id);
+            assert_eq!(rows[1].id, msg_body_only.id.unwrap());
+            assert_eq!(rows[1].project_id, proj_a_id);
+            assert!(rows.iter().all(|r| r.project_id != proj_c_id));
+        });
     }
 
     #[test]

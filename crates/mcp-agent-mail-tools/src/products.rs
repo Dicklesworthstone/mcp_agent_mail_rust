@@ -302,32 +302,30 @@ pub async fn search_messages_product(
         })?;
     let product_id = product.id.unwrap_or(0);
 
-    let projects = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::search_messages_for_product(
+            ctx.cx(),
+            &pool,
+            product_id,
+            trimmed,
+            max_results,
+        )
+        .await,
     )?;
 
-    let mut result: Vec<ProductSearchItem> = Vec::with_capacity(projects.len() * 4);
-    for p in projects {
-        let pid = p.id.unwrap_or(0);
-        let rows = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::search_messages(ctx.cx(), &pool, pid, trimmed, max_results)
-                .await,
-        )?;
-        for r in rows {
-            result.push(ProductSearchItem {
-                id: r.id,
-                subject: r.subject,
-                importance: r.importance,
-                ack_required: i32::try_from(r.ack_required).unwrap_or(i32::MAX),
-                created_ts: Some(micros_to_iso(r.created_ts)),
-                thread_id: r.thread_id,
-                from: r.from,
-                project_id: pid,
-            });
-        }
+    let mut result: Vec<ProductSearchItem> = Vec::with_capacity(rows.len());
+    for r in rows {
+        result.push(ProductSearchItem {
+            id: r.id,
+            subject: r.subject,
+            importance: r.importance,
+            ack_required: i32::try_from(r.ack_required).unwrap_or(i32::MAX),
+            created_ts: Some(micros_to_iso(r.created_ts)),
+            thread_id: r.thread_id,
+            from: r.from,
+            project_id: r.project_id,
+        });
     }
-
-    result.truncate(max_results);
 
     let response = ProductSearchResponse { result };
     serde_json::to_string(&response)
