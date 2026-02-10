@@ -139,6 +139,22 @@ CI parses the JSON block below and fails if any row:
       "notes": "Route exists; legacy supports filtering via ?q= on the project view. Rust uses a dedicated /search route; decide and lock the contract."
     },
     {
+      "id": "mail_projects_siblings_post",
+      "category": "route_json",
+      "method": "POST",
+      "python_path": "/mail/api/projects/{project_id}/siblings/{other_id}",
+      "rust_path": null,
+      "policy": "must_match",
+      "status": "gap",
+      "owner_beads": ["br-3vwi.13.2"],
+      "evidence": [
+        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py",
+        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/app.py (sibling suggestion logic)",
+        "crates/mcp-agent-mail-server/src/mail_ui.rs"
+      ],
+      "notes": "Legacy supports confirming/dismissing/resetting project sibling suggestions via this endpoint."
+    },
+    {
       "id": "mail_project_agents_api_get",
       "category": "route_json",
       "method": "GET",
@@ -490,4 +506,3 @@ This contract is only the governance layer. Implementation lives in:
 - `br-3vwi.13.7` + `br-3vwi.10.14` (permission/redaction + security E2E)
 - `br-3vwi.13.8` (parity test matrix + forensic logging)
 - `br-3vwi.13.9` (startup/transport compatibility lock)
-
