@@ -1,5 +1,33 @@
 #![forbid(unsafe_code)]
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Transport compatibility lock (br-3vwi.13.9)
+//
+// These constants define the externally observed startup/transport contract.
+// Changing any of them is a BREAKING CHANGE for existing operator workflows
+// and requires explicit approval + migration rationale.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Locked default server name for MCP clients that match on it.
+pub const COMPAT_SERVER_NAME: &str = "mcp-agent-mail";
+
+/// Locked health endpoint paths that always bypass bearer auth.
+pub const COMPAT_HEALTH_PATHS: &[&str] = &[
+    "/health/liveness",
+    "/health/readiness",
+    "/health",
+    "/healthz",
+];
+
+/// Locked OAuth well-known endpoint path.
+pub const COMPAT_OAUTH_WELL_KNOWN: &str = "/.well-known/oauth-authorization-server";
+
+/// Locked mail UI prefix (coexists with MCP endpoint).
+pub const COMPAT_MAIL_UI_PREFIX: &str = "/mail";
+
+/// Locked MCP base path aliases (interchangeable for dev convenience).
+pub const COMPAT_MCP_ALIASES: &[&str] = &["/api", "/mcp"];
+
 mod ack_ttl;
 mod cleanup;
 pub mod console;
@@ -10748,6 +10776,170 @@ mod tests {
             decoded.is_err(),
             "invalid token must be rejected even with stale cache"
         );
+    }
+
+    // ── Transport compatibility lock assertions (br-3vwi.13.9) ───────────
+
+    #[test]
+    fn compat_lock_server_name_matches_build_server() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        assert_eq!(
+            state.server_info.name, COMPAT_SERVER_NAME,
+            "COMPAT LOCK: build_server() must produce the locked server name"
+        );
+    }
+
+    #[test]
+    fn compat_lock_health_paths_bypass_auth() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        for &path in COMPAT_HEALTH_PATHS {
+            let req = make_request(Http1Method::Get, path, &[]);
+            let resp = block_on(state.handle(req));
+            assert_ne!(
+                resp.status, 401,
+                "COMPAT LOCK: Health path '{path}' must bypass bearer auth"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_lock_oauth_well_known_accessible() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, COMPAT_OAUTH_WELL_KNOWN, &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 200,
+            "COMPAT LOCK: OAuth well-known must return 200"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(body["mcp_oauth"], false);
+    }
+
+    #[test]
+    fn compat_lock_mail_ui_routes_to_handler() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        // /mail should not 404 — it routes to mail_ui::dispatch
+        let req = make_request(Http1Method::Get, COMPAT_MAIL_UI_PREFIX, &[]);
+        let resp = block_on(state.handle(req));
+        // Mail UI may return 200, 302, or even 404 for specific sub-paths,
+        // but it must NOT return 401 (auth is only for MCP endpoint).
+        assert_ne!(
+            resp.status, 401,
+            "COMPAT LOCK: /mail must not require bearer auth"
+        );
+    }
+
+    #[test]
+    fn compat_lock_mcp_aliases_all_accepted() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 999_i64);
+        let body = serde_json::to_vec(&json_rpc).expect("serialize");
+
+        for &alias in COMPAT_MCP_ALIASES {
+            let mut req = make_request(Http1Method::Post, alias, &[]);
+            req.body = body.clone();
+            let resp = block_on(state.handle(req));
+            assert_eq!(
+                resp.status, 200,
+                "COMPAT LOCK: MCP alias '{alias}' must route to handler"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_lock_initialize_handshake_succeeds_on_all_aliases() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let init_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "compat-test",
+                    "version": "1.0.0"
+                }
+            }
+        });
+        let body = serde_json::to_vec(&init_req).expect("serialize");
+
+        for &alias in COMPAT_MCP_ALIASES {
+            let mut req = make_request(Http1Method::Post, alias, &[]);
+            req.body = body.clone();
+            let resp = block_on(state.handle(req));
+            assert_eq!(
+                resp.status, 200,
+                "COMPAT LOCK: Initialize must succeed on '{alias}'"
+            );
+
+            let resp_body: serde_json::Value =
+                serde_json::from_slice(&resp.body).expect("json");
+            assert_eq!(resp_body["jsonrpc"], "2.0");
+            assert!(
+                resp_body.get("result").is_some(),
+                "COMPAT LOCK: Initialize on '{alias}' must return result, got: {resp_body}"
+            );
+            assert_eq!(
+                resp_body["result"]["serverInfo"]["name"],
+                COMPAT_SERVER_NAME,
+                "COMPAT LOCK: Server name in initialize response must match"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_lock_auth_mismatch_yields_401_before_body_parse() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("correct-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/mcp",
+            &[("Authorization", "Bearer wrong-token")],
+            Some(peer),
+        );
+        req.body = b"not-even-json".to_vec();
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 401,
+            "COMPAT LOCK: Wrong bearer token must 401 before parsing body"
+        );
+    }
+
+    #[test]
+    fn compat_lock_get_on_mcp_endpoint_yields_405() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        for &alias in COMPAT_MCP_ALIASES {
+            let req = make_request(Http1Method::Get, &format!("{alias}/"), &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(
+                resp.status, 405,
+                "COMPAT LOCK: GET on MCP endpoint '{alias}/' must be 405"
+            );
+        }
     }
 
     /// Cache freshness boundary: tokens are validated against fresh cache
