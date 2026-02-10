@@ -14,7 +14,7 @@ use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::search_planner::{DocKind, SearchQuery};
+use mcp_agent_mail_db::search_planner::{DocKind, Importance, SearchQuery};
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
@@ -111,6 +111,15 @@ impl ImportanceFilter {
             Self::Urgent => Self::High,
             Self::High => Self::Normal,
             Self::Normal => Self::Any,
+        }
+    }
+
+    const fn importance(&self) -> Option<Importance> {
+        match self {
+            Self::Any => None,
+            Self::Urgent => Some(Importance::Urgent),
+            Self::High => Some(Importance::High),
+            Self::Normal => Some(Importance::Normal),
         }
     }
 
@@ -325,15 +334,18 @@ impl SearchCockpitScreen {
     /// Build a `SearchQuery` from the current facet state.
     fn build_query(&self) -> SearchQuery {
         let raw = self.query_input.value().trim().to_string();
-
-        // Start with the appropriate doc_kind query builder
         let doc_kind = self.doc_kind_filter.doc_kind().unwrap_or(DocKind::Message);
-        let mut query = SearchQuery::new(raw.clone(), doc_kind);
-        query.limit = Some(MAX_RESULTS);
+
+        let mut query = SearchQuery {
+            text: raw,
+            doc_kind,
+            limit: Some(MAX_RESULTS),
+            ..Default::default()
+        };
 
         // Apply importance facet
-        if let Some(imp) = self.importance_filter.filter_string() {
-            query.importance = Some(imp);
+        if let Some(imp) = self.importance_filter.importance() {
+            query.importance = vec![imp];
         }
 
         // Apply ack filter
@@ -345,13 +357,6 @@ impl SearchCockpitScreen {
         if let Some(ref tid) = self.thread_filter {
             query.thread_id = Some(tid.clone());
         }
-
-        // Apply sort direction
-        query.direction = match self.sort_direction {
-            SortDirection::NewestFirst => Some("desc".to_string()),
-            SortDirection::OldestFirst => Some("asc".to_string()),
-            SortDirection::Relevance => None, // planner default = by score
-        };
 
         query
     }
@@ -420,7 +425,6 @@ impl SearchCockpitScreen {
 
         // Build WHERE conditions for facets
         let mut conditions = Vec::new();
-        let mut having = Vec::new();
 
         if let Some(ref imp) = self.importance_filter.filter_string() {
             let escaped = imp.replace('\'', "''");
@@ -439,12 +443,6 @@ impl SearchCockpitScreen {
         } else {
             format!(" AND {}", conditions.join(" AND "))
         };
-        let _having_clause = if having.is_empty() {
-            String::new()
-        } else {
-            format!(" HAVING {}", having.join(" AND "))
-        };
-
         let order = match self.sort_direction {
             SortDirection::NewestFirst => "m.created_ts DESC",
             SortDirection::OldestFirst => "m.created_ts ASC",
@@ -473,11 +471,6 @@ impl SearchCockpitScreen {
         }
 
         // LIKE fallback or empty query (recent messages)
-        let like_order = match self.sort_direction {
-            SortDirection::Relevance => "m.created_ts DESC",
-            other => other.label().to_lowercase().as_str().to_owned().leak(),
-        };
-        // Just use created_ts for non-FTS
         let order_clause = match self.sort_direction {
             SortDirection::NewestFirst => "m.created_ts DESC",
             SortDirection::OldestFirst => "m.created_ts ASC",
@@ -1015,9 +1008,9 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 // Rendering helpers
 // ──────────────────────────────────────────────────────────────────────
 
-const FACET_ACTIVE_FG: PackedRgba = PackedRgba::new(0x5F, 0xAF, 0xFF, 0xFF); // Blue
-const FACET_LABEL_FG: PackedRgba = PackedRgba::new(0x87, 0x87, 0x87, 0xFF); // Grey
-const RESULT_CURSOR_FG: PackedRgba = PackedRgba::new(0xFF, 0xD7, 0x00, 0xFF); // Yellow
+const FACET_ACTIVE_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xAF, 0xFF, 0xFF); // Blue
+const FACET_LABEL_FG: PackedRgba = PackedRgba::rgba(0x87, 0x87, 0x87, 0xFF); // Grey
+const RESULT_CURSOR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0xD7, 0x00, 0xFF); // Yellow
 
 fn render_query_bar(
     frame: &mut Frame<'_>,
@@ -1514,7 +1507,7 @@ mod tests {
         screen.ack_filter = AckFilter::Required;
         screen.thread_filter = Some("t-1".to_string());
         let q = screen.build_query();
-        assert_eq!(q.importance.as_deref(), Some("high"));
+        assert_eq!(q.importance, vec![Importance::High]);
         assert_eq!(q.ack_required, Some(true));
         assert_eq!(q.thread_id.as_deref(), Some("t-1"));
     }
