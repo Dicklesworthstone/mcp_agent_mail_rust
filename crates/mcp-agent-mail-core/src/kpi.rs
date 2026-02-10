@@ -1034,6 +1034,329 @@ pub fn quick_anomaly_scan() -> Vec<AnomalyAlert> {
 }
 
 // ---------------------------------------------------------------------------
+// Trend / forecast / correlation (br-3vwi.7.3)
+// ---------------------------------------------------------------------------
+
+/// Direction a metric is moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendDirection {
+    /// Metric is increasing.
+    Rising,
+    /// Metric is decreasing.
+    Falling,
+    /// Metric is roughly stable.
+    Flat,
+}
+
+impl std::fmt::Display for TrendDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rising => f.write_str("rising"),
+            Self::Falling => f.write_str("falling"),
+            Self::Flat => f.write_str("flat"),
+        }
+    }
+}
+
+/// A single trend indicator for one metric.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrendIndicator {
+    /// Name of the metric (e.g., `"error_rate_bps"`).
+    pub metric: String,
+    /// Direction of change.
+    pub direction: TrendDirection,
+    /// Absolute change between baseline and current (`current - baseline`).
+    pub delta: f64,
+    /// Relative change as a ratio (`delta / baseline`), or 0.0 if baseline is 0.
+    pub delta_ratio: f64,
+    /// Current value.
+    pub current: f64,
+    /// Baseline value.
+    pub baseline: f64,
+}
+
+/// Forecast for one metric over a short horizon.
+#[derive(Debug, Clone, Serialize)]
+pub struct ForecastPoint {
+    /// Name of the metric.
+    pub metric: String,
+    /// Forecast horizon in seconds.
+    pub horizon_secs: u64,
+    /// Projected value at horizon (linear extrapolation).
+    pub projected: f64,
+    /// Current value.
+    pub current: f64,
+    /// Rate of change per second used for projection.
+    pub rate_per_sec: f64,
+}
+
+/// A pair of correlated metric movements.
+#[derive(Debug, Clone, Serialize)]
+pub struct CorrelationPair {
+    /// First metric name.
+    pub metric_a: String,
+    /// Second metric name.
+    pub metric_b: String,
+    /// Both trends.
+    pub direction_a: TrendDirection,
+    pub direction_b: TrendDirection,
+    /// Pearson-like sign correlation: +1 same direction, -1 opposite, 0 if either flat.
+    pub sign_correlation: i8,
+    /// Human-readable explanation.
+    pub explanation: String,
+}
+
+/// Complete trend report comparing two snapshots.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrendReport {
+    /// Per-metric trend indicators.
+    pub trends: Vec<TrendIndicator>,
+    /// Short-horizon forecasts.
+    pub forecasts: Vec<ForecastPoint>,
+    /// Detected metric correlations.
+    pub correlations: Vec<CorrelationPair>,
+}
+
+/// Flat-threshold ratio: changes smaller than this fraction are considered flat.
+const FLAT_THRESHOLD: f64 = 0.05;
+
+/// Determine trend direction from a relative delta ratio.
+fn direction_from_ratio(delta_ratio: f64) -> TrendDirection {
+    if delta_ratio > FLAT_THRESHOLD {
+        TrendDirection::Rising
+    } else if delta_ratio < -FLAT_THRESHOLD {
+        TrendDirection::Falling
+    } else {
+        TrendDirection::Flat
+    }
+}
+
+/// Extract named metric values from a [`KpiSnapshot`] for trend analysis.
+#[allow(clippy::cast_precision_loss)]
+fn extract_metrics(kpi: &KpiSnapshot) -> Vec<(&'static str, f64)> {
+    vec![
+        ("tool_calls_per_sec", kpi.throughput.tool_calls_per_sec),
+        ("error_rate_bps", kpi.throughput.error_rate_bps),
+        ("http_rps", kpi.throughput.http_rps),
+        ("messages_per_sec", kpi.throughput.messages_per_sec),
+        (
+            "commit_throughput_per_sec",
+            kpi.throughput.commit_throughput_per_sec,
+        ),
+        ("tool_p95_ms", kpi.latency.tool_p95_ms),
+        ("tool_p99_ms", kpi.latency.tool_p99_ms),
+        ("pool_acquire_p95_ms", kpi.latency.pool_acquire_p95_ms),
+        ("git_commit_p95_ms", kpi.latency.git_commit_p95_ms),
+        (
+            "pool_utilization_pct",
+            kpi.contention.pool_utilization_pct as f64,
+        ),
+        (
+            "wbq_utilization_pct",
+            kpi.contention.wbq_utilization_pct as f64,
+        ),
+        ("ack_pending", kpi.ack_pressure.pending as f64),
+        ("ack_overdue", kpi.ack_pressure.overdue as f64),
+        (
+            "reservation_conflicts",
+            kpi.contention.reservation_conflicts_in_window as f64,
+        ),
+        (
+            "git_lock_retries",
+            kpi.contention.git_lock_retries_in_window as f64,
+        ),
+    ]
+}
+
+/// Compute trend indicators by comparing a current snapshot to a baseline.
+///
+/// Returns one [`TrendIndicator`] per tracked metric.
+#[must_use]
+pub fn compute_trends(current: &KpiSnapshot, baseline: &KpiSnapshot) -> Vec<TrendIndicator> {
+    let cur = extract_metrics(current);
+    let bl = extract_metrics(baseline);
+
+    cur.iter()
+        .zip(bl.iter())
+        .map(|(&(name, cur_val), &(_, bl_val))| {
+            let delta = cur_val - bl_val;
+            let delta_ratio = if bl_val.abs() > f64::EPSILON {
+                delta / bl_val
+            } else if cur_val.abs() > f64::EPSILON {
+                // Baseline was zero, current non-zero → rising.
+                1.0
+            } else {
+                0.0
+            };
+            TrendIndicator {
+                metric: name.into(),
+                direction: direction_from_ratio(delta_ratio),
+                delta,
+                delta_ratio,
+                current: cur_val,
+                baseline: bl_val,
+            }
+        })
+        .collect()
+}
+
+/// Produce linear-extrapolation forecasts for a set of horizon durations.
+///
+/// The rate of change is derived from `(current - baseline) / span_secs`.
+///
+/// # Arguments
+///
+/// * `current` — The most recent KPI snapshot.
+/// * `baseline` — An earlier snapshot to derive the rate of change.
+/// * `horizons` — Forecast horizons in seconds (e.g., `[60, 300]`).
+#[must_use]
+pub fn compute_forecasts(
+    current: &KpiSnapshot,
+    baseline: &KpiSnapshot,
+    horizons: &[u64],
+) -> Vec<ForecastPoint> {
+    let span = current.actual_span_secs - baseline.actual_span_secs;
+    // Use the actual window span from the current snapshot if the diff is nonsensical.
+    let dt = if span.abs() > f64::EPSILON {
+        span.abs()
+    } else {
+        current.actual_span_secs.max(1.0)
+    };
+
+    let cur = extract_metrics(current);
+    let bl = extract_metrics(baseline);
+
+    let mut forecasts = Vec::with_capacity(cur.len() * horizons.len());
+
+    for (&(name, cur_val), &(_, bl_val)) in cur.iter().zip(bl.iter()) {
+        let rate_per_sec = (cur_val - bl_val) / dt;
+        for &h in horizons {
+            #[allow(clippy::cast_precision_loss)]
+            let projected = cur_val + rate_per_sec * h as f64;
+            forecasts.push(ForecastPoint {
+                metric: name.into(),
+                horizon_secs: h,
+                projected,
+                current: cur_val,
+                rate_per_sec,
+            });
+        }
+    }
+
+    forecasts
+}
+
+/// Well-known metric pairs that, when moving together, indicate specific
+/// operational conditions.
+const CORRELATION_PAIRS: &[(&str, &str, &str, &str)] = &[
+    (
+        "error_rate_bps",
+        "tool_p95_ms",
+        "Error rate and latency rising together suggest systemic overload",
+        "Error rate rising while latency falling may indicate fast-fail paths",
+    ),
+    (
+        "tool_calls_per_sec",
+        "pool_utilization_pct",
+        "Throughput and pool utilization rising together: load increase reaching DB layer",
+        "Throughput rising while pool utilization falling: improved efficiency",
+    ),
+    (
+        "ack_pending",
+        "error_rate_bps",
+        "Growing ack backlog with rising errors: agents may be crashing on receipt",
+        "Ack backlog growing while errors falling: agents may be slow but healthy",
+    ),
+    (
+        "git_lock_retries",
+        "reservation_conflicts",
+        "Git lock pressure and reservation conflicts rising: multi-agent contention spike",
+        "Git locks and reservation conflicts diverging: localized rather than systemic contention",
+    ),
+    (
+        "tool_calls_per_sec",
+        "error_rate_bps",
+        "Throughput and error rate both rising: load-induced failures",
+        "Throughput rising while error rate falling: healthy scaling",
+    ),
+];
+
+/// Detect correlated metric movements between current and baseline.
+#[must_use]
+pub fn compute_correlations(current: &KpiSnapshot, baseline: &KpiSnapshot) -> Vec<CorrelationPair> {
+    let trends = compute_trends(current, baseline);
+
+    // Index trends by metric name for O(1) lookup.
+    let trend_map: std::collections::HashMap<&str, &TrendIndicator> =
+        trends.iter().map(|t| (t.metric.as_str(), t)).collect();
+
+    let mut correlations = Vec::new();
+
+    for &(metric_a, metric_b, same_dir_expl, diff_dir_expl) in CORRELATION_PAIRS {
+        let (Some(ta), Some(tb)) = (trend_map.get(metric_a), trend_map.get(metric_b)) else {
+            continue;
+        };
+
+        // Skip if either is flat — no meaningful correlation signal.
+        if ta.direction == TrendDirection::Flat || tb.direction == TrendDirection::Flat {
+            continue;
+        }
+
+        let sign_correlation: i8 = if ta.direction == tb.direction { 1 } else { -1 };
+
+        let explanation = if sign_correlation > 0 {
+            same_dir_expl
+        } else {
+            diff_dir_expl
+        };
+
+        correlations.push(CorrelationPair {
+            metric_a: metric_a.into(),
+            metric_b: metric_b.into(),
+            direction_a: ta.direction,
+            direction_b: tb.direction,
+            sign_correlation,
+            explanation: explanation.into(),
+        });
+    }
+
+    correlations
+}
+
+/// Build a complete trend report from two KPI snapshots.
+///
+/// Typically called with `current = snapshot(OneMin)` and `baseline = snapshot(FiveMin)`.
+///
+/// # Arguments
+///
+/// * `current` — The short-window snapshot.
+/// * `baseline` — The longer-window snapshot.
+/// * `forecast_horizons` — Seconds into the future to project (e.g., `[60, 300]`).
+#[must_use]
+pub fn trend_report(
+    current: &KpiSnapshot,
+    baseline: &KpiSnapshot,
+    forecast_horizons: &[u64],
+) -> TrendReport {
+    TrendReport {
+        trends: compute_trends(current, baseline),
+        forecasts: compute_forecasts(current, baseline, forecast_horizons),
+        correlations: compute_correlations(current, baseline),
+    }
+}
+
+/// Convenience: build a trend report from global 1-minute vs 5-minute snapshots.
+///
+/// Uses default forecast horizons of 60s and 300s.
+#[must_use]
+pub fn quick_trend_report() -> Option<TrendReport> {
+    let current = snapshot(KpiWindow::OneMin)?;
+    let baseline = snapshot(KpiWindow::FiveMin)?;
+    Some(trend_report(&current, &baseline, &[60, 300]))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1943,5 +2266,255 @@ mod tests {
         assert!(
             (default.ack_pending_threshold - normal.ack_pending_threshold).abs() < f64::EPSILON
         );
+    }
+
+    // -- Trend / forecast / correlation tests (br-3vwi.7.3) --
+
+    #[test]
+    fn trend_direction_from_ratio_boundaries() {
+        assert_eq!(direction_from_ratio(0.0), TrendDirection::Flat);
+        assert_eq!(direction_from_ratio(0.04), TrendDirection::Flat);
+        assert_eq!(direction_from_ratio(-0.04), TrendDirection::Flat);
+        assert_eq!(direction_from_ratio(0.06), TrendDirection::Rising);
+        assert_eq!(direction_from_ratio(-0.06), TrendDirection::Falling);
+        assert_eq!(direction_from_ratio(1.0), TrendDirection::Rising);
+        assert_eq!(direction_from_ratio(-1.0), TrendDirection::Falling);
+    }
+
+    #[test]
+    fn trend_direction_display() {
+        assert_eq!(format!("{}", TrendDirection::Rising), "rising");
+        assert_eq!(format!("{}", TrendDirection::Falling), "falling");
+        assert_eq!(format!("{}", TrendDirection::Flat), "flat");
+    }
+
+    #[test]
+    fn compute_trends_detects_rising_metric() {
+        let baseline = make_kpi(5.0, 50.0, 100.0, 40, 10, 5, 1, 1, 2, 0, 30.0);
+        let current = make_kpi(15.0, 120.0, 250.0, 85, 75, 25, 8, 10, 15, 5, 30.0);
+        let trends = compute_trends(&current, &baseline);
+
+        let err_trend = trends
+            .iter()
+            .find(|t| t.metric == "error_rate_bps")
+            .unwrap();
+        assert_eq!(err_trend.direction, TrendDirection::Rising);
+        assert!((err_trend.delta - 10.0).abs() < 0.01);
+        assert!(err_trend.delta_ratio > 0.0);
+
+        let lat_trend = trends.iter().find(|t| t.metric == "tool_p95_ms").unwrap();
+        assert_eq!(lat_trend.direction, TrendDirection::Rising);
+    }
+
+    #[test]
+    fn compute_trends_detects_falling_metric() {
+        let baseline = make_kpi(20.0, 100.0, 200.0, 80, 70, 30, 10, 10, 20, 5, 50.0);
+        let current = make_kpi(5.0, 30.0, 60.0, 30, 10, 5, 1, 1, 2, 0, 50.0);
+        let trends = compute_trends(&current, &baseline);
+
+        let err_trend = trends
+            .iter()
+            .find(|t| t.metric == "error_rate_bps")
+            .unwrap();
+        assert_eq!(err_trend.direction, TrendDirection::Falling);
+        assert!(err_trend.delta < 0.0);
+
+        let ack_trend = trends.iter().find(|t| t.metric == "ack_pending").unwrap();
+        assert_eq!(ack_trend.direction, TrendDirection::Falling);
+    }
+
+    #[test]
+    fn compute_trends_flat_when_unchanged() {
+        let kpi = make_kpi(10.0, 50.0, 100.0, 50, 20, 5, 1, 2, 3, 1, 30.0);
+        let trends = compute_trends(&kpi, &kpi);
+
+        for t in &trends {
+            assert_eq!(
+                t.direction,
+                TrendDirection::Flat,
+                "metric {} should be flat, got {}",
+                t.metric,
+                t.direction
+            );
+            assert!(t.delta.abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn compute_trends_handles_zero_baseline() {
+        let baseline = make_kpi(0.0, 0.0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0.0);
+        let current = make_kpi(10.0, 50.0, 100.0, 50, 20, 5, 1, 2, 3, 1, 30.0);
+        let trends = compute_trends(&current, &baseline);
+
+        let err_trend = trends
+            .iter()
+            .find(|t| t.metric == "error_rate_bps")
+            .unwrap();
+        assert_eq!(err_trend.direction, TrendDirection::Rising);
+        assert!((err_trend.delta_ratio - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_forecasts_linear_extrapolation() {
+        let mut baseline = make_kpi(10.0, 50.0, 100.0, 50, 20, 5, 1, 2, 3, 1, 30.0);
+        baseline.actual_span_secs = 300.0;
+        let mut current = make_kpi(20.0, 70.0, 140.0, 60, 25, 8, 2, 4, 5, 2, 40.0);
+        current.actual_span_secs = 60.0;
+
+        let forecasts = compute_forecasts(&current, &baseline, &[60, 300]);
+
+        let err_f60 = forecasts
+            .iter()
+            .find(|f| f.metric == "error_rate_bps" && f.horizon_secs == 60)
+            .unwrap();
+        assert!((err_f60.current - 20.0).abs() < f64::EPSILON);
+        assert!(
+            err_f60.projected > err_f60.current,
+            "rising metric should forecast higher"
+        );
+        assert!(err_f60.rate_per_sec > 0.0);
+    }
+
+    #[test]
+    fn compute_forecasts_multiple_horizons() {
+        let baseline = make_kpi(10.0, 50.0, 100.0, 50, 20, 5, 1, 2, 3, 1, 30.0);
+        let current = make_kpi(20.0, 70.0, 140.0, 60, 25, 8, 2, 4, 5, 2, 40.0);
+        let forecasts = compute_forecasts(&current, &baseline, &[60, 300, 900]);
+
+        // 15 metrics × 3 horizons = 45 forecast points.
+        assert_eq!(forecasts.len(), 15 * 3);
+
+        let err_f60 = forecasts
+            .iter()
+            .find(|f| f.metric == "error_rate_bps" && f.horizon_secs == 60)
+            .unwrap();
+        let err_f300 = forecasts
+            .iter()
+            .find(|f| f.metric == "error_rate_bps" && f.horizon_secs == 300)
+            .unwrap();
+        let err_f900 = forecasts
+            .iter()
+            .find(|f| f.metric == "error_rate_bps" && f.horizon_secs == 900)
+            .unwrap();
+        let delta_60 = (err_f60.projected - err_f60.current).abs();
+        let delta_300 = (err_f300.projected - err_f300.current).abs();
+        let delta_900 = (err_f900.projected - err_f900.current).abs();
+        assert!(delta_300 > delta_60, "300s delta should exceed 60s delta");
+        assert!(delta_900 > delta_300, "900s delta should exceed 300s delta");
+    }
+
+    #[test]
+    fn correlation_detected_when_both_rising() {
+        let baseline = make_kpi(5.0, 30.0, 60.0, 30, 10, 5, 1, 1, 2, 0, 50.0);
+        let current = make_kpi(20.0, 120.0, 250.0, 30, 10, 5, 1, 1, 2, 0, 50.0);
+        let corrs = compute_correlations(&current, &baseline);
+
+        let err_lat = corrs
+            .iter()
+            .find(|c| c.metric_a == "error_rate_bps" && c.metric_b == "tool_p95_ms");
+        assert!(err_lat.is_some(), "should detect error+latency correlation");
+        let c = err_lat.unwrap();
+        assert_eq!(c.sign_correlation, 1);
+        assert_eq!(c.direction_a, TrendDirection::Rising);
+        assert_eq!(c.direction_b, TrendDirection::Rising);
+    }
+
+    #[test]
+    fn correlation_detected_when_opposite() {
+        let baseline = make_kpi(5.0, 120.0, 250.0, 30, 10, 5, 1, 1, 2, 0, 50.0);
+        let current = make_kpi(20.0, 30.0, 60.0, 30, 10, 5, 1, 1, 2, 0, 50.0);
+        let corrs = compute_correlations(&current, &baseline);
+
+        let err_lat = corrs
+            .iter()
+            .find(|c| c.metric_a == "error_rate_bps" && c.metric_b == "tool_p95_ms");
+        assert!(err_lat.is_some(), "should detect divergent correlation");
+        assert_eq!(err_lat.unwrap().sign_correlation, -1);
+    }
+
+    #[test]
+    fn correlation_skipped_when_flat() {
+        let kpi = make_kpi(10.0, 50.0, 100.0, 50, 20, 5, 1, 2, 3, 1, 30.0);
+        let corrs = compute_correlations(&kpi, &kpi);
+        assert!(
+            corrs.is_empty(),
+            "flat metrics should produce no correlations"
+        );
+    }
+
+    #[test]
+    fn trend_report_combines_all_sections() {
+        let baseline = make_kpi(5.0, 30.0, 60.0, 30, 10, 5, 1, 1, 2, 0, 50.0);
+        let current = make_kpi(20.0, 120.0, 250.0, 85, 75, 25, 8, 10, 15, 5, 30.0);
+        let report = trend_report(&current, &baseline, &[60, 300]);
+
+        assert!(!report.trends.is_empty(), "should have trend indicators");
+        assert!(!report.forecasts.is_empty(), "should have forecast points");
+        assert!(
+            !report.correlations.is_empty(),
+            "should detect at least one correlation"
+        );
+    }
+
+    #[test]
+    fn trend_indicator_serializable() {
+        let indicator = TrendIndicator {
+            metric: "error_rate_bps".into(),
+            direction: TrendDirection::Rising,
+            delta: 10.0,
+            delta_ratio: 0.5,
+            current: 30.0,
+            baseline: 20.0,
+        };
+        let json = serde_json::to_value(&indicator).expect("should serialize");
+        assert_eq!(json["direction"], "rising");
+        assert_eq!(json["metric"], "error_rate_bps");
+    }
+
+    #[test]
+    fn forecast_point_serializable() {
+        let fp = ForecastPoint {
+            metric: "tool_p95_ms".into(),
+            horizon_secs: 300,
+            projected: 150.0,
+            current: 100.0,
+            rate_per_sec: 0.167,
+        };
+        let json = serde_json::to_value(&fp).expect("should serialize");
+        assert_eq!(json["horizon_secs"], 300);
+        assert!(json["projected"].as_f64().unwrap() > 100.0);
+    }
+
+    #[test]
+    fn correlation_pair_serializable() {
+        let cp = CorrelationPair {
+            metric_a: "error_rate_bps".into(),
+            metric_b: "tool_p95_ms".into(),
+            direction_a: TrendDirection::Rising,
+            direction_b: TrendDirection::Rising,
+            sign_correlation: 1,
+            explanation: "test".into(),
+        };
+        let json = serde_json::to_value(&cp).expect("should serialize");
+        assert_eq!(json["sign_correlation"], 1);
+        assert_eq!(json["direction_a"], "rising");
+    }
+
+    #[test]
+    fn extract_metrics_returns_all_tracked() {
+        let kpi = make_kpi(10.0, 50.0, 100.0, 50, 20, 5, 1, 2, 3, 1, 30.0);
+        let metrics = extract_metrics(&kpi);
+        assert_eq!(metrics.len(), 15, "should track 15 metrics");
+
+        let err = metrics
+            .iter()
+            .find(|&&(n, _)| n == "error_rate_bps")
+            .unwrap();
+        assert!((err.1 - 10.0).abs() < f64::EPSILON);
+        let tps = metrics
+            .iter()
+            .find(|&&(n, _)| n == "tool_calls_per_sec")
+            .unwrap();
+        assert!((tps.1 - 30.0).abs() < f64::EPSILON);
     }
 }
