@@ -4,6 +4,10 @@
 > Every downstream track references this document for screen IA, entity model,
 > navigation graph, operator journeys, layout principles, and done criteria.
 
+**Beads:** br-3vwi.1, br-3vwi.1.3  
+**Last updated:** 2026-02-10  
+**Status:** Published (controlling artifact)
+
 ---
 
 ## 1. Vocabulary
@@ -81,16 +85,17 @@ V2 expands from 8 to 12 screens, filling placeholders and adding new capabilitie
 
 ### 2.4 Deep-Link Targets (V2)
 
-| Target | Source screens | Destination |
-|--------|---------------|-------------|
-| `TimelineAtTime(i64)` | Dashboard event click | Timeline, cursor at timestamp |
-| `MessageById(i64)` | Threads, Search, Timeline | Messages, detail pane open |
-| `ThreadById(String)` | Messages, Dashboard, Agents | Threads, conversation view |
-| `AgentByName(String)` | Messages, Threads, Reservations | Agents, selected agent |
-| `ToolByName(String)` | Dashboard, Timeline | ToolMetrics, selected tool |
-| `ProjectBySlug(String)` | Search, Contacts | Projects, selected project |
-| `ReservationById(i64)` | Agents, Timeline | Reservations, selected reservation |
-| `ContactByPair(String,String)` | Agents | Contacts, selected link |
+| Target | Status | Source screens | Destination |
+|--------|--------|---------------|-------------|
+| `TimelineAtTime(i64)` | Implemented (v1) | Dashboard event click | Timeline, cursor at timestamp |
+| `MessageById(i64)` | Implemented (v1) | Threads, Search, Timeline | Messages, detail pane open |
+| `ThreadById(String)` | Implemented (v1) | Messages, Dashboard, Agents | Threads, conversation view |
+| `AgentByName(String)` | Implemented (v1) | Messages, Threads, Reservations | Agents, selected agent |
+| `ToolByName(String)` | Implemented (v1) | Dashboard, Timeline | ToolMetrics, selected tool |
+| `ProjectBySlug(String)` | Partial (v1) | Search, Contacts | Projects/Dashboard scoped to project |
+| `ReservationByAgent(String)` | Implemented (v1) | Agents, Timeline | Reservations, select agent reservation |
+| `ReservationById(i64)` | Planned (v2) | Agents, Timeline | Reservations, selected reservation |
+| `ContactByPair(String,String)` | Planned (v2) | Agents | Contacts, selected link |
 
 ### 2.5 Web Route Scheme (Baseline)
 
