@@ -57,6 +57,35 @@ matrix/conformance contract is owned by `br-3vwi.13.1`.
 | TUI System Health | No | Partial (web has minimal) | Yes | Drill-down panels + sparklines | Differentiate | br-3vwi.7.5 |
 | TUI Timeline + Inspector | Partial (archive/timeline) | No | Yes | Virtualized rail + typed filters + JSON view | Differentiate, but preserve deep-link parity | br-3vwi.5.5, br-3vwi.10.3 |
 
+## Legacy Mail-Web Route Inventory (Non-Exhaustive)
+
+These routes exist in legacy Python and are either missing or intentionally
+different in Rust today. This is a checklist to ensure `br-3vwi.13.*` captures
+the full surface area.
+
+- `GET /mail` (legacy: unified inbox HTML)
+- `GET /mail/api/unified-inbox` (JSON feed)
+- `GET /mail/projects` (projects listing; includes sibling suggestions)
+- `POST /mail/api/projects/{project_id}/siblings/{other_id}` (confirm/dismiss/reset suggestions)
+- `POST /mail/{project}/inbox/{agent}/mark-read` (single/batch mark read)
+- `POST /mail/{project}/inbox/{agent}/mark-all-read`
+- `POST /mail/{project}/overseer/send`
+- `GET /mail/archive/*` (guide/activity/commit/timeline/browser/network/time-travel/snapshot)
+
+## Notable Legacy Search UX Features
+
+Legacy `/mail/{project}` search supports additional query semantics beyond “q in
+subject/body”, including:
+
+- `scope` (subject/body/all)
+- `order` (relevance/time)
+- `boost` (relevance weight tweak)
+- Snippet extraction with `<mark>` highlights when FTS is available
+
+If Rust intentionally omits any of these, record as an explicit delta in the
+web parity contract and ensure the operator can still accomplish the core
+journeys.
+
 ## Recommendations (Immediate)
 
 1. Treat `docs/TUI_V2_CONTRACT.md` as the single product contract source; this matrix should link into it and feed `br-3vwi.13.1`.
@@ -71,4 +100,3 @@ matrix/conformance contract is owned by `br-3vwi.13.1`.
 - Every “Close parity” row must have an owner bead ID before implementation starts.
 - When a row is implemented, link evidence (tests/fixtures/E2E script) in the owner bead.
 - If a parity row is intentionally skipped, document the delta in `docs/TUI_V2_CONTRACT.md` (or the web parity contract).
-
