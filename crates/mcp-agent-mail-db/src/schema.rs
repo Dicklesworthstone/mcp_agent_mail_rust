@@ -682,6 +682,135 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v7: Search corpus FTS for agents + projects ──────────────────────
+    // Add lightweight identity indexes without paying write amplification costs
+    // on high-churn columns (e.g. `agents.last_active_ts`).
+
+    migrations.push(Migration::new(
+        "v7_create_fts_agents".to_string(),
+        "create fts_agents for agent identity search".to_string(),
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_agents USING fts5(\
+             agent_id UNINDEXED, \
+             project_id UNINDEXED, \
+             name, \
+             task_description, \
+             program UNINDEXED, \
+             model UNINDEXED, \
+             tokenize='porter unicode61 remove_diacritics 2', \
+             prefix='2,3'\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v7_create_fts_projects".to_string(),
+        "create fts_projects for project identity search".to_string(),
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_projects USING fts5(\
+             project_id UNINDEXED, \
+             slug, \
+             human_key, \
+             tokenize='porter unicode61 remove_diacritics 2', \
+             prefix='2,3'\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    // Agents → fts_agents triggers
+	    migrations.push(Migration::new(
+	        "v7_trg_fts_agents_insert".to_string(),
+	        "trigger to insert fts_agents on new agents".to_string(),
+	        "CREATE TRIGGER IF NOT EXISTS agents_ai \
+         AFTER INSERT ON agents \
+         BEGIN \
+             INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+	             VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
+	         END"
+	        .to_string(),
+	        String::new(),
+	    ));
+	    migrations.push(Migration::new(
+	        "v7_trg_fts_agents_delete".to_string(),
+	        "trigger to delete fts_agents on agent delete".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS agents_ad \
+         AFTER DELETE ON agents \
+	         BEGIN \
+	             DELETE FROM fts_agents WHERE rowid = OLD.id; \
+	         END"
+	        .to_string(),
+	        String::new(),
+	    ));
+	    migrations.push(Migration::new(
+	        "v7_trg_fts_agents_update".to_string(),
+	        "trigger to update fts_agents when indexed agent fields change".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS agents_au \
+         AFTER UPDATE OF name, task_description, program, model ON agents \
+         BEGIN \
+             DELETE FROM fts_agents WHERE rowid = OLD.id; \
+	             INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+	             VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
+	         END"
+	        .to_string(),
+	        String::new(),
+	    ));
+
+    // Projects → fts_projects triggers
+	    migrations.push(Migration::new(
+	        "v7_trg_fts_projects_insert".to_string(),
+	        "trigger to insert fts_projects on new projects".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS projects_ai \
+         AFTER INSERT ON projects \
+         BEGIN \
+	             INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
+	             VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
+	         END"
+	        .to_string(),
+	        String::new(),
+	    ));
+	    migrations.push(Migration::new(
+	        "v7_trg_fts_projects_delete".to_string(),
+	        "trigger to delete fts_projects on project delete".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS projects_ad \
+         AFTER DELETE ON projects \
+	         BEGIN \
+	             DELETE FROM fts_projects WHERE rowid = OLD.id; \
+	         END"
+	        .to_string(),
+	        String::new(),
+	    ));
+	    migrations.push(Migration::new(
+	        "v7_trg_fts_projects_update".to_string(),
+	        "trigger to update fts_projects when indexed project fields change".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS projects_au \
+         AFTER UPDATE OF slug, human_key ON projects \
+         BEGIN \
+             DELETE FROM fts_projects WHERE rowid = OLD.id; \
+	             INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
+	             VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
+	         END"
+	        .to_string(),
+	        String::new(),
+	    ));
+
+    // Backfill agent/project identity indexes from existing rows.
+	    migrations.push(Migration::new(
+	        "v7_backfill_fts_agents".to_string(),
+	        "backfill fts_agents from agents".to_string(),
+	        "INSERT OR REPLACE INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+	         SELECT id, id, project_id, name, task_description, program, model FROM agents"
+	        .to_string(),
+	        String::new(),
+	    ));
+	    migrations.push(Migration::new(
+	        "v7_backfill_fts_projects".to_string(),
+	        "backfill fts_projects from projects".to_string(),
+	        "INSERT OR REPLACE INTO fts_projects(rowid, project_id, slug, human_key) \
+	         SELECT id, id, slug, human_key FROM projects"
+	        .to_string(),
+	        String::new(),
+	    ));
+
     migrations
 }
 
@@ -1244,6 +1373,134 @@ mod tests {
             !rows.is_empty(),
             "bm25 weighted search should return results"
         );
+    }
+
+    #[test]
+    fn v7_fts_agents_and_projects_backfill_and_triggers_work() {
+        use sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v7_fts_identity.db");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
+
+        // Simulate a pre-v7 DB: identity tables exist, but there are no fts_agents/fts_projects.
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                slug TEXT NOT NULL UNIQUE,\
+                human_key TEXT NOT NULL,\
+                created_at INTEGER NOT NULL\
+            )",
+            &[],
+        )
+        .expect("create projects table");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL REFERENCES projects(id),\
+                name TEXT NOT NULL,\
+                program TEXT NOT NULL,\
+                model TEXT NOT NULL,\
+                task_description TEXT NOT NULL DEFAULT '',\
+                inception_ts INTEGER NOT NULL,\
+                last_active_ts INTEGER NOT NULL,\
+                attachments_policy TEXT NOT NULL DEFAULT 'auto',\
+                contact_policy TEXT NOT NULL DEFAULT 'auto',\
+                UNIQUE(project_id, name)\
+            )",
+            &[],
+        )
+        .expect("create agents table");
+
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("preproj".to_string()),
+                Value::Text("/alpha/workspace".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("BlueDog".to_string()),
+                Value::Text("codex".to_string()),
+                Value::Text("gpt-5".to_string()),
+                Value::Text("alpha agent".to_string()),
+                Value::BigInt(1),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert agent");
+
+        // Applying migrations should create fts_agents/fts_projects and backfill from existing rows.
+        block_on({
+            let conn = &conn;
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT project_id FROM fts_projects WHERE fts_projects MATCH 'preproj'",
+                &[],
+            )
+            .expect("fts_projects search");
+	        assert_eq!(rows.len(), 1);
+
+	        let rows = conn
+	            .query_sync(
+	                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'alpha'",
+	                &[],
+	            )
+	            .expect("fts_agents search");
+	        assert_eq!(rows.len(), 1);
+
+        // Update triggers should keep identity indexes fresh.
+        conn.execute_sync(
+            "UPDATE projects SET human_key = ? WHERE id = 1",
+            &[Value::Text("/beta/workspace".to_string())],
+        )
+        .expect("update project");
+        let rows = conn
+            .query_sync(
+                "SELECT project_id FROM fts_projects WHERE fts_projects MATCH 'beta'",
+                &[],
+            )
+            .expect("fts_projects search after update");
+        assert_eq!(rows.len(), 1);
+        let rows = conn
+            .query_sync(
+                "SELECT project_id FROM fts_projects WHERE fts_projects MATCH 'alpha'",
+                &[],
+            )
+            .expect("fts_projects search for old term");
+        assert!(rows.is_empty());
+
+        conn.execute_sync(
+            "UPDATE agents SET task_description = ? WHERE id = 1",
+            &[Value::Text("beta agent".to_string())],
+	        )
+	        .expect("update agent");
+	        let rows = conn
+	            .query_sync(
+	                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'beta'",
+	                &[],
+	            )
+	            .expect("fts_agents search after update");
+	        assert_eq!(rows.len(), 1);
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'alpha'",
+                &[],
+            )
+            .expect("fts_agents search for old term");
+        assert!(rows.is_empty());
     }
 
     #[test]

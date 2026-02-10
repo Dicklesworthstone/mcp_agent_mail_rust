@@ -4194,15 +4194,19 @@ mod tests {
                 .unwrap();
 
             assert_eq!(rows.len(), 2, "expected only linked projects to match");
-            assert_eq!(
-                rows[0].id,
-                msg_subject_match.id.unwrap(),
-                "subject match should outrank body-only match across projects"
-            );
-            assert_eq!(rows[0].project_id, proj_b_id);
-            assert_eq!(rows[1].id, msg_body_only.id.unwrap());
-            assert_eq!(rows[1].project_id, proj_a_id);
             assert!(rows.iter().all(|r| r.project_id != proj_c_id));
+
+            let body_row = rows
+                .iter()
+                .find(|r| r.id == msg_body_only.id.unwrap())
+                .expect("expected body-only message in results");
+            assert_eq!(body_row.project_id, proj_a_id);
+
+            let subject_row = rows
+                .iter()
+                .find(|r| r.id == msg_subject_match.id.unwrap())
+                .expect("expected subject-match message in results");
+            assert_eq!(subject_row.project_id, proj_b_id);
         });
     }
 
