@@ -47,13 +47,85 @@ struct ThreadSummary {
     participant_count: usize,
     last_subject: String,
     last_sender: String,
-    /// Raw timestamp for sorting/comparison (pre-wired for deep-link).
-    #[allow(dead_code)]
     last_timestamp_micros: i64,
     last_timestamp_iso: String,
-    /// Project slug (pre-wired for cross-project filtering).
-    #[allow(dead_code)]
+    /// Project slug for cross-project display.
     project_slug: String,
+    /// Whether any message in the thread has high/urgent importance.
+    has_escalation: bool,
+    /// Message velocity: messages per hour over the thread's lifetime.
+    velocity_msg_per_hr: f64,
+    /// Participant names (comma-separated).
+    participant_names: String,
+    /// First message timestamp (for velocity calculation).
+    #[allow(dead_code)]
+    first_timestamp_micros: i64,
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// View lens and sort mode
+// ──────────────────────────────────────────────────────────────────────
+
+/// Determines what secondary info is shown per thread row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewLens {
+    /// Default: message count + participant count.
+    Activity,
+    /// Show participant names.
+    Participants,
+    /// Show escalation markers and velocity.
+    Escalation,
+}
+
+impl ViewLens {
+    const fn next(self) -> Self {
+        match self {
+            Self::Activity => Self::Participants,
+            Self::Participants => Self::Escalation,
+            Self::Escalation => Self::Activity,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Activity => "Activity",
+            Self::Participants => "Participants",
+            Self::Escalation => "Escalation",
+        }
+    }
+}
+
+/// Sort criteria for the thread list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    /// Most recently active first.
+    LastActivity,
+    /// Highest message velocity first.
+    Velocity,
+    /// Most participants first.
+    ParticipantCount,
+    /// Escalated threads first, then by activity.
+    EscalationFirst,
+}
+
+impl SortMode {
+    const fn next(self) -> Self {
+        match self {
+            Self::LastActivity => Self::Velocity,
+            Self::Velocity => Self::ParticipantCount,
+            Self::ParticipantCount => Self::EscalationFirst,
+            Self::EscalationFirst => Self::LastActivity,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::LastActivity => "Recent",
+            Self::Velocity => "Velocity",
+            Self::ParticipantCount => "Participants",
+            Self::EscalationFirst => "Escalation",
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -114,6 +186,10 @@ pub struct ThreadExplorerScreen {
     filter_text: String,
     /// Whether we're in filter input mode.
     filter_editing: bool,
+    /// Active view lens (cycles with Tab).
+    view_lens: ViewLens,
+    /// Active sort mode (cycles with 's').
+    sort_mode: SortMode,
 }
 
 impl ThreadExplorerScreen {
@@ -132,6 +208,36 @@ impl ThreadExplorerScreen {
             list_dirty: true,
             filter_text: String::new(),
             filter_editing: false,
+            view_lens: ViewLens::Activity,
+            sort_mode: SortMode::LastActivity,
+        }
+    }
+
+    /// Re-sort the thread list according to the active sort mode.
+    fn apply_sort(&mut self) {
+        match self.sort_mode {
+            SortMode::LastActivity => {
+                self.threads
+                    .sort_by(|a, b| b.last_timestamp_micros.cmp(&a.last_timestamp_micros));
+            }
+            SortMode::Velocity => {
+                self.threads.sort_by(|a, b| {
+                    b.velocity_msg_per_hr
+                        .partial_cmp(&a.velocity_msg_per_hr)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            SortMode::ParticipantCount => {
+                self.threads
+                    .sort_by(|a, b| b.participant_count.cmp(&a.participant_count));
+            }
+            SortMode::EscalationFirst => {
+                self.threads.sort_by(|a, b| {
+                    b.has_escalation
+                        .cmp(&a.has_escalation)
+                        .then(b.last_timestamp_micros.cmp(&a.last_timestamp_micros))
+                });
+            }
         }
     }
 
@@ -159,6 +265,7 @@ impl ThreadExplorerScreen {
         };
 
         self.threads = fetch_threads(conn, &self.filter_text, MAX_THREADS);
+        self.apply_sort();
         self.last_refresh = Some(Instant::now());
         self.list_dirty = false;
 
@@ -284,6 +391,15 @@ impl MailScreen for ThreadExplorerScreen {
                             // Search/filter
                             KeyCode::Char('/') => {
                                 self.filter_editing = true;
+                            }
+                            // Cycle sort mode
+                            KeyCode::Char('s') => {
+                                self.sort_mode = self.sort_mode.next();
+                                self.apply_sort();
+                            }
+                            // Cycle view lens
+                            KeyCode::Char('v') => {
+                                self.view_lens = self.view_lens.next();
                             }
                             // Clear filter
                             KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
@@ -420,6 +536,8 @@ impl MailScreen for ThreadExplorerScreen {
                 &self.threads,
                 self.cursor,
                 matches!(self.focus, Focus::ThreadList),
+                self.view_lens,
+                self.sort_mode,
             );
             render_thread_detail(
                 frame,
@@ -433,7 +551,15 @@ impl MailScreen for ThreadExplorerScreen {
             // Narrow: show only the active pane
             match self.focus {
                 Focus::ThreadList => {
-                    render_thread_list(frame, content_area, &self.threads, self.cursor, true);
+                    render_thread_list(
+                        frame,
+                        content_area,
+                        &self.threads,
+                        self.cursor,
+                        true,
+                        self.view_lens,
+                        self.sort_mode,
+                    );
                 }
                 Focus::DetailPanel => {
                     render_thread_detail(
@@ -479,6 +605,14 @@ impl MailScreen for ThreadExplorerScreen {
                 key: "Ctrl+C",
                 action: "Clear filter",
             },
+            HelpEntry {
+                key: "s",
+                action: "Cycle sort mode",
+            },
+            HelpEntry {
+                key: "v",
+                action: "Cycle view lens",
+            },
         ]
     }
 
@@ -517,8 +651,11 @@ fn fetch_threads(conn: &SqliteConnection, filter: &str, limit: usize) -> Vec<Thr
            m.thread_id, \
            COUNT(DISTINCT m.id) AS msg_count, \
            COUNT(DISTINCT a_sender.name) AS participant_count, \
+           GROUP_CONCAT(DISTINCT a_sender.name) AS participant_names, \
            MAX(m.created_ts) AS last_ts, \
-           p.slug AS project_slug \
+           MIN(m.created_ts) AS first_ts, \
+           p.slug AS project_slug, \
+           MAX(CASE WHEN m.importance IN ('high','urgent') THEN 1 ELSE 0 END) AS has_escalation \
          FROM messages m \
          JOIN agents a_sender ON a_sender.id = m.sender_id \
          JOIN projects p ON p.id = m.project_id \
@@ -536,13 +673,24 @@ fn fetch_threads(conn: &SqliteConnection, filter: &str, limit: usize) -> Vec<Thr
         .filter_map(|row| {
             let thread_id = row.get_named::<String>("thread_id").ok()?;
             let last_ts = row.get_named::<i64>("last_ts").ok().unwrap_or(0);
+            let first_ts = row.get_named::<i64>("first_ts").ok().unwrap_or(last_ts);
+            let msg_count = row
+                .get_named::<i64>("msg_count")
+                .ok()
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(0);
+
+            // Compute velocity: msgs/hour over thread lifetime.
+            let duration_hours = (last_ts - first_ts).max(1) as f64 / (3_600_000_000.0); // micros to hours
+            let velocity = if duration_hours > 0.001 {
+                msg_count as f64 / duration_hours
+            } else {
+                msg_count as f64 // single-burst thread
+            };
+
             Some(ThreadSummary {
                 thread_id,
-                message_count: row
-                    .get_named::<i64>("msg_count")
-                    .ok()
-                    .and_then(|v| usize::try_from(v).ok())
-                    .unwrap_or(0),
+                message_count: msg_count,
                 participant_count: row
                     .get_named::<i64>("participant_count")
                     .ok()
@@ -556,6 +704,13 @@ fn fetch_threads(conn: &SqliteConnection, filter: &str, limit: usize) -> Vec<Thr
                     .get_named::<String>("project_slug")
                     .ok()
                     .unwrap_or_default(),
+                has_escalation: row.get_named::<i64>("has_escalation").ok().unwrap_or(0) != 0,
+                velocity_msg_per_hr: velocity,
+                participant_names: row
+                    .get_named::<String>("participant_names")
+                    .ok()
+                    .unwrap_or_default(),
+                first_timestamp_micros: first_ts,
             })
         })
         .collect();
@@ -658,9 +813,22 @@ fn render_thread_list(
     threads: &[ThreadSummary],
     cursor: usize,
     focused: bool,
+    view_lens: ViewLens,
+    sort_mode: SortMode,
 ) {
     let focus_tag = if focused { "" } else { " (inactive)" };
-    let title = format!("Threads ({} total){focus_tag}", threads.len());
+    let escalated = threads.iter().filter(|t| t.has_escalation).count();
+    let esc_tag = if escalated > 0 {
+        format!(" | {escalated} escalated")
+    } else {
+        String::new()
+    };
+    let title = format!(
+        "Threads ({} total){esc_tag} [Lens:{} Sort:{}]{focus_tag}",
+        threads.len(),
+        view_lens.label(),
+        sort_mode.label(),
+    );
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded);
@@ -690,6 +858,7 @@ fn render_thread_list(
     for (view_idx, thread) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
         let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
+        let esc_badge = if thread.has_escalation { "!" } else { " " };
 
         // Compact timestamp (HH:MM from ISO string)
         let time_short = if thread.last_timestamp_iso.len() >= 16 {
@@ -698,11 +867,33 @@ fn render_thread_list(
             &thread.last_timestamp_iso
         };
 
-        let meta = format!(
-            "{} msgs, {} agents",
-            thread.message_count, thread.participant_count
-        );
-        let prefix = format!("{marker} {time_short} ");
+        // Project tag (shortened)
+        let proj_tag = if thread.project_slug.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", truncate_str(&thread.project_slug, 12))
+        };
+
+        // Lens-specific metadata
+        let meta = match view_lens {
+            ViewLens::Activity => format!(
+                "{} msgs, {} agents, {:.1}/hr",
+                thread.message_count, thread.participant_count, thread.velocity_msg_per_hr,
+            ),
+            ViewLens::Participants => {
+                truncate_str(&thread.participant_names, inner_w.saturating_sub(30))
+            }
+            ViewLens::Escalation => {
+                let flag = if thread.has_escalation {
+                    "ESCALATED"
+                } else {
+                    "normal"
+                };
+                format!("{flag} | {:.1} msg/hr", thread.velocity_msg_per_hr)
+            }
+        };
+
+        let prefix = format!("{marker}{esc_badge}{time_short} {proj_tag}");
         let meta_len = meta.len() + 2; // " [...]"
         let id_space = inner_w.saturating_sub(prefix.len() + meta_len);
         let thread_id_display = truncate_str(&thread.thread_id, id_space);
@@ -1302,7 +1493,169 @@ mod tests {
             last_timestamp_micros: 1_700_000_000_000_000,
             last_timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
             project_slug: "test-proj".to_string(),
+            has_escalation: false,
+            velocity_msg_per_hr: msg_count as f64 / 2.0,
+            participant_names: "GoldFox,SilverWolf".to_string(),
+            first_timestamp_micros: 1_699_993_600_000_000,
         }
+    }
+
+    fn make_escalated_thread(id: &str, msg_count: usize) -> ThreadSummary {
+        let mut t = make_thread(id, msg_count, 3);
+        t.has_escalation = true;
+        t.velocity_msg_per_hr = 10.0;
+        t
+    }
+
+    // ── View lens ───────────────────────────────────────────────────
+
+    #[test]
+    fn view_lens_cycles() {
+        assert_eq!(ViewLens::Activity.next(), ViewLens::Participants);
+        assert_eq!(ViewLens::Participants.next(), ViewLens::Escalation);
+        assert_eq!(ViewLens::Escalation.next(), ViewLens::Activity);
+    }
+
+    #[test]
+    fn view_lens_labels() {
+        assert_eq!(ViewLens::Activity.label(), "Activity");
+        assert_eq!(ViewLens::Participants.label(), "Participants");
+        assert_eq!(ViewLens::Escalation.label(), "Escalation");
+    }
+
+    #[test]
+    fn v_key_cycles_view_lens() {
+        let mut screen = ThreadExplorerScreen::new();
+        assert_eq!(screen.view_lens, ViewLens::Activity);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let v = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        screen.update(&v, &state);
+        assert_eq!(screen.view_lens, ViewLens::Participants);
+
+        screen.update(&v, &state);
+        assert_eq!(screen.view_lens, ViewLens::Escalation);
+
+        screen.update(&v, &state);
+        assert_eq!(screen.view_lens, ViewLens::Activity);
+    }
+
+    // ── Sort mode ──────────────────────────────────────────────────
+
+    #[test]
+    fn sort_mode_cycles() {
+        assert_eq!(SortMode::LastActivity.next(), SortMode::Velocity);
+        assert_eq!(SortMode::Velocity.next(), SortMode::ParticipantCount);
+        assert_eq!(SortMode::ParticipantCount.next(), SortMode::EscalationFirst);
+        assert_eq!(SortMode::EscalationFirst.next(), SortMode::LastActivity);
+    }
+
+    #[test]
+    fn sort_mode_labels() {
+        assert_eq!(SortMode::LastActivity.label(), "Recent");
+        assert_eq!(SortMode::Velocity.label(), "Velocity");
+        assert_eq!(SortMode::ParticipantCount.label(), "Participants");
+        assert_eq!(SortMode::EscalationFirst.label(), "Escalation");
+    }
+
+    #[test]
+    fn s_key_cycles_sort_mode() {
+        let mut screen = ThreadExplorerScreen::new();
+        assert_eq!(screen.sort_mode, SortMode::LastActivity);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let s = Event::Key(ftui::KeyEvent::new(KeyCode::Char('s')));
+        screen.update(&s, &state);
+        assert_eq!(screen.sort_mode, SortMode::Velocity);
+    }
+
+    // ── Sorting correctness ────────────────────────────────────────
+
+    #[test]
+    fn sort_by_velocity() {
+        let mut screen = ThreadExplorerScreen::new();
+        let mut t1 = make_thread("slow", 2, 1);
+        t1.velocity_msg_per_hr = 1.0;
+        let mut t2 = make_thread("fast", 10, 2);
+        t2.velocity_msg_per_hr = 50.0;
+        screen.threads = vec![t1, t2];
+
+        screen.sort_mode = SortMode::Velocity;
+        screen.apply_sort();
+        assert_eq!(screen.threads[0].thread_id, "fast");
+        assert_eq!(screen.threads[1].thread_id, "slow");
+    }
+
+    #[test]
+    fn sort_by_participant_count() {
+        let mut screen = ThreadExplorerScreen::new();
+        let t1 = make_thread("few", 3, 1);
+        let t2 = make_thread("many", 3, 10);
+        screen.threads = vec![t1, t2];
+
+        screen.sort_mode = SortMode::ParticipantCount;
+        screen.apply_sort();
+        assert_eq!(screen.threads[0].thread_id, "many");
+    }
+
+    #[test]
+    fn sort_escalation_first() {
+        let mut screen = ThreadExplorerScreen::new();
+        let t1 = make_thread("normal", 5, 2);
+        let t2 = make_escalated_thread("urgent", 5);
+        screen.threads = vec![t1, t2];
+
+        screen.sort_mode = SortMode::EscalationFirst;
+        screen.apply_sort();
+        assert_eq!(screen.threads[0].thread_id, "urgent");
+        assert!(screen.threads[0].has_escalation);
+    }
+
+    // ── Cross-project + escalation rendering ───────────────────────
+
+    #[test]
+    fn render_with_escalation_no_panic() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen
+            .threads
+            .push(make_escalated_thread("alert-thread", 8));
+        screen.threads.push(make_thread("normal-thread", 3, 2));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+    }
+
+    #[test]
+    fn render_participants_lens_no_panic() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.view_lens = ViewLens::Participants;
+        screen.threads.push(make_thread("t1", 3, 2));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+    }
+
+    #[test]
+    fn render_escalation_lens_no_panic() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.view_lens = ViewLens::Escalation;
+        screen.threads.push(make_escalated_thread("hot-thread", 10));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+    }
+
+    // ── New keybindings ────────────────────────────────────────────
+
+    #[test]
+    fn keybindings_include_sort_and_lens() {
+        let screen = ThreadExplorerScreen::new();
+        let bindings = screen.keybindings();
+        assert!(bindings.iter().any(|b| b.key == "s"));
+        assert!(bindings.iter().any(|b| b.key == "v"));
     }
 
     fn make_message(id: i64) -> ThreadMessage {
