@@ -1335,14 +1335,12 @@ impl ConsoleLayoutState {
 }
 
 fn env_truthy(key: &str) -> bool {
-    std::env::var(key)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    std::env::var(key).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn should_force_mux_left_split(
