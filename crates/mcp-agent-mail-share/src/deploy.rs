@@ -153,7 +153,12 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
     let mut checks = Vec::new();
 
     // ── Required files ──────────────────────────────────────────────
-    check_file_exists(bundle_dir, "manifest.json", CheckSeverity::Error, &mut checks);
+    check_file_exists(
+        bundle_dir,
+        "manifest.json",
+        CheckSeverity::Error,
+        &mut checks,
+    );
     check_file_exists(bundle_dir, ".nojekyll", CheckSeverity::Warning, &mut checks);
     check_file_exists(bundle_dir, "_headers", CheckSeverity::Warning, &mut checks);
     check_file_exists(bundle_dir, "index.html", CheckSeverity::Error, &mut checks);
@@ -171,7 +176,12 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
         CheckSeverity::Warning,
         &mut checks,
     );
-    check_dir_exists(bundle_dir, "viewer/vendor", CheckSeverity::Warning, &mut checks);
+    check_dir_exists(
+        bundle_dir,
+        "viewer/vendor",
+        CheckSeverity::Warning,
+        &mut checks,
+    );
 
     // ── Database ────────────────────────────────────────────────────
     let has_db = bundle_dir.join("mailbox.sqlite3").is_file();
@@ -200,7 +210,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
     });
 
     // ── Data files ──────────────────────────────────────────────────
-    let has_data = bundle_dir.join("viewer/data").is_dir();
+    let _has_data = bundle_dir.join("viewer/data").is_dir();
     check_file_exists(
         bundle_dir,
         "viewer/data/messages.json",
@@ -228,8 +238,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
                     });
 
                     // Check schema version
-                    if let Some(version) = manifest.get("schema_version").and_then(|v| v.as_str())
-                    {
+                    if let Some(version) = manifest.get("schema_version").and_then(|v| v.as_str()) {
                         checks.push(DeployCheck {
                             name: "manifest_schema_version".to_string(),
                             passed: true,
@@ -315,7 +324,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
 /// Generate a GitHub Actions workflow for deploying to GitHub Pages.
 #[must_use]
 pub fn generate_gh_pages_workflow() -> String {
-    r##"# Deploy MCP Agent Mail static export to GitHub Pages
+    r###"# Deploy MCP Agent Mail static export to GitHub Pages
 #
 # Usage:
 #   1. Place your bundle output in the `docs/` directory (or configure path below)
@@ -392,14 +401,14 @@ jobs:
           echo "- **URL**: ${{ steps.deployment.outputs.page_url }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Triggered by**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-"##
+"###
     .to_string()
 }
 
 /// Generate a GitHub Actions workflow for deploying to Cloudflare Pages.
 #[must_use]
 pub fn generate_cf_pages_workflow() -> String {
-    r#"# Deploy MCP Agent Mail static export to Cloudflare Pages
+    r###"# Deploy MCP Agent Mail static export to Cloudflare Pages
 #
 # Usage:
 #   1. Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets in repo settings
@@ -464,7 +473,7 @@ jobs:
           echo "- **Status**: ${{ steps.deploy.outcome }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Triggered by**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-"#
+"###
     .to_string()
 }
 
@@ -884,13 +893,13 @@ fn build_security_expectations(bundle_dir: &Path, stats: &BundleStats) -> Securi
         );
     }
     if !stats.has_pages {
-        notes.push(
-            "No pre-rendered pages — content requires JavaScript for rendering".to_string(),
-        );
+        notes.push("No pre-rendered pages — content requires JavaScript for rendering".to_string());
     }
     if scrub_preset.as_deref() == Some("archive") {
-        notes.push("Archive scrub preset retains all data — suitable for private deployments only"
-            .to_string());
+        notes.push(
+            "Archive scrub preset retains all data — suitable for private deployments only"
+                .to_string(),
+        );
     }
 
     SecurityExpectations {
@@ -1024,17 +1033,13 @@ pub fn build_verify_plan(deployed_url: &str) -> VerifyResult {
     checks.push(DeployCheck {
         name: "coop_header".to_string(),
         passed: false,
-        message: format!(
-            "GET {url}/viewer/ should include Cross-Origin-Opener-Policy header"
-        ),
+        message: format!("GET {url}/viewer/ should include Cross-Origin-Opener-Policy header"),
         severity: CheckSeverity::Warning,
     });
     checks.push(DeployCheck {
         name: "coep_header".to_string(),
         passed: false,
-        message: format!(
-            "GET {url}/viewer/ should include Cross-Origin-Embedder-Policy header"
-        ),
+        message: format!("GET {url}/viewer/ should include Cross-Origin-Embedder-Policy header"),
         severity: CheckSeverity::Warning,
     });
 
@@ -1113,8 +1118,7 @@ pub fn write_deploy_tooling(bundle_dir: &Path) -> ShareResult<Vec<String>> {
 
     // Deploy report
     let report = validate_bundle(bundle_dir)?;
-    let report_json =
-        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+    let report_json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
     std::fs::write(bundle_dir.join("deploy_report.json"), &report_json)?;
     written.push("deploy_report.json".to_string());
 
@@ -1135,7 +1139,11 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("index.html"), "<html></html>").unwrap();
         std::fs::write(dir.join(".nojekyll"), "").unwrap();
-        std::fs::write(dir.join("_headers"), "Cross-Origin-Opener-Policy: same-origin\nCross-Origin-Embedder-Policy: require-corp").unwrap();
+        std::fs::write(
+            dir.join("_headers"),
+            "Cross-Origin-Opener-Policy: same-origin\nCross-Origin-Embedder-Policy: require-corp",
+        )
+        .unwrap();
         std::fs::write(dir.join("viewer/index.html"), "<html>viewer</html>").unwrap();
         std::fs::write(dir.join("viewer/styles.css"), "body{}").unwrap();
         std::fs::write(dir.join("viewer/data/messages.json"), "[]").unwrap();
@@ -1152,7 +1160,12 @@ mod tests {
 
         let report = validate_bundle(&bundle).unwrap();
         assert!(report.ready);
-        assert!(report.checks.iter().all(|c| c.passed || c.severity != CheckSeverity::Error));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|c| c.passed || c.severity != CheckSeverity::Error)
+        );
     }
 
     #[test]
@@ -1164,7 +1177,12 @@ mod tests {
 
         let report = validate_bundle(&bundle).unwrap();
         assert!(!report.ready);
-        assert!(report.checks.iter().any(|c| c.name == "file_manifest.json" && !c.passed));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "file_manifest.json" && !c.passed)
+        );
     }
 
     #[test]
@@ -1254,7 +1272,11 @@ mod tests {
 
         // Verify files exist
         assert!(bundle.join(".github/workflows/deploy-pages.yml").is_file());
-        assert!(bundle.join(".github/workflows/deploy-cf-pages.yml").is_file());
+        assert!(
+            bundle
+                .join(".github/workflows/deploy-cf-pages.yml")
+                .is_file()
+        );
         assert!(bundle.join("wrangler.toml.template").is_file());
         assert!(bundle.join("netlify.toml.template").is_file());
         assert!(bundle.join("scripts/validate_deploy.sh").is_file());
@@ -1486,7 +1508,11 @@ mod tests {
 
         let written = write_deploy_tooling(&bundle).unwrap();
         assert!(written.contains(&".github/workflows/deploy-cf-pages.yml".to_string()));
-        assert!(bundle.join(".github/workflows/deploy-cf-pages.yml").is_file());
+        assert!(
+            bundle
+                .join(".github/workflows/deploy-cf-pages.yml")
+                .is_file()
+        );
     }
 
     // ── Full report includes new fields ──────────────────────────────

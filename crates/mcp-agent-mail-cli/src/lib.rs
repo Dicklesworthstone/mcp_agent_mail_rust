@@ -333,6 +333,46 @@ pub enum ShareCommand {
     Decrypt(ShareDecryptArgs),
     Wizard,
     StaticExport(ShareStaticExportArgs),
+    #[command(name = "deploy")]
+    Deploy {
+        #[command(subcommand)]
+        action: DeployCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DeployCommand {
+    /// Run pre-flight validation on a bundle directory and display the deploy report.
+    Validate(DeployValidateArgs),
+    /// Write deployment configuration files (GH Actions, CF Pages, Netlify, validation script).
+    Tooling(DeployToolingArgs),
+    /// Build a verification plan for a deployed URL.
+    #[command(name = "verify")]
+    VerifyUrl(DeployVerifyArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DeployValidateArgs {
+    /// Path to the bundle directory to validate.
+    pub bundle: PathBuf,
+    /// Output as JSON instead of human-readable table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DeployToolingArgs {
+    /// Path to the bundle directory where config files will be written.
+    pub bundle: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct DeployVerifyArgs {
+    /// Deployed URL to verify (e.g., https://example.github.io/agent-mail).
+    pub url: String,
+    /// Output as JSON instead of human-readable table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1525,6 +1565,134 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 &manifest.content_hash[..12]
             );
             ftui_runtime::ftui_println!("Output: {output_display}");
+            Ok(())
+        }
+        ShareCommand::Deploy { action } => handle_deploy(action),
+    }
+}
+
+fn handle_deploy(action: DeployCommand) -> CliResult<()> {
+    match action {
+        DeployCommand::Validate(args) => {
+            ensure_dir(&args.bundle)?;
+            let report = share::deploy::validate_bundle(&args.bundle)?;
+            if args.json {
+                let json =
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+                ftui_runtime::ftui_println!("{json}");
+            } else {
+                ftui_runtime::ftui_println!("=== Deploy Validation Report ===");
+                ftui_runtime::ftui_println!("Generated: {}", report.generated_at);
+                ftui_runtime::ftui_println!("Ready: {}", if report.ready { "YES" } else { "NO" });
+                ftui_runtime::ftui_println!("");
+
+                ftui_runtime::ftui_println!("--- Checks ---");
+                for check in &report.checks {
+                    let icon = if check.passed {
+                        "PASS"
+                    } else {
+                        match check.severity {
+                            share::deploy::CheckSeverity::Error => "FAIL",
+                            share::deploy::CheckSeverity::Warning => "WARN",
+                            share::deploy::CheckSeverity::Info => "INFO",
+                        }
+                    };
+                    ftui_runtime::ftui_println!("  [{icon}] {}: {}", check.name, check.message);
+                }
+                ftui_runtime::ftui_println!("");
+
+                ftui_runtime::ftui_println!("--- Platforms ---");
+                for platform in &report.platforms {
+                    let status = if platform.detected {
+                        "detected"
+                    } else {
+                        "not detected"
+                    };
+                    ftui_runtime::ftui_println!("  {} ({})", platform.name, status);
+                    if let Some(ref cmd) = platform.deploy_command {
+                        ftui_runtime::ftui_println!("    Deploy: {cmd}");
+                    }
+                }
+                ftui_runtime::ftui_println!("");
+
+                ftui_runtime::ftui_println!("--- Bundle Stats ---");
+                ftui_runtime::ftui_println!(
+                    "  Files: {}, Bytes: {}, HTML: {}, Data: {}, Assets: {}",
+                    report.bundle_stats.total_files,
+                    report.bundle_stats.total_bytes,
+                    report.bundle_stats.html_pages,
+                    report.bundle_stats.data_files,
+                    report.bundle_stats.asset_files,
+                );
+                ftui_runtime::ftui_println!("");
+
+                ftui_runtime::ftui_println!("--- Security ---");
+                ftui_runtime::ftui_println!(
+                    "  Cross-origin isolation: {}",
+                    report.security.cross_origin_isolation
+                );
+                ftui_runtime::ftui_println!(
+                    "  Contains database: {}",
+                    report.security.contains_database
+                );
+                ftui_runtime::ftui_println!("  Static only: {}", report.security.static_only);
+                for note in &report.security.notes {
+                    ftui_runtime::ftui_println!("  Note: {note}");
+                }
+                ftui_runtime::ftui_println!("");
+
+                ftui_runtime::ftui_println!("--- Rollback ---");
+                if let Some(ref hash) = report.rollback.current_hash {
+                    ftui_runtime::ftui_println!("  Current hash: {}", &hash[..12.min(hash.len())]);
+                }
+                if let Some(ref hash) = report.rollback.previous_hash {
+                    ftui_runtime::ftui_println!("  Previous hash: {}", &hash[..12.min(hash.len())]);
+                }
+                for step in &report.rollback.steps {
+                    ftui_runtime::ftui_println!("  [{}] {}", step.platform, step.instruction);
+                }
+            }
+            if !report.ready {
+                return Err(CliError::ExitCode(1));
+            }
+            Ok(())
+        }
+        DeployCommand::Tooling(args) => {
+            ensure_dir(&args.bundle)?;
+            let written = share::deploy::write_deploy_tooling(&args.bundle)?;
+            ftui_runtime::ftui_println!("Wrote {} deployment files:", written.len());
+            for file in &written {
+                ftui_runtime::ftui_println!("  {file}");
+            }
+            Ok(())
+        }
+        DeployCommand::VerifyUrl(args) => {
+            let plan = share::deploy::build_verify_plan(&args.url);
+            if args.json {
+                let json = serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string());
+                ftui_runtime::ftui_println!("{json}");
+            } else {
+                ftui_runtime::ftui_println!("=== Deployment Verification Plan ===");
+                ftui_runtime::ftui_println!("URL: {}", plan.url);
+                ftui_runtime::ftui_println!("");
+                ftui_runtime::ftui_println!("Checks to perform:");
+                for check in &plan.checks {
+                    let severity = match check.severity {
+                        share::deploy::CheckSeverity::Error => "REQUIRED",
+                        share::deploy::CheckSeverity::Warning => "RECOMMENDED",
+                        share::deploy::CheckSeverity::Info => "OPTIONAL",
+                    };
+                    ftui_runtime::ftui_println!("  [{severity}] {}: {}", check.name, check.message);
+                }
+                ftui_runtime::ftui_println!("");
+                ftui_runtime::ftui_println!(
+                    "Run the validation script against the deployed URL for live HTTP checks:"
+                );
+                ftui_runtime::ftui_println!(
+                    "  ./scripts/validate_deploy.sh <bundle_dir> {}",
+                    plan.url
+                );
+            }
             Ok(())
         }
     }
