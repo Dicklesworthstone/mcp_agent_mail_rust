@@ -80,6 +80,8 @@ pub struct ReservationsScreen {
     sort_asc: bool,
     show_released: bool,
     last_seq: u64,
+    /// Synthetic event for the focused reservation (palette quick actions).
+    focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
 
 impl ReservationsScreen {
@@ -93,7 +95,26 @@ impl ReservationsScreen {
             sort_asc: true,
             show_released: false,
             last_seq: 0,
+            focused_synthetic: None,
         }
+    }
+
+    /// Rebuild the synthetic `MailEvent` for the currently selected reservation.
+    fn sync_focused_event(&mut self) {
+        self.focused_synthetic = self
+            .table_state
+            .selected
+            .and_then(|i| self.sorted_keys.get(i))
+            .and_then(|key| self.reservations.get(key))
+            .map(|r| {
+                crate::tui_events::MailEvent::reservation_granted(
+                    &r.agent,
+                    vec![r.path_pattern.clone()],
+                    r.exclusive,
+                    r.ttl_s,
+                    &r.project,
+                )
+            });
     }
 
     fn ingest_events(&mut self, state: &TuiSharedState) {
@@ -254,6 +275,11 @@ impl MailScreen for ReservationsScreen {
         if tick_count % 10 == 0 {
             self.rebuild_sorted();
         }
+        self.sync_focused_event();
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.focused_synthetic.as_ref()
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {

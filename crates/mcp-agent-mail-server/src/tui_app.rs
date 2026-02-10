@@ -396,6 +396,79 @@ impl MailAppModel {
             }
         }
 
+        // ── Macro actions (context-aware high-value operations) ───
+        if let Some(rest) = id.strip_prefix("macro:") {
+            return self.dispatch_macro_action(rest);
+        }
+
+        Cmd::none()
+    }
+
+    /// Dispatch a macro action by its suffix (after `macro:` prefix).
+    fn dispatch_macro_action(&mut self, rest: &str) -> Cmd<MailMsg> {
+        // Thread macros
+        if let Some(thread_id) = rest.strip_prefix("summarize_thread:") {
+            self.notifications.notify(
+                Toast::new(format!("Summarizing thread {thread_id}..."))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(4)),
+            );
+            let target = DeepLinkTarget::ThreadById(thread_id.to_string());
+            self.active_screen = MailScreenId::Threads;
+            if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
+                screen.receive_deep_link(&target);
+            }
+            return Cmd::none();
+        }
+        if let Some(thread_id) = rest.strip_prefix("view_thread:") {
+            let target = DeepLinkTarget::ThreadById(thread_id.to_string());
+            self.active_screen = MailScreenId::Threads;
+            if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
+                screen.receive_deep_link(&target);
+            }
+            return Cmd::none();
+        }
+
+        // Agent macros
+        if let Some(agent) = rest.strip_prefix("fetch_inbox:") {
+            let target = DeepLinkTarget::ExplorerForAgent(agent.to_string());
+            self.active_screen = MailScreenId::Explorer;
+            if let Some(screen) = self.screens.get_mut(&MailScreenId::Explorer) {
+                screen.receive_deep_link(&target);
+            }
+            return Cmd::none();
+        }
+        if let Some(agent) = rest.strip_prefix("view_reservations:") {
+            let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
+            self.active_screen = MailScreenId::Reservations;
+            if let Some(screen) = self.screens.get_mut(&MailScreenId::Reservations) {
+                screen.receive_deep_link(&target);
+            }
+            return Cmd::none();
+        }
+
+        // Tool macros
+        if let Some(tool) = rest.strip_prefix("tool_history:") {
+            let target = DeepLinkTarget::ToolByName(tool.to_string());
+            self.active_screen = MailScreenId::ToolMetrics;
+            if let Some(screen) = self.screens.get_mut(&MailScreenId::ToolMetrics) {
+                screen.receive_deep_link(&target);
+            }
+            return Cmd::none();
+        }
+
+        // Message macros
+        if let Some(id_str) = rest.strip_prefix("view_message:") {
+            if let Ok(msg_id) = id_str.parse::<i64>() {
+                let target = DeepLinkTarget::MessageById(msg_id);
+                self.active_screen = MailScreenId::Messages;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Messages) {
+                    screen.receive_deep_link(&target);
+                }
+            }
+            return Cmd::none();
+        }
+
         Cmd::none()
     }
 }
@@ -1741,5 +1814,57 @@ mod tests {
         assert_eq!(extract_reservation_agent(&ev1), Some("TestAgent"));
         assert_eq!(extract_reservation_agent(&ev2), Some("OtherAgent"));
         assert_eq!(extract_reservation_agent(&ev3), None);
+    }
+
+    // ── Macro dispatch tests ─────────────────────────────────────
+
+    #[test]
+    fn dispatch_macro_summarize_thread_goes_to_threads() {
+        let mut model = test_model();
+        model.dispatch_palette_action("macro:summarize_thread:br-3vwi");
+        assert_eq!(model.active_screen(), MailScreenId::Threads);
+    }
+
+    #[test]
+    fn dispatch_macro_view_thread_goes_to_threads() {
+        let mut model = test_model();
+        model.dispatch_palette_action("macro:view_thread:br-3vwi");
+        assert_eq!(model.active_screen(), MailScreenId::Threads);
+    }
+
+    #[test]
+    fn dispatch_macro_fetch_inbox_goes_to_explorer() {
+        let mut model = test_model();
+        model.dispatch_palette_action("macro:fetch_inbox:RedFox");
+        assert_eq!(model.active_screen(), MailScreenId::Explorer);
+    }
+
+    #[test]
+    fn dispatch_macro_view_reservations_goes_to_reservations() {
+        let mut model = test_model();
+        model.dispatch_palette_action("macro:view_reservations:BlueLake");
+        assert_eq!(model.active_screen(), MailScreenId::Reservations);
+    }
+
+    #[test]
+    fn dispatch_macro_tool_history_goes_to_tool_metrics() {
+        let mut model = test_model();
+        model.dispatch_palette_action("macro:tool_history:send_message");
+        assert_eq!(model.active_screen(), MailScreenId::ToolMetrics);
+    }
+
+    #[test]
+    fn dispatch_macro_view_message_goes_to_messages() {
+        let mut model = test_model();
+        model.dispatch_palette_action("macro:view_message:42");
+        assert_eq!(model.active_screen(), MailScreenId::Messages);
+    }
+
+    #[test]
+    fn dispatch_macro_unknown_is_noop() {
+        let mut model = test_model();
+        let prev = model.active_screen();
+        model.dispatch_palette_action("macro:unknown:foo");
+        assert_eq!(model.active_screen(), prev);
     }
 }

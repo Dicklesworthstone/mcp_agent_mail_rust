@@ -567,6 +567,9 @@ pub struct SearchCockpitScreen {
     query_history: Vec<QueryHistoryEntry>,
     history_cursor: Option<usize>,
     recipes_loaded: bool,
+
+    /// Synthetic event for the focused search result (palette quick actions).
+    focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
 
 impl SearchCockpitScreen {
@@ -599,7 +602,31 @@ impl SearchCockpitScreen {
             query_history: Vec::new(),
             history_cursor: None,
             recipes_loaded: false,
+            focused_synthetic: None,
         }
+    }
+
+    /// Rebuild the synthetic `MailEvent` for the currently selected search result.
+    fn sync_focused_event(&mut self) {
+        self.focused_synthetic = self.results.get(self.cursor).and_then(|entry| {
+            match entry.doc_kind {
+                DocKind::Message => Some(crate::tui_events::MailEvent::message_sent(
+                    entry.id,
+                    entry.from_agent.as_deref().unwrap_or(""),
+                    vec![], // to-agents not stored in search results
+                    &entry.title,
+                    entry.thread_id.as_deref().unwrap_or(""),
+                    "", // project slug not directly available
+                )),
+                DocKind::Agent => Some(crate::tui_events::MailEvent::agent_registered(
+                    &entry.title,
+                    "",
+                    "",
+                    "",
+                )),
+                DocKind::Project => None, // no good synthetic event for projects
+            }
+        });
     }
 
     /// Ensure we have a DB connection.
@@ -1351,6 +1378,11 @@ impl MailScreen for SearchCockpitScreen {
                 self.execute_search(state);
             }
         }
+        self.sync_focused_event();
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.focused_synthetic.as_ref()
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {

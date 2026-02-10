@@ -112,6 +112,8 @@ pub struct ToolMetricsScreen {
     sort_col: usize,
     sort_asc: bool,
     last_seq: u64,
+    /// Synthetic event for the focused tool (palette quick actions).
+    focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
 
 impl ToolMetricsScreen {
@@ -124,7 +126,29 @@ impl ToolMetricsScreen {
             sort_col: COL_CALLS,
             sort_asc: false,
             last_seq: 0,
+            focused_synthetic: None,
         }
+    }
+
+    /// Rebuild the synthetic `MailEvent` for the currently selected tool.
+    fn sync_focused_event(&mut self) {
+        self.focused_synthetic = self
+            .table_state
+            .selected
+            .and_then(|i| self.sorted_tools.get(i))
+            .and_then(|name| self.tool_map.get(name))
+            .map(|ts| {
+                crate::tui_events::MailEvent::tool_call_end(
+                    &ts.name,
+                    ts.avg_ms(),
+                    None,
+                    ts.calls,
+                    0.0,
+                    vec![],
+                    None,
+                    None,
+                )
+            });
     }
 
     fn ingest_events(&mut self, state: &TuiSharedState) {
@@ -251,6 +275,11 @@ impl MailScreen for ToolMetricsScreen {
         if tick_count % 10 == 0 {
             self.rebuild_sorted();
         }
+        self.sync_focused_event();
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.focused_synthetic.as_ref()
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {

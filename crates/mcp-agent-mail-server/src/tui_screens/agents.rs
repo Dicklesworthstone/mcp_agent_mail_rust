@@ -48,6 +48,8 @@ pub struct AgentsScreen {
     msg_counts: HashMap<String, u64>,
     /// Per-agent model names from `AgentRegistered` events.
     model_names: HashMap<String, String>,
+    /// Synthetic event for the focused agent (palette quick actions).
+    focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
 
 impl AgentsScreen {
@@ -63,7 +65,24 @@ impl AgentsScreen {
             last_seq: 0,
             msg_counts: HashMap::new(),
             model_names: HashMap::new(),
+            focused_synthetic: None,
         }
+    }
+
+    /// Rebuild the synthetic `MailEvent` for the currently selected agent.
+    fn sync_focused_event(&mut self) {
+        self.focused_synthetic = self
+            .table_state
+            .selected
+            .and_then(|i| self.agents.get(i))
+            .map(|row| {
+                crate::tui_events::MailEvent::agent_registered(
+                    &row.name,
+                    &row.program,
+                    &row.model,
+                    "", // agents span projects
+                )
+            });
     }
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
@@ -223,6 +242,11 @@ impl MailScreen for AgentsScreen {
         if tick_count % 10 == 0 {
             self.rebuild_from_state(state);
         }
+        self.sync_focused_event();
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.focused_synthetic.as_ref()
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
@@ -528,5 +552,43 @@ mod tests {
     fn default_impl() {
         let screen = AgentsScreen::default();
         assert!(screen.agents.is_empty());
+    }
+
+    // ── focused_event tests ───────────────────────────────────────
+
+    #[test]
+    fn focused_event_none_when_empty() {
+        let screen = AgentsScreen::new();
+        assert!(screen.focused_event().is_none());
+    }
+
+    #[test]
+    fn focused_event_returns_agent_registered_synthetic() {
+        let mut screen = AgentsScreen::new();
+        screen.agents.push(AgentRow {
+            name: "RedFox".to_string(),
+            program: "claude-code".to_string(),
+            model: "opus-4.6".to_string(),
+            last_active_ts: 0,
+            message_count: 0,
+        });
+        screen.table_state.selected = Some(0);
+        screen.sync_focused_event();
+
+        let event = screen.focused_event().expect("should have synthetic event");
+        if let crate::tui_events::MailEvent::AgentRegistered { name, program, .. } = event {
+            assert_eq!(name, "RedFox");
+            assert_eq!(program, "claude-code");
+        } else {
+            panic!("expected AgentRegistered, got {event:?}");
+        }
+    }
+
+    #[test]
+    fn focused_event_none_when_selection_out_of_range() {
+        let mut screen = AgentsScreen::new();
+        screen.table_state.selected = Some(5);
+        screen.sync_focused_event();
+        assert!(screen.focused_event().is_none());
     }
 }

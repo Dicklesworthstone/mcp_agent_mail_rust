@@ -190,6 +190,8 @@ pub struct ThreadExplorerScreen {
     view_lens: ViewLens,
     /// Active sort mode (cycles with 's').
     sort_mode: SortMode,
+    /// Synthetic event for the focused thread (palette quick actions).
+    focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
 
 impl ThreadExplorerScreen {
@@ -210,7 +212,22 @@ impl ThreadExplorerScreen {
             filter_editing: false,
             view_lens: ViewLens::Activity,
             sort_mode: SortMode::LastActivity,
+            focused_synthetic: None,
         }
+    }
+
+    /// Rebuild the synthetic `MailEvent` for the currently selected thread.
+    fn sync_focused_event(&mut self) {
+        self.focused_synthetic = self.threads.get(self.cursor).map(|t| {
+            crate::tui_events::MailEvent::message_sent(
+                0, // no single message id
+                &t.last_sender,
+                t.participant_names.split(", ").map(String::from).collect(),
+                &t.last_subject,
+                &t.thread_id,
+                &t.project_slug,
+            )
+        });
     }
 
     /// Re-sort the thread list according to the active sort mode.
@@ -471,6 +488,11 @@ impl MailScreen for ThreadExplorerScreen {
         if should_refresh {
             self.list_dirty = true;
         }
+        self.sync_focused_event();
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.focused_synthetic.as_ref()
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {

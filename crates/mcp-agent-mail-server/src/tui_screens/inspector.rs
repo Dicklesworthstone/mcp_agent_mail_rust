@@ -175,11 +175,13 @@ pub struct QuickAction {
 /// Build quick actions from a focused event's correlation links.
 ///
 /// Returns actions suitable for injection into the command palette.
+/// Includes both navigation ("Go to X") and macro ("Summarize thread",
+/// "Fetch inbox") actions derived from the focused entity.
 #[must_use]
 pub fn build_quick_actions(event: &MailEvent) -> Vec<QuickAction> {
     let links = extract_links(event);
-    links
-        .into_iter()
+    let mut actions: Vec<QuickAction> = links
+        .iter()
         .map(|link| {
             let (prefix, entity_name) = match &link.target {
                 DeepLinkTarget::AgentByName(name) => ("agent", name.as_str()),
@@ -199,10 +201,79 @@ pub fn build_quick_actions(event: &MailEvent) -> Vec<QuickAction> {
                 id,
                 label,
                 description,
-                target: link.target,
+                target: link.target.clone(),
             }
         })
-        .collect()
+        .collect();
+
+    // Append macro actions derived from correlatable entities.
+    build_macro_actions(event, &links, &mut actions);
+    actions
+}
+
+/// Append macro-style quick actions (summarize, fetch inbox, etc.).
+fn build_macro_actions(event: &MailEvent, links: &[CorrelationLink], out: &mut Vec<QuickAction>) {
+    // Thread macros: summarize thread, view all messages in thread.
+    for link in links {
+        if let DeepLinkTarget::ThreadById(thread_id) = &link.target {
+            out.push(QuickAction {
+                id: format!("macro:summarize_thread:{thread_id}"),
+                label: format!("Summarize thread {thread_id}"),
+                description: "Request LLM thread summary via command palette".to_string(),
+                target: DeepLinkTarget::ThreadById(thread_id.clone()),
+            });
+            out.push(QuickAction {
+                id: format!("macro:view_thread:{thread_id}"),
+                label: format!("View messages in {thread_id}"),
+                description: "Open Thread Explorer focused on this thread".to_string(),
+                target: DeepLinkTarget::ThreadById(thread_id.clone()),
+            });
+        }
+    }
+
+    // Agent macros: fetch inbox, view reservations, view in explorer.
+    let mut agent_seen = std::collections::HashSet::new();
+    for link in links {
+        if let DeepLinkTarget::AgentByName(name) = &link.target {
+            if !agent_seen.insert(name.clone()) {
+                continue;
+            }
+            out.push(QuickAction {
+                id: format!("macro:fetch_inbox:{name}"),
+                label: format!("Fetch inbox for {name}"),
+                description: "Open Explorer filtered to this agent's messages".to_string(),
+                target: DeepLinkTarget::ExplorerForAgent(name.clone()),
+            });
+            out.push(QuickAction {
+                id: format!("macro:view_reservations:{name}"),
+                label: format!("View reservations for {name}"),
+                description: "Open Reservations screen filtered to this agent".to_string(),
+                target: DeepLinkTarget::ReservationByAgent(name.clone()),
+            });
+        }
+    }
+
+    // Tool macros: view tool call history.
+    for link in links {
+        if let DeepLinkTarget::ToolByName(name) = &link.target {
+            out.push(QuickAction {
+                id: format!("macro:tool_history:{name}"),
+                label: format!("View call history for {name}"),
+                description: "Open Tool Metrics screen focused on this tool".to_string(),
+                target: DeepLinkTarget::ToolByName(name.clone()),
+            });
+        }
+    }
+
+    // Message macro: jump to message in context.
+    if let MailEvent::MessageSent { id, .. } | MailEvent::MessageReceived { id, .. } = event {
+        out.push(QuickAction {
+            id: format!("macro:view_message:{id}"),
+            label: format!("View message #{id} in context"),
+            description: "Open Message Browser focused on this message".to_string(),
+            target: DeepLinkTarget::MessageById(*id),
+        });
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1115,11 +1186,16 @@ mod tests {
     fn quick_actions_from_agent_registered() {
         let event = MailEvent::agent_registered("GoldHawk", "codex", "5.2", "proj1");
         let actions = build_quick_actions(&event);
-        assert_eq!(actions.len(), 2); // project + agent
+        // 2 navigation + 2 agent macros (fetch_inbox, view_reservations)
+        assert_eq!(actions.len(), 4);
 
+        // First two are navigation
         assert!(actions[0].id.contains("project:"));
         assert!(actions[0].label.contains("Go to"));
         assert!(actions[1].id.contains("agent:GoldHawk"));
+        // Last two are macros
+        assert!(actions[2].id.starts_with("macro:"));
+        assert!(actions[3].id.starts_with("macro:"));
     }
 
     #[test]
@@ -1130,11 +1206,17 @@ mod tests {
     }
 
     #[test]
-    fn quick_actions_labels_are_navigable() {
+    fn quick_actions_labels_are_well_formed() {
         let event = MailEvent::agent_registered("GoldHawk", "codex", "5.2", "proj1");
         let actions = build_quick_actions(&event);
         for action in &actions {
-            assert!(action.label.starts_with("Go to "));
+            // Navigation actions start with "Go to", macro actions have descriptive labels
+            assert!(
+                action.label.starts_with("Go to ") || action.id.starts_with("macro:"),
+                "unexpected label: {} (id: {})",
+                action.label,
+                action.id
+            );
             assert!(!action.id.is_empty());
             assert!(!action.description.is_empty());
         }
@@ -1287,5 +1369,113 @@ mod tests {
         );
         let hints = remediation_hints(&event);
         assert!(hints.is_empty());
+    }
+
+    // ── Macro quick action tests ──────────────────────────────────
+
+    #[test]
+    fn macro_actions_for_message_include_thread_and_agent() {
+        let event = MailEvent::message_sent(
+            42,
+            "RedFox",
+            vec!["BlueLake".to_string()],
+            "Hello",
+            "thread-1",
+            "my-project",
+        );
+        let actions = build_quick_actions(&event);
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+
+        // Should have macro actions for thread, agents
+        assert!(
+            ids.iter()
+                .any(|id| *id == "macro:summarize_thread:thread-1"),
+            "missing summarize thread macro: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| *id == "macro:view_thread:thread-1"),
+            "missing view thread macro: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| *id == "macro:fetch_inbox:RedFox"),
+            "missing fetch inbox macro: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| *id == "macro:view_reservations:RedFox"),
+            "missing view reservations macro: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| *id == "macro:view_message:42"),
+            "missing view message macro: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn macro_actions_for_tool_include_tool_history() {
+        let event = MailEvent::tool_call_start(
+            "send_message",
+            serde_json::Value::Null,
+            Some("proj".to_string()),
+            Some("RedFox".to_string()),
+        );
+        let actions = build_quick_actions(&event);
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+
+        assert!(
+            ids.iter()
+                .any(|id| *id == "macro:tool_history:send_message"),
+            "missing tool history macro: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| *id == "macro:fetch_inbox:RedFox"),
+            "missing fetch inbox macro for tool agent: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn macro_actions_agent_dedup() {
+        // Message with sender==recipient: agent macros should not duplicate.
+        let event =
+            MailEvent::message_sent(1, "RedFox", vec!["RedFox".to_string()], "Self", "t", "p");
+        let actions = build_quick_actions(&event);
+        let fetch_inbox_count = actions
+            .iter()
+            .filter(|a| a.id.starts_with("macro:fetch_inbox:"))
+            .count();
+        assert_eq!(fetch_inbox_count, 1, "agent macros should be deduped");
+    }
+
+    #[test]
+    fn macro_actions_empty_for_infra_events() {
+        let event = MailEvent::server_started("http://localhost", "config");
+        let actions = build_quick_actions(&event);
+        let macro_count = actions
+            .iter()
+            .filter(|a| a.id.starts_with("macro:"))
+            .count();
+        assert_eq!(macro_count, 0, "no macros for infrastructure events");
+    }
+
+    #[test]
+    fn macro_actions_reservation_includes_agent_macros() {
+        let event = MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/lib.rs".to_string()],
+            true,
+            3600,
+            "my-proj",
+        );
+        let actions = build_quick_actions(&event);
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+
+        assert!(
+            ids.iter().any(|id| *id == "macro:fetch_inbox:BlueLake"),
+            "reservation agent should get fetch_inbox macro: {ids:?}"
+        );
+        assert!(
+            ids.iter()
+                .any(|id| *id == "macro:view_reservations:BlueLake"),
+            "reservation agent should get view_reservations macro: {ids:?}"
+        );
     }
 }

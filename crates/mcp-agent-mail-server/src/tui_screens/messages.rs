@@ -164,6 +164,8 @@ pub struct MessageBrowserScreen {
     preset_index: usize,
     /// How the last search was resolved (for explainability).
     search_method: SearchMethod,
+    /// Synthetic event for the focused message (palette quick actions).
+    focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
 
 impl MessageBrowserScreen {
@@ -186,7 +188,22 @@ impl MessageBrowserScreen {
             last_refresh: None,
             preset_index: 0,
             search_method: SearchMethod::None,
+            focused_synthetic: None,
         }
+    }
+
+    /// Rebuild the synthetic `MailEvent` for the currently selected message.
+    fn sync_focused_event(&mut self) {
+        self.focused_synthetic = self.results.get(self.cursor).map(|entry| {
+            crate::tui_events::MailEvent::message_sent(
+                entry.id,
+                &entry.from_agent,
+                entry.to_agents.split(", ").map(String::from).collect(),
+                &entry.subject,
+                &entry.thread_id,
+                &entry.project_slug,
+            )
+        });
     }
 
     /// Apply a query preset by index, injecting its query into the search bar.
@@ -433,6 +450,11 @@ impl MailScreen for MessageBrowserScreen {
                 self.debounce_remaining = 0;
             }
         }
+        self.sync_focused_event();
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.focused_synthetic.as_ref()
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {

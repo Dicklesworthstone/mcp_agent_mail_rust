@@ -260,6 +260,9 @@ pub struct MailExplorerScreen {
     pressure_board: PressureBoard,
     pressure_cursor: usize,
     pressure_dirty: bool,
+
+    /// Synthetic event for the focused message (palette quick actions).
+    focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
 
 impl MailExplorerScreen {
@@ -290,7 +293,23 @@ impl MailExplorerScreen {
             pressure_board: PressureBoard::default(),
             pressure_cursor: 0,
             pressure_dirty: true,
+
+            focused_synthetic: None,
         }
+    }
+
+    /// Rebuild the synthetic `MailEvent` for the currently selected message.
+    fn sync_focused_event(&mut self) {
+        self.focused_synthetic = self.entries.get(self.cursor).map(|e| {
+            crate::tui_events::MailEvent::message_sent(
+                e.message_id,
+                &e.sender_name,
+                e.to_agents.split(", ").map(String::from).collect(),
+                &e.subject,
+                e.thread_id.as_deref().unwrap_or(""),
+                &e.project_slug,
+            )
+        });
     }
 
     fn ensure_db_conn(&mut self, state: &TuiSharedState) {
@@ -821,6 +840,11 @@ impl MailScreen for MailExplorerScreen {
         if self.pressure_mode && self.pressure_dirty {
             self.refresh_pressure_board(state);
         }
+        self.sync_focused_event();
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.focused_synthetic.as_ref()
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
