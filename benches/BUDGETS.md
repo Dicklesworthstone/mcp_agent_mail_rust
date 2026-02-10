@@ -96,6 +96,32 @@ Budgets are set to ~2x the measured baseline p95 to absorb variance.
 | file_reservation_paths | 5.98 ms | 167 elem/s | stable | **36x slower than fetch_inbox** — overlap check hot |
 | macro_start_session | 488.1 µs | 2.0K elem/s | stable | Composite: ensure+register+inbox |
 
+## Global Search Budgets (br-3vwi.2.3)
+
+Deterministic harness implemented in `crates/mcp-agent-mail/benches/benchmarks.rs` under the
+`global_search` bench group. It seeds synthetic mailboxes of increasing size and measures the
+DB-level global search pipeline p50/p95/p99 latency via
+`mcp_agent_mail_db::search_service::execute_search_simple()` (planner → SQL → row mapping) for a
+fixed query (`needle`, `limit=20`).
+
+Artifacts are written under:
+- `tests/artifacts/bench/search/<run_id>/summary.json`
+
+To enforce budgets (CI/robot mode):
+
+```bash
+MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1 \
+  cargo bench -p mcp-agent-mail --bench benchmarks -- global_search
+```
+
+Initial budgets (conservative; tighten after the first baseline run on CI-like hardware):
+
+| Scenario | Messages | Budget p95 | Budget p99 |
+|----------|----------|------------|------------|
+| small | 1,000 | < 3ms | < 5ms |
+| medium | 5,000 | < 15ms | < 25ms |
+| large | 15,000 | < 50ms | < 80ms |
+
 ## Share/Export Pipeline Budgets
 
 Baseline numbers are taken from the bench harness artifacts emitted by:

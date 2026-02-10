@@ -11,6 +11,7 @@ pub mod inspector;
 pub mod messages;
 pub mod projects;
 pub mod reservations;
+pub mod search;
 pub mod system_health;
 pub mod threads;
 pub mod timeline;
@@ -35,6 +36,7 @@ pub enum MailScreenId {
     Messages,
     Threads,
     Agents,
+    Search,
     Reservations,
     ToolMetrics,
     SystemHealth,
@@ -49,6 +51,7 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::Messages,
     MailScreenId::Threads,
     MailScreenId::Agents,
+    MailScreenId::Search,
     MailScreenId::Reservations,
     MailScreenId::ToolMetrics,
     MailScreenId::SystemHealth,
@@ -266,6 +269,13 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         description: "Agent roster with status and activity",
     },
     MailScreenMeta {
+        id: MailScreenId::Search,
+        title: "Search",
+        short_label: "Find",
+        category: ScreenCategory::Communication,
+        description: "Unified search across messages, agents, and projects with facet filters",
+    },
+    MailScreenMeta {
         id: MailScreenId::Reservations,
         title: "Reservations",
         short_label: "Reserv",
@@ -384,13 +394,13 @@ mod tests {
     #[test]
     fn screen_count_matches() {
         assert_eq!(ALL_SCREEN_IDS.len(), MAIL_SCREEN_REGISTRY.len());
-        assert_eq!(ALL_SCREEN_IDS.len(), 10);
+        assert_eq!(ALL_SCREEN_IDS.len(), 11);
     }
 
     #[test]
     fn next_prev_wraps() {
-        let first = MailScreenId::Dashboard;
-        let last = MailScreenId::Contacts;
+        let first = ALL_SCREEN_IDS[0];
+        let last = *ALL_SCREEN_IDS.last().unwrap();
 
         assert_eq!(last.next(), first);
         assert_eq!(first.prev(), last);
@@ -407,19 +417,19 @@ mod tests {
     #[test]
     fn from_number_valid() {
         assert_eq!(MailScreenId::from_number(1), Some(MailScreenId::Dashboard));
+        assert_eq!(MailScreenId::from_number(5), Some(MailScreenId::Search));
         assert_eq!(
-            MailScreenId::from_number(7),
+            MailScreenId::from_number(8),
             Some(MailScreenId::SystemHealth)
         );
-        assert_eq!(MailScreenId::from_number(8), Some(MailScreenId::Timeline));
-        assert_eq!(MailScreenId::from_number(9), Some(MailScreenId::Projects));
+        assert_eq!(MailScreenId::from_number(9), Some(MailScreenId::Timeline));
         // 0 maps to screen 10
-        assert_eq!(MailScreenId::from_number(0), Some(MailScreenId::Contacts));
+        assert_eq!(MailScreenId::from_number(0), Some(MailScreenId::Projects));
     }
 
     #[test]
     fn from_number_invalid() {
-        assert_eq!(MailScreenId::from_number(11), None);
+        assert_eq!(MailScreenId::from_number(12), None);
         assert_eq!(MailScreenId::from_number(100), None);
     }
 

@@ -23,8 +23,8 @@ use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MAIL_SCREEN_REGISTRY, MailScreen, MailScreenId, MailScreenMsg,
     agents::AgentsScreen, contacts::ContactsScreen, dashboard::DashboardScreen,
     messages::MessageBrowserScreen, projects::ProjectsScreen, reservations::ReservationsScreen,
-    screen_meta, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
-    timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+    screen_meta, search::SearchCockpitScreen, system_health::SystemHealthScreen,
+    threads::ThreadExplorerScreen, timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -102,6 +102,8 @@ impl MailAppModel {
                 screens.insert(id, Box::new(SystemHealthScreen::new(Arc::clone(&state))));
             } else if id == MailScreenId::Agents {
                 screens.insert(id, Box::new(AgentsScreen::new()));
+            } else if id == MailScreenId::Search {
+                screens.insert(id, Box::new(SearchCockpitScreen::new()));
             } else if id == MailScreenId::ToolMetrics {
                 screens.insert(id, Box::new(ToolMetricsScreen::new()));
             } else if id == MailScreenId::Reservations {
@@ -623,6 +625,7 @@ mod palette_action_ids {
     pub const SCREEN_RESERVATIONS: &str = "screen:reservations";
     pub const SCREEN_TOOL_METRICS: &str = "screen:tool_metrics";
     pub const SCREEN_SYSTEM_HEALTH: &str = "screen:system_health";
+    pub const SCREEN_SEARCH: &str = "screen:search";
     pub const SCREEN_PROJECTS: &str = "screen:projects";
     pub const SCREEN_CONTACTS: &str = "screen:contacts";
 }
@@ -634,6 +637,7 @@ fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
         palette_action_ids::SCREEN_THREADS => Some(MailScreenId::Threads),
         palette_action_ids::SCREEN_TIMELINE => Some(MailScreenId::Timeline),
         palette_action_ids::SCREEN_AGENTS => Some(MailScreenId::Agents),
+        palette_action_ids::SCREEN_SEARCH => Some(MailScreenId::Search),
         palette_action_ids::SCREEN_RESERVATIONS => Some(MailScreenId::Reservations),
         palette_action_ids::SCREEN_TOOL_METRICS => Some(MailScreenId::ToolMetrics),
         palette_action_ids::SCREEN_SYSTEM_HEALTH => Some(MailScreenId::SystemHealth),
@@ -650,6 +654,7 @@ const fn screen_palette_action_id(id: MailScreenId) -> &'static str {
         MailScreenId::Threads => palette_action_ids::SCREEN_THREADS,
         MailScreenId::Timeline => palette_action_ids::SCREEN_TIMELINE,
         MailScreenId::Agents => palette_action_ids::SCREEN_AGENTS,
+        MailScreenId::Search => palette_action_ids::SCREEN_SEARCH,
         MailScreenId::Reservations => palette_action_ids::SCREEN_RESERVATIONS,
         MailScreenId::ToolMetrics => palette_action_ids::SCREEN_TOOL_METRICS,
         MailScreenId::SystemHealth => palette_action_ids::SCREEN_SYSTEM_HEALTH,

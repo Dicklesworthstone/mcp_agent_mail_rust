@@ -7,8 +7,10 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fastmcp::{Budget, CallToolParams, Cx};
-use fastmcp_core::SessionState;
+use fastmcp_core::{Outcome, SessionState, block_on};
 use mcp_agent_mail_conformance::Fixtures;
+use mcp_agent_mail_db::search_planner::SearchQuery;
+use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -900,6 +902,378 @@ fn bench_archive_write(c: &mut Criterion) {
     batch_group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Global Search Harness (br-3vwi.2.3)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchScenario {
+    Small,
+    Medium,
+    Large,
+}
+
+impl SearchScenario {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    const fn message_count(self) -> usize {
+        match self {
+            Self::Small => 1_000,
+            Self::Medium => 5_000,
+            Self::Large => 15_000,
+        }
+    }
+
+    const fn ops(self) -> usize {
+        match self {
+            Self::Small => 200,
+            Self::Medium => 100,
+            Self::Large => 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SearchBenchScenarioResult {
+    scenario: String,
+    message_count: usize,
+    ops: usize,
+    query: String,
+    limit: i32,
+    samples_us: Vec<u64>,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    budget_p95_us: u64,
+    budget_p99_us: u64,
+    p95_within_budget: bool,
+    p99_within_budget: bool,
+    p95_delta_us: i64,
+    p99_delta_us: i64,
+    throughput_queries_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SearchBenchRun {
+    run_id: String,
+    arch: String,
+    os: String,
+    budget_regressions: usize,
+    results: Vec<SearchBenchScenarioResult>,
+}
+
+fn search_artifact_dir(run_id: &str) -> PathBuf {
+    repo_root()
+        .join("tests")
+        .join("artifacts")
+        .join("bench")
+        .join("search")
+        .join(run_id)
+}
+
+const fn search_scenario_budgets_us(scenario: SearchScenario) -> (u64, u64) {
+    match scenario {
+        SearchScenario::Small => (3_000, 5_000),
+        SearchScenario::Medium => (15_000, 25_000),
+        SearchScenario::Large => (50_000, 80_000),
+    }
+}
+
+struct SearchFixture {
+    _tmp: TempDir,
+    cx: Cx,
+    pool: DbPool,
+    query: SearchQuery,
+    message_count: usize,
+    query_text: &'static str,
+    limit: i32,
+}
+
+fn seed_search_fixture(scenario: SearchScenario) -> SearchFixture {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("storage.sqlite3");
+
+    let cx = Cx::for_testing();
+
+    let pool_cfg = DbPoolConfig {
+        database_url: format!("sqlite+aiosqlite:///{}", db_path.display()),
+        min_connections: 1,
+        max_connections: 1,
+        ..Default::default()
+    };
+    let pool = DbPool::new(&pool_cfg).expect("pool");
+
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    let human_key = workspace.to_string_lossy().to_string();
+
+    let project = match block_on(mcp_agent_mail_db::queries::ensure_project(
+        &cx, &pool, &human_key,
+    )) {
+        Outcome::Ok(row) => row,
+        Outcome::Err(e) => panic!("ensure_project failed: {e}"),
+        Outcome::Cancelled(_) => panic!("ensure_project cancelled"),
+        Outcome::Panicked(p) => panic!("ensure_project panicked: {}", p.message()),
+    };
+    let project_id = project.id.unwrap_or(0);
+
+    let sender = match block_on(mcp_agent_mail_db::queries::register_agent(
+        &cx,
+        &pool,
+        project_id,
+        "BlueLake",
+        "bench",
+        "bench",
+        Some("bench-search sender"),
+        Some("auto"),
+    )) {
+        Outcome::Ok(row) => row,
+        Outcome::Err(e) => panic!("register_agent sender failed: {e}"),
+        Outcome::Cancelled(_) => panic!("register_agent sender cancelled"),
+        Outcome::Panicked(p) => panic!("register_agent sender panicked: {}", p.message()),
+    };
+    let sender_id = sender.id.unwrap_or(0);
+
+    let vocab: [&str; 10] = [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+    ];
+    let message_count = scenario.message_count();
+
+    {
+        // Batch insert messages in a single transaction to keep fixture seeding fast.
+        // This relies on schema triggers to populate FTS tables.
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => panic!("pool acquire failed: {e}"),
+            Outcome::Cancelled(_) => panic!("pool acquire cancelled"),
+            Outcome::Panicked(p) => panic!("pool acquire panicked: {}", p.message()),
+        };
+
+        conn.execute_raw("BEGIN IMMEDIATE").expect("begin txn");
+        for i in 0..message_count {
+            let v = vocab[i % vocab.len()];
+            let mut subject = format!("bench {i} {v}");
+            if i % 97 == 0 {
+                subject.push_str(" needle");
+            }
+            let body = format!("body {i} {v} {}", vocab[(i * 7 + 3) % vocab.len()]);
+
+            // Keep values quote-safe for SQLite.
+            let subject_sql = subject.replace('\'', "''");
+            let body_sql = body.replace('\'', "''");
+
+            let created_ts = 1_700_000_000_000_000i64 + (i as i64);
+            conn.execute_raw(&format!(
+                "INSERT INTO messages (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                 VALUES ({project_id}, {sender_id}, 'bench-search', '{subject_sql}', '{body_sql}', 'normal', 0, {created_ts}, '[]')"
+            ))
+            .expect("insert message");
+        }
+        conn.execute_raw("COMMIT").expect("commit txn");
+        let _ = conn.execute_raw("ANALYZE");
+    }
+
+    let limit = 20;
+    let query_text = "needle";
+    let mut query = SearchQuery::messages(query_text, project_id);
+    query.limit = Some(usize::try_from(limit).unwrap_or(20));
+
+    SearchFixture {
+        _tmp: tmp,
+        cx,
+        pool,
+        query,
+        message_count,
+        query_text,
+        limit,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_search_harness_once() {
+    static DID_RUN: Once = Once::new();
+    DID_RUN.call_once(|| {
+        let run_id = run_id();
+        let out_dir = search_artifact_dir(&run_id);
+        let _ = std::fs::create_dir_all(&out_dir);
+
+        let scenarios: &[SearchScenario] = &[
+            SearchScenario::Small,
+            SearchScenario::Medium,
+            SearchScenario::Large,
+        ];
+
+        let mut results = Vec::new();
+        let mut regressions = 0usize;
+
+        for scenario in scenarios {
+            let fixture = seed_search_fixture(*scenario);
+            let ops = scenario.ops();
+
+            // Warm caches (FTS + pool) before sampling.
+            let warm = block_on(mcp_agent_mail_db::search_service::execute_search_simple(
+                &fixture.cx,
+                &fixture.pool,
+                &fixture.query,
+            ));
+            match warm {
+                Outcome::Ok(v) => {
+                    black_box(&v);
+                }
+                Outcome::Err(e) => panic!("warm search failed: {e}"),
+                Outcome::Cancelled(_) => panic!("warm search cancelled"),
+                Outcome::Panicked(p) => panic!("warm search panicked: {}", p.message()),
+            }
+
+            let mut samples_us: Vec<u64> = Vec::with_capacity(ops);
+            for _ in 0..ops {
+                let t0 = Instant::now();
+                let out = block_on(mcp_agent_mail_db::search_service::execute_search_simple(
+                    &fixture.cx,
+                    &fixture.pool,
+                    &fixture.query,
+                ));
+                match out {
+                    Outcome::Ok(v) => {
+                        black_box(&v);
+                    }
+                    Outcome::Err(e) => panic!("search failed: {e}"),
+                    Outcome::Cancelled(_) => panic!("search cancelled"),
+                    Outcome::Panicked(p) => panic!("search panicked: {}", p.message()),
+                }
+
+                let us = u64::try_from(t0.elapsed().as_micros().min(u128::from(u64::MAX)))
+                    .unwrap_or(u64::MAX);
+                samples_us.push(us);
+            }
+
+            let total_us: u64 = samples_us.iter().copied().sum();
+            let throughput = if total_us > 0 {
+                // Keep the conversion clippy-clean (avoid u64/usize -> f64 precision-loss lints).
+                let ops_u32 = u32::try_from(ops).unwrap_or(u32::MAX);
+                let total_us_u32 = u32::try_from(total_us).unwrap_or(u32::MAX).max(1);
+                f64::from(ops_u32) * 1_000_000.0 / f64::from(total_us_u32)
+            } else {
+                0.0
+            };
+
+            let p50_us = percentile_us(samples_us.clone(), 0.50);
+            let p95_us = percentile_us(samples_us.clone(), 0.95);
+            let p99_us = percentile_us(samples_us.clone(), 0.99);
+
+            let (budget_p95_us, budget_p99_us) = search_scenario_budgets_us(*scenario);
+            let p95_within_budget = p95_us <= budget_p95_us;
+            let p99_within_budget = p99_us <= budget_p99_us;
+            let p95_delta_us = i64::try_from(p95_us).unwrap_or(i64::MAX)
+                - i64::try_from(budget_p95_us).unwrap_or(i64::MAX);
+            let p99_delta_us = i64::try_from(p99_us).unwrap_or(i64::MAX)
+                - i64::try_from(budget_p99_us).unwrap_or(i64::MAX);
+
+            if !p95_within_budget || !p99_within_budget {
+                regressions += 1;
+            }
+
+            let scenario_result = SearchBenchScenarioResult {
+                scenario: scenario.name().to_string(),
+                message_count: fixture.message_count,
+                ops,
+                query: fixture.query_text.to_string(),
+                limit: fixture.limit,
+                samples_us: samples_us.clone(),
+                p50_us,
+                p95_us,
+                p99_us,
+                budget_p95_us,
+                budget_p99_us,
+                p95_within_budget,
+                p99_within_budget,
+                p95_delta_us,
+                p99_delta_us,
+                throughput_queries_per_sec: (throughput * 100.0).round() / 100.0,
+            };
+
+            let _ = std::fs::write(
+                out_dir.join(format!("{}.json", scenario.name())),
+                serde_json::to_string_pretty(&scenario_result).unwrap_or_default(),
+            );
+
+            results.push(scenario_result);
+        }
+
+        let run = SearchBenchRun {
+            run_id,
+            arch: std::env::consts::ARCH.to_string(),
+            os: std::env::consts::OS.to_string(),
+            budget_regressions: regressions,
+            results,
+        };
+
+        let _ = std::fs::write(
+            out_dir.join("summary.json"),
+            serde_json::to_string_pretty(&run).unwrap_or_default(),
+        );
+
+        if std::env::var("MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS")
+            .ok()
+            .as_deref()
+            == Some("1")
+            && regressions > 0
+        {
+            panic!(
+                "search bench budgets exceeded: {regressions} regressions (run_id={})",
+                run.run_id
+            );
+        }
+    });
+}
+
+fn bench_global_search(c: &mut Criterion) {
+    run_search_harness_once();
+
+    let scenarios: &[SearchScenario] = &[
+        SearchScenario::Small,
+        SearchScenario::Medium,
+        SearchScenario::Large,
+    ];
+
+    let mut group = c.benchmark_group("global_search");
+    group.sample_size(10);
+
+    for &scenario in scenarios {
+        let fixture = seed_search_fixture(scenario);
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::new(scenario.name(), fixture.message_count),
+            &fixture,
+            |b, fixture| {
+                b.iter(|| {
+                    let out = block_on(mcp_agent_mail_db::search_service::execute_search_simple(
+                        &fixture.cx,
+                        &fixture.pool,
+                        &fixture.query,
+                    ));
+                    match out {
+                        Outcome::Ok(v) => {
+                            black_box(&v);
+                        }
+                        Outcome::Err(e) => panic!("search failed: {e}"),
+                        Outcome::Cancelled(_) => panic!("search cancelled"),
+                        Outcome::Panicked(p) => panic!("search panicked: {}", p.message()),
+                    }
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShareScenario {
     TinyNoAttachments,
@@ -1742,6 +2116,7 @@ fn bench_share_export(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_tools,
+    bench_global_search,
     bench_archive_write,
     bench_share_export
 );
