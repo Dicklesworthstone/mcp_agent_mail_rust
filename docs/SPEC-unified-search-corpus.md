@@ -255,6 +255,27 @@ Measure on representative dataset sizes:
   - Total DB size
   - FTS segment size deltas per entity
 
+## Benchmark Report (2026-02-10)
+
+**Environment**
+
+- SQLite: `3.46.1`
+- Dataset: single project, single sender agent, bodies of the form `"hello world ..."` with token `needle` in 1% of messages.
+- Ingest path: direct `INSERT INTO messages` with `messages_ai` FTS triggers enabled (no `message_recipients`, no archive writes).
+- Query: `SELECT message_id FROM fts_messages WHERE fts_messages MATCH 'needle' LIMIT 50` (500 samples; warmed).
+
+**Results**
+
+| Messages | Ingest (msgs/sec) | FTS p50 (us) | FTS p95 (us) | DB logical size (MiB) | `fts_messages*` size (MiB) |
+|---:|---:|---:|---:|---:|---:|
+| 10,000 | 6,154.2 | 47.88 | 55.87 | 3.65 | 1.45 |
+| 100,000 | 4,409.8 | 65.03 | 80.86 | 35.98 | 14.71 |
+
+**Notes**
+
+- DB logical size computed as `PRAGMA page_count * PRAGMA page_size` (WAL may delay on-disk file growth).
+- `fts_messages*` size computed via `dbstat` summing objects with name prefix `fts_messages` (includes aux FTS tables).
+
 ## Tests
 
 - Unit tests:
@@ -278,4 +299,3 @@ Measure on representative dataset sizes:
   - `crates/mcp-agent-mail-cli/src/lib.rs`
 - TUI search path (needs convergence later):
   - `crates/mcp-agent-mail-server/src/tui_screens/messages.rs`
-

@@ -169,6 +169,9 @@ fn decode_json_from_tool_content(content: &[Content]) -> Result<Value, String> {
         Content::Image { mime_type, .. } => Err(format!(
             "tool returned Image content (mime_type={mime_type}); JSON decode not supported yet"
         )),
+        Content::Audio { mime_type, .. } => Err(format!(
+            "tool returned Audio content (mime_type={mime_type}); JSON decode not supported yet"
+        )),
     }
 }
 

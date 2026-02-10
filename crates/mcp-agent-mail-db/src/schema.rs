@@ -717,37 +717,37 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
-    // Agents → fts_agents triggers
-	    migrations.push(Migration::new(
-	        "v7_trg_fts_agents_insert".to_string(),
-	        "trigger to insert fts_agents on new agents".to_string(),
-	        "CREATE TRIGGER IF NOT EXISTS agents_ai \
+    // Agents -> fts_agents triggers
+    migrations.push(Migration::new(
+        "v7_trg_fts_agents_insert".to_string(),
+        "trigger to insert fts_agents on new agents".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS agents_ai \
          AFTER INSERT ON agents \
-         BEGIN \
-             INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+	         BEGIN \
+	             INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
 	             VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
 	         END"
 	        .to_string(),
 	        String::new(),
 	    ));
-	    migrations.push(Migration::new(
-	        "v7_trg_fts_agents_delete".to_string(),
-	        "trigger to delete fts_agents on agent delete".to_string(),
+    migrations.push(Migration::new(
+        "v7_trg_fts_agents_delete".to_string(),
+        "trigger to delete fts_agents on agent delete".to_string(),
         "CREATE TRIGGER IF NOT EXISTS agents_ad \
-         AFTER DELETE ON agents \
+	         AFTER DELETE ON agents \
 	         BEGIN \
 	             DELETE FROM fts_agents WHERE rowid = OLD.id; \
 	         END"
-	        .to_string(),
-	        String::new(),
-	    ));
-	    migrations.push(Migration::new(
-	        "v7_trg_fts_agents_update".to_string(),
-	        "trigger to update fts_agents when indexed agent fields change".to_string(),
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v7_trg_fts_agents_update".to_string(),
+        "trigger to update fts_agents when indexed agent fields change".to_string(),
         "CREATE TRIGGER IF NOT EXISTS agents_au \
          AFTER UPDATE OF name, task_description, program, model ON agents \
-         BEGIN \
-             DELETE FROM fts_agents WHERE rowid = OLD.id; \
+	         BEGIN \
+	             DELETE FROM fts_agents WHERE rowid = OLD.id; \
 	             INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
 	             VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
 	         END"
@@ -755,46 +755,46 @@ pub fn schema_migrations() -> Vec<Migration> {
 	        String::new(),
 	    ));
 
-    // Projects → fts_projects triggers
-	    migrations.push(Migration::new(
-	        "v7_trg_fts_projects_insert".to_string(),
-	        "trigger to insert fts_projects on new projects".to_string(),
+    // Projects -> fts_projects triggers
+    migrations.push(Migration::new(
+        "v7_trg_fts_projects_insert".to_string(),
+        "trigger to insert fts_projects on new projects".to_string(),
         "CREATE TRIGGER IF NOT EXISTS projects_ai \
          AFTER INSERT ON projects \
-         BEGIN \
+	         BEGIN \
 	             INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
 	             VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
 	         END"
-	        .to_string(),
-	        String::new(),
-	    ));
-	    migrations.push(Migration::new(
-	        "v7_trg_fts_projects_delete".to_string(),
-	        "trigger to delete fts_projects on project delete".to_string(),
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v7_trg_fts_projects_delete".to_string(),
+        "trigger to delete fts_projects on project delete".to_string(),
         "CREATE TRIGGER IF NOT EXISTS projects_ad \
-         AFTER DELETE ON projects \
+	         AFTER DELETE ON projects \
 	         BEGIN \
 	             DELETE FROM fts_projects WHERE rowid = OLD.id; \
 	         END"
-	        .to_string(),
-	        String::new(),
-	    ));
-	    migrations.push(Migration::new(
-	        "v7_trg_fts_projects_update".to_string(),
-	        "trigger to update fts_projects when indexed project fields change".to_string(),
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v7_trg_fts_projects_update".to_string(),
+        "trigger to update fts_projects when indexed project fields change".to_string(),
         "CREATE TRIGGER IF NOT EXISTS projects_au \
          AFTER UPDATE OF slug, human_key ON projects \
-         BEGIN \
-             DELETE FROM fts_projects WHERE rowid = OLD.id; \
+	         BEGIN \
+	             DELETE FROM fts_projects WHERE rowid = OLD.id; \
 	             INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
 	             VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
 	         END"
-	        .to_string(),
-	        String::new(),
-	    ));
+        .to_string(),
+        String::new(),
+    ));
 
     // Backfill agent/project identity indexes from existing rows.
-	    migrations.push(Migration::new(
+    migrations.push(Migration::new(
 	        "v7_backfill_fts_agents".to_string(),
 	        "backfill fts_agents from agents".to_string(),
 	        "INSERT OR REPLACE INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
@@ -802,14 +802,14 @@ pub fn schema_migrations() -> Vec<Migration> {
 	        .to_string(),
 	        String::new(),
 	    ));
-	    migrations.push(Migration::new(
-	        "v7_backfill_fts_projects".to_string(),
-	        "backfill fts_projects from projects".to_string(),
-	        "INSERT OR REPLACE INTO fts_projects(rowid, project_id, slug, human_key) \
+    migrations.push(Migration::new(
+        "v7_backfill_fts_projects".to_string(),
+        "backfill fts_projects from projects".to_string(),
+        "INSERT OR REPLACE INTO fts_projects(rowid, project_id, slug, human_key) \
 	         SELECT id, id, slug, human_key FROM projects"
-	        .to_string(),
-	        String::new(),
-	    ));
+            .to_string(),
+        String::new(),
+    ));
 
     migrations
 }
@@ -1376,6 +1376,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn v7_fts_agents_and_projects_backfill_and_triggers_work() {
         use sqlmodel_core::Value;
 
@@ -1451,15 +1452,15 @@ mod tests {
                 &[],
             )
             .expect("fts_projects search");
-	        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 1);
 
-	        let rows = conn
-	            .query_sync(
-	                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'alpha'",
-	                &[],
-	            )
-	            .expect("fts_agents search");
-	        assert_eq!(rows.len(), 1);
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'alpha'",
+                &[],
+            )
+            .expect("fts_agents search");
+        assert_eq!(rows.len(), 1);
 
         // Update triggers should keep identity indexes fresh.
         conn.execute_sync(
@@ -1485,15 +1486,15 @@ mod tests {
         conn.execute_sync(
             "UPDATE agents SET task_description = ? WHERE id = 1",
             &[Value::Text("beta agent".to_string())],
-	        )
-	        .expect("update agent");
-	        let rows = conn
-	            .query_sync(
-	                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'beta'",
-	                &[],
-	            )
-	            .expect("fts_agents search after update");
-	        assert_eq!(rows.len(), 1);
+        )
+        .expect("update agent");
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'beta'",
+                &[],
+            )
+            .expect("fts_agents search after update");
+        assert_eq!(rows.len(), 1);
         let rows = conn
             .query_sync(
                 "SELECT agent_id FROM fts_agents WHERE fts_agents MATCH 'alpha'",
