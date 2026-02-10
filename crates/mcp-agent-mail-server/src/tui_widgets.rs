@@ -65,13 +65,31 @@ impl<W: Widget> Widget for WidgetState<'_, W> {
         }
         match self {
             Self::Loading { message } => {
-                render_state_placeholder(area, frame, "\u{23F3}", message, PackedRgba::rgb(120, 160, 220));
+                render_state_placeholder(
+                    area,
+                    frame,
+                    "\u{23F3}",
+                    message,
+                    PackedRgba::rgb(120, 160, 220),
+                );
             }
             Self::Empty { message } => {
-                render_state_placeholder(area, frame, "\u{2205}", message, PackedRgba::rgb(140, 140, 140));
+                render_state_placeholder(
+                    area,
+                    frame,
+                    "\u{2205}",
+                    message,
+                    PackedRgba::rgb(140, 140, 140),
+                );
             }
             Self::Error { message } => {
-                render_state_placeholder(area, frame, "\u{26A0}", message, PackedRgba::rgb(255, 120, 80));
+                render_state_placeholder(
+                    area,
+                    frame,
+                    "\u{26A0}",
+                    message,
+                    PackedRgba::rgb(255, 120, 80),
+                );
             }
             Self::Ready(widget) => widget.render(area, frame),
         }
@@ -94,11 +112,17 @@ fn render_state_placeholder(
     // Center vertically.
     let y = area.y + area.height / 2;
     // Center horizontally.
+    #[allow(clippy::cast_possible_truncation)]
     let text_len = truncated.chars().count() as u16;
     let x = area.x + area.width.saturating_sub(text_len) / 2;
     let line = Line::from_spans([Span::styled(truncated, Style::new().fg(color))]);
     Paragraph::new(line).render(
-        Rect { x, y, width: area.width.saturating_sub(x - area.x), height: 1 },
+        Rect {
+            x,
+            y,
+            width: area.width.saturating_sub(x - area.x),
+            height: 1,
+        },
         frame,
     );
 }
@@ -132,7 +156,7 @@ pub struct HeatmapGrid<'a> {
     fill_char: char,
     /// Whether to show numeric values inside cells when width allows.
     show_values: bool,
-    /// Custom gradient function (overrides default heatmap_gradient).
+    /// Custom gradient function (overrides default `heatmap_gradient`).
     custom_gradient: Option<fn(f64) -> PackedRgba>,
 }
 
@@ -153,35 +177,35 @@ impl<'a> HeatmapGrid<'a> {
 
     /// Set optional row labels.
     #[must_use]
-    pub fn row_labels(mut self, labels: &'a [&'a str]) -> Self {
+    pub const fn row_labels(mut self, labels: &'a [&'a str]) -> Self {
         self.row_labels = Some(labels);
         self
     }
 
     /// Set optional column labels.
     #[must_use]
-    pub fn col_labels(mut self, labels: &'a [&'a str]) -> Self {
+    pub const fn col_labels(mut self, labels: &'a [&'a str]) -> Self {
         self.col_labels = Some(labels);
         self
     }
 
     /// Set a block border.
     #[must_use]
-    pub fn block(mut self, block: Block<'a>) -> Self {
+    pub const fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
     /// Use a custom fill character (default: space with colored background).
     #[must_use]
-    pub fn fill_char(mut self, ch: char) -> Self {
+    pub const fn fill_char(mut self, ch: char) -> Self {
         self.fill_char = ch;
         self
     }
 
     /// Show numeric values inside cells when cell width >= 3.
     #[must_use]
-    pub fn show_values(mut self, show: bool) -> Self {
+    pub const fn show_values(mut self, show: bool) -> Self {
         self.show_values = show;
         self
     }
@@ -194,16 +218,18 @@ impl<'a> HeatmapGrid<'a> {
     }
 
     fn resolve_color(&self, value: f64) -> PackedRgba {
-        let clamped = if value.is_nan() { 0.0 } else { value.clamp(0.0, 1.0) };
-        if let Some(f) = self.custom_gradient {
-            f(clamped)
+        let clamped = if value.is_nan() {
+            0.0
         } else {
-            heatmap_gradient(clamped)
-        }
+            value.clamp(0.0, 1.0)
+        };
+        self.custom_gradient
+            .map_or_else(|| heatmap_gradient(clamped), |f| f(clamped))
     }
 }
 
 impl Widget for HeatmapGrid<'_> {
+    #[allow(clippy::too_many_lines)]
     fn render(&self, area: Rect, frame: &mut Frame) {
         if area.is_empty() || self.data.is_empty() {
             return;
@@ -215,13 +241,11 @@ impl Widget for HeatmapGrid<'_> {
         }
 
         // Apply block border if set.
-        let inner = if let Some(ref block) = self.block {
+        let inner = self.block.as_ref().map_or(area, |block| {
             let inner = block.inner(area);
             block.clone().render(area, frame);
             inner
-        } else {
-            area
-        };
+        });
 
         if inner.is_empty() {
             return;
@@ -233,35 +257,36 @@ impl Widget for HeatmapGrid<'_> {
         }
 
         // Compute label gutter width.
-        let label_width: u16 = self
-            .row_labels
-            .map(|labels| {
-                labels
-                    .iter()
-                    .map(|l| l.len())
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1) // space after label
-            })
-            .unwrap_or(0) as u16;
+        #[allow(clippy::cast_possible_truncation)]
+        let label_width: u16 = self.row_labels.map_or(0, |labels| {
+            labels
+                .iter()
+                .map(|l| l.len())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1) // space after label
+        }) as u16;
 
         // Drop labels if they'd consume >40% of width.
-        let effective_label_width =
-            if label_width > 0 && label_width * 10 > inner.width * 4 { 0 } else { label_width };
+        let effective_label_width = if label_width > 0 && label_width * 10 > inner.width * 4 {
+            0
+        } else {
+            label_width
+        };
 
         let has_col_header = self.col_labels.is_some() && inner.height > 2;
-        let data_y_start = inner.y + u16::from(has_col_header);
-        let data_x_start = inner.x + effective_label_width;
-        let data_width = inner.width.saturating_sub(effective_label_width);
-        let data_height = inner.height.saturating_sub(u16::from(has_col_header));
+        let grid_top = inner.y + u16::from(has_col_header);
+        let grid_left = inner.x + effective_label_width;
+        let data_w = inner.width.saturating_sub(effective_label_width);
+        let data_h = inner.height.saturating_sub(u16::from(has_col_header));
 
-        if data_width == 0 || data_height == 0 {
+        if data_w == 0 || data_h == 0 {
             return;
         }
 
         // Cell width: divide available width evenly among columns.
         #[allow(clippy::cast_possible_truncation)]
-        let cell_w = (data_width / max_cols as u16).max(1);
+        let cell_w = (data_w / max_cols as u16).max(1);
 
         // Render column headers.
         if has_col_header {
@@ -269,13 +294,14 @@ impl Widget for HeatmapGrid<'_> {
                 let y = inner.y;
                 for (c, label) in col_labels.iter().enumerate() {
                     #[allow(clippy::cast_possible_truncation)]
-                    let x = data_x_start + (c as u16) * cell_w;
+                    let x = grid_left + (c as u16) * cell_w;
                     if x >= inner.right() {
                         break;
                     }
                     let max_w = cell_w.min(inner.right().saturating_sub(x));
                     let truncated: String = label.chars().take(max_w as usize).collect();
                     for (i, ch) in truncated.chars().enumerate() {
+                        #[allow(clippy::cast_possible_truncation)]
                         let cx = x + i as u16;
                         if cx < inner.right() {
                             let mut cell = Cell::from_char(ch);
@@ -292,7 +318,7 @@ impl Widget for HeatmapGrid<'_> {
         // Render data cells.
         for (r, row_data) in self.data.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
-            let y = data_y_start + r as u16;
+            let y = grid_top + r as u16;
             if y >= inner.bottom() {
                 break;
             }
@@ -306,8 +332,9 @@ impl Widget for HeatmapGrid<'_> {
                             .take((effective_label_width.saturating_sub(1)) as usize)
                             .collect();
                         for (i, ch) in lbl.chars().enumerate() {
+                            #[allow(clippy::cast_possible_truncation)]
                             let cx = inner.x + i as u16;
-                            if cx < data_x_start {
+                            if cx < grid_left {
                                 let mut cell = Cell::from_char(ch);
                                 cell.fg = PackedRgba::rgb(180, 180, 180);
                                 frame.buffer.set_fast(cx, y, cell);
@@ -320,7 +347,7 @@ impl Widget for HeatmapGrid<'_> {
             // Data cells.
             for (c, &value) in row_data.iter().enumerate() {
                 #[allow(clippy::cast_possible_truncation)]
-                let x = data_x_start + (c as u16) * cell_w;
+                let x = grid_left + (c as u16) * cell_w;
                 if x >= inner.right() {
                     break;
                 }
@@ -332,6 +359,7 @@ impl Widget for HeatmapGrid<'_> {
                     // Fallback: show numeric value.
                     let txt = format!("{:.0}", value * 100.0);
                     for (i, ch) in txt.chars().enumerate().take(actual_w as usize) {
+                        #[allow(clippy::cast_possible_truncation)]
                         frame.buffer.set_fast(x + i as u16, y, Cell::from_char(ch));
                     }
                 } else if self.show_values && actual_w >= 3 {
@@ -341,6 +369,7 @@ impl Widget for HeatmapGrid<'_> {
                         let mut cell = Cell::from_char(ch);
                         cell.bg = color;
                         cell.fg = contrast_text(color);
+                        #[allow(clippy::cast_possible_truncation)]
                         frame.buffer.set_fast(x + i as u16, y, cell);
                     }
                 } else {
@@ -406,35 +435,35 @@ pub struct PercentileRibbon<'a> {
 impl<'a> PercentileRibbon<'a> {
     /// Create a ribbon from a time series of percentile samples.
     #[must_use]
-    pub fn new(samples: &'a [PercentileSample]) -> Self {
+    pub const fn new(samples: &'a [PercentileSample]) -> Self {
         Self {
             samples,
             max: None,
             block: None,
-            color_p50: PackedRgba::rgb(80, 180, 80),   // green
-            color_p95: PackedRgba::rgb(220, 180, 50),   // gold
-            color_p99: PackedRgba::rgb(255, 80, 80),    // red
+            color_p50: PackedRgba::rgb(80, 180, 80),  // green
+            color_p95: PackedRgba::rgb(220, 180, 50), // gold
+            color_p99: PackedRgba::rgb(255, 80, 80),  // red
             label: None,
         }
     }
 
     /// Set explicit maximum value.
     #[must_use]
-    pub fn max(mut self, max: f64) -> Self {
+    pub const fn max(mut self, max: f64) -> Self {
         self.max = Some(max);
         self
     }
 
     /// Set a block border.
     #[must_use]
-    pub fn block(mut self, block: Block<'a>) -> Self {
+    pub const fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
     /// Override the default band colors.
     #[must_use]
-    pub fn colors(mut self, p50: PackedRgba, p95: PackedRgba, p99: PackedRgba) -> Self {
+    pub const fn colors(mut self, p50: PackedRgba, p95: PackedRgba, p99: PackedRgba) -> Self {
         self.color_p50 = p50;
         self.color_p95 = p95;
         self.color_p99 = p99;
@@ -443,7 +472,7 @@ impl<'a> PercentileRibbon<'a> {
 
     /// Set an optional label rendered at the top-left.
     #[must_use]
-    pub fn label(mut self, label: &'a str) -> Self {
+    pub const fn label(mut self, label: &'a str) -> Self {
         self.label = Some(label);
         self
     }
@@ -461,6 +490,9 @@ impl<'a> PercentileRibbon<'a> {
 
 impl Widget for PercentileRibbon<'_> {
     fn render(&self, area: Rect, frame: &mut Frame) {
+        // Density chars for no-styling fallback (light to heavy).
+        const DENSITY: &[char] = &[' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2588}'];
+
         if area.is_empty() || self.samples.is_empty() {
             return;
         }
@@ -469,13 +501,11 @@ impl Widget for PercentileRibbon<'_> {
             return;
         }
 
-        let inner = if let Some(ref block) = self.block {
+        let inner = self.block.as_ref().map_or(area, |block| {
             let inner = block.inner(area);
             block.clone().render(area, frame);
             inner
-        } else {
-            area
-        };
+        });
 
         if inner.width == 0 || inner.height == 0 {
             return;
@@ -510,12 +540,9 @@ impl Widget for PercentileRibbon<'_> {
         };
 
         let max_val = self.auto_max();
-        let height = data_area.height as f64;
-        let no_styling = frame.buffer.degradation
-            >= ftui::render::budget::DegradationLevel::NoStyling;
-
-        // Density chars for no-styling fallback (light to heavy).
-        const DENSITY: &[char] = &[' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2588}'];
+        let height = f64::from(data_area.height);
+        let no_styling =
+            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
 
         // Render each column (one per sample, right-aligned to show most recent).
         let width = data_area.width as usize;
@@ -529,8 +556,11 @@ impl Widget for PercentileRibbon<'_> {
             }
 
             // Compute row thresholds (bottom = 0, top = max).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let p50_rows = ((sample.p50 / max_val) * height).round() as u16;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let p95_rows = ((sample.p95 / max_val) * height).round() as u16;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let p99_rows = ((sample.p99 / max_val) * height).round() as u16;
 
             // Render from bottom to top.
@@ -628,43 +658,43 @@ pub struct Leaderboard<'a> {
 impl<'a> Leaderboard<'a> {
     /// Create a leaderboard from pre-sorted entries.
     #[must_use]
-    pub fn new(entries: &'a [LeaderboardEntry<'a>]) -> Self {
+    pub const fn new(entries: &'a [LeaderboardEntry<'a>]) -> Self {
         Self {
             entries,
             block: None,
             value_suffix: None,
             max_visible: 0,
-            color_up: PackedRgba::rgb(80, 200, 80),    // green
-            color_down: PackedRgba::rgb(255, 80, 80),   // red
-            color_new: PackedRgba::rgb(80, 180, 255),   // blue
-            color_top: PackedRgba::rgb(255, 215, 0),    // gold
+            color_up: PackedRgba::rgb(80, 200, 80),   // green
+            color_down: PackedRgba::rgb(255, 80, 80), // red
+            color_new: PackedRgba::rgb(80, 180, 255), // blue
+            color_top: PackedRgba::rgb(255, 215, 0),  // gold
         }
     }
 
     /// Set a block border.
     #[must_use]
-    pub fn block(mut self, block: Block<'a>) -> Self {
+    pub const fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
     /// Set a suffix for displayed values (e.g., "ms", "%", "ops/s").
     #[must_use]
-    pub fn value_suffix(mut self, suffix: &'a str) -> Self {
+    pub const fn value_suffix(mut self, suffix: &'a str) -> Self {
         self.value_suffix = Some(suffix);
         self
     }
 
     /// Limit the number of visible entries.
     #[must_use]
-    pub fn max_visible(mut self, n: usize) -> Self {
+    pub const fn max_visible(mut self, n: usize) -> Self {
         self.max_visible = n;
         self
     }
 
     /// Override change indicator colors.
     #[must_use]
-    pub fn colors(mut self, up: PackedRgba, down: PackedRgba, new: PackedRgba) -> Self {
+    pub const fn colors(mut self, up: PackedRgba, down: PackedRgba, new: PackedRgba) -> Self {
         self.color_up = up;
         self.color_down = down;
         self.color_new = new;
@@ -682,13 +712,11 @@ impl Widget for Leaderboard<'_> {
             return;
         }
 
-        let inner = if let Some(ref block) = self.block {
+        let inner = self.block.as_ref().map_or(area, |block| {
             let inner = block.inner(area);
             block.clone().render(area, frame);
             inner
-        } else {
-            area
-        };
+        });
 
         if inner.width < 10 || inner.height == 0 {
             return;
@@ -700,8 +728,8 @@ impl Widget for Leaderboard<'_> {
             inner.height as usize
         };
 
-        let no_styling = frame.buffer.degradation
-            >= ftui::render::budget::DegradationLevel::NoStyling;
+        let no_styling =
+            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
 
         let mut lines: Vec<Line> = Vec::with_capacity(max_entries);
 
@@ -714,15 +742,17 @@ impl Widget for Leaderboard<'_> {
                 RankChange::Up(n) => (format!("\u{25B2}{n}"), self.color_up),
                 RankChange::Down(n) => (format!("\u{25BC}{n}"), self.color_down),
                 RankChange::New => ("NEW".to_string(), self.color_new),
-                RankChange::Steady => ("\u{2500}\u{2500}".to_string(), PackedRgba::rgb(100, 100, 100)),
+                RankChange::Steady => (
+                    "\u{2500}\u{2500}".to_string(),
+                    PackedRgba::rgb(100, 100, 100),
+                ),
             };
 
             // Value formatting.
-            let value_str = if let Some(suffix) = self.value_suffix {
-                format!("{:.1}{suffix}", entry.value)
-            } else {
-                format!("{:.1}", entry.value)
-            };
+            let value_str = self.value_suffix.map_or_else(
+                || format!("{:.1}", entry.value),
+                |suffix| format!("{:.1}{suffix}", entry.value),
+            );
 
             let rank_color = if rank == 1 && !no_styling {
                 self.color_top
@@ -735,7 +765,11 @@ impl Widget for Leaderboard<'_> {
                 Span::raw(" "),
                 Span::styled(
                     indicator,
-                    if no_styling { Style::new() } else { Style::new().fg(ind_color) },
+                    if no_styling {
+                        Style::new()
+                    } else {
+                        Style::new().fg(ind_color)
+                    },
                 ),
                 Span::raw(" "),
                 Span::styled(
@@ -822,7 +856,7 @@ pub enum AnomalySeverity {
 impl AnomalySeverity {
     /// Color for the severity badge.
     #[must_use]
-    pub fn color(self) -> PackedRgba {
+    pub const fn color(self) -> PackedRgba {
         match self {
             Self::Low => PackedRgba::rgb(100, 180, 100),
             Self::Medium => PackedRgba::rgb(220, 180, 50),
@@ -833,7 +867,7 @@ impl AnomalySeverity {
 
     /// Short label for display.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Low => "LOW",
             Self::Medium => "MED",
@@ -846,7 +880,7 @@ impl AnomalySeverity {
 impl<'a> AnomalyCard<'a> {
     /// Create a new anomaly card.
     #[must_use]
-    pub fn new(severity: AnomalySeverity, confidence: f64, headline: &'a str) -> Self {
+    pub const fn new(severity: AnomalySeverity, confidence: f64, headline: &'a str) -> Self {
         Self {
             severity,
             confidence,
@@ -860,28 +894,28 @@ impl<'a> AnomalyCard<'a> {
 
     /// Set the rationale text.
     #[must_use]
-    pub fn rationale(mut self, text: &'a str) -> Self {
+    pub const fn rationale(mut self, text: &'a str) -> Self {
         self.rationale = Some(text);
         self
     }
 
     /// Set the next steps list.
     #[must_use]
-    pub fn next_steps(mut self, steps: &'a [&'a str]) -> Self {
+    pub const fn next_steps(mut self, steps: &'a [&'a str]) -> Self {
         self.next_steps = Some(steps);
         self
     }
 
     /// Mark this card as selected/focused (highlight border).
     #[must_use]
-    pub fn selected(mut self, selected: bool) -> Self {
+    pub const fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
     }
 
     /// Set a block border.
     #[must_use]
-    pub fn block(mut self, block: Block<'a>) -> Self {
+    pub const fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
@@ -895,7 +929,10 @@ impl<'a> AnomalyCard<'a> {
             h += 1;
         }
         if let Some(steps) = self.next_steps {
-            h += steps.len().min(3) as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                h += steps.len().min(3) as u16;
+            }
         }
         if self.block.is_some() {
             h += 2; // top + bottom border
@@ -905,6 +942,7 @@ impl<'a> AnomalyCard<'a> {
 }
 
 impl Widget for AnomalyCard<'_> {
+    #[allow(clippy::too_many_lines)]
     fn render(&self, area: Rect, frame: &mut Frame) {
         if area.is_empty() {
             return;
@@ -914,7 +952,7 @@ impl Widget for AnomalyCard<'_> {
             return;
         }
 
-        let inner = if let Some(ref block) = self.block {
+        let inner = self.block.as_ref().map_or(area, |block| {
             let mut blk = block.clone();
             if self.selected {
                 blk = blk.border_style(Style::new().fg(self.severity.color()));
@@ -922,16 +960,14 @@ impl Widget for AnomalyCard<'_> {
             let inner = blk.inner(area);
             blk.render(area, frame);
             inner
-        } else {
-            area
-        };
+        });
 
         if inner.width < 8 || inner.height == 0 {
             return;
         }
 
-        let no_styling = frame.buffer.degradation
-            >= ftui::render::budget::DegradationLevel::NoStyling;
+        let no_styling =
+            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
 
         let mut y = inner.y;
 
@@ -948,8 +984,7 @@ impl Widget for AnomalyCard<'_> {
             };
 
             let headline_max = (inner.width as usize).saturating_sub(sev_label.len() + 4);
-            let truncated_headline: String =
-                self.headline.chars().take(headline_max).collect();
+            let truncated_headline: String = self.headline.chars().take(headline_max).collect();
 
             let line = Line::from_spans([
                 badge_span,
@@ -961,7 +996,12 @@ impl Widget for AnomalyCard<'_> {
             ]);
 
             Paragraph::new(line).render(
-                Rect { x: inner.x, y, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
                 frame,
             );
             y += 1;
@@ -973,8 +1013,14 @@ impl Widget for AnomalyCard<'_> {
 
         // Line 2: confidence bar.
         {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let conf_pct = (self.confidence * 100.0).round() as u32;
             let bar_width = (inner.width as usize).saturating_sub(10); // "Conf: XX% " prefix
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
             let filled = ((self.confidence * bar_width as f64).round() as usize).min(bar_width);
             let empty = bar_width.saturating_sub(filled);
 
@@ -998,10 +1044,7 @@ impl Widget for AnomalyCard<'_> {
                         format!("Conf: {conf_pct:>3}% "),
                         Style::new().fg(PackedRgba::rgb(160, 160, 160)),
                     ),
-                    Span::styled(
-                        "\u{2588}".repeat(filled),
-                        Style::new().fg(conf_color),
-                    ),
+                    Span::styled("\u{2588}".repeat(filled), Style::new().fg(conf_color)),
                     Span::styled(
                         "\u{2591}".repeat(empty),
                         Style::new().fg(PackedRgba::rgb(60, 60, 60)),
@@ -1010,7 +1053,12 @@ impl Widget for AnomalyCard<'_> {
             };
 
             Paragraph::new(Line::from_spans(spans)).render(
-                Rect { x: inner.x, y, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
                 frame,
             );
             y += 1;
@@ -1026,7 +1074,12 @@ impl Widget for AnomalyCard<'_> {
             let truncated: String = rationale.chars().take(max_chars).collect();
             let line = Line::styled(truncated, Style::new().fg(PackedRgba::rgb(160, 160, 160)));
             Paragraph::new(line).render(
-                Rect { x: inner.x, y, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
                 frame,
             );
             y += 1;
@@ -1042,7 +1095,12 @@ impl Widget for AnomalyCard<'_> {
                 let truncated: String = bullet.chars().take(inner.width as usize).collect();
                 let line = Line::styled(truncated, Style::new().fg(PackedRgba::rgb(140, 180, 220)));
                 Paragraph::new(line).render(
-                    Rect { x: inner.x, y, width: inner.width, height: 1 },
+                    Rect {
+                        x: inner.x,
+                        y,
+                        width: inner.width,
+                        height: 1,
+                    },
                     frame,
                 );
                 y += 1;
@@ -1058,7 +1116,10 @@ impl Widget for AnomalyCard<'_> {
 /// Choose black or white text for optimal contrast against a background color.
 fn contrast_text(bg: PackedRgba) -> PackedRgba {
     // Relative luminance (simplified sRGB).
-    let lum = 0.299 * f64::from(bg.r()) + 0.587 * f64::from(bg.g()) + 0.114 * f64::from(bg.b());
+    let lum = 0.114f64.mul_add(
+        f64::from(bg.b()),
+        0.299f64.mul_add(f64::from(bg.r()), 0.587 * f64::from(bg.g())),
+    );
     if lum > 128.0 {
         PackedRgba::rgb(0, 0, 0)
     } else {
@@ -1099,7 +1160,7 @@ pub struct BrailleActivity<'a> {
 impl<'a> BrailleActivity<'a> {
     /// Create a new braille activity chart from time-series data.
     #[must_use]
-    pub fn new(values: &'a [f64]) -> Self {
+    pub const fn new(values: &'a [f64]) -> Self {
         Self {
             values,
             max: None,
@@ -1111,40 +1172,35 @@ impl<'a> BrailleActivity<'a> {
 
     /// Set explicit maximum value.
     #[must_use]
-    pub fn max(mut self, max: f64) -> Self {
+    pub const fn max(mut self, max: f64) -> Self {
         self.max = Some(max);
         self
     }
 
     /// Set a block border.
     #[must_use]
-    pub fn block(mut self, block: Block<'a>) -> Self {
+    pub const fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
     /// Set the foreground color for braille dots.
     #[must_use]
-    pub fn color(mut self, color: PackedRgba) -> Self {
+    pub const fn color(mut self, color: PackedRgba) -> Self {
         self.color = color;
         self
     }
 
     /// Set an optional label.
     #[must_use]
-    pub fn label(mut self, label: &'a str) -> Self {
+    pub const fn label(mut self, label: &'a str) -> Self {
         self.label = Some(label);
         self
     }
 
     fn auto_max(&self) -> f64 {
-        self.max.unwrap_or_else(|| {
-            self.values
-                .iter()
-                .copied()
-                .fold(0.0_f64, f64::max)
-                .max(1.0)
-        })
+        self.max
+            .unwrap_or_else(|| self.values.iter().copied().fold(0.0_f64, f64::max).max(1.0))
     }
 }
 
@@ -1158,13 +1214,11 @@ impl Widget for BrailleActivity<'_> {
             return;
         }
 
-        let inner = if let Some(ref block) = self.block {
+        let inner = self.block.as_ref().map_or(area, |block| {
             let inner = block.inner(area);
             block.clone().render(area, frame);
             inner
-        } else {
-            area
-        };
+        });
 
         if inner.width == 0 || inner.height == 0 {
             return;
@@ -1196,8 +1250,8 @@ impl Widget for BrailleActivity<'_> {
             inner
         };
 
-        let no_styling = frame.buffer.degradation
-            >= ftui::render::budget::DegradationLevel::NoStyling;
+        let no_styling =
+            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
 
         if no_styling {
             // Fallback: simple ASCII bar per column.
@@ -1211,7 +1265,8 @@ impl Widget for BrailleActivity<'_> {
                     break;
                 }
                 let ratio = (val / max_val).clamp(0.0, 1.0);
-                let filled = (ratio * data_area.height as f64).round() as u16;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let filled = (ratio * f64::from(data_area.height)).round() as u16;
                 for row in 0..filled {
                     let y = data_area.bottom().saturating_sub(1).saturating_sub(row);
                     if y >= data_area.y {
@@ -1237,12 +1292,13 @@ impl Widget for BrailleActivity<'_> {
         for (i, &val) in self.values[start_idx..].iter().enumerate() {
             let ratio = (val / max_val).clamp(0.0, 1.0);
             #[allow(clippy::cast_possible_truncation)]
-            let filled_h = (ratio * sub_h as f64).round() as i32;
+            let filled_h = (ratio * f64::from(sub_h)).round() as i32;
 
             let x = (sub_w as usize).saturating_sub(num_samples) + i;
             // Fill from bottom up.
             for dy in 0..filled_h {
-                let y = sub_h as i32 - 1 - dy;
+                let y = i32::from(sub_h) - 1 - dy;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 painter.point_colored(x as i32, y, self.color);
             }
         }
@@ -1294,7 +1350,7 @@ pub enum MetricTrend {
 impl MetricTrend {
     /// Unicode indicator for this trend.
     #[must_use]
-    pub fn indicator(self) -> &'static str {
+    pub const fn indicator(self) -> &'static str {
         match self {
             Self::Up => "\u{25B2}",
             Self::Down => "\u{25BC}",
@@ -1304,7 +1360,7 @@ impl MetricTrend {
 
     /// Color for this trend indicator.
     #[must_use]
-    pub fn color(self) -> PackedRgba {
+    pub const fn color(self) -> PackedRgba {
         match self {
             Self::Up => PackedRgba::rgb(80, 200, 80),
             Self::Down => PackedRgba::rgb(255, 80, 80),
@@ -1316,7 +1372,7 @@ impl MetricTrend {
 impl<'a> MetricTile<'a> {
     /// Create a new metric tile.
     #[must_use]
-    pub fn new(label: &'a str, value: &'a str, trend: MetricTrend) -> Self {
+    pub const fn new(label: &'a str, value: &'a str, trend: MetricTrend) -> Self {
         Self {
             label,
             value,
@@ -1329,21 +1385,21 @@ impl<'a> MetricTile<'a> {
 
     /// Set recent history for inline sparkline.
     #[must_use]
-    pub fn sparkline(mut self, data: &'a [f64]) -> Self {
+    pub const fn sparkline(mut self, data: &'a [f64]) -> Self {
         self.sparkline = Some(data);
         self
     }
 
     /// Set a block border.
     #[must_use]
-    pub fn block(mut self, block: Block<'a>) -> Self {
+    pub const fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
     /// Set the value text color.
     #[must_use]
-    pub fn value_color(mut self, color: PackedRgba) -> Self {
+    pub const fn value_color(mut self, color: PackedRgba) -> Self {
         self.value_color = color;
         self
     }
@@ -1351,8 +1407,7 @@ impl<'a> MetricTile<'a> {
 
 /// Unicode sparkline characters (8 levels of vertical bar).
 const SPARK_CHARS: &[char] = &[
-    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}',
-    '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
+    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
 ];
 
 impl Widget for MetricTile<'_> {
@@ -1365,26 +1420,32 @@ impl Widget for MetricTile<'_> {
             return;
         }
 
-        let inner = if let Some(ref block) = self.block {
+        let inner = self.block.as_ref().map_or(area, |block| {
             let inner = block.inner(area);
             block.clone().render(area, frame);
             inner
-        } else {
-            area
-        };
+        });
 
         if inner.width < 8 || inner.height == 0 {
             return;
         }
 
-        let no_styling = frame.buffer.degradation
-            >= ftui::render::budget::DegradationLevel::NoStyling;
+        let no_styling =
+            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
 
         // Line 1: label.
         let label_truncated: String = self.label.chars().take(inner.width as usize).collect();
-        let label_line = Line::styled(label_truncated, Style::new().fg(PackedRgba::rgb(160, 160, 160)));
+        let label_line = Line::styled(
+            label_truncated,
+            Style::new().fg(PackedRgba::rgb(160, 160, 160)),
+        );
         Paragraph::new(label_line).render(
-            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
             frame,
         );
 
@@ -1432,7 +1493,12 @@ impl Widget for MetricTile<'_> {
 
         let value_line = Line::from_spans(spans);
         Paragraph::new(value_line).render(
-            Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: 1,
+            },
             frame,
         );
     }
@@ -1471,7 +1537,7 @@ pub struct ReservationGauge<'a> {
 impl<'a> ReservationGauge<'a> {
     /// Create a new reservation gauge.
     #[must_use]
-    pub fn new(label: &'a str, current: u32, capacity: u32) -> Self {
+    pub const fn new(label: &'a str, current: u32, capacity: u32) -> Self {
         Self {
             label,
             current,
@@ -1485,28 +1551,28 @@ impl<'a> ReservationGauge<'a> {
 
     /// Set the TTL display string.
     #[must_use]
-    pub fn ttl_display(mut self, ttl: &'a str) -> Self {
+    pub const fn ttl_display(mut self, ttl: &'a str) -> Self {
         self.ttl_display = Some(ttl);
         self
     }
 
     /// Set a block border.
     #[must_use]
-    pub fn block(mut self, block: Block<'a>) -> Self {
+    pub const fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
     /// Set warning threshold (default 0.7).
     #[must_use]
-    pub fn warning_threshold(mut self, t: f64) -> Self {
+    pub const fn warning_threshold(mut self, t: f64) -> Self {
         self.warning_threshold = t;
         self
     }
 
     /// Set critical threshold (default 0.9).
     #[must_use]
-    pub fn critical_threshold(mut self, t: f64) -> Self {
+    pub const fn critical_threshold(mut self, t: f64) -> Self {
         self.critical_threshold = t;
         self
     }
@@ -1515,7 +1581,7 @@ impl<'a> ReservationGauge<'a> {
         if self.capacity == 0 {
             0.0
         } else {
-            (self.current as f64 / self.capacity as f64).clamp(0.0, 1.0)
+            (f64::from(self.current) / f64::from(self.capacity)).clamp(0.0, 1.0)
         }
     }
 
@@ -1541,30 +1607,38 @@ impl Widget for ReservationGauge<'_> {
             return;
         }
 
-        let inner = if let Some(ref block) = self.block {
+        let inner = self.block.as_ref().map_or(area, |block| {
             let inner = block.inner(area);
             block.clone().render(area, frame);
             inner
-        } else {
-            area
-        };
+        });
 
         if inner.width < 10 || inner.height == 0 {
             return;
         }
 
-        let no_styling = frame.buffer.degradation
-            >= ftui::render::budget::DegradationLevel::NoStyling;
+        let no_styling =
+            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
 
         // Line 1: label + count.
         let count_str = format!("{}/{}", self.current, self.capacity);
-        let ttl_suffix = self.ttl_display.map_or(String::new(), |t| format!(" ({t})"));
+        let ttl_suffix = self
+            .ttl_display
+            .map_or(String::new(), |t| format!(" ({t})"));
         let header = format!("{} {count_str}{ttl_suffix}", self.label);
         let header_truncated: String = header.chars().take(inner.width as usize).collect();
 
-        let label_line = Line::styled(header_truncated, Style::new().fg(PackedRgba::rgb(200, 200, 200)));
+        let label_line = Line::styled(
+            header_truncated,
+            Style::new().fg(PackedRgba::rgb(200, 200, 200)),
+        );
         Paragraph::new(label_line).render(
-            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
             frame,
         );
 
@@ -1575,7 +1649,11 @@ impl Widget for ReservationGauge<'_> {
         // Line 2: gauge bar.
         let bar_width = inner.width as usize;
         let ratio = self.ratio();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
         let filled = (ratio * bar_width as f64).round() as usize;
         let empty = bar_width.saturating_sub(filled);
         let pct_str = format!("{:.0}%", ratio * 100.0);
@@ -1589,7 +1667,12 @@ impl Widget for ReservationGauge<'_> {
             let truncated: String = bar.chars().take(bar_width).collect();
             let line = Line::from_spans([Span::raw(truncated)]);
             Paragraph::new(line).render(
-                Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y: inner.y + 1,
+                    width: inner.width,
+                    height: 1,
+                },
                 frame,
             );
         } else {
@@ -1597,19 +1680,19 @@ impl Widget for ReservationGauge<'_> {
             let y = inner.y + 1;
             for dx in 0..inner.width {
                 let x = inner.x + dx;
-                if (dx as usize) < filled {
-                    let mut cell = Cell::from_char(' ');
-                    cell.bg = color;
-                    frame.buffer.set_fast(x, y, cell);
+                let bg = if (dx as usize) < filled {
+                    color
                 } else {
-                    let mut cell = Cell::from_char(' ');
-                    cell.bg = PackedRgba::rgb(40, 40, 40);
-                    frame.buffer.set_fast(x, y, cell);
-                }
+                    PackedRgba::rgb(40, 40, 40)
+                };
+                let mut cell = Cell::from_char(' ');
+                cell.bg = bg;
+                frame.buffer.set_fast(x, y, cell);
             }
             // Overlay percentage text centered.
             let pct_start = (bar_width.saturating_sub(pct_str.len())) / 2;
             for (i, ch) in pct_str.chars().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
                 let x = inner.x + (pct_start + i) as u16;
                 if x < inner.right() {
                     let existing_bg = frame.buffer.get(x, y).unwrap().bg;
@@ -1652,7 +1735,7 @@ impl<'a> AgentHeatmap<'a> {
     ///
     /// `matrix[i][j]` is the normalized message count from agent `i` to agent `j`.
     #[must_use]
-    pub fn new(agents: &'a [&'a str], matrix: &'a [Vec<f64>]) -> Self {
+    pub const fn new(agents: &'a [&'a str], matrix: &'a [Vec<f64>]) -> Self {
         Self {
             agents,
             matrix,
@@ -1663,14 +1746,14 @@ impl<'a> AgentHeatmap<'a> {
 
     /// Set a block border.
     #[must_use]
-    pub fn block(mut self, block: Block<'a>) -> Self {
+    pub const fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
     /// Show numeric values inside cells.
     #[must_use]
-    pub fn show_values(mut self, show: bool) -> Self {
+    pub const fn show_values(mut self, show: bool) -> Self {
         self.show_values = show;
         self
     }
@@ -1705,7 +1788,7 @@ impl Widget for AgentHeatmap<'_> {
 /// - **High contrast**: Replace gradient colors with maximum-contrast pairs (black/white/red/green).
 /// - **Reduced motion**: Disable sparkline animation, braille sub-pixel rendering falls back to ASCII.
 /// - **Focus visible**: Render a visible focus ring (border highlight) when the widget is focused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct A11yConfig {
     /// Use maximum-contrast colors (WCAG AAA compliance).
     pub high_contrast: bool,
@@ -1713,16 +1796,6 @@ pub struct A11yConfig {
     pub reduced_motion: bool,
     /// Always show focus indicator (not just on keyboard navigation).
     pub focus_visible: bool,
-}
-
-impl Default for A11yConfig {
-    fn default() -> Self {
-        Self {
-            high_contrast: false,
-            reduced_motion: false,
-            focus_visible: false,
-        }
-    }
 }
 
 impl A11yConfig {
@@ -1759,19 +1832,19 @@ impl A11yConfig {
         // Map to 4-level high-contrast palette.
         let clamped = value.clamp(0.0, 1.0);
         if clamped < 0.25 {
-            PackedRgba::rgb(0, 0, 180)   // blue (cold)
+            PackedRgba::rgb(0, 0, 180) // blue (cold)
         } else if clamped < 0.50 {
-            PackedRgba::rgb(0, 180, 0)   // green (warm)
+            PackedRgba::rgb(0, 180, 0) // green (warm)
         } else if clamped < 0.75 {
             PackedRgba::rgb(220, 180, 0) // yellow (hot)
         } else {
-            PackedRgba::rgb(220, 0, 0)   // red (critical)
+            PackedRgba::rgb(220, 0, 0) // red (critical)
         }
     }
 
     /// Text color for high-contrast mode.
     #[must_use]
-    pub fn text_fg(&self) -> PackedRgba {
+    pub const fn text_fg(&self) -> PackedRgba {
         if self.high_contrast {
             PackedRgba::rgb(255, 255, 255)
         } else {
@@ -1781,7 +1854,7 @@ impl A11yConfig {
 
     /// Muted/secondary text color for high-contrast mode.
     #[must_use]
-    pub fn muted_fg(&self) -> PackedRgba {
+    pub const fn muted_fg(&self) -> PackedRgba {
         if self.high_contrast {
             PackedRgba::rgb(200, 200, 200)
         } else {
@@ -1801,7 +1874,7 @@ impl A11yConfig {
 /// corresponding number key to trigger navigation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrillDownAction {
-    /// Human-readable label (e.g., "View agent: RedFox").
+    /// Human-readable label (e.g., "View agent: `RedFox`").
     pub label: String,
     /// Navigation target for the app router.
     pub target: DrillDownTarget,
@@ -1851,14 +1924,14 @@ pub trait DrillDownWidget {
 
 impl DrillDownWidget for Leaderboard<'_> {
     fn drill_down_actions(&self, selected_index: usize) -> Vec<DrillDownAction> {
-        if let Some(entry) = self.entries.get(selected_index) {
-            vec![DrillDownAction {
-                label: format!("View tool: {}", entry.name),
-                target: DrillDownTarget::Tool(entry.name.to_string()),
-            }]
-        } else {
-            vec![]
-        }
+        self.entries
+            .get(selected_index)
+            .map_or_else(Vec::new, |entry| {
+                vec![DrillDownAction {
+                    label: format!("View tool: {}", entry.name),
+                    target: DrillDownTarget::Tool(entry.name.to_string()),
+                }]
+            })
     }
 }
 
@@ -1928,7 +2001,9 @@ pub fn render_focus_ring(area: Rect, frame: &mut Frame, a11y: &A11yConfig) {
 
         let mut bottom = Cell::from_char('\u{2500}');
         bottom.fg = color;
-        frame.buffer.set_fast(x, area.bottom().saturating_sub(1), bottom);
+        frame
+            .buffer
+            .set_fast(x, area.bottom().saturating_sub(1), bottom);
     }
 
     // Left and right edges.
@@ -1939,15 +2014,21 @@ pub fn render_focus_ring(area: Rect, frame: &mut Frame, a11y: &A11yConfig) {
 
         let mut right = Cell::from_char('\u{2502}');
         right.fg = color;
-        frame.buffer.set_fast(area.right().saturating_sub(1), y, right);
+        frame
+            .buffer
+            .set_fast(area.right().saturating_sub(1), y, right);
     }
 
     // Corners.
     let corners = [
-        (area.x, area.y, '\u{256D}'),                                              // ╭
-        (area.right().saturating_sub(1), area.y, '\u{256E}'),                       // ╮
-        (area.x, area.bottom().saturating_sub(1), '\u{2570}'),                      // ╰
-        (area.right().saturating_sub(1), area.bottom().saturating_sub(1), '\u{256F}'), // ╯
+        (area.x, area.y, '\u{256D}'),                          // ╭
+        (area.right().saturating_sub(1), area.y, '\u{256E}'),  // ╮
+        (area.x, area.bottom().saturating_sub(1), '\u{2570}'), // ╰
+        (
+            area.right().saturating_sub(1),
+            area.bottom().saturating_sub(1),
+            '\u{256F}',
+        ), // ╯
     ];
     for (x, y, ch) in corners {
         let mut cell = Cell::from_char(ch);
@@ -1989,7 +2070,7 @@ pub struct AnimationBudget {
 impl AnimationBudget {
     /// Create a new budget with the given frame-time limit.
     #[must_use]
-    pub fn new(limit: std::time::Duration) -> Self {
+    pub const fn new(limit: std::time::Duration) -> Self {
         Self {
             limit,
             spent: std::time::Duration::ZERO,
@@ -1999,7 +2080,7 @@ impl AnimationBudget {
 
     /// Create a budget for a 60fps target (16.6ms per frame).
     #[must_use]
-    pub fn for_60fps() -> Self {
+    pub const fn for_60fps() -> Self {
         Self::new(std::time::Duration::from_micros(16_600))
     }
 
@@ -2019,13 +2100,13 @@ impl AnimationBudget {
 
     /// Returns true if any widget was degraded during this frame.
     #[must_use]
-    pub fn was_degraded(&self) -> bool {
+    pub const fn was_degraded(&self) -> bool {
         self.degraded
     }
 
     /// Remaining budget (zero if exhausted).
     #[must_use]
-    pub fn remaining(&self) -> std::time::Duration {
+    pub const fn remaining(&self) -> std::time::Duration {
         self.limit.saturating_sub(self.spent)
     }
 
@@ -2098,7 +2179,11 @@ mod tests {
         widget.render(Rect::new(0, 0, 10, 3), &mut frame);
         // The cell at (0,0) should have a colored background.
         let cell = frame.buffer.get(0, 0).unwrap();
-        assert_ne!(cell.bg, PackedRgba::TRANSPARENT, "cell should have colored bg");
+        assert_ne!(
+            cell.bg,
+            PackedRgba::TRANSPARENT,
+            "cell should have colored bg"
+        );
     }
 
     #[test]
@@ -2166,7 +2251,11 @@ mod tests {
 
     #[test]
     fn ribbon_single_sample() {
-        let samples = vec![PercentileSample { p50: 10.0, p95: 20.0, p99: 30.0 }];
+        let samples = vec![PercentileSample {
+            p50: 10.0,
+            p95: 20.0,
+            p99: 30.0,
+        }];
         let widget = PercentileRibbon::new(&samples);
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(20, 10, &mut pool);
@@ -2180,8 +2269,12 @@ mod tests {
     fn ribbon_multiple_samples() {
         let samples: Vec<PercentileSample> = (0..30)
             .map(|i| {
-                let v = i as f64;
-                PercentileSample { p50: v, p95: v * 1.5, p99: v * 2.0 }
+                let v = f64::from(i);
+                PercentileSample {
+                    p50: v,
+                    p95: v * 1.5,
+                    p99: v * 2.0,
+                }
             })
             .collect();
         let widget = PercentileRibbon::new(&samples);
@@ -2191,8 +2284,16 @@ mod tests {
     #[test]
     fn ribbon_with_label_and_max() {
         let samples = vec![
-            PercentileSample { p50: 5.0, p95: 15.0, p99: 25.0 },
-            PercentileSample { p50: 8.0, p95: 18.0, p99: 30.0 },
+            PercentileSample {
+                p50: 5.0,
+                p95: 15.0,
+                p99: 25.0,
+            },
+            PercentileSample {
+                p50: 8.0,
+                p95: 18.0,
+                p99: 30.0,
+            },
         ];
         let widget = PercentileRibbon::new(&samples)
             .max(50.0)
@@ -2203,7 +2304,11 @@ mod tests {
 
     #[test]
     fn ribbon_minimal_height() {
-        let samples = vec![PercentileSample { p50: 10.0, p95: 20.0, p99: 30.0 }];
+        let samples = vec![PercentileSample {
+            p50: 10.0,
+            p95: 20.0,
+            p99: 30.0,
+        }];
         let widget = PercentileRibbon::new(&samples);
         // Minimal height — should not panic.
         let _out = render_widget(&widget, 20, 1);
@@ -2222,9 +2327,24 @@ mod tests {
     #[test]
     fn leaderboard_basic() {
         let entries = vec![
-            LeaderboardEntry { name: "send_message", value: 42.5, secondary: Some("120 calls"), change: RankChange::Up(2) },
-            LeaderboardEntry { name: "fetch_inbox", value: 31.2, secondary: None, change: RankChange::Steady },
-            LeaderboardEntry { name: "register_agent", value: 15.8, secondary: None, change: RankChange::Down(1) },
+            LeaderboardEntry {
+                name: "send_message",
+                value: 42.5,
+                secondary: Some("120 calls"),
+                change: RankChange::Up(2),
+            },
+            LeaderboardEntry {
+                name: "fetch_inbox",
+                value: 31.2,
+                secondary: None,
+                change: RankChange::Steady,
+            },
+            LeaderboardEntry {
+                name: "register_agent",
+                value: 15.8,
+                secondary: None,
+                change: RankChange::Down(1),
+            },
         ];
         let widget = Leaderboard::new(&entries).value_suffix("ms");
         let out = render_widget(&widget, 60, 10);
@@ -2235,9 +2355,12 @@ mod tests {
 
     #[test]
     fn leaderboard_new_entry() {
-        let entries = vec![
-            LeaderboardEntry { name: "newcomer", value: 99.0, secondary: None, change: RankChange::New },
-        ];
+        let entries = vec![LeaderboardEntry {
+            name: "newcomer",
+            value: 99.0,
+            secondary: None,
+            change: RankChange::New,
+        }];
         let widget = Leaderboard::new(&entries);
         let out = render_widget(&widget, 40, 5);
         assert!(out.contains("NEW"), "should show NEW badge");
@@ -2246,9 +2369,24 @@ mod tests {
     #[test]
     fn leaderboard_max_visible() {
         let entries = vec![
-            LeaderboardEntry { name: "a", value: 10.0, secondary: None, change: RankChange::Steady },
-            LeaderboardEntry { name: "b", value: 8.0, secondary: None, change: RankChange::Steady },
-            LeaderboardEntry { name: "c", value: 6.0, secondary: None, change: RankChange::Steady },
+            LeaderboardEntry {
+                name: "a",
+                value: 10.0,
+                secondary: None,
+                change: RankChange::Steady,
+            },
+            LeaderboardEntry {
+                name: "b",
+                value: 8.0,
+                secondary: None,
+                change: RankChange::Steady,
+            },
+            LeaderboardEntry {
+                name: "c",
+                value: 6.0,
+                secondary: None,
+                change: RankChange::Steady,
+            },
         ];
         let widget = Leaderboard::new(&entries).max_visible(2);
         let out = render_widget(&widget, 40, 10);
@@ -2259,9 +2397,12 @@ mod tests {
 
     #[test]
     fn leaderboard_narrow_area() {
-        let entries = vec![
-            LeaderboardEntry { name: "test", value: 1.0, secondary: None, change: RankChange::Steady },
-        ];
+        let entries = vec![LeaderboardEntry {
+            name: "test",
+            value: 1.0,
+            secondary: None,
+            change: RankChange::Steady,
+        }];
         let widget = Leaderboard::new(&entries);
         // Width < 10 — should render nothing gracefully.
         let out = render_widget(&widget, 8, 5);
@@ -2295,8 +2436,8 @@ mod tests {
     #[test]
     fn anomaly_card_with_steps() {
         let steps: &[&str] = &["Check logs", "Restart service"];
-        let widget = AnomalyCard::new(AnomalySeverity::Medium, 0.6, "Utilization high")
-            .next_steps(steps);
+        let widget =
+            AnomalyCard::new(AnomalySeverity::Medium, 0.6, "Utilization high").next_steps(steps);
         let out = render_widget(&widget, 50, 8);
         assert!(out.contains("Check logs"));
         assert!(out.contains("Restart"));
@@ -2307,13 +2448,12 @@ mod tests {
         let basic = AnomalyCard::new(AnomalySeverity::Low, 0.5, "Test");
         assert_eq!(basic.required_height(), 2); // headline + confidence
 
-        let with_rationale = AnomalyCard::new(AnomalySeverity::Low, 0.5, "Test")
-            .rationale("Some rationale");
+        let with_rationale =
+            AnomalyCard::new(AnomalySeverity::Low, 0.5, "Test").rationale("Some rationale");
         assert_eq!(with_rationale.required_height(), 3);
 
         let steps: &[&str] = &["Step 1", "Step 2"];
-        let with_steps = AnomalyCard::new(AnomalySeverity::Low, 0.5, "Test")
-            .next_steps(steps);
+        let with_steps = AnomalyCard::new(AnomalySeverity::Low, 0.5, "Test").next_steps(steps);
         assert_eq!(with_steps.required_height(), 4); // headline + confidence + 2 steps
     }
 
@@ -2322,7 +2462,11 @@ mod tests {
         use ftui::widgets::borders::BorderType;
         let widget = AnomalyCard::new(AnomalySeverity::Critical, 0.9, "Alert!")
             .selected(true)
-            .block(Block::new().borders(ftui::widgets::borders::Borders::ALL).border_type(BorderType::Rounded));
+            .block(
+                Block::new()
+                    .borders(ftui::widgets::borders::Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
         // Should not panic.
         let _out = render_widget(&widget, 40, 6);
     }
@@ -2381,7 +2525,11 @@ mod tests {
     #[test]
     fn contrast_text_dark_bg() {
         let result = contrast_text(PackedRgba::rgb(0, 0, 0));
-        assert_eq!(result, PackedRgba::rgb(255, 255, 255), "dark bg → white text");
+        assert_eq!(
+            result,
+            PackedRgba::rgb(255, 255, 255),
+            "dark bg → white text"
+        );
     }
 
     // ─── RankChange tests ───────────────────────────────────────────────
@@ -2398,26 +2546,35 @@ mod tests {
 
     #[test]
     fn widget_state_loading() {
-        let state: WidgetState<'_, HeatmapGrid<'_>> =
-            WidgetState::Loading { message: "Fetching metrics..." };
+        let state: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Loading {
+            message: "Fetching metrics...",
+        };
         let out = render_widget(&state, 40, 5);
-        assert!(out.contains("Fetching"), "loading state should show message");
+        assert!(
+            out.contains("Fetching"),
+            "loading state should show message"
+        );
     }
 
     #[test]
     fn widget_state_empty() {
-        let state: WidgetState<'_, HeatmapGrid<'_>> =
-            WidgetState::Empty { message: "No data available" };
+        let state: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Empty {
+            message: "No data available",
+        };
         let out = render_widget(&state, 40, 5);
         assert!(out.contains("No data"), "empty state should show message");
     }
 
     #[test]
     fn widget_state_error() {
-        let state: WidgetState<'_, HeatmapGrid<'_>> =
-            WidgetState::Error { message: "Connection failed" };
+        let state: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Error {
+            message: "Connection failed",
+        };
         let out = render_widget(&state, 40, 5);
-        assert!(out.contains("Connection"), "error state should show message");
+        assert!(
+            out.contains("Connection"),
+            "error state should show message"
+        );
     }
 
     #[test]
@@ -2453,7 +2610,7 @@ mod tests {
 
     #[test]
     fn braille_activity_many_values() {
-        let values: Vec<f64> = (0..100).map(|i| (i as f64).sin().abs() * 100.0).collect();
+        let values: Vec<f64> = (0..100).map(|i| f64::from(i).sin().abs() * 100.0).collect();
         let widget = BrailleActivity::new(&values)
             .label("Activity")
             .color(PackedRgba::rgb(100, 200, 255));
@@ -2482,8 +2639,8 @@ mod tests {
     #[test]
     fn metric_tile_with_sparkline() {
         let history = [10.0, 15.0, 12.0, 18.0, 20.0, 25.0];
-        let widget = MetricTile::new("Throughput", "250 ops/s", MetricTrend::Up)
-            .sparkline(&history);
+        let widget =
+            MetricTile::new("Throughput", "250 ops/s", MetricTrend::Up).sparkline(&history);
         let out = render_widget(&widget, 50, 3);
         assert!(out.contains("Throughput"));
         assert!(out.contains("250"));
@@ -2505,7 +2662,11 @@ mod tests {
 
     #[test]
     fn metric_trend_colors_distinct() {
-        let colors = [MetricTrend::Up.color(), MetricTrend::Down.color(), MetricTrend::Flat.color()];
+        let colors = [
+            MetricTrend::Up.color(),
+            MetricTrend::Down.color(),
+            MetricTrend::Flat.color(),
+        ];
         assert_ne!(colors[0], colors[1]);
         assert_ne!(colors[1], colors[2]);
         assert_ne!(colors[0], colors[2]);
@@ -2552,13 +2713,25 @@ mod tests {
     #[test]
     fn reservation_gauge_color_thresholds() {
         let low = ReservationGauge::new("L", 3, 10);
-        assert_eq!(low.bar_color(), PackedRgba::rgb(80, 200, 80), "below warning = green");
+        assert_eq!(
+            low.bar_color(),
+            PackedRgba::rgb(80, 200, 80),
+            "below warning = green"
+        );
 
         let warn = ReservationGauge::new("W", 8, 10);
-        assert_eq!(warn.bar_color(), PackedRgba::rgb(220, 180, 50), "warning = gold");
+        assert_eq!(
+            warn.bar_color(),
+            PackedRgba::rgb(220, 180, 50),
+            "warning = gold"
+        );
 
         let crit = ReservationGauge::new("C", 10, 10);
-        assert_eq!(crit.bar_color(), PackedRgba::rgb(255, 60, 60), "critical = red");
+        assert_eq!(
+            crit.bar_color(),
+            PackedRgba::rgb(255, 60, 60),
+            "critical = red"
+        );
     }
 
     // ─── AgentHeatmap tests ────────────────────────────────────────────
@@ -2618,7 +2791,7 @@ mod tests {
     #[test]
     fn perf_heatmap_10x10() {
         let data: Vec<Vec<f64>> = (0..10)
-            .map(|r| (0..10).map(|c| ((r * 10 + c) as f64) / 100.0).collect())
+            .map(|r| (0..10).map(|c| f64::from(r * 10 + c) / 100.0).collect())
             .collect();
         let widget = HeatmapGrid::new(&data).show_values(true);
         render_perf(&widget, 80, 24, 500, 500);
@@ -2628,8 +2801,12 @@ mod tests {
     fn perf_percentile_ribbon_100_samples() {
         let samples: Vec<PercentileSample> = (0..100)
             .map(|i| {
-                let v = (i as f64 * 0.1).sin().abs() * 50.0;
-                PercentileSample { p50: v, p95: v * 1.5, p99: v * 2.0 }
+                let v = (f64::from(i) * 0.1).sin().abs() * 50.0;
+                PercentileSample {
+                    p50: v,
+                    p95: v * 1.5,
+                    p99: v * 2.0,
+                }
             })
             .collect();
         let widget = PercentileRibbon::new(&samples).label("Latency ms");
@@ -2641,9 +2818,13 @@ mod tests {
         let entries: Vec<LeaderboardEntry<'_>> = (0..20)
             .map(|i| LeaderboardEntry {
                 name: "agent_tool_call",
-                value: 100.0 - i as f64 * 4.0,
+                value: f64::from(i).mul_add(-4.0, 100.0),
                 secondary: Some("42 calls"),
-                change: if i % 3 == 0 { RankChange::Up(1) } else { RankChange::Steady },
+                change: if i % 3 == 0 {
+                    RankChange::Up(1)
+                } else {
+                    RankChange::Steady
+                },
             })
             .collect();
         let widget = Leaderboard::new(&entries).value_suffix("ms");
@@ -2661,23 +2842,25 @@ mod tests {
 
     #[test]
     fn perf_braille_activity_200_values() {
-        let values: Vec<f64> = (0..200).map(|i| (i as f64 * 0.05).sin().abs() * 100.0).collect();
+        let values: Vec<f64> = (0..200)
+            .map(|i| (f64::from(i) * 0.05).sin().abs() * 100.0)
+            .collect();
         let widget = BrailleActivity::new(&values).label("Activity");
         render_perf(&widget, 80, 20, 200, 2000);
     }
 
     #[test]
     fn perf_metric_tile_with_sparkline() {
-        let history: Vec<f64> = (0..50).map(|i| (i as f64 * 0.1).sin().abs() * 100.0).collect();
-        let widget = MetricTile::new("Latency p95", "42.3ms", MetricTrend::Up)
-            .sparkline(&history);
+        let history: Vec<f64> = (0..50)
+            .map(|i| (f64::from(i) * 0.1).sin().abs() * 100.0)
+            .collect();
+        let widget = MetricTile::new("Latency p95", "42.3ms", MetricTrend::Up).sparkline(&history);
         render_perf(&widget, 50, 3, 1000, 200);
     }
 
     #[test]
     fn perf_reservation_gauge() {
-        let widget = ReservationGauge::new("File Reservations", 7, 10)
-            .ttl_display("12m left");
+        let widget = ReservationGauge::new("File Reservations", 7, 10).ttl_display("12m left");
         render_perf(&widget, 50, 3, 1000, 200);
     }
 
@@ -2685,7 +2868,17 @@ mod tests {
     fn perf_agent_heatmap_5x5() {
         let agents: &[&str] = &["Alpha", "Beta", "Gamma", "Delta", "Epsilon"];
         let matrix: Vec<Vec<f64>> = (0..5)
-            .map(|r| (0..5).map(|c| if r == c { 0.0 } else { (r * 5 + c) as f64 / 25.0 }).collect())
+            .map(|r| {
+                (0..5)
+                    .map(|c| {
+                        if r == c {
+                            0.0
+                        } else {
+                            f64::from(r * 5 + c) / 25.0
+                        }
+                    })
+                    .collect()
+            })
             .collect();
         let widget = AgentHeatmap::new(agents, &matrix).show_values(true);
         render_perf(&widget, 60, 10, 500, 500);
@@ -2693,16 +2886,17 @@ mod tests {
 
     #[test]
     fn perf_widget_state_variants() {
-        let loading: WidgetState<'_, HeatmapGrid<'_>> =
-            WidgetState::Loading { message: "Fetching metrics..." };
+        let loading: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Loading {
+            message: "Fetching metrics...",
+        };
         render_perf(&loading, 40, 5, 1000, 100);
 
-        let empty: WidgetState<'_, HeatmapGrid<'_>> =
-            WidgetState::Empty { message: "No data" };
+        let empty: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Empty { message: "No data" };
         render_perf(&empty, 40, 5, 1000, 100);
 
-        let error: WidgetState<'_, HeatmapGrid<'_>> =
-            WidgetState::Error { message: "Connection failed" };
+        let error: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Error {
+            message: "Connection failed",
+        };
         render_perf(&error, 40, 5, 1000, 100);
     }
 
@@ -2728,12 +2922,19 @@ mod tests {
     fn a11y_resolve_color_passthrough() {
         let cfg = A11yConfig::none();
         let color = PackedRgba::rgb(42, 100, 200);
-        assert_eq!(cfg.resolve_color(0.5, color), color, "no-a11y should passthrough");
+        assert_eq!(
+            cfg.resolve_color(0.5, color),
+            color,
+            "no-a11y should passthrough"
+        );
     }
 
     #[test]
     fn a11y_resolve_color_high_contrast_bands() {
-        let cfg = A11yConfig { high_contrast: true, ..A11yConfig::none() };
+        let cfg = A11yConfig {
+            high_contrast: true,
+            ..A11yConfig::none()
+        };
         let dummy = PackedRgba::rgb(128, 128, 128);
 
         let cold = cfg.resolve_color(0.1, dummy);
@@ -2745,7 +2946,10 @@ mod tests {
         let colors = [cold, warm, hot, critical];
         for i in 0..colors.len() {
             for j in (i + 1)..colors.len() {
-                assert_ne!(colors[i], colors[j], "high-contrast bands {i} and {j} should differ");
+                assert_ne!(
+                    colors[i], colors[j],
+                    "high-contrast bands {i} and {j} should differ"
+                );
             }
         }
     }
@@ -2753,7 +2957,10 @@ mod tests {
     #[test]
     fn a11y_text_colors() {
         let normal = A11yConfig::none();
-        let hc = A11yConfig { high_contrast: true, ..A11yConfig::none() };
+        let hc = A11yConfig {
+            high_contrast: true,
+            ..A11yConfig::none()
+        };
 
         // High contrast text should be brighter.
         assert_eq!(hc.text_fg(), PackedRgba::rgb(255, 255, 255));
@@ -2768,21 +2975,37 @@ mod tests {
     #[test]
     fn leaderboard_drill_down_valid_index() {
         let entries = vec![
-            LeaderboardEntry { name: "send_message", value: 42.5, secondary: None, change: RankChange::Steady },
-            LeaderboardEntry { name: "fetch_inbox", value: 31.2, secondary: None, change: RankChange::Steady },
+            LeaderboardEntry {
+                name: "send_message",
+                value: 42.5,
+                secondary: None,
+                change: RankChange::Steady,
+            },
+            LeaderboardEntry {
+                name: "fetch_inbox",
+                value: 31.2,
+                secondary: None,
+                change: RankChange::Steady,
+            },
         ];
         let widget = Leaderboard::new(&entries);
         let actions = widget.drill_down_actions(0);
         assert_eq!(actions.len(), 1);
         assert!(actions[0].label.contains("send_message"));
-        assert_eq!(actions[0].target, DrillDownTarget::Tool("send_message".to_string()));
+        assert_eq!(
+            actions[0].target,
+            DrillDownTarget::Tool("send_message".to_string())
+        );
     }
 
     #[test]
     fn leaderboard_drill_down_out_of_bounds() {
-        let entries = vec![
-            LeaderboardEntry { name: "test", value: 1.0, secondary: None, change: RankChange::Steady },
-        ];
+        let entries = vec![LeaderboardEntry {
+            name: "test",
+            value: 1.0,
+            secondary: None,
+            change: RankChange::Steady,
+        }];
         let widget = Leaderboard::new(&entries);
         let actions = widget.drill_down_actions(99);
         assert!(actions.is_empty(), "out-of-bounds should return empty");
@@ -2799,10 +3022,13 @@ mod tests {
         let widget = AgentHeatmap::new(agents, &matrix);
 
         // Cell (1, 2) = Beta→Gamma: should get sender=Beta, receiver=Gamma.
-        let actions = widget.drill_down_actions(1 * 3 + 2);
+        let actions = widget.drill_down_actions(5);
         assert_eq!(actions.len(), 2);
         assert!(actions[0].label.contains("Beta"), "sender should be Beta");
-        assert!(actions[1].label.contains("Gamma"), "receiver should be Gamma");
+        assert!(
+            actions[1].label.contains("Gamma"),
+            "receiver should be Gamma"
+        );
 
         // Diagonal cell (0, 0) = Alpha→Alpha: only one action (no self-link).
         let actions = widget.drill_down_actions(0);
@@ -2821,11 +3047,7 @@ mod tests {
 
     #[test]
     fn anomaly_card_drill_down() {
-        let widget = AnomalyCard::new(
-            AnomalySeverity::High,
-            0.85,
-            "Latency spike",
-        );
+        let widget = AnomalyCard::new(AnomalySeverity::High, 0.85, "Latency spike");
         let actions = widget.drill_down_actions(0);
         assert_eq!(actions.len(), 1);
         assert!(actions[0].label.contains("[HIGH]"));
@@ -2845,18 +3067,29 @@ mod tests {
         let tl = frame.buffer.get(0, 0).unwrap();
         assert_eq!(tl.content.as_char().unwrap(), '\u{256D}', "top-left corner");
         let tr = frame.buffer.get(9, 0).unwrap();
-        assert_eq!(tr.content.as_char().unwrap(), '\u{256E}', "top-right corner");
+        assert_eq!(
+            tr.content.as_char().unwrap(),
+            '\u{256E}',
+            "top-right corner"
+        );
     }
 
     #[test]
     fn focus_ring_high_contrast_uses_yellow() {
-        let a11y = A11yConfig { high_contrast: true, ..A11yConfig::none() };
+        let a11y = A11yConfig {
+            high_contrast: true,
+            ..A11yConfig::none()
+        };
         let mut pool = GraphemePool::new();
         let mut frame = Frame::new(10, 5, &mut pool);
         render_focus_ring(Rect::new(0, 0, 10, 5), &mut frame, &a11y);
 
         let cell = frame.buffer.get(1, 0).unwrap(); // top edge
-        assert_eq!(cell.fg, PackedRgba::rgb(255, 255, 0), "high-contrast ring should be yellow");
+        assert_eq!(
+            cell.fg,
+            PackedRgba::rgb(255, 255, 0),
+            "high-contrast ring should be yellow"
+        );
     }
 
     #[test]
@@ -2907,6 +3140,9 @@ mod tests {
     #[test]
     fn budget_zero_limit() {
         let budget = AnimationBudget::new(std::time::Duration::ZERO);
-        assert_eq!(budget.utilization(), 1.0, "zero limit should show 100% utilization");
+        assert!(
+            (budget.utilization() - 1.0).abs() < f64::EPSILON,
+            "zero limit should show 100% utilization"
+        );
     }
 }
