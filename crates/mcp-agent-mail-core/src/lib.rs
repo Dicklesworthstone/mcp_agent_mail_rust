@@ -41,10 +41,11 @@ pub use error::{Error as MailError, Result as MailResult};
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};
 pub use kpi::{
-    AckPressureKpi, ContentionKpi, KpiReport, KpiSnapshot, KpiWindow, LatencyKpi, ThroughputKpi,
-    kpi_gauges, latest_raw as kpi_latest_raw, record_sample as kpi_record_sample,
-    report as kpi_report, reset_samples as kpi_reset_samples, sample_count as kpi_sample_count,
-    snapshot as kpi_snapshot,
+    AckPressureKpi, AnomalyAlert, AnomalyKind, AnomalySeverity, AnomalyThresholds, ContentionKpi,
+    KpiReport, KpiSnapshot, KpiWindow, LatencyKpi, Sensitivity, ThroughputKpi, detect_anomalies,
+    kpi_gauges, latest_raw as kpi_latest_raw, quick_anomaly_scan,
+    record_sample as kpi_record_sample, report as kpi_report, reset_samples as kpi_reset_samples,
+    sample_count as kpi_sample_count, snapshot as kpi_snapshot,
 };
 pub use lock_order::{
     LockContentionEntry, LockLevel, OrderedMutex, OrderedRwLock, lock_contention_reset,

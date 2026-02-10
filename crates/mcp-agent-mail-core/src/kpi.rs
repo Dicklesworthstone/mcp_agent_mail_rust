@@ -576,6 +576,464 @@ pub fn latest_raw() -> Option<GlobalMetricsSnapshot> {
 }
 
 // ---------------------------------------------------------------------------
+// Anomaly detection (br-3vwi.7.2)
+// ---------------------------------------------------------------------------
+
+/// What kind of operational anomaly was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnomalyKind {
+    /// Error rate exceeds threshold.
+    HighErrorRate,
+    /// Tool call latency (p95 or p99) spiked.
+    LatencySpike,
+    /// Throughput dropped below baseline.
+    ThroughputDrop,
+    /// Ack backlog is growing.
+    AckBacklog,
+    /// DB pool or WBQ utilization is high.
+    HighUtilization,
+    /// File reservation conflicts are elevated.
+    ReservationConflicts,
+    /// Git index lock retries are elevated.
+    GitLockPressure,
+    /// WBQ backpressure events detected.
+    WbqBackpressure,
+}
+
+impl std::fmt::Display for AnomalyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HighErrorRate => f.write_str("high_error_rate"),
+            Self::LatencySpike => f.write_str("latency_spike"),
+            Self::ThroughputDrop => f.write_str("throughput_drop"),
+            Self::AckBacklog => f.write_str("ack_backlog"),
+            Self::HighUtilization => f.write_str("high_utilization"),
+            Self::ReservationConflicts => f.write_str("reservation_conflicts"),
+            Self::GitLockPressure => f.write_str("git_lock_pressure"),
+            Self::WbqBackpressure => f.write_str("wbq_backpressure"),
+        }
+    }
+}
+
+/// Severity of an anomaly alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnomalySeverity {
+    /// Informational — minor deviation, no action needed.
+    Low,
+    /// Warning — approaching thresholds, monitor closely.
+    Medium,
+    /// Problem — threshold breached, investigate.
+    High,
+    /// Emergency — severe degradation, act immediately.
+    Critical,
+}
+
+impl std::fmt::Display for AnomalySeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Low => f.write_str("low"),
+            Self::Medium => f.write_str("medium"),
+            Self::High => f.write_str("high"),
+            Self::Critical => f.write_str("critical"),
+        }
+    }
+}
+
+/// A single anomaly detection result.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnomalyAlert {
+    /// What anomaly was detected.
+    pub kind: AnomalyKind,
+    /// How severe the anomaly is.
+    pub severity: AnomalySeverity,
+    /// Normalized score (0.0 = no anomaly, 1.0 = maximum anomaly).
+    pub score: f64,
+    /// Current observed value.
+    pub current_value: f64,
+    /// Threshold that was breached (or approached).
+    pub threshold: f64,
+    /// Optional baseline value from a longer window.
+    pub baseline_value: Option<f64>,
+    /// Human-readable explanation of the anomaly.
+    pub explanation: String,
+    /// Suggested action for the operator.
+    pub suggested_action: String,
+}
+
+/// Sensitivity level for anomaly detection thresholds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sensitivity {
+    /// Fewer alerts, only flag severe issues.
+    Relaxed,
+    /// Balanced detection (default).
+    #[default]
+    Normal,
+    /// More alerts, flag early deviations.
+    Strict,
+}
+
+/// Threshold configuration for anomaly detection.
+///
+/// All thresholds are derived from the SLO constants in [`crate::slo`]
+/// and scaled by the sensitivity level.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnomalyThresholds {
+    /// Error rate threshold in basis points (1 bp = 0.01%).
+    pub error_rate_bps: f64,
+    /// Tool latency p95 threshold in ms.
+    pub tool_latency_p95_ms: f64,
+    /// Tool latency p99 threshold in ms.
+    pub tool_latency_p99_ms: f64,
+    /// Pool utilization threshold (0–100).
+    pub pool_utilization_pct: f64,
+    /// WBQ utilization threshold (0–100).
+    pub wbq_utilization_pct: f64,
+    /// Ack pending count threshold.
+    pub ack_pending_threshold: f64,
+    /// Ack overdue count threshold.
+    pub ack_overdue_threshold: f64,
+    /// Reservation conflicts per window threshold.
+    pub reservation_conflict_threshold: f64,
+    /// Git lock retries per window threshold.
+    pub git_lock_retry_threshold: f64,
+    /// WBQ backpressure events per window threshold.
+    pub wbq_backpressure_threshold: f64,
+    /// Throughput drop ratio (0.0–1.0) — fraction of baseline below which
+    /// throughput is considered anomalous (e.g., 0.5 = alert if < 50% of baseline).
+    pub throughput_drop_ratio: f64,
+}
+
+impl AnomalyThresholds {
+    /// Build thresholds from SLO constants scaled by sensitivity.
+    ///
+    /// # Formulas
+    ///
+    /// | Threshold | Relaxed | Normal | Strict |
+    /// |-----------|---------|--------|--------|
+    /// | `error_rate_bps` | SLO × 2.0 | SLO × 1.0 | SLO × 0.5 |
+    /// | `tool_latency_p95_ms` | SLO × 1.5 | SLO × 1.0 | SLO × 0.7 |
+    /// | `pool_utilization_pct` | 90 | 80 | 60 |
+    /// | `ack_pending` | 50 | 20 | 10 |
+    #[must_use]
+    pub fn from_sensitivity(sensitivity: Sensitivity) -> Self {
+        use crate::slo;
+
+        let factor = match sensitivity {
+            Sensitivity::Relaxed => 2.0,
+            Sensitivity::Normal => 1.0,
+            Sensitivity::Strict => 0.5,
+        };
+
+        let latency_factor = match sensitivity {
+            Sensitivity::Relaxed => 1.5,
+            Sensitivity::Normal => 1.0,
+            Sensitivity::Strict => 0.7,
+        };
+
+        #[allow(clippy::cast_precision_loss)]
+        Self {
+            error_rate_bps: f64::from(slo::ERROR_RATE_MAX_BP) * factor,
+            tool_latency_p95_ms: slo::TOOL_P95_US as f64 / 1000.0 * latency_factor,
+            tool_latency_p99_ms: slo::TOOL_P99_US as f64 / 1000.0 * latency_factor,
+            pool_utilization_pct: match sensitivity {
+                Sensitivity::Relaxed => 90.0,
+                Sensitivity::Normal => 80.0,
+                Sensitivity::Strict => 60.0,
+            },
+            wbq_utilization_pct: match sensitivity {
+                Sensitivity::Relaxed => 90.0,
+                Sensitivity::Normal => 80.0,
+                Sensitivity::Strict => 60.0,
+            },
+            ack_pending_threshold: match sensitivity {
+                Sensitivity::Relaxed => 50.0,
+                Sensitivity::Normal => 20.0,
+                Sensitivity::Strict => 10.0,
+            },
+            ack_overdue_threshold: match sensitivity {
+                Sensitivity::Relaxed => 20.0,
+                Sensitivity::Normal => 5.0,
+                Sensitivity::Strict => 2.0,
+            },
+            reservation_conflict_threshold: match sensitivity {
+                Sensitivity::Relaxed => 20.0,
+                Sensitivity::Normal => 5.0,
+                Sensitivity::Strict => 2.0,
+            },
+            git_lock_retry_threshold: match sensitivity {
+                Sensitivity::Relaxed => 30.0,
+                Sensitivity::Normal => 10.0,
+                Sensitivity::Strict => 3.0,
+            },
+            wbq_backpressure_threshold: match sensitivity {
+                Sensitivity::Relaxed => 20.0,
+                Sensitivity::Normal => 5.0,
+                Sensitivity::Strict => 1.0,
+            },
+            throughput_drop_ratio: match sensitivity {
+                Sensitivity::Relaxed => 0.3,
+                Sensitivity::Normal => 0.5,
+                Sensitivity::Strict => 0.7,
+            },
+        }
+    }
+}
+
+impl Default for AnomalyThresholds {
+    fn default() -> Self {
+        Self::from_sensitivity(Sensitivity::Normal)
+    }
+}
+
+/// Detect anomalies in a KPI snapshot against thresholds and optional baseline.
+///
+/// The `baseline` parameter, when provided, enables relative deviation detection
+/// (e.g., throughput drop). When `None`, only absolute threshold checks apply.
+///
+/// # Returns
+///
+/// A vector of alerts sorted by severity (critical first), then by score.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn detect_anomalies(
+    kpi: &KpiSnapshot,
+    baseline: Option<&KpiSnapshot>,
+    thresholds: &AnomalyThresholds,
+) -> Vec<AnomalyAlert> {
+    let mut alerts = Vec::new();
+
+    // -- Error rate --
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::HighErrorRate,
+        kpi.throughput.error_rate_bps,
+        thresholds.error_rate_bps,
+        "Error rate",
+        "basis points",
+        "Investigate failing tool calls; check logs for recurring errors",
+    );
+
+    // -- Latency spike (p95) --
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::LatencySpike,
+        kpi.latency.tool_p95_ms,
+        thresholds.tool_latency_p95_ms,
+        "Tool call p95 latency",
+        "ms",
+        "Check DB pool health and query performance; look for lock contention",
+    );
+
+    // -- Latency spike (p99) --
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::LatencySpike,
+        kpi.latency.tool_p99_ms,
+        thresholds.tool_latency_p99_ms,
+        "Tool call p99 latency",
+        "ms",
+        "Investigate tail latency; check for GC pauses or disk IO stalls",
+    );
+
+    // -- Pool utilization --
+    #[allow(clippy::cast_precision_loss)]
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::HighUtilization,
+        kpi.contention.pool_utilization_pct as f64,
+        thresholds.pool_utilization_pct,
+        "DB pool utilization",
+        "%",
+        "Consider increasing pool size or optimizing query throughput",
+    );
+
+    // -- WBQ utilization --
+    #[allow(clippy::cast_precision_loss)]
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::HighUtilization,
+        kpi.contention.wbq_utilization_pct as f64,
+        thresholds.wbq_utilization_pct,
+        "Write-behind queue utilization",
+        "%",
+        "Check archive write throughput; increase WBQ capacity if persistent",
+    );
+
+    // -- Ack backlog (pending) --
+    #[allow(clippy::cast_precision_loss)]
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::AckBacklog,
+        kpi.ack_pressure.pending as f64,
+        thresholds.ack_pending_threshold,
+        "Pending ack count",
+        "messages",
+        "Agents may be unresponsive; check for crashed or overloaded agents",
+    );
+
+    // -- Ack backlog (overdue) --
+    #[allow(clippy::cast_precision_loss)]
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::AckBacklog,
+        kpi.ack_pressure.overdue as f64,
+        thresholds.ack_overdue_threshold,
+        "Overdue ack count",
+        "messages",
+        "Messages require urgent acknowledgment; check agent health",
+    );
+
+    // -- Reservation conflicts --
+    #[allow(clippy::cast_precision_loss)]
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::ReservationConflicts,
+        kpi.contention.reservation_conflicts_in_window as f64,
+        thresholds.reservation_conflict_threshold,
+        "Reservation conflicts",
+        "conflicts",
+        "Agents are contending for the same files; coordinate work allocation",
+    );
+
+    // -- Git lock retries --
+    #[allow(clippy::cast_precision_loss)]
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::GitLockPressure,
+        kpi.contention.git_lock_retries_in_window as f64,
+        thresholds.git_lock_retry_threshold,
+        "Git index lock retries",
+        "retries",
+        "Git archive writes are contending; check commit coalescer health",
+    );
+
+    // -- WBQ backpressure --
+    #[allow(clippy::cast_precision_loss)]
+    check_threshold(
+        &mut alerts,
+        AnomalyKind::WbqBackpressure,
+        kpi.contention.wbq_backpressure_in_window as f64,
+        thresholds.wbq_backpressure_threshold,
+        "WBQ backpressure events",
+        "events",
+        "Write-behind queue is overloaded; increase capacity or reduce write rate",
+    );
+
+    // -- Throughput drop (relative to baseline) --
+    if let Some(bl) = baseline {
+        let bl_rate = bl.throughput.tool_calls_per_sec;
+        let cur_rate = kpi.throughput.tool_calls_per_sec;
+        if bl_rate > 1.0 {
+            let ratio = cur_rate / bl_rate;
+            if ratio < thresholds.throughput_drop_ratio {
+                let score = ((thresholds.throughput_drop_ratio - ratio)
+                    / thresholds.throughput_drop_ratio)
+                    .clamp(0.0, 1.0);
+                let severity = severity_from_score(score);
+                alerts.push(AnomalyAlert {
+                    kind: AnomalyKind::ThroughputDrop,
+                    severity,
+                    score,
+                    current_value: cur_rate,
+                    threshold: bl_rate * thresholds.throughput_drop_ratio,
+                    baseline_value: Some(bl_rate),
+                    explanation: format!(
+                        "Throughput dropped to {cur_rate:.1} ops/s ({:.0}% of baseline {bl_rate:.1} ops/s)",
+                        ratio * 100.0
+                    ),
+                    suggested_action: "Check for upstream failures, network issues, or client-side problems".into(),
+                });
+            }
+        }
+    }
+
+    // Sort: critical first, then by score descending.
+    alerts.sort_by(|a, b| {
+        b.severity.cmp(&a.severity).then(
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+
+    alerts
+}
+
+/// Helper: check a value against a threshold and emit an alert if breached.
+#[allow(clippy::too_many_arguments)]
+fn check_threshold(
+    alerts: &mut Vec<AnomalyAlert>,
+    kind: AnomalyKind,
+    current: f64,
+    threshold: f64,
+    metric_name: &str,
+    unit: &str,
+    suggested_action: &str,
+) {
+    if threshold <= 0.0 || current <= 0.0 {
+        return;
+    }
+
+    let ratio = current / threshold;
+    if ratio < 0.5 {
+        return; // Below 50% of threshold — no alert.
+    }
+
+    let score = ((ratio - 0.5) / 0.5).clamp(0.0, 1.0);
+    let severity = if ratio >= 2.0 {
+        AnomalySeverity::Critical
+    } else if ratio >= 1.0 {
+        // Threshold breached.
+        severity_from_score(score)
+    } else {
+        // Approaching threshold (50%–100%).
+        AnomalySeverity::Low
+    };
+
+    alerts.push(AnomalyAlert {
+        kind,
+        severity,
+        score,
+        current_value: current,
+        threshold,
+        baseline_value: None,
+        explanation: format!(
+            "{metric_name} is {current:.1} {unit} ({:.0}% of {threshold:.1} threshold)",
+            ratio * 100.0
+        ),
+        suggested_action: suggested_action.into(),
+    });
+}
+
+/// Map a 0.0–1.0 score to a severity level.
+fn severity_from_score(score: f64) -> AnomalySeverity {
+    if score >= 0.9 {
+        AnomalySeverity::Critical
+    } else if score >= 0.6 {
+        AnomalySeverity::High
+    } else if score >= 0.3 {
+        AnomalySeverity::Medium
+    } else {
+        AnomalySeverity::Low
+    }
+}
+
+/// Convenience: detect anomalies on the 1-minute window with default thresholds,
+/// using the 5-minute window as baseline.
+#[must_use]
+pub fn quick_anomaly_scan() -> Vec<AnomalyAlert> {
+    let thresholds = AnomalyThresholds::default();
+    let current = snapshot(KpiWindow::OneMin);
+    let baseline = snapshot(KpiWindow::FiveMin);
+    current.as_ref().map_or_else(Vec::new, |kpi| {
+        detect_anomalies(kpi, baseline.as_ref(), &thresholds)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1177,5 +1635,313 @@ mod tests {
         assert!(kpi.throughput.messages_per_sec.abs() < f64::EPSILON);
         assert!(kpi.throughput.commit_throughput_per_sec.abs() < f64::EPSILON);
         assert_eq!(kpi.contention.reservation_conflicts_in_window, 0);
+    }
+
+    // -- Anomaly detection tests (br-3vwi.7.2) --
+
+    /// Build a KPI snapshot with specific values for anomaly testing.
+    #[allow(clippy::too_many_arguments)]
+    fn make_kpi(
+        error_rate_bps: f64,
+        tool_p95_ms: f64,
+        tool_p99_ms: f64,
+        pool_util: u64,
+        wbq_util: u64,
+        ack_pending: u64,
+        ack_overdue: u64,
+        conflicts: u64,
+        git_retries: u64,
+        wbq_bp: u64,
+        tool_calls_per_sec: f64,
+    ) -> KpiSnapshot {
+        KpiSnapshot {
+            window: KpiWindow::OneMin,
+            actual_span_secs: 60.0,
+            sample_count: 60,
+            throughput: ThroughputKpi {
+                tool_calls_per_sec,
+                tool_errors_per_sec: 0.0,
+                error_rate_bps,
+                http_rps: tool_calls_per_sec,
+                messages_per_sec: 0.0,
+                commit_throughput_per_sec: 0.0,
+            },
+            latency: LatencyKpi {
+                tool_p50_ms: tool_p95_ms * 0.5,
+                tool_p95_ms,
+                tool_p99_ms,
+                pool_acquire_p50_ms: 0.2,
+                pool_acquire_p95_ms: 1.0,
+                http_p50_ms: 0.5,
+                http_p95_ms: 2.0,
+                git_commit_p95_ms: 8.0,
+                wbq_queue_p95_ms: 0.5,
+            },
+            ack_pressure: AckPressureKpi {
+                pending: ack_pending,
+                overdue: ack_overdue,
+            },
+            contention: ContentionKpi {
+                pool_utilization_pct: pool_util,
+                wbq_utilization_pct: wbq_util,
+                reservation_active: 5,
+                reservation_conflicts_in_window: conflicts,
+                wbq_backpressure_in_window: wbq_bp,
+                git_lock_retries_in_window: git_retries,
+            },
+        }
+    }
+
+    #[test]
+    fn no_anomalies_on_healthy_system() {
+        let kpi = make_kpi(0.0, 10.0, 20.0, 30, 5, 2, 0, 0, 0, 0, 50.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&kpi, None, &thresholds);
+        assert!(
+            alerts.is_empty(),
+            "healthy system should have no alerts, got: {alerts:?}"
+        );
+    }
+
+    #[test]
+    fn high_error_rate_detected() {
+        // SLO ERROR_RATE_MAX_BP = 10, Normal threshold = 10 bps
+        let kpi = make_kpi(15.0, 10.0, 20.0, 30, 5, 0, 0, 0, 0, 0, 50.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&kpi, None, &thresholds);
+
+        let error_alerts: Vec<_> = alerts
+            .iter()
+            .filter(|a| a.kind == AnomalyKind::HighErrorRate)
+            .collect();
+        assert!(!error_alerts.is_empty(), "should detect high error rate");
+        assert!(error_alerts[0].severity >= AnomalySeverity::High);
+        assert!(error_alerts[0].explanation.contains("Error rate"));
+    }
+
+    #[test]
+    fn latency_spike_detected() {
+        // Normal threshold: TOOL_P95_US / 1000 = 100ms
+        let kpi = make_kpi(0.0, 120.0, 300.0, 30, 5, 0, 0, 0, 0, 0, 50.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&kpi, None, &thresholds);
+
+        assert!(
+            alerts.iter().any(|a| a.kind == AnomalyKind::LatencySpike),
+            "should detect latency spike, got: {alerts:?}"
+        );
+    }
+
+    #[test]
+    fn ack_backlog_detected() {
+        // Normal threshold: pending=20, overdue=5
+        let kpi = make_kpi(0.0, 10.0, 20.0, 30, 5, 30, 8, 0, 0, 0, 50.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&kpi, None, &thresholds);
+
+        let ack_count = alerts
+            .iter()
+            .filter(|a| a.kind == AnomalyKind::AckBacklog)
+            .count();
+        assert!(
+            ack_count >= 2,
+            "should detect both pending and overdue ack backlog"
+        );
+    }
+
+    #[test]
+    fn high_utilization_detected() {
+        // Normal pool threshold: 80%
+        let kpi = make_kpi(0.0, 10.0, 20.0, 90, 85, 0, 0, 0, 0, 0, 50.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&kpi, None, &thresholds);
+
+        let util_count = alerts
+            .iter()
+            .filter(|a| a.kind == AnomalyKind::HighUtilization)
+            .count();
+        assert!(
+            util_count >= 2,
+            "should detect both pool and WBQ high utilization"
+        );
+    }
+
+    #[test]
+    fn throughput_drop_detected_with_baseline() {
+        // Current: 5 ops/sec, Baseline: 50 ops/sec → 10% of baseline
+        let current = make_kpi(0.0, 10.0, 20.0, 30, 5, 0, 0, 0, 0, 0, 5.0);
+        let baseline = make_kpi(0.0, 10.0, 20.0, 30, 5, 0, 0, 0, 0, 0, 50.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&current, Some(&baseline), &thresholds);
+
+        let drop_alert = alerts
+            .iter()
+            .find(|a| a.kind == AnomalyKind::ThroughputDrop);
+        assert!(drop_alert.is_some(), "should detect throughput drop");
+        assert!(
+            drop_alert.unwrap().baseline_value.is_some(),
+            "should include baseline value"
+        );
+    }
+
+    #[test]
+    fn throughput_drop_not_detected_without_baseline() {
+        let current = make_kpi(0.0, 10.0, 20.0, 30, 5, 0, 0, 0, 0, 0, 5.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&current, None, &thresholds);
+
+        assert!(
+            !alerts.iter().any(|a| a.kind == AnomalyKind::ThroughputDrop),
+            "should not detect throughput drop without baseline"
+        );
+    }
+
+    #[test]
+    fn sensitivity_levels_affect_thresholds() {
+        let relaxed = AnomalyThresholds::from_sensitivity(Sensitivity::Relaxed);
+        let normal = AnomalyThresholds::from_sensitivity(Sensitivity::Normal);
+        let strict = AnomalyThresholds::from_sensitivity(Sensitivity::Strict);
+
+        // Relaxed should have higher (more lenient) thresholds
+        assert!(relaxed.error_rate_bps > normal.error_rate_bps);
+        assert!(normal.error_rate_bps > strict.error_rate_bps);
+
+        assert!(relaxed.tool_latency_p95_ms > normal.tool_latency_p95_ms);
+        assert!(normal.tool_latency_p95_ms > strict.tool_latency_p95_ms);
+
+        assert!(relaxed.ack_pending_threshold > normal.ack_pending_threshold);
+        assert!(normal.ack_pending_threshold > strict.ack_pending_threshold);
+    }
+
+    #[test]
+    fn strict_sensitivity_catches_more_anomalies() {
+        // Moderate values that Normal won't flag but Strict will
+        let kpi = make_kpi(6.0, 75.0, 180.0, 65, 65, 12, 3, 3, 4, 2, 50.0);
+
+        let normal_alerts = detect_anomalies(
+            &kpi,
+            None,
+            &AnomalyThresholds::from_sensitivity(Sensitivity::Normal),
+        );
+        let strict_alerts = detect_anomalies(
+            &kpi,
+            None,
+            &AnomalyThresholds::from_sensitivity(Sensitivity::Strict),
+        );
+
+        assert!(
+            strict_alerts.len() >= normal_alerts.len(),
+            "strict should catch at least as many anomalies as normal: strict={}, normal={}",
+            strict_alerts.len(),
+            normal_alerts.len()
+        );
+    }
+
+    #[test]
+    fn alerts_sorted_by_severity_then_score() {
+        // Multiple anomalies with different severities
+        let kpi = make_kpi(50.0, 500.0, 800.0, 95, 90, 100, 50, 30, 40, 25, 50.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&kpi, None, &thresholds);
+
+        assert!(!alerts.is_empty());
+
+        // Verify sorting: severity descending, score descending within severity
+        for window in alerts.windows(2) {
+            assert!(
+                window[0].severity >= window[1].severity,
+                "alerts should be sorted by severity descending"
+            );
+            if window[0].severity == window[1].severity {
+                assert!(
+                    window[0].score >= window[1].score - f64::EPSILON,
+                    "within same severity, alerts should be sorted by score descending"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alert_has_human_readable_fields() {
+        let kpi = make_kpi(50.0, 10.0, 20.0, 30, 5, 0, 0, 0, 0, 0, 50.0);
+        let thresholds = AnomalyThresholds::default();
+        let alerts = detect_anomalies(&kpi, None, &thresholds);
+
+        for alert in &alerts {
+            assert!(
+                !alert.explanation.is_empty(),
+                "explanation should not be empty"
+            );
+            assert!(
+                !alert.suggested_action.is_empty(),
+                "suggested_action should not be empty"
+            );
+            assert!(
+                alert.score >= 0.0 && alert.score <= 1.0,
+                "score should be 0..1"
+            );
+        }
+    }
+
+    #[test]
+    fn anomaly_alert_serializable() {
+        let alert = AnomalyAlert {
+            kind: AnomalyKind::HighErrorRate,
+            severity: AnomalySeverity::High,
+            score: 0.75,
+            current_value: 50.0,
+            threshold: 10.0,
+            baseline_value: None,
+            explanation: "Error rate is 50 bps".into(),
+            suggested_action: "Check logs".into(),
+        };
+
+        let json = serde_json::to_value(&alert).expect("should serialize");
+        assert_eq!(json["kind"], "high_error_rate");
+        assert_eq!(json["severity"], "high");
+        assert!(json["score"].as_f64().unwrap() > 0.7);
+    }
+
+    #[test]
+    fn severity_from_score_boundaries() {
+        assert_eq!(severity_from_score(0.0), AnomalySeverity::Low);
+        assert_eq!(severity_from_score(0.29), AnomalySeverity::Low);
+        assert_eq!(severity_from_score(0.3), AnomalySeverity::Medium);
+        assert_eq!(severity_from_score(0.59), AnomalySeverity::Medium);
+        assert_eq!(severity_from_score(0.6), AnomalySeverity::High);
+        assert_eq!(severity_from_score(0.89), AnomalySeverity::High);
+        assert_eq!(severity_from_score(0.9), AnomalySeverity::Critical);
+        assert_eq!(severity_from_score(1.0), AnomalySeverity::Critical);
+    }
+
+    #[test]
+    fn anomaly_kind_display() {
+        assert_eq!(format!("{}", AnomalyKind::HighErrorRate), "high_error_rate");
+        assert_eq!(format!("{}", AnomalyKind::LatencySpike), "latency_spike");
+        assert_eq!(
+            format!("{}", AnomalyKind::ThroughputDrop),
+            "throughput_drop"
+        );
+        assert_eq!(format!("{}", AnomalyKind::AckBacklog), "ack_backlog");
+        assert_eq!(
+            format!("{}", AnomalyKind::HighUtilization),
+            "high_utilization"
+        );
+        assert_eq!(
+            format!("{}", AnomalyKind::WbqBackpressure),
+            "wbq_backpressure"
+        );
+    }
+
+    #[test]
+    fn default_thresholds_match_normal_sensitivity() {
+        let default = AnomalyThresholds::default();
+        let normal = AnomalyThresholds::from_sensitivity(Sensitivity::Normal);
+
+        assert!((default.error_rate_bps - normal.error_rate_bps).abs() < f64::EPSILON);
+        assert!((default.tool_latency_p95_ms - normal.tool_latency_p95_ms).abs() < f64::EPSILON);
+        assert!(
+            (default.ack_pending_threshold - normal.ack_pending_threshold).abs() < f64::EPSILON
+        );
     }
 }
