@@ -2,12 +2,12 @@ Endpoint:
 Web UI:                                                                         
 Auth:     disabled (token_present: false, len: 0)                               
 Checked:  (never)                                                               
+Uptime:   0s                                                                    
                                                                                 
 Connection diagnostics:                                                         
 - [OK] tcp::0  0ms                                                              
                                                                                 
-Keys: r refresh                                                                 
-                                                                                
+Keys: r refresh | v dashboard                                                   
                                                                                 
                                                                                 
                                                                                 
