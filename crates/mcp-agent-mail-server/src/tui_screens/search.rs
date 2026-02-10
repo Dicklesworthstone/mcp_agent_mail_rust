@@ -27,6 +27,7 @@ use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 
 use crate::tui_bridge::TuiSharedState;
+use crate::tui_markdown;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -246,6 +247,8 @@ struct ResultEntry {
     doc_kind: DocKind,
     title: String,
     body_preview: String,
+    /// Full message body for markdown preview (messages only, lazy-loaded).
+    full_body: Option<String>,
     score: Option<f64>,
     importance: Option<String>,
     ack_required: Option<bool>,
@@ -1297,6 +1300,36 @@ impl MailScreen for SearchCockpitScreen {
                             self.search_dirty = true;
                             self.debounce_remaining = 0;
                         }
+                        // Jump to thread (messages only)
+                        KeyCode::Char('o') => {
+                            if let Some(entry) = self.results.get(self.cursor) {
+                                if let Some(ref tid) = entry.thread_id {
+                                    return Cmd::msg(MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::ThreadById(tid.clone()),
+                                    ));
+                                }
+                            }
+                        }
+                        // Jump to agent profile
+                        KeyCode::Char('a') => {
+                            if let Some(entry) = self.results.get(self.cursor) {
+                                if let Some(ref agent) = entry.from_agent {
+                                    return Cmd::msg(MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::AgentByName(agent.clone()),
+                                    ));
+                                }
+                            }
+                        }
+                        // Jump to timeline at message time
+                        KeyCode::Char('T') => {
+                            if let Some(entry) = self.results.get(self.cursor) {
+                                if let Some(ts) = entry.created_ts {
+                                    return Cmd::msg(MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::TimelineAtTime(ts),
+                                    ));
+                                }
+                            }
+                        }
                         // Clear search
                         KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
                             self.query_input.clear();
@@ -1433,6 +1466,18 @@ impl MailScreen for SearchCockpitScreen {
                 action: "Scroll detail",
             },
             HelpEntry {
+                key: "o",
+                action: "Open thread",
+            },
+            HelpEntry {
+                key: "a",
+                action: "Jump to agent",
+            },
+            HelpEntry {
+                key: "T",
+                action: "Timeline at time",
+            },
+            HelpEntry {
                 key: "Ctrl+C",
                 action: "Clear all",
             },
@@ -1527,6 +1572,7 @@ fn query_message_rows(
                         doc_kind: DocKind::Message,
                         title: subject,
                         body_preview: preview,
+                        full_body: Some(body),
                         score: row.get_named("score").ok(),
                         importance: row.get_named("importance").ok(),
                         ack_required: row.get_named::<i64>("ack_required").ok().map(|v| v != 0),
@@ -1555,6 +1601,7 @@ fn query_agent_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> Vec
                         doc_kind: DocKind::Agent,
                         title: name,
                         body_preview: truncate_str(&desc, 120),
+                        full_body: None,
                         score: row.get_named("score").ok(),
                         importance: None,
                         ack_required: None,
@@ -1583,6 +1630,7 @@ fn query_project_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> V
                         doc_kind: DocKind::Project,
                         title: slug,
                         body_preview: human_key,
+                        full_body: None,
                         score: row.get_named("score").ok(),
                         importance: None,
                         ack_required: None,
@@ -1659,6 +1707,7 @@ const FACET_ACTIVE_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xAF, 0xFF, 0xFF); //
 const FACET_LABEL_FG: PackedRgba = PackedRgba::rgba(0x87, 0x87, 0x87, 0xFF); // Grey
 const RESULT_CURSOR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0xD7, 0x00, 0xFF); // Yellow
 const ERROR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0x5F, 0x5F, 0xFF); // Red
+const ACTION_KEY_FG: PackedRgba = PackedRgba::rgba(0x87, 0xD7, 0x87, 0xFF); // Green
 
 fn render_query_bar(
     frame: &mut Frame<'_>,
@@ -2017,6 +2066,12 @@ fn render_detail(
         return;
     };
 
+    // Reserve 1 row for action bar at bottom.
+    let action_bar_h: u16 = 1;
+    let content_h = inner.height.saturating_sub(action_bar_h);
+    let content_area = Rect::new(inner.x, inner.y, inner.width, content_h);
+    let action_area = Rect::new(inner.x, inner.y + content_h, inner.width, action_bar_h);
+
     let label_style = Style::default().fg(FACET_LABEL_FG);
     let highlight_style = Style::default().fg(RESULT_CURSOR_FG).bold();
 
@@ -2060,18 +2115,70 @@ fn render_detail(
         lines.push(Line::raw(format!("Score:   {score:.3}")));
     }
 
+    // Markdown preview section (messages with full body) or plain preview fallback.
     lines.push(Line::raw(String::new()));
-    lines.push(Line::styled("--- Preview ---".to_string(), label_style));
-    lines.push(Line::from_spans(highlight_spans(
-        &entry.body_preview,
-        highlight_terms,
-        None,
-        highlight_style,
-    )));
+    if let Some(ref body) = entry.full_body {
+        lines.push(Line::styled(
+            "\u{2500}\u{2500}\u{2500} Body \u{2500}\u{2500}\u{2500}".to_string(),
+            label_style,
+        ));
+        let theme = tui_markdown::MarkdownTheme::default();
+        let rendered = tui_markdown::render_body(body, &theme);
+        for line in rendered.lines() {
+            lines.push(line.clone());
+        }
+    } else {
+        lines.push(Line::styled(
+            "\u{2500}\u{2500}\u{2500} Preview \u{2500}\u{2500}\u{2500}".to_string(),
+            label_style,
+        ));
+        lines.push(Line::from_spans(highlight_spans(
+            &entry.body_preview,
+            highlight_terms,
+            None,
+            highlight_style,
+        )));
+    }
 
-    // Apply scroll
+    // Apply scroll and render content.
     let skip = scroll.min(lines.len().saturating_sub(1));
-    Paragraph::new(Text::from_lines(lines.into_iter().skip(skip))).render(inner, frame);
+    Paragraph::new(Text::from_lines(lines.into_iter().skip(skip))).render(content_area, frame);
+
+    // Contextual action bar.
+    render_action_bar(frame, action_area, entry);
+}
+
+/// Render a contextual action bar showing available deep-link keys.
+fn render_action_bar(frame: &mut Frame<'_>, area: Rect, entry: &ResultEntry) {
+    if area.width < 10 || area.height == 0 {
+        return;
+    }
+    let key_style = Style::default().fg(ACTION_KEY_FG).bold();
+    let label_style = Style::default().fg(FACET_LABEL_FG);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // Enter always available
+    spans.push(Span::styled("Enter".to_string(), key_style));
+    spans.push(Span::styled(" Open  ".to_string(), label_style));
+
+    if entry.thread_id.is_some() {
+        spans.push(Span::styled("o".to_string(), key_style));
+        spans.push(Span::styled(" Thread  ".to_string(), label_style));
+    }
+    if entry.from_agent.is_some() {
+        spans.push(Span::styled("a".to_string(), key_style));
+        spans.push(Span::styled(" Agent  ".to_string(), label_style));
+    }
+    if entry.created_ts.is_some() {
+        spans.push(Span::styled("T".to_string(), key_style));
+        spans.push(Span::styled(" Timeline  ".to_string(), label_style));
+    }
+    spans.push(Span::styled("J/K".to_string(), key_style));
+    spans.push(Span::styled(" Scroll".to_string(), label_style));
+
+    let line = Line::from_spans(spans);
+    Paragraph::new(Text::from_lines(vec![line])).render(area, frame);
 }
 
 /// Compute a centered viewport range for scrolling.
@@ -2607,6 +2714,251 @@ mod tests {
             spans
                 .iter()
                 .any(|s| s.as_str() == "xx" && s.style == Some(base))
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // br-3vwi.4.3: Markdown preview + contextual actions + deep-links
+    // ──────────────────────────────────────────────────────────────────
+
+    fn make_msg_entry() -> ResultEntry {
+        ResultEntry {
+            id: 42,
+            doc_kind: DocKind::Message,
+            title: "Test subject".to_string(),
+            body_preview: "short preview".to_string(),
+            full_body: Some("# Hello\n\nThis is **bold** markdown.".to_string()),
+            score: Some(0.95),
+            importance: Some("normal".to_string()),
+            ack_required: Some(false),
+            created_ts: Some(1_700_000_000_000_000),
+            thread_id: Some("test-thread".to_string()),
+            from_agent: Some("GoldFox".to_string()),
+            project_id: Some(1),
+        }
+    }
+
+    fn make_agent_entry() -> ResultEntry {
+        ResultEntry {
+            id: 10,
+            doc_kind: DocKind::Agent,
+            title: "GoldFox".to_string(),
+            body_preview: "agent task description".to_string(),
+            full_body: None,
+            score: None,
+            importance: None,
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            project_id: Some(1),
+        }
+    }
+
+    #[test]
+    fn result_entry_full_body_populated_for_messages() {
+        let entry = make_msg_entry();
+        assert!(entry.full_body.is_some());
+        assert!(entry.full_body.as_ref().unwrap().contains("**bold**"));
+    }
+
+    #[test]
+    fn result_entry_full_body_none_for_agents() {
+        let entry = make_agent_entry();
+        assert!(entry.full_body.is_none());
+    }
+
+    #[test]
+    fn render_detail_with_markdown_no_panic() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 30, &mut pool);
+        let entry = make_msg_entry();
+        render_detail(&mut frame, Rect::new(0, 0, 80, 30), Some(&entry), 0, &[]);
+        let text = buffer_to_text(&frame.buffer);
+        // Should contain the body header
+        assert!(
+            text.contains("Body"),
+            "detail should show Body header, got:\n{text}"
+        );
+        // Should contain action bar keys
+        assert!(
+            text.contains("Enter"),
+            "detail should show Enter action, got:\n{text}"
+        );
+        assert!(
+            text.contains("Thread"),
+            "detail should show Thread action, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_detail_plain_preview_when_no_full_body() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 20, &mut pool);
+        let entry = make_agent_entry();
+        render_detail(&mut frame, Rect::new(0, 0, 80, 20), Some(&entry), 0, &[]);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Preview"),
+            "agent detail should show Preview header, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_detail_no_entry_shows_prompt() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(60, 10, &mut pool);
+        render_detail(&mut frame, Rect::new(0, 0, 60, 10), None, 0, &[]);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Select a result"),
+            "should show selection prompt, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn action_bar_shows_thread_for_message() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 2, &mut pool);
+        let entry = make_msg_entry();
+        render_action_bar(&mut frame, Rect::new(0, 0, 80, 1), &entry);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Thread"),
+            "message action bar should show Thread, got:\n{text}"
+        );
+        assert!(
+            text.contains("Agent"),
+            "message action bar should show Agent, got:\n{text}"
+        );
+        assert!(
+            text.contains("Timeline"),
+            "message action bar should show Timeline, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn action_bar_hides_thread_for_agent() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 2, &mut pool);
+        let entry = make_agent_entry();
+        render_action_bar(&mut frame, Rect::new(0, 0, 80, 1), &entry);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            !text.contains("Thread"),
+            "agent action bar should not show Thread, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Agent"),
+            "agent action bar should not show Agent, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn o_key_emits_thread_deep_link() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::ResultList;
+        screen.results = vec![make_msg_entry()];
+        screen.cursor = 0;
+
+        let o = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('o'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let cmd = screen.update(&o, &state);
+
+        // Should emit a DeepLink command (non-None)
+        assert!(
+            !matches!(cmd, Cmd::None),
+            "o key should emit deep link for thread"
+        );
+    }
+
+    #[test]
+    fn a_key_emits_agent_deep_link() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::ResultList;
+        screen.results = vec![make_msg_entry()];
+        screen.cursor = 0;
+
+        let a = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('a'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let cmd = screen.update(&a, &state);
+
+        assert!(
+            !matches!(cmd, Cmd::None),
+            "a key should emit deep link for agent"
+        );
+    }
+
+    #[test]
+    fn shift_t_key_emits_timeline_deep_link() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::ResultList;
+        screen.results = vec![make_msg_entry()];
+        screen.cursor = 0;
+
+        let t = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('T'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let cmd = screen.update(&t, &state);
+
+        assert!(
+            !matches!(cmd, Cmd::None),
+            "T key should emit deep link for timeline"
+        );
+    }
+
+    #[test]
+    fn o_key_noop_when_no_thread_id() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::ResultList;
+        screen.results = vec![make_agent_entry()];
+        screen.cursor = 0;
+
+        let o = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('o'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let cmd = screen.update(&o, &state);
+
+        assert!(
+            matches!(cmd, Cmd::None),
+            "o key should be noop for agent (no thread_id)"
+        );
+    }
+
+    #[test]
+    fn keybindings_include_contextual_actions() {
+        let screen = SearchCockpitScreen::new();
+        let bindings = screen.keybindings();
+        let actions: Vec<&str> = bindings.iter().map(|h| h.action).collect();
+        assert!(
+            actions.contains(&"Open thread"),
+            "keybindings should include 'Open thread'"
+        );
+        assert!(
+            actions.contains(&"Jump to agent"),
+            "keybindings should include 'Jump to agent'"
+        );
+        assert!(
+            actions.contains(&"Timeline at time"),
+            "keybindings should include 'Timeline at time'"
         );
     }
 }
