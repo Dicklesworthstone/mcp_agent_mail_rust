@@ -95,6 +95,17 @@ journeys.
    - overseer send endpoint
    - archive/time-travel story (explicitly fold into export/static pipeline or restore web UI)
 
+## Unresolved Tradeoffs (Record Explicitly)
+
+- **`/mail` meaning**: legacy uses `/mail` for unified inbox; Rust currently uses `/mail` as project index.
+  - Option A (parity): make `/mail` unified inbox and move index to `/mail/projects` (legacy-compatible).
+  - Option B (delta): keep Rust `/mail` as index, but ensure `/mail/unified-inbox` is first-class and discoverable.
+- **Archive/time-travel UI**: legacy has `/mail/archive/*` browsing/network/time-travel routes.
+  - Option A (web parity): re-implement archive viewer routes and tests in Rust web UI.
+  - Option B (differentiation): fold archive/time-travel into `Exports` + static export workflows, with deep-link/anchor parity.
+- **Search “power user” semantics**: legacy supports query scoping, ordering, boost, and FTS snippets.
+  - If omitted in Rust, compensate with a clear Search Cockpit UX that still satisfies operator journeys.
+
 ## Quality Checks
 
 - Every “Close parity” row must have an owner bead ID before implementation starts.
