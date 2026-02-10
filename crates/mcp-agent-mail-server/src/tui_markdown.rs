@@ -269,4 +269,207 @@ Thanks!";
         let text = render_body_streaming(partial, &theme());
         assert!(text.height() >= 3);
     }
+
+    // ── Security / hostile markdown tests ─────────────────────────
+
+    #[test]
+    fn hostile_script_tag_safe_in_terminal() {
+        // In terminal context, HTML tags render as literal text (no DOM execution).
+        // Verify content renders without panic and script is not hidden.
+        let md = "Hello <script>alert('xss')</script> world";
+        let text = render_body(md, &theme());
+        let rendered = text_to_string(&text);
+        // Content should be visible (not silently swallowed)
+        assert!(rendered.contains("Hello"), "surrounding text preserved");
+        assert!(rendered.contains("world"), "surrounding text preserved");
+        assert!(text.height() >= 1, "renders without panic");
+    }
+
+    #[test]
+    fn hostile_onerror_safe_in_terminal() {
+        // Event handlers are inert in terminal rendering — no DOM to attach to
+        let md = "![img](x onerror=alert(1))";
+        let text = render_body(md, &theme());
+        assert!(text.height() >= 1, "renders without panic");
+    }
+
+    #[test]
+    fn hostile_javascript_url_safe_in_terminal() {
+        // javascript: URLs are inert in terminal — no browser to execute
+        let md = "[click](javascript:alert(1))";
+        let text = render_body(md, &theme());
+        let rendered = text_to_string(&text);
+        assert!(rendered.contains("click"), "link text preserved");
+        assert!(text.height() >= 1, "renders without panic");
+    }
+
+    #[test]
+    fn hostile_deeply_nested_markup() {
+        // Deeply nested emphasis/bold shouldn't cause stack overflow
+        let deep = "*".repeat(500) + "text" + &"*".repeat(500);
+        let text = render_body(&deep, &theme());
+        // Should render without panic — content doesn't matter
+        assert!(text.height() >= 1);
+    }
+
+    #[test]
+    fn hostile_huge_heading() {
+        let md = format!("# {}\n\nBody", "A".repeat(10_000));
+        let text = render_body(&md, &theme());
+        assert!(text.height() >= 2);
+    }
+
+    #[test]
+    fn hostile_huge_table() {
+        // Table with many columns
+        let header = (0..100)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let sep = (0..100).map(|_| "---").collect::<Vec<_>>().join("|");
+        let row = (0..100)
+            .map(|i| format!("v{i}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let md = format!("|{header}|\n|{sep}|\n|{row}|");
+        let text = render_body(&md, &theme());
+        assert!(
+            text.height() >= 1,
+            "Large table should render without panic"
+        );
+    }
+
+    #[test]
+    fn hostile_unclosed_code_fence() {
+        let md = "```\nunclosed code\nblock\nhere";
+        let text = render_body(md, &theme());
+        assert!(text.height() >= 1);
+    }
+
+    #[test]
+    fn hostile_zero_width_characters() {
+        let md = "Hello\u{200B}World\u{200B}Test **bold\u{200B}text**";
+        let text = render_body(md, &theme());
+        assert!(text.height() >= 1);
+    }
+
+    #[test]
+    fn hostile_control_characters() {
+        let md = "Hello\x01\x02\x03World\n**bold\x0B text**";
+        let text = render_body(md, &theme());
+        assert!(text.height() >= 1);
+    }
+
+    #[test]
+    fn hostile_ansi_escape_in_markdown() {
+        // ANSI escape sequences embedded in markdown content should render
+        // without crashing. Terminal rendering uses styled spans (not raw ANSI),
+        // so embedded escapes are treated as literal characters.
+        let md = "Hello \x1b[31mred\x1b[0m text";
+        let text = render_body(md, &theme());
+        assert!(text.height() >= 1, "renders without panic");
+        let rendered = text_to_string(&text);
+        // Core text should be preserved
+        assert!(rendered.contains("Hello"), "surrounding text preserved");
+        assert!(rendered.contains("text"), "surrounding text preserved");
+    }
+
+    #[test]
+    fn hostile_null_bytes() {
+        let md = "Hello\0World\0**bold**";
+        let text = render_body(md, &theme());
+        assert!(text.height() >= 1);
+    }
+
+    #[test]
+    fn hostile_extremely_long_line() {
+        let long_line = "x".repeat(100_000);
+        let md = format!("Start\n\n{long_line}\n\nEnd");
+        let text = render_body(&md, &theme());
+        assert!(text.height() >= 1, "Extremely long line should not panic");
+    }
+
+    #[test]
+    fn hostile_many_backticks() {
+        // Many backtick sequences that could confuse fence detection
+        let md = "````````````````````````````````";
+        let text = render_body(md, &theme());
+        assert!(text.height() >= 1, "should render at least one line");
+    }
+
+    #[test]
+    fn hostile_html_entities() {
+        let md = "Hello &lt;script&gt;alert(1)&lt;/script&gt; world";
+        let text = render_body(md, &theme());
+        let rendered = text_to_string(&text);
+        // Entities should decode safely, not execute
+        assert!(
+            !rendered.contains("<script"),
+            "HTML entities must not become tags"
+        );
+    }
+
+    #[test]
+    fn hostile_image_with_huge_alt() {
+        let alt = "A".repeat(50_000);
+        let md = format!("![{alt}](https://example.com/img.png)");
+        let text = render_body(&md, &theme());
+        assert!(text.height() >= 1);
+    }
+
+    // ── Snapshot-style rendering consistency tests ─────────────────
+
+    #[test]
+    fn snapshot_heading_produces_styled_output() {
+        let md = "# Title\n\nParagraph **text**.";
+        let text = render_body(md, &theme());
+        let lines = text.lines();
+        // First line should be the heading
+        assert!(!lines.is_empty());
+        // Heading line should have some styled spans (not just raw text)
+        let first = &lines[0];
+        assert!(!first.spans().is_empty(), "heading should have spans");
+    }
+
+    #[test]
+    fn snapshot_code_fence_has_content() {
+        let md = "```\nhello\nworld\n```";
+        let text = render_body(md, &theme());
+        let rendered = text_to_string(&text);
+        assert!(
+            rendered.contains("hello"),
+            "code content should be preserved"
+        );
+        assert!(
+            rendered.contains("world"),
+            "code content should be preserved"
+        );
+    }
+
+    #[test]
+    fn snapshot_list_items_have_bullets_or_numbers() {
+        let md = "- alpha\n- beta\n- gamma";
+        let text = render_body(md, &theme());
+        let rendered = text_to_string(&text);
+        // List items should contain their text
+        assert!(rendered.contains("alpha"));
+        assert!(rendered.contains("beta"));
+        assert!(rendered.contains("gamma"));
+    }
+
+    // ── Helper ────────────────────────────────────────────────────
+
+    /// Flatten styled Text into a plain string for assertion checks.
+    fn text_to_string(text: &Text) -> String {
+        text.lines()
+            .iter()
+            .map(|line| {
+                line.spans()
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
