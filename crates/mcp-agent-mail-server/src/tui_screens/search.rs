@@ -2596,7 +2596,7 @@ mod tests {
         let highlight = Style::default().fg(RESULT_CURSOR_FG).bold();
         let spans = highlight_spans("xxNEEDLEyy", &terms, Some(base), highlight);
 
-        let plain: String = spans.iter().map(|s| s.as_str()).collect();
+        let plain: String = spans.iter().map(Span::as_str).collect();
         assert_eq!(plain, "xxNEEDLEyy");
         assert!(
             spans
