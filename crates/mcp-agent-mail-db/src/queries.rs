@@ -1570,9 +1570,35 @@ pub fn sanitize_fts_query(query: &str) -> Option<String> {
         return None;
     }
 
+    // Punctuation/emoji-only queries (no alphanumeric content) cannot yield meaningful matches.
+    if !trimmed.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+
     // Bare boolean operators without terms
     let upper = trimmed.to_ascii_uppercase();
     if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
+        return None;
+    }
+
+    // Multi-token boolean operator sequences without any terms.
+    // Examples: "AND OR NOT", "(AND) OR" → None.
+    let mut saw_operator = false;
+    let mut saw_term = false;
+    for raw_tok in trimmed.split_whitespace() {
+        let tok = raw_tok.trim_matches(|c: char| !c.is_alphanumeric());
+        if tok.is_empty() {
+            continue;
+        }
+        match tok.to_ascii_uppercase().as_str() {
+            "AND" | "OR" | "NOT" | "NEAR" => saw_operator = true,
+            _ => {
+                saw_term = true;
+                break;
+            }
+        }
+    }
+    if saw_operator && !saw_term {
         return None;
     }
 
@@ -3906,6 +3932,19 @@ mod tests {
         assert!(sanitize_fts_query("OR").is_none());
         assert!(sanitize_fts_query("NOT").is_none());
         assert!(sanitize_fts_query("and").is_none());
+    }
+
+    #[test]
+    fn sanitize_operator_only_sequences() {
+        assert!(sanitize_fts_query("AND OR NOT").is_none());
+        assert!(sanitize_fts_query("(AND) OR").is_none());
+        assert!(sanitize_fts_query("NEAR AND").is_none());
+    }
+
+    #[test]
+    fn sanitize_punctuation_only_is_none() {
+        assert!(sanitize_fts_query("!!!").is_none());
+        assert!(sanitize_fts_query("((()))").is_none());
     }
 
     #[test]

@@ -11,14 +11,14 @@
 use std::sync::Arc;
 
 use ftui::{Frame, GraphemePool};
-use ftui_harness::{assert_snapshot, buffer_to_text, Rect};
+use ftui_harness::{Rect, assert_snapshot, buffer_to_text};
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
 use mcp_agent_mail_server::tui_screens::{
-    agents::AgentsScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen,
-    reservations::ReservationsScreen, search::SearchCockpitScreen,
+    MailScreen, MailScreenId, agents::AgentsScreen, dashboard::DashboardScreen,
+    messages::MessageBrowserScreen, reservations::ReservationsScreen, search::SearchCockpitScreen,
     system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
-    tool_metrics::ToolMetricsScreen, MailScreen, MailScreenId,
+    tool_metrics::ToolMetricsScreen,
 };
 
 // ---------------------------------------------------------------------------

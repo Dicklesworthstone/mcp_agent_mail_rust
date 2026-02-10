@@ -531,10 +531,55 @@ use crate::queries::{extract_like_terms, sanitize_fts_query};
 /// agent-identity resolution that the pure planner cannot perform.
 #[must_use]
 pub fn plan_search(query: &SearchQuery) -> SearchPlan {
-    match query.doc_kind {
+    let mut plan = match query.doc_kind {
         DocKind::Message => plan_message_search(query),
         DocKind::Agent => plan_agent_search(query),
         DocKind::Project => plan_project_search(query),
+    };
+
+    // Even when we short-circuit execution for empty plans, the planner contract
+    // expects a non-empty, valid SQL string for hostile/non-searchable *non-empty*
+    // inputs. Use a deterministic, schema-independent "empty result" query.
+    if plan.method == PlanMethod::Empty && !query.text.is_empty() && plan.sql.is_empty() {
+        plan.sql = empty_plan_sql(query.doc_kind).to_string();
+    }
+
+    plan
+}
+
+const fn empty_plan_sql(kind: DocKind) -> &'static str {
+    match kind {
+        DocKind::Message => {
+            "SELECT \
+                0 AS id, \
+                '' AS subject, \
+                '' AS importance, \
+                0 AS ack_required, \
+                0 AS created_ts, \
+                '' AS thread_id, \
+                '' AS from_name, \
+                '' AS body_md, \
+                0 AS project_id, \
+                0.0 AS score \
+             WHERE 0"
+        }
+        DocKind::Agent => {
+            "SELECT \
+                0 AS id, \
+                '' AS name, \
+                '' AS task_description, \
+                0 AS project_id, \
+                0.0 AS score \
+             WHERE 0"
+        }
+        DocKind::Project => {
+            "SELECT \
+                0 AS id, \
+                '' AS slug, \
+                '' AS human_key, \
+                0.0 AS score \
+             WHERE 0"
+        }
     }
 }
 

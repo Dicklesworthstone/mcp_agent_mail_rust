@@ -48,6 +48,7 @@ static HTML_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
             "b",
             "blockquote",
             "code",
+            "del", // Comrak uses <del> for ~~strikethrough~~.
             "em",
             "i",
             "li",
@@ -178,7 +179,7 @@ mod tests {
     #[test]
     fn strikethrough() {
         let html = render_markdown_to_safe_html("~~deleted~~");
-        assert!(html.contains("deleted"));
+        assert!(html.contains("<del>deleted</del>"));
     }
 
     #[test]
@@ -274,5 +275,105 @@ mod tests {
         let html =
             render_markdown_to_safe_html("<img src=\"data:image/png;base64,abc123\" alt=\"pic\">");
         assert!(html.contains("data:image/png"));
+    }
+
+    // --- Parity conformance tests (br-3vwi.13.3) ---
+
+    #[test]
+    fn code_block_with_language_class_preserved() {
+        let html = render_markdown_to_safe_html("```python\nprint('hello')\n```");
+        assert!(html.contains("<pre>"));
+        assert!(html.contains("<code"));
+        assert!(html.contains("language-python"));
+        assert!(html.contains("print(&#x27;hello&#x27;)") || html.contains("print('hello')"));
+    }
+
+    #[test]
+    fn nested_lists() {
+        let md = "- outer\n  - inner\n  - inner2\n- outer2";
+        let html = render_markdown_to_safe_html(md);
+        assert!(html.contains("<ul>"));
+        assert!(html.contains("outer"));
+        assert!(html.contains("inner"));
+    }
+
+    #[test]
+    fn mixed_html_and_markdown() {
+        let md = "**bold** and <em>html italic</em> and `code`";
+        let html = render_markdown_to_safe_html(md);
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("<em>html italic</em>"));
+        assert!(html.contains("<code>code</code>"));
+    }
+
+    #[test]
+    fn inline_code_not_rendered() {
+        let html = render_markdown_to_safe_html("`**not bold**`");
+        assert!(html.contains("<code>**not bold**</code>") || html.contains("<code>"));
+        assert!(!html.contains("<strong>"));
+    }
+
+    #[test]
+    fn link_no_rel_attribute_forced() {
+        // Python parity: bleach does not force rel on links.
+        let html = render_markdown_to_safe_html("[link](https://example.com)");
+        assert!(!html.contains("noopener"));
+        assert!(!html.contains("noreferrer"));
+    }
+
+    #[test]
+    fn table_with_alignment() {
+        let md = "| Left | Center | Right |\n|:-----|:------:|------:|\n| a | b | c |";
+        let html = render_markdown_to_safe_html(md);
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<th"));
+        assert!(html.contains("<td"));
+    }
+
+    #[test]
+    fn horizontal_rule() {
+        let html = render_markdown_to_safe_html("above\n\n---\n\nbelow");
+        assert!(html.contains("<hr"));
+    }
+
+    #[test]
+    fn hard_breaks_enabled() {
+        let html = render_markdown_to_safe_html("line one\nline two");
+        assert!(html.contains("<br"));
+    }
+
+    #[test]
+    fn svg_xss_stripped() {
+        let html =
+            render_markdown_to_safe_html("<svg onload=\"alert(1)\"><circle r=10></circle></svg>");
+        assert!(!html.contains("<svg"));
+        assert!(!html.contains("onload"));
+    }
+
+    #[test]
+    fn img_onerror_stripped() {
+        let html = render_markdown_to_safe_html("<img src=x onerror=\"alert(1)\">");
+        assert!(!html.contains("onerror"));
+    }
+
+    #[test]
+    fn encoded_javascript_url_stripped() {
+        let html = render_markdown_to_safe_html("<a href=\"&#106;avascript:alert(1)\">click</a>");
+        assert!(!html.contains("javascript"));
+    }
+
+    #[test]
+    fn unicode_preserved() {
+        let html = render_markdown_to_safe_html("日本語テスト 🦀 Ñoño");
+        assert!(html.contains("日本語テスト"));
+        assert!(html.contains("🦀"));
+        assert!(html.contains("Ñoño"));
+    }
+
+    #[test]
+    fn long_content_does_not_truncate() {
+        let long = "x".repeat(100_000);
+        let html = render_markdown_to_safe_html(&long);
+        assert!(html.len() >= 100_000);
     }
 }

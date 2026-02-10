@@ -711,3 +711,222 @@ TuiSharedState.sparkline_data() -> VecDeque<f64>
 | Persistence | `crates/mcp-agent-mail-server/src/tui_persist.rs` |
 | DB queries | `crates/mcp-agent-mail-db/src/queries.rs` |
 | Tool metrics | `crates/mcp-agent-mail-tools/src/metrics.rs` |
+
+---
+
+## Appendix C: Widget Catalog (FrankentUI Showcase Pack)
+
+This appendix defines the **advanced widget set** targeted by `br-3vwi.6`
+([track] FrankentUI advanced widgets/gizmos showcase pack). Each widget is
+specified by:
+
+- Operator question answered (no gimmicks)
+- Data contract (exact inputs + units)
+- Interaction + deep-link actions (keyboard-first)
+- Fallback behavior at the 5 breakpoint profiles used in the test matrix:
+  `40x10`, `80x24`, `120x40`, `160x50`, `200x60`
+
+### C.1 Data Contract Conventions
+
+- Timestamps are `i64` microseconds since Unix epoch (UTC).
+- Durations are displayed in milliseconds unless explicitly labeled otherwise.
+- Percentiles MUST be computed over a fixed rolling window (widget header must
+  show the window, e.g. "last 15m", "last 60m").
+- All ordering is deterministic with explicit tie-breakers (see each widget).
+
+Contract-level shapes (not an implementation requirement, but the semantics are
+binding):
+
+```rust
+/// One time-bucketed data point.
+struct TimeSeriesPoint {
+    ts_us: i64,
+    value: f64,
+}
+
+/// Percentiles over a defined rolling window.
+struct Percentiles {
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+```
+
+### C.2 Widget Index
+
+| Widget ID | Name | Primary Screen | Default Action |
+|----------:|------|----------------|----------------|
+| W-001 | Request Throughput Heatmap | Dashboard | `Enter` -> TimelineAtTime |
+| W-002 | Tool Latency Ribbon (P50/P95/P99) | ToolMetrics, Dashboard | `Enter` -> ToolByName |
+| W-003 | Ack SLA Ribbon (age percentiles) | Dashboard, Messages | `Enter` -> Messages preset (ack required) |
+| W-004 | Inbox Pressure Leaderboard | Dashboard, Agents | `Enter` -> AgentByName |
+| W-005 | Reservation Contention Map | Dashboard, Reservations | `Enter` -> ReservationByAgent |
+| W-006 | Anomaly / Insight Cards | Dashboard | `Enter` -> Deep link from card |
+| W-007 | Export Pipeline Status Panel | Exports | `Enter` -> Open artifact / route |
+
+### C.3 W-001: Request Throughput Heatmap
+
+**Operator question:** "When did load spike, and is it increasing or cooling?"
+
+**Data contract:**
+- `window_seconds`: typically `3600` (last hour)
+- `bucket_seconds`: typically `60` (per-minute)
+- `buckets`: `Vec<TimeSeriesPoint>` where `value` is requests per bucket
+- `max_value`: max of `value` over the window (used for color scaling)
+
+**Interactions:**
+- Arrow keys move a cursor across buckets (older -> newer).
+- `Enter` deep-links to `TimelineAtTime(ts_us)` for the selected bucket start.
+
+**Determinism:**
+- Bucket boundaries are aligned to `bucket_seconds` on UTC epoch boundaries.
+- If there are missing buckets, they MUST be present with `value=0`.
+
+**Fallback behavior:**
+- `40x10`: show "req/min now" + a 60-sample sparkline, no heatmap grid.
+- `80x24`: single-row heatmap (newest on right) + current req/min label.
+- `120x40+`: multi-row heatmap with cursor + legend.
+
+### C.4 W-002: Tool Latency Ribbon (P50/P95/P99)
+
+**Operator question:** "Which tool is slow right now, and how bad is the tail?"
+
+**Data contract (top-N tools, typically N=10):**
+- `window_seconds`: rolling window used by the metrics snapshot
+- `tools`: list of entries:
+  - `tool_name`: `String`
+  - `calls`: `u64`
+  - `errors`: `u64`
+  - `latency`: `Percentiles` (ms)
+
+**Interactions:**
+- Up/down selects a tool row.
+- `Enter` deep-links to `ToolByName(tool_name)`.
+
+**Determinism:**
+- Default sort: `p95_ms desc`, tie-breaker `tool_name asc`.
+- Values are displayed with fixed rounding (integer ms).
+
+**Fallback behavior:**
+- `40x10`: show only the single worst tool (p95) + its p50/p95/p99 numbers.
+- `80x24`: show top 5 rows, compact ribbons.
+- `120x40+`: show top 10 rows with error badges and richer ribbons.
+
+### C.5 W-003: Ack SLA Ribbon (age percentiles)
+
+**Operator question:** "Are ack-required messages getting stuck?"
+
+**Data contract:**
+- `window_seconds`: typically `86400` (last day) for SLA context
+- `pending_count`: `u64` (ack-required + not yet acknowledged)
+- `age_percentiles_ms`: `Percentiles` computed over `now - created_ts`
+- Optional: `oldest_age_ms`: `u64` (for explicit worst-case display)
+
+**Interactions:**
+- `Enter` deep-links to Messages with the `Ack Required` preset enabled.
+
+**Determinism:**
+- If `pending_count == 0`, percentiles MUST render as `0ms` and widget shows
+  "No pending acks".
+
+**Fallback behavior:**
+- `40x10`: show `pending_count` + `oldest_age_ms`.
+- `80x24+`: show ribbon + percentiles + deep-link hint.
+
+### C.6 W-004: Inbox Pressure Leaderboard
+
+**Operator question:** "Which agents are overloaded or falling behind?"
+
+**Data contract (top-N agents, typically N=8):**
+- `agents`: list of entries:
+  - `agent_name`: `String`
+  - `unread_count`: `u64`
+  - `ack_pending_count`: `u64`
+  - `last_active_ts_us`: `i64`
+
+**Interactions:**
+- Up/down selects an agent.
+- `Enter` deep-links to `AgentByName(agent_name)`.
+
+**Determinism:**
+- Default sort: `unread_count desc`, tie-breaker `agent_name asc`.
+- "Inactive" is computed deterministically from `now - last_active_ts_us` using
+  a fixed threshold (TBD in analytics track), and displayed as a badge only.
+
+**Fallback behavior:**
+- `40x10`: show only top 3 agents with unread counts.
+- `80x24+`: show top 8 with ack pending and last-active badge.
+
+### C.7 W-005: Reservation Contention Map
+
+**Operator question:** "Where are agents colliding on file ownership?"
+
+**Data contract:**
+- `active_reservations`: list of `(agent_name, path_pattern, exclusive, expires_ts_us)`
+- `conflicts`: derived list of conflict groups with:
+  - `path_pattern`: `String` (the canonical pattern displayed)
+  - `agents`: `Vec<String>` (sorted)
+  - `exclusive_conflict`: `bool`
+
+**Interactions:**
+- Up/down selects a conflict group or reservation row.
+- `Enter` deep-links to `ReservationByAgent(agent_name)` for the primary agent.
+
+**Determinism:**
+- Conflict grouping uses a stable canonicalization:
+  - `path_pattern` sorted ascending
+  - within group, `agents` sorted ascending
+- Default sort: `exclusive_conflict desc`, then `agents.len() desc`, then `path_pattern asc`.
+
+**Fallback behavior:**
+- `40x10`: show a single line: "conflicts: N (exclusive: M)".
+- `80x24+`: compact table of conflict groups.
+- `120x40+`: include TTL countdown and reservation reasons (bead IDs).
+
+### C.8 W-006: Anomaly / Insight Cards
+
+**Operator question:** "What is unusual right now, how confident are we, and what should I do next?"
+
+**Data contract:**
+- `cards`: list of entries:
+  - `title`: `String`
+  - `severity`: `Info|Warn|Error`
+  - `confidence`: `f64` in `[0.0, 1.0]`
+  - `rationale`: short `String` (1-2 lines, deterministic phrasing)
+  - `evidence_ts_us`: `i64`
+  - `deep_link`: one of the DeepLinkTargets in section 2.4
+
+**Interactions:**
+- Left/right selects a card; `Enter` navigates via the card's `deep_link`.
+
+**Determinism:**
+- Ordering is stable: `severity desc`, then `confidence desc`, then `title asc`.
+- Card text must not include nondeterministic numbers without rounding rules.
+
+**Fallback behavior:**
+- `40x10`: show only the top card (title + action hint).
+- `80x24+`: show 2-3 cards.
+- `120x40+`: show 4-6 cards with rationale lines.
+
+### C.9 W-007: Export Pipeline Status Panel
+
+**Operator question:** "Are exports/snapshots working, and where are the artifacts?"
+
+**Data contract:**
+- `recent_exports`: list of entries:
+  - `export_id`: `String` (stable identifier)
+  - `created_ts_us`: `i64`
+  - `status`: `Queued|Running|Success|Failed`
+  - `target`: `GitHubPages|CloudflarePages|LocalBundle`
+  - `artifact_paths`: `Vec<String>` (sorted)
+  - Optional: `error_summary`: `String` (short)
+
+**Interactions:**
+- `Enter` opens the selected export detail route (web UI) or copies the artifact path.
+
+**Determinism:**
+- Default sort: `created_ts_us desc`, tie-breaker `export_id asc`.
+
+**Fallback behavior:**
+- `40x10`: show only most recent export status.
+- `80x24+`: show list with status badges.

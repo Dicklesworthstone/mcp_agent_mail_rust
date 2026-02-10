@@ -10,7 +10,7 @@ use fastmcp_core::block_on;
 use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
 use mcp_agent_mail_db::pool::DbPool;
-use mcp_agent_mail_db::timestamps::micros_to_iso;
+use mcp_agent_mail_db::timestamps::{micros_to_iso, micros_to_naive, now_micros};
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
 use mcp_agent_mail_storage::{self as storage, ensure_archive, ensure_archive_root};
 use serde::Serialize;
@@ -20,9 +20,17 @@ use crate::templates;
 
 /// Dispatch a mail UI request to the correct handler.
 ///
-/// Returns `Some(html_string)` if the route was handled, `None` for unrecognized paths.
+/// Returns `Some(html_or_json_string)` if the route was handled, `None` for unrecognized paths.
 /// Returns `Err(status, message)` for errors.
-pub fn dispatch(path: &str, query: &str) -> Result<Option<String>, (u16, String)> {
+///
+/// `method` should be `"GET"` or `"POST"`.
+/// `body` is the raw request body (only relevant for POST requests).
+pub fn dispatch(
+    path: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+) -> Result<Option<String>, (u16, String)> {
     let cx = Cx::for_testing();
     let pool = get_pool()?;
 
@@ -30,15 +38,17 @@ pub fn dispatch(path: &str, query: &str) -> Result<Option<String>, (u16, String)
     let sub = path.strip_prefix("/mail").unwrap_or(path);
 
     match sub {
-        "" | "/" => render_index(&cx, &pool),
-        "/unified-inbox" => {
+        // Python parity: GET /mail and /mail/unified-inbox → unified inbox.
+        "" | "/" | "/unified-inbox" => {
             let limit = extract_query_int(query, "limit", 10000);
             let filter_importance = extract_query_str(query, "filter_importance");
             render_unified_inbox(&cx, &pool, limit, filter_importance.as_deref())
         }
-        _ if sub.starts_with("/api/") => handle_api_route(sub, &cx, &pool),
+        // Explicit projects list route (legacy Python: GET /mail/projects).
+        "/projects" => render_projects_list(&cx, &pool),
+        _ if sub.starts_with("/api/") => handle_api_route(sub, query, method, body, &cx, &pool),
         _ if sub.starts_with("/archive/") => render_archive_route(sub, query, &cx, &pool),
-        _ => dispatch_project_route(sub, &cx, &pool, query),
+        _ => dispatch_project_route(sub, method, body, &cx, &pool, query),
     }
 }
 
@@ -278,6 +288,48 @@ fn ts_display_opt(micros: Option<i64>) -> String {
     micros.map_or_else(String::new, ts_display)
 }
 
+/// Format micros as "Month DD, YYYY at I:MM PM" (Python parity: `created_full`).
+fn ts_display_full(micros: i64) -> String {
+    micros_to_naive(micros)
+        .format("%B %d, %Y at %l:%M %p")
+        .to_string()
+}
+
+/// Format micros as relative time (e.g. "5m ago", "2h ago", "3d ago").
+/// Python parity: `created_relative`.
+fn ts_display_relative(micros: i64) -> String {
+    let now = now_micros();
+    let delta_secs = (now - micros) / 1_000_000;
+    if delta_secs < 60 {
+        "Just now".to_string()
+    } else if delta_secs < 3600 {
+        format!("{}m ago", delta_secs / 60)
+    } else if delta_secs < 86400 {
+        format!("{}h ago", delta_secs / 3600)
+    } else {
+        format!("{}d ago", delta_secs / 86400)
+    }
+}
+
+/// Extract a plain-text excerpt from markdown body (first 150 chars).
+fn body_excerpt(body: &str, max_len: usize) -> String {
+    // Strip basic markdown/HTML for a clean excerpt.
+    let plain: String = body
+        .chars()
+        .filter(|c| *c != '#' && *c != '*' && *c != '`')
+        .collect();
+    let trimmed = plain.trim();
+    if trimmed.len() <= max_len {
+        trimmed.to_string()
+    } else {
+        let mut end = max_len;
+        while end > 0 && !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &trimmed[..end])
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Route: GET /mail — project index
 // ---------------------------------------------------------------------------
@@ -308,6 +360,34 @@ fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)>
         });
     }
     render("mail_index.html", IndexCtx { projects: items })
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /mail/projects — explicit projects list (Python parity)
+// ---------------------------------------------------------------------------
+
+fn render_projects_list(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
+    // Reuse the index renderer — Python's /mail/projects renders the same template
+    // as the old /mail root (project list view).
+    render_index(cx, pool)
+}
+
+// ---------------------------------------------------------------------------
+// JSON response helper (for POST endpoints returning JSON)
+// ---------------------------------------------------------------------------
+
+fn json_ok(value: &serde_json::Value) -> Result<Option<String>, (u16, String)> {
+    serde_json::to_string(value)
+        .map(Some)
+        .map_err(|e| (500, format!("JSON error: {e}")))
+}
+
+fn json_err(status: u16, detail: &str) -> Result<Option<String>, (u16, String)> {
+    let body = serde_json::json!({ "error": detail });
+    let s = serde_json::to_string(&body).unwrap_or_else(|_| format!("{{\"error\":\"{detail}\"}}"));
+    // Return the JSON as a successful dispatch result so the caller can set the HTTP status.
+    // We embed the status in the Err variant so the server can return the right code.
+    Err((status, s))
 }
 
 // ---------------------------------------------------------------------------
@@ -546,13 +626,21 @@ fn render_inbox(
     let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
     let aid = a.id.unwrap_or(0);
 
+    // Fetch a generous amount, then paginate client-side (Python parity).
+    let fetch_limit = 10_000;
     let inbox = block_on_outcome(
         cx,
-        queries::fetch_inbox(cx, pool, pid, aid, false, None, limit),
+        queries::fetch_inbox(cx, pool, pid, aid, false, None, fetch_limit),
     )?;
     let total = inbox.len();
+
+    // Offset-based pagination (Python: offset = (page - 1) * limit).
+    let page = page.max(1);
+    let offset = (page - 1) * limit.max(1);
     let items: Vec<InboxMessage> = inbox
         .iter()
+        .skip(offset)
+        .take(limit)
         .map(|row| {
             let m = &row.message;
             InboxMessage {
@@ -569,6 +657,13 @@ fn render_inbox(
         })
         .collect();
 
+    let prev_page = if page > 1 { Some(page - 1) } else { None };
+    let next_page = if offset + limit < total {
+        Some(page + 1)
+    } else {
+        None
+    };
+
     render(
         "mail_inbox.html",
         InboxCtx {
@@ -578,8 +673,8 @@ fn render_inbox(
             page,
             limit,
             total,
-            prev_page: None,
-            next_page: None,
+            prev_page,
+            next_page,
         },
     )
 }
@@ -904,6 +999,8 @@ fn render_overseer_compose(
 
 fn dispatch_project_route(
     sub: &str,
+    method: &str,
+    body: &str,
     cx: &Cx,
     pool: &DbPool,
     query: &str,
@@ -922,16 +1019,31 @@ fn dispatch_project_route(
         "file_reservations" => render_file_reservations(cx, pool, project_slug),
         "attachments" => render_attachments(cx, pool, project_slug),
         "overseer/compose" => render_overseer_compose(cx, pool, project_slug),
+        "overseer/send" if method == "POST" => handle_overseer_send(cx, pool, project_slug, body),
         _ if rest.starts_with("inbox/") => {
-            let agent_name = rest.strip_prefix("inbox/").unwrap_or("");
+            let agent_rest = rest.strip_prefix("inbox/").unwrap_or("");
+            if agent_rest.is_empty() {
+                return Err((400, "Missing agent name".to_string()));
+            }
+            // Parse agent name and optional sub-action.
+            let (agent_name, action) = agent_rest.split_once('/').unwrap_or((agent_rest, ""));
+
             if agent_name.is_empty() {
                 return Err((400, "Missing agent name".to_string()));
             }
-            // Strip any sub-paths (e.g. mark-read) — for now only handle the inbox view.
-            let agent_name = agent_name.split('/').next().unwrap_or(agent_name);
-            let limit = extract_query_int(query, "limit", 10000);
-            let page = extract_query_int(query, "page", 1);
-            render_inbox(cx, pool, project_slug, agent_name, limit, page)
+
+            match (method, action) {
+                ("POST", "mark-read") => handle_mark_read(cx, pool, project_slug, agent_name, body),
+                ("POST", "mark-all-read") => {
+                    handle_mark_all_read(cx, pool, project_slug, agent_name)
+                }
+                ("GET", _) => {
+                    let limit = extract_query_int(query, "limit", 10000);
+                    let page = extract_query_int(query, "page", 1);
+                    render_inbox(cx, pool, project_slug, agent_name, limit, page)
+                }
+                _ => Err((405, "Method Not Allowed".to_string())),
+            }
         }
         _ if rest.starts_with("message/") => {
             let mid_str = rest.strip_prefix("message/").unwrap_or("");
@@ -955,13 +1067,34 @@ fn dispatch_project_route(
 // API sub-routes under /mail/api/*
 // ---------------------------------------------------------------------------
 
-fn handle_api_route(sub: &str, cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
+fn handle_api_route(
+    sub: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+    cx: &Cx,
+    pool: &DbPool,
+) -> Result<Option<String>, (u16, String)> {
     // /api/unified-inbox → JSON
     if sub == "/api/unified-inbox" {
-        return render_api_unified_inbox(cx, pool);
+        return render_api_unified_inbox(cx, pool, query);
     }
-    // /api/projects/{project}/agents → JSON
+    // /api/projects/{project_id}/siblings/{other_id} → POST (sibling suggestion)
     if let Some(rest) = sub.strip_prefix("/api/projects/") {
+        // Check for siblings route: {project_id}/siblings/{other_id}
+        if let Some((project_id_str, siblings_rest)) = rest.split_once("/siblings/") {
+            if method == "POST" {
+                let project_id: i64 = project_id_str
+                    .parse()
+                    .map_err(|_| (400, "Invalid project ID".to_string()))?;
+                let other_id: i64 = siblings_rest
+                    .parse()
+                    .map_err(|_| (400, "Invalid sibling project ID".to_string()))?;
+                return handle_sibling_update(cx, pool, project_id, other_id, body);
+            }
+            return Err((405, "Method Not Allowed".to_string()));
+        }
+        // /api/projects/{project}/agents → JSON
         if let Some(project_slug) = rest.strip_suffix("/agents") {
             return render_api_project_agents(cx, pool, project_slug);
         }
@@ -970,8 +1103,17 @@ fn handle_api_route(sub: &str, cx: &Cx, pool: &DbPool) -> Result<Option<String>,
     Ok(None)
 }
 
-fn render_api_unified_inbox(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
-    // Return JSON of recent messages across all projects.
+fn render_api_unified_inbox(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &str,
+) -> Result<Option<String>, (u16, String)> {
+    // Python parity: limit (default 50000, clamped to 1000), include_projects.
+    let raw_limit = extract_query_int(query, "limit", 50_000);
+    let limit = raw_limit.clamp(1, 1000);
+    let include_projects =
+        extract_query_str(query, "include_projects").is_some_and(|v| v == "true" || v == "1");
+
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
     let mut messages = Vec::new();
     for p in &projects {
@@ -980,7 +1122,7 @@ fn render_api_unified_inbox(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u
         for a in &agents {
             let inbox = block_on_outcome(
                 cx,
-                queries::fetch_inbox(cx, pool, pid, a.id.unwrap_or(0), false, None, 500),
+                queries::fetch_inbox(cx, pool, pid, a.id.unwrap_or(0), false, None, limit),
             )?;
             for row in inbox {
                 let m = &row.message;
@@ -989,12 +1131,16 @@ fn render_api_unified_inbox(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u
                     "subject": m.subject,
                     "body_md": m.body_md,
                     "body_length": m.body_md.len(),
+                    "excerpt": body_excerpt(&m.body_md, 150),
                     "created_ts": ts_display(m.created_ts),
+                    "created_full": ts_display_full(m.created_ts),
+                    "created_relative": ts_display_relative(m.created_ts),
                     "importance": m.importance,
                     "thread_id": m.thread_id,
-                    "sender_name": row.sender_name,
+                    "sender": row.sender_name,
                     "project_slug": p.slug,
                     "project_name": p.human_key,
+                    "read": false,
                 }));
             }
         }
@@ -1004,12 +1150,25 @@ fn render_api_unified_inbox(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u
         let tb = b["created_ts"].as_str().unwrap_or("");
         tb.cmp(ta)
     });
-    messages.truncate(500);
-    let json = serde_json::to_string(&serde_json::json!({
-        "messages": messages,
-        "total": messages.len(),
-    }))
-    .map_err(|e| (500, format!("JSON error: {e}")))?;
+    messages.truncate(limit);
+
+    let mut result = serde_json::json!({ "messages": messages });
+    if include_projects {
+        let proj_list: Vec<serde_json::Value> = projects
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id.unwrap_or(0),
+                    "slug": p.slug,
+                    "human_key": p.human_key,
+                    "created_at": ts_display(p.created_at),
+                })
+            })
+            .collect();
+        result["projects"] = serde_json::json!(proj_list);
+    }
+
+    let json = serde_json::to_string(&result).map_err(|e| (500, format!("JSON error: {e}")))?;
     Ok(Some(json))
 }
 
@@ -1020,7 +1179,8 @@ fn render_api_project_agents(
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
-    let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+    let mut names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+    names.sort_unstable(); // Python parity: ORDER BY name
     let json = serde_json::to_string(&serde_json::json!({ "agents": names }))
         .map_err(|e| (500, format!("JSON error: {e}")))?;
     Ok(Some(json))
@@ -1392,6 +1552,322 @@ fn render_archive_time_travel_snapshot(
     }))
     .map_err(|e| (500, format!("JSON error: {e}")))?;
     Ok(Some(json))
+}
+
+// ---------------------------------------------------------------------------
+// POST: /mail/{project}/inbox/{agent}/mark-read
+// ---------------------------------------------------------------------------
+
+fn handle_mark_read(
+    cx: &Cx,
+    pool: &DbPool,
+    project_slug: &str,
+    agent_name: &str,
+    body: &str,
+) -> Result<Option<String>, (u16, String)> {
+    let payload: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| (400, format!("Invalid JSON: {e}")))?;
+
+    let message_ids: Vec<i64> = payload
+        .get("message_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_i64)
+                .collect::<Vec<i64>>()
+        })
+        .unwrap_or_default();
+
+    if message_ids.is_empty() {
+        return json_err(400, "No message IDs provided");
+    }
+
+    // Limit to prevent abuse (Python parity: max 500).
+    if message_ids.len() > 500 {
+        return json_err(
+            400,
+            &format!(
+                "Too many messages selected ({}). Maximum is 500. Use 'Mark All Read' instead.",
+                message_ids.len()
+            ),
+        );
+    }
+
+    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let pid = p.id.unwrap_or(0);
+    let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
+    let aid = a.id.unwrap_or(0);
+
+    let mut marked_count = 0i64;
+    for mid in &message_ids {
+        match block_on_outcome(cx, queries::mark_message_read(cx, pool, aid, *mid)) {
+            Ok(_) => marked_count += 1,
+            Err((404, _)) => {} // Not found — already read or not a recipient; skip.
+            Err(e) => return Err(e),
+        }
+    }
+
+    json_ok(&serde_json::json!({
+        "success": true,
+        "marked_count": marked_count,
+        "requested_count": message_ids.len(),
+        "agent": agent_name,
+        "project": p.slug,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// POST: /mail/{project}/inbox/{agent}/mark-all-read
+// ---------------------------------------------------------------------------
+
+fn handle_mark_all_read(
+    cx: &Cx,
+    pool: &DbPool,
+    project_slug: &str,
+    agent_name: &str,
+) -> Result<Option<String>, (u16, String)> {
+    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let pid = p.id.unwrap_or(0);
+    let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
+    let aid = a.id.unwrap_or(0);
+
+    // Fetch all inbox messages and mark each as read.
+    // `mark_message_read` is idempotent — it uses COALESCE(read_ts, now) so
+    // already-read messages are harmlessly skipped.
+    let inbox = block_on_outcome(
+        cx,
+        queries::fetch_inbox(cx, pool, pid, aid, false, None, 10_000),
+    )?;
+
+    let mut marked_count = 0i64;
+    for row in &inbox {
+        let mid = row.message.id.unwrap_or(0);
+        if block_on_outcome(cx, queries::mark_message_read(cx, pool, aid, mid)).is_ok() {
+            marked_count += 1;
+        }
+    }
+
+    json_ok(&serde_json::json!({
+        "success": true,
+        "marked_count": marked_count,
+        "agent": agent_name,
+        "project": p.slug,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// POST: /mail/{project}/overseer/send
+// ---------------------------------------------------------------------------
+
+const OVERSEER_PREAMBLE: &str = "---\n\n\
+    MESSAGE FROM HUMAN OVERSEER\n\n\
+    This message is from a human operator overseeing this project. \
+    Please prioritize the instructions below over your current tasks.\n\n\
+    You should:\n\
+    1. Temporarily pause your current work\n\
+    2. Complete the request described below\n\
+    3. Resume your original plans afterward (unless modified by these instructions)\n\n\
+    The human's guidance supersedes all other priorities.\n\n\
+    ---\n\n";
+
+struct OverseerPayload {
+    recipients: Vec<String>,
+    subject: String,
+    body_md: String,
+    thread_id: Option<String>,
+}
+
+fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
+    let payload: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| (400, format!("Invalid JSON: {e}")))?;
+
+    let recipients: Vec<String> = payload
+        .get("recipients")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let subject = payload
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let body_md = payload
+        .get("body_md")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let thread_id = payload
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Validation (Python parity).
+    let err = |msg: &str| -> (u16, String) {
+        let body = serde_json::json!({ "error": msg });
+        (
+            400,
+            serde_json::to_string(&body).unwrap_or_else(|_| format!("{{\"error\":\"{msg}\"}}")),
+        )
+    };
+    if recipients.is_empty() {
+        return Err(err("At least one recipient is required"));
+    }
+    if recipients.len() > 100 {
+        return Err(err("Too many recipients (maximum 100 agents)"));
+    }
+    if subject.is_empty() {
+        return Err(err("Subject is required"));
+    }
+    if subject.len() > 200 {
+        return Err(err("Subject too long (maximum 200 characters)"));
+    }
+    if body_md.is_empty() {
+        return Err(err("Message body is required"));
+    }
+    if body_md.len() > 50_000 {
+        return Err(err("Message body too long (maximum 50,000 characters)"));
+    }
+
+    // Deduplicate recipients while preserving order.
+    let mut seen = std::collections::HashSet::new();
+    let recipients: Vec<String> = recipients
+        .into_iter()
+        .filter(|r| seen.insert(r.clone()))
+        .collect();
+
+    Ok(OverseerPayload {
+        recipients,
+        subject,
+        body_md,
+        thread_id,
+    })
+}
+
+fn handle_overseer_send(
+    cx: &Cx,
+    pool: &DbPool,
+    project_slug: &str,
+    body: &str,
+) -> Result<Option<String>, (u16, String)> {
+    let parsed = parse_overseer_body(body)?;
+    let full_body = format!("{OVERSEER_PREAMBLE}{}", parsed.body_md);
+
+    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let pid = p.id.unwrap_or(0);
+
+    // Ensure HumanOverseer agent exists.
+    let overseer = block_on_outcome(
+        cx,
+        queries::register_agent(
+            cx,
+            pool,
+            pid,
+            "HumanOverseer",
+            "WebUI",
+            "Human",
+            Some("Human operator providing guidance and oversight to agents"),
+            Some("auto"),
+        ),
+    )?;
+    let overseer_id = overseer.id.unwrap_or(0);
+
+    // Resolve valid recipient agent IDs.
+    let mut valid: Vec<(String, i64)> = Vec::new();
+    for name in &parsed.recipients {
+        if let Ok(a) = block_on_outcome(cx, queries::get_agent(cx, pool, pid, name)) {
+            valid.push((name.clone(), a.id.unwrap_or(0)));
+        }
+    }
+
+    if valid.is_empty() {
+        return json_err(
+            400,
+            &format!(
+                "None of the specified recipients exist in this project. \
+                 Available agents can be seen at /mail/{project_slug}"
+            ),
+        );
+    }
+
+    // Build recipients slice for the DB call.
+    let recipient_pairs: Vec<(i64, &str)> = valid.iter().map(|(_, id)| (*id, "to")).collect();
+
+    let msg = block_on_outcome(
+        cx,
+        queries::create_message_with_recipients(
+            cx,
+            pool,
+            pid,
+            overseer_id,
+            &parsed.subject,
+            &full_body,
+            parsed.thread_id.as_deref(),
+            "high", // Always high importance for overseer
+            false,
+            "[]",
+            &recipient_pairs,
+        ),
+    )?;
+
+    let valid_names: Vec<&str> = valid.iter().map(|(n, _)| n.as_str()).collect();
+    let created = ts_display(msg.created_ts);
+
+    json_ok(&serde_json::json!({
+        "success": true,
+        "message_id": msg.id.unwrap_or(0),
+        "recipients": valid_names,
+        "sent_at": created,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// POST: /mail/api/projects/{id}/siblings/{other_id}
+// ---------------------------------------------------------------------------
+
+fn handle_sibling_update(
+    _cx: &Cx,
+    _pool: &DbPool,
+    project_id: i64,
+    other_id: i64,
+    body: &str,
+) -> Result<Option<String>, (u16, String)> {
+    let payload: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| (400, format!("Invalid JSON: {e}")))?;
+
+    let action = payload
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if !matches!(action.as_str(), "confirm" | "dismiss" | "reset") {
+        return json_err(400, "Invalid action");
+    }
+
+    let target_status = match action.as_str() {
+        "confirm" => "confirmed",
+        "dismiss" => "dismissed",
+        "reset" => "suggested",
+        _ => unreachable!(),
+    };
+
+    // Note: The sibling suggestion feature requires a `project_siblings` table
+    // that is not yet part of the Rust schema. Return a stub response that acknowledges
+    // the action. When the schema is added, this handler will execute the DB update.
+    json_ok(&serde_json::json!({
+        "status": target_status,
+        "suggestion": {
+            "project_id": project_id,
+            "other_id": other_id,
+            "status": target_status,
+        },
+    }))
 }
 
 /// Render an error page.

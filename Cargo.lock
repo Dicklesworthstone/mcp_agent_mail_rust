@@ -2159,9 +2159,7 @@ dependencies = [
  "ftui-core 0.1.1",
  "memchr",
  "smallvec",
- "unicode-display-width",
  "unicode-segmentation",
- "unicode-width",
 ]
 
 [[package]]

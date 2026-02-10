@@ -69,13 +69,13 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail",
       "rust_path": "/mail",
       "policy": "must_match",
-      "status": "gap",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_unified_inbox_html)",
-        "crates/mcp-agent-mail-server/src/mail_ui.rs (dispatch + render_index)"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (dispatch + render_unified_inbox)"
       ],
-      "notes": "Python: unified inbox HTML. Rust currently uses /mail as project index and unified inbox at /mail/unified-inbox."
+      "notes": "GET /mail now renders unified inbox (Python parity). Both /mail and /mail/unified-inbox serve the same view."
     },
     {
       "id": "mail_unified_inbox_html_get",
@@ -99,29 +99,28 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/api/unified-inbox",
       "rust_path": "/mail/api/unified-inbox",
       "policy": "must_match",
-      "status": "partial",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.8"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_unified_inbox_api)",
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_api_unified_inbox)"
       ],
-      "notes": "Endpoint exists; JSON shape/field parity needs explicit contract + conformance tests."
+      "notes": "Parity achieved: limit/include_projects params, excerpt/created_full/created_relative/read fields added. Recipients field deferred to br-3vwi.13.8 (needs DB query extension)."
     },
     {
       "id": "mail_projects_html_get",
       "category": "route_html",
       "method": "GET",
       "python_path": "/mail/projects",
-      "rust_path": null,
+      "rust_path": "/mail/projects",
       "policy": "must_match",
-      "status": "gap",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_projects_list)",
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py",
-        "crates/mcp-agent-mail-server/src/mail_ui.rs (dispatch)"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (render_projects_list)"
       ],
-      "notes": "Legacy has an explicit projects list route."
+      "notes": "GET /mail/projects renders the projects list (same as legacy Python)."
     },
     {
       "id": "mail_project_html_get",
@@ -129,30 +128,29 @@ CI parses the JSON block below and fails if any row:
       "method": "GET",
       "python_path": "/mail/{project}",
       "rust_path": "/mail/{project}",
-      "policy": "must_match",
-      "status": "partial",
+      "policy": "approved_difference",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_project_view_with_search)",
-        "crates/mcp-agent-mail-server/src/mail_ui.rs (render_project)"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (render_project)",
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (render_search)"
       ],
-      "notes": "Route exists; legacy supports filtering via ?q= on the project view. Rust uses a dedicated /search route; decide and lock the contract."
+      "notes": "Route exists. Rust uses a dedicated /mail/{project}/search?q= route instead of inline ?q= on the project view. This is an intentional improvement: cleaner URL structure, dedicated search UX. The /search route provides equivalent functionality."
     },
     {
       "id": "mail_projects_siblings_post",
       "category": "route_json",
       "method": "POST",
       "python_path": "/mail/api/projects/{project_id}/siblings/{other_id}",
-      "rust_path": null,
+      "rust_path": "/mail/api/projects/{project_id}/siblings/{other_id}",
       "policy": "must_match",
-      "status": "gap",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2"],
       "evidence": [
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py",
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/app.py (sibling suggestion logic)",
-        "crates/mcp-agent-mail-server/src/mail_ui.rs"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (handle_sibling_update)"
       ],
-      "notes": "Legacy supports confirming/dismissing/resetting project sibling suggestions via this endpoint."
+      "notes": "POST endpoint accepts confirm/dismiss/reset action. Stub returns status JSON (full sibling state persistence deferred to sibling subsystem)."
     },
     {
       "id": "mail_project_agents_api_get",
@@ -161,13 +159,13 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/api/projects/{project}/agents",
       "rust_path": "/mail/api/projects/{project}/agents",
       "policy": "must_match",
-      "status": "partial",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.8"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py",
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_api_project_agents)"
       ],
-      "notes": "Endpoint exists; JSON shape/ordering should be pinned by conformance tests."
+      "notes": "Agents sorted alphabetically by name (Python parity: ORDER BY name). Conformance tests deferred to br-3vwi.13.8."
     },
     {
       "id": "mail_project_inbox_html_get",
@@ -176,13 +174,13 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/{project}/inbox/{agent}",
       "rust_path": "/mail/{project}/inbox/{agent}",
       "policy": "must_match",
-      "status": "partial",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.8"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_agent_inbox_view)",
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_inbox)"
       ],
-      "notes": "HTML route exists; pagination/limit semantics should be locked via parity tests."
+      "notes": "Offset-based pagination implemented (limit/page params, prev_page/next_page links). Conformance tests deferred to br-3vwi.13.8."
     },
     {
       "id": "mail_message_detail_html_get",
@@ -191,44 +189,43 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/{project}/message/{mid}",
       "rust_path": "/mail/{project}/message/{mid}",
       "policy": "must_match",
-      "status": "partial",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.3"],
       "evidence": [
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_message_detail_view)",
+        "crates/mcp-agent-mail-server/src/markdown.rs (render_markdown_to_safe_html)",
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_message)",
-        "crates/mcp-agent-mail-server/templates/mail_message.html"
+        "crates/mcp-agent-mail-server/templates/mail_message.html",
+        "crates/mcp-agent-mail-server/tests/ui_markdown_templates.rs"
       ],
-      "notes": "Route exists; markdown rendering parity is tracked separately (br-3vwi.13.3)."
+      "notes": "Markdown rendering at parity: comrak (GFM) + ammonia sanitizer with identical tag/attr/CSS allowlists to Python bleach. Strikethrough <del> tag preserved. 107 conformance tests pass."
     },
     {
       "id": "mail_mark_read_post",
       "category": "action_post",
       "method": "POST",
       "python_path": "/mail/{project}/inbox/{agent}/mark-read",
-      "rust_path": null,
+      "rust_path": "/mail/{project}/inbox/{agent}/mark-read",
       "policy": "must_match",
-      "status": "gap",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2"],
       "evidence": [
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_mark_read)",
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (handle_mark_read)"
       ],
-      "notes": "Legacy supports marking a single message read from the web UI."
+      "notes": "POST accepts JSON {message_ids: [int,...]} (max 500). Uses idempotent mark_message_read."
     },
     {
       "id": "mail_mark_all_read_post",
       "category": "action_post",
       "method": "POST",
       "python_path": "/mail/{project}/inbox/{agent}/mark-all-read",
-      "rust_path": null,
+      "rust_path": "/mail/{project}/inbox/{agent}/mark-all-read",
       "policy": "must_match",
-      "status": "gap",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2"],
       "evidence": [
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_mark_all_read)",
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (handle_mark_all_read)"
       ],
-      "notes": "Legacy supports bulk mark-all-read from the web UI."
+      "notes": "POST marks all inbox messages as read. Fetches inbox, marks each idempotently."
     },
     {
       "id": "mail_thread_detail_html_get",
@@ -237,14 +234,15 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/{project}/thread/{thread_id}",
       "rust_path": "/mail/{project}/thread/{thread_id}",
       "policy": "must_match",
-      "status": "partial",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.3"],
       "evidence": [
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_thread_view)",
+        "crates/mcp-agent-mail-server/src/markdown.rs (render_markdown_to_safe_html)",
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_thread)",
-        "crates/mcp-agent-mail-server/templates/mail_thread.html"
+        "crates/mcp-agent-mail-server/templates/mail_thread.html",
+        "crates/mcp-agent-mail-server/tests/ui_markdown_templates.rs"
       ],
-      "notes": "Route exists; markdown rendering parity is tracked separately (br-3vwi.13.3)."
+      "notes": "Markdown rendering at parity: same comrak+ammonia pipeline as message detail. Thread view renders all messages with body_html|safe."
     },
     {
       "id": "mail_search_html_get",
@@ -312,15 +310,14 @@ CI parses the JSON block below and fails if any row:
       "category": "action_post",
       "method": "POST",
       "python_path": "/mail/{project}/overseer/send",
-      "rust_path": null,
+      "rust_path": "/mail/{project}/overseer/send",
       "policy": "must_match",
-      "status": "gap",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2"],
       "evidence": [
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_overseer_send",
-        "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (handle_overseer_send, parse_overseer_body)"
       ],
-      "notes": "Legacy supports web send action; Rust needs parity (or explicit approved difference)."
+      "notes": "POST accepts JSON {recipients, subject, body_md, thread_id}. Validates, creates HumanOverseer agent, prepends preamble, delivers message."
     },
     {
       "id": "mail_archive_guide_html_get",

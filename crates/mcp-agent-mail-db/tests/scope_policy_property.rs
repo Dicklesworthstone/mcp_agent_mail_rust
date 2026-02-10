@@ -21,9 +21,9 @@
 
 use mcp_agent_mail_db::search_planner::{DocKind, SearchResult};
 use mcp_agent_mail_db::search_scope::{
-    apply_redaction, apply_scope, build_scope_sql_clauses, evaluate_scope, ContactPolicyKind,
-    RecipientEntry, RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopeSqlParam, ScopeVerdict,
-    ScopedSearchResult, SenderPolicy, ViewerIdentity,
+    ContactPolicyKind, RecipientEntry, RedactionPolicy, ScopeAuditSummary, ScopeContext,
+    ScopeSqlParam, ScopeVerdict, ScopedSearchResult, SenderPolicy, ViewerIdentity, apply_redaction,
+    apply_scope, build_scope_sql_clauses, evaluate_scope,
 };
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -278,15 +278,12 @@ fn markdown_renders_fenced_code_without_language() {
 }
 
 #[test]
-fn markdown_strikethrough_text_preserved_tag_stripped() {
-    // Legacy parity: markdown2 produces <del> for ~~text~~, but bleach strips <del>
-    // because it's not in the allowed tags list. Our sanitizer matches this behavior.
+fn markdown_strikethrough_del_tag_preserved() {
+    // br-3vwi.13.3: <del> is now in the sanitizer allowlist so strikethrough renders.
     let md = "Some ~~deleted text~~ here";
     let html = markdown::render_markdown_to_safe_html(md);
-    // Text content should be preserved even though the tag is stripped.
     assert!(html.contains("deleted text"), "text preserved: {html}");
-    // The <del> tag should be stripped by the sanitizer (not in allowlist).
-    assert!(!html.contains("<del>"), "del tag stripped: {html}");
+    assert!(html.contains("<del>"), "del tag preserved: {html}");
 }
 
 #[test]

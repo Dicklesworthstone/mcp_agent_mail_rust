@@ -3,7 +3,9 @@ Search across messages, agents, projects... (/ to focus)
 Route: /search                                                                  
                                                                                 
                                                                                 
-  Type            No results found.           Select a result to view details.  
+  Scope           No results found.           Select a result to view details.  
+  [global]                                                                      
+  Type                                                                          
   [Messages]                                                                    
   Imp.                                                                          
   [Any]                                                                         
@@ -11,8 +13,6 @@ Route: /search
   [Any]                                                                         
   Sort                                                                          
   [Newest]                                                                      
-                                                                                
-                                                                                
                                                                                 
                                                                                 
                                                                                 

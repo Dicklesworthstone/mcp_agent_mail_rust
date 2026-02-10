@@ -3128,41 +3128,7 @@ impl HttpState {
         }
 
         if path == "/mail" || path.starts_with("/mail/") {
-            if !matches!(req.method, Http1Method::Get) {
-                return Some(self.error_response(req, 405, "Method Not Allowed"));
-            }
-            let (_path_part, query_part) = split_path_query(&req.uri);
-            let query_str = query_part.as_deref().unwrap_or("");
-            match mail_ui::dispatch(path, query_str) {
-                Ok(Some(body)) => {
-                    let is_api = path.contains("/api/");
-                    let content_type = if is_api {
-                        "application/json"
-                    } else {
-                        "text/html; charset=utf-8"
-                    };
-                    return Some(self.raw_response(req, 200, content_type, body.into_bytes()));
-                }
-                Ok(None) => {
-                    return Some(self.error_response(req, 404, "Not Found"));
-                }
-                Err((status, msg)) => {
-                    if status == 404 {
-                        let html = templates::render_template(
-                            "error.html",
-                            serde_json::json!({ "message": msg }),
-                        )
-                        .unwrap_or_else(|_| msg.clone());
-                        return Some(self.raw_response(
-                            req,
-                            404,
-                            "text/html; charset=utf-8",
-                            html.into_bytes(),
-                        ));
-                    }
-                    return Some(self.error_response(req, status, &msg));
-                }
-            }
+            return Some(self.handle_mail_dispatch(req, path));
         }
 
         // Static file serving from optional web/ SPA directory.
@@ -3181,6 +3147,52 @@ impl HttpState {
         }
 
         None
+    }
+
+    /// Dispatch a `/mail` or `/mail/…` request to the mail UI layer.
+    fn handle_mail_dispatch(&self, req: &Http1Request, path: &str) -> Http1Response {
+        if !matches!(req.method, Http1Method::Get | Http1Method::Post) {
+            return self.error_response(req, 405, "Method Not Allowed");
+        }
+        let (_path_part, query_part) = split_path_query(&req.uri);
+        let query_str = query_part.as_deref().unwrap_or("");
+        let method_str = if matches!(req.method, Http1Method::Post) {
+            "POST"
+        } else {
+            "GET"
+        };
+        let body_str = std::str::from_utf8(&req.body).unwrap_or("");
+        let is_api = path.contains("/api/") || method_str == "POST";
+        match mail_ui::dispatch(path, query_str, method_str, body_str) {
+            Ok(Some(body)) => {
+                let content_type = if is_api {
+                    "application/json"
+                } else {
+                    "text/html; charset=utf-8"
+                };
+                self.raw_response(req, 200, content_type, body.into_bytes())
+            }
+            Ok(None) => self.error_response(req, 404, "Not Found"),
+            Err((status, msg)) => {
+                if is_api {
+                    return self.raw_response(req, status, "application/json", msg.into_bytes());
+                }
+                if status == 404 {
+                    let html = templates::render_template(
+                        "error.html",
+                        serde_json::json!({ "message": msg }),
+                    )
+                    .unwrap_or_else(|_| msg.clone());
+                    return self.raw_response(
+                        req,
+                        404,
+                        "text/html; charset=utf-8",
+                        html.into_bytes(),
+                    );
+                }
+                self.error_response(req, status, &msg)
+            }
+        }
     }
 
     /// Check if `path` is under the configured MCP base path.
