@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 
 use ftui::layout::Rect;
+use ftui::Style;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Sparkline;
 use ftui::widgets::Widget;
@@ -436,6 +437,7 @@ fn truncate(s: &str, max: usize) -> &str {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Render the stat tiles row with Sparkline and `MiniBar` widgets.
+#[allow(clippy::too_many_lines)]
 fn render_stat_tiles(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -483,14 +485,34 @@ fn render_stat_tiles(
 
     // ── Database tile: stats + MiniBar gauges ───────────────────
     let db = state.db_stats_snapshot().unwrap_or_default();
-    let stats_text = format!(
-        "Proj: {:>5}  Agents: {:>5}\nMsg:  {:>5}  Reserv: {:>5}\nLinks:{:>5}  AckPnd: {:>5}",
-        db.projects, db.agents, db.messages, db.file_reservations, db.contact_links, db.ack_pending,
-    );
+    let db_title = if db.ack_pending > 0 {
+        format!("Database [{} ack]", db.ack_pending)
+    } else {
+        "Database".to_string()
+    };
+    let ack_style = if db.ack_pending > 0 {
+        Style::default().fg(PackedRgba::rgb(255, 80, 80)).bold()
+    } else {
+        Style::default()
+    };
+    let stats_lines = vec![
+        Line::raw(format!(
+            "Proj: {:>5}  Agents: {:>5}",
+            db.projects, db.agents,
+        )),
+        Line::raw(format!(
+            "Msg:  {:>5}  Reserv: {:>5}",
+            db.messages, db.file_reservations,
+        )),
+        Line::from_spans([
+            Span::raw(format!("Links:{:>5}  AckPnd: ", db.contact_links)),
+            Span::styled(format!("{:>5}", db.ack_pending), ack_style),
+        ]),
+    ];
     let block = Block::default()
-        .title("Database")
+        .title(db_title.as_str())
         .border_type(BorderType::Rounded);
-    let p = Paragraph::new(stats_text).block(block);
+    let p = Paragraph::new(Text::from_lines(stats_lines)).block(block);
     p.render(col2, frame);
 
     // MiniBar for request success rate in the bottom of the DB tile
@@ -508,23 +530,35 @@ fn render_stat_tiles(
         bar.render(bar_area, frame);
     }
 
-    // ── Agents tile: show top 5 agents ──────────────────────────
+    // ── Agents tile: show top 5 agents with activity dots ──────
     let agents = &db.agents_list;
-    let agent_text = if agents.is_empty() {
-        "(no agents)".to_string()
+    #[allow(clippy::cast_possible_truncation)]
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64);
+    let agent_lines: Vec<Line> = if agents.is_empty() {
+        vec![Line::raw("(no agents)")]
     } else {
         agents
             .iter()
             .take(5)
-            .map(|a| format!("{} ({})", a.name, a.program))
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(|a| {
+                let (dot, color) = activity_indicator(now_us, a.last_active_ts);
+                Line::from_spans([
+                    Span::styled(
+                        format!("{dot} "),
+                        Style::default().fg(color),
+                    ),
+                    Span::raw(format!("{} ({})", a.name, a.program)),
+                ])
+            })
+            .collect()
     };
     let title = format!("Agents ({})", db.agents);
     let block = Block::default()
         .title(title.as_str())
         .border_type(BorderType::Rounded);
-    let p = Paragraph::new(agent_text).block(block);
+    let p = Paragraph::new(Text::from_lines(agent_lines)).block(block);
     p.render(col3, frame);
 }
 
@@ -676,6 +710,35 @@ pub fn render_sparkline(data: &[f64], width: usize) -> String {
             SPARK_CHARS[normalized.min(SPARK_CHARS.len() - 1)]
         })
         .collect()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Activity indicators
+// ──────────────────────────────────────────────────────────────────────
+
+/// Thresholds for agent activity status (in microseconds).
+const ACTIVE_THRESHOLD_US: i64 = 60 * 1_000_000; // 60 seconds
+const IDLE_THRESHOLD_US: i64 = 5 * 60 * 1_000_000; // 5 minutes
+
+/// Activity dot colors.
+const ACTIVITY_GREEN: PackedRgba = PackedRgba::rgb(80, 220, 100);
+const ACTIVITY_YELLOW: PackedRgba = PackedRgba::rgb(220, 200, 60);
+const ACTIVITY_GRAY: PackedRgba = PackedRgba::rgb(120, 120, 120);
+
+/// Returns an activity dot character and color based on how recently an agent
+/// was active. Green = active (<60s), yellow = idle (<5m), gray = stale.
+const fn activity_indicator(now_us: i64, last_active_us: i64) -> (char, PackedRgba) {
+    if last_active_us == 0 {
+        return ('○', ACTIVITY_GRAY);
+    }
+    let age = now_us.saturating_sub(last_active_us);
+    if age < ACTIVE_THRESHOLD_US {
+        ('●', ACTIVITY_GREEN)
+    } else if age < IDLE_THRESHOLD_US {
+        ('●', ACTIVITY_YELLOW)
+    } else {
+        ('○', ACTIVITY_GRAY)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1364,5 +1427,67 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 1, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 80, 1), &state);
+    }
+
+    // ── Activity indicator tests ──────────────────────────────────
+
+    #[test]
+    fn activity_indicator_active() {
+        let now = 1_000_000_000_i64; // 1 second in micros
+        let recent = now - 30_000_000; // 30 seconds ago
+        let (dot, color) = activity_indicator(now, recent);
+        assert_eq!(dot, '●');
+        assert_eq!(color, ACTIVITY_GREEN);
+    }
+
+    #[test]
+    fn activity_indicator_idle() {
+        let now = 1_000_000_000_i64;
+        let idle = now - 120_000_000; // 2 minutes ago
+        let (dot, color) = activity_indicator(now, idle);
+        assert_eq!(dot, '●');
+        assert_eq!(color, ACTIVITY_YELLOW);
+    }
+
+    #[test]
+    fn activity_indicator_stale() {
+        let now = 1_000_000_000_i64;
+        let stale = now - 600_000_000; // 10 minutes ago
+        let (dot, color) = activity_indicator(now, stale);
+        assert_eq!(dot, '○');
+        assert_eq!(color, ACTIVITY_GRAY);
+    }
+
+    #[test]
+    fn activity_indicator_zero_ts_is_gray() {
+        let (dot, color) = activity_indicator(1_000_000_000, 0);
+        assert_eq!(dot, '○');
+        assert_eq!(color, ACTIVITY_GRAY);
+    }
+
+    #[test]
+    fn activity_indicator_boundary_at_60s() {
+        let now = 1_000_000_000_i64;
+        // Exactly at boundary: 60s ago
+        let at_boundary = now - ACTIVE_THRESHOLD_US;
+        let (_, color) = activity_indicator(now, at_boundary);
+        assert_eq!(color, ACTIVITY_YELLOW, "exactly 60s should be idle/yellow");
+        // 1us before boundary: 59.999999s ago
+        let just_inside = now - ACTIVE_THRESHOLD_US + 1;
+        let (_, color) = activity_indicator(now, just_inside);
+        assert_eq!(color, ACTIVITY_GREEN, "just under 60s should be green");
+    }
+
+    #[test]
+    fn activity_indicator_boundary_at_5m() {
+        let now = 1_000_000_000_i64;
+        let at_boundary = now - IDLE_THRESHOLD_US;
+        let (dot, color) = activity_indicator(now, at_boundary);
+        assert_eq!(dot, '○');
+        assert_eq!(color, ACTIVITY_GRAY, "exactly 5m should be stale/gray");
+        let just_inside = now - IDLE_THRESHOLD_US + 1;
+        let (dot, color) = activity_indicator(now, just_inside);
+        assert_eq!(dot, '●');
+        assert_eq!(color, ACTIVITY_YELLOW, "just under 5m should be yellow");
     }
 }
