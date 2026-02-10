@@ -283,28 +283,31 @@ pub async fn search_messages(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    // Execute search (currently uses LIKE; will be upgraded to FTS5)
-    let rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::search_messages(
-            ctx.cx(),
-            &pool,
-            project_id,
-            trimmed,
-            max_results,
-        )
-        .await,
+    // Build a SearchQuery and execute via the unified search service
+    let search_query =
+        mcp_agent_mail_db::search_planner::SearchQuery::messages(trimmed, project_id);
+    let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
+        limit: Some(max_results),
+        ..search_query
+    };
+
+    let planner_response = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::search_service::execute_search_simple(ctx.cx(), &pool, &search_query)
+            .await,
     )?;
 
-    let results: Vec<SearchResult> = rows
+    // Map planner SearchResult → tool SearchResult (legacy format)
+    let results: Vec<SearchResult> = planner_response
+        .results
         .into_iter()
         .map(|r| SearchResult {
             id: r.id,
-            subject: r.subject,
-            importance: r.importance,
-            ack_required: i32::try_from(r.ack_required).unwrap_or(i32::MAX),
-            created_ts: Some(micros_to_iso(r.created_ts)),
+            subject: r.title,
+            importance: r.importance.unwrap_or_default(),
+            ack_required: i32::from(r.ack_required.unwrap_or(false)),
+            created_ts: r.created_ts.map(micros_to_iso),
             thread_id: r.thread_id,
-            from: r.from,
+            from: r.from_agent.unwrap_or_default(),
         })
         .collect();
 

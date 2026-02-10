@@ -302,30 +302,34 @@ pub async fn search_messages_product(
         })?;
     let product_id = product.id.unwrap_or(0);
 
-    let rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::search_messages_for_product(
-            ctx.cx(),
-            &pool,
-            product_id,
-            trimmed,
-            max_results,
-        )
-        .await,
+    // Build a product-wide SearchQuery and execute via the unified search service
+    let search_query =
+        mcp_agent_mail_db::search_planner::SearchQuery::product_messages(trimmed, product_id);
+    let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
+        limit: Some(max_results),
+        ..search_query
+    };
+
+    let planner_response = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::search_service::execute_search_simple(ctx.cx(), &pool, &search_query)
+            .await,
     )?;
 
-    let mut result: Vec<ProductSearchItem> = Vec::with_capacity(rows.len());
-    for r in rows {
-        result.push(ProductSearchItem {
+    // Map planner SearchResult → tool ProductSearchItem (legacy format)
+    let result: Vec<ProductSearchItem> = planner_response
+        .results
+        .into_iter()
+        .map(|r| ProductSearchItem {
             id: r.id,
-            subject: r.subject,
-            importance: r.importance,
-            ack_required: i32::try_from(r.ack_required).unwrap_or(i32::MAX),
-            created_ts: Some(micros_to_iso(r.created_ts)),
+            subject: r.title,
+            importance: r.importance.unwrap_or_default(),
+            ack_required: i32::from(r.ack_required.unwrap_or(false)),
+            created_ts: r.created_ts.map(micros_to_iso),
             thread_id: r.thread_id,
-            from: r.from,
-            project_id: r.project_id,
-        });
-    }
+            from: r.from_agent.unwrap_or_default(),
+            project_id: r.project_id.unwrap_or(0),
+        })
+        .collect();
 
     let response = ProductSearchResponse { result };
     serde_json::to_string(&response)
