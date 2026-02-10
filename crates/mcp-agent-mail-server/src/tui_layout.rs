@@ -1055,6 +1055,7 @@ impl Default for ReactiveLayout {
 ///
 /// Returns `(remaining_area, computed_panels)` where `remaining_area`
 /// is the rect given to the first/primary panel (largest allocation).
+#[allow(clippy::too_many_lines)]
 fn allocate_axis(
     area: Rect,
     panels: &[(&PanelPolicy, &PanelConstraint)],
@@ -1141,6 +1142,7 @@ fn allocate_axis(
                     continue;
                 }
                 let panel_constraint = &panels[*i].1;
+                #[allow(clippy::cast_possible_truncation)]
                 let cut =
                     (u32::from(*cells) * u32::from(overflow) / u32::from(non_primary_total)) as u16;
                 let cut = cut.min(remaining_cut);

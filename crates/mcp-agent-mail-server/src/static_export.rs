@@ -438,7 +438,7 @@ struct NavEntry {
     title: String,
     path: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    children: Vec<NavEntry>,
+    children: Vec<Self>,
 }
 
 /// Generate a navigation manifest (sitemap-like JSON).
@@ -615,7 +615,8 @@ fn sha256_hex(data: &[u8]) -> String {
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
