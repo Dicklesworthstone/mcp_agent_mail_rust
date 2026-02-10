@@ -217,6 +217,7 @@ pub struct Config {
     pub tui_dock_visible: bool,
     pub tui_high_contrast: bool,
     pub tui_key_hints: bool,
+    pub tui_keymap_profile: String,
 }
 
 /// Application environment
@@ -568,6 +569,7 @@ impl Default for Config {
             tui_dock_visible: true,
             tui_high_contrast: false,
             tui_key_hints: true,
+            tui_keymap_profile: "default".to_string(),
         }
     }
 }
@@ -1091,6 +1093,15 @@ impl Config {
         config.tui_dock_visible = console_bool("TUI_DOCK_VISIBLE", config.tui_dock_visible);
         config.tui_high_contrast = console_bool("TUI_HIGH_CONTRAST", config.tui_high_contrast);
         config.tui_key_hints = console_bool("TUI_KEY_HINTS", config.tui_key_hints);
+        if let Some(v) = console_value("TUI_KEYMAP_PROFILE") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "default" | "vim" | "emacs" | "minimal" | "custom"
+            ) {
+                config.tui_keymap_profile = lower;
+            }
+        }
 
         config
     }

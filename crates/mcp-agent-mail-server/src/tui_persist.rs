@@ -18,6 +18,7 @@ use mcp_agent_mail_core::config::update_envfile;
 
 use serde::{Deserialize, Serialize};
 
+use crate::tui_keymap::KeymapProfile;
 use crate::tui_layout::{DockLayout, DockPosition};
 
 /// Minimum interval between successive envfile writes.
@@ -51,6 +52,8 @@ pub struct TuiPreferences {
     pub dock: DockLayout,
     #[serde(default)]
     pub accessibility: AccessibilitySettings,
+    #[serde(default)]
+    pub keymap_profile: KeymapProfile,
 }
 
 impl TuiPreferences {
@@ -66,12 +69,21 @@ impl TuiPreferences {
         let ratio = f32::from(config.tui_dock_ratio_percent.clamp(20, 80)) / 100.0;
         let visible = config.tui_dock_visible;
 
+        let keymap_profile = match config.tui_keymap_profile.as_str() {
+            "vim" => KeymapProfile::Vim,
+            "emacs" => KeymapProfile::Emacs,
+            "minimal" => KeymapProfile::Minimal,
+            "custom" => KeymapProfile::Custom,
+            _ => KeymapProfile::Default,
+        };
+
         Self {
             dock: DockLayout::new(position, ratio).with_visible(visible),
             accessibility: AccessibilitySettings {
                 high_contrast: config.tui_high_contrast,
                 key_hints: config.tui_key_hints,
             },
+            keymap_profile,
         }
     }
 
@@ -122,6 +134,10 @@ impl TuiPreferences {
             self.accessibility.high_contrast.to_string(),
         );
         map.insert("TUI_KEY_HINTS", self.accessibility.key_hints.to_string());
+        map.insert(
+            "TUI_KEYMAP_PROFILE",
+            self.keymap_profile.label().to_ascii_lowercase(),
+        );
         map
     }
 }
@@ -889,6 +905,7 @@ mod tests {
                 high_contrast: true,
                 key_hints: false,
             },
+            ..Default::default()
         };
         let json = prefs.to_json().unwrap();
         let restored = TuiPreferences::from_json(&json).unwrap();
@@ -912,6 +929,7 @@ mod tests {
                 high_contrast: true,
                 key_hints: false,
             },
+            ..Default::default()
         };
         let map = prefs.to_env_map();
         assert_eq!(map.get("TUI_HIGH_CONTRAST").unwrap(), "true");
@@ -926,9 +944,90 @@ mod tests {
                 high_contrast: true,
                 key_hints: false,
             },
+            ..Default::default()
         };
         prefs.reset();
         assert!(!prefs.accessibility.high_contrast);
         assert!(prefs.accessibility.key_hints);
+    }
+
+    // ── KeymapProfile persistence tests ──────────────────────────
+
+    #[test]
+    fn keymap_profile_from_config_default() {
+        let config = Config::default();
+        let prefs = TuiPreferences::from_config(&config);
+        assert_eq!(prefs.keymap_profile, KeymapProfile::Default);
+    }
+
+    #[test]
+    fn keymap_profile_from_config_vim() {
+        let config = Config {
+            tui_keymap_profile: "vim".to_string(),
+            ..Config::default()
+        };
+        let prefs = TuiPreferences::from_config(&config);
+        assert_eq!(prefs.keymap_profile, KeymapProfile::Vim);
+    }
+
+    #[test]
+    fn keymap_profile_from_config_invalid_falls_back() {
+        let config = Config {
+            tui_keymap_profile: "dvorak".to_string(),
+            ..Config::default()
+        };
+        let prefs = TuiPreferences::from_config(&config);
+        assert_eq!(prefs.keymap_profile, KeymapProfile::Default);
+    }
+
+    #[test]
+    fn keymap_profile_persisted_to_env_map() {
+        let prefs = TuiPreferences {
+            keymap_profile: KeymapProfile::Emacs,
+            ..Default::default()
+        };
+        let map = prefs.to_env_map();
+        assert_eq!(map.get("TUI_KEYMAP_PROFILE").unwrap(), "emacs");
+    }
+
+    #[test]
+    fn keymap_profile_json_roundtrip() {
+        let prefs = TuiPreferences {
+            keymap_profile: KeymapProfile::Vim,
+            ..Default::default()
+        };
+        let json = prefs.to_json().unwrap();
+        let restored = TuiPreferences::from_json(&json).unwrap();
+        assert_eq!(restored.keymap_profile, KeymapProfile::Vim);
+    }
+
+    #[test]
+    fn keymap_profile_json_missing_defaults() {
+        // Old JSON without keymap_profile field should default to Default.
+        let json = r#"{"dock":{"position":"right","ratio":0.4,"visible":true}}"#;
+        let prefs = TuiPreferences::from_json(json).unwrap();
+        assert_eq!(prefs.keymap_profile, KeymapProfile::Default);
+    }
+
+    #[test]
+    fn keymap_profile_persists_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.env");
+        let config = Config {
+            console_persist_path: path.clone(),
+            console_auto_save: true,
+            ..Config::default()
+        };
+
+        let prefs = TuiPreferences {
+            keymap_profile: KeymapProfile::Minimal,
+            ..Default::default()
+        };
+
+        let mut persister = PreferencePersister::new(&config);
+        assert!(persister.save_now(&prefs));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("TUI_KEYMAP_PROFILE=minimal"));
     }
 }

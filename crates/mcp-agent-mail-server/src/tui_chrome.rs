@@ -375,6 +375,96 @@ pub fn render_help_overlay(
     }
 }
 
+/// Render the help overlay from structured `HelpSection`s (profile-aware).
+///
+/// This version displays the profile name in the title and supports
+/// scrolling through sections with a scroll offset.
+pub fn render_help_overlay_sections(
+    sections: &[crate::tui_keymap::HelpSection],
+    scroll_offset: u16,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
+    let overlay_width = (u32::from(area.width) * 60 / 100).clamp(36, 72) as u16;
+    let overlay_height = (u32::from(area.height) * 60 / 100).clamp(10, 28) as u16;
+    let overlay_width = overlay_width.min(area.width.saturating_sub(2));
+    let overlay_height = overlay_height.min(area.height.saturating_sub(2));
+
+    let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+    let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
+
+    // Total line count for scroll indicator.
+    let total_lines: usize = sections
+        .iter()
+        .map(|s| s.line_count() + 1) // +1 for blank separator between sections
+        .sum::<usize>()
+        .saturating_sub(1); // no trailing separator
+
+    let scroll_hint = if total_lines > usize::from(overlay_height.saturating_sub(2)) {
+        " (j/k to scroll) "
+    } else {
+        " "
+    };
+
+    let title = format!(" Keyboard Shortcuts{scroll_hint}(Esc to close) ");
+    let block = Block::bordered()
+        .border_type(BorderType::Double)
+        .title(title.as_str())
+        .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
+
+    let inner = block.inner(overlay_area);
+    block.render(overlay_area, frame);
+
+    let key_col = 14u16;
+    let col_width = inner.width.saturating_sub(1);
+    let mut line_idx: u16 = 0;
+    let visible_start = scroll_offset;
+    let visible_end = scroll_offset.saturating_add(inner.height);
+    let mut y_pos = 0u16;
+
+    for (si, section) in sections.iter().enumerate() {
+        // Blank separator between sections (except before the first).
+        if si > 0 {
+            line_idx += 1;
+        }
+
+        // Section header.
+        if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
+            let header = Paragraph::new(section.title.as_str()).style(
+                Style::default()
+                    .fg(tp.help_category_fg)
+                    .bg(tp.help_bg)
+                    .bold(),
+            );
+            header.render(
+                Rect::new(inner.x + 1, inner.y + y_pos, col_width, 1),
+                frame,
+            );
+            y_pos += 1;
+        }
+        line_idx += 1;
+
+        // Entries.
+        for (key, action) in &section.entries {
+            if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
+                render_keybinding_line_themed(
+                    key,
+                    action,
+                    Rect::new(inner.x + 1, inner.y + y_pos, col_width, 1),
+                    key_col,
+                    &tp,
+                    frame,
+                );
+                y_pos += 1;
+            }
+            line_idx += 1;
+        }
+    }
+}
+
 /// Render a single keybinding line: `  [key]  action` (theme-aware).
 fn render_keybinding_line_themed(
     key: &str,

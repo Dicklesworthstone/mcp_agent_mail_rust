@@ -78,6 +78,8 @@ pub struct MailAppModel {
     active_screen: MailScreenId,
     screens: HashMap<MailScreenId, Box<dyn MailScreen>>,
     help_visible: bool,
+    help_scroll: u16,
+    keymap: crate::tui_keymap::KeymapRegistry,
     command_palette: CommandPalette,
     notifications: NotificationQueue,
     last_toast_seq: u64,
@@ -124,6 +126,8 @@ impl MailAppModel {
             active_screen: MailScreenId::Dashboard,
             screens,
             help_visible: false,
+            help_scroll: 0,
+            keymap: crate::tui_keymap::KeymapRegistry::default(),
             command_palette,
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
@@ -141,6 +145,9 @@ impl MailAppModel {
             high_contrast: config.tui_high_contrast,
             key_hints: config.tui_key_hints,
         };
+        // Restore keymap profile from persisted config.
+        let prefs = crate::tui_persist::TuiPreferences::from_config(config);
+        model.keymap.set_profile(prefs.keymap_profile);
         model
     }
 
@@ -165,6 +172,17 @@ impl MailAppModel {
     #[must_use]
     pub const fn accessibility(&self) -> &crate::tui_persist::AccessibilitySettings {
         &self.accessibility
+    }
+
+    /// Mutable access to the keymap registry.
+    pub const fn keymap_mut(&mut self) -> &mut crate::tui_keymap::KeymapRegistry {
+        &mut self.keymap
+    }
+
+    /// Read-only access to the keymap registry.
+    #[must_use]
+    pub const fn keymap(&self) -> &crate::tui_keymap::KeymapRegistry {
+        &self.keymap
     }
 
     /// Whether the active screen is consuming text input.
@@ -207,6 +225,7 @@ impl MailAppModel {
         match id {
             palette_action_ids::APP_TOGGLE_HELP => {
                 self.help_visible = !self.help_visible;
+                self.help_scroll = 0;
                 return Cmd::none();
             }
             palette_action_ids::APP_QUIT => {
@@ -441,6 +460,7 @@ impl Model for MailAppModel {
                             }
                             KeyCode::Char('?') if !text_mode => {
                                 self.help_visible = !self.help_visible;
+                self.help_scroll = 0;
                                 return Cmd::none();
                             }
                             KeyCode::Char('m') if !text_mode => {
@@ -468,6 +488,15 @@ impl Model for MailAppModel {
                             }
                             KeyCode::Escape if self.help_visible => {
                                 self.help_visible = false;
+                                return Cmd::none();
+                            }
+                            // Scroll help overlay with j/k or arrow keys.
+                            KeyCode::Char('j') | KeyCode::Down if self.help_visible => {
+                                self.help_scroll = self.help_scroll.saturating_add(1);
+                                return Cmd::none();
+                            }
+                            KeyCode::Char('k') | KeyCode::Up if self.help_visible => {
+                                self.help_scroll = self.help_scroll.saturating_sub(1);
                                 return Cmd::none();
                             }
                             KeyCode::Char(c) if c.is_ascii_digit() && !text_mode => {
@@ -518,6 +547,7 @@ impl Model for MailAppModel {
             }
             MailMsg::ToggleHelp => {
                 self.help_visible = !self.help_visible;
+                self.help_scroll = 0;
                 Cmd::none()
             }
             MailMsg::Quit => {
@@ -562,12 +592,14 @@ impl Model for MailAppModel {
 
         // 6. Help overlay (z=6, topmost)
         if self.help_visible {
-            let bindings = self
+            let screen_bindings = self
                 .screens
                 .get(&self.active_screen)
                 .map(|s| s.keybindings())
                 .unwrap_or_default();
-            tui_chrome::render_help_overlay(self.active_screen, &bindings, frame, area);
+            let screen_label = crate::tui_screens::screen_meta(self.active_screen).title;
+            let sections = self.keymap.contextual_help(&screen_bindings, screen_label);
+            tui_chrome::render_help_overlay_sections(&sections, self.help_scroll, frame, area);
         }
     }
 }
