@@ -630,6 +630,10 @@ Complete the three placeholder screens that already have screen IDs, tab slots, 
 
 ## 12. Parity Matrix: V1 TUI to V2
 
+Related artifacts:
+
+- `docs/TUI_V2_PARITY_DIFF.md` (br-3vwi.1.2): legacy mail-web vs current Rust surfaces vs FrankentUI showcase analysis
+
 | V1 Feature | V1 Status | V2 Target | Notes |
 |------------|-----------|-----------|-------|
 | Dashboard event log | Done | Enhance (alert badges) | Add per-agent dots, clickable stats |
