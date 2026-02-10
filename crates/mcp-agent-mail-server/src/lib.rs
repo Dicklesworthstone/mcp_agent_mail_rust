@@ -8,6 +8,7 @@ mod mail_ui;
 mod markdown;
 mod retention;
 pub mod startup_checks;
+pub mod static_export;
 mod static_files;
 mod templates;
 pub mod theme;

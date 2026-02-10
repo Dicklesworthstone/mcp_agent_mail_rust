@@ -332,6 +332,7 @@ pub enum ShareCommand {
     Verify(ShareVerifyArgs),
     Decrypt(ShareDecryptArgs),
     Wizard,
+    StaticExport(ShareStaticExportArgs),
 }
 
 #[derive(Args, Debug)]
@@ -424,6 +425,22 @@ pub struct ShareDecryptArgs {
     identity: Option<PathBuf>,
     #[arg(long, short = 'p')]
     passphrase: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ShareStaticExportArgs {
+    /// Output directory for static HTML files.
+    #[arg(long, short = 'o')]
+    pub output: PathBuf,
+    /// Project slugs to export (omit for all).
+    #[arg(long = "project", short = 'p')]
+    pub projects: Vec<String>,
+    /// Include archive visualization routes.
+    #[arg(long, default_value_t = true)]
+    pub include_archive: bool,
+    /// Generate client-side search index artifact.
+    #[arg(long, default_value_t = true)]
+    pub include_search_index: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1490,6 +1507,25 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
             let cwd = std::env::current_dir()
                 .map_err(|e| CliError::Other(format!("failed to resolve current dir: {e}")))?;
             run_share_wizard_in_cwd(&cwd)
+        }
+        ShareCommand::StaticExport(args) => {
+            let output_display = args.output.display().to_string();
+            let config = mcp_agent_mail_server::static_export::ExportConfig {
+                output_dir: args.output,
+                projects: args.projects,
+                include_archive: args.include_archive,
+                include_search_index: args.include_search_index,
+            };
+            let manifest = mcp_agent_mail_server::static_export::export_static_site(&config)
+                .map_err(|e| CliError::Other(format!("static export failed: {e}")))?;
+            ftui_runtime::ftui_println!(
+                "Static export complete: {} files, {} bytes, hash: {}",
+                manifest.file_count,
+                manifest.total_bytes,
+                &manifest.content_hash[..12]
+            );
+            ftui_runtime::ftui_println!("Output: {output_display}");
+            Ok(())
         }
     }
 }
