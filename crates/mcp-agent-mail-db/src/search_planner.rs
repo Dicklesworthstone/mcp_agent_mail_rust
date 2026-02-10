@@ -5,6 +5,8 @@
 //! - BM25 relevance ranking with score extraction
 //! - Stable cursor-based pagination using (score, id)
 //! - Query explain output for debugging/trust
+//! - Permission-aware visibility with contact-policy enforcement
+//! - Field-level redaction with deterministic audit events
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -103,6 +105,136 @@ pub enum RankingMode {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Scope & Redaction
+// ────────────────────────────────────────────────────────────────────
+
+/// Visibility scope policy for search results.
+///
+/// Controls how aggressively the planner enforces contact-policy and
+/// project-visibility rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopePolicy {
+    /// No visibility enforcement — return all matches.
+    /// Suitable for operator/admin dashboards.
+    #[default]
+    Unrestricted,
+
+    /// Restrict results to projects the caller belongs to.
+    /// Messages from agents with `block_all` or `contacts_only` policy
+    /// (when the caller lacks an approved contact link) are excluded.
+    CallerScoped {
+        /// The caller's agent name (used to resolve identity + links).
+        caller_agent: String,
+    },
+
+    /// Restrict to an explicit set of project IDs.
+    /// Useful for pre-computed access lists.
+    ProjectSet {
+        allowed_project_ids: Vec<i64>,
+    },
+}
+
+impl ScopePolicy {
+    /// Whether this policy requires any visibility filtering.
+    #[must_use]
+    pub const fn is_restricted(&self) -> bool {
+        !matches!(self, Self::Unrestricted)
+    }
+}
+
+/// Controls which fields are redacted in search results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactionConfig {
+    /// Replace message body/snippet with placeholder text.
+    pub redact_body: bool,
+    /// Remove sender/recipient agent names from results.
+    pub redact_agent_names: bool,
+    /// Remove thread IDs from results.
+    pub redact_thread_ids: bool,
+    /// Placeholder text for redacted fields.
+    pub placeholder: String,
+}
+
+impl Default for RedactionConfig {
+    fn default() -> Self {
+        Self {
+            redact_body: false,
+            redact_agent_names: false,
+            redact_thread_ids: false,
+            placeholder: "[redacted]".to_string(),
+        }
+    }
+}
+
+impl RedactionConfig {
+    /// Standard redaction for cross-project results where contact policy blocks visibility.
+    #[must_use]
+    pub fn contact_blocked() -> Self {
+        Self {
+            redact_body: true,
+            redact_agent_names: false,
+            redact_thread_ids: true,
+            placeholder: "[content hidden — contact policy]".to_string(),
+        }
+    }
+
+    /// Strict redaction for results that should be almost entirely hidden.
+    #[must_use]
+    pub fn strict() -> Self {
+        Self {
+            redact_body: true,
+            redact_agent_names: true,
+            redact_thread_ids: true,
+            placeholder: "[redacted]".to_string(),
+        }
+    }
+
+    /// Whether any redaction is configured.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.redact_body || self.redact_agent_names || self.redact_thread_ids
+    }
+}
+
+/// Audit entry for a search result that was filtered or redacted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchAuditEntry {
+    /// What happened to the result.
+    pub action: AuditAction,
+    /// The document kind that was affected.
+    pub doc_kind: DocKind,
+    /// The ID of the affected document (message/agent/project).
+    pub doc_id: i64,
+    /// The project ID where the document lives.
+    pub project_id: Option<i64>,
+    /// Why this action was taken.
+    pub reason: String,
+    /// The scope policy that triggered this.
+    pub policy: String,
+}
+
+/// What happened to a search result during visibility enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditAction {
+    /// Result was completely excluded from response.
+    Denied,
+    /// Result was included but with redacted fields.
+    Redacted,
+}
+
+impl AuditAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::Redacted => "redacted",
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
 // SearchQuery
 // ────────────────────────────────────────────────────────────────────
 
@@ -158,6 +290,15 @@ pub struct SearchQuery {
     /// Whether to include explain metadata in results.
     #[serde(default)]
     pub explain: bool,
+
+    // ── Visibility & Redaction ─────────────────────────────────────
+    /// Scope policy controlling result visibility.
+    #[serde(default)]
+    pub scope: ScopePolicy,
+
+    /// Redaction configuration for restricted results.
+    /// If `None`, default redaction rules apply based on scope policy.
+    pub redaction: Option<RedactionConfig>,
 }
 
 impl SearchQuery {
@@ -267,6 +408,14 @@ pub struct SearchResult {
     pub created_ts: Option<i64>,
     pub thread_id: Option<String>,
     pub from_agent: Option<String>,
+
+    // ── Redaction metadata ────────────────────────────────────────
+    /// Whether any fields in this result were redacted.
+    #[serde(default)]
+    pub redacted: bool,
+    /// Human-readable reason for redaction (displayed to user).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redaction_reason: Option<String>,
 }
 
 /// Response from the search planner, including results and pagination info.
@@ -275,6 +424,10 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     pub next_cursor: Option<String>,
     pub explain: Option<QueryExplain>,
+
+    /// Audit log of denied/redacted results (empty when scope is unrestricted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit: Vec<SearchAuditEntry>,
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -296,6 +449,20 @@ pub struct QueryExplain {
     pub facets_applied: Vec<String>,
     /// The raw SQL executed (for debugging).
     pub sql: String,
+
+    /// Scope policy that was applied.
+    #[serde(default = "default_scope_label")]
+    pub scope_policy: String,
+    /// How many results were denied by visibility rules.
+    #[serde(default)]
+    pub denied_count: usize,
+    /// How many results were redacted (included but with hidden fields).
+    #[serde(default)]
+    pub redacted_count: usize,
+}
+
+fn default_scope_label() -> String {
+    "unrestricted".to_string()
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -310,6 +477,10 @@ pub struct SearchPlan {
     pub method: PlanMethod,
     pub normalized_query: Option<String>,
     pub facets_applied: Vec<String>,
+    /// Whether the plan includes scope-enforcement SQL.
+    pub scope_enforced: bool,
+    /// Label for the scope policy applied.
+    pub scope_label: String,
 }
 
 /// Parameter value for a planned SQL query.
@@ -355,6 +526,11 @@ use crate::queries::{extract_like_terms, sanitize_fts_query};
 ///
 /// This function does NOT execute the query — it produces a [`SearchPlan`]
 /// that the caller can execute against a database connection.
+///
+/// Scope enforcement via SQL WHERE clauses is applied when the query has
+/// a `ProjectSet` scope policy. `CallerScoped` enforcement is deferred
+/// to post-processing via [`apply_visibility()`] since it requires
+/// agent-identity resolution that the pure planner cannot perform.
 #[must_use]
 pub fn plan_search(query: &SearchQuery) -> SearchPlan {
     match query.doc_kind {
@@ -392,14 +568,10 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         PlanMethod::Empty
     };
 
+    let scope_label = scope_policy_label(&query.scope);
+
     if method == PlanMethod::Empty {
-        return SearchPlan {
-            sql: String::new(),
-            params: Vec::new(),
-            method,
-            normalized_query: None,
-            facets_applied,
-        };
+        return SearchPlan::empty(scope_label);
     }
 
     let mut params: Vec<PlanParam> = Vec::new();
@@ -465,6 +637,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     };
 
     // ── Scope filters ──────────────────────────────────────────────
+    let mut scope_enforced = false;
     if let Some(pid) = query.project_id {
         where_clauses.push("m.project_id = ?".to_string());
         params.push(PlanParam::Int(pid));
@@ -476,6 +649,19 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         );
         params.push(PlanParam::Int(prod_id));
         facets_applied.push("product_id".to_string());
+    }
+
+    // ── Visibility scope enforcement ──────────────────────────────
+    if let ScopePolicy::ProjectSet { ref allowed_project_ids } = query.scope {
+        if !allowed_project_ids.is_empty() {
+            let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
+            where_clauses.push(format!("m.project_id IN ({})", placeholders.join(", ")));
+            for &pid in allowed_project_ids {
+                params.push(PlanParam::Int(pid));
+            }
+            facets_applied.push("scope_project_set".to_string());
+            scope_enforced = true;
+        }
     }
 
     // ── Facet filters ──────────────────────────────────────────────
@@ -569,11 +755,14 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         method,
         normalized_query: sanitized,
         facets_applied,
+        scope_enforced,
+        scope_label,
     }
 }
 
 fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let limit = query.effective_limit();
+    let scope_label = scope_policy_label(&query.scope);
     let sanitized = if query.text.is_empty() {
         None
     } else {
@@ -589,18 +778,13 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     };
 
     if method == PlanMethod::Empty {
-        return SearchPlan {
-            sql: String::new(),
-            params: Vec::new(),
-            method,
-            normalized_query: None,
-            facets_applied: Vec::new(),
-        };
+        return SearchPlan::empty(scope_label);
     }
 
     let mut params: Vec<PlanParam> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
     let mut facets_applied: Vec<String> = Vec::new();
+    let mut scope_enforced = false;
 
     let (select_cols, from_clause, order_clause) = match method {
         PlanMethod::Fts => {
@@ -644,6 +828,19 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
         facets_applied.push("project_id".to_string());
     }
 
+    // Scope enforcement for ProjectSet
+    if let ScopePolicy::ProjectSet { ref allowed_project_ids } = query.scope {
+        if !allowed_project_ids.is_empty() {
+            let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
+            where_clauses.push(format!("a.project_id IN ({})", placeholders.join(", ")));
+            for &pid in allowed_project_ids {
+                params.push(PlanParam::Int(pid));
+            }
+            facets_applied.push("scope_project_set".to_string());
+            scope_enforced = true;
+        }
+    }
+
     let where_str = if where_clauses.is_empty() {
         String::new()
     } else {
@@ -659,11 +856,14 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
         method,
         normalized_query: sanitized,
         facets_applied,
+        scope_enforced,
+        scope_label,
     }
 }
 
 fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     let limit = query.effective_limit();
+    let scope_label = scope_policy_label(&query.scope);
     let sanitized = if query.text.is_empty() {
         None
     } else {
@@ -679,17 +879,13 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     };
 
     if method == PlanMethod::Empty {
-        return SearchPlan {
-            sql: String::new(),
-            params: Vec::new(),
-            method,
-            normalized_query: None,
-            facets_applied: Vec::new(),
-        };
+        return SearchPlan::empty(scope_label);
     }
 
     let mut params: Vec<PlanParam> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
+    let mut facets_applied: Vec<String> = Vec::new();
+    let mut scope_enforced = false;
 
     let (select_cols, from_clause, order_clause) = match method {
         PlanMethod::Fts => {
@@ -724,6 +920,19 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
         _ => unreachable!(),
     };
 
+    // Scope enforcement for ProjectSet
+    if let ScopePolicy::ProjectSet { ref allowed_project_ids } = query.scope {
+        if !allowed_project_ids.is_empty() {
+            let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
+            where_clauses.push(format!("p.id IN ({})", placeholders.join(", ")));
+            for &pid in allowed_project_ids {
+                params.push(PlanParam::Int(pid));
+            }
+            facets_applied.push("scope_project_set".to_string());
+            scope_enforced = true;
+        }
+    }
+
     let where_str = if where_clauses.is_empty() {
         String::new()
     } else {
@@ -738,7 +947,9 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
         params,
         method,
         normalized_query: sanitized,
-        facets_applied: Vec::new(),
+        facets_applied,
+        scope_enforced,
+        scope_label,
     }
 }
 
@@ -765,6 +976,142 @@ impl SearchPlan {
             facet_count: self.facets_applied.len(),
             facets_applied: self.facets_applied.clone(),
             sql: self.sql.clone(),
+            scope_policy: self.scope_label.clone(),
+            denied_count: 0,
+            redacted_count: 0,
+        }
+    }
+
+    /// Create an empty plan for zero-result queries.
+    const fn empty(scope_label: String) -> Self {
+        Self {
+            sql: String::new(),
+            params: Vec::new(),
+            method: PlanMethod::Empty,
+            normalized_query: None,
+            facets_applied: Vec::new(),
+            scope_enforced: false,
+            scope_label,
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Visibility — post-processing redaction and filtering
+// ────────────────────────────────────────────────────────────────────
+
+/// Context for evaluating visibility of a single result.
+/// Populated from the caller's agent identity and contact links.
+pub struct VisibilityContext {
+    /// Project IDs the caller belongs to.
+    pub caller_project_ids: Vec<i64>,
+    /// Agent IDs the caller has approved contact links with.
+    /// (The other end's `agent_id` for each approved link.)
+    pub approved_contact_ids: Vec<i64>,
+    /// The scope policy in effect.
+    pub policy: ScopePolicy,
+    /// Redaction config (defaults to `contact_blocked` if not set).
+    pub redaction: RedactionConfig,
+}
+
+impl VisibilityContext {
+    /// Check if the caller can see a result from the given project.
+    #[must_use]
+    pub fn can_see_project(&self, project_id: i64) -> bool {
+        match &self.policy {
+            ScopePolicy::Unrestricted => true,
+            ScopePolicy::CallerScoped { .. } => {
+                self.caller_project_ids.contains(&project_id)
+            }
+            ScopePolicy::ProjectSet { allowed_project_ids } => {
+                allowed_project_ids.contains(&project_id)
+            }
+        }
+    }
+}
+
+/// Apply visibility rules to search results, producing redacted/filtered output
+/// and audit entries.
+///
+/// Results from projects the caller can see are included as-is.
+/// Results from other projects are either denied or redacted based on policy.
+#[must_use]
+pub fn apply_visibility(
+    results: Vec<SearchResult>,
+    ctx: &VisibilityContext,
+) -> (Vec<SearchResult>, Vec<SearchAuditEntry>) {
+    if !ctx.policy.is_restricted() {
+        return (results, Vec::new());
+    }
+
+    let mut visible = Vec::with_capacity(results.len());
+    let mut audit = Vec::new();
+
+    for result in results {
+        let project_id = result.project_id.unwrap_or(0);
+
+        if ctx.can_see_project(project_id) {
+            visible.push(result);
+            continue;
+        }
+
+        // Not in caller's projects — check redaction config
+        if ctx.redaction.is_active() {
+            // Include but redact
+            let reason = ctx.redaction.placeholder.clone();
+            audit.push(SearchAuditEntry {
+                action: AuditAction::Redacted,
+                doc_kind: result.doc_kind,
+                doc_id: result.id,
+                project_id: result.project_id,
+                reason: reason.clone(),
+                policy: scope_policy_label(&ctx.policy),
+            });
+            visible.push(redact_result(result, &ctx.redaction));
+        } else {
+            // Deny entirely
+            audit.push(SearchAuditEntry {
+                action: AuditAction::Denied,
+                doc_kind: result.doc_kind,
+                doc_id: result.id,
+                project_id: result.project_id,
+                reason: "project not visible to caller".to_string(),
+                policy: scope_policy_label(&ctx.policy),
+            });
+        }
+    }
+
+    (visible, audit)
+}
+
+/// Apply redaction to a single search result.
+fn redact_result(mut result: SearchResult, config: &RedactionConfig) -> SearchResult {
+    result.redacted = true;
+    result.redaction_reason = Some(config.placeholder.clone());
+
+    if config.redact_body {
+        result.body.clone_from(&config.placeholder);
+        result.title.clone_from(&config.placeholder);
+    }
+    if config.redact_agent_names {
+        result.from_agent = Some(config.placeholder.clone());
+    }
+    if config.redact_thread_ids {
+        result.thread_id = None;
+    }
+
+    result
+}
+
+/// Human-readable label for a scope policy.
+fn scope_policy_label(policy: &ScopePolicy) -> String {
+    match policy {
+        ScopePolicy::Unrestricted => "unrestricted".to_string(),
+        ScopePolicy::CallerScoped { caller_agent } => {
+            format!("caller_scoped:{caller_agent}")
+        }
+        ScopePolicy::ProjectSet { allowed_project_ids } => {
+            format!("project_set:{}", allowed_project_ids.len())
         }
     }
 }
@@ -1162,11 +1509,14 @@ mod tests {
             created_ts: Some(1000),
             thread_id: Some("t1".to_string()),
             from_agent: Some("Blue".to_string()),
+            redacted: false,
+            redaction_reason: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: SearchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(r2.id, 1);
         assert_eq!(r2.score, Some(-1.5));
+        assert!(!r2.redacted);
     }
 
     // ── Multiple facets combined ───────────────────────────────────
@@ -1192,5 +1542,330 @@ mod tests {
         assert!(plan.sql.contains("m.project_id = ?"));
         // 6 facets applied
         assert_eq!(plan.facets_applied.len(), 6);
+    }
+
+    // ── ScopePolicy ───────────────────────────────────────────────
+
+    #[test]
+    fn scope_policy_unrestricted_not_restricted() {
+        assert!(!ScopePolicy::Unrestricted.is_restricted());
+    }
+
+    #[test]
+    fn scope_policy_caller_scoped_is_restricted() {
+        let policy = ScopePolicy::CallerScoped {
+            caller_agent: "BlueLake".to_string(),
+        };
+        assert!(policy.is_restricted());
+    }
+
+    #[test]
+    fn scope_policy_project_set_is_restricted() {
+        let policy = ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![1, 2],
+        };
+        assert!(policy.is_restricted());
+    }
+
+    #[test]
+    fn scope_policy_serde_roundtrip() {
+        let policy = ScopePolicy::CallerScoped {
+            caller_agent: "TestAgent".to_string(),
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let p2: ScopePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(p2, policy);
+    }
+
+    // ── RedactionConfig ───────────────────────────────────────────
+
+    #[test]
+    fn redaction_config_default_inactive() {
+        let config = RedactionConfig::default();
+        assert!(!config.is_active());
+    }
+
+    #[test]
+    fn redaction_config_contact_blocked_active() {
+        let config = RedactionConfig::contact_blocked();
+        assert!(config.is_active());
+        assert!(config.redact_body);
+        assert!(!config.redact_agent_names);
+        assert!(config.redact_thread_ids);
+    }
+
+    #[test]
+    fn redaction_config_strict_all_active() {
+        let config = RedactionConfig::strict();
+        assert!(config.is_active());
+        assert!(config.redact_body);
+        assert!(config.redact_agent_names);
+        assert!(config.redact_thread_ids);
+    }
+
+    // ── AuditAction ───────────────────────────────────────────────
+
+    #[test]
+    fn audit_action_as_str() {
+        assert_eq!(AuditAction::Denied.as_str(), "denied");
+        assert_eq!(AuditAction::Redacted.as_str(), "redacted");
+    }
+
+    // ── Plan with ProjectSet scope ────────────────────────────────
+
+    #[test]
+    fn plan_message_with_project_set_scope() {
+        let mut q = SearchQuery::messages("hello", 1);
+        q.scope = ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![1, 2, 3],
+        };
+        let plan = plan_search(&q);
+        assert_eq!(plan.method, PlanMethod::Fts);
+        assert!(plan.sql.contains("m.project_id IN (?, ?, ?)"));
+        assert!(plan.scope_enforced);
+        assert!(plan.facets_applied.contains(&"scope_project_set".to_string()));
+    }
+
+    #[test]
+    fn plan_agent_with_project_set_scope() {
+        let mut q = SearchQuery::agents("blue", 1);
+        q.scope = ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![5],
+        };
+        let plan = plan_search(&q);
+        assert!(plan.sql.contains("a.project_id IN (?)"));
+        assert!(plan.scope_enforced);
+    }
+
+    #[test]
+    fn plan_project_with_project_set_scope() {
+        let mut q = SearchQuery::projects("myproj");
+        q.scope = ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![10, 20],
+        };
+        let plan = plan_search(&q);
+        assert!(plan.sql.contains("p.id IN (?, ?)"));
+        assert!(plan.scope_enforced);
+    }
+
+    #[test]
+    fn plan_caller_scoped_not_sql_enforced() {
+        // CallerScoped doesn't add SQL — relies on post-processing
+        let mut q = SearchQuery::messages("hello", 1);
+        q.scope = ScopePolicy::CallerScoped {
+            caller_agent: "BlueLake".to_string(),
+        };
+        let plan = plan_search(&q);
+        assert!(!plan.scope_enforced);
+        assert!(plan.scope_label.starts_with("caller_scoped"));
+    }
+
+    #[test]
+    fn plan_scope_label_in_explain() {
+        let mut q = SearchQuery::messages("hello", 1);
+        q.scope = ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![1],
+        };
+        let plan = plan_search(&q);
+        let explain = plan.explain();
+        assert!(explain.scope_policy.starts_with("project_set"));
+    }
+
+    // ── apply_visibility ──────────────────────────────────────────
+
+    fn make_result(id: i64, project_id: i64) -> SearchResult {
+        SearchResult {
+            doc_kind: DocKind::Message,
+            id,
+            project_id: Some(project_id),
+            title: format!("Subject {id}"),
+            body: format!("Body {id}"),
+            score: Some(-1.0),
+            importance: Some("normal".to_string()),
+            ack_required: None,
+            created_ts: Some(1000),
+            thread_id: Some("t1".to_string()),
+            from_agent: Some("BlueLake".to_string()),
+            redacted: false,
+            redaction_reason: None,
+        }
+    }
+
+    #[test]
+    fn visibility_unrestricted_passes_all() {
+        let results = vec![make_result(1, 10), make_result(2, 20)];
+        let ctx = VisibilityContext {
+            caller_project_ids: vec![10],
+            approved_contact_ids: vec![],
+            policy: ScopePolicy::Unrestricted,
+            redaction: RedactionConfig::default(),
+        };
+        let (visible, audit) = apply_visibility(results, &ctx);
+        assert_eq!(visible.len(), 2);
+        assert!(audit.is_empty());
+    }
+
+    #[test]
+    fn visibility_caller_scoped_denies_outside_projects() {
+        let results = vec![make_result(1, 10), make_result(2, 20), make_result(3, 10)];
+        let ctx = VisibilityContext {
+            caller_project_ids: vec![10],
+            approved_contact_ids: vec![],
+            policy: ScopePolicy::CallerScoped {
+                caller_agent: "BlueLake".to_string(),
+            },
+            redaction: RedactionConfig::default(), // not active → deny
+        };
+        let (visible, audit) = apply_visibility(results, &ctx);
+        // Only results from project 10 are visible
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].id, 1);
+        assert_eq!(visible[1].id, 3);
+        // Result from project 20 was denied
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, AuditAction::Denied);
+        assert_eq!(audit[0].doc_id, 2);
+    }
+
+    #[test]
+    fn visibility_caller_scoped_redacts_when_configured() {
+        let results = vec![make_result(1, 10), make_result(2, 20)];
+        let ctx = VisibilityContext {
+            caller_project_ids: vec![10],
+            approved_contact_ids: vec![],
+            policy: ScopePolicy::CallerScoped {
+                caller_agent: "BlueLake".to_string(),
+            },
+            redaction: RedactionConfig::contact_blocked(),
+        };
+        let (visible, audit) = apply_visibility(results, &ctx);
+        assert_eq!(visible.len(), 2);
+        // First result unredacted
+        assert!(!visible[0].redacted);
+        assert_eq!(visible[0].body, "Body 1");
+        // Second result redacted
+        assert!(visible[1].redacted);
+        assert_eq!(visible[1].body, "[content hidden — contact policy]");
+        assert_eq!(visible[1].title, "[content hidden — contact policy]");
+        assert!(visible[1].thread_id.is_none()); // thread_id redacted
+        assert!(visible[1].from_agent.is_some()); // agent name NOT redacted in contact_blocked
+        // Audit
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, AuditAction::Redacted);
+    }
+
+    #[test]
+    fn visibility_strict_redaction_hides_agent_names() {
+        let results = vec![make_result(1, 99)];
+        let ctx = VisibilityContext {
+            caller_project_ids: vec![10],
+            approved_contact_ids: vec![],
+            policy: ScopePolicy::CallerScoped {
+                caller_agent: "BlueLake".to_string(),
+            },
+            redaction: RedactionConfig::strict(),
+        };
+        let (visible, audit) = apply_visibility(results, &ctx);
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].redacted);
+        assert_eq!(visible[0].from_agent.as_deref(), Some("[redacted]"));
+        assert!(visible[0].thread_id.is_none());
+        assert_eq!(audit.len(), 1);
+    }
+
+    #[test]
+    fn visibility_project_set_filters_by_allowed_ids() {
+        let results = vec![
+            make_result(1, 10),
+            make_result(2, 20),
+            make_result(3, 30),
+        ];
+        let ctx = VisibilityContext {
+            caller_project_ids: vec![],
+            approved_contact_ids: vec![],
+            policy: ScopePolicy::ProjectSet {
+                allowed_project_ids: vec![10, 30],
+            },
+            redaction: RedactionConfig::default(),
+        };
+        let (visible, audit) = apply_visibility(results, &ctx);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].id, 1);
+        assert_eq!(visible[1].id, 3);
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].doc_id, 2);
+    }
+
+    // ── SearchAuditEntry serde ────────────────────────────────────
+
+    #[test]
+    fn audit_entry_serde_roundtrip() {
+        let entry = SearchAuditEntry {
+            action: AuditAction::Denied,
+            doc_kind: DocKind::Message,
+            doc_id: 42,
+            project_id: Some(1),
+            reason: "not visible".to_string(),
+            policy: "caller_scoped:BlueLake".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let e2: SearchAuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(e2.action, AuditAction::Denied);
+        assert_eq!(e2.doc_id, 42);
+    }
+
+    // ── SearchResponse with audit ─────────────────────────────────
+
+    #[test]
+    fn search_response_audit_omitted_when_empty() {
+        let resp = SearchResponse {
+            results: vec![],
+            next_cursor: None,
+            explain: None,
+            audit: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("audit"));
+    }
+
+    #[test]
+    fn search_response_audit_included_when_present() {
+        let resp = SearchResponse {
+            results: vec![],
+            next_cursor: None,
+            explain: None,
+            audit: vec![SearchAuditEntry {
+                action: AuditAction::Redacted,
+                doc_kind: DocKind::Message,
+                doc_id: 1,
+                project_id: Some(1),
+                reason: "test".to_string(),
+                policy: "test".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("audit"));
+        assert!(json.contains("redacted"));
+    }
+
+    // ── SearchQuery with scope serde ──────────────────────────────
+
+    #[test]
+    fn search_query_with_scope_serde() {
+        let q = SearchQuery {
+            text: "test".to_string(),
+            scope: ScopePolicy::CallerScoped {
+                caller_agent: "BlueLake".to_string(),
+            },
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        let q2: SearchQuery = serde_json::from_str(&json).unwrap();
+        match q2.scope {
+            ScopePolicy::CallerScoped { caller_agent } => {
+                assert_eq!(caller_agent, "BlueLake");
+            }
+            _ => panic!("expected CallerScoped"),
+        }
     }
 }
