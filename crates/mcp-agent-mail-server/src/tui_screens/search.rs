@@ -5,21 +5,26 @@
 //! composable filtering by document kind, importance, ack status, and more.
 
 use ftui::layout::Rect;
+use ftui::text::Span;
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::Widget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
-    plan_search, DocKind, Importance, RankingMode, SearchQuery,
+    DocKind, Importance, RankingMode, SearchQuery, plan_search,
+};
+use mcp_agent_mail_db::search_recipes::{
+    QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe, list_recent_history,
+    list_recipes, touch_recipe,
 };
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
-use mcp_agent_mail_db::timestamps::micros_to_iso;
+use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -33,6 +38,13 @@ const MAX_RESULTS: usize = 200;
 
 /// Debounce delay in ticks (~100ms each, so 3 ticks = ~300ms).
 const DEBOUNCE_TICKS: u8 = 3;
+
+/// Max chars for the message snippet shown in the detail pane.
+#[allow(dead_code)] // In-progress: used once results rendering is wired up.
+const MAX_SNIPPET_CHARS: usize = 180;
+
+/// Hard cap on highlight terms to keep rendering predictable.
+const MAX_HIGHLIGHT_TERMS: usize = 8;
 
 // ──────────────────────────────────────────────────────────────────────
 // Facet types
@@ -236,6 +248,220 @@ struct ResultEntry {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Query highlighting + snippet extraction
+// ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryTermKind {
+    Word,
+    Phrase,
+    Prefix,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryTerm {
+    text: String,
+    kind: QueryTermKind,
+    negated: bool,
+}
+
+fn clean_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| {
+            !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | '.' | '/' | '*')
+        })
+        .to_string()
+}
+
+fn extract_query_terms(raw: &str) -> Vec<QueryTerm> {
+    let mut terms: Vec<QueryTerm> = Vec::new();
+    let mut chars = raw.chars().peekable();
+    let mut negate_next = false;
+
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_whitespace() {
+            let _ = chars.next();
+            continue;
+        }
+
+        // Quoted phrase
+        if ch == '"' {
+            let _ = chars.next();
+            let mut phrase = String::new();
+            for c in chars.by_ref() {
+                if c == '"' {
+                    break;
+                }
+                phrase.push(c);
+            }
+            let phrase = phrase.trim();
+            if phrase.len() >= 2 {
+                terms.push(QueryTerm {
+                    text: phrase.to_string(),
+                    kind: QueryTermKind::Phrase,
+                    negated: std::mem::take(&mut negate_next),
+                });
+            }
+            if terms.len() >= MAX_HIGHLIGHT_TERMS {
+                break;
+            }
+            continue;
+        }
+
+        // Unquoted token
+        let mut token = String::new();
+        while let Some(c) = chars.peek().copied() {
+            if c.is_whitespace() {
+                break;
+            }
+            token.push(c);
+            let _ = chars.next();
+        }
+
+        let token = clean_token(&token);
+        if token.is_empty() {
+            continue;
+        }
+
+        match token.to_ascii_uppercase().as_str() {
+            "AND" | "OR" | "NEAR" => continue,
+            "NOT" => {
+                negate_next = true;
+                continue;
+            }
+            _ => {}
+        }
+
+        let (kind, text) = if let Some(stripped) = token.strip_suffix('*') {
+            if stripped.len() >= 2 {
+                (QueryTermKind::Prefix, stripped.to_string())
+            } else {
+                continue;
+            }
+        } else if token.len() >= 2 {
+            (QueryTermKind::Word, token)
+        } else {
+            continue;
+        };
+
+        terms.push(QueryTerm {
+            text,
+            kind,
+            negated: std::mem::take(&mut negate_next),
+        });
+        if terms.len() >= MAX_HIGHLIGHT_TERMS {
+            break;
+        }
+    }
+
+    terms
+}
+
+#[allow(dead_code)] // In-progress: used once results rendering is wired up.
+fn clamp_to_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+#[allow(dead_code)] // In-progress: used once results rendering is wired up.
+fn extract_snippet(text: &str, terms: &[QueryTerm], max_chars: usize) -> String {
+    let mut best_pos: Option<usize> = None;
+    let mut best_len: usize = 0;
+
+    if !terms.is_empty() {
+        let hay = text.to_ascii_lowercase();
+        for term in terms.iter().filter(|t| !t.negated) {
+            if term.text.len() < 2 {
+                continue;
+            }
+            let needle = term.text.to_ascii_lowercase();
+            if let Some(pos) = hay.find(&needle) {
+                if best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX) {
+                    best_pos = Some(pos);
+                    best_len = needle.len();
+                }
+            }
+        }
+    }
+
+    let Some(pos) = best_pos else {
+        return truncate_str(text.trim(), max_chars);
+    };
+
+    // Byte-based window with UTF-8 boundary clamping.
+    let context = max_chars / 2;
+    let start = clamp_to_char_boundary(text, pos.saturating_sub(context));
+    let end = clamp_to_char_boundary(text, (pos + best_len + context).min(text.len()));
+    let slice = text[start..end].trim();
+
+    let mut snippet = String::new();
+    if start > 0 {
+        snippet.push('\u{2026}');
+    }
+    snippet.push_str(slice);
+    if end < text.len() {
+        snippet.push('\u{2026}');
+    }
+
+    truncate_str(&snippet, max_chars)
+}
+
+#[allow(dead_code)] // In-progress: used once results rendering is wired up.
+fn highlight_spans(text: &str, terms: &[QueryTerm], style: Style) -> Vec<Span<'static>> {
+    let needles: Vec<String> = terms
+        .iter()
+        .filter(|t| !t.negated)
+        .map(|t| t.text.to_ascii_lowercase())
+        .filter(|t| t.len() >= 2)
+        .take(MAX_HIGHLIGHT_TERMS)
+        .collect();
+    if needles.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+
+    let hay = text.to_ascii_lowercase();
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut i = 0usize;
+    while i < text.len() {
+        let mut best: Option<(usize, usize)> = None;
+        for needle in &needles {
+            if let Some(rel) = hay[i..].find(needle) {
+                let start = i + rel;
+                let end = start + needle.len();
+                best = match best {
+                    None => Some((start, end)),
+                    Some((bs, be)) => {
+                        if start < bs || (start == bs && (end - start) > (be - bs)) {
+                            Some((start, end))
+                        } else {
+                            Some((bs, be))
+                        }
+                    }
+                };
+            }
+        }
+
+        let Some((start, end)) = best else {
+            out.push(Span::raw(text[i..].to_string()));
+            break;
+        };
+
+        if start > i {
+            out.push(Span::raw(text[i..start].to_string()));
+        }
+        if end > start {
+            out.push(Span::styled(text[start..end].to_string(), style));
+        }
+        i = end;
+    }
+
+    out
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Focus state
 // ──────────────────────────────────────────────────────────────────────
 
@@ -249,6 +475,7 @@ enum Focus {
 /// Which facet is currently highlighted in the rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FacetSlot {
+    Scope,
     DocKind,
     Importance,
     AckStatus,
@@ -258,16 +485,18 @@ enum FacetSlot {
 impl FacetSlot {
     const fn next(self) -> Self {
         match self {
+            Self::Scope => Self::DocKind,
             Self::DocKind => Self::Importance,
             Self::Importance => Self::AckStatus,
             Self::AckStatus => Self::SortOrder,
-            Self::SortOrder => Self::DocKind,
+            Self::SortOrder => Self::Scope,
         }
     }
 
     const fn prev(self) -> Self {
         match self {
-            Self::DocKind => Self::SortOrder,
+            Self::Scope => Self::SortOrder,
+            Self::DocKind => Self::Scope,
             Self::Importance => Self::DocKind,
             Self::AckStatus => Self::Importance,
             Self::SortOrder => Self::AckStatus,
@@ -285,11 +514,13 @@ pub struct SearchCockpitScreen {
     query_input: TextInput,
 
     // Facet state
+    scope_mode: ScopeMode,
     doc_kind_filter: DocKindFilter,
     importance_filter: ImportanceFilter,
     ack_filter: AckFilter,
     sort_direction: SortDirection,
     thread_filter: Option<String>,
+    highlight_terms: Vec<QueryTerm>,
 
     // Results
     results: Vec<ResultEntry>,
@@ -308,6 +539,12 @@ pub struct SearchCockpitScreen {
     last_error: Option<String>,
     debounce_remaining: u8,
     search_dirty: bool,
+
+    // Recipes and history
+    saved_recipes: Vec<SearchRecipe>,
+    query_history: Vec<QueryHistoryEntry>,
+    history_cursor: Option<usize>,
+    recipes_loaded: bool,
 }
 
 impl SearchCockpitScreen {
@@ -317,11 +554,13 @@ impl SearchCockpitScreen {
             query_input: TextInput::new()
                 .with_placeholder("Search across messages, agents, projects... (/ to focus)")
                 .with_focused(false),
+            scope_mode: ScopeMode::Global,
             doc_kind_filter: DocKindFilter::Messages,
             importance_filter: ImportanceFilter::Any,
             ack_filter: AckFilter::Any,
             sort_direction: SortDirection::NewestFirst,
             thread_filter: None,
+            highlight_terms: Vec::new(),
             results: Vec::new(),
             cursor: 0,
             detail_scroll: 0,
@@ -334,6 +573,10 @@ impl SearchCockpitScreen {
             last_error: None,
             debounce_remaining: 0,
             search_dirty: true,
+            saved_recipes: Vec::new(),
+            query_history: Vec::new(),
+            history_cursor: None,
+            recipes_loaded: false,
         }
     }
 
@@ -350,6 +593,9 @@ impl SearchCockpitScreen {
         };
         if let Ok(path) = cfg.sqlite_path() {
             self.db_conn = SqliteConnection::open_file(&path).ok();
+            if self.db_conn.is_some() {
+                self.ensure_recipes_loaded();
+            }
         }
     }
 
@@ -396,6 +642,7 @@ impl SearchCockpitScreen {
         self.last_query.clone_from(&raw);
         self.last_error = validate_query_syntax(&raw);
         if self.last_error.is_some() {
+            self.highlight_terms.clear();
             self.results.clear();
             self.total_sql_rows = 0;
             self.cursor = 0;
@@ -403,6 +650,8 @@ impl SearchCockpitScreen {
             self.search_dirty = false;
             return;
         }
+
+        self.highlight_terms = extract_query_terms(&raw);
 
         self.ensure_db_conn(state);
         let Some(conn) = self.db_conn.take() else {
@@ -439,6 +688,7 @@ impl SearchCockpitScreen {
         }
         self.detail_scroll = 0;
         self.search_dirty = false;
+        self.record_history();
     }
 
     /// Run a search for a single doc kind using sync queries.
@@ -593,6 +843,7 @@ impl SearchCockpitScreen {
     #[allow(clippy::missing_const_for_fn)] // mutates self through .next() chains
     fn toggle_active_facet(&mut self) {
         match self.active_facet {
+            FacetSlot::Scope => self.scope_mode = self.scope_mode.next(),
             FacetSlot::DocKind => self.doc_kind_filter = self.doc_kind_filter.next(),
             FacetSlot::Importance => self.importance_filter = self.importance_filter.next(),
             FacetSlot::AckStatus => self.ack_filter = self.ack_filter.next(),
@@ -604,6 +855,7 @@ impl SearchCockpitScreen {
 
     /// Clear all facets to defaults.
     fn reset_facets(&mut self) {
+        self.scope_mode = ScopeMode::Global;
         self.doc_kind_filter = DocKindFilter::Messages;
         self.importance_filter = ImportanceFilter::Any;
         self.ack_filter = AckFilter::Any;
@@ -613,12 +865,109 @@ impl SearchCockpitScreen {
         self.debounce_remaining = 0;
     }
 
+    /// Load saved recipes and recent history from the DB (once).
+    fn ensure_recipes_loaded(&mut self) {
+        if self.recipes_loaded {
+            return;
+        }
+        self.recipes_loaded = true;
+        if let Some(ref conn) = self.db_conn {
+            self.saved_recipes = list_recipes(conn).unwrap_or_default();
+            self.query_history = list_recent_history(conn, 50).unwrap_or_default();
+        }
+    }
+
+    /// Record the current query to history.
+    fn record_history(&mut self) {
+        let text = self.query_input.value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let entry = QueryHistoryEntry {
+            query_text: text,
+            doc_kind: self.doc_kind_filter.route_value().to_string(),
+            scope_mode: self.scope_mode,
+            scope_id: None,
+            result_count: i64::try_from(self.results.len()).unwrap_or(0),
+            executed_ts: now_micros(),
+            ..Default::default()
+        };
+        if let Some(ref conn) = self.db_conn {
+            let _ = insert_history(conn, &entry);
+        }
+        // Prepend to in-memory history
+        self.query_history.insert(0, entry);
+        self.query_history.truncate(50);
+        self.history_cursor = None;
+    }
+
+    /// Save current search state as a named recipe.
+    #[allow(dead_code)] // In-progress: called once recipe save UI is wired up.
+    fn save_current_as_recipe(&mut self, name: String) {
+        let recipe = SearchRecipe {
+            name,
+            query_text: self.query_input.value().trim().to_string(),
+            doc_kind: self.doc_kind_filter.route_value().to_string(),
+            scope_mode: self.scope_mode,
+            importance_filter: self.importance_filter.filter_string().unwrap_or_default(),
+            ack_filter: match self.ack_filter {
+                AckFilter::Any => "any".to_string(),
+                AckFilter::Required => "required".to_string(),
+                AckFilter::NotRequired => "not_required".to_string(),
+            },
+            sort_mode: self.sort_direction.route_value().to_string(),
+            thread_filter: self.thread_filter.clone(),
+            ..Default::default()
+        };
+        if let Some(ref conn) = self.db_conn {
+            if let Ok(id) = insert_recipe(conn, &recipe) {
+                let mut saved = recipe;
+                saved.id = Some(id);
+                self.saved_recipes.insert(0, saved);
+            }
+        }
+    }
+
+    /// Load a recipe into the current search state.
+    #[allow(dead_code)] // In-progress: called once recipe load UI is wired up.
+    fn load_recipe(&mut self, recipe: &SearchRecipe) {
+        self.query_input.set_value(&recipe.query_text);
+        self.scope_mode = recipe.scope_mode;
+        self.doc_kind_filter = match recipe.doc_kind.as_str() {
+            "agents" => DocKindFilter::Agents,
+            "projects" => DocKindFilter::Projects,
+            "all" => DocKindFilter::All,
+            _ => DocKindFilter::Messages,
+        };
+        self.sort_direction = match recipe.sort_mode.as_str() {
+            "oldest" => SortDirection::OldestFirst,
+            "relevance" => SortDirection::Relevance,
+            _ => SortDirection::NewestFirst,
+        };
+        self.ack_filter = match recipe.ack_filter.as_str() {
+            "required" => AckFilter::Required,
+            "not_required" => AckFilter::NotRequired,
+            _ => AckFilter::Any,
+        };
+        self.thread_filter.clone_from(&recipe.thread_filter);
+        self.search_dirty = true;
+        self.debounce_remaining = 0;
+
+        // Touch the recipe's use count
+        if let (Some(conn), Some(id)) = (&self.db_conn, recipe.id) {
+            let _ = touch_recipe(conn, id);
+        }
+    }
+
     fn route_string(&self) -> String {
         let mut params: Vec<(&'static str, String)> = Vec::new();
 
         let q = self.query_input.value().trim();
         if !q.is_empty() {
             params.push(("q", url_encode_component(q)));
+        }
+        if self.scope_mode != ScopeMode::Global {
+            params.push(("scope", self.scope_mode.as_str().to_string()));
         }
         if self.doc_kind_filter != DocKindFilter::Messages {
             params.push(("type", self.doc_kind_filter.route_value().to_string()));
@@ -759,14 +1108,46 @@ impl MailScreen for SearchCockpitScreen {
                             self.debounce_remaining = 0;
                             self.focus = Focus::ResultList;
                             self.query_input.set_focused(false);
+                            self.history_cursor = None;
                         }
                         KeyCode::Escape => {
                             self.focus = Focus::ResultList;
                             self.query_input.set_focused(false);
+                            self.history_cursor = None;
                         }
                         KeyCode::Tab => {
                             self.focus = Focus::FacetRail;
                             self.query_input.set_focused(false);
+                        }
+                        KeyCode::Up => {
+                            // Recall previous history entry
+                            if !self.query_history.is_empty() {
+                                let next = match self.history_cursor {
+                                    None => 0,
+                                    Some(c) => (c + 1).min(self.query_history.len() - 1),
+                                };
+                                self.history_cursor = Some(next);
+                                self.query_input
+                                    .set_value(&self.query_history[next].query_text);
+                                self.search_dirty = true;
+                                self.debounce_remaining = DEBOUNCE_TICKS;
+                            }
+                        }
+                        KeyCode::Down => {
+                            // Recall more recent history entry
+                            if let Some(c) = self.history_cursor {
+                                if c == 0 {
+                                    self.history_cursor = None;
+                                    self.query_input.clear();
+                                } else {
+                                    let next = c - 1;
+                                    self.history_cursor = Some(next);
+                                    self.query_input
+                                        .set_value(&self.query_history[next].query_text);
+                                }
+                                self.search_dirty = true;
+                                self.debounce_remaining = DEBOUNCE_TICKS;
+                            }
                         }
                         _ => {
                             let before = self.query_input.value().to_string();
@@ -774,6 +1155,7 @@ impl MailScreen for SearchCockpitScreen {
                             if self.query_input.value() != before {
                                 self.search_dirty = true;
                                 self.debounce_remaining = DEBOUNCE_TICKS;
+                                self.history_cursor = None;
                             }
                         }
                     },
@@ -798,6 +1180,9 @@ impl MailScreen for SearchCockpitScreen {
                         KeyCode::Left => {
                             // Reverse toggle
                             match self.active_facet {
+                                FacetSlot::Scope => {
+                                    self.scope_mode = self.scope_mode.next();
+                                }
                                 FacetSlot::DocKind => {
                                     self.doc_kind_filter = self.doc_kind_filter.prev();
                                 }
@@ -1020,6 +1405,10 @@ impl MailScreen for SearchCockpitScreen {
             HelpEntry {
                 key: "r",
                 action: "Reset facets",
+            },
+            HelpEntry {
+                key: "\u{2191}/\u{2193}",
+                action: "Query history (in query bar)",
             },
             HelpEntry {
                 key: "\"phrase\"",
@@ -1283,6 +1672,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
     let w = inner.width as usize;
 
     let facets: &[(FacetSlot, &str, &str)] = &[
+        (FacetSlot::Scope, "Scope", screen.scope_mode.as_str()),
         (FacetSlot::DocKind, "Type", screen.doc_kind_filter.label()),
         (
             FacetSlot::Importance,
@@ -1336,7 +1726,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
 
     // Thread filter indicator
     if let Some(ref tid) = screen.thread_filter {
-        let y = inner.y + 8;
+        let y = inner.y + 10;
         if y + 1 < inner.y + inner.height {
             let thread_text = format!("  Thread: {}", truncate_str(tid, w.saturating_sub(10)));
             let thread_area = Rect::new(inner.x, y, inner.width, 1);
@@ -1348,7 +1738,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
 
     // Help hint at bottom
     let help_y = inner.y + inner.height - 1;
-    if help_y > inner.y + 9 {
+    if help_y > inner.y + 11 {
         let hint = if in_rail {
             "Enter:toggle r:reset"
         } else {
@@ -1582,7 +1972,9 @@ mod tests {
 
     #[test]
     fn facet_slot_cycles() {
-        let mut s = FacetSlot::DocKind;
+        let mut s = FacetSlot::Scope;
+        s = s.next();
+        assert_eq!(s, FacetSlot::DocKind);
         s = s.next();
         assert_eq!(s, FacetSlot::Importance);
         s = s.next();
@@ -1590,12 +1982,14 @@ mod tests {
         s = s.next();
         assert_eq!(s, FacetSlot::SortOrder);
         s = s.next();
-        assert_eq!(s, FacetSlot::DocKind);
+        assert_eq!(s, FacetSlot::Scope);
     }
 
     #[test]
     fn facet_slot_prev_cycles() {
         let mut s = FacetSlot::DocKind;
+        s = s.prev();
+        assert_eq!(s, FacetSlot::Scope);
         s = s.prev();
         assert_eq!(s, FacetSlot::SortOrder);
         s = s.prev();
@@ -1819,5 +2213,160 @@ mod tests {
         assert!(AckFilter::Any.filter_value().is_none());
         assert_eq!(AckFilter::Required.filter_value(), Some(true));
         assert_eq!(AckFilter::NotRequired.filter_value(), Some(false));
+    }
+
+    #[test]
+    fn scope_mode_cycles_through_facet_toggle() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.active_facet = FacetSlot::Scope;
+        assert_eq!(screen.scope_mode, ScopeMode::Global);
+
+        screen.toggle_active_facet();
+        assert_eq!(screen.scope_mode, ScopeMode::Project);
+        assert!(screen.search_dirty);
+
+        screen.toggle_active_facet();
+        assert_eq!(screen.scope_mode, ScopeMode::Product);
+
+        screen.toggle_active_facet();
+        assert_eq!(screen.scope_mode, ScopeMode::Global);
+    }
+
+    #[test]
+    fn facet_slot_scope_cycles() {
+        let mut s = FacetSlot::Scope;
+        s = s.next();
+        assert_eq!(s, FacetSlot::DocKind);
+        s = s.prev();
+        assert_eq!(s, FacetSlot::Scope);
+        s = s.prev();
+        assert_eq!(s, FacetSlot::SortOrder);
+    }
+
+    #[test]
+    fn reset_facets_clears_scope() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.scope_mode = ScopeMode::Product;
+        screen.reset_facets();
+        assert_eq!(screen.scope_mode, ScopeMode::Global);
+    }
+
+    #[test]
+    fn route_string_includes_scope() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_input.set_value("test");
+        screen.scope_mode = ScopeMode::Project;
+        let route = screen.route_string();
+        assert!(route.contains("scope=project"), "route was: {route}");
+    }
+
+    #[test]
+    fn route_string_omits_default_scope() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_input.set_value("test");
+        screen.scope_mode = ScopeMode::Global;
+        let route = screen.route_string();
+        assert!(!route.contains("scope="), "route was: {route}");
+    }
+
+    #[test]
+    fn history_cursor_resets_on_enter() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.history_cursor = Some(3);
+        screen.focus = Focus::QueryBar;
+
+        let enter = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Enter,
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&enter, &state);
+
+        assert!(screen.history_cursor.is_none());
+        assert_eq!(screen.focus, Focus::ResultList);
+    }
+
+    #[test]
+    fn history_cursor_resets_on_escape() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.history_cursor = Some(1);
+        screen.focus = Focus::QueryBar;
+
+        let esc = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Escape,
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&esc, &state);
+
+        assert!(screen.history_cursor.is_none());
+    }
+
+    #[test]
+    fn history_up_recalls_entry() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::QueryBar;
+        screen.query_input.set_focused(true);
+        screen.query_history = vec![
+            QueryHistoryEntry {
+                query_text: "first".to_string(),
+                ..Default::default()
+            },
+            QueryHistoryEntry {
+                query_text: "second".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let up = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Up,
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&up, &state);
+
+        assert_eq!(screen.history_cursor, Some(0));
+        assert_eq!(screen.query_input.value(), "first");
+    }
+
+    #[test]
+    fn history_down_clears_at_bottom() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::QueryBar;
+        screen.query_input.set_focused(true);
+        screen.history_cursor = Some(0);
+        screen.query_history = vec![QueryHistoryEntry {
+            query_text: "old query".to_string(),
+            ..Default::default()
+        }];
+        screen.query_input.set_value("old query");
+
+        let down = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Down,
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&down, &state);
+
+        assert!(screen.history_cursor.is_none());
+        assert_eq!(screen.query_input.value(), "");
+    }
+
+    #[test]
+    fn screen_defaults_include_scope() {
+        let screen = SearchCockpitScreen::new();
+        assert_eq!(screen.scope_mode, ScopeMode::Global);
+        assert!(screen.saved_recipes.is_empty());
+        assert!(screen.query_history.is_empty());
+        assert!(screen.history_cursor.is_none());
+        assert!(!screen.recipes_loaded);
     }
 }

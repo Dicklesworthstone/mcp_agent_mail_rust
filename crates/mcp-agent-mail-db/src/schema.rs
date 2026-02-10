@@ -811,6 +811,9 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v8: Search recipes and query history ──────────────────────
+    migrations.extend(crate::search_recipes::recipe_migrations());
+
     migrations
 }
 
