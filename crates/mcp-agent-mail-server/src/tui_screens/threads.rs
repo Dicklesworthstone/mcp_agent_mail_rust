@@ -8,6 +8,7 @@
 use std::time::Instant;
 
 use ftui::layout::Rect;
+use ftui::text::{Line, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
@@ -779,11 +780,12 @@ fn render_thread_detail(
 
     // Build conversation view: each message as a "chat bubble"
     let body_width = inner.width as usize;
-    let mut lines = Vec::new();
+    let md_theme = ftui_extras::markdown::MarkdownTheme::default();
+    let mut styled_lines: Vec<Line> = Vec::new();
 
     for (i, msg) in messages.iter().enumerate() {
         if i > 0 {
-            lines.push(String::new()); // Separator between messages
+            styled_lines.push(Line::raw("")); // Separator between messages
         }
 
         // Header line: sender → recipients, timestamp
@@ -814,48 +816,31 @@ fn render_thread_detail(
             badge = importance_badge,
             time = time_short,
         );
-        lines.push(truncate_str(&header, body_width));
+        styled_lines.push(Line::raw(truncate_str(&header, body_width)));
 
         // Subject (if different from thread_id)
         if !msg.subject.is_empty() {
-            lines.push(format!(
+            styled_lines.push(Line::raw(format!(
                 "  Subj: {}",
                 truncate_str(&msg.subject, body_width.saturating_sub(8))
-            ));
+            )));
         }
 
-        // Body (wrapped)
-        for body_line in msg.body_md.lines() {
-            if body_line.len() <= body_width {
-                lines.push(format!("  {body_line}"));
-            } else {
-                let mut current = String::from("  ");
-                for word in body_line.split_whitespace() {
-                    if current.len() == 2 {
-                        current.push_str(word);
-                    } else if current.len() + 1 + word.len() <= body_width {
-                        current.push(' ');
-                        current.push_str(word);
-                    } else {
-                        lines.push(current);
-                        current = format!("  {word}");
-                    }
-                }
-                if current.len() > 2 {
-                    lines.push(current);
-                }
-            }
+        // Body (rendered with GFM markdown support)
+        let body_text = crate::tui_markdown::render_body(&msg.body_md, &md_theme);
+        for line in body_text.lines() {
+            styled_lines.push(line.clone());
         }
     }
 
     // Apply scroll offset
-    let visible_lines: Vec<&str> = lines
-        .iter()
+    let visible_height = inner.height as usize;
+    let visible: Vec<Line> = styled_lines
+        .into_iter()
         .skip(scroll)
-        .take(inner.height as usize)
-        .map(String::as_str)
+        .take(visible_height)
         .collect();
-    let text = visible_lines.join("\n");
+    let text = Text::from_lines(visible);
     let p = Paragraph::new(text);
     p.render(inner, frame);
 }
