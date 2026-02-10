@@ -18,7 +18,7 @@ use mcp_agent_mail_db::mail_explorer::{AckFilter, Direction, ExplorerStats, Grou
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::{Row, Value};
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
-use mcp_agent_mail_db::timestamps::micros_to_iso;
+use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -29,6 +29,9 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 const MAX_ENTRIES: usize = 200;
 const DEBOUNCE_TICKS: u8 = 3;
+
+/// Default SLA threshold for overdue acks: 30 minutes in microseconds.
+const ACK_SLA_THRESHOLD_MICROS: i64 = 30 * 60 * 1_000_000;
 
 // ──────────────────────────────────────────────────────────────────────
 // Focus and filter rail
@@ -165,10 +168,63 @@ struct DisplayEntry {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Pressure board data
+// ──────────────────────────────────────────────────────────────────────
+
+/// An overdue ack-required message that has exceeded the SLA threshold.
+#[derive(Debug, Clone)]
+struct AckPressureCard {
+    agent_name: String,
+    project_slug: String,
+    count: usize,
+    oldest_ts: i64,
+    age_minutes: i64,
+}
+
+/// Unread message concentration for a specific agent/project.
+#[derive(Debug, Clone)]
+struct UnreadPressureCard {
+    agent_name: String,
+    project_slug: String,
+    unread_count: usize,
+    total_inbound: usize,
+}
+
+/// A file reservation that is near expiry or represents a hotspot.
+#[derive(Debug, Clone)]
+struct ReservationPressureCard {
+    agent_name: String,
+    project_slug: String,
+    path_pattern: String,
+    ttl_remaining_minutes: i64,
+    exclusive: bool,
+}
+
+/// Aggregate pressure board state.
+#[derive(Debug, Clone, Default)]
+struct PressureBoard {
+    overdue_acks: Vec<AckPressureCard>,
+    unread_hotspots: Vec<UnreadPressureCard>,
+    reservation_pressure: Vec<ReservationPressureCard>,
+    computed_at: i64,
+}
+
+impl PressureBoard {
+    fn total_cards(&self) -> usize {
+        self.overdue_acks.len() + self.unread_hotspots.len() + self.reservation_pressure.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total_cards() == 0
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // MailExplorerScreen
 // ──────────────────────────────────────────────────────────────────────
 
 /// Unified inbox/outbox explorer with direction, sort, group, and ack filters.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MailExplorerScreen {
     // Filter state
     agent_filter: String,
@@ -198,6 +254,12 @@ pub struct MailExplorerScreen {
     last_error: Option<String>,
     debounce_remaining: u8,
     search_dirty: bool,
+
+    // Pressure board
+    pressure_mode: bool,
+    pressure_board: PressureBoard,
+    pressure_cursor: usize,
+    pressure_dirty: bool,
 }
 
 impl MailExplorerScreen {
@@ -223,6 +285,11 @@ impl MailExplorerScreen {
             last_error: None,
             debounce_remaining: 0,
             search_dirty: true,
+
+            pressure_mode: false,
+            pressure_board: PressureBoard::default(),
+            pressure_cursor: 0,
+            pressure_dirty: true,
         }
     }
 
@@ -296,6 +363,148 @@ impl MailExplorerScreen {
         self.last_error = None;
         self.search_dirty = false;
         self.db_conn = Some(conn);
+    }
+
+    fn refresh_pressure_board(&mut self, state: &TuiSharedState) {
+        self.ensure_db_conn(state);
+        let Some(conn) = self.db_conn.take() else {
+            return;
+        };
+
+        let now = now_micros();
+
+        let overdue_acks = Self::query_overdue_acks(&conn, now);
+        let unread_hotspots = Self::query_unread_hotspots(&conn);
+        let reservation_pressure = Self::query_reservation_pressure(&conn, now);
+
+        self.pressure_board = PressureBoard {
+            overdue_acks: overdue_acks.unwrap_or_default(),
+            unread_hotspots: unread_hotspots.unwrap_or_default(),
+            reservation_pressure: reservation_pressure.unwrap_or_default(),
+            computed_at: now,
+        };
+
+        let total_cards = self.pressure_board.total_cards();
+        if total_cards == 0 {
+            self.pressure_cursor = 0;
+        } else {
+            self.pressure_cursor = self.pressure_cursor.min(total_cards - 1);
+        }
+        self.pressure_dirty = false;
+        self.db_conn = Some(conn);
+    }
+
+    fn query_overdue_acks(
+        conn: &SqliteConnection,
+        now: i64,
+    ) -> Result<Vec<AckPressureCard>, String> {
+        let threshold = now - ACK_SLA_THRESHOLD_MICROS;
+
+        let sql = "SELECT a.name AS agent_name, p.slug AS project_slug, \
+                   COUNT(*) AS cnt, MIN(m.created_ts) AS oldest_ts \
+                   FROM message_recipients r \
+                   JOIN messages m ON m.id = r.message_id \
+                   JOIN agents a ON a.id = r.agent_id \
+                   JOIN projects p ON p.id = m.project_id \
+                   WHERE m.ack_required = 1 AND r.ack_ts IS NULL \
+                   AND m.created_ts < ?1 \
+                   GROUP BY a.name, p.slug \
+                   ORDER BY oldest_ts ASC \
+                   LIMIT 50";
+
+        let params = vec![Value::BigInt(threshold)];
+        conn.query_sync(sql, &params)
+            .map_err(|e| format!("Overdue acks query: {e}"))
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|row| {
+                        let oldest_ts: i64 = row.get_named("oldest_ts").ok()?;
+                        let age_micros = now.saturating_sub(oldest_ts);
+                        Some(AckPressureCard {
+                            agent_name: row.get_named("agent_name").unwrap_or_default(),
+                            project_slug: row.get_named("project_slug").unwrap_or_default(),
+                            count: row
+                                .get_named::<i64>("cnt")
+                                .ok()
+                                .and_then(|v| usize::try_from(v).ok())
+                                .unwrap_or(0),
+                            oldest_ts,
+                            age_minutes: age_micros / 60_000_000,
+                        })
+                    })
+                    .collect()
+            })
+    }
+
+    fn query_unread_hotspots(conn: &SqliteConnection) -> Result<Vec<UnreadPressureCard>, String> {
+        let sql = "SELECT a.name AS agent_name, p.slug AS project_slug, \
+                   COUNT(CASE WHEN r.read_ts IS NULL THEN 1 END) AS unread_count, \
+                   COUNT(*) AS total_inbound \
+                   FROM message_recipients r \
+                   JOIN messages m ON m.id = r.message_id \
+                   JOIN agents a ON a.id = r.agent_id \
+                   JOIN projects p ON p.id = m.project_id \
+                   GROUP BY a.name, p.slug \
+                   HAVING unread_count > 0 \
+                   ORDER BY unread_count DESC \
+                   LIMIT 50";
+
+        conn.query_sync(sql, &[])
+            .map_err(|e| format!("Unread hotspots query: {e}"))
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| UnreadPressureCard {
+                        agent_name: row.get_named("agent_name").unwrap_or_default(),
+                        project_slug: row.get_named("project_slug").unwrap_or_default(),
+                        unread_count: row
+                            .get_named::<i64>("unread_count")
+                            .ok()
+                            .and_then(|v| usize::try_from(v).ok())
+                            .unwrap_or(0),
+                        total_inbound: row
+                            .get_named::<i64>("total_inbound")
+                            .ok()
+                            .and_then(|v| usize::try_from(v).ok())
+                            .unwrap_or(0),
+                    })
+                    .collect()
+            })
+    }
+
+    fn query_reservation_pressure(
+        conn: &SqliteConnection,
+        now: i64,
+    ) -> Result<Vec<ReservationPressureCard>, String> {
+        let sql = "SELECT fr.path_pattern, fr.exclusive, fr.expires_ts, \
+                   a.name AS agent_name, p.slug AS project_slug \
+                   FROM file_reservations fr \
+                   JOIN agents a ON a.id = fr.agent_id \
+                   JOIN projects p ON p.id = fr.project_id \
+                   WHERE fr.released_ts IS NULL AND fr.expires_ts > ?1 \
+                   ORDER BY fr.expires_ts ASC \
+                   LIMIT 50";
+
+        let params = vec![Value::BigInt(now)];
+        conn.query_sync(sql, &params)
+            .map_err(|e| format!("Reservation pressure query: {e}"))
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|row| {
+                        let expires_ts: i64 = row.get_named("expires_ts").ok()?;
+                        let remaining_micros = expires_ts.saturating_sub(now);
+                        Some(ReservationPressureCard {
+                            agent_name: row.get_named("agent_name").unwrap_or_default(),
+                            project_slug: row.get_named("project_slug").unwrap_or_default(),
+                            path_pattern: row.get_named("path_pattern").unwrap_or_default(),
+                            ttl_remaining_minutes: remaining_micros / 60_000_000,
+                            exclusive: row
+                                .get_named::<i64>("exclusive")
+                                .ok()
+                                .is_some_and(|v| v != 0),
+                        })
+                    })
+                    .collect()
+            })
     }
 
     fn fetch_inbound(
@@ -580,6 +789,13 @@ impl MailScreen for MailExplorerScreen {
                             self.search_dirty = true;
                             self.debounce_remaining = 0;
                         }
+                        // Toggle pressure board
+                        KeyCode::Char('P') => {
+                            self.pressure_mode = !self.pressure_mode;
+                            if self.pressure_mode {
+                                self.pressure_dirty = true;
+                            }
+                        }
                         // Clear all
                         KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
                             self.search_input.clear();
@@ -601,6 +817,10 @@ impl MailScreen for MailExplorerScreen {
                 self.execute_query(state);
             }
         }
+
+        if self.pressure_mode && self.pressure_dirty {
+            self.refresh_pressure_board(state);
+        }
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
@@ -617,45 +837,50 @@ impl MailScreen for MailExplorerScreen {
 
         render_header(frame, header_area, &self.search_input, self);
 
-        // Body: filter rail (left) + results + detail (right)
-        let filter_w: u16 = if area.width >= 100 { 18 } else { 14 };
-        let remaining_w = body_area.width.saturating_sub(filter_w);
-
-        let filter_area = Rect::new(body_area.x, body_area.y, filter_w, body_area.height);
-
-        if remaining_w >= 60 {
-            let results_w = remaining_w * 45 / 100;
-            let detail_w = remaining_w - results_w;
-            let results_area = Rect::new(
-                body_area.x + filter_w,
-                body_area.y,
-                results_w,
-                body_area.height,
-            );
-            let detail_area = Rect::new(
-                body_area.x + filter_w + results_w,
-                body_area.y,
-                detail_w,
-                body_area.height,
-            );
-
-            render_filter_rail(frame, filter_area, self);
-            render_results(frame, results_area, &self.entries, self.cursor);
-            render_detail(
-                frame,
-                detail_area,
-                self.entries.get(self.cursor),
-                self.detail_scroll,
-            );
+        if self.pressure_mode {
+            // Pressure board takes the full body area
+            render_pressure_board(frame, body_area, &self.pressure_board, self.pressure_cursor);
         } else {
-            let results_area = Rect::new(
-                body_area.x + filter_w,
-                body_area.y,
-                remaining_w,
-                body_area.height,
-            );
-            render_filter_rail(frame, filter_area, self);
-            render_results(frame, results_area, &self.entries, self.cursor);
+            // Normal mode: filter rail (left) + results + detail (right)
+            let filter_w: u16 = if area.width >= 100 { 18 } else { 14 };
+            let remaining_w = body_area.width.saturating_sub(filter_w);
+
+            let filter_area = Rect::new(body_area.x, body_area.y, filter_w, body_area.height);
+
+            if remaining_w >= 60 {
+                let results_w = remaining_w * 45 / 100;
+                let detail_w = remaining_w - results_w;
+                let results_area = Rect::new(
+                    body_area.x + filter_w,
+                    body_area.y,
+                    results_w,
+                    body_area.height,
+                );
+                let detail_area = Rect::new(
+                    body_area.x + filter_w + results_w,
+                    body_area.y,
+                    detail_w,
+                    body_area.height,
+                );
+
+                render_filter_rail(frame, filter_area, self);
+                render_results(frame, results_area, &self.entries, self.cursor);
+                render_detail(
+                    frame,
+                    detail_area,
+                    self.entries.get(self.cursor),
+                    self.detail_scroll,
+                );
+            } else {
+                let results_area = Rect::new(
+                    body_area.x + filter_w,
+                    body_area.y,
+                    remaining_w,
+                    body_area.height,
+                );
+                render_filter_rail(frame, filter_area, self);
+                render_results(frame, results_area, &self.entries, self.cursor);
+            }
         }
     }
 
@@ -704,6 +929,10 @@ impl MailScreen for MailExplorerScreen {
             HelpEntry {
                 key: "Ctrl+C",
                 action: "Clear all",
+            },
+            HelpEntry {
+                key: "P",
+                action: "Pressure board",
             },
             HelpEntry {
                 key: "r",
@@ -885,18 +1114,43 @@ fn render_header(
         format!(" @{}", screen.agent_filter)
     };
 
-    let stats = &screen.stats;
-    let stat_line = format!(
-        "in:{} out:{} unread:{} ack:{} thr:{} proj:{}",
-        stats.inbound_count,
-        stats.outbound_count,
-        stats.unread_count,
-        stats.pending_ack_count,
-        stats.unique_threads,
-        stats.unique_projects,
-    );
+    let stat_line = if screen.pressure_mode {
+        let pb = &screen.pressure_board;
+        let age = if pb.computed_at > 0 {
+            let iso = micros_to_iso(pb.computed_at);
+            if iso.len() >= 19 {
+                iso[11..19].to_string()
+            } else {
+                iso
+            }
+        } else {
+            "---".to_string()
+        };
+        format!(
+            "PRESSURE: ack:{} unread:{} reserv:{} @{age} | P:toggle",
+            pb.overdue_acks.len(),
+            pb.unread_hotspots.len(),
+            pb.reservation_pressure.len(),
+        )
+    } else {
+        let stats = &screen.stats;
+        format!(
+            "in:{} out:{} unread:{} ack:{} thr:{} proj:{}",
+            stats.inbound_count,
+            stats.outbound_count,
+            stats.unread_count,
+            stats.pending_ack_count,
+            stats.unique_threads,
+            stats.unique_projects,
+        )
+    };
 
-    let title = format!("Explorer {dir}{agent_label} ({count}){focus_label}");
+    let mode_label = if screen.pressure_mode {
+        " [PRESSURE]"
+    } else {
+        ""
+    };
+    let title = format!("Explorer {dir}{agent_label} ({count}){focus_label}{mode_label}");
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded);
@@ -1137,6 +1391,180 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&DisplayEntry>
     let visible = &lines[skip..];
     let text = visible.join("\n");
     Paragraph::new(text).render(inner, frame);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Pressure board rendering
+// ──────────────────────────────────────────────────────────────────────
+
+const PRESSURE_ACK_FG: PackedRgba = PackedRgba::rgba(0xFF, 0x5F, 0x5F, 0xFF);
+const PRESSURE_UNREAD_FG: PackedRgba = PackedRgba::rgba(0xFF, 0xAF, 0x00, 0xFF);
+const PRESSURE_RESERVATION_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xD7, 0xFF, 0xFF);
+const PRESSURE_SECTION_FG: PackedRgba = PackedRgba::rgba(0xD7, 0x87, 0xFF, 0xFF);
+const PRESSURE_OK_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xAF, 0x5F, 0xFF);
+
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoard, cursor: usize) {
+    let block = Block::default()
+        .title("Pressure Board")
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if board.is_empty() {
+        Paragraph::new("  No pressure signals. All clear.")
+            .style(Style::default().fg(PRESSURE_OK_FG))
+            .render(inner, frame);
+        return;
+    }
+
+    let w = inner.width as usize;
+
+    // Build all lines with their styles
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    let mut card_line_indices: Vec<usize> = Vec::new();
+    let mut card_index: usize = 0;
+
+    // Section: Overdue Acks
+    if !board.overdue_acks.is_empty() {
+        lines.push((
+            format!(
+                "\u{26A0} Overdue Acks ({} agent/project groups)",
+                board.overdue_acks.len()
+            ),
+            Style::default().fg(PRESSURE_SECTION_FG),
+        ));
+
+        for card in &board.overdue_acks {
+            let marker = if card_index == cursor { '>' } else { ' ' };
+            let oldest_time = {
+                let iso = micros_to_iso(card.oldest_ts);
+                if iso.len() >= 19 {
+                    iso[11..19].to_string()
+                } else {
+                    iso
+                }
+            };
+            let line = format!(
+                "{marker} {:<16} {:<20} {:>3} overdue  {}m ago (since {oldest_time})",
+                truncate_str(&card.agent_name, 16),
+                truncate_str(&card.project_slug, 20),
+                card.count,
+                card.age_minutes,
+            );
+            card_line_indices.push(lines.len());
+            lines.push((
+                truncate_str(&line, w),
+                if card_index == cursor {
+                    Style::default().fg(CURSOR_FG)
+                } else {
+                    Style::default().fg(PRESSURE_ACK_FG)
+                },
+            ));
+            card_index += 1;
+        }
+        lines.push((String::new(), Style::default()));
+    }
+
+    // Section: Unread Hotspots
+    if !board.unread_hotspots.is_empty() {
+        lines.push((
+            format!(
+                "\u{1F4EC} Unread Concentrations ({} agent/project groups)",
+                board.unread_hotspots.len()
+            ),
+            Style::default().fg(PRESSURE_SECTION_FG),
+        ));
+
+        for card in &board.unread_hotspots {
+            let marker = if card_index == cursor { '>' } else { ' ' };
+            let pct = (card.unread_count * 100)
+                .checked_div(card.total_inbound)
+                .unwrap_or(0);
+            let line = format!(
+                "{marker} {:<16} {:<20} {:>3} unread / {} total ({}%)",
+                truncate_str(&card.agent_name, 16),
+                truncate_str(&card.project_slug, 20),
+                card.unread_count,
+                card.total_inbound,
+                pct,
+            );
+            card_line_indices.push(lines.len());
+            lines.push((
+                truncate_str(&line, w),
+                if card_index == cursor {
+                    Style::default().fg(CURSOR_FG)
+                } else {
+                    Style::default().fg(PRESSURE_UNREAD_FG)
+                },
+            ));
+            card_index += 1;
+        }
+        lines.push((String::new(), Style::default()));
+    }
+
+    // Section: Reservation Pressure
+    if !board.reservation_pressure.is_empty() {
+        lines.push((
+            format!(
+                "\u{1F512} Reservation Pressure ({} active)",
+                board.reservation_pressure.len()
+            ),
+            Style::default().fg(PRESSURE_SECTION_FG),
+        ));
+
+        for card in &board.reservation_pressure {
+            let marker = if card_index == cursor { '>' } else { ' ' };
+            let excl = if card.exclusive { "excl" } else { "share" };
+            let urgency = if card.ttl_remaining_minutes <= 10 {
+                "!!"
+            } else if card.ttl_remaining_minutes <= 30 {
+                "! "
+            } else {
+                "  "
+            };
+            let line = format!(
+                "{marker}{urgency}{:<16} {:<20} {excl} {:>4}m  {}",
+                truncate_str(&card.agent_name, 16),
+                truncate_str(&card.project_slug, 20),
+                card.ttl_remaining_minutes,
+                truncate_str(&card.path_pattern, 30),
+            );
+            card_line_indices.push(lines.len());
+            let style = if card_index == cursor {
+                Style::default().fg(CURSOR_FG)
+            } else if card.ttl_remaining_minutes <= 10 {
+                Style::default().fg(PRESSURE_ACK_FG)
+            } else {
+                Style::default().fg(PRESSURE_RESERVATION_FG)
+            };
+            lines.push((truncate_str(&line, w), style));
+            card_index += 1;
+        }
+    }
+
+    // Render visible lines
+    let visible_h = inner.height as usize;
+
+    // Find the cursor card's line index for scrolling
+    let cursor_line = card_line_indices.get(cursor).copied().unwrap_or(0);
+    let (start, end) = viewport_range(lines.len(), visible_h, cursor_line);
+    let viewport = &lines[start..end];
+
+    for (i, (text, style)) in viewport.iter().enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let line_area = Rect::new(inner.x, y, inner.width, 1);
+        Paragraph::new(text.as_str())
+            .style(*style)
+            .render(line_area, frame);
+    }
 }
 
 fn viewport_range(total: usize, visible: usize, cursor: usize) -> (usize, usize) {
@@ -1454,7 +1882,201 @@ mod tests {
         assert!(text.contains("ERR:"), "expected ERR line, got:\n{text}");
     }
 
+    // ── Pressure board tests ─────────────────────────────────
+
+    #[test]
+    fn pressure_board_default_is_empty() {
+        let pb = PressureBoard::default();
+        assert!(pb.is_empty());
+        assert_eq!(pb.total_cards(), 0);
+    }
+
+    #[test]
+    fn pressure_board_total_cards() {
+        let pb = PressureBoard {
+            overdue_acks: vec![test_ack_card("AgentA", 3, 45)],
+            unread_hotspots: vec![
+                test_unread_card("AgentB", 5, 10),
+                test_unread_card("AgentC", 2, 8),
+            ],
+            reservation_pressure: vec![test_reservation_card("AgentD", "src/**", 15)],
+            computed_at: 0,
+        };
+        assert_eq!(pb.total_cards(), 4);
+        assert!(!pb.is_empty());
+    }
+
+    #[test]
+    fn pressure_toggle_sets_dirty() {
+        let mut screen = MailExplorerScreen::new();
+        assert!(!screen.pressure_mode);
+        screen.pressure_dirty = false;
+
+        // Simulate pressing 'P'
+        let ev = ftui::Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('P'),
+            modifiers: Modifiers::SHIFT,
+            kind: KeyEventKind::Press,
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&ev, &state);
+
+        assert!(screen.pressure_mode);
+        assert!(screen.pressure_dirty);
+    }
+
+    #[test]
+    fn pressure_toggle_off() {
+        let mut screen = MailExplorerScreen::new();
+        screen.pressure_mode = true;
+
+        let ev = ftui::Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('P'),
+            modifiers: Modifiers::SHIFT,
+            kind: KeyEventKind::Press,
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&ev, &state);
+
+        assert!(!screen.pressure_mode);
+    }
+
+    #[test]
+    fn pressure_board_renders_empty() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+        screen.pressure_mode = true;
+        screen.pressure_dirty = false;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 40), &state);
+        let text = buffer_to_text(&frame.buffer);
+        // In pressure mode, the PRESSURE label appears in the header and
+        // the body shows the Pressure Board panel.
+        assert!(
+            text.contains("PRESSURE") || text.contains("Pressure"),
+            "expected PRESSURE or Pressure in output, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn pressure_board_renders_with_data() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+        screen.pressure_mode = true;
+        screen.pressure_dirty = false;
+        screen.pressure_board = PressureBoard {
+            overdue_acks: vec![test_ack_card("RedFox", 5, 90)],
+            unread_hotspots: vec![test_unread_card("BlueLake", 12, 50)],
+            reservation_pressure: vec![test_reservation_card("GoldHawk", "src/**", 8)],
+            computed_at: 0,
+        };
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 40), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Overdue Acks"),
+            "expected Overdue Acks section, got:\n{text}"
+        );
+        assert!(
+            text.contains("Unread"),
+            "expected Unread section, got:\n{text}"
+        );
+        assert!(
+            text.contains("Reservation"),
+            "expected Reservation section, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn pressure_board_renders_narrow() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+        screen.pressure_mode = true;
+        screen.pressure_dirty = false;
+        screen.pressure_board = PressureBoard {
+            overdue_acks: vec![test_ack_card("TestAgent", 2, 60)],
+            unread_hotspots: Vec::new(),
+            reservation_pressure: Vec::new(),
+            computed_at: 0,
+        };
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(60, 20, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 60, 20), &state);
+        // Should not panic
+    }
+
+    #[test]
+    fn pressure_header_shows_mode() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+        screen.pressure_mode = true;
+        screen.pressure_dirty = false;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 10, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 10), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("PRESSURE"),
+            "expected PRESSURE label, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn pressure_keybinding_listed() {
+        let screen = MailExplorerScreen::new();
+        let bindings = screen.keybindings();
+        assert!(
+            bindings.iter().any(|h| h.key == "P"),
+            "P keybinding should be listed"
+        );
+    }
+
     // ── Test helpers ──────────────────────────────────────────
+
+    fn test_ack_card(agent: &str, count: usize, age_minutes: i64) -> AckPressureCard {
+        AckPressureCard {
+            agent_name: agent.to_string(),
+            project_slug: "test-project".to_string(),
+            count,
+            oldest_ts: 0,
+            age_minutes,
+        }
+    }
+
+    fn test_unread_card(
+        agent: &str,
+        unread_count: usize,
+        total_inbound: usize,
+    ) -> UnreadPressureCard {
+        UnreadPressureCard {
+            agent_name: agent.to_string(),
+            project_slug: "test-project".to_string(),
+            unread_count,
+            total_inbound,
+        }
+    }
+
+    fn test_reservation_card(agent: &str, path: &str, ttl_minutes: i64) -> ReservationPressureCard {
+        ReservationPressureCard {
+            agent_name: agent.to_string(),
+            project_slug: "test-project".to_string(),
+            path_pattern: path.to_string(),
+            ttl_remaining_minutes: ttl_minutes,
+            exclusive: true,
+        }
+    }
 
     fn test_entry(id: i64, ts: i64, direction: Direction) -> DisplayEntry {
         DisplayEntry {
