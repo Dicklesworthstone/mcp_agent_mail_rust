@@ -40,6 +40,12 @@ pub use diagnostics::{
 pub use error::{Error as MailError, Result as MailResult};
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};
+pub use kpi::{
+    AckPressureKpi, ContentionKpi, KpiReport, KpiSnapshot, KpiWindow, LatencyKpi, ThroughputKpi,
+    kpi_gauges, latest_raw as kpi_latest_raw, record_sample as kpi_record_sample,
+    report as kpi_report, reset_samples as kpi_reset_samples, sample_count as kpi_sample_count,
+    snapshot as kpi_snapshot,
+};
 pub use lock_order::{
     LockContentionEntry, LockLevel, OrderedMutex, OrderedRwLock, lock_contention_reset,
     lock_contention_snapshot,
@@ -54,11 +60,5 @@ pub use models::{
     Agent, AgentLink, ConsistencyMessageRef, ConsistencyReport, FileReservation, Message,
     MessageRecipient, Product, ProductProjectLink, Project, ProjectSiblingSuggestion,
     VALID_ADJECTIVES, VALID_NOUNS, generate_agent_name, is_valid_agent_name,
-};
-pub use kpi::{
-    AckPressureKpi, ContentionKpi, KpiReport, KpiSnapshot, KpiWindow, LatencyKpi, ThroughputKpi,
-    kpi_gauges, latest_raw as kpi_latest_raw, record_sample as kpi_record_sample,
-    report as kpi_report, reset_samples as kpi_reset_samples,
-    sample_count as kpi_sample_count, snapshot as kpi_snapshot,
 };
 pub use slo::{OpClass, PoolHealth};

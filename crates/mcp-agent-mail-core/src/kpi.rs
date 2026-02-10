@@ -146,8 +146,7 @@ struct Sample {
 const MAX_SAMPLES: usize = 3600;
 
 /// Global sample ring buffer.
-static SAMPLE_BUFFER: LazyLock<Mutex<SampleRing>> =
-    LazyLock::new(|| Mutex::new(SampleRing::new()));
+static SAMPLE_BUFFER: LazyLock<Mutex<SampleRing>> = LazyLock::new(|| Mutex::new(SampleRing::new()));
 
 struct SampleRing {
     buf: Vec<Sample>,
@@ -190,7 +189,7 @@ impl SampleRing {
     }
 
     /// Find the sample closest to `target_age` seconds ago from the latest.
-    /// Returns (oldest_sample, newest_sample) pair for delta computation.
+    /// Returns (`oldest_sample`, `newest_sample`) pair for delta computation.
     fn window_pair(&self, window_secs: u64) -> Option<(&Sample, &Sample)> {
         let newest = self.latest()?;
         if self.buf.len() < 2 {
@@ -207,7 +206,7 @@ impl SampleRing {
         let mut best_diff = u64::MAX;
 
         for offset in 1..len {
-            let raw = if self.head >= 1 + offset {
+            let raw = if self.head > offset {
                 self.head - 1 - offset
             } else {
                 len - (1 + offset - self.head)
@@ -418,10 +417,16 @@ fn compute_kpi(window: KpiWindow, old: &Sample, new: &Sample) -> KpiSnapshot {
     let m_new = &new.metrics;
 
     // -- Throughput --
-    let tool_calls_per_sec =
-        delta_rate(m_old.tools.tool_calls_total, m_new.tools.tool_calls_total, dt_secs);
-    let tool_errors_per_sec =
-        delta_rate(m_old.tools.tool_errors_total, m_new.tools.tool_errors_total, dt_secs);
+    let tool_calls_per_sec = delta_rate(
+        m_old.tools.tool_calls_total,
+        m_new.tools.tool_calls_total,
+        dt_secs,
+    );
+    let tool_errors_per_sec = delta_rate(
+        m_old.tools.tool_errors_total,
+        m_new.tools.tool_errors_total,
+        dt_secs,
+    );
 
     let delta_calls = m_new
         .tools
@@ -438,10 +443,12 @@ fn compute_kpi(window: KpiWindow, old: &Sample, new: &Sample) -> KpiSnapshot {
         (delta_errors as f64 / delta_calls as f64) * 10_000.0
     };
 
-    let http_rps =
-        delta_rate(m_old.http.requests_total, m_new.http.requests_total, dt_secs);
-    let messages_per_sec =
-        delta_rate(old.messages_sent_total, new.messages_sent_total, dt_secs);
+    let http_rps = delta_rate(
+        m_old.http.requests_total,
+        m_new.http.requests_total,
+        dt_secs,
+    );
+    let messages_per_sec = delta_rate(old.messages_sent_total, new.messages_sent_total, dt_secs);
     let commit_throughput_per_sec = delta_rate(
         m_old.storage.commit_drained_total,
         m_new.storage.commit_drained_total,
@@ -533,19 +540,17 @@ pub fn snapshot(window: KpiWindow) -> Option<KpiSnapshot> {
     let (old, new) = ring.window_pair(window.seconds())?;
     let mut kpi = compute_kpi(window, old, new);
     kpi.sample_count = ring.len();
+    drop(ring);
     Some(kpi)
 }
 
 /// Compute KPI snapshots for all standard windows.
 #[must_use]
 pub fn report() -> KpiReport {
-    let ring = match SAMPLE_BUFFER.lock() {
-        Ok(r) => r,
-        Err(_) => {
-            return KpiReport {
-                windows: Vec::new(),
-            };
-        }
+    let Ok(ring) = SAMPLE_BUFFER.lock() else {
+        return KpiReport {
+            windows: Vec::new(),
+        };
     };
 
     let sample_count = ring.len();
@@ -559,6 +564,7 @@ pub fn report() -> KpiReport {
         })
         .collect();
 
+    drop(ring);
     KpiReport { windows }
 }
 
@@ -692,10 +698,17 @@ mod tests {
     }
 
     /// Helper: inject a sample into the ring with explicit Instant.
-    fn inject_sample(ring: &mut SampleRing, at: Instant, metrics: GlobalMetricsSnapshot,
-                     ack_pending: u64, ack_overdue: u64,
-                     reservation_active: u64, reservation_conflicts: u64,
-                     messages_sent: u64) {
+    #[allow(clippy::too_many_arguments)]
+    fn inject_sample(
+        ring: &mut SampleRing,
+        at: Instant,
+        metrics: GlobalMetricsSnapshot,
+        ack_pending: u64,
+        ack_overdue: u64,
+        reservation_active: u64,
+        reservation_conflicts: u64,
+        messages_sent: u64,
+    ) {
         ring.push(Sample {
             taken_at: at,
             metrics,
@@ -720,8 +733,16 @@ mod tests {
     fn ring_single_sample_has_latest_but_no_pair() {
         let mut ring = SampleRing::new();
         let now = Instant::now();
-        inject_sample(&mut ring, now, make_snapshot(0, 0, 0, 0, 0, 0),
-                      0, 0, 0, 0, 0);
+        inject_sample(
+            &mut ring,
+            now,
+            make_snapshot(0, 0, 0, 0, 0, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
         assert!(ring.latest().is_some());
         assert!(ring.window_pair(60).is_none());
     }
@@ -731,10 +752,26 @@ mod tests {
         let mut ring = SampleRing::new();
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(30);
-        inject_sample(&mut ring, t0, make_snapshot(100, 5, 200, 10, 0, 0),
-                      2, 0, 5, 0, 50);
-        inject_sample(&mut ring, t1, make_snapshot(200, 10, 400, 20, 1, 2),
-                      3, 1, 8, 1, 100);
+        inject_sample(
+            &mut ring,
+            t0,
+            make_snapshot(100, 5, 200, 10, 0, 0),
+            2,
+            0,
+            5,
+            0,
+            50,
+        );
+        inject_sample(
+            &mut ring,
+            t1,
+            make_snapshot(200, 10, 400, 20, 1, 2),
+            3,
+            1,
+            8,
+            1,
+            100,
+        );
 
         let (old, new) = ring.window_pair(60).unwrap();
         assert_eq!(old.metrics.tools.tool_calls_total, 100);
@@ -755,7 +792,11 @@ mod tests {
                 &mut ring,
                 t0 + Duration::from_secs(i),
                 make_snapshot(i * 10, 0, 0, 0, 0, 0),
-                0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
             );
         }
         // Ring should have MAX_SAMPLES entries (3600), not wrap at 4
@@ -824,8 +865,8 @@ mod tests {
         new_sample.taken_at = t1;
 
         let kpi = compute_kpi(KpiWindow::OneMin, &old, &new_sample);
-        assert_eq!(kpi.throughput.error_rate_bps, 0.0);
-        assert_eq!(kpi.throughput.tool_calls_per_sec, 0.0);
+        assert!(kpi.throughput.error_rate_bps.abs() < f64::EPSILON);
+        assert!(kpi.throughput.tool_calls_per_sec.abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1051,20 +1092,41 @@ mod tests {
     }
 
     #[test]
-    fn report_returns_all_windows() {
-        reset_samples();
+    fn report_returns_windows_when_data_available() {
+        // Test the computation logic via SampleRing directly, avoiding
+        // shared global state races with parallel tests.
+        let mut ring = SampleRing::new();
+        let t0 = Instant::now();
 
-        record_sample();
-        thread::sleep(Duration::from_millis(10));
-        record_sample();
+        inject_sample(
+            &mut ring,
+            t0,
+            make_snapshot(100, 5, 200, 10, 0, 0),
+            2,
+            0,
+            5,
+            0,
+            50,
+        );
+        inject_sample(
+            &mut ring,
+            t0 + Duration::from_secs(30),
+            make_snapshot(200, 10, 400, 20, 1, 2),
+            3,
+            1,
+            8,
+            1,
+            100,
+        );
 
-        let rep = report();
-        // With only ~10ms of data, only the 1m window will have a pair
-        // (since all windows search for the closest sample).
-        assert!(!rep.windows.is_empty());
-
-        // Cleanup
-        reset_samples();
+        // All windows should find a pair (both point to the same 2 samples).
+        for &w in &KpiWindow::ALL {
+            let pair = ring.window_pair(w.seconds());
+            assert!(pair.is_some(), "window {w} should find a pair");
+            let (old, new) = pair.unwrap();
+            let kpi = compute_kpi(w, old, new);
+            assert!(kpi.actual_span_secs > 0.0);
+        }
     }
 
     #[test]
@@ -1102,18 +1164,18 @@ mod tests {
             ack_overdue: 0,
             reservation_active: 0,
             reservation_conflicts_total: 1, // lower than old
-            messages_sent_total: 20, // lower than old
+            messages_sent_total: 20,        // lower than old
         };
 
         let kpi = compute_kpi(KpiWindow::OneMin, &old, &new);
 
         // All rates should be 0 (not negative or panicked).
-        assert_eq!(kpi.throughput.tool_calls_per_sec, 0.0);
-        assert_eq!(kpi.throughput.tool_errors_per_sec, 0.0);
-        assert_eq!(kpi.throughput.error_rate_bps, 0.0);
-        assert_eq!(kpi.throughput.http_rps, 0.0);
-        assert_eq!(kpi.throughput.messages_per_sec, 0.0);
-        assert_eq!(kpi.throughput.commit_throughput_per_sec, 0.0);
+        assert!(kpi.throughput.tool_calls_per_sec.abs() < f64::EPSILON);
+        assert!(kpi.throughput.tool_errors_per_sec.abs() < f64::EPSILON);
+        assert!(kpi.throughput.error_rate_bps.abs() < f64::EPSILON);
+        assert!(kpi.throughput.http_rps.abs() < f64::EPSILON);
+        assert!(kpi.throughput.messages_per_sec.abs() < f64::EPSILON);
+        assert!(kpi.throughput.commit_throughput_per_sec.abs() < f64::EPSILON);
         assert_eq!(kpi.contention.reservation_conflicts_in_window, 0);
     }
 }
