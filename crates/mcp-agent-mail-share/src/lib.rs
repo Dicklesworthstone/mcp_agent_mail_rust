@@ -7,6 +7,7 @@ pub mod hosting;
 pub mod scope;
 pub mod scrub;
 pub mod snapshot;
+pub mod static_render;
 
 pub use bundle::{
     AttachmentConfig, AttachmentItem, AttachmentManifest, AttachmentStats, ChunkManifest,
@@ -25,6 +26,9 @@ pub use hosting::{HostingHint, detect_hosting_hints, generate_headers_file};
 pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
 pub use scrub::{ScrubSummary, scrub_snapshot};
 pub use snapshot::{SnapshotContext, create_snapshot_context, create_sqlite_snapshot};
+pub use static_render::{
+    SearchIndexEntry, SitemapEntry, StaticRenderConfig, StaticRenderResult, render_static_site,
+};
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
