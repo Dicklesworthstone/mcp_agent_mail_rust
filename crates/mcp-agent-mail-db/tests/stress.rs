@@ -3219,6 +3219,204 @@ fn set_contact_policy_updates_cache() {
     });
 }
 
+// =============================================================================
+// Edge case: message-to-self (sender is also a recipient)
+// =============================================================================
+
+#[test]
+fn edge_case_message_to_self() {
+    let (pool, _dir) = make_pool();
+    let suffix = unique_suffix();
+    let human_key = format!("/data/stress/self_msg_{suffix}");
+
+    block_on(|cx| async move {
+        let proj = match queries::ensure_project(&cx, &pool, &human_key).await {
+            Outcome::Ok(r) => r,
+            _ => panic!("ensure_project failed"),
+        };
+        let pid = proj.id.unwrap();
+
+        let agent =
+            match queries::register_agent(&cx, &pool, pid, "GoldLake", "test", "test", None, None)
+                .await
+            {
+                Outcome::Ok(r) => r,
+                _ => panic!("register agent failed"),
+            };
+        let agent_id = agent.id.unwrap();
+
+        // Send a message where sender == recipient (message-to-self)
+        let msg = match queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            pid,
+            agent_id,
+            "Note to self",
+            "Remember to review the PR",
+            Some("self-thread"),
+            "normal",
+            false,
+            "[]",
+            &[(agent_id, "to")],
+        )
+        .await
+        {
+            Outcome::Ok(m) => m,
+            other => panic!("create_message_with_recipients failed: {other:?}"),
+        };
+        let msg_id = msg.id.unwrap();
+        assert!(msg_id > 0, "message should have a valid ID");
+
+        // Fetch inbox — the message should appear (sender == recipient)
+        let inbox = match queries::fetch_inbox(&cx, &pool, pid, agent_id, false, None, 20).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("fetch_inbox failed: {other:?}"),
+        };
+        assert_eq!(inbox.len(), 1, "self-sent message should appear in inbox");
+        assert_eq!(inbox[0].message.subject, "Note to self");
+        assert_eq!(
+            inbox[0].message.sender_id, agent_id,
+            "sender_id should match the recipient's own id"
+        );
+    });
+}
+
+// =============================================================================
+// Edge case: force-release idempotency (double force-release returns 0)
+// =============================================================================
+
+#[test]
+fn edge_case_force_release_idempotency() {
+    let (pool, _dir) = make_pool();
+    let suffix = unique_suffix();
+    let human_key = format!("/data/stress/force_release_{suffix}");
+
+    block_on(|cx| async move {
+        let proj = match queries::ensure_project(&cx, &pool, &human_key).await {
+            Outcome::Ok(r) => r,
+            _ => panic!("ensure_project failed"),
+        };
+        let pid = proj.id.unwrap();
+
+        let agent =
+            match queries::register_agent(&cx, &pool, pid, "RedPeak", "test", "test", None, None)
+                .await
+            {
+                Outcome::Ok(r) => r,
+                _ => panic!("register agent failed"),
+            };
+        let agent_id = agent.id.unwrap();
+
+        // Create a file reservation
+        let reservations = match queries::create_file_reservations(
+            &cx,
+            &pool,
+            pid,
+            agent_id,
+            &["src/*.rs"],
+            3600,
+            true,
+            "test",
+        )
+        .await
+        {
+            Outcome::Ok(r) => r,
+            other => panic!("create_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 1);
+        let res_id = reservations[0].id.unwrap();
+
+        // First force-release: should affect 1 row
+        let released = match queries::force_release_reservation(&cx, &pool, res_id).await {
+            Outcome::Ok(n) => n,
+            other => panic!("first force_release failed: {other:?}"),
+        };
+        assert_eq!(released, 1, "first force-release should update 1 row");
+
+        // Second force-release (idempotent): should affect 0 rows (already released)
+        let released_again = match queries::force_release_reservation(&cx, &pool, res_id).await {
+            Outcome::Ok(n) => n,
+            other => panic!("second force_release failed: {other:?}"),
+        };
+        assert_eq!(
+            released_again, 0,
+            "second force-release should be a no-op (0 rows affected)"
+        );
+    });
+}
+
+// =============================================================================
+// Edge case: release_reservations idempotency (double release returns 0)
+// =============================================================================
+
+#[test]
+fn edge_case_release_reservations_idempotency() {
+    let (pool, _dir) = make_pool();
+    let suffix = unique_suffix();
+    let human_key = format!("/data/stress/release_idem_{suffix}");
+
+    block_on(|cx| async move {
+        let proj = match queries::ensure_project(&cx, &pool, &human_key).await {
+            Outcome::Ok(r) => r,
+            _ => panic!("ensure_project failed"),
+        };
+        let pid = proj.id.unwrap();
+
+        let agent =
+            match queries::register_agent(&cx, &pool, pid, "BluePond", "test", "test", None, None)
+                .await
+            {
+                Outcome::Ok(r) => r,
+                _ => panic!("register agent failed"),
+            };
+        let agent_id = agent.id.unwrap();
+
+        // Create two file reservations
+        let reservations = match queries::create_file_reservations(
+            &cx,
+            &pool,
+            pid,
+            agent_id,
+            &["src/main.rs", "src/lib.rs"],
+            3600,
+            true,
+            "test",
+        )
+        .await
+        {
+            Outcome::Ok(r) => r,
+            other => panic!("create_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 2);
+
+        // First release: should release both
+        let released =
+            match queries::release_reservations(&cx, &pool, pid, agent_id, None, None).await {
+                Outcome::Ok(n) => n,
+                other => panic!("first release failed: {other:?}"),
+            };
+        assert_eq!(released, 2, "first release should free 2 reservations");
+
+        // Second release (idempotent): should release 0
+        let released_again =
+            match queries::release_reservations(&cx, &pool, pid, agent_id, None, None).await {
+                Outcome::Ok(n) => n,
+                other => panic!("second release failed: {other:?}"),
+            };
+        assert_eq!(
+            released_again, 0,
+            "second release should be a no-op (0 rows, all already released)"
+        );
+
+        // Verify no active reservations remain
+        let active = match queries::get_active_reservations(&cx, &pool, pid).await {
+            Outcome::Ok(r) => r,
+            other => panic!("get_active_reservations failed: {other:?}"),
+        };
+        assert!(active.is_empty(), "no active reservations should remain");
+    });
+}
+
 /// Helper: pick a valid noun based on index to avoid name collisions in tests.
 fn noun_for(idx: u64) -> &'static str {
     const NOUNS: &[&str] = &[

@@ -2679,4 +2679,68 @@ mod tests {
         assert!(!json_str.contains("acknowledged_at"));
         assert!(!json_str.contains("read_at"));
     }
+
+    // -----------------------------------------------------------------------
+    // Edge case: Unicode subject truncation with "Re:" prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prefix_plus_unicode_subject_truncated_at_char_boundary() {
+        // 198 CJK chars (each 3 bytes UTF-8, 1 char). After "Re: " prefix (4 chars)
+        // the result is 202 chars, which should be truncated to 200.
+        let base: String = "\u{4e16}".repeat(198); // 世 repeated 198 times
+        assert_eq!(base.chars().count(), 198);
+
+        let prefixed = apply_prefix(&base, "Re:");
+        assert_eq!(prefixed, format!("Re: {base}"));
+        assert_eq!(prefixed.chars().count(), 202);
+
+        let truncated = truncate_subject(&prefixed);
+        assert_eq!(truncated.chars().count(), 200);
+        assert!(truncated.starts_with("Re: "));
+        // Verify valid UTF-8 (implicit — it's a String — but also check boundary)
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn prefix_plus_mixed_multibyte_truncated_safely() {
+        // Mix of emoji (4 bytes), CJK (3 bytes), and ASCII (1 byte).
+        // Build exactly 199 chars, then prefix pushes it to 203.
+        let segment = "\u{1F600}\u{4e16}a"; // 😀世a = 3 chars, 8 bytes
+        let repeats = 67; // 67 * 3 = 201 chars, take first 199
+        let base: String = segment.repeat(repeats).chars().take(199).collect();
+        assert_eq!(base.chars().count(), 199);
+
+        let prefixed = apply_prefix(&base, "Re:");
+        assert_eq!(prefixed.chars().count(), 203);
+
+        let truncated = truncate_subject(&prefixed);
+        assert_eq!(truncated.chars().count(), 200);
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn prefix_on_exactly_200_char_unicode_subject_truncates() {
+        // Subject is exactly 200 emoji chars. "Re: " prefix adds 4 -> 204 -> must truncate.
+        let base: String = "\u{1F389}".repeat(200); // 🎉 × 200
+        assert_eq!(base.chars().count(), 200);
+
+        let prefixed = apply_prefix(&base, "Re:");
+        assert_eq!(prefixed.chars().count(), 204);
+
+        let truncated = truncate_subject(&prefixed);
+        assert_eq!(truncated.chars().count(), 200);
+        assert!(truncated.starts_with("Re: "));
+    }
+
+    #[test]
+    fn prefix_on_short_unicode_subject_no_truncation() {
+        let base = "\u{1F600}\u{4e16}\u{1F389}"; // 😀世🎉 = 3 chars
+        let prefixed = apply_prefix(base, "Re:");
+        assert_eq!(prefixed, format!("Re: {base}"));
+        assert_eq!(prefixed.chars().count(), 7); // "Re: " (4) + 3 = 7
+
+        let truncated = truncate_subject(&prefixed);
+        assert_eq!(truncated, prefixed, "short subject should not be truncated");
+    }
 }

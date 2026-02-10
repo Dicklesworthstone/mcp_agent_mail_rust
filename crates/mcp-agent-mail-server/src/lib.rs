@@ -1334,6 +1334,28 @@ impl ConsoleLayoutState {
     }
 }
 
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn should_force_mux_left_split(
+    layout: &ConsoleLayoutState,
+    caps: &console::ConsoleCaps,
+    allow_inline_in_mux: bool,
+) -> bool {
+    caps.in_mux
+        && !caps.sync_output
+        && !allow_inline_in_mux
+        && layout.split_mode == ConsoleSplitMode::Inline
+}
+
 struct StartupDashboard {
     writer: Mutex<ftui::TerminalWriter<std::io::Stdout>>,
     stop: AtomicBool,
@@ -1376,16 +1398,28 @@ impl StartupDashboard {
 
         let term_width = parse_env_u16("COLUMNS", 120).max(80);
         let term_height = parse_env_u16("LINES", 36).max(20);
-        let console_layout = ConsoleLayoutState::from_config(config);
-        let (screen_mode, ui_anchor) = console_layout.compute_writer_settings(term_height);
+        let mut console_layout = ConsoleLayoutState::from_config(config);
         let term_caps = ftui::TerminalCapabilities::detect();
         let console_caps = console::ConsoleCaps::from_capabilities(&term_caps);
+        let allow_inline_in_mux = env_truthy("CONSOLE_MUX_INLINE_OK");
+        let force_mux_left_split =
+            should_force_mux_left_split(&console_layout, &console_caps, allow_inline_in_mux);
+        if force_mux_left_split {
+            console_layout.split_mode = ConsoleSplitMode::Left;
+        }
+        let (screen_mode, ui_anchor) = console_layout.compute_writer_settings(term_height);
 
         // Emit a grep-friendly console summary before engaging AltScreen so PTY capture and
         // terminal scrollback have stable, plain-text breadcrumbs (E2E + debugging).
         if console_layout.is_split_mode() {
             eprintln!("Console: {}", console_layout.summary_line());
             eprintln!("{}", console_caps.one_liner());
+            if force_mux_left_split {
+                eprintln!(
+                    "Console: auto-switched to left split mode for multiplexer stability \
+                     (set CONSOLE_MUX_INLINE_OK=1 to force inline mode)"
+                );
+            }
         }
 
         let mut writer =
@@ -1440,6 +1474,12 @@ impl StartupDashboard {
         dashboard.refresh_db_stats();
         dashboard.render_now();
         dashboard.emit_startup_showcase(config);
+        if force_mux_left_split {
+            dashboard.log_line(
+                "Console: auto-switched to left split mode for multiplexer stability \
+                 (set CONSOLE_MUX_INLINE_OK=1 to force inline mode)",
+            );
+        }
         dashboard.spawn_refresh_worker();
         dashboard.spawn_console_input_worker();
         Some(dashboard)
@@ -5198,6 +5238,67 @@ mod tests {
             "Inline mode should not produce AltScreen, got {mode:?}"
         );
         assert!(!layout.is_split_mode());
+    }
+
+    #[test]
+    fn mux_guard_forces_left_split_when_inline_and_sync_unavailable() {
+        let layout = ConsoleLayoutState {
+            persist_path: PathBuf::from("/dev/null"),
+            auto_save: true,
+            interactive_enabled: true,
+            ui_height_percent: 33,
+            ui_anchor: ConsoleUiAnchor::Bottom,
+            ui_auto_size: false,
+            inline_auto_min_rows: 8,
+            inline_auto_max_rows: 18,
+            split_mode: ConsoleSplitMode::Inline,
+            split_ratio_percent: 30,
+        };
+        let caps = console::ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: false,
+            mouse_sgr: true,
+            sync_output: false,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: true,
+        };
+        assert!(should_force_mux_left_split(&layout, &caps, false));
+        assert!(!should_force_mux_left_split(&layout, &caps, true));
+    }
+
+    #[test]
+    fn mux_guard_does_not_force_when_sync_available_or_already_left() {
+        let mut layout = ConsoleLayoutState {
+            persist_path: PathBuf::from("/dev/null"),
+            auto_save: true,
+            interactive_enabled: true,
+            ui_height_percent: 33,
+            ui_anchor: ConsoleUiAnchor::Bottom,
+            ui_auto_size: false,
+            inline_auto_min_rows: 8,
+            inline_auto_max_rows: 18,
+            split_mode: ConsoleSplitMode::Inline,
+            split_ratio_percent: 30,
+        };
+        let mut caps = console::ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: false,
+            mouse_sgr: true,
+            sync_output: true,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: true,
+        };
+        assert!(!should_force_mux_left_split(&layout, &caps, false));
+
+        caps.sync_output = false;
+        caps.in_mux = false;
+        assert!(!should_force_mux_left_split(&layout, &caps, false));
+
+        caps.in_mux = true;
+        layout.split_mode = ConsoleSplitMode::Left;
+        assert!(!should_force_mux_left_split(&layout, &caps, false));
     }
 
     #[test]

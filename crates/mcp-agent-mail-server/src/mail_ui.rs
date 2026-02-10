@@ -753,7 +753,7 @@ fn render_search(
             .map(|r| SearchResult {
                 id: r.id,
                 subject: r.subject.clone(),
-                body_snippet: truncate_body(&r.subject, 200),
+                body_snippet: truncate_body(&r.body_md, 200),
                 sender_name: r.from.clone(),
                 created: ts_display(r.created_ts),
                 importance: r.importance.clone(),

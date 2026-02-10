@@ -148,6 +148,26 @@ done
 resolved_path="$(normalize_http_path "$path_mode")"
 export LOG_RICH_ENABLED="${LOG_RICH_ENABLED:-true}"
 
+# Reuse an already-running Agent Mail server on the same host/port to avoid
+# clobbering a healthy instance started by another tool/agent.
+if [[ "${AM_REUSE_RUNNING:-1}" == "1" ]]; then
+  listener_pid=""
+  listener_cmd=""
+  if command -v lsof >/dev/null 2>&1; then
+    listener_pid="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -n "$listener_pid" ]]; then
+    listener_cmd="$(ps -p "$listener_pid" -o args= 2>/dev/null || true)"
+    if [[ "$listener_cmd" == *"mcp_agent_mail"* ]] || [[ "$listener_cmd" == *"mcp-agent-mail"* ]]; then
+      echo "am: reusing existing Agent Mail server on ${host}:${port} (pid ${listener_pid})." >&2
+      exit 0
+    fi
+    echo "am: port ${port} is in use by a non-Agent-Mail process (pid ${listener_pid})." >&2
+    echo "am: free the port or choose a different one with --port." >&2
+    exit 2
+  fi
+fi
+
 if [[ "$no_auth" -eq 1 ]]; then
   unset HTTP_BEARER_TOKEN
 else

@@ -266,7 +266,7 @@ pub fn render_tool_call_start(
 
     // Title
     let title = format!(" {primary}\u{1f527} TOOL CALL{RESET} {text}{tool_name}{RESET} ");
-    let title_vis = 12 + tool_name.len(); // "🔧 TOOL CALL " + tool_name
+    let title_vis = 14 + tool_name.len(); // " 🔧 TOOL CALL {tool_name} " (leading + trailing spaces)
     let pad = w.saturating_sub(title_vis);
     lines.push(format!(
         "{secondary_b}\u{2551}{title}{}{secondary_b}\u{2551}{RESET}",
@@ -356,7 +356,7 @@ pub fn render_tool_call_end(
     // Title
     let title =
         format!(" {color}{icon} {text}{tool_name}{RESET} {color}completed in {label}{RESET} ",);
-    let title_vis = 2 + tool_name.len() + 15 + label.len(); // icon + spaces + "completed in " + label
+    let title_vis = 3 + tool_name.len() + 15 + label.len(); // leading space + icon + spaces + "completed in " + label
     let pad = w.saturating_sub(title_vis);
     lines.push(format!(
         "{color}\u{2502}{title}{}{color}\u{2502}{RESET}",

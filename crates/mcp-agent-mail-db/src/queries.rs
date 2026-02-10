@@ -1534,6 +1534,7 @@ pub struct SearchRow {
     pub created_ts: i64,
     pub thread_id: Option<String>,
     pub from: String,
+    pub body_md: String,
 }
 
 // FTS5 unsearchable patterns that cannot produce meaningful results.
@@ -1748,7 +1749,7 @@ async fn run_like_fallback(
     params.push(Value::BigInt(limit));
 
     let sql = format!(
-        "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name \
+        "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md \
          FROM messages m \
          JOIN agents a ON a.id = m.sender_id \
          WHERE m.project_id = ? AND {where_clause} \
@@ -1783,7 +1784,7 @@ pub async fn search_messages(
 
     let rows_out = if let Some(ref fts_query) = sanitized {
         // FTS5-backed search with relevance ordering.
-        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name \
+        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md \
                    FROM fts_messages \
                    JOIN messages m ON m.id = fts_messages.message_id \
                    JOIN agents a ON a.id = m.sender_id \
@@ -1846,6 +1847,7 @@ pub async fn search_messages(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
+                let body_md: String = row.get_named("body_md").unwrap_or_default();
 
                 out.push(SearchRow {
                     id,
@@ -1855,6 +1857,7 @@ pub async fn search_messages(
                     created_ts,
                     thread_id,
                     from,
+                    body_md,
                 });
             }
             Outcome::Ok(out)

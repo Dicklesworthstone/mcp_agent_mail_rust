@@ -743,6 +743,14 @@ it should deny with a deterministic message and exit code `2` telling you to use
 
 Note: `scripts/am` is a dev wrapper around `mcp-agent-mail serve` (HTTP + TUI). It is not the `am` CLI binary.
 
+### Port Discipline During Migration (Critical)
+
+`127.0.0.1:8765` is the canonical Agent Mail endpoint used by local coding agents. Keep behavior stable on this port.
+
+- Do not run port-kill commands targeting `8765` (for example `fuser -k 8765/tcp`) unless the user explicitly requests it in this session.
+- If an Agent Mail server is already running on `8765`, reuse it instead of replacing it.
+- Any Rust-side change that affects externally observed behavior on `8765` must maintain Python parity or be treated as a bug.
+
 ### Same Repository Workflow
 
 1. **Register identity:**
