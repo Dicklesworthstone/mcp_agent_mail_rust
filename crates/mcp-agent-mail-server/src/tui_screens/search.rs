@@ -5,18 +5,19 @@
 //! composable filtering by document kind, importance, ack status, and more.
 
 use ftui::layout::Rect;
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::Widget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::search_planner::DocKind;
-#[cfg(test)]
-use mcp_agent_mail_db::search_planner::{Importance, SearchQuery};
+use mcp_agent_mail_db::search_planner::{
+    plan_search, DocKind, Importance, RankingMode, SearchQuery,
+};
+use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
@@ -57,6 +58,15 @@ impl DocKindFilter {
             Self::Agents => "Agents",
             Self::Projects => "Projects",
             Self::All => "All",
+        }
+    }
+
+    const fn route_value(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::Agents => "agents",
+            Self::Projects => "projects",
+            Self::All => "all",
         }
     }
 
@@ -116,7 +126,6 @@ impl ImportanceFilter {
         }
     }
 
-    #[cfg(test)]
     const fn importance(self) -> Option<Importance> {
         match self {
             Self::Any => None,
@@ -187,6 +196,14 @@ impl SortDirection {
             Self::NewestFirst => "Newest",
             Self::OldestFirst => "Oldest",
             Self::Relevance => "Relevance",
+        }
+    }
+
+    const fn route_value(self) -> &'static str {
+        match self {
+            Self::NewestFirst => "newest",
+            Self::OldestFirst => "oldest",
+            Self::Relevance => "relevance",
         }
     }
 
@@ -288,6 +305,7 @@ pub struct SearchCockpitScreen {
     db_conn: Option<SqliteConnection>,
     db_conn_attempted: bool,
     last_query: String,
+    last_error: Option<String>,
     debounce_remaining: u8,
     search_dirty: bool,
 }
@@ -313,6 +331,7 @@ impl SearchCockpitScreen {
             db_conn: None,
             db_conn_attempted: false,
             last_query: String::new(),
+            last_error: None,
             debounce_remaining: 0,
             search_dirty: true,
         }
@@ -347,6 +366,12 @@ impl SearchCockpitScreen {
             ..Default::default()
         };
 
+        // Apply ranking mode
+        query.ranking = match self.sort_direction {
+            SortDirection::Relevance => RankingMode::Relevance,
+            SortDirection::NewestFirst | SortDirection::OldestFirst => RankingMode::Recency,
+        };
+
         // Apply importance facet
         if let Some(imp) = self.importance_filter.importance() {
             query.importance = vec![imp];
@@ -367,37 +392,44 @@ impl SearchCockpitScreen {
 
     /// Execute the search using sync DB connection.
     fn execute_search(&mut self, state: &TuiSharedState) {
-        self.ensure_db_conn(state);
-        let Some(conn) = &self.db_conn else {
-            return;
-        };
-
         let raw = self.query_input.value().trim().to_string();
         self.last_query.clone_from(&raw);
+        self.last_error = validate_query_syntax(&raw);
+        if self.last_error.is_some() {
+            self.results.clear();
+            self.total_sql_rows = 0;
+            self.cursor = 0;
+            self.detail_scroll = 0;
+            self.search_dirty = false;
+            return;
+        }
+
+        self.ensure_db_conn(state);
+        let Some(conn) = self.db_conn.take() else {
+            return;
+        };
 
         if self.doc_kind_filter == DocKindFilter::All {
             // Run all three kinds and merge
             let mut all_results = Vec::new();
             for kind in &[DocKind::Message, DocKind::Agent, DocKind::Project] {
-                let results = self.run_kind_search(conn, *kind, &raw);
+                let results = self.run_kind_search(&conn, *kind, &raw);
                 all_results.extend(results);
             }
-            // Sort by score descending
-            all_results.sort_by(|a, b| {
-                b.score
-                    .unwrap_or(0.0)
-                    .partial_cmp(&a.score.unwrap_or(0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            sort_results(&mut all_results, self.sort_direction);
             all_results.truncate(MAX_RESULTS);
             self.total_sql_rows = all_results.len();
             self.results = all_results;
         } else {
             let kind = self.doc_kind_filter.doc_kind().unwrap_or(DocKind::Message);
-            let results = self.run_kind_search(conn, kind, &raw);
+            let results = self.run_kind_search(&conn, kind, &raw);
+            let mut results = results;
+            sort_results(&mut results, self.sort_direction);
             self.total_sql_rows = results.len();
             self.results = results;
         }
+
+        self.db_conn = Some(conn);
 
         // Clamp cursor
         if self.results.is_empty() {
@@ -411,138 +443,150 @@ impl SearchCockpitScreen {
 
     /// Run a search for a single doc kind using sync queries.
     fn run_kind_search(
-        &self,
+        &mut self,
         conn: &SqliteConnection,
         kind: DocKind,
         raw: &str,
     ) -> Vec<ResultEntry> {
         match kind {
             DocKind::Message => self.search_messages(conn, raw),
-            DocKind::Agent => self.search_agents(conn, raw),
-            DocKind::Project => self.search_projects(conn, raw),
+            DocKind::Agent => Self::search_agents(conn, raw),
+            DocKind::Project => Self::search_projects(conn, raw),
         }
     }
 
-    /// Search messages via FTS5 with LIKE fallback.
-    fn search_messages(&self, conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
-        let sanitized = sanitize_fts_query(raw);
+    /// Search messages using the global planner for non-empty queries.
+    fn search_messages(&mut self, conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
+        if raw.is_empty() {
+            return self.search_messages_recent(conn);
+        }
 
-        // Build WHERE conditions for facets
-        let mut conditions = Vec::new();
+        let mut query = SearchQuery {
+            text: raw.to_string(),
+            doc_kind: DocKind::Message,
+            limit: Some(MAX_RESULTS),
+            ..Default::default()
+        };
+        query.ranking = match self.sort_direction {
+            SortDirection::Relevance => RankingMode::Relevance,
+            SortDirection::NewestFirst | SortDirection::OldestFirst => RankingMode::Recency,
+        };
 
-        if let Some(ref imp) = self.importance_filter.filter_string() {
-            let escaped = imp.replace('\'', "''");
-            conditions.push(format!("m.importance = '{escaped}'"));
+        if let Some(imp) = self.importance_filter.importance() {
+            query.importance = vec![imp];
         }
         if let Some(ack) = self.ack_filter.filter_value() {
-            conditions.push(format!("m.ack_required = {}", i32::from(ack)));
+            query.ack_required = Some(ack);
         }
         if let Some(ref tid) = self.thread_filter {
-            let escaped = tid.replace('\'', "''");
-            conditions.push(format!("m.thread_id = '{escaped}'"));
+            query.thread_id = Some(tid.clone());
         }
 
-        let extra_where = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!(" AND {}", conditions.join(" AND "))
-        };
-        let order = match self.sort_direction {
-            SortDirection::NewestFirst => "m.created_ts DESC",
-            SortDirection::OldestFirst => "m.created_ts ASC",
-            SortDirection::Relevance => "rank",
-        };
+        let plan = plan_search(&query);
+        if plan.sql.is_empty() {
+            return Vec::new();
+        }
 
-        // Try FTS first
-        if !sanitized.is_empty() {
-            let sql = format!(
-                "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, \
-                 m.ack_required, m.created_ts, \
-                 a.name AS from_name, m.project_id \
-                 FROM fts_messages fts \
-                 JOIN messages m ON m.id = fts.message_id \
-                 LEFT JOIN agents a ON a.id = m.sender_id \
-                 WHERE fts_messages MATCH '{sanitized}'{extra_where} \
-                 GROUP BY m.id \
-                 ORDER BY {order} \
-                 LIMIT {MAX_RESULTS}"
-            );
-
-            let results = query_message_rows(conn, &sql);
-            if !results.is_empty() {
-                return results;
+        let params: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
+        match query_message_rows(conn, &plan.sql, &params) {
+            Ok(results) => results,
+            Err(e) => {
+                self.last_error = Some(format!("Search failed: {e}"));
+                Vec::new()
             }
         }
+    }
 
-        // LIKE fallback or empty query (recent messages)
-        let order_clause = match self.sort_direction {
-            SortDirection::OldestFirst => "m.created_ts ASC",
-            SortDirection::NewestFirst | SortDirection::Relevance => "m.created_ts DESC",
-        };
+    /// Recent messages view (empty query).
+    fn search_messages_recent(&mut self, conn: &SqliteConnection) -> Vec<ResultEntry> {
+        let mut where_clauses: Vec<&str> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
 
-        if raw.is_empty() {
-            let sql = format!(
-                "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, \
-                 m.ack_required, m.created_ts, \
-                 a.name AS from_name, m.project_id \
-                 FROM messages m \
-                 LEFT JOIN agents a ON a.id = m.sender_id \
-                 WHERE 1=1{extra_where} \
-                 ORDER BY {order_clause} \
-                 LIMIT {MAX_RESULTS}"
-            );
-            return query_message_rows(conn, &sql);
+        if let Some(ref imp) = self.importance_filter.filter_string() {
+            where_clauses.push("m.importance = ?");
+            params.push(Value::Text(imp.clone()));
+        }
+        if let Some(ack) = self.ack_filter.filter_value() {
+            where_clauses.push("m.ack_required = ?");
+            params.push(Value::BigInt(i64::from(ack)));
+        }
+        if let Some(ref tid) = self.thread_filter {
+            where_clauses.push("m.thread_id = ?");
+            params.push(Value::Text(tid.clone()));
         }
 
-        let escaped = raw.replace('\'', "''");
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let order_clause = match self.sort_direction {
+            SortDirection::OldestFirst => "m.created_ts ASC, m.id ASC",
+            SortDirection::NewestFirst | SortDirection::Relevance => "m.created_ts DESC, m.id ASC",
+        };
+
         let sql = format!(
-            "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, \
-             m.ack_required, m.created_ts, \
-             a.name AS from_name, m.project_id \
+            "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
+             m.thread_id, a.name AS from_name, m.body_md, m.project_id, 0.0 AS score \
              FROM messages m \
-             LEFT JOIN agents a ON a.id = m.sender_id \
-             WHERE (m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%'){extra_where} \
+             LEFT JOIN agents a ON a.id = m.sender_id{where_sql} \
              ORDER BY {order_clause} \
-             LIMIT {MAX_RESULTS}"
+             LIMIT ?"
         );
-        query_message_rows(conn, &sql)
+        params.push(Value::BigInt(i64::try_from(MAX_RESULTS).unwrap_or(50)));
+
+        match query_message_rows(conn, &sql, &params) {
+            Ok(results) => results,
+            Err(e) => {
+                self.last_error = Some(format!("Search failed: {e}"));
+                Vec::new()
+            }
+        }
     }
 
     /// Search agents.
-    fn search_agents(&self, conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
-        let _ = self; // future: may use self for per-project scoping
+    fn search_agents(conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
         if raw.is_empty() {
-            let sql = "SELECT id, name, task_description, project_id \
+            let sql = "SELECT id, name, task_description, project_id, 0.0 AS score \
                        FROM agents ORDER BY name LIMIT 100";
-            return query_agent_rows(conn, sql);
+            return query_agent_rows(conn, sql, &[]);
         }
-        let escaped = raw.replace('\'', "''");
-        let sql = format!(
-            "SELECT id, name, task_description, project_id \
-             FROM agents \
-             WHERE name LIKE '%{escaped}%' OR task_description LIKE '%{escaped}%' \
-             ORDER BY name \
-             LIMIT {MAX_RESULTS}"
-        );
-        query_agent_rows(conn, &sql)
+
+        let query = SearchQuery {
+            text: raw.to_string(),
+            doc_kind: DocKind::Agent,
+            limit: Some(MAX_RESULTS),
+            ..Default::default()
+        };
+        let plan = plan_search(&query);
+        if plan.sql.is_empty() {
+            return Vec::new();
+        }
+        let params: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
+        query_agent_rows(conn, &plan.sql, &params)
     }
 
     /// Search projects.
-    fn search_projects(&self, conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
-        let _ = self; // future: may use self for filtering
+    fn search_projects(conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
         if raw.is_empty() {
-            let sql = "SELECT id, slug, human_key FROM projects ORDER BY slug LIMIT 100";
-            return query_project_rows(conn, sql);
+            let sql = "SELECT id, slug, human_key, 0.0 AS score \
+                       FROM projects ORDER BY slug LIMIT 100";
+            return query_project_rows(conn, sql, &[]);
         }
-        let escaped = raw.replace('\'', "''");
-        let sql = format!(
-            "SELECT id, slug, human_key \
-             FROM projects \
-             WHERE slug LIKE '%{escaped}%' OR human_key LIKE '%{escaped}%' \
-             ORDER BY slug \
-             LIMIT {MAX_RESULTS}"
-        );
-        query_project_rows(conn, &sql)
+
+        let query = SearchQuery {
+            text: raw.to_string(),
+            doc_kind: DocKind::Project,
+            limit: Some(MAX_RESULTS),
+            ..Default::default()
+        };
+        let plan = plan_search(&query);
+        if plan.sql.is_empty() {
+            return Vec::new();
+        }
+        let params: Vec<Value> = plan.params.iter().map(plan_param_to_value).collect();
+        query_project_rows(conn, &plan.sql, &params)
     }
 
     /// Toggle the active facet's value.
@@ -567,6 +611,133 @@ impl SearchCockpitScreen {
         self.thread_filter = None;
         self.search_dirty = true;
         self.debounce_remaining = 0;
+    }
+
+    fn route_string(&self) -> String {
+        let mut params: Vec<(&'static str, String)> = Vec::new();
+
+        let q = self.query_input.value().trim();
+        if !q.is_empty() {
+            params.push(("q", url_encode_component(q)));
+        }
+        if self.doc_kind_filter != DocKindFilter::Messages {
+            params.push(("type", self.doc_kind_filter.route_value().to_string()));
+        }
+        if let Some(imp) = self.importance_filter.filter_string() {
+            params.push(("imp", url_encode_component(&imp)));
+        }
+        if let Some(ack) = self.ack_filter.filter_value() {
+            params.push((
+                "ack",
+                if ack {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                },
+            ));
+        }
+        if self.sort_direction != SortDirection::NewestFirst {
+            params.push(("sort", self.sort_direction.route_value().to_string()));
+        }
+        if let Some(ref tid) = self.thread_filter {
+            params.push(("thread", url_encode_component(tid)));
+        }
+
+        if params.is_empty() {
+            return "/search".to_string();
+        }
+
+        let mut out = String::from("/search?");
+        for (i, (k, v)) in params.into_iter().enumerate() {
+            if i > 0 {
+                out.push('&');
+            }
+            out.push_str(k);
+            out.push('=');
+            out.push_str(&v);
+        }
+        out
+    }
+}
+
+fn validate_query_syntax(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Simple, deterministic validation: avoid FTS5 parse failures while typing.
+    let quote_count = trimmed.chars().filter(|c| *c == '"').count();
+    if quote_count % 2 == 1 {
+        return Some("Unbalanced quotes: close your \"phrase\"".to_string());
+    }
+
+    // Bare boolean operators can't yield meaningful results.
+    match trimmed.to_ascii_uppercase().as_str() {
+        "AND" | "OR" | "NOT" => {
+            return Some("Query must include search terms (bare boolean operator)".to_string());
+        }
+        _ => {}
+    }
+
+    None
+}
+
+const fn doc_kind_order(kind: DocKind) -> u8 {
+    match kind {
+        DocKind::Message => 0,
+        DocKind::Agent => 1,
+        DocKind::Project => 2,
+    }
+}
+
+fn sort_results(results: &mut [ResultEntry], mode: SortDirection) {
+    match mode {
+        SortDirection::Relevance => results.sort_by(|a, b| {
+            let sa = a.score.unwrap_or(f64::INFINITY);
+            let sb = b.score.unwrap_or(f64::INFINITY);
+            let ord = sa.total_cmp(&sb);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            let ord = doc_kind_order(a.doc_kind).cmp(&doc_kind_order(b.doc_kind));
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            let ta = a.created_ts.unwrap_or(i64::MIN);
+            let tb = b.created_ts.unwrap_or(i64::MIN);
+            let ord = tb.cmp(&ta); // newest first as a stable tiebreak
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            a.id.cmp(&b.id)
+        }),
+        SortDirection::NewestFirst => results.sort_by(|a, b| {
+            let ta = a.created_ts.unwrap_or(i64::MIN);
+            let tb = b.created_ts.unwrap_or(i64::MIN);
+            let ord = tb.cmp(&ta);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            let ord = doc_kind_order(a.doc_kind).cmp(&doc_kind_order(b.doc_kind));
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            a.id.cmp(&b.id)
+        }),
+        SortDirection::OldestFirst => results.sort_by(|a, b| {
+            let ta = a.created_ts.unwrap_or(i64::MAX);
+            let tb = b.created_ts.unwrap_or(i64::MAX);
+            let ord = ta.cmp(&tb);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            let ord = doc_kind_order(a.doc_kind).cmp(&doc_kind_order(b.doc_kind));
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            a.id.cmp(&b.id)
+        }),
     }
 }
 
@@ -750,8 +921,8 @@ impl MailScreen for SearchCockpitScreen {
             return;
         }
 
-        // Layout: query bar (3h) + body
-        let query_h: u16 = 3;
+        // Layout: query bar (3-4h) + body
+        let query_h: u16 = if area.height >= 6 { 4 } else { 3 };
         let body_h = area.height.saturating_sub(query_h);
 
         let query_area = Rect::new(area.x, area.y, area.width, query_h);
@@ -850,6 +1021,22 @@ impl MailScreen for SearchCockpitScreen {
                 key: "r",
                 action: "Reset facets",
             },
+            HelpEntry {
+                key: "\"phrase\"",
+                action: "Phrase search",
+            },
+            HelpEntry {
+                key: "term*",
+                action: "Prefix search",
+            },
+            HelpEntry {
+                key: "AND/OR/NOT",
+                action: "Boolean operators",
+            },
+            HelpEntry {
+                key: "NOT term",
+                action: "Exclude term",
+            },
         ]
     }
 
@@ -884,9 +1071,21 @@ impl MailScreen for SearchCockpitScreen {
 // DB query helpers
 // ──────────────────────────────────────────────────────────────────────
 
-fn query_message_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
-    conn.query_sync(sql, &[])
-        .ok()
+fn plan_param_to_value(param: &mcp_agent_mail_db::search_planner::PlanParam) -> Value {
+    match param {
+        mcp_agent_mail_db::search_planner::PlanParam::Int(v) => Value::BigInt(*v),
+        mcp_agent_mail_db::search_planner::PlanParam::Text(s) => Value::Text(s.clone()),
+        mcp_agent_mail_db::search_planner::PlanParam::Float(f) => Value::Double(*f),
+    }
+}
+
+fn query_message_rows(
+    conn: &SqliteConnection,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<ResultEntry>, String> {
+    conn.query_sync(sql, params)
+        .map_err(|e| e.to_string())
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
@@ -899,7 +1098,7 @@ fn query_message_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
                         doc_kind: DocKind::Message,
                         title: subject,
                         body_preview: preview,
-                        score: None,
+                        score: row.get_named("score").ok(),
                         importance: row.get_named("importance").ok(),
                         ack_required: row.get_named::<i64>("ack_required").ok().map(|v| v != 0),
                         created_ts: row.get_named("created_ts").ok(),
@@ -910,11 +1109,10 @@ fn query_message_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
-fn query_agent_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
-    conn.query_sync(sql, &[])
+fn query_agent_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> Vec<ResultEntry> {
+    conn.query_sync(sql, params)
         .ok()
         .map(|rows| {
             rows.into_iter()
@@ -927,7 +1125,7 @@ fn query_agent_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
                         doc_kind: DocKind::Agent,
                         title: name,
                         body_preview: truncate_str(&desc, 120),
-                        score: None,
+                        score: row.get_named("score").ok(),
                         importance: None,
                         ack_required: None,
                         created_ts: None,
@@ -941,8 +1139,8 @@ fn query_agent_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
         .unwrap_or_default()
 }
 
-fn query_project_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
-    conn.query_sync(sql, &[])
+fn query_project_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> Vec<ResultEntry> {
+    conn.query_sync(sql, params)
         .ok()
         .map(|rows| {
             rows.into_iter()
@@ -955,7 +1153,7 @@ fn query_project_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
                         doc_kind: DocKind::Project,
                         title: slug,
                         body_preview: human_key,
-                        score: None,
+                        score: row.get_named("score").ok(),
                         importance: None,
                         ack_required: None,
                         created_ts: None,
@@ -969,25 +1167,6 @@ fn query_project_rows(conn: &SqliteConnection, sql: &str) -> Vec<ResultEntry> {
         .unwrap_or_default()
 }
 
-/// Sanitize FTS5 query to prevent syntax errors.
-fn sanitize_fts_query(query: &str) -> String {
-    let mut tokens = Vec::new();
-    for word in query.split_whitespace() {
-        let w = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
-        if w.is_empty()
-            || w.eq_ignore_ascii_case("AND")
-            || w.eq_ignore_ascii_case("OR")
-            || w.eq_ignore_ascii_case("NOT")
-            || w.eq_ignore_ascii_case("NEAR")
-        {
-            continue;
-        }
-        let escaped = w.replace('"', "");
-        tokens.push(format!("\"{escaped}\""));
-    }
-    tokens.join(" ")
-}
-
 /// Truncate a string to `max_chars`, adding ellipsis if needed.
 fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars {
@@ -999,6 +1178,26 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn url_encode_component(s: &str) -> String {
+    // Minimal percent-encoding for deterministic deeplink-style routes.
+    // Encodes all bytes outside the unreserved set.
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len() + 8);
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[(b >> 4) as usize]));
+                out.push(char::from(HEX[(b & 0x0F) as usize]));
+            }
+        }
+    }
+    out
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Rendering helpers
 // ──────────────────────────────────────────────────────────────────────
@@ -1006,6 +1205,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 const FACET_ACTIVE_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xAF, 0xFF, 0xFF); // Blue
 const FACET_LABEL_FG: PackedRgba = PackedRgba::rgba(0x87, 0x87, 0x87, 0xFF); // Grey
 const RESULT_CURSOR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0xD7, 0x00, 0xFF); // Yellow
+const ERROR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0x5F, 0x5F, 0xFF); // Red
 
 fn render_query_bar(
     frame: &mut Frame<'_>,
@@ -1034,8 +1234,37 @@ fn render_query_bar(
     let inner = block.inner(area);
     block.render(area, frame);
 
-    if inner.height > 0 && inner.width > 0 {
-        input.render(inner, frame);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    input.render(input_area, frame);
+
+    // Optional hint line when the query bar has extra height.
+    if inner.height >= 2 {
+        let w = inner.width as usize;
+        let (hint, style) = screen.last_error.as_ref().map_or_else(
+            || {
+                if screen.focus == Focus::QueryBar {
+                    (
+                        "Syntax: \"phrase\" term* AND/OR/NOT (no leading *)".to_string(),
+                        Style::default().fg(FACET_LABEL_FG),
+                    )
+                } else {
+                    (
+                        format!("Route: {}", screen.route_string()),
+                        Style::default().fg(FACET_LABEL_FG),
+                    )
+                }
+            },
+            |err| (format!("ERR: {err}"), Style::default().fg(ERROR_FG)),
+        );
+
+        let hint_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+        Paragraph::new(truncate_str(&hint, w))
+            .style(style)
+            .render(hint_area, frame);
     }
 }
 
@@ -1278,6 +1507,7 @@ fn viewport_range(total: usize, visible: usize, cursor: usize) -> (usize, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftui_harness::buffer_to_text;
 
     #[test]
     fn screen_defaults() {
@@ -1290,6 +1520,7 @@ mod tests {
         assert!(screen.results.is_empty());
         assert!(screen.search_dirty);
         assert!(screen.thread_filter.is_none());
+        assert!(screen.last_error.is_none());
     }
 
     #[test]
@@ -1405,20 +1636,51 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_fts_empty() {
-        assert_eq!(sanitize_fts_query(""), "");
-        assert_eq!(sanitize_fts_query("   "), "");
+    fn validate_query_syntax_rejects_unbalanced_quotes() {
+        let err = validate_query_syntax("\"oops");
+        assert!(err.is_some());
+        assert!(err.unwrap().contains("Unbalanced quotes"));
     }
 
     #[test]
-    fn sanitize_fts_strips_operators() {
-        assert_eq!(sanitize_fts_query("hello AND world"), "\"hello\" \"world\"");
-        assert_eq!(sanitize_fts_query("NOT test"), "\"test\"");
+    fn validate_query_syntax_rejects_bare_boolean() {
+        assert!(validate_query_syntax("AND").is_some());
+        assert!(validate_query_syntax("or").is_some());
+        assert!(validate_query_syntax("Not").is_some());
     }
 
     #[test]
-    fn sanitize_fts_quotes_tokens() {
-        assert_eq!(sanitize_fts_query("hello world"), "\"hello\" \"world\"");
+    fn route_string_is_deterministic_and_encoded() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_input.set_value("hello world");
+        screen.doc_kind_filter = DocKindFilter::All;
+        screen.importance_filter = ImportanceFilter::Urgent;
+        screen.ack_filter = AckFilter::Required;
+        screen.sort_direction = SortDirection::Relevance;
+        screen.thread_filter = Some("t-1".to_string());
+        assert_eq!(
+            screen.route_string(),
+            "/search?q=hello%20world&type=all&imp=urgent&ack=1&sort=relevance&thread=t-1"
+        );
+    }
+
+    #[test]
+    fn query_bar_renders_error_hint_line() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_input.set_value("\"oops");
+        screen.last_error = validate_query_syntax(screen.query_input.value());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 10, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 80, 10), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(text.contains("ERR:"), "expected ERR line, got:\n{text}");
+        assert!(
+            text.contains("Unbalanced quotes"),
+            "expected validation error, got:\n{text}"
+        );
     }
 
     #[test]

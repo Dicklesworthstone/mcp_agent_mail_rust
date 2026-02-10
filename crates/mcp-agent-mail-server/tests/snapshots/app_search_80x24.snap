@@ -1,0 +1,24 @@
+ 1:Dashboard  2:Messages  3:Threads  4:Agents  5:Search  6:Reservations         
+Search across messages, agents, projects... (/ to focus)                        
+Route: /search                                                                  
+                                                                                
+                                                                                
+  Type            No results found.           Select a result to view details.  
+  [Messages]                                                                    
+  Imp.                                                                          
+  [Any]                                                                         
+  Ack                                                                           
+  [Any]                                                                         
+  Sort                                                                          
+  [Newest]                                                                      
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+f:facets                                                                        
+ Search | mode:api up:0m00s           req:0 ok:0 err:0 avg:0ms          ? help  

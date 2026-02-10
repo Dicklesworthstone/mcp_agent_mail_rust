@@ -11,14 +11,14 @@
 use std::sync::Arc;
 
 use ftui::{Frame, GraphemePool};
-use ftui_harness::{Rect, assert_snapshot, buffer_to_text};
+use ftui_harness::{assert_snapshot, buffer_to_text, Rect};
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
 use mcp_agent_mail_server::tui_screens::{
-    MailScreen, MailScreenId, agents::AgentsScreen, dashboard::DashboardScreen,
-    messages::MessageBrowserScreen, reservations::ReservationsScreen,
+    agents::AgentsScreen, dashboard::DashboardScreen, messages::MessageBrowserScreen,
+    reservations::ReservationsScreen, search::SearchCockpitScreen,
     system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
-    tool_metrics::ToolMetricsScreen,
+    tool_metrics::ToolMetricsScreen, MailScreen, MailScreenId,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,6 +98,13 @@ fn agents_empty_80x24() {
 }
 
 #[test]
+fn search_empty_80x24() {
+    let state = test_state();
+    let screen = SearchCockpitScreen::new();
+    snapshot_screen(&screen, &state, 80, 24, "search_empty_80x24");
+}
+
+#[test]
 fn reservations_empty_80x24() {
     let state = test_state();
     let screen = ReservationsScreen::new();
@@ -137,6 +144,13 @@ fn agents_empty_120x40() {
 }
 
 #[test]
+fn search_empty_120x40() {
+    let state = test_state();
+    let screen = SearchCockpitScreen::new();
+    snapshot_screen(&screen, &state, 120, 40, "search_empty_120x40");
+}
+
+#[test]
 fn system_health_empty_120x40() {
     let state = test_state();
     let screen = SystemHealthScreen::new(Arc::clone(&state));
@@ -165,6 +179,11 @@ fn app_threads_80x24() {
 #[test]
 fn app_agents_80x24() {
     snapshot_app(80, 24, MailScreenId::Agents, "app_agents_80x24");
+}
+
+#[test]
+fn app_search_80x24() {
+    snapshot_app(80, 24, MailScreenId::Search, "app_search_80x24");
 }
 
 #[test]
