@@ -760,6 +760,32 @@ mod tests {
     }
 
     #[test]
+    fn hex_encode_empty() {
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn hex_encode_single_byte() {
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0x0a]), "0a");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+    }
+
+    #[test]
+    fn hex_encode_multi_byte() {
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        assert_eq!(hex_encode(&[0x01, 0x23, 0x45, 0x67]), "01234567");
+    }
+
+    #[test]
+    fn hex_encode_always_lowercase_padded() {
+        // Ensure leading zeros are preserved
+        assert_eq!(hex_encode(&[0x00, 0x01, 0x02]), "000102");
+        // Ensure lowercase
+        assert_eq!(hex_encode(&[0xAB, 0xCD]), "abcd");
+    }
+
+    #[test]
     fn hosting_files_are_emitted() {
         let dir = PathBuf::from("/tmp/static_export_test_hosting");
         let _ = fs::remove_dir_all(&dir);

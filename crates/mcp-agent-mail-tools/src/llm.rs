@@ -1219,6 +1219,137 @@ mod tests {
         ));
     }
 
+    // -- extract_fenced_json edge cases --
+
+    #[test]
+    fn fenced_json_with_json_tag() {
+        let input = "Preamble\n```json\n{\"a\": 1}\n```\nEpilogue";
+        let val = extract_fenced_json(input).unwrap();
+        assert_eq!(val["a"], 1);
+    }
+
+    #[test]
+    fn fenced_json_without_tag() {
+        let input = "```\n{\"b\": 2}\n```";
+        let val = extract_fenced_json(input).unwrap();
+        assert_eq!(val["b"], 2);
+    }
+
+    #[test]
+    fn fenced_json_crlf_line_endings() {
+        let input = "```json\r\n{\"c\": 3}\r\n```";
+        let val = extract_fenced_json(input).unwrap();
+        assert_eq!(val["c"], 3);
+    }
+
+    #[test]
+    fn fenced_json_no_closing_fence() {
+        let input = "```json\n{\"d\": 4}\nno closing";
+        assert!(extract_fenced_json(input).is_none());
+    }
+
+    #[test]
+    fn fenced_json_invalid_json_content() {
+        let input = "```json\nnot json at all\n```";
+        assert!(extract_fenced_json(input).is_none());
+    }
+
+    #[test]
+    fn fenced_json_empty_fence() {
+        let input = "```json\n\n```";
+        assert!(extract_fenced_json(input).is_none());
+    }
+
+    #[test]
+    fn fenced_json_picks_first_block() {
+        let input = "```json\n{\"first\": true}\n```\n```json\n{\"second\": true}\n```";
+        let val = extract_fenced_json(input).unwrap();
+        assert!(val["first"].as_bool().unwrap());
+    }
+
+    // -- extract_brace_json edge cases --
+
+    #[test]
+    fn brace_json_simple() {
+        let val = extract_brace_json("text {\"x\": 1} more").unwrap();
+        assert_eq!(val["x"], 1);
+    }
+
+    #[test]
+    fn brace_json_nested() {
+        let val = extract_brace_json("prefix {\"a\": {\"b\": 2}} suffix").unwrap();
+        assert_eq!(val["a"]["b"], 2);
+    }
+
+    #[test]
+    fn brace_json_no_braces() {
+        assert!(extract_brace_json("no json here").is_none());
+    }
+
+    #[test]
+    fn brace_json_close_before_open() {
+        assert!(extract_brace_json("} before { is bad").is_none());
+    }
+
+    #[test]
+    fn brace_json_single_brace_only() {
+        assert!(extract_brace_json("{").is_none());
+        assert!(extract_brace_json("}").is_none());
+    }
+
+    #[test]
+    fn brace_json_invalid_content() {
+        assert!(extract_brace_json("{not: valid json}").is_none());
+    }
+
+    // -- stubbed_completion_content tests --
+
+    #[test]
+    fn stub_single_thread_returns_fenced_json() {
+        let content = stubbed_completion_content("Summarize this thread", "Messages follow...");
+        assert!(content.contains("```json"));
+        assert!(content.contains("participants"));
+        assert!(content.contains("BlueLake"));
+        // Should parse successfully via fenced extraction
+        let val = extract_fenced_json(&content).unwrap();
+        assert!(val["participants"].is_array());
+    }
+
+    #[test]
+    fn stub_multi_thread_returns_brace_json() {
+        let content = stubbed_completion_content(
+            "Digest across threads for a multi-thread summary",
+            "Digest these threads: ...",
+        );
+        // Should NOT contain code fences (exercises brace-slice fallback)
+        assert!(!content.contains("```json"));
+        assert!(content.contains("threads"));
+        // Should parse via brace extraction
+        let val = extract_brace_json(&content).unwrap();
+        assert!(val["aggregate"]["key_points"].is_array());
+    }
+
+    #[test]
+    fn stub_single_thread_has_required_fields() {
+        let content = stubbed_completion_content("summary prompt", "user messages");
+        let val = extract_fenced_json(&content).unwrap();
+        // All expected fields present
+        assert!(val["participants"].is_array());
+        assert!(val["key_points"].is_array());
+        assert!(val["action_items"].is_array());
+        assert!(val["total_messages"].is_number());
+    }
+
+    #[test]
+    fn stub_multi_thread_has_required_fields() {
+        let content =
+            stubbed_completion_content("digest across threads", "Digest these threads: T-1, T-2");
+        let val = extract_brace_json(&content).unwrap();
+        assert!(val["threads"].is_array());
+        assert!(val["aggregate"]["top_mentions"].is_array());
+        assert!(val["aggregate"]["action_items"].is_array());
+    }
+
     // -- prompt building tests --
 
     #[test]
