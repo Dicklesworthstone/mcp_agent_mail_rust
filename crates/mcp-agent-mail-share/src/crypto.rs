@@ -3,7 +3,7 @@
 //! - Ed25519 manifest signing via `ed25519-dalek`
 //! - Age encryption/decryption via CLI shelling
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -118,7 +118,7 @@ pub fn verify_bundle(
             sri_checked = true;
             for (relative_path, expected_sri) in sri_map {
                 if let Some(expected) = expected_sri.as_str() {
-                    let file_path = bundle_root.join(relative_path);
+                    let file_path = resolve_sri_file_path(bundle_root, relative_path);
                     if file_path.exists() {
                         let content = std::fs::read(&file_path)?;
                         let actual_hash =
@@ -212,6 +212,16 @@ pub fn verify_bundle(
         key_source,
         error: None,
     })
+}
+
+fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> PathBuf {
+    // Historical manifests store SRI paths relative to `viewer/` (e.g. `vendor/foo.js`),
+    // while some tooling may emit bundle-root relative paths. Accept either.
+    let direct = bundle_root.join(relative_path);
+    if direct.exists() {
+        return direct;
+    }
+    bundle_root.join("viewer").join(relative_path)
 }
 
 /// Result of bundle verification.
@@ -533,6 +543,34 @@ mod tests {
         assert!(!result.signature_verified);
         assert!(!result.sri_checked);
         assert!(result.key_source.is_none());
+    }
+
+    #[test]
+    fn verify_sri_paths_resolve_from_viewer_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("viewer").join("vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        let css_path = vendor_dir.join("clusterize.min.css");
+        std::fs::write(&css_path, b".clusterize{display:block}").unwrap();
+
+        let expected_sri = format!(
+            "sha256-{}",
+            base64_encode(&sha256_bytes(b".clusterize{display:block}"))
+        );
+        let manifest = serde_json::json!({
+            "viewer": {
+                "sri": {
+                    "vendor/clusterize.min.css": expected_sri
+                }
+            }
+        });
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.sri_checked);
+        assert!(result.sri_valid);
+        assert!(result.error.is_none());
     }
 
     #[test]
