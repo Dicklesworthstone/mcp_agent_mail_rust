@@ -451,9 +451,10 @@ CI parses the JSON block below and fails if any row:
       "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.8"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py",
-        "crates/mcp-agent-mail-server/src/mail_ui.rs (render_archive_time_travel_snapshot)"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (render_archive_time_travel_snapshot)",
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (utility_tests::time_travel_timestamp_validation_python_parity)"
       ],
-      "notes": "Snapshot payload needs an explicit schema contract + conformance coverage."
+      "notes": "Validation and JSON schema prefix now aligned (project slug, agent format, timestamp prefix + messages/snapshot_time/commit_sha/requested_time keys). Still partial because full historical commit-based retrieval parity needs deeper conformance coverage."
     },
     {
       "id": "mail_security_xss_escaped",

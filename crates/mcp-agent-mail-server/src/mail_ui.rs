@@ -103,6 +103,44 @@ fn extract_query_int(query: &str, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn is_valid_project_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn is_valid_archive_agent_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn is_valid_time_travel_timestamp(timestamp: &str) -> bool {
+    // Python parity: must match prefix YYYY-MM-DDTHH:MM, with optional trailing
+    // seconds/fraction/timezone.
+    let bytes = timestamp.as_bytes();
+    if bytes.len() < 16 {
+        return false;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' {
+        return false;
+    }
+
+    bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && bytes[14..16].iter().all(u8::is_ascii_digit)
+}
+
+fn archive_browser_file_project_slug(sub: &str) -> Option<&str> {
+    let rest = sub.strip_prefix("/archive/browser/")?;
+    let (project_slug, tail) = rest.split_once('/')?;
+    if project_slug.is_empty() || tail != "file" {
+        return None;
+    }
+    Some(project_slug)
+}
+
 /// Percent-decode a single URL query component.
 ///
 /// This is intentionally minimal (no `;` separators, no nested decoding), but:
@@ -274,6 +312,65 @@ mod utility_tests {
         let result = ts_display_opt(Some(1_700_000_000_000_000));
         assert!(!result.is_empty());
     }
+
+    // --- archive time-travel validation ---
+
+    #[test]
+    fn project_slug_validation_python_parity() {
+        assert!(is_valid_project_slug("alpha"));
+        assert!(is_valid_project_slug("alpha-beta_01"));
+        assert!(!is_valid_project_slug("alpha-beta_01.v2"));
+        assert!(!is_valid_project_slug(""));
+        assert!(!is_valid_project_slug("../etc/passwd"));
+        assert!(!is_valid_project_slug("project with spaces"));
+    }
+
+    #[test]
+    fn archive_agent_name_validation_python_parity() {
+        assert!(is_valid_archive_agent_name("Agent123"));
+        assert!(is_valid_archive_agent_name("A"));
+        assert!(!is_valid_archive_agent_name(""));
+        assert!(!is_valid_archive_agent_name("agent-name"));
+        assert!(!is_valid_archive_agent_name("agent name"));
+        assert!(!is_valid_archive_agent_name("agent!"));
+    }
+
+    #[test]
+    fn time_travel_timestamp_validation_python_parity() {
+        assert!(is_valid_time_travel_timestamp("2026-02-11T05:43"));
+        assert!(is_valid_time_travel_timestamp("2026-02-11T05:43:59Z"));
+        assert!(is_valid_time_travel_timestamp("2026-02-11T05:43:59+05:30"));
+        assert!(is_valid_time_travel_timestamp(
+            "2026-02-11T05:43:59.123456-08:00"
+        ));
+
+        assert!(!is_valid_time_travel_timestamp(""));
+        assert!(!is_valid_time_travel_timestamp("2026-02-11"));
+        assert!(!is_valid_time_travel_timestamp("2026-02-11T05"));
+        assert!(!is_valid_time_travel_timestamp("not-a-timestamp"));
+    }
+
+    #[test]
+    fn archive_browser_file_project_slug_parser_enforces_exact_shape() {
+        assert_eq!(
+            archive_browser_file_project_slug("/archive/browser/demo/file"),
+            Some("demo")
+        );
+        assert_eq!(
+            archive_browser_file_project_slug("/archive/browser/demo/file/extra"),
+            None
+        );
+        assert_eq!(
+            archive_browser_file_project_slug("/archive/browser/demo"),
+            None
+        );
+    }
+
+    #[test]
+    fn time_travel_timestamp_rejects_invalid_separators() {
+        assert!(!is_valid_time_travel_timestamp("2026/02/11T05:43"));
+        assert!(!is_valid_time_travel_timestamp("2026-02-11 05:43"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +484,12 @@ fn json_err(status: u16, detail: &str) -> Result<Option<String>, (u16, String)> 
     let s = serde_json::to_string(&body).unwrap_or_else(|_| format!("{{\"error\":\"{detail}\"}}"));
     // Return the JSON as a successful dispatch result so the caller can set the HTTP status.
     // We embed the status in the Err variant so the server can return the right code.
+    Err((status, s))
+}
+
+fn json_detail_err(status: u16, detail: &str) -> Result<Option<String>, (u16, String)> {
+    let body = serde_json::json!({ "detail": detail });
+    let s = serde_json::to_string(&body).unwrap_or_else(|_| format!("{{\"detail\":\"{detail}\"}}"));
     Err((status, s))
 }
 
@@ -1548,14 +1651,9 @@ fn render_archive_route(
             let timestamp = extract_query_str(query, "timestamp").unwrap_or_default();
             render_archive_time_travel_snapshot(cx, pool, &project, &agent, &timestamp)
         }
-        _ if sub.starts_with("/archive/browser/") && sub.contains("/file") => {
+        _ if archive_browser_file_project_slug(sub).is_some() => {
             // /archive/browser/{project}/file?path=...
-            let parts: Vec<&str> = sub
-                .strip_prefix("/archive/browser/")
-                .unwrap_or("")
-                .split('/')
-                .collect();
-            let project_slug = parts.first().copied().unwrap_or("");
+            let project_slug = archive_browser_file_project_slug(sub).unwrap_or_default();
             let path = extract_query_str(query, "path").unwrap_or_default();
             render_archive_browser_file(project_slug, &path)
         }
@@ -1769,22 +1867,22 @@ fn render_archive_browser_file(
     project_slug: &str,
     path: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    if project_slug.is_empty() {
-        return Err((400, "Invalid project identifier".to_string()));
+    if !is_valid_project_slug(project_slug) {
+        return json_detail_err(400, "Invalid project identifier");
     }
 
     let archive = get_project_archive(project_slug)?;
     match storage::get_archive_file_content(&archive, path, 10 * 1024 * 1024) {
         Ok(Some(content)) => {
-            let json = serde_json::to_string(&serde_json::json!({
-                "content": content,
-                "path": path,
-            }))
-            .map_err(|e| (500, format!("JSON error: {e}")))?;
+            // Python parity: the payload is a JSON string with file content.
+            let json =
+                serde_json::to_string(&content).map_err(|e| (500, format!("JSON error: {e}")))?;
             Ok(Some(json))
         }
-        Ok(None) => Err((404, "File not found".to_string())),
-        Err(e) => Err((400, format!("File error: {e}"))),
+        Err(storage::StorageError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            json_detail_err(400, "Invalid file path")
+        }
+        Ok(None) | Err(_) => json_detail_err(404, "File not found"),
     }
 }
 
@@ -1840,29 +1938,39 @@ fn render_archive_time_travel(cx: &Cx, pool: &DbPool) -> Result<Option<String>, 
 
 /// JSON API: get historical inbox snapshot at a point in time.
 fn render_archive_time_travel_snapshot(
-    cx: &Cx,
-    pool: &DbPool,
+    _cx: &Cx,
+    _pool: &DbPool,
     project_slug: &str,
     agent_name: &str,
-    _timestamp: &str,
+    timestamp: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    if project_slug.is_empty() || agent_name.is_empty() {
-        return Err((400, "project and agent parameters required".to_string()));
+    if !is_valid_project_slug(project_slug) {
+        return json_detail_err(400, "Invalid project identifier");
+    }
+    if !is_valid_archive_agent_name(agent_name) {
+        return json_detail_err(400, "Invalid agent name format");
+    }
+    if !is_valid_time_travel_timestamp(timestamp) {
+        return json_detail_err(
+            400,
+            "Invalid timestamp format. Use ISO 8601 format (YYYY-MM-DDTHH:MM)",
+        );
     }
 
-    // Validate project exists
-    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
-    let agent_names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+    let archive = get_project_archive(project_slug)?;
+    let snapshot =
+        match storage::get_historical_inbox_snapshot(&archive, agent_name, timestamp, 200) {
+            Ok(s) => s,
+            Err(err) => serde_json::json!({
+                "messages": [],
+                "snapshot_time": serde_json::Value::Null,
+                "commit_sha": serde_json::Value::Null,
+                "requested_time": timestamp,
+                "error": format!("Unable to retrieve historical snapshot: {err}"),
+            }),
+        };
 
-    // Return current agent list + project info (full time-travel requires git checkout)
-    let json = serde_json::to_string(&serde_json::json!({
-        "project": project_slug,
-        "agent": agent_name,
-        "agents": agent_names,
-        "note": "Time-travel snapshot shows current state; full git history browsing available via archive browser",
-    }))
-    .map_err(|e| (500, format!("JSON error: {e}")))?;
+    let json = serde_json::to_string(&snapshot).map_err(|e| (500, format!("JSON error: {e}")))?;
     Ok(Some(json))
 }
 
