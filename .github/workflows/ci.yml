@@ -247,6 +247,9 @@ jobs:
       - name: E2E web parity suite (HTTP wrapper, includes mail_ui)
         run: bash tests/e2e/test_http.sh
 
+      - name: E2E static export conformance suite
+        run: bash tests/e2e/test_share.sh
+
       - name: Validate artifact bundles
         if: always()
         run: |

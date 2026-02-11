@@ -77,6 +77,46 @@ am_env() {
     "$@"
 }
 
+extract_local_asset_paths() {
+    local html_file="$1"
+    local base_dir="${2:-}"
+    python3 - <<'PY' "${html_file}" "${base_dir}"
+import re
+import sys
+import posixpath
+from pathlib import Path
+
+html_path = Path(sys.argv[1])
+base_dir = (sys.argv[2] or "").strip("/")
+text = html_path.read_text(encoding="utf-8", errors="replace")
+
+paths = set()
+for _, raw in re.findall(r'(href|src)\s*=\s*["\']([^"\']+)["\']', text, flags=re.IGNORECASE):
+    value = (raw or "").strip()
+    if not value:
+        continue
+    if value.startswith(("#", "data:", "mailto:", "tel:", "javascript:", "http://", "https://")):
+        continue
+    value = value.split("?", 1)[0].split("#", 1)[0]
+
+    if value.startswith("/"):
+        resolved = value.lstrip("/")
+    else:
+        joined = posixpath.join(base_dir, value) if base_dir else value
+        resolved = posixpath.normpath(joined)
+
+    while resolved.startswith("../"):
+        resolved = resolved[3:]
+    resolved = resolved.lstrip("./")
+    if not resolved or resolved == ".":
+        continue
+    paths.add(resolved)
+
+for path in sorted(paths):
+    print(path)
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Seed a realistic mailbox
 # ---------------------------------------------------------------------------
@@ -381,6 +421,32 @@ print("match" if m1 == m2 else "mismatch")
 PY
 )"
 e2e_assert_eq "manifest structures match (ignoring timestamps)" "match" "${MANIFEST_MATCH}"
+
+MANIFEST_DIFF="$(python3 - <<'PY' "${BUNDLE1}/manifest.json" "${BUNDLE2}/manifest.json"
+import difflib
+import json
+import sys
+
+def strip_volatile(obj):
+    if isinstance(obj, dict):
+        return {
+            k: strip_volatile(v)
+            for k, v in obj.items()
+            if k not in ("exported_at", "created_at", "timestamp", "generated_at")
+        }
+    if isinstance(obj, list):
+        return [strip_volatile(v) for v in obj]
+    return obj
+
+m1 = strip_volatile(json.load(open(sys.argv[1], "r", encoding="utf-8")))
+m2 = strip_volatile(json.load(open(sys.argv[2], "r", encoding="utf-8")))
+t1 = json.dumps(m1, indent=2, sort_keys=True).splitlines()
+t2 = json.dumps(m2, indent=2, sort_keys=True).splitlines()
+diff = list(difflib.unified_diff(t1, t2, fromfile="bundle1_manifest", tofile="bundle2_manifest", lineterm=""))
+print("\n".join(diff) if diff else "NO_DIFF")
+PY
+)"
+e2e_save_artifact "manifest_diff.txt" "${MANIFEST_DIFF}"
 
 # ---------------------------------------------------------------------------
 # Case 6: Verify subcommand on valid bundle
@@ -717,6 +783,87 @@ fi
 kill "${PREVIEW_PID}" 2>/dev/null || true
 wait "${PREVIEW_PID}" 2>/dev/null || true
 set -e
+
+# ---------------------------------------------------------------------------
+# Case 16: GH Pages + Cloudflare Pages publish-like smoke checks
+# ---------------------------------------------------------------------------
+
+e2e_case_banner "static host smoke: Cloudflare Pages + GitHub Pages layouts"
+
+CF_PORT="$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")"
+CF_SERVER_LOG="${E2E_ARTIFACT_DIR}/case_16_cf_server.log"
+python3 -m http.server "${CF_PORT}" --bind 127.0.0.1 --directory "${BUNDLE1}" >"${CF_SERVER_LOG}" 2>&1 &
+CF_PID=$!
+
+if e2e_wait_port 127.0.0.1 "${CF_PORT}" 5; then
+    CF_INDEX_STATUS="$(curl -sS -o "${E2E_ARTIFACT_DIR}/case_16_cf_index_body.html" -w "%{http_code}" "http://127.0.0.1:${CF_PORT}/viewer/index.html" 2>/dev/null || echo "000")"
+    e2e_assert_eq "CF smoke: index.html returns 200" "200" "${CF_INDEX_STATUS}"
+
+    CF_ASSET_PROBE="${E2E_ARTIFACT_DIR}/case_16_cf_asset_probe.txt"
+    : >"${CF_ASSET_PROBE}"
+    while IFS= read -r rel; do
+        [ -z "${rel}" ] && continue
+        local_status="$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${CF_PORT}/${rel}" 2>/dev/null || echo "000")"
+        printf "%s %s\n" "${local_status}" "${rel}" >>"${CF_ASSET_PROBE}"
+        if [ "${rel##*/}" = "viewer.js" ] && [ "${local_status}" != "200" ]; then
+            e2e_pass "CF optional asset absent: ${rel} (status=${local_status})"
+        elif [ "${local_status}" = "200" ]; then
+            e2e_pass "CF asset reachable: ${rel}"
+        else
+            e2e_fail "CF asset missing: ${rel} (status=${local_status})"
+        fi
+    done < <(extract_local_asset_paths "${E2E_ARTIFACT_DIR}/case_16_cf_index_body.html" "viewer")
+else
+    e2e_fail "CF smoke server failed to start"
+fi
+kill "${CF_PID}" 2>/dev/null || true
+wait "${CF_PID}" 2>/dev/null || true
+
+GH_ROOT="${WORK}/gh_pages_root"
+GH_REPO_PATH="${GH_ROOT}/repo"
+mkdir -p "${GH_REPO_PATH}"
+cp -R "${BUNDLE1}/." "${GH_REPO_PATH}/"
+
+GH_PORT="$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")"
+GH_SERVER_LOG="${E2E_ARTIFACT_DIR}/case_16_gh_server.log"
+python3 -m http.server "${GH_PORT}" --bind 127.0.0.1 --directory "${GH_ROOT}" >"${GH_SERVER_LOG}" 2>&1 &
+GH_PID=$!
+
+if e2e_wait_port 127.0.0.1 "${GH_PORT}" 5; then
+    GH_INDEX_STATUS="$(curl -sS -o "${E2E_ARTIFACT_DIR}/case_16_gh_index_body.html" -w "%{http_code}" "http://127.0.0.1:${GH_PORT}/repo/index.html" 2>/dev/null || echo "000")"
+    e2e_assert_eq "GH smoke: /repo/index.html returns 200" "200" "${GH_INDEX_STATUS}"
+
+    GH_VIEWER_STATUS="$(curl -sS -o "${E2E_ARTIFACT_DIR}/case_16_gh_viewer_body.html" -w "%{http_code}" "http://127.0.0.1:${GH_PORT}/repo/viewer/index.html" 2>/dev/null || echo "000")"
+    e2e_assert_eq "GH smoke: /repo/viewer/index.html returns 200" "200" "${GH_VIEWER_STATUS}"
+
+    GH_ASSET_PROBE="${E2E_ARTIFACT_DIR}/case_16_gh_asset_probe.txt"
+    : >"${GH_ASSET_PROBE}"
+    while IFS= read -r rel; do
+        [ -z "${rel}" ] && continue
+        local_status="$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${GH_PORT}/repo/${rel}" 2>/dev/null || echo "000")"
+        printf "%s %s\n" "${local_status}" "${rel}" >>"${GH_ASSET_PROBE}"
+        if [ "${rel}" = "viewer/viewer.js" ] && [ "${local_status}" != "200" ]; then
+            e2e_pass "GH optional asset absent: /repo/${rel} (status=${local_status})"
+        elif [ "${local_status}" = "200" ]; then
+            e2e_pass "GH asset reachable: /repo/${rel}"
+        else
+            e2e_fail "GH asset missing: /repo/${rel} (status=${local_status})"
+        fi
+    done < <(extract_local_asset_paths "${E2E_ARTIFACT_DIR}/case_16_gh_viewer_body.html" "viewer")
+else
+    e2e_fail "GH smoke server failed to start"
+fi
+kill "${GH_PID}" 2>/dev/null || true
+wait "${GH_PID}" 2>/dev/null || true
+
+e2e_save_artifact "case_16_replay.txt" "$(cat <<EOF
+Cloudflare-like smoke:
+python3 -m http.server ${CF_PORT} --bind 127.0.0.1 --directory ${BUNDLE1}/viewer
+
+GitHub-Pages-like smoke (repo subpath):
+python3 -m http.server ${GH_PORT} --bind 127.0.0.1 --directory ${GH_ROOT}
+EOF
+)"
 
 # ---------------------------------------------------------------------------
 # Finalize: save hashes and summary
