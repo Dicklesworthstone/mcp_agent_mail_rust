@@ -155,6 +155,11 @@ impl MailAppModel {
         // Restore keymap profile from persisted config.
         let prefs = crate::tui_persist::TuiPreferences::from_config(config);
         model.keymap.set_profile(prefs.keymap_profile);
+        // Screens with config-driven preferences + persistence.
+        model.set_screen(
+            MailScreenId::Timeline,
+            Box::new(TimelineScreen::with_config(config)),
+        );
         model
     }
 
@@ -278,6 +283,16 @@ impl MailAppModel {
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_palette_action(&mut self, id: &str) -> Cmd<MailMsg> {
+        self.dispatch_palette_action_inner(id, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_palette_action_from_macro(&mut self, id: &str) -> Cmd<MailMsg> {
+        self.dispatch_palette_action_inner(id, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_palette_action_inner(&mut self, id: &str, macro_playback: bool) -> Cmd<MailMsg> {
         // ── Macro engine controls (never recorded) ────────────────
         if let Some(cmd) = self.handle_macro_control(id) {
             return cmd;
@@ -324,20 +339,62 @@ impl MailAppModel {
                 return Cmd::none();
             }
             palette_action_ids::LAYOUT_RESET => {
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
-                    screen.reset_layout();
+                let ok = self
+                    .screens
+                    .get_mut(&MailScreenId::Timeline)
+                    .is_some_and(|s| s.reset_layout());
+                if ok {
+                    self.notifications.notify(
+                        Toast::new("Layout reset")
+                            .icon(ToastIcon::Info)
+                            .duration(Duration::from_secs(2)),
+                    );
+                } else {
+                    self.notifications.notify(
+                        Toast::new("Layout reset not supported")
+                            .icon(ToastIcon::Warning)
+                            .duration(Duration::from_secs(3)),
+                    );
                 }
                 return Cmd::none();
             }
             palette_action_ids::LAYOUT_EXPORT => {
-                if let Some(screen) = self.screens.get(&MailScreenId::Threads) {
-                    screen.export_layout();
+                let path = self
+                    .screens
+                    .get(&MailScreenId::Timeline)
+                    .and_then(|s| s.export_layout());
+                if let Some(path) = path {
+                    self.notifications.notify(
+                        Toast::new(format!("Exported layout to {}", path.display()))
+                            .icon(ToastIcon::Info)
+                            .duration(Duration::from_secs(4)),
+                    );
+                } else {
+                    self.notifications.notify(
+                        Toast::new("Layout export not available")
+                            .icon(ToastIcon::Warning)
+                            .duration(Duration::from_secs(3)),
+                    );
                 }
                 return Cmd::none();
             }
             palette_action_ids::LAYOUT_IMPORT => {
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
-                    screen.import_layout();
+                let ok = self
+                    .screens
+                    .get_mut(&MailScreenId::Timeline)
+                    .is_some_and(|s| s.import_layout());
+                if ok {
+                    self.notifications.notify(
+                        Toast::new("Imported layout")
+                            .icon(ToastIcon::Info)
+                            .duration(Duration::from_secs(3)),
+                    );
+                } else {
+                    self.notifications.notify(
+                        Toast::new("Layout import failed (missing layout.json?)")
+                            .icon(ToastIcon::Warning)
+                            .duration(Duration::from_secs(4)),
+                    );
                 }
                 return Cmd::none();
             }
@@ -466,6 +523,19 @@ impl MailAppModel {
         // ── Macro actions (context-aware high-value operations) ───
         if let Some(rest) = id.strip_prefix("macro:") {
             return self.dispatch_macro_action(rest);
+        }
+
+        // If this action was part of macro playback, treat unknown IDs as a
+        // deterministic fail-stop (for replay safety + forensics).
+        if macro_playback {
+            let reason = format!("unrecognized palette action: {id}");
+            self.macro_engine.mark_last_playback_error(reason.clone());
+            self.macro_engine.fail_playback(&reason);
+            self.notifications.notify(
+                Toast::new(format!("Macro failed: {id}"))
+                    .icon(ToastIcon::Error)
+                    .duration(Duration::from_secs(4)),
+            );
         }
 
         Cmd::none()
@@ -621,6 +691,10 @@ impl MailAppModel {
                     return Some(Cmd::none());
                 }
                 if let Some(name) = id.strip_prefix(macro_ids::DRY_RUN_PREFIX) {
+                    // Use the playback engine so dry-run leaves a structured log for forensics.
+                    if self.macro_engine.start_playback(name, PlaybackMode::DryRun) {
+                        self.execute_macro_steps();
+                    }
                     if let Some(steps) = self.macro_engine.preview(name) {
                         let preview: Vec<String> = steps
                             .iter()
@@ -666,7 +740,7 @@ impl MailAppModel {
                         // Should not happen, but guard against it.
                         break;
                     }
-                    let _ = self.dispatch_palette_action(&action_id);
+                    let _ = self.dispatch_palette_action_from_macro(&action_id);
                 }
                 None => break,
             }
@@ -729,7 +803,7 @@ impl Model for MailAppModel {
                             match key.code {
                                 KeyCode::Enter => {
                                     if let Some(action_id) = self.macro_engine.confirm_step() {
-                                        let _ = self.dispatch_palette_action(&action_id);
+                                        let _ = self.dispatch_palette_action_from_macro(&action_id);
                                         // Show progress toast.
                                         if let Some(label) =
                                             self.macro_engine.playback_state().status_label()
@@ -1401,8 +1475,12 @@ fn extract_reservation_agent(event: &MailEvent) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui_macro::{MacroDef, MacroStep};
     use crate::tui_screens::MailScreenMsg;
+    use ftui::KeyEvent;
     use mcp_agent_mail_core::Config;
+    use serde::Serialize;
+    use std::path::{Path, PathBuf};
 
     fn test_model() -> MailAppModel {
         let config = Config::default();
@@ -2169,5 +2247,430 @@ mod tests {
         let prev = model.active_screen();
         model.dispatch_palette_action("macro:unknown:foo");
         assert_eq!(model.active_screen(), prev);
+    }
+
+    // ── Operator macro deterministic replay E2E (br-3vwi.10.15) ────────────
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf()
+    }
+
+    fn new_artifact_dir(label: &str) -> PathBuf {
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let dir = repo_root().join(format!(
+            "tests/artifacts/tui/macro_replay/{ts}_{}_{}",
+            std::process::id(),
+            label
+        ));
+        let _ = std::fs::create_dir_all(dir.join("steps"));
+        let _ = std::fs::create_dir_all(dir.join("failures"));
+        dir
+    }
+
+    #[derive(Debug, Serialize)]
+    struct StepTelemetry {
+        phase: &'static str,
+        step_index: usize,
+        action_id: String,
+        label: String,
+        stable_hash64: String,
+        delay_ms: Option<u64>,
+        executed: Option<bool>,
+        error: Option<String>,
+        before_screen: String,
+        after_screen: String,
+        help_visible: bool,
+    }
+
+    fn screen_label(id: MailScreenId) -> &'static str {
+        match id {
+            MailScreenId::Dashboard => "dashboard",
+            MailScreenId::Messages => "messages",
+            MailScreenId::Threads => "threads",
+            MailScreenId::Search => "search",
+            MailScreenId::Agents => "agents",
+            MailScreenId::Reservations => "reservations",
+            MailScreenId::ToolMetrics => "tool_metrics",
+            MailScreenId::SystemHealth => "system_health",
+            MailScreenId::Timeline => "timeline",
+            MailScreenId::Projects => "projects",
+            MailScreenId::Contacts => "contacts",
+            MailScreenId::Explorer => "explorer",
+            MailScreenId::Analytics => "analytics",
+            MailScreenId::Attachments => "attachments",
+        }
+    }
+
+    fn first_divergence(a: &[u64], b: &[u64]) -> Option<usize> {
+        let n = a.len().min(b.len());
+        for i in 0..n {
+            if a[i] != b[i] {
+                return Some(i);
+            }
+        }
+        if a.len() != b.len() {
+            return Some(n);
+        }
+        None
+    }
+
+    #[derive(Debug, Serialize)]
+    struct MacroReplayReport {
+        generated_at: String,
+        agent: &'static str,
+        bead: &'static str,
+        macro_name: String,
+        step_count: usize,
+        baseline_hashes: Vec<String>,
+        dry_run_hashes: Vec<String>,
+        step_play_hashes: Vec<String>,
+        divergence_index: Option<usize>,
+        layout_json_exists_after_record: bool,
+        layout_json_exists_after_replay: bool,
+        repro: String,
+        verdict: &'static str,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct MacroFailStopReport {
+        generated_at: String,
+        agent: &'static str,
+        bead: &'static str,
+        macro_name: String,
+        baseline_hashes: Vec<String>,
+        edited_hashes: Vec<String>,
+        divergence_index: Option<usize>,
+        verdict: &'static str,
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operator_macro_record_save_load_replay_forensics() {
+        // Use a per-test temp workspace to avoid touching user config.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let macro_dir = tmp.path().join("macros");
+        let _ = std::fs::create_dir_all(&macro_dir);
+        let envfile_path = tmp.path().join("config.env");
+
+        let config = Config {
+            console_persist_path: envfile_path.clone(),
+            console_auto_save: true,
+            ..Config::default()
+        };
+
+        let artifacts = new_artifact_dir("record_save_load_replay");
+
+        let state = TuiSharedState::new(&config);
+        let mut model = MailAppModel::with_config(state, &config);
+        model.macro_engine = MacroEngine::with_dir(macro_dir.clone());
+
+        // ── Record a macro ────────────────────────────────────────
+        model.dispatch_palette_action(macro_ids::RECORD_START);
+        assert!(model.macro_engine.recorder_state().is_recording());
+
+        let record_actions: &[&str] = &[
+            palette_action_ids::SCREEN_TIMELINE,
+            palette_action_ids::LAYOUT_EXPORT,
+            palette_action_ids::SCREEN_MESSAGES,
+            palette_action_ids::APP_TOGGLE_HELP,
+            "macro:view_thread:br-3vwi",
+            palette_action_ids::APP_TOGGLE_HELP,
+            palette_action_ids::SCREEN_TIMELINE,
+            palette_action_ids::LAYOUT_IMPORT,
+            palette_action_ids::SCREEN_DASHBOARD,
+        ];
+
+        for (i, &action_id) in record_actions.iter().enumerate() {
+            let before = model.active_screen();
+            let _ = model.dispatch_palette_action(action_id);
+            let after = model.active_screen();
+            let tel = StepTelemetry {
+                phase: "record",
+                step_index: i,
+                action_id: action_id.to_string(),
+                label: palette_action_label(action_id),
+                stable_hash64: format!(
+                    "{:016x}",
+                    MacroStep::new(action_id, palette_action_label(action_id)).stable_hash64()
+                ),
+                delay_ms: None,
+                executed: None,
+                error: None,
+                before_screen: screen_label(before).to_string(),
+                after_screen: screen_label(after).to_string(),
+                help_visible: model.help_visible(),
+            };
+            let path = artifacts.join(format!("steps/step_{:04}_record.json", i + 1));
+            let _ = std::fs::write(path, serde_json::to_string_pretty(&tel).unwrap());
+        }
+
+        model.dispatch_palette_action(macro_ids::RECORD_STOP);
+        assert!(!model.macro_engine.recorder_state().is_recording());
+
+        let names = model.macro_engine.list_macros();
+        assert_eq!(names.len(), 1, "expected exactly 1 recorded macro");
+        let auto_name = names[0].to_string();
+
+        // Rename to a stable test name for deterministic file paths.
+        let macro_name = "e2e-macro";
+        assert!(
+            model.macro_engine.rename_macro(&auto_name, macro_name),
+            "rename macro"
+        );
+
+        let def = model
+            .macro_engine
+            .get_macro(macro_name)
+            .expect("macro def exists");
+        assert_eq!(
+            def.steps.len(),
+            record_actions.len(),
+            "macro step count matches"
+        );
+
+        let baseline_hashes: Vec<u64> = def.steps.iter().map(MacroStep::stable_hash64).collect();
+
+        // Persisted macro JSON should exist in the macro dir.
+        let macro_path = macro_dir.join(format!("{macro_name}.json"));
+        assert!(
+            macro_path.exists(),
+            "macro persisted: {}",
+            macro_path.display()
+        );
+
+        // Layout export should have created layout.json next to the envfile.
+        let layout_json_path = envfile_path
+            .parent()
+            .expect("envfile parent")
+            .join("layout.json");
+
+        let layout_json_exists_after_record = layout_json_path.exists();
+
+        // ── Load in a fresh model + replay ────────────────────────
+        let state2 = TuiSharedState::new(&config);
+        let mut replay = MailAppModel::with_config(state2, &config);
+        replay.macro_engine = MacroEngine::with_dir(macro_dir);
+
+        // Dry-run (preview) should create a structured playback log without executing.
+        replay.dispatch_palette_action(&format!("{}{}", macro_ids::DRY_RUN_PREFIX, macro_name));
+
+        let dry_log = replay.macro_engine.playback_log().to_vec();
+        assert_eq!(dry_log.len(), baseline_hashes.len(), "dry-run log length");
+        assert!(
+            dry_log.iter().all(|e| !e.executed),
+            "dry-run should mark executed=false"
+        );
+
+        let dry_hashes: Vec<u64> = dry_log
+            .iter()
+            .map(|e| MacroStep::new(&e.action_id, &e.label).stable_hash64())
+            .collect();
+        assert_eq!(dry_hashes, baseline_hashes, "dry-run step hashes match");
+
+        // Step-by-step playback: confirm each step via Enter.
+        replay.macro_engine.clear_playback();
+        replay.dispatch_palette_action(&format!("{}{}", macro_ids::PLAY_STEP_PREFIX, macro_name));
+
+        let mut step_play_hashes: Vec<u64> = Vec::new();
+        for i in 0..baseline_hashes.len() {
+            let before = replay.active_screen();
+            let _ = replay.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Enter))));
+            let after = replay.active_screen();
+
+            let entry = replay
+                .macro_engine
+                .playback_log()
+                .last()
+                .expect("playback log entry");
+            let h = MacroStep::new(&entry.action_id, &entry.label).stable_hash64();
+            step_play_hashes.push(h);
+
+            let tel = StepTelemetry {
+                phase: "play_step",
+                step_index: i,
+                action_id: entry.action_id.clone(),
+                label: entry.label.clone(),
+                stable_hash64: format!("{h:016x}"),
+                delay_ms: None,
+                executed: Some(entry.executed),
+                error: entry.error.clone(),
+                before_screen: screen_label(before).to_string(),
+                after_screen: screen_label(after).to_string(),
+                help_visible: replay.help_visible(),
+            };
+            let path = artifacts.join(format!("steps/step_{:04}_play.json", i + 1));
+            let _ = std::fs::write(path, serde_json::to_string_pretty(&tel).unwrap());
+        }
+
+        assert_eq!(
+            step_play_hashes, baseline_hashes,
+            "step-by-step hashes match"
+        );
+        assert!(
+            matches!(
+                replay.macro_engine.playback_state(),
+                PlaybackState::Completed { .. }
+            ),
+            "playback completed"
+        );
+
+        // Layout file should still exist after replay (export/import steps are idempotent).
+        let layout_json_exists_after_replay = layout_json_path.exists();
+
+        let report = MacroReplayReport {
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            agent: "EmeraldPeak",
+            bead: "br-3vwi.10.15",
+            macro_name: macro_name.to_string(),
+            step_count: baseline_hashes.len(),
+            baseline_hashes: baseline_hashes
+                .iter()
+                .map(|h| format!("{h:016x}"))
+                .collect(),
+            dry_run_hashes: dry_hashes.iter().map(|h| format!("{h:016x}")).collect(),
+            step_play_hashes: step_play_hashes
+                .iter()
+                .map(|h| format!("{h:016x}"))
+                .collect(),
+            divergence_index: first_divergence(&baseline_hashes, &step_play_hashes),
+            layout_json_exists_after_record,
+            layout_json_exists_after_replay,
+            repro: "cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture"
+                .to_string(),
+            verdict: "PASS",
+        };
+
+        let _ = std::fs::write(
+            artifacts.join("report.json"),
+            serde_json::to_string_pretty(&report).unwrap(),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operator_macro_edit_and_fail_stop_forensics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let macro_dir = tmp.path().join("macros");
+        let _ = std::fs::create_dir_all(&macro_dir);
+        let envfile_path = tmp.path().join("config.env");
+
+        let config = Config {
+            console_persist_path: envfile_path,
+            console_auto_save: true,
+            ..Config::default()
+        };
+
+        let artifacts = new_artifact_dir("edit_fail_stop");
+
+        // Record a small macro (we'll edit the JSON on disk to inject failure).
+        let state = TuiSharedState::new(&config);
+        let mut model = MailAppModel::with_config(state, &config);
+        model.macro_engine = MacroEngine::with_dir(macro_dir.clone());
+
+        model.dispatch_palette_action(macro_ids::RECORD_START);
+        model.dispatch_palette_action(palette_action_ids::SCREEN_MESSAGES);
+        model.dispatch_palette_action(palette_action_ids::SCREEN_TIMELINE);
+        model.dispatch_palette_action(macro_ids::RECORD_STOP);
+
+        let names = model.macro_engine.list_macros();
+        assert_eq!(names.len(), 1, "expected 1 macro");
+        let auto_name = names[0].to_string();
+
+        let macro_name = "e2e-macro";
+        assert!(model.macro_engine.rename_macro(&auto_name, macro_name));
+
+        let original = model
+            .macro_engine
+            .get_macro(macro_name)
+            .expect("macro exists")
+            .clone();
+        let baseline_hashes: Vec<u64> = original
+            .steps
+            .iter()
+            .map(MacroStep::stable_hash64)
+            .collect();
+
+        // Edit persisted JSON: inject a failing step at index 1.
+        let macro_path = macro_dir.join(format!("{macro_name}.json"));
+        let data = std::fs::read_to_string(&macro_path).expect("read macro json");
+        let mut def: MacroDef = serde_json::from_str(&data).expect("parse macro json");
+        def.steps.insert(
+            1,
+            MacroStep::new("nonexistent:action", "Injected failure step"),
+        );
+        let _ = std::fs::write(&macro_path, serde_json::to_string_pretty(&def).unwrap());
+
+        let edited_hashes: Vec<u64> = def.steps.iter().map(MacroStep::stable_hash64).collect();
+        let div = first_divergence(&baseline_hashes, &edited_hashes);
+        assert_eq!(div, Some(1), "expected divergence at injected index");
+
+        // Load and attempt playback: should fail-stop on the injected action.
+        let state2 = TuiSharedState::new(&config);
+        let mut replay = MailAppModel::with_config(state2, &config);
+        replay.macro_engine = MacroEngine::with_dir(macro_dir);
+
+        replay.dispatch_palette_action(&format!("{}{}", macro_ids::PLAY_PREFIX, macro_name));
+
+        assert!(
+            matches!(
+                replay.macro_engine.playback_state(),
+                PlaybackState::Failed { .. }
+            ),
+            "playback should fail-stop"
+        );
+
+        let log = replay.macro_engine.playback_log();
+        assert!(
+            log.len() <= 2,
+            "should stop at injected step (log_len={})",
+            log.len()
+        );
+        if let Some(last) = log.last() {
+            // The failing entry should carry an error string.
+            assert!(last.error.is_some(), "expected playback log error");
+            let tel = StepTelemetry {
+                phase: "fail_stop",
+                step_index: last.step_index,
+                action_id: last.action_id.clone(),
+                label: last.label.clone(),
+                stable_hash64: format!(
+                    "{:016x}",
+                    MacroStep::new(&last.action_id, &last.label).stable_hash64()
+                ),
+                delay_ms: None,
+                executed: Some(last.executed),
+                error: last.error.clone(),
+                before_screen: screen_label(replay.active_screen()).to_string(),
+                after_screen: screen_label(replay.active_screen()).to_string(),
+                help_visible: replay.help_visible(),
+            };
+            let _ = std::fs::write(
+                artifacts.join("failures/fail_0001.json"),
+                serde_json::to_string_pretty(&tel).unwrap(),
+            );
+        }
+
+        // Write a small report (useful in CI artifact bundles).
+        let report = MacroFailStopReport {
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            agent: "EmeraldPeak",
+            bead: "br-3vwi.10.15",
+            macro_name: macro_name.to_string(),
+            baseline_hashes: baseline_hashes
+                .iter()
+                .map(|h| format!("{h:016x}"))
+                .collect(),
+            edited_hashes: edited_hashes.iter().map(|h| format!("{h:016x}")).collect(),
+            divergence_index: div,
+            verdict: "PASS",
+        };
+        let _ = std::fs::write(
+            artifacts.join("report.json"),
+            serde_json::to_string_pretty(&report).unwrap(),
+        );
     }
 }

@@ -2112,7 +2112,6 @@ dependencies = [
  "ftui-widgets 0.1.1",
  "math-text-transform",
  "pulldown-cmark",
- "serde_json",
  "unicode-display-width",
  "unicode-segmentation",
  "unicodeit",
