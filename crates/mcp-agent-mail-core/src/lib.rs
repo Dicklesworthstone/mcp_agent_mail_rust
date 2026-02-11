@@ -14,6 +14,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod disk;
 pub mod error;
+pub mod flake_triage;
 pub mod identity;
 pub mod intern;
 pub mod kpi;
