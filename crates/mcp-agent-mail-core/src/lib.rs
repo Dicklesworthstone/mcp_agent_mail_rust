@@ -22,6 +22,7 @@ pub mod memory;
 pub mod metrics;
 pub mod models;
 pub mod slo;
+pub mod test_harness;
 pub mod toon;
 
 // Re-export key types for convenience
