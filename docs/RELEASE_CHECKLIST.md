@@ -2,7 +2,29 @@
 
 Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 
+**Primary Bead:** br-3vwi.12.1
+**Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
+**Last Updated:** 2026-02-11
+
 ---
+
+## Staged Rollout Gate Matrix
+
+- [ ] Phase 0 packet complete: CI + local validation evidence attached
+- [ ] Phase 1 packet complete: 24-48h canary metrics + incident log review attached
+- [ ] Phase 2 packet complete: 25%/50%/100% ring promotions each signed separately
+- [ ] Phase 3 packet complete: GA sign-off + ongoing monitoring owners recorded
+- [ ] Kill-switch owner for each V2 surface is named and on-call reachable
+- [ ] Rollback communication template reviewed and ready for use
+
+### Measurable Promotion Criteria (All phases)
+
+- [ ] Correctness: required suites report zero failures
+- [ ] Security/privacy: search scope and secret-redaction checks are clean
+- [ ] Accessibility: keyboard-only path and focus checks are clean
+- [ ] Performance: no budget regressions; p95 not worse than 2x baseline
+- [ ] Determinism: static export and golden outputs match expected checksums
+- [ ] Governance: sign-off ledger has owner + UTC timestamp + evidence links
 
 ## Functional Readiness
 
@@ -163,7 +185,7 @@ ls tests/fixtures/golden_snapshots/mcp_deny_*.txt
    ```
 
 4. Start `am` and verify TUI:
-   - TUI renders correctly (all 8 screens load)
+   - TUI renders correctly (all 11 screens load)
    - Keybindings respond (Tab, 1-8, ?, q)
    - Command palette opens (Ctrl+P)
    - System Health shows green status
@@ -227,6 +249,39 @@ curl -s http://127.0.0.1:8765/mcp/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"resource://tooling/locks"}}' \
   | jq '.result.contents[0].text | fromjson | .summary'
 ```
+
+## V2 Surface Ownership and Kill-Switch Mapping
+
+| Surface | Activation boundary | Kill-switch action | Primary owner | Secondary owner |
+|---------|---------------------|--------------------|---------------|-----------------|
+| MCP interface mode | `AM_INTERFACE_MODE` policy + binary separation | Clear CLI mode env and redeploy MCP binary | Runtime owner | Release owner |
+| CLI workflows (`am`) | CLI binary rollout ring | Roll back `am` to last-known-good release | CLI owner | Runtime owner |
+| TUI console | `TUI_ENABLED=true` and launch profile | Restart with `--no-tui` | TUI owner | Runtime owner |
+| Static export pipeline | publish workflow gates | Disable publish jobs and hold exports | Docs/release owner | CLI owner |
+| Build slots/worktrees | `WORKTREES_ENABLED=true` only after canary | Set `WORKTREES_ENABLED=false` and restart | Runtime owner | Storage owner |
+| Local auth posture | bearer/JWT policy | Re-enable strict auth (`HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0`) | Security owner | Runtime owner |
+
+## Incident Rollback Timelines and Communication Paths
+
+| Milestone | Target timeline | Channel | Required payload |
+|-----------|-----------------|---------|------------------|
+| Incident acknowledged | <= 5 minutes | on-call chat | incident ID, suspected surface, owner |
+| Kill-switch decision | <= 10 minutes | incident bridge | go/no-go with rationale |
+| Rollback executed | <= 15 minutes | deployment channel | command/runbook step + env scope |
+| Operator notice | <= 20 minutes | operator channel + thread | user impact + workaround |
+| Evidence bundle posted | <= 60 minutes | bead thread + incident doc | logs, artifacts, reproduction |
+
+## Release Sign-Off Ledger (Required)
+
+Fill one row per phase promotion decision.
+
+| Phase | Decision (`go`/`no-go`) | Owner | UTC timestamp | Rationale | Evidence links |
+|------|--------------------------|-------|---------------|-----------|----------------|
+| Phase 0 -> Phase 1 |  |  |  |  |  |
+| Phase 1 -> Phase 2 |  |  |  |  |  |
+| Phase 2 (25% -> 50%) |  |  |  |  |  |
+| Phase 2 (50% -> 100%) |  |  |  |  |  |
+| Phase 3 (GA confirmation) |  |  |  |  |  |
 
 ---
 

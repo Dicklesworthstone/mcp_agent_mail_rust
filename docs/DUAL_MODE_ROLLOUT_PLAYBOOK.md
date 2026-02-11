@@ -5,7 +5,9 @@ opt-in). Includes activation criteria, kill-switch procedures, and rollback
 paths.
 
 **ADR:** [ADR-001](ADR-001-dual-mode-invariants.md)
-**Bead:** br-21gj.6.3
+**Primary Bead:** br-3vwi.12.1
+**Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
+**Last Updated:** 2026-02-11
 
 ---
 
@@ -24,9 +26,42 @@ is executed (compile-time separation per ADR-001 Invariant 3).
 
 ---
 
-## Phase 1: Internal Validation (Pre-Rollout)
+## V2 Surface Cohorts and Feature-Flag Boundaries
 
-**Criteria to enter Phase 2:**
+| Surface | Activation boundary | Default state | Kill switch |
+|---------|---------------------|---------------|-------------|
+| MCP interface mode | `AM_INTERFACE_MODE` policy + binary separation | `mcp` | clear CLI env + restart |
+| CLI workflows (`am`) | CLI binary deployment ring | enabled for operators | roll back CLI binary |
+| TUI console | `TUI_ENABLED=true` | enabled in ops profile | launch `--no-tui` |
+| Static export | publish workflow + share validation | disabled until Phase 2 | disable publish jobs |
+| Build slots/worktrees | `WORKTREES_ENABLED=true` | disabled | set `WORKTREES_ENABLED=false` |
+| Local auth posture | bearer/JWT env policy | strict auth | force strict auth flags |
+
+## Stage Definitions (Exposure Cohorts)
+
+| Stage | Exposure cohort | Blast radius | Minimum dwell |
+|-------|-----------------|--------------|---------------|
+| Phase 0 | CI + dev workstations | internal only | until all gates pass |
+| Phase 1 | Canary (1 project, 1-3 agents) | single project | 24-48h |
+| Phase 2 | Rings: 25% -> 50% -> 100% | proportional by ring | 72h at 25%, 48h at 50% |
+| Phase 3 | General availability | full | ongoing |
+
+## Governance Artifacts (Auditable Evidence)
+
+Each promotion decision must include:
+
+- gate owner
+- UTC timestamp
+- decision (`go`/`no-go`)
+- linked evidence bundle paths
+
+Use `docs/RELEASE_CHECKLIST.md` as the canonical sign-off ledger.
+
+---
+
+## Phase 0: Internal Validation (Pre-Rollout)
+
+**Criteria to enter Phase 1:**
 
 - [ ] All CI gates pass (unit, integration, conformance, perf/security, E2E)
   ```bash
@@ -55,12 +90,12 @@ is executed (compile-time separation per ADR-001 Invariant 3).
 - [ ] Clippy clean: `cargo clippy --workspace -- -D warnings`
 - [ ] Manual smoke test: start both binaries, verify denial and help
 
-**Owner:** Development team
+**Owner:** Development + Release owners
 **Blast radius:** None (internal only)
 
 ---
 
-## Phase 2: Canary Deployment
+## Phase 1: Canary Deployment
 
 **Duration:** 24-48 hours
 **Blast radius:** Single operator environment
@@ -100,31 +135,32 @@ If any of these occur, execute kill-switch (see below):
 
 ---
 
-## Phase 3: Broad Rollout
+## Phase 2: Broad Rollout Rings
 
 **Duration:** 1 week
 **Blast radius:** All operator environments
 
 ### Activation
 
-1. Update deployment configs to use new binaries
-2. Update `scripts/am` wrapper if needed
-3. Announce migration timeline to operators (see migration guide)
+1. Roll to 25% target ring and dwell 72h
+2. Roll to 50% ring only after sign-off ledger entry
+3. Roll to 100% ring after second sign-off entry
+4. Announce migration timeline to operators (see migration guide)
 
 ### Success Criteria
 
-- [ ] All monitoring signals from Phase 2 remain stable
+- [ ] All monitoring signals from Phase 1 remain stable
 - [ ] No user-reported confusion about which binary to use
 - [ ] CI pipeline validates both binaries on every push
 - [ ] Documentation is updated and accessible
 
 ---
 
-## Phase 4: Steady State
+## Phase 3: Steady State
 
 - Remove any backward-compatibility shims
 - Mark dual-mode as the permanent architecture
-- Close the br-21gj epic
+- Close the br-3vwi.12 track when all child beads are closed
 
 ---
 
@@ -141,7 +177,7 @@ Activate the kill-switch if:
 
 ### Steps
 
-**Role:** Any team member with deploy access
+**Role:** Runtime owner (primary), Release owner (secondary)
 **Time to execute:** < 5 minutes
 
 ```bash
@@ -169,6 +205,16 @@ mcp-agent-mail share 2>&1
 #   - Link to logs/artifacts
 ```
 
+### Kill-Switch Ownership and Response Timelines
+
+| Step | Owner | SLA |
+|------|-------|-----|
+| Detection + acknowledgement | Runtime owner | <= 5 minutes |
+| Decision to rollback | Runtime owner + Release owner | <= 10 minutes |
+| Rollback execution | Runtime owner | <= 15 minutes |
+| Operator communications | Release owner | <= 20 minutes |
+| Evidence bundle + follow-up bead | Security/release delegate | <= 60 minutes |
+
 ### Post-Rollback
 
 1. Collect artifacts from the failed deployment:
@@ -190,7 +236,7 @@ mcp-agent-mail share 2>&1
 4. Do not re-deploy until:
    - Root cause is identified
    - Fix is committed and passes all CI gates
-   - Phase 2 canary validates the fix
+   - Phase 1 canary validates the fix
 
 ---
 
@@ -198,11 +244,11 @@ mcp-agent-mail share 2>&1
 
 | Decision | Criteria | Action |
 |----------|----------|--------|
-| Enter Phase 2 | All Phase 1 checks pass | Deploy to canary |
-| Enter Phase 3 | 24h canary with 0 issues | Deploy broadly |
-| Enter Phase 4 | 1 week stable | Remove shims |
+| Enter Phase 1 | All Phase 0 checks pass | Deploy to canary |
+| Enter Phase 2 | 24h canary with 0 issues | Deploy ringed rollout |
+| Enter Phase 3 | 1 week stable | Confirm steady-state |
 | Kill-switch | Any trigger condition | Rollback immediately |
-| Re-deploy after rollback | Root cause fixed + CI green | Return to Phase 2 |
+| Re-deploy after rollback | Root cause fixed + CI green | Return to Phase 1 |
 
 ---
 
@@ -210,8 +256,8 @@ mcp-agent-mail share 2>&1
 
 | Event | Channel | Template |
 |-------|---------|----------|
-| Phase 2 start | Team chat | "Starting dual-mode canary on [env]. Monitor [dashboard]." |
-| Phase 3 start | Team chat + email | "Dual-mode rolling out to all environments. Migration guide: [link]." |
+| Phase 1 start | Team chat | "Starting dual-mode canary on [env]. Monitor [dashboard]." |
+| Phase 2 start | Team chat + email | "Dual-mode rolling out by ring (25/50/100). Migration guide: [link]." |
 | Kill-switch activated | Team chat (urgent) | "ROLLBACK: dual-mode rolled back on [env]. Reason: [brief]. Investigating." |
 | Post-mortem | Team meeting | Standard incident review format |
 

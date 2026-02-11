@@ -1,8 +1,9 @@
 # Dual-Mode Rollout and Kill-Switch Playbook
 
-**Bead:** br-21gj.6.3
-**Depends on:** ADR-001 (br-21gj.1.1), E2E suite (br-21gj.5.6), CI gates (br-21gj.5.7)
-**Date:** 2026-02-08
+**Primary Bead:** br-3vwi.12.1
+**Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
+**Depends on:** security/privacy E2E, stress/soak harness, CI gate automation, dual-mode invariants
+**Last Updated:** 2026-02-11
 
 ---
 
@@ -15,6 +16,39 @@ kill-switch procedure for rolling back if incidents occur.
 **Key invariant:** MCP mode is the default. The MCP binary rejects CLI-only
 commands with exit code 2 and a remediation message. There is no runtime mode
 switch (see ADR-001).
+
+### 1.1 V2 Surface Cohorts and Feature-Flag Boundaries
+
+| Surface | Cohort progression | Activation boundary | Kill switch |
+|---------|--------------------|---------------------|-------------|
+| MCP server interface mode | Phase 0 → 1 → 2 → 3 | Default `mcp`; CLI opt-in via `AM_INTERFACE_MODE=cli` only when explicitly needed | Remove/clear `AM_INTERFACE_MODE`, restart server |
+| Operator CLI (`am`) workflows | Phase 0 → 1 → 2 → 3 | Operator binary path + command allowlist | Roll back `am` binary to last known good |
+| TUI operations console | Phase 0 → 1 → 2 → 3 | `TUI_ENABLED=true` and `scripts/am` profile | Start headless with `--no-tui` |
+| Web parity surfaces (`/mail/*`) | Phase 0 → 1 → 2 → 3 | Deployment cohort (host/project ring), no hidden compatibility shim | Roll back server binary and redeploy previous release |
+| Static export (GH Pages / Cloudflare Pages) | Phase 0 → 1 → 2 → 3 | Publish workflow gating + `am share export` verification | Disable publish jobs and hold new exports |
+| Build slots / worktree behavior | Phase 0 → 1 → 2 → 3 | `WORKTREES_ENABLED=true` only after canary evidence | Set `WORKTREES_ENABLED=false`, restart |
+| Local auth strictness | Phase 0 → 1 → 2 → 3 | `HTTP_BEARER_TOKEN` + `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` policy | Re-enable strict auth (`HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0`) |
+
+### 1.2 Stage Definitions (Exposure Cohorts)
+
+| Stage | Exposure cohort | Blast radius | Minimum dwell time |
+|-------|-----------------|--------------|--------------------|
+| Phase 0 | CI + dev workstations | Internal only | Until all gate checks pass |
+| Phase 1 | Single canary project / 1-3 active agents | One project | 24-48h |
+| Phase 2 | Staged rollout rings (25% → 50% → 100%) | Proportional by ring | 72h at 25%, 48h at 50% |
+| Phase 3 | General availability | Full | Ongoing |
+
+### 1.3 Governance Artifacts (Versioned + Auditable)
+
+Every promotion decision must reference versioned evidence in git:
+
+- `docs/ROLLOUT_PLAYBOOK.md` (this staged policy)
+- `docs/RELEASE_CHECKLIST.md` (gate state and sign-off ledger)
+- `docs/DUAL_MODE_ROLLOUT_PLAYBOOK.md` (dual-mode specific operational runbook)
+- `tests/artifacts/**/bundle.json` and `summary.json` outputs from required suites
+
+Sign-off entries must include: gate owner, UTC timestamp, decision (`go`/`no-go`),
+and evidence artifact paths.
 
 ---
 
@@ -95,6 +129,49 @@ shows green across all jobs: `build`, `test`, `clippy`, `conformance`, `e2e`.
 gh run list --branch main --limit 1
 ```
 
+### 2.10 Security and Privacy Gates
+
+```bash
+bash tests/e2e/test_security_privacy.sh
+# Expected: 0 failures
+```
+
+Required evidence:
+- `tests/artifacts/security_privacy/<timestamp>/case_01_search_scope.txt`
+- `tests/artifacts/security_privacy/<timestamp>/case_09_secret_body.txt`
+
+### 2.11 Accessibility and Keyboard-Only Gates
+
+```bash
+bash tests/e2e/test_tui_a11y.sh
+# Expected: 0 failures
+```
+
+### 2.12 Static Export Conformance Gates
+
+```bash
+bash tests/e2e/test_share.sh
+# Expected: 0 failures with deterministic bundle manifests
+```
+
+### 2.13 Performance and Determinism Gates
+
+```bash
+bash tests/e2e/test_soak_harness.sh --quick
+cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture
+# Expected: no regressions, no budget failures
+```
+
+### 2.14 Measurable Gate Thresholds
+
+Promotion from each phase requires all of:
+
+- Test correctness: all required suites above report `fail=0`.
+- Security/privacy: no leakage assertions fail in security/privacy suite artifacts.
+- Accessibility: keyboard-only suite passes with no focus/contrast regressions.
+- Performance: no perf/security budget test failures; no p95 regressions above 2x baseline.
+- Operational readiness: release checklist sign-off ledger completed for the phase.
+
 ---
 
 ## 3. Phased Rollout Plan
@@ -173,7 +250,7 @@ gh run list --branch main --limit 1
 **Post-GA actions:**
 1. Remove legacy binary aliases (if any).
 2. Update external documentation and integration guides.
-3. Close the br-21gj epic.
+3. Close the br-3vwi.12 rollout-governance track.
 
 ---
 
@@ -390,10 +467,10 @@ cp tests/artifacts/dual_mode/*/run_summary.json tests/artifacts/dry_run/
 
 | Artifact | Source Bead | Location |
 |----------|------------|----------|
-| Dual-mode E2E results | br-21gj.5.6 | `tests/artifacts/dual_mode/*/` |
-| CI gate logs | br-21gj.5.7 | `.github/workflows/ci.yml` outputs |
-| Golden snapshots | br-21gj.5.5 | `tests/fixtures/golden_snapshots/` |
-| Denial UX contract | br-21gj.1.2 | `docs/SPEC-denial-ux-contract.md` |
-| Mode invariants | br-21gj.1.1 | `docs/ADR-001-dual-mode-invariants.md` |
-| Parity matrix | br-21gj.1.4 | `docs/SPEC-parity-matrix.md` |
-| Golden benchmark checksums | br-21gj.5.5 | `benches/golden/checksums.sha256` |
+| Dual-mode E2E results | br-3vwi.12.1 (and prior dual-mode work) | `tests/artifacts/dual_mode/*/` |
+| CI gate logs | br-3vwi.12.1 (and prior CI gate work) | `.github/workflows/ci.yml` outputs |
+| Golden snapshots | br-3vwi.12.1 (and prior snapshot work) | `tests/fixtures/golden_snapshots/` |
+| Denial UX contract | br-3vwi.12.1 (rollout gate reference) | `docs/SPEC-denial-ux-contract.md` |
+| Mode invariants | br-3vwi.12.1 (rollout gate reference) | `docs/ADR-001-dual-mode-invariants.md` |
+| Parity matrix | br-3vwi.12.1 (rollout gate reference) | `docs/SPEC-parity-matrix.md` |
+| Golden benchmark checksums | br-3vwi.12.1 (rollout gate reference) | `benches/golden/checksums.sha256` |
