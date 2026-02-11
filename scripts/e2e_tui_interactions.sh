@@ -7,10 +7,12 @@
 #   bash scripts/e2e_tui_interactions.sh
 #
 # Validates:
-#   - Screen switching via number keys (1-8) and Tab/BackTab
+#   - Screen switching via number keys (1-0) and Tab/BackTab
 #   - Help overlay toggle (?/Escape)
 #   - Command palette open/close (Ctrl+P, Escape)
 #   - Data visibility after seeding via API
+#   - Explorer/analytics/widgets workflows (Timeline, SystemHealth, ToolMetrics)
+#   - Forensic artifacts: action timeline + health snapshots + provenance traces
 #   - Rapid input handling (no crash)
 #   - Quit (q) exits cleanly
 #
@@ -147,6 +149,17 @@ print(json.dumps({
         --data "${payload}" 2>/dev/null
 }
 
+# Combine two JSON documents into a single valid JSON array payload.
+json_array_pair() {
+    local first_json="$1"
+    local second_json="$2"
+    python3 -c '
+import json
+import sys
+print(json.dumps([json.loads(sys.argv[1]), json.loads(sys.argv[2])], separators=(",", ":")))
+' "$first_json" "$second_json"
+}
+
 e2e_assert_file_contains() {
     local label="$1"
     local path="$2"
@@ -200,7 +213,7 @@ EXPECT_EOF
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
 # ═══════════════════════════════════════════════════════════════════════
-# Case 1: Screen switching via number keys (1-8)
+# Case 1: Screen switching via number keys (1-0)
 # ═══════════════════════════════════════════════════════════════════════
 e2e_case_banner "screen_switching_number_keys"
 
@@ -236,7 +249,7 @@ spawn env DATABASE_URL=sqlite:////$db \
 # Wait for full TUI startup and first render
 sleep 4
 
-# Switch through all screens: 1-8 then back to 1
+# Switch through all screens: 1-0 then back to 1
 send "2"
 sleep 0.8
 send "3"
@@ -250,6 +263,10 @@ sleep 0.8
 send "7"
 sleep 0.8
 send "8"
+sleep 0.8
+send "9"
+sleep 0.8
+send "0"
 sleep 0.8
 send "1"
 sleep 0.5
@@ -510,8 +527,7 @@ if e2e_wait_port 127.0.0.1 "${PORT5}" 10; then
 
     REG1=$(jsonrpc_call "${PORT5}" "register_agent" '{"project_key":"/data/e2e/live_tui","program":"e2e","model":"test","name":"RedLake","task_description":"E2E sender"}')
     REG2=$(jsonrpc_call "${PORT5}" "register_agent" '{"project_key":"/data/e2e/live_tui","program":"e2e","model":"test","name":"BluePeak","task_description":"E2E receiver"}')
-    e2e_save_artifact "live_seed_agents.json" "${REG1}
-${REG2}"
+    e2e_save_artifact "live_seed_agents.json" "$(json_array_pair "${REG1}" "${REG2}")"
 
     MSG=$(jsonrpc_call "${PORT5}" "send_message" '{"project_key":"/data/e2e/live_tui","sender_name":"RedLake","to":["BluePeak"],"subject":"Live TUI canary","body_md":"Seeded while TUI is running."}')
     e2e_save_artifact "live_seed_message.json" "${MSG}"
@@ -573,7 +589,7 @@ spawn env DATABASE_URL=sqlite:////$db \
 
 sleep 4
 
-# Step 1: Visit every screen (1-8)
+# Step 1: Visit every numbered screen (1-0)
 send "1"
 sleep 0.5
 send "2"
@@ -589,6 +605,10 @@ sleep 0.5
 send "7"
 sleep 0.5
 send "8"
+sleep 0.5
+send "9"
+sleep 0.5
+send "0"
 sleep 0.5
 
 # Step 2: Toggle help on and off
@@ -701,6 +721,157 @@ if [ -f "${RAW7}" ]; then
 else
     e2e_fail "Rapid key sequences: raw log not created"
 fi
+
+# ═══════════════════════════════════════════════════════════════════════
+# Case 8: Explorer/analytics/widgets workflow with forensic artifacts
+# ═══════════════════════════════════════════════════════════════════════
+e2e_case_banner "analytics_widgets_forensics"
+
+WORK8="$(e2e_mktemp "e2e_tui_interact_analytics")"
+DB8="${WORK8}/db.sqlite3"
+STORAGE8="${WORK8}/storage"
+mkdir -p "${STORAGE8}"
+PORT8="$(pick_port)"
+RAW8="${E2E_ARTIFACT_DIR}/analytics_widgets.raw"
+ACTION_TRACE8="${E2E_ARTIFACT_DIR}/trace/analytics_widgets_timeline.tsv"
+
+run_tui_expect "analytics_widgets" "${BIN}" "${PORT8}" "${DB8}" "${STORAGE8}" "${RAW8}" '
+set bin [lindex $argv 0]
+set port [lindex $argv 1]
+set db [lindex $argv 2]
+set storage [lindex $argv 3]
+set raw_log [lindex $argv 4]
+
+log_file -noappend $raw_log
+set timeout 35
+set stty_init "rows 40 columns 120"
+
+spawn env DATABASE_URL=sqlite:////$db \
+    STORAGE_ROOT=$storage \
+    HTTP_HOST=127.0.0.1 \
+    HTTP_PORT=$port \
+    HTTP_RBAC_ENABLED=0 \
+    HTTP_RATE_LIMIT_ENABLED=0 \
+    HTTP_JWT_ENABLED=0 \
+    HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
+    LINES=40 COLUMNS=120 \
+    $bin serve --host 127.0.0.1 --port $port
+
+sleep 5
+
+# Explorer/search cockpit interactions
+send "5"
+sleep 0.8
+send "/"
+sleep 0.2
+send "latency"
+sleep 0.3
+send "\r"
+sleep 0.6
+send "\033"
+sleep 0.3
+
+# Timeline interactions
+send "9"
+sleep 0.6
+send "v"
+sleep 0.3
+send "k"
+sleep 0.2
+send "j"
+sleep 0.2
+
+# SystemHealth interactions
+send "8"
+sleep 0.6
+send "v"
+sleep 0.3
+send "h"
+sleep 0.2
+send "l"
+sleep 0.2
+
+# ToolMetrics interactions
+send "7"
+sleep 0.6
+send "s"
+sleep 0.3
+send "v"
+sleep 0.3
+send "j"
+sleep 0.2
+send "k"
+sleep 0.2
+
+# Projects -> Contacts via Tab
+send "0"
+sleep 0.5
+send "\t"
+sleep 0.5
+
+# Command palette action provenance
+send "\x10"
+sleep 0.5
+send "timeline"
+sleep 0.2
+send "\r"
+sleep 0.6
+
+send "q"
+expect eof
+' &
+EXPECT8_PID=$!
+
+sleep 6
+if e2e_wait_port 127.0.0.1 "${PORT8}" 12; then
+    PRE_HEALTH=$(jsonrpc_call "${PORT8}" "health_check" '{}')
+    e2e_save_artifact "analytics_health_pre.json" "${PRE_HEALTH}"
+
+    EP8=$(jsonrpc_call "${PORT8}" "ensure_project" '{"human_key":"/data/e2e/analytics_widgets"}')
+    REG8_A=$(jsonrpc_call "${PORT8}" "register_agent" '{"project_key":"/data/e2e/analytics_widgets","program":"e2e","model":"test","name":"AmberRidge","task_description":"analytics sender"}')
+    REG8_B=$(jsonrpc_call "${PORT8}" "register_agent" '{"project_key":"/data/e2e/analytics_widgets","program":"e2e","model":"test","name":"SlateRiver","task_description":"analytics receiver"}')
+    MSG8_1=$(jsonrpc_call "${PORT8}" "send_message" '{"project_key":"/data/e2e/analytics_widgets","sender_name":"AmberRidge","to":["SlateRiver"],"subject":"Widget latency delta","body_md":"p95 increased from 18ms to 32ms"}')
+    MSG8_2=$(jsonrpc_call "${PORT8}" "send_message" '{"project_key":"/data/e2e/analytics_widgets","sender_name":"AmberRidge","to":["SlateRiver"],"subject":"Timeline anomaly","body_md":"Ack backlog above threshold"}')
+    RES8=$(jsonrpc_call "${PORT8}" "file_reservation_paths" '{"project_key":"/data/e2e/analytics_widgets","agent_name":"AmberRidge","paths":["src/**"],"ttl_seconds":1800,"exclusive":true,"reason":"e2e-analytics"}')
+    SEARCH8=$(jsonrpc_call "${PORT8}" "search_messages" '{"project_key":"/data/e2e/analytics_widgets","query":"latency OR anomaly","limit":10}')
+    FETCH8=$(jsonrpc_call "${PORT8}" "fetch_inbox" '{"project_key":"/data/e2e/analytics_widgets","agent_name":"SlateRiver","limit":10}')
+    POST_HEALTH=$(jsonrpc_call "${PORT8}" "health_check" '{}')
+
+    e2e_save_artifact "analytics_seed_project.json" "${EP8}"
+    e2e_save_artifact "analytics_seed_agents.json" "$(json_array_pair "${REG8_A}" "${REG8_B}")"
+    e2e_save_artifact "analytics_seed_messages.json" "$(json_array_pair "${MSG8_1}" "${MSG8_2}")"
+    e2e_save_artifact "analytics_seed_reservation.json" "${RES8}"
+    e2e_save_artifact "analytics_search_response.json" "${SEARCH8}"
+    e2e_save_artifact "analytics_inbox_response.json" "${FETCH8}"
+    e2e_save_artifact "analytics_health_post.json" "${POST_HEALTH}"
+else
+    e2e_fail "analytics/widgets server port not reachable"
+fi
+
+wait "${EXPECT8_PID}" 2>/dev/null || true
+
+cat > "${ACTION_TRACE8}" <<'EOF'
+step	key_sequence	target	description
+1	5	Search	Open explorer/search cockpit
+2	/ + latency + Enter	Search	Exercise query bar and submit search
+3	9 + v + k + j	Timeline	Cycle verbosity and navigate event rows
+4	8 + v + h + l	SystemHealth	Toggle view/navigate details
+5	7 + s + v + j + k	ToolMetrics	Sort + view-mode + cursor movement
+6	0 + Tab	Projects/Contacts	Traverse to contacts surface
+7	Ctrl+P + timeline + Enter	CommandPalette	Provenance trace for palette-driven jump
+EOF
+e2e_pass "Action timeline trace captured"
+
+RENDERED8="${E2E_ARTIFACT_DIR}/analytics_widgets.rendered.txt"
+if [ -f "${RAW8}" ]; then
+    render_pty_output "${RAW8}" "${RENDERED8}"
+    e2e_pass "Explorer/analytics/widgets workflow completed without crash"
+else
+    e2e_fail "analytics/widgets: raw log not created"
+fi
+
+e2e_assert_file_contains "Analytics workflow bootstrap banner" "${RENDERED8}" "am: Starting MCP Agent Mail server"
+e2e_assert_file_contains "Analytics action trace includes ToolMetrics step" "${ACTION_TRACE8}" "ToolMetrics"
 
 # ═══════════════════════════════════════════════════════════════════════
 e2e_summary

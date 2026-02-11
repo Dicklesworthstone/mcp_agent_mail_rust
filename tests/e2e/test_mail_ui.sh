@@ -270,6 +270,13 @@ http_get "mail_search" "${BASE_URL}/mail/${PROJECT_SLUG}/search?q=br-123&limit=1
 MAIL_SEARCH_BODY="$(cat "${E2E_ARTIFACT_DIR}/mail_search_body.txt")"
 e2e_assert_contains "search includes subject" "${MAIL_SEARCH_BODY}" "[br-123] XSS probe"
 
+e2e_case_banner "GET /mail/${PROJECT_SLUG}/search?q=<script>... (xss escaped)"
+SEARCH_XSS_QUERY="%3Cscript%3Ealert(1)%3C%2Fscript%3E"
+http_get "mail_search_xss_query" "${BASE_URL}/mail/${PROJECT_SLUG}/search?q=${SEARCH_XSS_QUERY}&limit=10" || true
+MAIL_SEARCH_XSS_BODY="$(cat "${E2E_ARTIFACT_DIR}/mail_search_xss_query_body.txt")"
+e2e_assert_not_contains "search query xss is not rendered as script tag" "${MAIL_SEARCH_XSS_BODY}" "<script>alert(1)</script>"
+e2e_assert_contains "search query xss is html-escaped in input value" "${MAIL_SEARCH_XSS_BODY}" "value=\"&lt;script&gt;alert(1)&lt;&#x2f;script&gt;\""
+
 e2e_case_banner "GET /mail/${PROJECT_SLUG}/overseer/compose (compose)"
 http_get "mail_compose" "${BASE_URL}/mail/${PROJECT_SLUG}/overseer/compose" || true
 MAIL_COMPOSE_BODY="$(cat "${E2E_ARTIFACT_DIR}/mail_compose_body.txt")"

@@ -46,6 +46,13 @@ jobs:
           HTTP_PORT: "1"
           HTTP_PATH: "/mcp/"
 
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
+
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -81,6 +88,13 @@ jobs:
           HTTP_PORT: "1"
           HTTP_PATH: "/mcp/"
 
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
+
       - name: Upload matrix artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -114,6 +128,13 @@ jobs:
           HTTP_PORT: "1"
           HTTP_PATH: "/mcp/"
 
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
+
       - name: Upload conformance artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -127,7 +148,7 @@ jobs:
   perf-security:
     name: Perf & Security
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -149,12 +170,55 @@ jobs:
           HTTP_PORT: "1"
           HTTP_PATH: "/mcp/"
 
+      - name: Soak harness perf trend suite (quick)
+        run: |
+          SOAK_SEED=42 \
+          SOAK_PROJECTS=3 \
+          SOAK_AGENTS_PER_PROJECT=3 \
+          SUSTAINED_LOAD_RPS=60 \
+          SUSTAINED_LOAD_SECS=5 \
+          SOAK_DURATION_SECS=5 \
+          bash tests/e2e/test_soak_harness.sh --quick
+
+      - name: Verify perf trend artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          TREND_FILE="$(command find tests/artifacts/cli/perf_security -type f -name 'perf_timeseries.jsonl' -print -quit || true)"
+          if [ -z "${TREND_FILE}" ]; then
+            echo "Missing perf trend artifact (perf_timeseries.jsonl)"
+            exit 1
+          fi
+          echo "Perf trend artifact: ${TREND_FILE}"
+
+      - name: Verify soak trend artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          SOAK_TREND_FILE="$(command find tests/artifacts/perf/soak_harness -type f -name 'perf_timeseries.jsonl' -print -quit || true)"
+          if [ -z "${SOAK_TREND_FILE}" ]; then
+            echo "Missing soak trend artifact (perf_timeseries.jsonl)"
+            exit 1
+          fi
+          echo "Soak trend artifact: ${SOAK_TREND_FILE}"
+
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
+
       - name: Upload perf/security artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: perf-security-artifacts
-          path: tests/artifacts/cli/perf_security/
+          path: |
+            tests/artifacts/cli/perf_security/
+            tests/artifacts/perf/soak_harness/
+            tests/artifacts/soak/multi_project/
+            tests/artifacts/tui/soak_replay/
           retention-days: 14
           if-no-files-found: ignore
 
@@ -179,6 +243,13 @@ jobs:
 
       - name: E2E mode matrix suite
         run: bash scripts/e2e_mode_matrix.sh
+
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
 
       - name: Upload E2E artifacts
         if: always()
@@ -213,6 +284,13 @@ jobs:
           HTTP_HOST: "127.0.0.1"
           HTTP_PORT: "1"
           HTTP_PATH: "/mcp/"
+
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
 
       - name: Upload snapshot diff artifacts
         if: failure()

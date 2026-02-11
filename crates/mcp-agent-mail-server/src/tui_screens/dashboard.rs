@@ -13,6 +13,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
+use ftui_extras::markdown::MarkdownTheme;
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
@@ -126,6 +127,8 @@ pub struct DashboardScreen {
     prev_req_total: u64,
     /// Whether the trend panel is visible (toggled by user).
     show_trend_panel: bool,
+    /// Metadata for the most recent message event, rendered as markdown.
+    recent_message_preview: Option<RecentMessagePreview>,
 }
 
 /// A pre-formatted event log entry.
@@ -138,6 +141,83 @@ pub(crate) struct EventEntry {
     pub(crate) timestamp: String,
     pub(crate) icon: char,
     pub(crate) summary: String,
+}
+
+/// Dashboard preview payload for the most recent message event.
+#[derive(Debug, Clone)]
+struct RecentMessagePreview {
+    direction: &'static str,
+    timestamp: String,
+    from: String,
+    to: String,
+    subject: String,
+    thread_id: String,
+    project: String,
+}
+
+impl RecentMessagePreview {
+    fn from_event(event: &MailEvent) -> Option<Self> {
+        match event {
+            MailEvent::MessageSent {
+                timestamp_micros,
+                from,
+                to,
+                subject,
+                thread_id,
+                project,
+                ..
+            } => Some(Self {
+                direction: "Outbound",
+                timestamp: format_ts(*timestamp_micros),
+                from: from.clone(),
+                to: summarize_recipients(to),
+                subject: subject.clone(),
+                thread_id: thread_id.clone(),
+                project: project.clone(),
+            }),
+            MailEvent::MessageReceived {
+                timestamp_micros,
+                from,
+                to,
+                subject,
+                thread_id,
+                project,
+                ..
+            } => Some(Self {
+                direction: "Inbound",
+                timestamp: format_ts(*timestamp_micros),
+                from: from.clone(),
+                to: summarize_recipients(to),
+                subject: subject.clone(),
+                thread_id: thread_id.clone(),
+                project: project.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn to_markdown(&self) -> String {
+        let subject = if self.subject.trim().is_empty() {
+            "(no subject)"
+        } else {
+            truncate(&self.subject, 160)
+        };
+        let thread = if self.thread_id.trim().is_empty() {
+            "(none)"
+        } else {
+            self.thread_id.as_str()
+        };
+        let project = if self.project.trim().is_empty() {
+            "(unknown)"
+        } else {
+            self.project.as_str()
+        };
+
+        format!(
+            "### {} Message · {}\n\n**{}**\n\n- **From:** `{}`\n- **To:** `{}`\n- **Thread:** `{}`\n- **Project:** `{}`\n\n_Preview is derived from event metadata; open Messages/Threads for full body._",
+            self.direction, self.timestamp, subject, self.from, self.to, thread, project
+        )
+    }
 }
 
 impl DashboardScreen {
@@ -157,6 +237,7 @@ impl DashboardScreen {
             throughput_history: Vec::with_capacity(THROUGHPUT_HISTORY_CAP),
             prev_req_total: 0,
             show_trend_panel: true,
+            recent_message_preview: None,
         }
     }
 
@@ -165,6 +246,9 @@ impl DashboardScreen {
         let new_events = state.events_since(self.last_seq);
         for event in &new_events {
             self.last_seq = event.seq().max(self.last_seq);
+            if let Some(preview) = RecentMessagePreview::from_event(event) {
+                self.recent_message_preview = Some(preview);
+            }
             self.event_log.push(format_event(event));
         }
         // Trim to capacity
@@ -279,16 +363,31 @@ impl DashboardScreen {
         );
     }
 
-    /// Build the `ReactiveLayout` for the main content area (event log + trend panel).
-    fn main_content_layout() -> ReactiveLayout {
-        ReactiveLayout::new()
+    /// Build the `ReactiveLayout` for the main content area.
+    ///
+    /// Layout contains:
+    /// - Primary event log
+    /// - Optional trend panel (right rail)
+    /// - Recent message markdown preview (bottom rail on wide terminals)
+    fn main_content_layout(show_trend_panel: bool) -> ReactiveLayout {
+        let mut layout = ReactiveLayout::new()
+            // Primary anchor for horizontal splitting (footer rail).
+            .panel(PanelPolicy::new(
+                PanelSlot::Primary,
+                0,
+                SplitAxis::Horizontal,
+                PanelConstraint::visible(1.0, 20),
+            ))
+            // Primary anchor for vertical splitting (trend inspector).
             .panel(PanelPolicy::new(
                 PanelSlot::Primary,
                 0,
                 SplitAxis::Vertical,
                 PanelConstraint::visible(1.0, 20),
-            ))
-            .panel(
+            ));
+
+        if show_trend_panel {
+            layout = layout.panel(
                 PanelPolicy::new(
                     PanelSlot::Inspector,
                     1,
@@ -297,7 +396,19 @@ impl DashboardScreen {
                 )
                 .at(TerminalClass::Wide, PanelConstraint::visible(0.35, 30))
                 .at(TerminalClass::UltraWide, PanelConstraint::visible(0.40, 40)),
+            );
+        }
+
+        layout.panel(
+            PanelPolicy::new(
+                PanelSlot::Footer,
+                2,
+                SplitAxis::Horizontal,
+                PanelConstraint::HIDDEN,
             )
+            .at(TerminalClass::Wide, PanelConstraint::visible(0.30, 8))
+            .at(TerminalClass::UltraWide, PanelConstraint::visible(0.28, 9)),
+        )
     }
 }
 
@@ -449,21 +560,24 @@ impl MailScreen for DashboardScreen {
             render_anomaly_rail(frame, anomaly_area, &self.anomalies);
         }
 
-        // Main: event log + optional trend panel via layout engine
-        if self.show_trend_panel {
-            let layout = Self::main_content_layout();
-            let comp = layout.compute(main_area);
-            self.render_event_log_panel(frame, comp.primary(), state);
-            if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
-                render_trend_panel(
-                    frame,
-                    trend_rect,
-                    &self.percentile_history,
-                    &self.throughput_history,
-                );
-            }
-        } else {
-            self.render_event_log_panel(frame, main_area, state);
+        // Main: event log + optional trend panel + recent message markdown preview.
+        let layout = Self::main_content_layout(self.show_trend_panel);
+        let comp = layout.compute(main_area);
+        self.render_event_log_panel(frame, comp.primary(), state);
+        if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
+            render_trend_panel(
+                frame,
+                trend_rect,
+                &self.percentile_history,
+                &self.throughput_history,
+            );
+        }
+        if let Some(preview_rect) = comp.rect(PanelSlot::Footer) {
+            render_recent_message_preview_panel(
+                frame,
+                preview_rect,
+                self.recent_message_preview.as_ref(),
+            );
         }
 
         if footer_h > 0 {
@@ -685,6 +799,18 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+fn summarize_recipients(recipients: &[String]) -> String {
+    match recipients {
+        [] => "(none)".to_string(),
+        [one] => one.clone(),
+        [one, two] => format!("{one}, {two}"),
+        [one, two, three] => format!("{one}, {two}, {three}"),
+        [one, two, three, rest @ ..] => {
+            format!("{one}, {two}, {three} +{}", rest.len())
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -918,6 +1044,37 @@ fn render_trend_panel(
     }
 }
 
+/// Render the dashboard's recent-message markdown preview rail.
+fn render_recent_message_preview_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    preview: Option<&RecentMessagePreview>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let block = Block::default()
+        .title("Recent Message Preview")
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let text = preview.map_or_else(
+        || Text::from("No message traffic yet. Recent sent/received metadata appears here."),
+        |preview| {
+            let theme = MarkdownTheme::default();
+            crate::tui_markdown::render_body(&preview.to_markdown(), &theme)
+        },
+    );
+
+    Paragraph::new(text).render(inner, frame);
+}
+
 /// Derive a `MetricTrend` from two consecutive values.
 const fn trend_for(current: u64, previous: u64) -> MetricTrend {
     if current > previous {
@@ -1134,6 +1291,17 @@ const fn activity_indicator(now_us: i64, last_active_us: i64) -> (char, PackedRg
 mod tests {
     use super::*;
 
+    fn rects_overlap(left: Rect, right: Rect) -> bool {
+        let left_right = left.x.saturating_add(left.width);
+        let right_right = right.x.saturating_add(right.width);
+        let left_bottom = left.y.saturating_add(left.height);
+        let right_bottom = right.y.saturating_add(right.height);
+        left.x < right_right
+            && right.x < left_right
+            && left.y < right_bottom
+            && right.y < left_bottom
+    }
+
     #[test]
     fn format_ts_renders_hms_millis() {
         // 13:45:23.456
@@ -1253,6 +1421,185 @@ mod tests {
         // Emoji: '🎉' is 4 bytes; "hi🎉bye" = h(0) i(1) 🎉(2..5) b(6) y(7) e(8)
         assert_eq!(truncate("hi🎉bye", 3), "hi"); // byte 3 mid-emoji, backs up to 2
         assert_eq!(truncate("hi🎉bye", 6), "hi🎉"); // byte 6 = start of 'b'
+    }
+
+    #[test]
+    fn summarize_recipients_formats_by_count() {
+        assert_eq!(summarize_recipients(&[]), "(none)");
+        assert_eq!(summarize_recipients(&["A".to_string()]), "A");
+        assert_eq!(
+            summarize_recipients(&["A".to_string(), "B".to_string()]),
+            "A, B"
+        );
+        assert_eq!(
+            summarize_recipients(&["A".to_string(), "B".to_string(), "C".to_string()]),
+            "A, B, C"
+        );
+        assert_eq!(
+            summarize_recipients(&[
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ]),
+            "A, B, C +1"
+        );
+    }
+
+    #[test]
+    fn ingest_events_tracks_most_recent_message_preview() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "GoldFox",
+            vec!["SilverWolf".to_string(), "RedPine".to_string()],
+            "Initial update",
+            "br-3vwi.6.5",
+            "test-project",
+        ));
+        screen.ingest_events(&state);
+        let first = screen
+            .recent_message_preview
+            .as_ref()
+            .expect("expected outbound preview after message_sent");
+        assert_eq!(first.direction, "Outbound");
+        assert_eq!(first.from, "GoldFox");
+        assert_eq!(first.to, "SilverWolf, RedPine");
+        assert_eq!(first.thread_id, "br-3vwi.6.5");
+
+        let _ = state.push_event(MailEvent::message_received(
+            2,
+            "TealBasin",
+            vec!["GoldFox".to_string()],
+            "Ack received",
+            "br-3vwi.6.5",
+            "test-project",
+        ));
+        screen.ingest_events(&state);
+        let second = screen
+            .recent_message_preview
+            .as_ref()
+            .expect("expected inbound preview after message_received");
+        assert_eq!(second.direction, "Inbound");
+        assert_eq!(second.from, "TealBasin");
+        assert_eq!(second.to, "GoldFox");
+        assert_eq!(second.subject, "Ack received");
+    }
+
+    #[test]
+    fn recent_message_preview_markdown_contains_key_metadata() {
+        let preview = RecentMessagePreview {
+            direction: "Outbound",
+            timestamp: "12:34:56.789".to_string(),
+            from: "FrostyLantern".to_string(),
+            to: "TealBasin, CalmCrane".to_string(),
+            subject: "Status update".to_string(),
+            thread_id: "br-3vwi.6.5".to_string(),
+            project: "data-projects-mcp-agent-mail-rust".to_string(),
+        };
+
+        let md = preview.to_markdown();
+        assert!(md.contains("Outbound Message"));
+        assert!(md.contains("Status update"));
+        assert!(md.contains("FrostyLantern"));
+        assert!(md.contains("TealBasin, CalmCrane"));
+        assert!(md.contains("br-3vwi.6.5"));
+        assert!(md.contains("data-projects-mcp-agent-mail-rust"));
+    }
+
+    #[test]
+    fn panel_budget_heights_match_terminal_classes() {
+        assert_eq!(summary_band_height(TerminalClass::Tiny), 1);
+        assert_eq!(summary_band_height(TerminalClass::Compact), 3);
+        assert_eq!(summary_band_height(TerminalClass::Normal), 3);
+        assert_eq!(summary_band_height(TerminalClass::Wide), 3);
+        assert_eq!(summary_band_height(TerminalClass::UltraWide), 3);
+
+        assert_eq!(anomaly_rail_height(TerminalClass::Tiny, 2), 0);
+        assert_eq!(anomaly_rail_height(TerminalClass::Compact, 2), 0);
+        assert_eq!(anomaly_rail_height(TerminalClass::Normal, 2), 4);
+        assert_eq!(anomaly_rail_height(TerminalClass::Wide, 2), 4);
+        assert_eq!(anomaly_rail_height(TerminalClass::UltraWide, 2), 4);
+
+        assert_eq!(footer_bar_height(TerminalClass::Tiny), 0);
+        assert_eq!(footer_bar_height(TerminalClass::Compact), 1);
+        assert_eq!(footer_bar_height(TerminalClass::Normal), 1);
+        assert_eq!(footer_bar_height(TerminalClass::Wide), 1);
+        assert_eq!(footer_bar_height(TerminalClass::UltraWide), 1);
+    }
+
+    #[test]
+    fn main_layout_ultrawide_exposes_double_surface_vs_standard() {
+        let standard = DashboardScreen::main_content_layout(true).compute(Rect::new(0, 0, 100, 30));
+        let ultra = DashboardScreen::main_content_layout(true).compute(Rect::new(0, 0, 200, 50));
+
+        let standard_visible = standard
+            .panels
+            .iter()
+            .filter(|p| p.visibility != crate::tui_layout::PanelVisibility::Hidden)
+            .count();
+        let ultra_visible = ultra
+            .panels
+            .iter()
+            .filter(|p| p.visibility != crate::tui_layout::PanelVisibility::Hidden)
+            .count();
+
+        assert!(
+            ultra_visible >= standard_visible.saturating_mul(2),
+            "expected ultrawide to expose at least 2x panel surface: standard={standard_visible}, ultrawide={ultra_visible}"
+        );
+        assert!(standard.rect(PanelSlot::Inspector).is_none());
+        assert!(standard.rect(PanelSlot::Footer).is_none());
+        assert!(ultra.rect(PanelSlot::Inspector).is_some());
+        assert!(ultra.rect(PanelSlot::Footer).is_some());
+    }
+
+    #[test]
+    fn main_layout_ultrawide_panels_fit_bounds_without_overlap() {
+        let area = Rect::new(0, 0, 200, 50);
+        let composition = DashboardScreen::main_content_layout(true).compute(area);
+        let visible_rects: Vec<Rect> = [
+            composition.rect(PanelSlot::Primary),
+            composition.rect(PanelSlot::Inspector),
+            composition.rect(PanelSlot::Footer),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        assert!(
+            visible_rects.len() >= 3,
+            "expected primary + trend + preview panels in ultrawide layout"
+        );
+
+        for rect in &visible_rects {
+            let right = rect.x.saturating_add(rect.width);
+            let bottom = rect.y.saturating_add(rect.height);
+            assert!(rect.x >= area.x);
+            assert!(rect.y >= area.y);
+            assert!(right <= area.x.saturating_add(area.width));
+            assert!(bottom <= area.y.saturating_add(area.height));
+        }
+
+        for (index, left) in visible_rects.iter().enumerate() {
+            for right in visible_rects.iter().skip(index + 1) {
+                assert!(
+                    !rects_overlap(*left, *right),
+                    "panel rects overlap in ultrawide layout: left={left:?} right={right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_layout_hides_trend_panel_when_disabled() {
+        let composition =
+            DashboardScreen::main_content_layout(false).compute(Rect::new(0, 0, 200, 50));
+        assert!(composition.rect(PanelSlot::Inspector).is_none());
+        assert!(composition.rect(PanelSlot::Footer).is_some());
     }
 
     #[test]

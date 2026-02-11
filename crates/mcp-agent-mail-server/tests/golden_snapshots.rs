@@ -137,6 +137,13 @@ fn dashboard_empty_120x40() {
 }
 
 #[test]
+fn dashboard_ultrawide_200x50() {
+    let state = test_state();
+    let screen = DashboardScreen::new();
+    snapshot_screen(&screen, &state, 200, 50, "dashboard_ultrawide_200x50");
+}
+
+#[test]
 fn agents_empty_120x40() {
     let state = test_state();
     let screen = AgentsScreen::new();

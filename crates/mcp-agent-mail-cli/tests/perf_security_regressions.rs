@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
+use std::{fs::OpenOptions, io::Write};
 
 fn am_bin() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_BIN_EXE_am").expect("CARGO_BIN_EXE_am must be set"))
@@ -38,15 +39,42 @@ fn artifacts_dir() -> PathBuf {
 
 #[derive(Debug, serde::Serialize)]
 struct PerfRow {
+    metric_name: String,
     binary: String,
     command: String,
     iterations: usize,
+    samples_us: Vec<u64>,
+    mean_us: f64,
+    variance_us2: f64,
+    stddev_us: f64,
     p50_us: u64,
     p95_us: u64,
     p99_us: u64,
     max_us: u64,
     budget_p95_us: u64,
+    baseline_p95_us: Option<u64>,
+    delta_p95_us: Option<i64>,
+    max_delta_p95_us: Option<u64>,
+    fixture_signature: String,
+    environment: EnvironmentProfile,
     passed: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EnvironmentProfile {
+    os: String,
+    arch: String,
+    family: String,
+    cpu_count: usize,
+    rust_pkg_version: String,
+}
+
+struct PerfCase<'a> {
+    metric_name: &'a str,
+    binary: &'a str,
+    command: &'a str,
+    budget_p95_us: u64,
+    fixture_env: &'a [(&'a str, &'a str)],
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -68,6 +96,47 @@ fn save_artifact<T: serde::Serialize>(data: &T, name: &str) {
     let json = serde_json::to_string_pretty(data).unwrap_or_default();
     let _ = std::fs::write(&path, &json);
     eprintln!("artifact: {}", path.display());
+}
+
+fn save_perf_artifact(row: &PerfRow, name: &str) {
+    save_artifact(row, name);
+
+    let trends_dir = artifacts_dir().join("trends");
+    let _ = std::fs::create_dir_all(&trends_dir);
+    let trend_path = trends_dir.join("perf_timeseries.jsonl");
+    let trend_row = serde_json::json!({
+        "schema_version": 1,
+        "run_ts": chrono::Utc::now().to_rfc3339(),
+        "metric_name": row.metric_name,
+        "binary": row.binary,
+        "command": row.command,
+        "iterations": row.iterations,
+        "samples_us": row.samples_us,
+        "mean_us": row.mean_us,
+        "variance_us2": row.variance_us2,
+        "stddev_us": row.stddev_us,
+        "p50_us": row.p50_us,
+        "p95_us": row.p95_us,
+        "p99_us": row.p99_us,
+        "max_us": row.max_us,
+        "budget_p95_us": row.budget_p95_us,
+        "baseline_p95_us": row.baseline_p95_us,
+        "delta_p95_us": row.delta_p95_us,
+        "max_delta_p95_us": row.max_delta_p95_us,
+        "fixture_signature": row.fixture_signature,
+        "environment": row.environment,
+        "passed": row.passed,
+    });
+
+    if let Ok(line) = serde_json::to_string(&trend_row)
+        && let Ok(mut fh) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&trend_path)
+    {
+        let _ = writeln!(fh, "{line}");
+        eprintln!("artifact: {}", trend_path.display());
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -102,6 +171,156 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+fn mean_us(values: &[u64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let sum: u128 = values.iter().map(|v| u128::from(*v)).sum();
+    sum as f64 / values.len() as f64
+}
+
+fn variance_us2(values: &[u64], mean: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let sq_sum: f64 = values
+        .iter()
+        .map(|v| {
+            let d = *v as f64 - mean;
+            d * d
+        })
+        .sum();
+    sq_sum / values.len() as f64
+}
+
+fn metric_env_suffix(metric_name: &str) -> String {
+    metric_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn read_u64_env(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse::<u64>().ok()
+}
+
+fn baseline_p95_us(metric_name: &str) -> Option<u64> {
+    let suffix = metric_env_suffix(metric_name);
+    let metric_specific = format!("PERF_BASELINE_P95_US_{suffix}");
+    read_u64_env(&metric_specific).or_else(|| read_u64_env("PERF_BASELINE_P95_US"))
+}
+
+fn max_delta_p95_us(metric_name: &str) -> Option<u64> {
+    let suffix = metric_env_suffix(metric_name);
+    let metric_specific = format!("PERF_MAX_DELTA_P95_US_{suffix}");
+    read_u64_env(&metric_specific).or_else(|| read_u64_env("PERF_MAX_DELTA_P95_US"))
+}
+
+fn environment_profile() -> EnvironmentProfile {
+    EnvironmentProfile {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        family: std::env::consts::FAMILY.to_string(),
+        cpu_count: std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(0),
+        rust_pkg_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+fn fnv1a64(input: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut h = OFFSET;
+    for b in input.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+fn fixture_signature(
+    binary: &str,
+    command: &str,
+    iterations: usize,
+    budget_p95_us: u64,
+    fixture_env: &[(&str, &str)],
+    env_profile: &EnvironmentProfile,
+) -> String {
+    let mut material = format!(
+        "binary={binary};command={command};iterations={iterations};budget_p95_us={budget_p95_us};os={};arch={};family={};cpus={}",
+        env_profile.os, env_profile.arch, env_profile.family, env_profile.cpu_count
+    );
+    for (k, v) in fixture_env {
+        material.push(';');
+        material.push_str(k);
+        material.push('=');
+        material.push_str(v);
+    }
+    format!("{:016x}", fnv1a64(&material))
+}
+
+fn build_perf_row(
+    perf_case: &PerfCase<'_>,
+    iterations: usize,
+    samples_us: &[u64],
+    sorted_us: &[u64],
+) -> PerfRow {
+    let p50_us = percentile(sorted_us, 50.0);
+    let p95_us = percentile(sorted_us, 95.0);
+    let p99_us = percentile(sorted_us, 99.0);
+    let max_us = *sorted_us.last().unwrap_or(&0);
+    let mean_us = mean_us(samples_us);
+    let variance_us2 = variance_us2(samples_us, mean_us);
+    let stddev_us = variance_us2.sqrt();
+
+    let baseline_p95_us = baseline_p95_us(perf_case.metric_name);
+    let delta_p95_us = baseline_p95_us.map(|baseline| p95_us as i64 - baseline as i64);
+    let max_delta_p95_us = max_delta_p95_us(perf_case.metric_name);
+    let regression_ok = match (delta_p95_us, max_delta_p95_us) {
+        (Some(delta), Some(max_delta)) => delta <= max_delta as i64,
+        _ => true,
+    };
+
+    let environment = environment_profile();
+    let fixture_signature = fixture_signature(
+        perf_case.binary,
+        perf_case.command,
+        iterations,
+        perf_case.budget_p95_us,
+        perf_case.fixture_env,
+        &environment,
+    );
+
+    PerfRow {
+        metric_name: perf_case.metric_name.to_string(),
+        binary: perf_case.binary.to_string(),
+        command: perf_case.command.to_string(),
+        iterations,
+        samples_us: samples_us.to_vec(),
+        mean_us,
+        variance_us2,
+        stddev_us,
+        p50_us,
+        p95_us,
+        p99_us,
+        max_us,
+        budget_p95_us: perf_case.budget_p95_us,
+        baseline_p95_us,
+        delta_p95_us,
+        max_delta_p95_us,
+        fixture_signature,
+        environment,
+        passed: p95_us < perf_case.budget_p95_us && regression_ok,
+    }
+}
+
 // ── Performance Tests ────────────────────────────────────────────────
 
 /// PERF-1: MCP denial gate dispatch latency.
@@ -127,33 +346,35 @@ fn perf_mcp_denial_gate_dispatch_latency() {
         latencies.push(elapsed);
     }
 
-    latencies.sort();
+    let mut sorted_latencies = latencies.clone();
+    sorted_latencies.sort_unstable();
     let budget_p95 = 50_000; // 50ms
 
-    let row = PerfRow {
-        binary: "mcp-agent-mail".to_string(),
-        command: "share (denied)".to_string(),
-        iterations,
-        p50_us: percentile(&latencies, 50.0),
-        p95_us: percentile(&latencies, 95.0),
-        p99_us: percentile(&latencies, 99.0),
-        max_us: *latencies.last().unwrap_or(&0),
+    let perf_case = PerfCase {
+        metric_name: "mcp_denial_gate_dispatch",
+        binary: "mcp-agent-mail",
+        command: "share (denied)",
         budget_p95_us: budget_p95,
-        passed: percentile(&latencies, 95.0) < budget_p95,
+        fixture_env: &[],
     };
-    save_artifact(&row, "perf_denial_gate");
+    let row = build_perf_row(&perf_case, iterations, &latencies, &sorted_latencies);
+    save_perf_artifact(&row, "perf_denial_gate");
     eprintln!(
-        "denial gate: p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+        "denial gate: p50={:.1}ms p95={:.1}ms p99={:.1}ms stddev={:.1}ms",
         row.p50_us as f64 / 1000.0,
         row.p95_us as f64 / 1000.0,
         row.p99_us as f64 / 1000.0,
+        row.stddev_us / 1000.0,
     );
 
     assert!(
         row.passed,
-        "denial gate p95 {:.1}ms exceeds budget {:.1}ms",
+        "denial gate p95 {:.1}ms exceeds budget {:.1}ms (baseline_p95_us={:?}, delta_p95_us={:?}, max_delta_p95_us={:?})",
         row.p95_us as f64 / 1000.0,
         budget_p95 as f64 / 1000.0,
+        row.baseline_p95_us,
+        row.delta_p95_us,
+        row.max_delta_p95_us,
     );
 }
 
@@ -173,33 +394,35 @@ fn perf_cli_help_dispatch_latency() {
         latencies.push(elapsed);
     }
 
-    latencies.sort();
+    let mut sorted_latencies = latencies.clone();
+    sorted_latencies.sort_unstable();
     let budget_p95 = 100_000; // 100ms
 
-    let row = PerfRow {
-        binary: "am".to_string(),
-        command: "--help".to_string(),
-        iterations,
-        p50_us: percentile(&latencies, 50.0),
-        p95_us: percentile(&latencies, 95.0),
-        p99_us: percentile(&latencies, 99.0),
-        max_us: *latencies.last().unwrap_or(&0),
+    let perf_case = PerfCase {
+        metric_name: "cli_help_dispatch",
+        binary: "am",
+        command: "--help",
         budget_p95_us: budget_p95,
-        passed: percentile(&latencies, 95.0) < budget_p95,
+        fixture_env: &[],
     };
-    save_artifact(&row, "perf_cli_help");
+    let row = build_perf_row(&perf_case, iterations, &latencies, &sorted_latencies);
+    save_perf_artifact(&row, "perf_cli_help");
     eprintln!(
-        "CLI --help: p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+        "CLI --help: p50={:.1}ms p95={:.1}ms p99={:.1}ms stddev={:.1}ms",
         row.p50_us as f64 / 1000.0,
         row.p95_us as f64 / 1000.0,
         row.p99_us as f64 / 1000.0,
+        row.stddev_us / 1000.0,
     );
 
     assert!(
         row.passed,
-        "CLI --help p95 {:.1}ms exceeds budget {:.1}ms",
+        "CLI --help p95 {:.1}ms exceeds budget {:.1}ms (baseline_p95_us={:?}, delta_p95_us={:?}, max_delta_p95_us={:?})",
         row.p95_us as f64 / 1000.0,
         budget_p95 as f64 / 1000.0,
+        row.baseline_p95_us,
+        row.delta_p95_us,
+        row.max_delta_p95_us,
     );
 }
 
@@ -217,52 +440,51 @@ fn perf_mcp_config_dispatch_latency() {
 
     let iterations = 20;
     let mut latencies = Vec::with_capacity(iterations);
+    let perf_env = [
+        ("DATABASE_URL", "sqlite:///tmp/perf_test.db"),
+        ("STORAGE_ROOT", "/tmp"),
+        ("AGENT_NAME", "PerfTest"),
+        ("HTTP_HOST", "127.0.0.1"),
+        ("HTTP_PORT", "1"),
+        ("HTTP_PATH", "/mcp/"),
+    ];
 
     for _ in 0..iterations {
         let start = Instant::now();
-        let _ = run_binary_with_env(
-            &mcp,
-            &["config"],
-            &[
-                ("DATABASE_URL", "sqlite:///tmp/perf_test.db"),
-                ("STORAGE_ROOT", "/tmp"),
-                ("AGENT_NAME", "PerfTest"),
-                ("HTTP_HOST", "127.0.0.1"),
-                ("HTTP_PORT", "1"),
-                ("HTTP_PATH", "/mcp/"),
-            ],
-        );
+        let _ = run_binary_with_env(&mcp, &["config"], &perf_env);
         let elapsed = start.elapsed().as_micros() as u64;
         latencies.push(elapsed);
     }
 
-    latencies.sort();
+    let mut sorted_latencies = latencies.clone();
+    sorted_latencies.sort_unstable();
     let budget_p95 = 100_000; // 100ms
 
-    let row = PerfRow {
-        binary: "mcp-agent-mail".to_string(),
-        command: "config".to_string(),
-        iterations,
-        p50_us: percentile(&latencies, 50.0),
-        p95_us: percentile(&latencies, 95.0),
-        p99_us: percentile(&latencies, 99.0),
-        max_us: *latencies.last().unwrap_or(&0),
+    let perf_case = PerfCase {
+        metric_name: "mcp_config_dispatch",
+        binary: "mcp-agent-mail",
+        command: "config",
         budget_p95_us: budget_p95,
-        passed: percentile(&latencies, 95.0) < budget_p95,
+        fixture_env: &perf_env,
     };
-    save_artifact(&row, "perf_mcp_config");
+    let row = build_perf_row(&perf_case, iterations, &latencies, &sorted_latencies);
+    save_perf_artifact(&row, "perf_mcp_config");
     eprintln!(
-        "MCP config: p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+        "MCP config: p50={:.1}ms p95={:.1}ms p99={:.1}ms stddev={:.1}ms",
         row.p50_us as f64 / 1000.0,
         row.p95_us as f64 / 1000.0,
         row.p99_us as f64 / 1000.0,
+        row.stddev_us / 1000.0,
     );
 
     assert!(
         row.passed,
-        "MCP config p95 {:.1}ms exceeds budget {:.1}ms",
+        "MCP config p95 {:.1}ms exceeds budget {:.1}ms (baseline_p95_us={:?}, delta_p95_us={:?}, max_delta_p95_us={:?})",
         row.p95_us as f64 / 1000.0,
         budget_p95 as f64 / 1000.0,
+        row.baseline_p95_us,
+        row.delta_p95_us,
+        row.max_delta_p95_us,
     );
 }
 

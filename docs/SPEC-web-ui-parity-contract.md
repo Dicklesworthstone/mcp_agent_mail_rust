@@ -468,15 +468,16 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/{project}/search?q=<script>...",
       "rust_path": "/mail/{project}/search?q=<script>...",
       "policy": "must_match",
-      "status": "partial",
-      "owner_beads": ["br-3vwi.13.7", "br-3vwi.10.14"],
+      "status": "implemented",
+      "owner_beads": ["br-3vwi.13.7", "br-3vwi.10.14", "br-3vwi.13.8"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/tests/test_mail_viewer_e2e.py (test_mail_xss_in_search_query, test_mail_xss_in_project_name)",
         "crates/mcp-agent-mail-server/tests/ui_markdown_templates.rs",
         "crates/mcp-agent-mail-server/src/templates.rs",
-        "crates/mcp-agent-mail-server/templates/base.html"
+        "crates/mcp-agent-mail-server/templates/base.html",
+        "tests/e2e/test_mail_ui.sh (mail_search_xss_query)"
       ],
-      "notes": "HTML must escape query/path input; lock with dedicated Rust parity tests and regression boundaries."
+      "notes": "Locked by dedicated E2E parity assertions proving search query payloads are escaped in rendered HTML (no executable script tag rendering)."
     },
     {
       "id": "startup_transport_default_8765_mcp_path",

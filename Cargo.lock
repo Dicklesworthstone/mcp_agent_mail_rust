@@ -2168,6 +2168,7 @@ version = "0.1.1"
 dependencies = [
  "ftui-core 0.1.1",
  "rustc-hash",
+ "serde",
 ]
 
 [[package]]

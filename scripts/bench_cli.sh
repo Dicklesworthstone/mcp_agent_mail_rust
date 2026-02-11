@@ -246,17 +246,42 @@ fi
 # ---------------------------------------------------------------------------
 log "Aggregating results..."
 python3 -c "
-import json, glob, os, sys
+import glob
+import hashlib
+import json
+import os
+import sys
 
 results_dir = sys.argv[1]
 timestamp = sys.argv[2]
 
+def pct(values, p):
+    if not values:
+        return 0.0
+    idx = int(round((p / 100.0) * (len(values) - 1)))
+    idx = max(0, min(idx, len(values) - 1))
+    return values[idx]
+
+baseline_path = os.getenv('BENCH_BASELINE_FILE', '')
+baselines = {}
+if baseline_path and os.path.isfile(baseline_path):
+    try:
+        with open(baseline_path) as bf:
+            baselines = json.load(bf)
+    except Exception:
+        baselines = {}
+
 summary = {
     'timestamp': timestamp,
+    'schema_version': 1,
     'hardware': {
         'hostname': os.uname().nodename,
         'arch': os.uname().machine,
         'kernel': os.uname().release,
+    },
+    'environment_profile': {
+        'python': sys.version.split()[0],
+        'cwd': os.getcwd(),
     },
     'benchmarks': {}
 }
@@ -267,12 +292,43 @@ for f in sorted(glob.glob(os.path.join(results_dir, f'*_{timestamp}.json'))):
         data = json.load(open(f))
         if 'results' in data and data['results']:
             r = data['results'][0]
+            samples_ms = sorted([round(v * 1000, 4) for v in r.get('times', [])])
+            p95_ms = round(pct(samples_ms, 95.0), 2)
+            p99_ms = round(pct(samples_ms, 99.0), 2)
+            variance_ms2 = round((r.get('stddev', 0.0) * 1000) ** 2, 4)
+            baseline_p95_ms = None
+            delta_p95_ms = None
+            if isinstance(baselines, dict):
+                baseline = baselines.get(name, {})
+                if isinstance(baseline, dict):
+                    baseline_p95_ms = baseline.get('p95_ms')
+                elif isinstance(baseline, (int, float)):
+                    baseline_p95_ms = float(baseline)
+                if baseline_p95_ms is not None:
+                    delta_p95_ms = round(p95_ms - float(baseline_p95_ms), 2)
+
+            fixture_material = '|'.join([
+                name,
+                r.get('command', ''),
+                str(r.get('parameters', {})),
+                os.uname().machine,
+                os.uname().release,
+            ])
+            fixture_signature = hashlib.sha256(fixture_material.encode('utf-8')).hexdigest()[:16]
+
             summary['benchmarks'][name] = {
                 'mean_ms': round(r['mean'] * 1000, 2),
                 'stddev_ms': round(r['stddev'] * 1000, 2),
+                'variance_ms2': variance_ms2,
                 'min_ms': round(r['min'] * 1000, 2),
                 'max_ms': round(r['max'] * 1000, 2),
                 'median_ms': round(r['median'] * 1000, 2),
+                'p95_ms': p95_ms,
+                'p99_ms': p99_ms,
+                'baseline_p95_ms': baseline_p95_ms,
+                'delta_p95_ms': delta_p95_ms,
+                'timeseries_ms': samples_ms,
+                'fixture_signature': fixture_signature,
                 'command': r.get('command', ''),
             }
     except Exception as e:

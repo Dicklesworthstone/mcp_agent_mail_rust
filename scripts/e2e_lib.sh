@@ -113,6 +113,11 @@ _E2E_TOTAL=0
 # Current case (for trace correlation)
 _E2E_CURRENT_CASE=""
 
+# Optional fixture identifiers gathered by suites/harness.
+# Suites can append with e2e_add_fixture_id; environment injection is also
+# supported via E2E_FIXTURE_IDS (comma/space-separated).
+_E2E_FIXTURE_IDS=()
+
 # Trace file (initialized by e2e_init_artifacts)
 _E2E_TRACE_FILE=""
 
@@ -339,7 +344,7 @@ trap _e2e_cleanup EXIT
 
 # Initialize the artifact directory for this run
 e2e_init_artifacts() {
-    mkdir -p "$E2E_ARTIFACT_DIR"/{diagnostics,trace,transcript}
+    mkdir -p "$E2E_ARTIFACT_DIR"/{diagnostics,trace,transcript,logs,screenshots}
     _E2E_TRACE_FILE="${E2E_ARTIFACT_DIR}/trace/events.jsonl"
     touch "$_E2E_TRACE_FILE"
     _e2e_trace_event "suite_start" ""
@@ -362,6 +367,14 @@ e2e_copy_artifact() {
     local dest="${E2E_ARTIFACT_DIR}/${dest_name}"
     mkdir -p "$(dirname "$dest")"
     cp -r "$src" "$dest" 2>/dev/null || true
+}
+
+e2e_add_fixture_id() {
+    local fixture_id="${1:-}"
+    if [ -z "$fixture_id" ]; then
+        return 0
+    fi
+    _E2E_FIXTURE_IDS+=("$fixture_id")
 }
 
 # ---------------------------------------------------------------------------
@@ -430,6 +443,153 @@ EOF
   "command": "$( _e2e_json_escape "$cmd" )"
 }
 EOJSON
+}
+
+e2e_write_fixture_ids_json() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    local out="${artifact_dir}/fixtures.json"
+    local td
+    td="$(e2e_mktemp "e2e_fixtures")"
+    local list_file="${td}/fixture_ids.txt"
+    : >"$list_file"
+
+    local id
+    for id in "${_E2E_FIXTURE_IDS[@]}"; do
+        if [ -n "$id" ]; then
+            printf '%s\n' "$id" >>"$list_file"
+        fi
+    done
+
+    local env_ids="${E2E_FIXTURE_IDS:-}"
+    if [ -n "$env_ids" ]; then
+        local normalized
+        normalized="$(printf '%s' "$env_ids" | tr ',;' '  ')"
+        local token
+        for token in $normalized; do
+            if [ -n "$token" ]; then
+                printf '%s\n' "$token" >>"$list_file"
+            fi
+        done
+    fi
+
+    if [ -d "${artifact_dir}/fixtures" ]; then
+        while IFS= read -r f; do
+            local rel="${f#"$artifact_dir"/}"
+            printf '%s\n' "$rel" >>"$list_file"
+        done < <(find "${artifact_dir}/fixtures" -type f | sort)
+    fi
+
+    sort -u "$list_file" -o "$list_file"
+
+    {
+        echo "{"
+        echo "  \"schema_version\": 1,"
+        echo "  \"suite\": \"$( _e2e_json_escape "$E2E_SUITE" )\","
+        echo "  \"timestamp\": \"$( _e2e_json_escape "$E2E_TIMESTAMP" )\","
+        echo "  \"fixture_ids\": ["
+        local first=1
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [ "$first" -eq 1 ]; then
+                first=0
+            else
+                echo "    ,"
+            fi
+            echo "    \"$( _e2e_json_escape "$line" )\""
+        done <"$list_file"
+        echo "  ]"
+        echo "}"
+    } >"$out"
+}
+
+e2e_write_logs_index_json() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    local out="${artifact_dir}/logs/index.json"
+    mkdir -p "$(dirname "$out")"
+
+    local td
+    td="$(e2e_mktemp "e2e_logs_index")"
+    local list_file="${td}/logs.txt"
+    : >"$list_file"
+
+    while IFS= read -r f; do
+        local rel="${f#"$artifact_dir"/}"
+        if [ "$rel" = "logs/index.json" ]; then
+            continue
+        fi
+        printf '%s\n' "$rel" >>"$list_file"
+    done < <(find "$artifact_dir" -type f \( -name "*.log" -o -name "*.log.*" \) | sort)
+
+    {
+        echo "{"
+        echo "  \"schema_version\": 1,"
+        echo "  \"suite\": \"$( _e2e_json_escape "$E2E_SUITE" )\","
+        echo "  \"timestamp\": \"$( _e2e_json_escape "$E2E_TIMESTAMP" )\","
+        echo "  \"files\": ["
+        local first=1
+        while IFS= read -r rel; do
+            [ -z "$rel" ] && continue
+            local abs="${artifact_dir}/${rel}"
+            local bytes sha
+            bytes="$(_e2e_stat_bytes "$abs")"
+            sha="$(e2e_sha256 "$abs")"
+            if [ "$first" -eq 1 ]; then
+                first=0
+            else
+                echo "    ,"
+            fi
+            echo "    {\"path\": \"$( _e2e_json_escape "$rel" )\", \"bytes\": ${bytes}, \"sha256\": \"$( _e2e_json_escape "$sha" )\"}"
+        done <"$list_file"
+        echo "  ]"
+        echo "}"
+    } >"$out"
+}
+
+e2e_write_screenshots_index_json() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    local out="${artifact_dir}/screenshots/index.json"
+    mkdir -p "$(dirname "$out")"
+
+    local td
+    td="$(e2e_mktemp "e2e_screenshots_index")"
+    local list_file="${td}/screenshots.txt"
+    : >"$list_file"
+
+    while IFS= read -r f; do
+        local rel="${f#"$artifact_dir"/}"
+        printf '%s\n' "$rel" >>"$list_file"
+    done < <(find "$artifact_dir" -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.webp" -o -iname "*.gif" -o -iname "*.bmp" \) | sort)
+
+    {
+        echo "{"
+        echo "  \"schema_version\": 1,"
+        echo "  \"suite\": \"$( _e2e_json_escape "$E2E_SUITE" )\","
+        echo "  \"timestamp\": \"$( _e2e_json_escape "$E2E_TIMESTAMP" )\","
+        echo "  \"files\": ["
+        local first=1
+        while IFS= read -r rel; do
+            [ -z "$rel" ] && continue
+            local abs="${artifact_dir}/${rel}"
+            local bytes sha
+            bytes="$(_e2e_stat_bytes "$abs")"
+            sha="$(e2e_sha256 "$abs")"
+            if [ "$first" -eq 1 ]; then
+                first=0
+            else
+                echo "    ,"
+            fi
+            echo "    {\"path\": \"$( _e2e_json_escape "$rel" )\", \"bytes\": ${bytes}, \"sha256\": \"$( _e2e_json_escape "$sha" )\"}"
+        done <"$list_file"
+        echo "  ]"
+        echo "}"
+    } >"$out"
+}
+
+e2e_write_forensic_indexes() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    e2e_write_fixture_ids_json "$artifact_dir"
+    e2e_write_logs_index_json "$artifact_dir"
+    e2e_write_screenshots_index_json "$artifact_dir"
 }
 
 _e2e_now_rfc3339() {
@@ -630,6 +790,9 @@ e2e_write_transcript_summary() {
         echo "  meta: meta.json"
         echo "  metrics: metrics.json"
         echo "  trace: trace/events.jsonl"
+        echo "  logs_index: logs/index.json"
+        echo "  screenshots_index: screenshots/index.json"
+        echo "  fixtures: fixtures.json"
         echo "  repro: repro.txt"
         echo "  repro_json: repro.json"
         echo "  env: diagnostics/env_redacted.txt"
@@ -675,7 +838,15 @@ e2e_write_bundle_manifest() {
         echo "      \"tree\": {\"path\": \"diagnostics/tree.txt\"}"
         echo "    },"
         echo "    \"trace\": {\"events\": {\"path\": \"trace/events.jsonl\", \"schema\": \"trace-events.v1\"}},"
-        echo "    \"transcript\": {\"summary\": {\"path\": \"transcript/summary.txt\"}}"
+        echo "    \"transcript\": {\"summary\": {\"path\": \"transcript/summary.txt\"}},"
+        echo "    \"logs\": {\"index\": {\"path\": \"logs/index.json\", \"schema\": \"logs-index.v1\"}},"
+        echo "    \"screenshots\": {\"index\": {\"path\": \"screenshots/index.json\", \"schema\": \"screenshots-index.v1\"}},"
+        echo "    \"fixtures\": {\"path\": \"fixtures.json\", \"schema\": \"fixtures.v1\"},"
+        echo "    \"replay\": {"
+        echo "      \"command\": {\"path\": \"repro.txt\"},"
+        echo "      \"environment\": {\"path\": \"repro.env\"},"
+        echo "      \"metadata\": {\"path\": \"repro.json\", \"schema\": \"repro.v1\"}"
+        echo "    }"
         echo "  },"
         echo "  \"files\": ["
 
@@ -706,11 +877,39 @@ e2e_write_bundle_manifest() {
                     kind="trace"
                     schema_json="\"trace-events.v1\""
                     ;;
+                logs/index.json)
+                    kind="log"
+                    schema_json="\"logs-index.v1\""
+                    ;;
+                screenshots/index.json)
+                    kind="screenshot"
+                    schema_json="\"screenshots-index.v1\""
+                    ;;
+                fixtures.json)
+                    kind="fixture"
+                    schema_json="\"fixtures.v1\""
+                    ;;
+                repro.json)
+                    kind="replay"
+                    schema_json="\"repro.v1\""
+                    ;;
+                repro.txt|repro.env)
+                    kind="replay"
+                    ;;
                 diagnostics/*)
                     kind="diagnostics"
                     ;;
                 transcript/*)
                     kind="transcript"
+                    ;;
+                fixtures/*)
+                    kind="fixture"
+                    ;;
+                *.log|*.log.*)
+                    kind="log"
+                    ;;
+                *.png|*.jpg|*.jpeg|*.webp|*.gif|*.bmp)
+                    kind="screenshot"
                     ;;
                 steps/step_*.json)
                     kind="trace"
@@ -833,9 +1032,37 @@ require(events, "schema", str)
 transcript = require(artifacts, "transcript", dict)
 req_path(transcript, "summary")
 
+logs = require(artifacts, "logs", dict)
+logs_index = require(logs, "index", dict)
+required_artifact_paths.append(require(logs_index, "path", str))
+require(logs_index, "schema", str)
+
+screenshots = require(artifacts, "screenshots", dict)
+screenshots_index = require(screenshots, "index", dict)
+required_artifact_paths.append(require(screenshots_index, "path", str))
+require(screenshots_index, "schema", str)
+
+req_path(artifacts, "fixtures", True)
+
+replay = require(artifacts, "replay", dict)
+req_path(replay, "command")
+req_path(replay, "environment")
+req_path(replay, "metadata", True)
+
 files = require(bundle, "files", list)
 file_map = {}
-allowed_kinds = {"metadata", "metrics", "diagnostics", "trace", "transcript", "opaque"}
+allowed_kinds = {
+    "metadata",
+    "metrics",
+    "diagnostics",
+    "trace",
+    "transcript",
+    "log",
+    "screenshot",
+    "fixture",
+    "replay",
+    "opaque",
+}
 sha_re = re.compile(r"^[0-9a-f]{64}$")
 
 for i, ent in enumerate(files):
@@ -920,6 +1147,61 @@ for k in ("total", "pass", "fail", "skip"):
     if mc[k] != counts[k]:
         fail(f"metrics.json counts.{k} mismatch")
 
+fixtures = load_json("fixtures.json")
+require(fixtures, "schema_version", int)
+if require(fixtures, "suite", str) != suite:
+    fail("fixtures.json suite mismatch")
+if require(fixtures, "timestamp", str) != timestamp:
+    fail("fixtures.json timestamp mismatch")
+fixture_ids = require(fixtures, "fixture_ids", list)
+seen_fixture_ids = set()
+for i, fid in enumerate(fixture_ids):
+    if not isinstance(fid, str):
+        fail(f"fixtures.json fixture_ids[{i}] must be string")
+    if fid in seen_fixture_ids:
+        fail(f"fixtures.json fixture_ids must be unique: {fid}")
+    seen_fixture_ids.add(fid)
+
+repro = load_json("repro.json")
+require(repro, "schema_version", int)
+if require(repro, "suite", str) != suite:
+    fail("repro.json suite mismatch")
+if require(repro, "timestamp", str) != timestamp:
+    fail("repro.json timestamp mismatch")
+require(repro, "clock_mode", str)
+require(repro, "seed", int)
+require(repro, "run_started_at", str)
+require(repro, "run_start_epoch_s", int)
+require(repro, "command", str)
+
+def validate_index(rel_path: str, index_name: str):
+    idx = load_json(rel_path)
+    require(idx, "schema_version", int)
+    if require(idx, "suite", str) != suite:
+        fail(f"{index_name} suite mismatch")
+    if require(idx, "timestamp", str) != timestamp:
+        fail(f"{index_name} timestamp mismatch")
+    entries = require(idx, "files", list)
+    for i, ent in enumerate(entries):
+        if not isinstance(ent, dict):
+            fail(f"{index_name} files[{i}] must be object")
+        p = require(ent, "path", str)
+        if p not in file_map:
+            fail(f"{index_name} references missing file: {p}")
+        b = require(ent, "bytes", int)
+        if b < 0:
+            fail(f"{index_name} files[{i}].bytes must be >= 0")
+        sha = require(ent, "sha256", str)
+        if not sha_re.match(sha):
+            fail(f"{index_name} files[{i}].sha256 must be 64 lowercase hex chars")
+        if file_map[p]["bytes"] != b:
+            fail(f"{index_name} bytes mismatch for {p}")
+        if file_map[p]["sha256"] != sha:
+            fail(f"{index_name} sha256 mismatch for {p}")
+
+validate_index("logs/index.json", "logs/index.json")
+validate_index("screenshots/index.json", "screenshots/index.json")
+
 # Parse and validate trace events JSONL
 events_path = os.path.join(artifact_dir, "trace", "events.jsonl")
 seen_start = False
@@ -996,6 +1278,37 @@ PY
 
     # Fallback: shallow sanity check (no JSON parser available).
     grep -q '"schema"' "$manifest" && grep -q '"files"' "$manifest" && grep -q '"artifacts"' "$manifest"
+}
+
+e2e_validate_bundle_tree() {
+    local root_dir="${1:-${E2E_PROJECT_ROOT}/tests/artifacts}"
+    if [ ! -d "$root_dir" ]; then
+        e2e_log "No artifact root at ${root_dir}; skipping bundle-tree validation"
+        return 0
+    fi
+
+    local found=0
+    local failed=0
+    while IFS= read -r manifest; do
+        (( found++ )) || true
+        local bundle_dir
+        bundle_dir="$(dirname "$manifest")"
+        if ! e2e_validate_bundle_manifest "$bundle_dir"; then
+            e2e_log "Invalid bundle: ${bundle_dir}"
+            (( failed++ )) || true
+        fi
+    done < <(find "$root_dir" -type f -name "bundle.json" | sort)
+
+    if [ "$found" -eq 0 ]; then
+        e2e_log "No bundle.json files found under ${root_dir}"
+        return 0
+    fi
+    if [ "$failed" -gt 0 ]; then
+        e2e_log "Bundle-tree validation failed: ${failed}/${found} invalid"
+        return 1
+    fi
+    e2e_log "Bundle-tree validation passed: ${found} bundle(s)"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1167,6 +1480,7 @@ e2e_summary() {
         e2e_write_diagnostics_files
         e2e_write_transcript_summary
         e2e_write_repro_files
+        e2e_write_forensic_indexes
 
         # Emit a versioned bundle manifest and validate it. This provides
         # artifact-contract enforcement for CI regression triage (br-3vwi.10.18).

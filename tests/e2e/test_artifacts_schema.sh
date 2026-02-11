@@ -40,6 +40,8 @@ e2e_write_meta_json "${GOOD_DIR}"
 e2e_write_metrics_json "${GOOD_DIR}"
 e2e_write_diagnostics_files "${GOOD_DIR}"
 e2e_write_transcript_summary "${GOOD_DIR}"
+e2e_write_repro_files "${GOOD_DIR}"
+e2e_write_forensic_indexes "${GOOD_DIR}"
 e2e_write_bundle_manifest "${GOOD_DIR}"
 
 e2e_case_banner "Valid bundle validates"
@@ -141,4 +143,3 @@ else
 fi
 
 e2e_summary
-
