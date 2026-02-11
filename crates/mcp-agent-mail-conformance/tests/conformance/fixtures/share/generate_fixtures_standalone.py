@@ -18,9 +18,7 @@ import shutil
 import sqlite3
 import tempfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = SCRIPT_DIR
