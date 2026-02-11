@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e2e_tui_compat_matrix.sh - Cross-terminal compatibility matrix (br-3vwi.10.16)
+# e2e_tui_compat_matrix.sh - Cross-terminal compatibility matrix (br-3vwi.10.16, br-3vwi.10.21)
 #
 # Run via:
 #   ./scripts/e2e_test.sh tui_compat_matrix
@@ -47,6 +47,22 @@ s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()
 PY
+}
+
+terminal_class_from_dims() {
+    local rows="$1"
+    local cols="$2"
+    if [ "${cols}" -lt 40 ] || [ "${rows}" -lt 10 ]; then
+        echo "tiny"
+    elif [ "${cols}" -lt 80 ]; then
+        echo "compact"
+    elif [ "${cols}" -lt 120 ]; then
+        echo "standard"
+    elif [ "${cols}" -lt 180 ]; then
+        echo "wide"
+    else
+        echo "ultrawide"
+    fi
 }
 
 jsonrpc_call() {
@@ -458,19 +474,117 @@ ${BIN} serve --host 127.0.0.1 --port ${port}" C-m
 
     sleep 1.5
 
-    # Navigate to Messages (2), then resize down/up, capturing snapshots.
-    tmux send-keys -t "${pane_id}" "2"
-    sleep 0.8
+    local capabilities_txt="${prof_dir}/terminal_capabilities.txt"
+    {
+        echo "tmux_version: $(tmux -V 2>/dev/null || echo unknown)"
+        echo "term: screen-256color"
+        echo "lang: ${LANG:-unset}"
+        echo "lc_all: ${LC_ALL:-unset}"
+        echo "default_terminal: $(tmux show-options -gv default-terminal 2>/dev/null || echo unknown)"
+    } >"${capabilities_txt}"
+    if command -v infocmp >/dev/null 2>&1; then
+        infocmp screen-256color >"${prof_dir}/terminal_infocmp.txt" 2>/dev/null || true
+    fi
 
-    tmux capture-pane -p -t "${pane_id}" >"${prof_dir}/tmux_00_initial.txt" 2>/dev/null || true
+    # Matrix: breakpoint classes + required screens for br-3vwi.10.21.
+    local -a size_matrix=(
+        "39:9"
+        "80:24"
+        "200:50"
+    )
+    local -a screen_matrix=(
+        "1:dashboard:Dashboard"
+        "5:search:Search"
+        "4:agents:Agents"
+        "6:reservations:Reservations"
+        "8:system_health:System ?Health"
+        "7:tool_metrics:Tool ?Metrics"
+        "9:timeline:Timeline"
+    )
 
-    tmux resize-window -t "${win_id}" -x 80 -y 24 >/dev/null 2>&1 || true
-    sleep 0.6
-    tmux capture-pane -p -t "${pane_id}" >"${prof_dir}/tmux_01_80x24.txt" 2>/dev/null || true
+    local trace_tsv="${prof_dir}/layout_trace.tsv"
+    printf "profile\tterm\trows\tcols\tclass\tscreen_key\tscreen\tcapture\tbytes\tsha256\n" >"${trace_tsv}"
 
-    tmux resize-window -t "${win_id}" -x 200 -y 50 >/dev/null 2>&1 || true
-    sleep 0.6
-    tmux capture-pane -p -t "${pane_id}" >"${prof_dir}/tmux_02_200x50.txt" 2>/dev/null || true
+    for size_spec in "${size_matrix[@]}"; do
+        local cols rows class_label
+        IFS=":" read -r cols rows <<<"${size_spec}"
+        class_label="$(terminal_class_from_dims "${rows}" "${cols}")"
+
+        tmux resize-window -t "${win_id}" -x "${cols}" -y "${rows}" >/dev/null 2>&1 || true
+        sleep 0.8
+
+        for screen_spec in "${screen_matrix[@]}"; do
+            local screen_key screen_slug expected_regex capture_path capture_bytes capture_sha
+            IFS=":" read -r screen_key screen_slug expected_regex <<<"${screen_spec}"
+            tmux send-keys -t "${pane_id}" "${screen_key}"
+            sleep 0.5
+
+            capture_path="${prof_dir}/tmux_${class_label}_${cols}x${rows}_${screen_slug}.txt"
+            tmux capture-pane -p -t "${pane_id}" >"${capture_path}" 2>/dev/null || true
+
+            if [ -s "${capture_path}" ]; then
+                e2e_pass "${profile}: captured ${screen_slug} @ ${cols}x${rows} (${class_label})"
+            else
+                e2e_fail "${profile}: empty capture for ${screen_slug} @ ${cols}x${rows}"
+            fi
+
+            if [ "${class_label}" != "tiny" ]; then
+                if grep -Eiq "${expected_regex}" "${capture_path}"; then
+                    e2e_pass "${profile}: marker '${expected_regex}' found in ${screen_slug} @ ${class_label}"
+                else
+                    e2e_fail "${profile}: missing marker '${expected_regex}' in ${screen_slug} @ ${class_label}"
+                fi
+            fi
+
+            capture_bytes="$(wc -c <"${capture_path}" | tr -d '[:space:]')"
+            capture_sha="$(sha256sum "${capture_path}" 2>/dev/null | awk '{print $1}')"
+            printf "%s\tscreen-256color\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+                "${profile}" "${rows}" "${cols}" "${class_label}" "${screen_key}" "${screen_slug}" \
+                "$(basename "${capture_path}")" "${capture_bytes}" "${capture_sha}" >>"${trace_tsv}"
+        done
+    done
+
+    # Visual diffs between breakpoint captures for forensic triage.
+    for screen_spec in "${screen_matrix[@]}"; do
+        local _screen_key screen_slug _expected_regex
+        IFS=":" read -r _screen_key screen_slug _expected_regex <<<"${screen_spec}"
+        local tiny_file standard_file ultrawide_file
+        tiny_file="${prof_dir}/tmux_tiny_39x9_${screen_slug}.txt"
+        standard_file="${prof_dir}/tmux_standard_80x24_${screen_slug}.txt"
+        ultrawide_file="${prof_dir}/tmux_ultrawide_200x50_${screen_slug}.txt"
+        if [ -f "${tiny_file}" ] && [ -f "${standard_file}" ]; then
+            diff -u "${tiny_file}" "${standard_file}" >"${prof_dir}/diff_${screen_slug}_tiny_vs_standard.patch" || true
+        fi
+        if [ -f "${standard_file}" ] && [ -f "${ultrawide_file}" ]; then
+            diff -u "${standard_file}" "${ultrawide_file}" >"${prof_dir}/diff_${screen_slug}_standard_vs_ultrawide.patch" || true
+        fi
+    done
+
+    python3 - "${trace_tsv}" "${prof_dir}/layout_trace.json" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+trace_tsv = Path(sys.argv[1])
+out_json = Path(sys.argv[2])
+
+rows = []
+with trace_tsv.open("r", encoding="utf-8") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        rows.append(row)
+
+summary = {
+    "profiles": sorted({r["profile"] for r in rows}),
+    "screen_count": len({r["screen"] for r in rows}),
+    "breakpoint_classes": sorted({r["class"] for r in rows}),
+    "capture_count": len(rows),
+}
+
+payload = {"summary": summary, "captures": rows}
+out_json.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+PY
 
     # Quit cleanly.
     tmux send-keys -t "${pane_id}" "q"
@@ -478,10 +592,10 @@ ${BIN} serve --host 127.0.0.1 --port ${port}" C-m
     tmux capture-pane -p -t "${pane_id}" >"${prof_dir}/tmux_03_after_quit.txt" 2>/dev/null || true
     tmux kill-session -t "${sess}" >/dev/null 2>&1 || true
 
-    if [ -s "${prof_dir}/tmux_00_initial.txt" ]; then
-        e2e_pass "${profile}: tmux capture produced output"
+    if find "${prof_dir}" -maxdepth 1 -type f -name 'tmux_*_*x*_*.txt' -size +0c | grep -q .; then
+        e2e_pass "${profile}: tmux matrix captures produced output"
     else
-        e2e_fail "${profile}: empty tmux capture"
+        e2e_fail "${profile}: no non-empty tmux matrix captures"
     fi
 }
 
@@ -489,24 +603,32 @@ BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
 e2e_case_banner "pty_profiles"
 
-# Key script: basic navigation + help + quit.
+# Key script: cycle required screens + help + quit.
 KEY_SCRIPT_DEFAULT='[
   {"delay_ms":3500,"keys":""},
-  {"keys":"2","delay_ms":700},
+  {"keys":"1","delay_ms":450},
+  {"keys":"5","delay_ms":450},
+  {"keys":"4","delay_ms":450},
+  {"keys":"6","delay_ms":450},
+  {"keys":"8","delay_ms":450},
+  {"keys":"7","delay_ms":450},
+  {"keys":"9","delay_ms":450},
   {"keys":"?","delay_ms":500},
   {"keys":"\\x1b","delay_ms":400},
   {"keys":"1","delay_ms":400},
   {"keys":"q","delay_ms":300}
 ]'
 
-# Resize script: apply two resizes late to exercise SIGWINCH handling.
+# Resize script: tiny + standard + ultrawide to exercise full reflow matrix.
 RESIZE_SCRIPT='[
+  {"rows":9,"cols":39},
   {"rows":24,"cols":80},
   {"rows":50,"cols":200}
 ]'
 
 run_tui_pty_profile "pty_xterm_120x40_resize" "xterm-256color" 40 120 "${RESIZE_SCRIPT}" "${KEY_SCRIPT_DEFAULT}" 0
-run_tui_pty_profile "pty_xterm_80x24_tiny" "xterm-256color" 24 80 "[]" "${KEY_SCRIPT_DEFAULT}" 0
+run_tui_pty_profile "pty_xterm_39x9_tiny" "xterm-256color" 9 39 "[]" "${KEY_SCRIPT_DEFAULT}" 0
+run_tui_pty_profile "pty_xterm_80x24_standard" "xterm-256color" 24 80 "[]" "${KEY_SCRIPT_DEFAULT}" 0
 run_tui_pty_profile "pty_vt100_80x24_degraded" "vt100" 24 80 "[]" "${KEY_SCRIPT_DEFAULT}" 0
 
 e2e_case_banner "unicode_wide_glyph_profile"
