@@ -45,6 +45,15 @@ impl MacroStep {
         self.delay_ms = ms;
         self
     }
+
+    /// Stable 64-bit hash for determinism checks and replay forensics.
+    ///
+    /// Intentionally excludes timestamps and timing (`delay_ms`) so hashes are
+    /// resilient to variable operator pacing.
+    #[must_use]
+    pub fn stable_hash64(&self) -> u64 {
+        stable_hash64_pair(&self.action_id, &self.label)
+    }
 }
 
 // ── Macro Definition ───────────────────────────────────────────────────
@@ -306,6 +315,13 @@ impl MacroEngine {
         &self.playback_log
     }
 
+    /// Mark the most recent playback log entry as failed (for forensic artifacts).
+    pub fn mark_last_playback_error(&mut self, error: impl Into<String>) {
+        if let Some(last) = self.playback_log.last_mut() {
+            last.error = Some(error.into());
+        }
+    }
+
     // ── Recording ──────────────────────────────────────────────────
 
     /// Start recording a new macro.
@@ -526,33 +542,38 @@ impl MacroEngine {
 
     /// Stop playback (cancel or finish early).
     pub fn stop_playback(&mut self) {
-        if let PlaybackState::Playing { name, step, .. }
-        | PlaybackState::Paused { name, step, .. } = &self.playback
-        {
-            let name = name.clone();
-            let step = *step;
-            self.playback = PlaybackState::Failed {
-                name,
-                step,
-                reason: "cancelled by operator".to_string(),
-            };
+        // Only meaningful while actively playing/paused.
+        if !self.playback.is_active() {
+            return;
         }
+        let Some(mac) = self.playback_macro.as_ref() else {
+            return;
+        };
+        let step = self.playback_log.last().map(|e| e.step_index).unwrap_or(0);
+        self.playback = PlaybackState::Failed {
+            name: mac.name.clone(),
+            step,
+            reason: "cancelled by operator".to_string(),
+        };
         self.playback_macro = None;
     }
 
     /// Mark playback as failed at the current step.
     pub fn fail_playback(&mut self, reason: &str) {
-        if let PlaybackState::Playing { name, step, .. }
-        | PlaybackState::Paused { name, step, .. } = &self.playback
-        {
-            let name = name.clone();
-            let step = *step;
-            self.playback = PlaybackState::Failed {
-                name,
-                step,
-                reason: reason.to_string(),
-            };
+        // Allow failure even if the engine already advanced to Completed for the
+        // last dispatched step (continuous mode advances before dispatch).
+        if matches!(self.playback, PlaybackState::Idle) {
+            return;
         }
+        let Some(mac) = self.playback_macro.as_ref() else {
+            return;
+        };
+        let step = self.playback_log.last().map(|e| e.step_index).unwrap_or(0);
+        self.playback = PlaybackState::Failed {
+            name: mac.name.clone(),
+            step,
+            reason: reason.to_string(),
+        };
         self.playback_macro = None;
     }
 
@@ -662,6 +683,24 @@ fn sanitize_filename(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[must_use]
+fn stable_hash64_pair(a: &str, b: &str) -> u64 {
+    // FNV-1a 64-bit (simple and stable; no extra deps).
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in a.as_bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    // Separator to avoid accidental concatenation collisions.
+    h ^= u64::from(0x1f_u8);
+    h = h.wrapping_mul(0x0100_0000_01b3);
+    for &byte in b.as_bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 // ── Palette action IDs for macro operations ────────────────────────────
