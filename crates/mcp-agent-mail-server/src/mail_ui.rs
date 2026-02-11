@@ -76,6 +76,11 @@ fn block_on_outcome<T>(
     }
 }
 
+fn is_fts_match_syntax_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("fts5: syntax error") || lower.contains("malformed match expression")
+}
+
 fn render(name: &str, ctx: impl Serialize) -> Result<Option<String>, (u16, String)> {
     templates::render_template(name, ctx)
         .map(Some)
@@ -1089,7 +1094,7 @@ fn render_search(
     query_str: &str,
 ) -> Result<Option<String>, (u16, String)> {
     use mcp_agent_mail_db::search_planner::{
-        Direction, Importance, RankingMode, SearchQuery, TimeRange,
+        Direction, Importance, RankingMode, SearchQuery, SearchResponse, TimeRange,
     };
 
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
@@ -1181,10 +1186,23 @@ fn render_search(
             ..Default::default()
         };
 
-        let resp = block_on_outcome(
+        let resp = match block_on_outcome(
             cx,
             mcp_agent_mail_db::search_service::execute_search_simple(cx, pool, &search_query),
-        )?;
+        ) {
+            Ok(resp) => resp,
+            // Python parity: malformed FTS MATCH expressions should not 500 the UI route.
+            // Return deterministic empty search results while still rendering the page.
+            Err((status, msg)) if status == 500 && is_fts_match_syntax_error(&msg) => {
+                SearchResponse {
+                    results: Vec::new(),
+                    next_cursor: None,
+                    explain: None,
+                    audit: Vec::new(),
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         let web_results: Vec<WebSearchResult> = resp
             .results
