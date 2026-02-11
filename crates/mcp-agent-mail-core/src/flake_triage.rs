@@ -1,7 +1,7 @@
 //! Flake triage harness and failure-forensics automation (br-3vwi.10.5).
 //!
 //! Provides infrastructure to capture, analyze, and reproduce intermittent
-//! test failures. Integrates with the deterministic [`test_harness`] module
+//! test failures. Integrates with the deterministic `test_harness` module
 //! and produces structured artifacts for CI debugging.
 //!
 //! # Quick start

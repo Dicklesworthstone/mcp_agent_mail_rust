@@ -368,7 +368,7 @@ pub struct DeployToolingArgs {
 
 #[derive(Args, Debug)]
 pub struct DeployVerifyArgs {
-    /// Deployed URL to verify (e.g., https://example.github.io/agent-mail).
+    /// Deployed URL to verify (e.g., `https://example.github.io/agent-mail`).
     pub url: String,
     /// Output as JSON instead of human-readable table.
     #[arg(long)]

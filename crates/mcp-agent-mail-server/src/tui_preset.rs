@@ -141,7 +141,7 @@ impl BandConfig {
 
 /// Serializable panel layout specification.
 ///
-/// This mirrors [`ReactiveLayout`] but is fully serializable. At runtime,
+/// This mirrors `ReactiveLayout` but is fully serializable. At runtime,
 /// the dashboard converts this to a `ReactiveLayout` for rendering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanelLayoutConfig {
