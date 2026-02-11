@@ -8,18 +8,23 @@ use std::collections::HashSet;
 use ftui::Style;
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
-use ftui::widgets::Sparkline;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::progress::MiniBar;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{DbStatSnapshot, EventSeverity, MailEvent, MailEventKind, VerbosityTier};
+use crate::tui_layout::{
+    DensityHint, PanelConstraint, PanelPolicy, PanelSlot, ReactiveLayout, SplitAxis, TerminalClass,
+};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::{
+    AnomalyCard, AnomalySeverity, BrailleActivity, MetricTile, MetricTrend, PercentileRibbon,
+    PercentileSample,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -34,11 +39,65 @@ const STAT_REFRESH_TICKS: u64 = 10;
 /// Unicode block characters for sparkline rendering (bottom-aligned).
 const SPARK_CHARS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
+// ── Panel budgets ────────────────────────────────────────────────────
+
+/// Summary band height (`MetricTile` row) by terminal class.
+const fn summary_band_height(tc: TerminalClass) -> u16 {
+    match tc {
+        TerminalClass::Tiny => 1,
+        _ => 3,
+    }
+}
+
+/// Anomaly rail height (0 when no anomalies or terminal too small).
+const fn anomaly_rail_height(tc: TerminalClass, anomaly_count: usize) -> u16 {
+    if anomaly_count == 0 {
+        return 0;
+    }
+    match tc {
+        TerminalClass::Tiny | TerminalClass::Compact => 0,
+        _ => 4,
+    }
+}
+
+/// Footer height by terminal class.
+const fn footer_bar_height(tc: TerminalClass) -> u16 {
+    match tc {
+        TerminalClass::Tiny => 0,
+        _ => 1,
+    }
+}
+
+/// Max percentile samples to retain.
+const PERCENTILE_HISTORY_CAP: usize = 120;
+
+/// Max throughput samples to retain.
+const THROUGHPUT_HISTORY_CAP: usize = 120;
+
+/// Anomaly thresholds.
+const ACK_PENDING_WARN: u64 = 3;
+const ACK_PENDING_HIGH: u64 = 10;
+const ERROR_RATE_WARN: f64 = 0.05;
+const ERROR_RATE_HIGH: f64 = 0.15;
+const RING_FILL_WARN: u8 = 80;
+
+// ── Detected anomaly ─────────────────────────────────────────────────
+
+/// A runtime-detected anomaly for the anomaly/action rail.
+#[derive(Debug, Clone)]
+pub(crate) struct DetectedAnomaly {
+    pub(crate) severity: AnomalySeverity,
+    pub(crate) confidence: f64,
+    pub(crate) headline: String,
+    pub(crate) rationale: String,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // DashboardScreen
 // ──────────────────────────────────────────────────────────────────────
 
 /// The main dashboard screen.
+#[allow(clippy::struct_excessive_bools)]
 pub struct DashboardScreen {
     /// Cached event log lines (rendered from `MailEvent`s).
     event_log: Vec<EventEntry>,
@@ -56,6 +115,17 @@ pub struct DashboardScreen {
     prev_db_stats: DbStatSnapshot,
     /// Sparkline data: recent latency samples.
     sparkline_data: Vec<f64>,
+    // ── Showcase composition state ───────────────────────────────
+    /// Detected anomalies (refreshed each stat tick).
+    anomalies: Vec<DetectedAnomaly>,
+    /// Rolling percentile samples for the trend ribbon.
+    percentile_history: Vec<PercentileSample>,
+    /// Rolling throughput samples (requests per stat interval).
+    throughput_history: Vec<f64>,
+    /// Previous request total for delta/trend computation.
+    prev_req_total: u64,
+    /// Whether the trend panel is visible (toggled by user).
+    show_trend_panel: bool,
 }
 
 /// A pre-formatted event log entry.
@@ -82,6 +152,11 @@ impl DashboardScreen {
             verbosity: VerbosityTier::default(),
             prev_db_stats: DbStatSnapshot::default(),
             sparkline_data: Vec::with_capacity(60),
+            anomalies: Vec::new(),
+            percentile_history: Vec::with_capacity(PERCENTILE_HISTORY_CAP),
+            throughput_history: Vec::with_capacity(THROUGHPUT_HISTORY_CAP),
+            prev_req_total: 0,
+            show_trend_panel: true,
         }
     }
 
@@ -108,6 +183,121 @@ impl DashboardScreen {
                     && (self.type_filter.is_empty() || self.type_filter.contains(&e.kind))
             })
             .collect()
+    }
+
+    /// Detect anomalies from current state.
+    #[allow(clippy::cast_precision_loss, clippy::unused_self)]
+    fn detect_anomalies(&self, state: &TuiSharedState) -> Vec<DetectedAnomaly> {
+        let mut out = Vec::new();
+        let counters = state.request_counters();
+        let db = state.db_stats_snapshot().unwrap_or_default();
+        let ring = state.event_ring_stats();
+
+        // Ack pending anomaly.
+        if db.ack_pending >= ACK_PENDING_HIGH {
+            out.push(DetectedAnomaly {
+                severity: AnomalySeverity::High,
+                confidence: 0.95,
+                headline: format!("{} messages awaiting acknowledgement", db.ack_pending),
+                rationale: "High ack backlog may indicate stalled agents".into(),
+            });
+        } else if db.ack_pending >= ACK_PENDING_WARN {
+            out.push(DetectedAnomaly {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.7,
+                headline: format!("{} ack-pending messages", db.ack_pending),
+                rationale: "Monitor for growing backlog".into(),
+            });
+        }
+
+        // Error rate anomaly.
+        if counters.total > 20 {
+            let err_rate = counters.status_5xx as f64 / counters.total as f64;
+            if err_rate >= ERROR_RATE_HIGH {
+                out.push(DetectedAnomaly {
+                    severity: AnomalySeverity::Critical,
+                    confidence: 0.9,
+                    headline: format!("5xx error rate {:.0}%", err_rate * 100.0),
+                    rationale: format!(
+                        "{} of {} requests failed",
+                        counters.status_5xx, counters.total
+                    ),
+                });
+            } else if err_rate >= ERROR_RATE_WARN {
+                out.push(DetectedAnomaly {
+                    severity: AnomalySeverity::High,
+                    confidence: 0.8,
+                    headline: format!("Elevated 5xx rate {:.1}%", err_rate * 100.0),
+                    rationale: "Server errors above threshold".into(),
+                });
+            }
+        }
+
+        // Ring buffer backpressure.
+        if ring.fill_pct() >= RING_FILL_WARN {
+            out.push(DetectedAnomaly {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.85,
+                headline: format!("Event ring {}% full", ring.fill_pct()),
+                rationale: format!("{} events dropped", ring.total_drops()),
+            });
+        }
+
+        out
+    }
+
+    /// Compute approximate percentiles from sparkline data.
+    fn compute_percentile(data: &[f64]) -> PercentileSample {
+        if data.is_empty() {
+            return PercentileSample {
+                p50: 0.0,
+                p95: 0.0,
+                p99: 0.0,
+            };
+        }
+        let mut sorted: Vec<f64> = data.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let len = sorted.len();
+        PercentileSample {
+            p50: sorted[len / 2],
+            p95: sorted[(len * 95 / 100).min(len - 1)],
+            p99: sorted[(len * 99 / 100).min(len - 1)],
+        }
+    }
+
+    /// Render the event log into the given area (delegates to the free function).
+    fn render_event_log_panel(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        let _ = state; // used for future deep-link context
+        render_event_log(
+            frame,
+            area,
+            &self.visible_entries(),
+            self.scroll_offset,
+            self.auto_follow,
+            &self.type_filter,
+            self.verbosity,
+        );
+    }
+
+    /// Build the `ReactiveLayout` for the main content area (event log + trend panel).
+    fn main_content_layout() -> ReactiveLayout {
+        ReactiveLayout::new()
+            .panel(PanelPolicy::new(
+                PanelSlot::Primary,
+                0,
+                SplitAxis::Vertical,
+                PanelConstraint::visible(1.0, 20),
+            ))
+            .panel(
+                PanelPolicy::new(
+                    PanelSlot::Inspector,
+                    1,
+                    SplitAxis::Vertical,
+                    PanelConstraint::HIDDEN,
+                )
+                .at(TerminalClass::Wide, PanelConstraint::visible(0.35, 30))
+                .at(TerminalClass::UltraWide, PanelConstraint::visible(0.40, 40)),
+            )
     }
 }
 
@@ -165,6 +355,10 @@ impl MailScreen for DashboardScreen {
                     KeyCode::Char('v') => {
                         self.verbosity = self.verbosity.next();
                     }
+                    // Toggle trend panel visibility
+                    KeyCode::Char('p') => {
+                        self.show_trend_panel = !self.show_trend_panel;
+                    }
                     // Toggle type filter
                     KeyCode::Char('t') => {
                         // Cycle through filter states:
@@ -188,56 +382,93 @@ impl MailScreen for DashboardScreen {
         Cmd::None
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         // Ingest new events every tick
         self.ingest_events(state);
 
-        // Refresh stat snapshot periodically
+        // Refresh sparkline from per-request latency samples
+        self.sparkline_data = state.sparkline_snapshot();
+
+        // Refresh stats and compute trends on stat interval
         if tick_count % STAT_REFRESH_TICKS == 0 {
             if let Some(stats) = state.db_stats_snapshot() {
                 self.prev_db_stats = stats;
             }
-        }
 
-        // Refresh sparkline from per-request latency samples
-        self.sparkline_data = state.sparkline_snapshot();
+            // Compute anomalies
+            self.anomalies = self.detect_anomalies(state);
+
+            // Track latency percentiles
+            if !self.sparkline_data.is_empty() {
+                let sample = Self::compute_percentile(&self.sparkline_data);
+                self.percentile_history.push(sample);
+                if self.percentile_history.len() > PERCENTILE_HISTORY_CAP {
+                    self.percentile_history
+                        .drain(..self.percentile_history.len() - PERCENTILE_HISTORY_CAP);
+                }
+            }
+
+            // Track throughput (delta requests since last stat tick)
+            let counters = state.request_counters();
+            let delta = counters.total.saturating_sub(self.prev_req_total);
+            self.throughput_history.push(delta as f64);
+            if self.throughput_history.len() > THROUGHPUT_HISTORY_CAP {
+                self.throughput_history
+                    .drain(..self.throughput_history.len() - THROUGHPUT_HISTORY_CAP);
+            }
+            self.prev_req_total = counters.total;
+        }
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
-        // Main layout: [stat tiles row: 7 lines] | [event log: fill] | [footer: 1 line]
-        let stat_height = 7_u16;
-        let footer_height = 1_u16;
-        let log_height = area
-            .height
-            .saturating_sub(stat_height + footer_height)
-            .max(3);
+        let tc = TerminalClass::from_rect(area);
+        let density = DensityHint::from_terminal_class(tc);
 
-        let stat_area = Rect::new(area.x, area.y, area.width, stat_height);
-        let log_area = Rect::new(area.x, area.y + stat_height, area.width, log_height);
-        let footer_area = Rect::new(
-            area.x,
-            area.y + stat_height + log_height,
-            area.width,
-            footer_height,
-        );
+        // ── Panel budgets (explicit per terminal class) ──────────
+        let summary_h = summary_band_height(tc);
+        let anomaly_h = anomaly_rail_height(tc, self.anomalies.len());
+        let footer_h = footer_bar_height(tc);
+        let chrome_h = summary_h + anomaly_h + footer_h;
+        let main_h = area.height.saturating_sub(chrome_h).max(3);
 
-        render_stat_tiles(
-            frame,
-            stat_area,
-            state,
-            &self.prev_db_stats,
-            &self.sparkline_data,
-        );
-        render_event_log(
-            frame,
-            log_area,
-            &self.visible_entries(),
-            self.scroll_offset,
-            self.auto_follow,
-            &self.type_filter,
-            self.verbosity,
-        );
-        render_footer(frame, footer_area, state);
+        // ── Rect allocation ──────────────────────────────────────
+        let mut y = area.y;
+        let summary_area = Rect::new(area.x, y, area.width, summary_h);
+        y += summary_h;
+        let anomaly_area = Rect::new(area.x, y, area.width, anomaly_h);
+        y += anomaly_h;
+        let main_area = Rect::new(area.x, y, area.width, main_h);
+        y += main_h;
+        let footer_area = Rect::new(area.x, y, area.width, footer_h);
+
+        // ── Render bands ─────────────────────────────────────────
+        render_summary_band(frame, summary_area, state, &self.prev_db_stats, density);
+
+        if anomaly_h > 0 {
+            render_anomaly_rail(frame, anomaly_area, &self.anomalies);
+        }
+
+        // Main: event log + optional trend panel via layout engine
+        if self.show_trend_panel {
+            let layout = Self::main_content_layout();
+            let comp = layout.compute(main_area);
+            self.render_event_log_panel(frame, comp.primary(), state);
+            if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
+                render_trend_panel(
+                    frame,
+                    trend_rect,
+                    &self.percentile_history,
+                    &self.throughput_history,
+                );
+            }
+        } else {
+            self.render_event_log_panel(frame, main_area, state);
+        }
+
+        if footer_h > 0 {
+            render_footer(frame, footer_area, state);
+        }
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -269,6 +500,10 @@ impl MailScreen for DashboardScreen {
             HelpEntry {
                 key: "g",
                 action: "Jump to top",
+            },
+            HelpEntry {
+                key: "p",
+                action: "Toggle trend panel",
             },
         ]
     }
@@ -456,127 +691,242 @@ fn truncate(s: &str, max: usize) -> &str {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-/// Render the stat tiles row with Sparkline and `MiniBar` widgets.
-#[allow(clippy::too_many_lines)]
-fn render_stat_tiles(
+/// Render the summary band using `MetricTile` widgets.
+///
+/// Adapts tile count to terminal density: 3 tiles at Minimal/Compact, up to 6 at Detailed.
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn render_summary_band(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &TuiSharedState,
-    _prev_stats: &DbStatSnapshot,
-    sparkline_data: &[f64],
+    prev_stats: &DbStatSnapshot,
+    density: DensityHint,
 ) {
-    // Split into 3 columns: server info | DB stats | agents
-    let col_width = area.width / 3;
-    let col1 = Rect::new(area.x, area.y, col_width, area.height);
-    let col2 = Rect::new(area.x + col_width, area.y, col_width, area.height);
-    let col3 = Rect::new(
-        area.x + col_width * 2,
-        area.y,
-        area.width.saturating_sub(col_width * 2),
-        area.height,
-    );
-
-    // ── Server tile: uptime + counters + latency sparkline ──────
     let counters = state.request_counters();
-    let uptime = state.uptime();
-    let uptime_str = format_duration(uptime);
+    let db = state.db_stats_snapshot().unwrap_or_default();
+    let uptime_str = format_duration(state.uptime());
     let avg_ms = counters
         .latency_total_ms
         .checked_div(counters.total)
         .unwrap_or(0);
-    let info = format!(
-        "Up: {uptime_str}  Avg: {avg_ms}ms\nReq: {} 2xx:{} 4xx:{} 5xx:{}",
-        counters.total, counters.status_2xx, counters.status_4xx, counters.status_5xx,
-    );
-    let block = Block::default()
-        .title("Server")
-        .border_type(BorderType::Rounded);
-    let p = Paragraph::new(info).block(block);
-    p.render(col1, frame);
+    let avg_str = format!("{avg_ms}ms");
+    let msg_str = format!("{}", db.messages);
+    let agent_str = format!("{}", db.agents);
+    let ack_str = format!("{}", db.ack_pending);
+    let req_str = format!("{}", counters.total);
 
-    // Render latency sparkline in the bottom of the server tile (inside the border)
-    let spark_inner_y = col1.y + col1.height.saturating_sub(2);
-    let spark_inner_w = col_width.saturating_sub(2);
-    if spark_inner_w > 4 && col1.height >= 5 {
-        let spark_area = Rect::new(col1.x + 1, spark_inner_y, spark_inner_w, 1);
-        let sparkline = Sparkline::new(sparkline_data).gradient(PackedRgba::GREEN, PackedRgba::RED);
-        sparkline.render(spark_area, frame);
-    }
-
-    // ── Database tile: stats + MiniBar gauges ───────────────────
-    let db = state.db_stats_snapshot().unwrap_or_default();
-    let db_title = if db.ack_pending > 0 {
-        format!("Database [{} ack]", db.ack_pending)
-    } else {
-        "Database".to_string()
+    // Determine trend directions by comparing to previous snapshot.
+    let msg_trend = trend_for(db.messages, prev_stats.messages);
+    let agent_trend = trend_for(db.agents, prev_stats.agents);
+    let ack_trend = match db.ack_pending.cmp(&prev_stats.ack_pending) {
+        std::cmp::Ordering::Greater => MetricTrend::Up, // ack growing = bad
+        std::cmp::Ordering::Less => MetricTrend::Down,
+        std::cmp::Ordering::Equal => MetricTrend::Flat,
     };
-    let ack_style = if db.ack_pending > 0 {
-        Style::default().fg(PackedRgba::rgb(255, 80, 80)).bold()
-    } else {
-        Style::default()
+
+    // Build tiles based on density.
+    let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
+        DensityHint::Minimal | DensityHint::Compact => vec![
+            (
+                "Up",
+                &uptime_str,
+                MetricTrend::Flat,
+                PackedRgba::rgb(200, 200, 200),
+            ),
+            (
+                "Req",
+                &req_str,
+                MetricTrend::Flat,
+                PackedRgba::rgb(120, 200, 255),
+            ),
+            ("Msg", &msg_str, msg_trend, PackedRgba::rgb(200, 200, 120)),
+        ],
+        DensityHint::Normal => vec![
+            (
+                "Uptime",
+                &uptime_str,
+                MetricTrend::Flat,
+                PackedRgba::rgb(200, 200, 200),
+            ),
+            (
+                "Requests",
+                &req_str,
+                MetricTrend::Flat,
+                PackedRgba::rgb(120, 200, 255),
+            ),
+            (
+                "Avg Lat",
+                &avg_str,
+                MetricTrend::Flat,
+                PackedRgba::rgb(180, 140, 255),
+            ),
+            (
+                "Messages",
+                &msg_str,
+                msg_trend,
+                PackedRgba::rgb(200, 200, 120),
+            ),
+            (
+                "Agents",
+                &agent_str,
+                agent_trend,
+                PackedRgba::rgb(120, 220, 160),
+            ),
+        ],
+        DensityHint::Detailed => vec![
+            (
+                "Uptime",
+                &uptime_str,
+                MetricTrend::Flat,
+                PackedRgba::rgb(200, 200, 200),
+            ),
+            (
+                "Requests",
+                &req_str,
+                MetricTrend::Flat,
+                PackedRgba::rgb(120, 200, 255),
+            ),
+            (
+                "Avg Lat",
+                &avg_str,
+                MetricTrend::Flat,
+                PackedRgba::rgb(180, 140, 255),
+            ),
+            (
+                "Messages",
+                &msg_str,
+                msg_trend,
+                PackedRgba::rgb(200, 200, 120),
+            ),
+            (
+                "Agents",
+                &agent_str,
+                agent_trend,
+                PackedRgba::rgb(120, 220, 160),
+            ),
+            (
+                "Ack Pend",
+                &ack_str,
+                ack_trend,
+                if db.ack_pending > 0 {
+                    PackedRgba::rgb(255, 100, 100)
+                } else {
+                    PackedRgba::rgb(120, 200, 120)
+                },
+            ),
+        ],
     };
-    let stats_lines = vec![
-        Line::raw(format!(
-            "Proj: {:>5}  Agents: {:>5}",
-            db.projects, db.agents,
-        )),
-        Line::raw(format!(
-            "Msg:  {:>5}  Reserv: {:>5}",
-            db.messages, db.file_reservations,
-        )),
-        Line::from_spans([
-            Span::raw(format!("Links:{:>5}  AckPnd: ", db.contact_links)),
-            Span::styled(format!("{:>5}", db.ack_pending), ack_style),
-        ]),
-    ];
-    let block = Block::default()
-        .title(db_title.as_str())
-        .border_type(BorderType::Rounded);
-    let p = Paragraph::new(Text::from_lines(stats_lines)).block(block);
-    p.render(col2, frame);
 
-    // MiniBar for request success rate in the bottom of the DB tile
-    let bar_inner_y = col2.y + col2.height.saturating_sub(2);
-    let bar_inner_w = col_width.saturating_sub(2);
-    if bar_inner_w > 6 && col2.height >= 5 {
-        let bar_area = Rect::new(col2.x + 1, bar_inner_y, bar_inner_w, 1);
-        #[allow(clippy::cast_precision_loss)]
-        let success_rate = if counters.total > 0 {
-            counters.status_2xx as f64 / counters.total as f64
-        } else {
-            1.0
-        };
-        let bar = MiniBar::new(success_rate, bar_inner_w).show_percent(true);
-        bar.render(bar_area, frame);
+    let tile_count = tiles.len();
+    if tile_count == 0 || area.width == 0 || area.height == 0 {
+        return;
     }
-
-    // ── Agents tile: show top 5 agents with activity dots ──────
-    let agents = &db.agents_list;
     #[allow(clippy::cast_possible_truncation)]
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as i64);
-    let agent_lines: Vec<Line> = if agents.is_empty() {
-        vec![Line::raw("(no agents)")]
+    let tile_w = area.width / tile_count as u16;
+
+    for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let x = area.x + (i as u16) * tile_w;
+        let w = if i == tile_count - 1 {
+            area.width.saturating_sub(x - area.x)
+        } else {
+            tile_w
+        };
+        let tile_area = Rect::new(x, area.y, w, area.height);
+        let tile = MetricTile::new(label, value, *trend).value_color(*color);
+        tile.render(tile_area, frame);
+    }
+}
+
+/// Render the anomaly/action rail using `AnomalyCard` widgets.
+fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedAnomaly]) {
+    if anomalies.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    // Show up to 3 anomalies side by side.
+    let visible = anomalies.len().min(3);
+    #[allow(clippy::cast_possible_truncation)]
+    let card_w = area.width / visible as u16;
+    for (i, anomaly) in anomalies.iter().take(visible).enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let x = area.x + (i as u16) * card_w;
+        let w = if i == visible - 1 {
+            area.width.saturating_sub(x - area.x)
+        } else {
+            card_w
+        };
+        let card_area = Rect::new(x, area.y, w, area.height);
+        let card = AnomalyCard::new(anomaly.severity, anomaly.confidence, &anomaly.headline)
+            .rationale(&anomaly.rationale);
+        card.render(card_area, frame);
+    }
+}
+
+/// Render the trend/insight panel with percentile ribbon and throughput activity.
+fn render_trend_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    percentile_history: &[PercentileSample],
+    throughput_history: &[f64],
+) {
+    if area.width < 10 || area.height < 6 {
+        return;
+    }
+    // Split vertically: top half = percentile ribbon, bottom half = throughput
+    let ribbon_h = area.height / 2;
+    let activity_h = area.height.saturating_sub(ribbon_h);
+    let ribbon_area = Rect::new(area.x, area.y, area.width, ribbon_h);
+    let activity_area = Rect::new(area.x, area.y + ribbon_h, area.width, activity_h);
+
+    // Percentile ribbon
+    if percentile_history.len() >= 2 {
+        let ribbon = PercentileRibbon::new(percentile_history)
+            .label("Latency")
+            .block(
+                Block::default()
+                    .title("Latency P50/P95/P99")
+                    .border_type(BorderType::Rounded),
+            );
+        ribbon.render(ribbon_area, frame);
     } else {
-        agents
-            .iter()
-            .take(5)
-            .map(|a| {
-                let (dot, color) = activity_indicator(now_us, a.last_active_ts);
-                Line::from_spans([
-                    Span::styled(format!("{dot} "), Style::default().fg(color)),
-                    Span::raw(format!("{} ({})", a.name, a.program)),
-                ])
-            })
-            .collect()
-    };
-    let title = format!("Agents ({})", db.agents);
-    let block = Block::default()
-        .title(title.as_str())
-        .border_type(BorderType::Rounded);
-    let p = Paragraph::new(Text::from_lines(agent_lines)).block(block);
-    p.render(col3, frame);
+        let block = Block::default()
+            .title("Latency (collecting...)")
+            .border_type(BorderType::Rounded);
+        Paragraph::new("Awaiting data...")
+            .block(block)
+            .render(ribbon_area, frame);
+    }
+
+    // Throughput activity (braille sparkline)
+    if throughput_history.len() >= 2 {
+        let activity = BrailleActivity::new(throughput_history)
+            .label("Throughput")
+            .color(PackedRgba::rgb(80, 200, 255))
+            .block(
+                Block::default()
+                    .title("Req/interval")
+                    .border_type(BorderType::Rounded),
+            );
+        activity.render(activity_area, frame);
+    } else {
+        let block = Block::default()
+            .title("Throughput (collecting...)")
+            .border_type(BorderType::Rounded);
+        Paragraph::new("Awaiting data...")
+            .block(block)
+            .render(activity_area, frame);
+    }
+}
+
+/// Derive a `MetricTrend` from two consecutive values.
+const fn trend_for(current: u64, previous: u64) -> MetricTrend {
+    if current > previous {
+        MetricTrend::Up
+    } else if current < previous {
+        MetricTrend::Down
+    } else {
+        MetricTrend::Flat
+    }
 }
 
 /// Render the scrollable event log.
@@ -745,17 +1095,23 @@ pub fn render_sparkline(data: &[f64], width: usize) -> String {
 // Activity indicators
 // ──────────────────────────────────────────────────────────────────────
 
-/// Thresholds for agent activity status (in microseconds).
+/// Thresholds for agent activity status (in microseconds, used in tests).
+#[cfg(test)]
 const ACTIVE_THRESHOLD_US: i64 = 60 * 1_000_000; // 60 seconds
+#[cfg(test)]
 const IDLE_THRESHOLD_US: i64 = 5 * 60 * 1_000_000; // 5 minutes
 
-/// Activity dot colors.
+/// Activity dot colors (used in tests).
+#[cfg(test)]
 const ACTIVITY_GREEN: PackedRgba = PackedRgba::rgb(80, 220, 100);
+#[cfg(test)]
 const ACTIVITY_YELLOW: PackedRgba = PackedRgba::rgb(220, 200, 60);
+#[cfg(test)]
 const ACTIVITY_GRAY: PackedRgba = PackedRgba::rgb(120, 120, 120);
 
 /// Returns an activity dot character and color based on how recently an agent
 /// was active. Green = active (<60s), yellow = idle (<5m), gray = stale.
+#[cfg(test)]
 const fn activity_indicator(now_us: i64, last_active_us: i64) -> (char, PackedRgba) {
     if last_active_us == 0 {
         return ('○', ACTIVITY_GRAY);

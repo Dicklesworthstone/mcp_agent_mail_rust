@@ -1,10 +1,7 @@
-Up: 0s  Avg: 0ms                        Proj:     0  Agents:     0              (no agents)                             
-Req: 0 2xx:0 4xx:0 5xx:0                Msg:      0  Reserv:     0                                                      
-                                        Links:    0  AckPnd:     0                                                      
+Uptime              Requests            Avg Lat             Messages            Agents              Ack Pend            
+0s ─                0 ─                 0ms ─               0 ─                 0 ─                 0 ─                 
                                                                                                                         
-                                                                                                                        
-                                         █████████████████████████████████ 100%                                         
-                                                                                                                        
+                                                                              Awaiting data...                          
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -20,6 +17,9 @@ Req: 0 2xx:0 4xx:0 5xx:0                Msg:      0  Reserv:     0
                                                                                                                         
                                                                                                                         
                                                                                                                         
+                                                                                                                        
+                                                                                                                        
+                                                                              Awaiting data...                          
                                                                                                                         
                                                                                                                         
                                                                                                                         

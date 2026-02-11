@@ -41,6 +41,7 @@ mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools" }
 tempfile.workspace = true
 ftui-harness.workspace = true
 ftui-render.workspace = true
+sqlmodel-sqlite.workspace = true
 
 [lints]
 workspace = true

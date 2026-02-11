@@ -4450,6 +4450,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlmodel-sqlite",
  "tempfile",
  "tracing",
 ]
