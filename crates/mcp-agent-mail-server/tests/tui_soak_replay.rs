@@ -33,7 +33,7 @@ use ftui_runtime::program::Model;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
-use mcp_agent_mail_server::tui_screens::{ALL_SCREEN_IDS, MailScreenId};
+use mcp_agent_mail_server::tui_screens::{MailScreenId, ALL_SCREEN_IDS};
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -50,6 +50,9 @@ const SNAPSHOT_INTERVAL_SECS: u64 = 5;
 /// Maximum allowed p95 tick-cycle latency (microseconds).
 /// Must stay well under the 100ms tick interval.
 const BUDGET_TICK_CYCLE_P95_US: u64 = 50_000; // 50ms
+
+/// Maximum allowed p95 render latency (microseconds).
+const BUDGET_RENDER_P95_US: u64 = 75_000; // 75ms
 
 /// Maximum allowed RSS growth factor over baseline.
 /// E.g., 3.0 means RSS must not triple from startup.
@@ -252,6 +255,33 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+fn mean(samples: &[u64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = samples.iter().map(|v| *v as f64).sum();
+    sum / samples.len() as f64
+}
+
+fn variance(samples: &[u64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let avg = mean(samples);
+    samples
+        .iter()
+        .map(|v| {
+            let delta = *v as f64 - avg;
+            delta * delta
+        })
+        .sum::<f64>()
+        / samples.len() as f64
+}
+
+fn stddev(samples: &[u64]) -> f64 {
+    variance(samples).sqrt()
+}
+
 /// Periodic health snapshot captured during the soak run.
 #[derive(Debug, serde::Serialize)]
 struct SoakSnapshot {
@@ -286,13 +316,39 @@ struct SoakReport {
     action_p95_us: u64,
     action_p99_us: u64,
     action_max_us: u64,
+    action_mean_us: f64,
+    action_variance_us2: f64,
+    action_stddev_us: f64,
     render_p50_us: u64,
     render_p95_us: u64,
     render_p99_us: u64,
     render_max_us: u64,
+    render_mean_us: f64,
+    render_variance_us2: f64,
+    render_stddev_us: f64,
     errors: u64,
     snapshots: Vec<SoakSnapshot>,
     verdict: &'static str,
+}
+
+/// Standalone metric report for interaction/search loops.
+#[derive(Debug, serde::Serialize)]
+struct SoakLoopReport {
+    generated_at: String,
+    bead: &'static str,
+    metric_name: &'static str,
+    category: &'static str,
+    iterations: usize,
+    samples_us: Vec<u64>,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+    mean_us: f64,
+    variance_us2: f64,
+    stddev_us: f64,
+    budget_p95_us: u64,
+    passed: bool,
 }
 
 fn repo_root() -> PathBuf {
@@ -303,17 +359,21 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn save_report(report: &SoakReport) {
+fn save_named_report<T: serde::Serialize>(report: &T, name: &str) {
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
     let dir = repo_root().join(format!(
         "tests/artifacts/tui/soak_replay/{ts}_{}",
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("report.json");
+    let path = dir.join(format!("{name}.json"));
     let json = serde_json::to_string_pretty(report).unwrap_or_default();
     let _ = std::fs::write(&path, &json);
     eprintln!("soak artifact: {}", path.display());
+}
+
+fn save_report(report: &SoakReport) {
+    save_named_report(report, "report");
 }
 
 fn soak_duration() -> Duration {
@@ -459,15 +519,22 @@ fn soak_replay_empty_state() {
         action_p95_us: percentile(&action_latencies, 95.0),
         action_p99_us: percentile(&action_latencies, 99.0),
         action_max_us: action_latencies.last().copied().unwrap_or(0),
+        action_mean_us: mean(&action_latencies),
+        action_variance_us2: variance(&action_latencies),
+        action_stddev_us: stddev(&action_latencies),
         render_p50_us: percentile(&render_latencies, 50.0),
         render_p95_us: percentile(&render_latencies, 95.0),
         render_p99_us: percentile(&render_latencies, 99.0),
         render_max_us: render_latencies.last().copied().unwrap_or(0),
+        render_mean_us: mean(&render_latencies),
+        render_variance_us2: variance(&render_latencies),
+        render_stddev_us: stddev(&render_latencies),
         errors,
         snapshots,
         verdict: if errors == 0
             && rss_growth < MAX_RSS_GROWTH_FACTOR
             && percentile(&action_latencies, 95.0) < BUDGET_TICK_CYCLE_P95_US
+            && percentile(&render_latencies, 95.0) < BUDGET_RENDER_P95_US
         {
             "PASS"
         } else {
@@ -486,7 +553,10 @@ fn soak_replay_empty_state() {
         "  Action p95:   {:.1}µs (budget: {:.1}µs)",
         report.action_p95_us as f64, BUDGET_TICK_CYCLE_P95_US as f64,
     );
-    eprintln!("  Render p95:   {:.1}µs", report.render_p95_us as f64,);
+    eprintln!(
+        "  Render p95:   {:.1}µs (budget: {:.1}µs)",
+        report.render_p95_us as f64, BUDGET_RENDER_P95_US as f64,
+    );
     eprintln!(
         "  RSS:          {}KB → {}KB ({:.2}x, limit {:.1}x)",
         report.baseline_rss_kb,
@@ -501,6 +571,18 @@ fn soak_replay_empty_state() {
         report.errors, 0,
         "soak replay encountered {} errors",
         report.errors
+    );
+    assert!(
+        report.action_p95_us < BUDGET_TICK_CYCLE_P95_US,
+        "action p95 {:.1}µs exceeds budget {:.1}µs",
+        report.action_p95_us as f64,
+        BUDGET_TICK_CYCLE_P95_US as f64,
+    );
+    assert!(
+        report.render_p95_us < BUDGET_RENDER_P95_US,
+        "render p95 {:.1}µs exceeds budget {:.1}µs",
+        report.render_p95_us as f64,
+        BUDGET_RENDER_P95_US as f64,
     );
     assert!(
         report.rss_growth_factor < MAX_RSS_GROWTH_FACTOR,
@@ -547,8 +629,13 @@ fn soak_rapid_screen_cycling() {
     }
 
     latencies.sort_unstable();
-    let p95 = percentile(&latencies, 95.0);
     let p50 = percentile(&latencies, 50.0);
+    let p95 = percentile(&latencies, 95.0);
+    let p99 = percentile(&latencies, 99.0);
+    let max = latencies.last().copied().unwrap_or(0);
+    let mean_us = mean(&latencies);
+    let variance_us2 = variance(&latencies);
+    let stddev_us = stddev(&latencies);
 
     eprintln!(
         "rapid_cycling: {} iterations × {} screens = {} cycles, p50={:.0}µs p95={:.0}µs max={:.0}µs",
@@ -557,8 +644,27 @@ fn soak_rapid_screen_cycling() {
         latencies.len(),
         p50 as f64,
         p95 as f64,
-        latencies.last().copied().unwrap_or(0) as f64,
+        max as f64,
     );
+
+    let report = SoakLoopReport {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        bead: "br-3vwi.9.3",
+        metric_name: "tui_interaction_rapid_screen_cycle",
+        category: "interaction",
+        iterations: latencies.len(),
+        samples_us: latencies.clone(),
+        p50_us: p50,
+        p95_us: p95,
+        p99_us: p99,
+        max_us: max,
+        mean_us,
+        variance_us2,
+        stddev_us,
+        budget_p95_us: BUDGET_TICK_CYCLE_P95_US,
+        passed: p95 < BUDGET_TICK_CYCLE_P95_US,
+    };
+    save_named_report(&report, "rapid_screen_cycling_report");
 
     assert!(
         p95 < BUDGET_TICK_CYCLE_P95_US,
@@ -695,16 +801,40 @@ fn soak_search_typing_stress() {
     }
 
     latencies.sort_unstable();
-    let p95 = percentile(&latencies, 95.0);
     let p50 = percentile(&latencies, 50.0);
+    let p95 = percentile(&latencies, 95.0);
+    let p99 = percentile(&latencies, 99.0);
+    let max = latencies.last().copied().unwrap_or(0);
+    let mean_us = mean(&latencies);
+    let variance_us2 = variance(&latencies);
+    let stddev_us = stddev(&latencies);
 
     eprintln!(
         "search_typing: {} keystrokes, p50={:.0}µs p95={:.0}µs max={:.0}µs",
         latencies.len(),
         p50 as f64,
         p95 as f64,
-        latencies.last().copied().unwrap_or(0) as f64,
+        max as f64,
     );
+
+    let report = SoakLoopReport {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        bead: "br-3vwi.9.3",
+        metric_name: "tui_search_typing",
+        category: "search",
+        iterations: latencies.len(),
+        samples_us: latencies.clone(),
+        p50_us: p50,
+        p95_us: p95,
+        p99_us: p99,
+        max_us: max,
+        mean_us,
+        variance_us2,
+        stddev_us,
+        budget_p95_us: 5_000,
+        passed: p95 < 5_000,
+    };
+    save_named_report(&report, "search_typing_report");
 
     // Individual keystroke should be very fast (< 5ms p95)
     assert!(
