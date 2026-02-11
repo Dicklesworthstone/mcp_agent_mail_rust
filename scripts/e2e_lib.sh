@@ -40,15 +40,69 @@ fi
 # Root of the project
 E2E_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ---------------------------------------------------------------------------
+# Determinism / replay controls (br-3vwi.10.19)
+# ---------------------------------------------------------------------------
+#
+# Use these env vars to make runs replayable with stable timestamps and harness-
+# generated IDs:
+#   E2E_CLOCK_MODE=wall|deterministic
+#   E2E_SEED=<u64>
+#   E2E_TIMESTAMP=<YYYYmmdd_HHMMSS>
+#   E2E_RUN_STARTED_AT=<rfc3339>
+#   E2E_RUN_START_EPOCH_S=<epoch seconds>
+#
+E2E_CLOCK_MODE="${E2E_CLOCK_MODE:-wall}"
+E2E_CLOCK_MODE="$(printf '%s' "$E2E_CLOCK_MODE" | tr '[:upper:]' '[:lower:]')"
+
+E2E_SEED="${E2E_SEED:-}"
+E2E_TIMESTAMP="${E2E_TIMESTAMP:-}"
+E2E_RUN_STARTED_AT="${E2E_RUN_STARTED_AT:-}"
+E2E_RUN_START_EPOCH_S="${E2E_RUN_START_EPOCH_S:-}"
+
+# Artifact run timestamp is always wall-clock by default (avoids clobbering
+# prior artifact dirs when replaying deterministic runs).
+if [ -z "$E2E_TIMESTAMP" ]; then
+    E2E_TIMESTAMP="$(date -u '+%Y%m%d_%H%M%S')"
+fi
+
+if [ -z "$E2E_SEED" ]; then
+    # Default seed: numeric form of the UTC run timestamp.
+    E2E_SEED="${E2E_TIMESTAMP//_/}"
+fi
+
+if [ "$E2E_CLOCK_MODE" = "deterministic" ]; then
+    # Derive logical time from the seed unless explicitly pinned.
+    if [ -z "$E2E_RUN_START_EPOCH_S" ]; then
+        # Stable epoch derived from seed (mod 1 day). Base epoch is arbitrary but fixed.
+        E2E_RUN_START_EPOCH_S=$(( 1700000000 + (E2E_SEED % 86400) ))
+    fi
+
+    if [ -z "$E2E_RUN_STARTED_AT" ]; then
+        E2E_RUN_STARTED_AT="$(date -u -d "@${E2E_RUN_START_EPOCH_S}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    fi
+else
+    if [ -z "$E2E_RUN_STARTED_AT" ]; then
+        E2E_RUN_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    fi
+
+    if [ -z "$E2E_RUN_START_EPOCH_S" ]; then
+        E2E_RUN_START_EPOCH_S="$(date +%s)"
+    fi
+fi
+
 # Artifact directory for this run
-E2E_TIMESTAMP="$(date -u '+%Y%m%d_%H%M%S')"
 E2E_ARTIFACT_DIR="${E2E_PROJECT_ROOT}/tests/artifacts/${E2E_SUITE}/${E2E_TIMESTAMP}"
 
 # Run timing (used for artifact bundle metadata/metrics)
-E2E_RUN_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-E2E_RUN_START_EPOCH_S="$(date +%s)"
 E2E_RUN_ENDED_AT=""
 E2E_RUN_END_EPOCH_S="0"
+
+# Deterministic trace clock: monotonically incremented seconds since E2E_RUN_START_EPOCH_S.
+_E2E_TRACE_SEQ=0
+
+# Deterministic RNG state (used only by harness helpers; suites may opt-in).
+_E2E_RNG_STATE=0
 
 # Counters
 _E2E_PASS=0
@@ -64,6 +118,51 @@ _E2E_TRACE_FILE=""
 
 # Temp dirs to clean up
 _E2E_TMP_DIRS=()
+
+# ---------------------------------------------------------------------------
+# Deterministic helpers (br-3vwi.10.19)
+# ---------------------------------------------------------------------------
+
+_e2e_rng_init() {
+    # Small bash-native RNG for stable IDs (NOT cryptographic).
+    if [[ "${E2E_SEED}" =~ ^[0-9]+$ ]]; then
+        _E2E_RNG_STATE=$(( E2E_SEED & 0x7fffffff ))
+    else
+        _E2E_RNG_STATE=0
+    fi
+}
+
+_e2e_rng_next_u32() {
+    # Deterministic LCG (glibc-ish constants), masked to 31 bits.
+    _E2E_RNG_STATE=$(( (1103515245 * _E2E_RNG_STATE + 12345) & 0x7fffffff ))
+    echo "$_E2E_RNG_STATE"
+}
+
+e2e_seeded_hex() {
+    local n
+    n="$(_e2e_rng_next_u32)"
+    printf '%08x' "$n"
+}
+
+e2e_seeded_id() {
+    local prefix="${1:-id}"
+    echo "${prefix}_$(e2e_seeded_hex)"
+}
+
+e2e_repro_command() {
+    # Copy/paste friendly one-liner for deterministic replay.
+    # Note: We intentionally do NOT pin E2E_TIMESTAMP so each replay writes to a fresh artifact dir.
+    local suite="${E2E_SUITE}"
+    printf 'cd %q && AM_E2E_KEEP_TMP=1 E2E_CLOCK_MODE=%q E2E_SEED=%q E2E_RUN_STARTED_AT=%q E2E_RUN_START_EPOCH_S=%q ./scripts/e2e_test.sh %q\n' \
+        "$E2E_PROJECT_ROOT" \
+        "${E2E_CLOCK_MODE}" \
+        "${E2E_SEED}" \
+        "${E2E_RUN_STARTED_AT}" \
+        "${E2E_RUN_START_EPOCH_S}" \
+        "${suite}"
+}
+
+_e2e_rng_init
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -284,7 +383,64 @@ _e2e_stat_bytes() {
     stat --format='%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null || echo "0"
 }
 
+e2e_write_repro_files() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    if [ ! -d "$artifact_dir" ]; then
+        return 0
+    fi
+
+    local cmd
+    cmd="$(e2e_repro_command)"
+
+    cat > "${artifact_dir}/repro.txt" <<EOF
+Repro (br-3vwi.10.19):
+${cmd}
+EOF
+
+    cat > "${artifact_dir}/repro.env" <<EOF
+# Source this file, then run:
+#   ./scripts/e2e_test.sh ${E2E_SUITE}
+# Original artifact timestamp (for reference): ${E2E_TIMESTAMP}
+AM_E2E_KEEP_TMP=1
+E2E_CLOCK_MODE=${E2E_CLOCK_MODE}
+E2E_SEED=${E2E_SEED}
+E2E_RUN_STARTED_AT=${E2E_RUN_STARTED_AT}
+E2E_RUN_START_EPOCH_S=${E2E_RUN_START_EPOCH_S}
+EOF
+
+    local seed_json="0"
+    if [[ "${E2E_SEED}" =~ ^[0-9]+$ ]]; then
+        seed_json="${E2E_SEED}"
+    fi
+
+    local start_epoch_json="0"
+    if [[ "${E2E_RUN_START_EPOCH_S}" =~ ^[0-9]+$ ]]; then
+        start_epoch_json="${E2E_RUN_START_EPOCH_S}"
+    fi
+
+    cat > "${artifact_dir}/repro.json" <<EOJSON
+{
+  "schema_version": 1,
+  "suite": "$( _e2e_json_escape "$E2E_SUITE" )",
+  "timestamp": "$( _e2e_json_escape "$E2E_TIMESTAMP" )",
+  "clock_mode": "$( _e2e_json_escape "$E2E_CLOCK_MODE" )",
+  "seed": ${seed_json},
+  "run_started_at": "$( _e2e_json_escape "$E2E_RUN_STARTED_AT" )",
+  "run_start_epoch_s": ${start_epoch_json},
+  "command": "$( _e2e_json_escape "$cmd" )"
+}
+EOJSON
+}
+
 _e2e_now_rfc3339() {
+    if [ "${E2E_CLOCK_MODE:-wall}" = "deterministic" ]; then
+        local epoch="${E2E_RUN_START_EPOCH_S}"
+        epoch=$(( epoch + _E2E_TRACE_SEQ ))
+        (( _E2E_TRACE_SEQ++ )) || true
+        date -u -d "@${epoch}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
+        return 0
+    fi
+
     date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
@@ -355,6 +511,16 @@ e2e_write_meta_json() {
         py_ver="$(python --version 2>&1 || true)"
     fi
 
+    local seed_json="0"
+    if [[ "${E2E_SEED}" =~ ^[0-9]+$ ]]; then
+        seed_json="${E2E_SEED}"
+    fi
+
+    local start_epoch_json="0"
+    if [[ "${E2E_RUN_START_EPOCH_S}" =~ ^[0-9]+$ ]]; then
+        start_epoch_json="${E2E_RUN_START_EPOCH_S}"
+    fi
+
     cat > "${artifact_dir}/meta.json" <<EOJSON
 {
   "schema_version": 1,
@@ -378,6 +544,11 @@ e2e_write_meta_json() {
   "paths": {
     "project_root": "$( _e2e_json_escape "$E2E_PROJECT_ROOT" )",
     "artifact_dir": "$( _e2e_json_escape "$artifact_dir" )"
+  },
+  "determinism": {
+    "clock_mode": "$( _e2e_json_escape "$E2E_CLOCK_MODE" )",
+    "seed": ${seed_json},
+    "run_start_epoch_s": ${start_epoch_json}
   }
 }
 EOJSON
@@ -446,6 +617,10 @@ e2e_write_transcript_summary() {
         echo "timestamp: ${E2E_TIMESTAMP}"
         echo "started_at: ${E2E_RUN_STARTED_AT}"
         echo "ended_at: ${E2E_RUN_ENDED_AT}"
+        echo "clock_mode: ${E2E_CLOCK_MODE}"
+        echo "seed: ${E2E_SEED}"
+        echo "run_start_epoch_s: ${E2E_RUN_START_EPOCH_S}"
+        echo "repro_command: $(e2e_repro_command | tr -d '\n')"
         echo "counts: total=${_E2E_TOTAL} pass=${_E2E_PASS} fail=${_E2E_FAIL} skip=${_E2E_SKIP}"
         echo "git: commit=${git_commit} branch=${git_branch} dirty=${git_dirty}"
         echo "artifacts_dir: ${artifact_dir}"
@@ -455,6 +630,8 @@ e2e_write_transcript_summary() {
         echo "  meta: meta.json"
         echo "  metrics: metrics.json"
         echo "  trace: trace/events.jsonl"
+        echo "  repro: repro.txt"
+        echo "  repro_json: repro.json"
         echo "  env: diagnostics/env_redacted.txt"
         echo "  tree: diagnostics/tree.txt"
     } >"$out"
@@ -974,7 +1151,12 @@ e2e_summary() {
     echo -e "${_e2e_color_blue}════════════════════════════════════════════════════════════${_e2e_color_reset}"
 
     E2E_RUN_ENDED_AT="$(_e2e_now_rfc3339)"
-    E2E_RUN_END_EPOCH_S="$(date +%s)"
+    if [ "${E2E_CLOCK_MODE:-wall}" = "deterministic" ]; then
+        # _e2e_now_rfc3339 advances _E2E_TRACE_SEQ by 1.
+        E2E_RUN_END_EPOCH_S=$(( E2E_RUN_START_EPOCH_S + _E2E_TRACE_SEQ - 1 ))
+    else
+        E2E_RUN_END_EPOCH_S="$(date +%s)"
+    fi
     _e2e_trace_event "suite_end" ""
 
     # Save summary to artifacts
@@ -984,6 +1166,7 @@ e2e_summary() {
         e2e_write_metrics_json
         e2e_write_diagnostics_files
         e2e_write_transcript_summary
+        e2e_write_repro_files
 
         # Emit a versioned bundle manifest and validate it. This provides
         # artifact-contract enforcement for CI regression triage (br-3vwi.10.18).
@@ -995,6 +1178,10 @@ e2e_summary() {
     fi
 
     if [ "$_E2E_FAIL" -gt 0 ]; then
+        echo "" >&2
+        echo "[e2e] Repro:" >&2
+        e2e_repro_command >&2
+        echo "" >&2
         return 1
     fi
     return 0

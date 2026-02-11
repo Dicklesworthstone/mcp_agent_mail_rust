@@ -17,6 +17,16 @@
 //! entity inventories, timing, and validation results.
 
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast,
+    clippy::doc_markdown,
+    clippy::option_if_let_else,
+    clippy::type_complexity
+)]
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -224,6 +234,7 @@ fn count_table(conn: &sqlmodel_sqlite::SqliteConnection, table: &str) -> i64 {
         .and_then(|r| r.get_by_name("COUNT(*)"))
         .and_then(|v| match v {
             SqlValue::BigInt(n) => Some(*n),
+            SqlValue::Int(n) => Some(i64::from(*n)),
             _ => None,
         })
         .unwrap_or(0)

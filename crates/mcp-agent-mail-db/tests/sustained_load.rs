@@ -23,7 +23,10 @@
     clippy::doc_markdown,
     clippy::similar_names,
     clippy::redundant_closure_for_method_calls,
-    clippy::significant_drop_tightening
+    clippy::significant_drop_tightening,
+    clippy::items_after_statements,
+    clippy::struct_excessive_bools,
+    clippy::missing_const_for_fn
 )]
 
 use asupersync::runtime::RuntimeBuilder;
@@ -732,7 +735,11 @@ impl Rng64 {
     const fn new(seed: u64) -> Self {
         // Ensure non-zero state
         Self {
-            state: if seed == 0 { 0x517c_c1b7_2722_0a95 } else { seed },
+            state: if seed == 0 {
+                0x517c_c1b7_2722_0a95
+            } else {
+                seed
+            },
         }
     }
 
@@ -851,8 +858,8 @@ fn multi_project_soak_replay() {
     let total_agents = n_projects * agents_per_project;
 
     // Threshold budgets
-    let p99_budget_us: u64 = 3_000_000;     // 3s
-    let rss_budget_kb: u64 = 150 * 1024;    // 150MB
+    let p99_budget_us: u64 = 3_000_000; // 3s
+    let rss_budget_kb: u64 = 150 * 1024; // 150MB
     let wal_budget_bytes: u64 = 200 * 1024 * 1024; // 200MB
     let degradation_budget_pct: f64 = 25.0;
 
@@ -862,7 +869,9 @@ fn multi_project_soak_replay() {
 
     // ── Pool setup ──
     let dir = tempfile::tempdir().expect("create tempdir");
-    let db_path = dir.path().join(format!("soak_multi_{}.db", unique_suffix()));
+    let db_path = dir
+        .path()
+        .join(format!("soak_multi_{}.db", unique_suffix()));
     let db_path_str = db_path.display().to_string();
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{db_path_str}"),
@@ -919,8 +928,14 @@ fn multi_project_soak_replay() {
                 let p = pool.clone();
                 block_on(|cx| async move {
                     match queries::register_agent(
-                        &cx, &p, project_id, &name, "soak-test", "soak-model",
-                        Some("multi-project soak worker"), None,
+                        &cx,
+                        &p,
+                        project_id,
+                        &name,
+                        "soak-test",
+                        "soak-model",
+                        Some("multi-project soak worker"),
+                        None,
                     )
                     .await
                     {
@@ -939,10 +954,16 @@ fn multi_project_soak_replay() {
             let p = pool.clone();
             block_on(|cx| async move {
                 let _ = queries::create_message_with_recipients(
-                    &cx, &p, project_id, sender,
+                    &cx,
+                    &p,
+                    project_id,
+                    sender,
                     &format!("soak-seed-p{p_idx}-{i}"),
                     &format!("seed body for soak project {p_idx} message {i}"),
-                    None, "normal", i % 3 == 0, "",
+                    None,
+                    "normal",
+                    i % 3 == 0,
+                    "",
                     &[(receiver, "to")],
                 )
                 .await;
@@ -968,11 +989,8 @@ fn multi_project_soak_replay() {
     let error_count = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
     let rate_limiter = Arc::new(RateLimiter::new(target_rps));
-    let per_project_ops: Arc<Vec<AtomicU64>> = Arc::new(
-        (0..n_projects)
-            .map(|_| AtomicU64::new(0))
-            .collect(),
-    );
+    let per_project_ops: Arc<Vec<AtomicU64>> =
+        Arc::new((0..n_projects).map(|_| AtomicU64::new(0)).collect());
 
     let initial_rss = rss_kb();
 
@@ -1018,9 +1036,14 @@ fn multi_project_soak_replay() {
                 };
                 eprintln!(
                     "  [{:>4}s] ops={:<7} rps={:<7.1} p50={:<7}μs p95={:<7}μs p99={:<7}μs errs={} rss={}KB wal={:.1}MB health={}",
-                    entry.elapsed_secs, entry.ops_total, entry.actual_rps,
-                    entry.p50_us, entry.p95_us, entry.p99_us,
-                    entry.errors, entry.rss_kb,
+                    entry.elapsed_secs,
+                    entry.ops_total,
+                    entry.actual_rps,
+                    entry.p50_us,
+                    entry.p95_us,
+                    entry.p99_us,
+                    entry.errors,
+                    entry.rss_kb,
                     entry.wal_bytes as f64 / (1024.0 * 1024.0),
                     entry.health_level,
                 );
@@ -1101,13 +1124,19 @@ fn multi_project_soak_replay() {
                         OpType::SendMessage => {
                             let p = pool.clone();
                             let subj = format!("soak-w{worker_id}-p{proj_idx}-{local_ops}");
-                            let body = format!(
-                                "soak body w{worker_id} p{proj_idx} op{local_ops}"
-                            );
+                            let body = format!("soak body w{worker_id} p{proj_idx} op{local_ops}");
                             block_on(|cx| async move {
                                 match queries::create_message_with_recipients(
-                                    &cx, &p, project_id, agent_id,
-                                    &subj, &body, None, "normal", false, "",
+                                    &cx,
+                                    &p,
+                                    project_id,
+                                    agent_id,
+                                    &subj,
+                                    &body,
+                                    None,
+                                    "normal",
+                                    false,
+                                    "",
                                     &[(receiver_id, "to")],
                                 )
                                 .await
@@ -1133,13 +1162,17 @@ fn multi_project_soak_replay() {
                         }
                         OpType::Reservation => {
                             let p = pool.clone();
-                            let path = format!(
-                                "src/p{proj_idx}/w{worker_id}/file_{local_ops}.rs"
-                            );
+                            let path = format!("src/p{proj_idx}/w{worker_id}/file_{local_ops}.rs");
                             block_on(|cx| async move {
                                 match queries::create_file_reservations(
-                                    &cx, &p, project_id, agent_id,
-                                    &[path.as_str()], 300, true, "soak test",
+                                    &cx,
+                                    &p,
+                                    project_id,
+                                    agent_id,
+                                    &[path.as_str()],
+                                    300,
+                                    true,
+                                    "soak test",
                                 )
                                 .await
                                 {
@@ -1147,10 +1180,9 @@ fn multi_project_soak_replay() {
                                         let ids: Vec<i64> =
                                             reservations.iter().filter_map(|r| r.id).collect();
                                         if !ids.is_empty() {
-                                            let _ = queries::release_reservations_by_ids(
-                                                &cx, &p, &ids,
-                                            )
-                                            .await;
+                                            let _ =
+                                                queries::release_reservations_by_ids(&cx, &p, &ids)
+                                                    .await;
                                         }
                                         Ok(())
                                     }
@@ -1182,8 +1214,7 @@ fn multi_project_soak_replay() {
                         }
                     };
 
-                    let op_us =
-                        u64::try_from(op_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    let op_us = u64::try_from(op_start.elapsed().as_micros()).unwrap_or(u64::MAX);
                     latency.record(op_us);
 
                     match result {
@@ -1264,13 +1295,13 @@ fn multi_project_soak_replay() {
 
     // ── Build threshold results ──
     let thresholds = ThresholdResults {
-        p99_budget_us: p99_budget_us,
+        p99_budget_us,
         p99_actual_us: final_snap.p99,
         p99_pass: final_snap.p99 <= p99_budget_us,
-        rss_budget_kb: rss_budget_kb,
+        rss_budget_kb,
         rss_growth_kb,
         rss_pass: rss_growth_kb <= rss_budget_kb,
-        wal_budget_bytes: wal_budget_bytes,
+        wal_budget_bytes,
         wal_actual_bytes: final_wal,
         wal_pass: final_wal <= wal_budget_bytes,
         errors_pass: total_errors == 0,
@@ -1330,19 +1361,22 @@ fn multi_project_soak_replay() {
         rss_growth_kb,
         wal_bytes: final_wal,
         per_project_ops: pp_ops_vec.clone(),
-        snapshots: snaps.iter().map(|s| SoakTimeSeriesEntry {
-            elapsed_secs: s.elapsed_secs,
-            ops_total: s.ops_total,
-            actual_rps: s.actual_rps,
-            p50_us: s.p50_us,
-            p95_us: s.p95_us,
-            p99_us: s.p99_us,
-            max_us: s.max_us,
-            errors: s.errors,
-            rss_kb: s.rss_kb,
-            wal_bytes: s.wal_bytes,
-            health_level: s.health_level.clone(),
-        }).collect(),
+        snapshots: snaps
+            .iter()
+            .map(|s| SoakTimeSeriesEntry {
+                elapsed_secs: s.elapsed_secs,
+                ops_total: s.ops_total,
+                actual_rps: s.actual_rps,
+                p50_us: s.p50_us,
+                p95_us: s.p95_us,
+                p99_us: s.p99_us,
+                max_us: s.max_us,
+                errors: s.errors,
+                rss_kb: s.rss_kb,
+                wal_bytes: s.wal_bytes,
+                health_level: s.health_level.clone(),
+            })
+            .collect(),
         thresholds: thresholds.clone(),
         verdict: verdict.clone(),
     };
@@ -1363,7 +1397,9 @@ fn multi_project_soak_replay() {
     );
     eprintln!(
         "  RSS:          {}KB → {}KB (growth: {}KB = {:.1}MB, budget: {:.0}MB)",
-        initial_rss, final_rss, rss_growth_kb,
+        initial_rss,
+        final_rss,
+        rss_growth_kb,
         rss_growth_kb as f64 / 1024.0,
         rss_budget_kb as f64 / 1024.0,
     );
@@ -1406,8 +1442,10 @@ fn multi_project_soak_replay() {
          - WAL size (large WAL slows reads)\n\
          - Pool exhaustion (increase max_connections)\n\
          - FTS query complexity (optimize search_messages)",
-        final_snap.p99, final_snap.p99 as f64 / 1000.0,
-        p99_budget_us, p99_budget_us as f64 / 1000.0,
+        final_snap.p99,
+        final_snap.p99 as f64 / 1000.0,
+        p99_budget_us,
+        p99_budget_us as f64 / 1000.0,
     );
     assert!(
         thresholds.rss_pass,
@@ -1416,8 +1454,10 @@ fn multi_project_soak_replay() {
          - Read cache growth (invalidation frequency)\n\
          - Event ring buffer sizing\n\
          - Per-query allocation patterns",
-        rss_growth_kb, rss_growth_kb as f64 / 1024.0,
-        rss_budget_kb, rss_budget_kb as f64 / 1024.0,
+        rss_growth_kb,
+        rss_growth_kb as f64 / 1024.0,
+        rss_budget_kb,
+        rss_budget_kb as f64 / 1024.0,
     );
     assert!(
         thresholds.wal_pass,
@@ -1426,7 +1466,8 @@ fn multi_project_soak_replay() {
          - PRAGMA wal_autocheckpoint tuning\n\
          - Write batching in deferred touch handler\n\
          - Message volume rate limiting",
-        final_wal, final_wal as f64 / (1024.0 * 1024.0),
+        final_wal,
+        final_wal as f64 / (1024.0 * 1024.0),
         wal_budget_bytes as f64 / (1024.0 * 1024.0),
     );
     assert!(
@@ -1438,5 +1479,7 @@ fn multi_project_soak_replay() {
          - Cache eviction thrashing under multi-project load",
     );
 
-    eprintln!("\n=== PASS: multi-project soak {n_projects}p×{agents_per_project}a at {target_rps} RPS for {duration_secs}s (seed={seed}) ===");
+    eprintln!(
+        "\n=== PASS: multi-project soak {n_projects}p×{agents_per_project}a at {target_rps} RPS for {duration_secs}s (seed={seed}) ==="
+    );
 }
