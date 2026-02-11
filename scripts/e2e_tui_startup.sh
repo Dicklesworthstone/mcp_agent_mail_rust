@@ -3,6 +3,7 @@
 #
 # Run via:
 #   ./scripts/e2e_test.sh tui_startup
+#   bash scripts/e2e_tui_startup.sh --showcase
 #
 # Validates:
 #   - `mcp-agent-mail serve` starts server+TUI and reaches ready state.
@@ -14,29 +15,52 @@
 #
 # Artifacts:
 #   tests/artifacts/tui_startup/<timestamp>/*
+#   tests/artifacts/tui_showcase/<timestamp>/*  (when --showcase)
 
 set -euo pipefail
 
 : "${AM_E2E_KEEP_TMP:=1}"
 
-E2E_SUITE="${E2E_SUITE:-tui_startup}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHOWCASE_MODE=0
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<'EOF'
+Usage:
+  bash scripts/e2e_tui_startup.sh
+  bash scripts/e2e_tui_startup.sh --showcase
+
+Modes:
+  default     Run startup contract assertions (existing tui_startup suite).
+  --showcase  Run deterministic demo orchestration across startup, search,
+              interactions, security/redaction, macro tools/playback, and
+              cross-terminal compatibility.
+EOF
+    exit 0
+fi
+
+if [ "${1:-}" = "--showcase" ]; then
+    SHOWCASE_MODE=1
+    shift
+fi
+
+if [ "${SHOWCASE_MODE}" -eq 1 ]; then
+    E2E_SUITE="${E2E_SUITE:-tui_showcase}"
+else
+    E2E_SUITE="${E2E_SUITE:-tui_startup}"
+fi
+
 # shellcheck source=./e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 e2e_init_artifacts
-e2e_banner "TUI Startup (PTY) E2E Test Suite"
+if [ "${SHOWCASE_MODE}" -eq 1 ]; then
+    e2e_banner "TUI Showcase Demo (Deterministic) E2E Orchestration"
+else
+    e2e_banner "TUI Startup (PTY) E2E Test Suite"
+fi
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
-
-for cmd in script timeout python3 curl; do
-    if ! command -v "${cmd}" >/dev/null 2>&1; then
-        e2e_log "${cmd} not found; skipping suite"
-        e2e_skip "${cmd} required"
-        e2e_summary
-        exit 0
-    fi
-done
 
 e2e_fatal() {
     local msg="$1"
@@ -192,6 +216,331 @@ stop_server() {
         kill -9 "${pid}" 2>/dev/null || true
     fi
 }
+
+showcase_assert_file_exists() {
+    local label="$1"
+    local path="$2"
+    if [ -f "${path}" ]; then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label}"
+        e2e_log "missing file: ${path}"
+    fi
+}
+
+showcase_assert_summary_green() {
+    local label="$1"
+    local summary_path="$2"
+    if [ ! -f "${summary_path}" ]; then
+        e2e_fail "${label}"
+        e2e_log "missing summary: ${summary_path}"
+        return
+    fi
+
+    if python3 - "${summary_path}" <<'PY'
+import json
+import sys
+
+summary_path = sys.argv[1]
+with open(summary_path, "r", encoding="utf-8") as f:
+    summary = json.load(f)
+
+fail = int(summary.get("fail", 0))
+skip = int(summary.get("skip", 0))
+if fail != 0:
+    raise SystemExit(1)
+print(f"fail={fail} skip={skip}")
+PY
+    then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label}"
+    fi
+}
+
+showcase_require_prereqs() {
+    local missing=0
+    for cmd in script timeout python3 curl tmux expect cargo; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            e2e_fail "showcase prerequisite missing: ${cmd}"
+            missing=1
+        else
+            e2e_pass "showcase prerequisite available: ${cmd}"
+        fi
+    done
+
+    if python3 -c "import pyte" >/dev/null 2>&1; then
+        e2e_pass "showcase prerequisite available: python3 module pyte"
+    else
+        e2e_fail "showcase prerequisite missing: python3 module pyte"
+        missing=1
+    fi
+
+    return "${missing}"
+}
+
+showcase_verify_suite_artifacts() {
+    local suite="$1"
+    local suite_dir="$2"
+    local summary="${suite_dir}/summary.json"
+
+    showcase_assert_file_exists "${suite}: summary.json exists" "${summary}"
+    showcase_assert_file_exists "${suite}: bundle.json exists" "${suite_dir}/bundle.json"
+    showcase_assert_summary_green "${suite}: summary reports zero failures" "${summary}"
+
+    case "${suite}" in
+        tui_startup)
+            showcase_assert_file_exists "${suite}: PTY transcript exists" "${suite_dir}/server_tui_ready.normalized.txt"
+            e2e_assert_file_contains "${suite}: masked token shown" "${suite_dir}/server_token_auto.log" "****"
+            e2e_assert_file_not_contains "${suite}: raw token redacted" "${suite_dir}/server_token_auto.log" "test-secret-token-e2e-12345"
+            ;;
+        search_cockpit)
+            showcase_assert_file_exists "${suite}: keyword search artifact exists" "${suite_dir}/case_01_keyword.txt"
+            showcase_assert_file_exists "${suite}: boolean search artifact exists" "${suite_dir}/case_04_boolean.txt"
+            showcase_assert_file_exists "${suite}: thread summary artifact exists" "${suite_dir}/case_07_thread_summary.txt"
+            ;;
+        tui_interactions)
+            showcase_assert_file_exists "${suite}: analytics rendered transcript exists" "${suite_dir}/analytics_widgets.rendered.txt"
+            showcase_assert_file_exists "${suite}: analytics action trace exists" "${suite_dir}/trace/analytics_widgets_timeline.tsv"
+            e2e_assert_file_contains "${suite}: action trace has ToolMetrics step" "${suite_dir}/trace/analytics_widgets_timeline.tsv" "ToolMetrics"
+            ;;
+        security_privacy)
+            showcase_assert_file_exists "${suite}: hostile markdown artifact exists" "${suite_dir}/case_06_hostile_md.txt"
+            showcase_assert_file_exists "${suite}: secret body artifact exists" "${suite_dir}/case_09_secret_body.txt"
+            showcase_assert_file_exists "${suite}: search scope artifact exists" "${suite_dir}/case_01_search_scope.txt"
+            ;;
+        macros)
+            showcase_assert_file_exists "${suite}: start session artifact exists" "${suite_dir}/case_01_start_session.txt"
+            showcase_assert_file_exists "${suite}: reservation cycle artifact exists" "${suite_dir}/case_02_reservation_cycle.txt"
+            showcase_assert_file_exists "${suite}: slot conflict artifact exists" "${suite_dir}/case_05_slot_conflict.txt"
+            ;;
+        tui_compat_matrix)
+            showcase_assert_file_exists "${suite}: tmux layout trace exists" "${suite_dir}/profiles/tmux_screen_resize_matrix/layout_trace.tsv"
+            showcase_assert_file_exists "${suite}: tmux layout trace json exists" "${suite_dir}/profiles/tmux_screen_resize_matrix/layout_trace.json"
+            e2e_assert_file_contains "${suite}: matrix includes tool metrics screen capture" "${suite_dir}/profiles/tmux_screen_resize_matrix/layout_trace.tsv" "tool_metrics"
+            ;;
+    esac
+}
+
+showcase_run_suite() {
+    local suite="$1"
+    local reason="$2"
+    local log_path="${E2E_ARTIFACT_DIR}/showcase/logs/${suite}.log"
+    local suite_dir="${E2E_PROJECT_ROOT}/tests/artifacts/${suite}/${SHOWCASE_TIMESTAMP}"
+    local rc=0
+
+    e2e_case_banner "showcase_suite_${suite}"
+    e2e_log "Running suite ${suite}: ${reason}"
+
+    (
+        cd "${E2E_PROJECT_ROOT}"
+        AM_E2E_KEEP_TMP=1 \
+        E2E_CLOCK_MODE="${SHOWCASE_CLOCK_MODE}" \
+        E2E_SEED="${SHOWCASE_SEED}" \
+        E2E_TIMESTAMP="${SHOWCASE_TIMESTAMP}" \
+        E2E_RUN_STARTED_AT="${SHOWCASE_RUN_STARTED_AT}" \
+        E2E_RUN_START_EPOCH_S="${SHOWCASE_RUN_START_EPOCH_S}" \
+        bash "./scripts/e2e_test.sh" "${suite}"
+    ) >"${log_path}" 2>&1 || rc=$?
+
+    if [ "${rc}" -eq 0 ]; then
+        e2e_pass "${suite}: suite command exited 0"
+    else
+        e2e_fail "${suite}: suite command failed (rc=${rc})"
+        e2e_log "suite log: ${log_path}"
+    fi
+
+    if [ -d "${suite_dir}" ]; then
+        e2e_pass "${suite}: artifact directory created"
+    else
+        e2e_fail "${suite}: artifact directory missing"
+        e2e_log "expected artifact directory: ${suite_dir}"
+    fi
+
+    showcase_verify_suite_artifacts "${suite}" "${suite_dir}"
+    printf "%s\t%s\t%s\t%s\n" "${suite}" "${rc}" "${suite_dir}" "${log_path}" >> "${SHOWCASE_INDEX_TSV}"
+}
+
+showcase_find_latest_macro_playback_dir() {
+    local pattern="$1"
+    find "${E2E_PROJECT_ROOT}/tests/artifacts/tui/macro_replay" \
+        -mindepth 1 -maxdepth 1 -type d -name "${pattern}" 2>/dev/null | sort | tail -n 1
+}
+
+showcase_run_macro_playback_forensics() {
+    local replay_root="${E2E_PROJECT_ROOT}/tests/artifacts/tui/macro_replay"
+    local log_path="${E2E_ARTIFACT_DIR}/showcase/logs/macro_playback_forensics.log"
+    local rc=0
+
+    e2e_case_banner "showcase_macro_playback_forensics"
+    mkdir -p "${replay_root}"
+
+    local before_count
+    before_count="$(find "${replay_root}" -mindepth 1 -maxdepth 1 -type d -name '*_record_save_load_replay' 2>/dev/null | wc -l | tr -d '[:space:]')"
+
+    (
+        cd "${E2E_PROJECT_ROOT}"
+        cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture
+    ) >"${log_path}" 2>&1 || rc=$?
+
+    if [ "${rc}" -eq 0 ]; then
+        e2e_pass "macro playback forensics test exits 0"
+    else
+        e2e_fail "macro playback forensics test failed (rc=${rc})"
+        e2e_log "macro playback log: ${log_path}"
+    fi
+
+    local after_count
+    after_count="$(find "${replay_root}" -mindepth 1 -maxdepth 1 -type d -name '*_record_save_load_replay' 2>/dev/null | wc -l | tr -d '[:space:]')"
+    if [ "${after_count}" -gt "${before_count}" ]; then
+        e2e_pass "macro playback created a new replay artifact directory"
+    else
+        e2e_skip "macro playback directory count unchanged; reusing latest artifact"
+    fi
+
+    SHOWCASE_MACRO_REPLAY_DIR="$(showcase_find_latest_macro_playback_dir '*_record_save_load_replay')"
+    if [ -n "${SHOWCASE_MACRO_REPLAY_DIR}" ] && [ -d "${SHOWCASE_MACRO_REPLAY_DIR}" ]; then
+        e2e_pass "macro playback artifact directory resolved"
+        showcase_assert_file_exists "macro playback report exists" "${SHOWCASE_MACRO_REPLAY_DIR}/report.json"
+        showcase_assert_file_exists "macro playback recorded steps exist" "${SHOWCASE_MACRO_REPLAY_DIR}/steps/step_0001_record.json"
+        showcase_assert_file_exists "macro playback replay steps exist" "${SHOWCASE_MACRO_REPLAY_DIR}/steps/step_0001_play.json"
+        e2e_copy_artifact "${SHOWCASE_MACRO_REPLAY_DIR}/report.json" "showcase/macro_playback/report.json"
+        e2e_copy_artifact "${SHOWCASE_MACRO_REPLAY_DIR}/steps" "showcase/macro_playback/steps"
+    else
+        e2e_fail "macro playback artifact directory not found"
+    fi
+
+    printf "%s\t%s\t%s\t%s\n" \
+        "macro_playback_forensics" \
+        "${rc}" \
+        "${SHOWCASE_MACRO_REPLAY_DIR:-<missing>}" \
+        "${log_path}" >> "${SHOWCASE_INDEX_TSV}"
+}
+
+showcase_write_manifest() {
+    local manifest="${E2E_ARTIFACT_DIR}/showcase/manifest.json"
+    python3 - "${SHOWCASE_INDEX_TSV}" "${manifest}" "${SHOWCASE_REPRO_COMMAND}" "${SHOWCASE_TIMESTAMP}" "${SHOWCASE_SEED}" "${SHOWCASE_CLOCK_MODE}" <<'PY'
+import csv
+import json
+import pathlib
+import sys
+
+index_path = pathlib.Path(sys.argv[1])
+manifest_path = pathlib.Path(sys.argv[2])
+repro_cmd = sys.argv[3]
+timestamp = sys.argv[4]
+seed = sys.argv[5]
+clock_mode = sys.argv[6]
+
+rows = []
+with index_path.open("r", encoding="utf-8") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        rows.append(row)
+
+status = "pass"
+for row in rows:
+    if row.get("rc", "0") != "0":
+        status = "fail"
+        break
+
+manifest = {
+    "schema": "tui_showcase.v1",
+    "status": status,
+    "timestamp": timestamp,
+    "clock_mode": clock_mode,
+    "seed": seed,
+    "repro_command": repro_cmd,
+    "stages": rows,
+}
+
+manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+PY
+    showcase_assert_file_exists "showcase manifest written" "${manifest}"
+}
+
+run_showcase() {
+    SHOWCASE_CLOCK_MODE="${AM_TUI_SHOWCASE_CLOCK_MODE:-deterministic}"
+    SHOWCASE_SEED="${AM_TUI_SHOWCASE_SEED:-${E2E_SEED}}"
+    SHOWCASE_TIMESTAMP="${AM_TUI_SHOWCASE_TIMESTAMP:-${E2E_TIMESTAMP}}"
+    SHOWCASE_RUN_STARTED_AT="${AM_TUI_SHOWCASE_RUN_STARTED_AT:-${E2E_RUN_STARTED_AT}}"
+    SHOWCASE_RUN_START_EPOCH_S="${AM_TUI_SHOWCASE_RUN_START_EPOCH_S:-${E2E_RUN_START_EPOCH_S}}"
+    SHOWCASE_SUITES="${AM_TUI_SHOWCASE_SUITES:-tui_startup,search_cockpit,tui_interactions,security_privacy,macros,tui_compat_matrix}"
+    SHOWCASE_INDEX_TSV="${E2E_ARTIFACT_DIR}/showcase/index.tsv"
+    SHOWCASE_MACRO_REPLAY_DIR=""
+
+    e2e_case_banner "showcase_reset_setup"
+    mkdir -p "${E2E_ARTIFACT_DIR}/showcase/logs"
+    {
+        echo "SHOWCASE_CLOCK_MODE=${SHOWCASE_CLOCK_MODE}"
+        echo "SHOWCASE_SEED=${SHOWCASE_SEED}"
+        echo "SHOWCASE_TIMESTAMP=${SHOWCASE_TIMESTAMP}"
+        echo "SHOWCASE_RUN_STARTED_AT=${SHOWCASE_RUN_STARTED_AT}"
+        echo "SHOWCASE_RUN_START_EPOCH_S=${SHOWCASE_RUN_START_EPOCH_S}"
+        echo "SHOWCASE_SUITES=${SHOWCASE_SUITES}"
+    } > "${E2E_ARTIFACT_DIR}/showcase/reset_setup.env"
+    printf "suite\trc\tartifact_dir\tlog_path\n" > "${SHOWCASE_INDEX_TSV}"
+    e2e_pass "showcase reset/setup context captured"
+
+    e2e_case_banner "showcase_prerequisites"
+    if ! showcase_require_prereqs; then
+        e2e_fatal "showcase prerequisites missing; install required commands/modules"
+    fi
+
+    for suite in ${SHOWCASE_SUITES//,/ }; do
+        case "${suite}" in
+            tui_startup)
+                showcase_run_suite "${suite}" "bootstrap banner + token redaction sanity"
+                ;;
+            search_cockpit)
+                showcase_run_suite "${suite}" "search explorer deterministic query corpus"
+                ;;
+            tui_interactions)
+                showcase_run_suite "${suite}" "explorer + analytics + widgets seeded interaction flow"
+                ;;
+            security_privacy)
+                showcase_run_suite "${suite}" "security/redaction/privacy behavior validation"
+                ;;
+            macros)
+                showcase_run_suite "${suite}" "macro helper workflows + build slot lifecycle"
+                ;;
+            tui_compat_matrix)
+                showcase_run_suite "${suite}" "cross-terminal profiles with resize/unicode matrix"
+                ;;
+            *)
+                e2e_fail "unknown showcase suite: ${suite}"
+                printf "%s\t%s\t%s\t%s\n" "${suite}" "1" "<unknown>" "<none>" >> "${SHOWCASE_INDEX_TSV}"
+                ;;
+        esac
+    done
+
+    showcase_run_macro_playback_forensics
+
+    e2e_case_banner "showcase_teardown_handoff"
+    SHOWCASE_REPRO_COMMAND="cd ${E2E_PROJECT_ROOT} && AM_E2E_KEEP_TMP=1 E2E_CLOCK_MODE=${SHOWCASE_CLOCK_MODE} E2E_SEED=${SHOWCASE_SEED} E2E_TIMESTAMP=${SHOWCASE_TIMESTAMP} E2E_RUN_STARTED_AT=${SHOWCASE_RUN_STARTED_AT} E2E_RUN_START_EPOCH_S=${SHOWCASE_RUN_START_EPOCH_S} bash scripts/e2e_tui_startup.sh --showcase"
+    e2e_save_artifact "showcase/repro_command.txt" "${SHOWCASE_REPRO_COMMAND}"
+    e2e_save_artifact "showcase/teardown.txt" "Teardown is no-op by design. Artifacts are intentionally retained for handoff review under tests/artifacts."
+    showcase_write_manifest
+    e2e_pass "showcase handoff artifacts generated"
+}
+
+if [ "${SHOWCASE_MODE}" -eq 1 ]; then
+    run_showcase
+    e2e_summary
+    if [ "${_E2E_FAIL}" -gt 0 ]; then
+        exit 1
+    fi
+    exit 0
+fi
+
+for cmd in script timeout python3 curl; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        e2e_log "${cmd} not found; skipping suite"
+        e2e_skip "${cmd} required"
+        e2e_summary
+        exit 0
+    fi
+done
 
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 

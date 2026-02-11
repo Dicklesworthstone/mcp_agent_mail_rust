@@ -486,7 +486,59 @@ Run this before declaring a rollout candidate:
 5. Rollback readiness:
    confirm fallback launch command and prior known-good commit are recorded in incident notes before go/no-go.
 
-## 11. Graceful Shutdown
+## 11. Deterministic Showcase Demo
+
+Use this when you need a reproducible handoff bundle that demonstrates startup,
+search/explorer, analytics/widgets, security/redaction, macro workflows/playback,
+and cross-terminal compatibility in one run.
+
+### Run
+
+```bash
+bash scripts/e2e_tui_startup.sh --showcase
+```
+
+Optional deterministic overrides:
+
+```bash
+AM_TUI_SHOWCASE_SEED=20260211 \
+AM_TUI_SHOWCASE_TIMESTAMP=20260211_120000 \
+bash scripts/e2e_tui_startup.sh --showcase
+```
+
+### Stage Contract (Reset/Setup/Teardown Included)
+
+1. Reset/setup captures deterministic env and creates `tests/artifacts/tui_showcase/<timestamp>/showcase/`.
+2. Suite stages run and validate expected artifacts:
+   `tui_startup`, `search_cockpit`, `tui_interactions`, `security_privacy`,
+   `macros`, `tui_compat_matrix`.
+3. Macro playback forensics stage runs:
+   `cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture`.
+4. Teardown writes handoff metadata without deleting artifacts.
+
+### Handoff Artifacts
+
+| Artifact | Path |
+|----------|------|
+| Showcase manifest | `tests/artifacts/tui_showcase/<timestamp>/showcase/manifest.json` |
+| Stage index (suite + rc + log) | `tests/artifacts/tui_showcase/<timestamp>/showcase/index.tsv` |
+| Deterministic replay command | `tests/artifacts/tui_showcase/<timestamp>/showcase/repro_command.txt` |
+| Explorer/analytics/widgets trace | `tests/artifacts/tui_interactions/<timestamp>/trace/analytics_widgets_timeline.tsv` |
+| Security/redaction evidence | `tests/artifacts/security_privacy/<timestamp>/case_06_hostile_md.txt`, `tests/artifacts/security_privacy/<timestamp>/case_09_secret_body.txt` |
+| Cross-terminal profile matrix | `tests/artifacts/tui_compat_matrix/<timestamp>/profiles/tmux_screen_resize_matrix/layout_trace.tsv` |
+| Macro playback forensic report | `tests/artifacts/tui/macro_replay/*_record_save_load_replay/report.json` |
+
+### Demo Failure Recovery Appendix
+
+| Failure | Recovery Command |
+|---------|------------------|
+| Missing `pyte` for PTY render emulation | `python3 -m pip install --user pyte` |
+| Missing shell tools (`expect`, `tmux`, `script`) | Install required packages, then re-run showcase command. |
+| A specific suite fails and you need focused rerun | `AM_TUI_SHOWCASE_SUITES=tui_interactions bash scripts/e2e_tui_startup.sh --showcase` |
+| Macro playback forensic step fails | `cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture` |
+| Artifact path mismatch (wrong timestamp) | `ls -1 tests/artifacts/tui_showcase/ | tail -n 5` then open matching `showcase/index.tsv` |
+
+## 12. Graceful Shutdown
 
 Press `q` to initiate shutdown. The server:
 
@@ -498,7 +550,7 @@ Press `q` to initiate shutdown. The server:
 
 For immediate termination, send `SIGTERM` or `SIGINT` (Ctrl+C).
 
-## 12. Health Levels
+## 13. Health Levels
 
 The System Health screen shows overall health as Green/Yellow/Red:
 
@@ -511,7 +563,7 @@ The System Health screen shows overall health as Green/Yellow/Red:
 At Red level, the server may shed non-essential tools to protect core
 operations. Check the System Health screen for specifics.
 
-## 13. Common Operations
+## 14. Common Operations
 
 ### Restart without data loss
 ```bash
