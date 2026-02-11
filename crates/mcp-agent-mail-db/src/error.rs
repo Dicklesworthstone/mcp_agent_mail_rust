@@ -170,3 +170,260 @@ impl From<serde_json::Error> for DbError {
         Self::Serialization(e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Constructor helpers ──────────────────────────────────────────
+
+    #[test]
+    fn not_found_constructor() {
+        let e = DbError::not_found("Agent", "BlueLake");
+        assert!(matches!(
+            e,
+            DbError::NotFound {
+                entity: "Agent",
+                ..
+            }
+        ));
+        assert!(e.to_string().contains("BlueLake"));
+    }
+
+    #[test]
+    fn duplicate_constructor() {
+        let e = DbError::duplicate("Project", "/tmp/proj");
+        assert!(matches!(
+            e,
+            DbError::Duplicate {
+                entity: "Project",
+                ..
+            }
+        ));
+        assert!(e.to_string().contains("/tmp/proj"));
+    }
+
+    #[test]
+    fn invalid_argument_constructor() {
+        let e = DbError::invalid("name", "must be adjective+noun");
+        assert!(matches!(e, DbError::InvalidArgument { field: "name", .. }));
+        assert!(e.to_string().contains("must be adjective+noun"));
+    }
+
+    // ── error_code ──────────────────────────────────────────────────
+
+    #[test]
+    fn error_code_pool_exhausted() {
+        let e = DbError::PoolExhausted {
+            message: "test".into(),
+            pool_size: 5,
+            max_overflow: 10,
+        };
+        assert_eq!(e.error_code(), "DATABASE_POOL_EXHAUSTED");
+    }
+
+    #[test]
+    fn error_code_resource_busy() {
+        let e = DbError::ResourceBusy("busy".into());
+        assert_eq!(e.error_code(), "RESOURCE_BUSY");
+    }
+
+    #[test]
+    fn error_code_circuit_breaker() {
+        let e = DbError::CircuitBreakerOpen {
+            message: "open".into(),
+            failures: 5,
+            reset_after_secs: 30.0,
+        };
+        assert_eq!(e.error_code(), "RESOURCE_BUSY");
+    }
+
+    #[test]
+    fn error_code_not_found() {
+        let e = DbError::not_found("X", "y");
+        assert_eq!(e.error_code(), "NOT_FOUND");
+    }
+
+    #[test]
+    fn error_code_duplicate() {
+        let e = DbError::duplicate("X", "y");
+        assert_eq!(e.error_code(), "DUPLICATE");
+    }
+
+    #[test]
+    fn error_code_invalid_argument() {
+        let e = DbError::invalid("f", "bad");
+        assert_eq!(e.error_code(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn error_code_integrity_corruption() {
+        let e = DbError::IntegrityCorruption {
+            message: "bad page".into(),
+            details: vec!["page 42".into()],
+        };
+        assert_eq!(e.error_code(), "INTEGRITY_CORRUPTION");
+    }
+
+    #[test]
+    fn error_code_internal_variants() {
+        // Sqlite, Pool, Schema, Serialization, Internal all map to INTERNAL_ERROR
+        for e in [
+            DbError::Sqlite("err".into()),
+            DbError::Pool("err".into()),
+            DbError::Schema("err".into()),
+            DbError::Serialization("err".into()),
+            DbError::Internal("err".into()),
+        ] {
+            assert_eq!(e.error_code(), "INTERNAL_ERROR", "for {e}");
+        }
+    }
+
+    // ── is_retryable ────────────────────────────────────────────────
+
+    #[test]
+    fn retryable_pool_exhausted() {
+        let e = DbError::PoolExhausted {
+            message: "timeout".into(),
+            pool_size: 3,
+            max_overflow: 0,
+        };
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn retryable_resource_busy_with_lock_msg() {
+        let e = DbError::ResourceBusy("database is locked".into());
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn retryable_sqlite_locked() {
+        let e = DbError::Sqlite("database is locked".into());
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn not_retryable_sqlite_syntax() {
+        let e = DbError::Sqlite("syntax error near SELECT".into());
+        assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn not_retryable_not_found() {
+        let e = DbError::not_found("Agent", "x");
+        assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn not_retryable_duplicate() {
+        let e = DbError::duplicate("Agent", "x");
+        assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn not_retryable_invalid() {
+        let e = DbError::invalid("f", "bad");
+        assert!(!e.is_retryable());
+    }
+
+    // ── is_recoverable ──────────────────────────────────────────────
+
+    #[test]
+    fn recoverable_variants() {
+        assert!(
+            DbError::PoolExhausted {
+                message: "x".into(),
+                pool_size: 1,
+                max_overflow: 0
+            }
+            .is_recoverable()
+        );
+        assert!(DbError::ResourceBusy("x".into()).is_recoverable());
+        assert!(
+            DbError::CircuitBreakerOpen {
+                message: "x".into(),
+                failures: 1,
+                reset_after_secs: 1.0
+            }
+            .is_recoverable()
+        );
+        assert!(DbError::Pool("x".into()).is_recoverable());
+    }
+
+    #[test]
+    fn not_recoverable_variants() {
+        assert!(!DbError::not_found("X", "y").is_recoverable());
+        assert!(!DbError::duplicate("X", "y").is_recoverable());
+        assert!(!DbError::invalid("f", "m").is_recoverable());
+        assert!(!DbError::Sqlite("err".into()).is_recoverable());
+        assert!(!DbError::Schema("err".into()).is_recoverable());
+        assert!(!DbError::Internal("err".into()).is_recoverable());
+    }
+
+    // ── is_lock_error ───────────────────────────────────────────────
+
+    #[test]
+    fn lock_error_patterns() {
+        assert!(is_lock_error("database is locked"));
+        assert!(is_lock_error("Database Is Locked")); // case-insensitive
+        assert!(is_lock_error("database is busy"));
+        assert!(is_lock_error("file locked by another process"));
+        assert!(is_lock_error("unable to open database file"));
+        assert!(is_lock_error("disk I/O error"));
+    }
+
+    #[test]
+    fn not_lock_error() {
+        assert!(!is_lock_error("syntax error"));
+        assert!(!is_lock_error("table not found"));
+        assert!(!is_lock_error(""));
+    }
+
+    // ── is_pool_exhausted_error ─────────────────────────────────────
+
+    #[test]
+    fn pool_exhausted_patterns() {
+        assert!(is_pool_exhausted_error("pool timeout after 30s"));
+        assert!(is_pool_exhausted_error("connection pool exhausted"));
+        assert!(is_pool_exhausted_error("QueuePool limit reached"));
+    }
+
+    #[test]
+    fn not_pool_exhausted() {
+        assert!(!is_pool_exhausted_error("database is locked"));
+        assert!(!is_pool_exhausted_error("pool party")); // "pool" alone isn't enough
+        assert!(!is_pool_exhausted_error(""));
+    }
+
+    // ── From<serde_json::Error> ─────────────────────────────────────
+
+    #[test]
+    fn from_serde_json_error() {
+        let json_err = serde_json::from_str::<i32>("invalid").unwrap_err();
+        let db_err: DbError = json_err.into();
+        assert!(matches!(db_err, DbError::Serialization(_)));
+        assert_eq!(db_err.error_code(), "INTERNAL_ERROR");
+    }
+
+    // ── Display ─────────────────────────────────────────────────────
+
+    #[test]
+    fn display_messages_are_informative() {
+        let cases: Vec<(DbError, &str)> = vec![
+            (DbError::Sqlite("oops".into()), "SQLite error: oops"),
+            (DbError::Pool("gone".into()), "Pool error: gone"),
+            (DbError::not_found("Agent", "X"), "Agent not found: X"),
+            (
+                DbError::duplicate("Project", "/tmp"),
+                "Project already exists: /tmp",
+            ),
+            (DbError::invalid("name", "bad"), "Invalid name: bad"),
+            (DbError::Schema("v3 fail".into()), "Schema error: v3 fail"),
+            (DbError::Internal("bug".into()), "Internal error: bug"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+}

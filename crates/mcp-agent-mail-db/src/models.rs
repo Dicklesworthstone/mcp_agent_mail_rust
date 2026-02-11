@@ -465,3 +465,283 @@ pub struct InboxStatsRow {
     #[sqlmodel(nullable)]
     pub last_message_ts: Option<i64>,
 }
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default, clippy::float_cmp)]
+mod tests {
+    use super::*;
+    use crate::timestamps::now_micros;
+
+    // ── ProjectRow ──────────────────────────────────────────────────
+
+    #[test]
+    fn project_row_default_has_recent_timestamp() {
+        let proj = ProjectRow::default();
+        assert!(proj.id.is_none());
+        assert!(proj.slug.is_empty());
+        let now = now_micros();
+        assert!((now - proj.created_at).abs() < 1_000_000);
+    }
+
+    #[test]
+    fn project_row_new_sets_fields() {
+        let proj = ProjectRow::new("my-proj".into(), "/data/my-proj".into());
+        assert_eq!(proj.slug, "my-proj");
+        assert_eq!(proj.human_key, "/data/my-proj");
+        assert!(proj.id.is_none());
+    }
+
+    #[test]
+    fn project_row_created_at_naive_roundtrip() {
+        let mut proj = ProjectRow::default();
+        proj.created_at = 1_705_320_000_000_000; // 2024-01-15 12:00:00 UTC
+        let dt = proj.created_at_naive();
+        assert_eq!(dt.and_utc().timestamp(), 1_705_320_000);
+    }
+
+    #[test]
+    fn project_row_created_at_naive_epoch() {
+        let mut proj = ProjectRow::default();
+        proj.created_at = 0;
+        let dt = proj.created_at_naive();
+        assert_eq!(dt.and_utc().timestamp(), 0);
+    }
+
+    // ── AgentRow ────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_row_default_has_matching_timestamps() {
+        let agent = AgentRow::default();
+        assert_eq!(agent.inception_ts, agent.last_active_ts);
+        assert_eq!(agent.attachments_policy, "auto");
+        assert_eq!(agent.contact_policy, "auto");
+    }
+
+    #[test]
+    fn agent_row_new_sets_fields() {
+        let agent = AgentRow::new(
+            42,
+            "BlueLake".into(),
+            "claude-code".into(),
+            "opus-4.6".into(),
+        );
+        assert_eq!(agent.project_id, 42);
+        assert_eq!(agent.name, "BlueLake");
+        assert_eq!(agent.program, "claude-code");
+        assert_eq!(agent.model, "opus-4.6");
+        assert!(agent.task_description.is_empty());
+    }
+
+    #[test]
+    fn agent_row_touch_advances_timestamp() {
+        let mut agent = AgentRow::default();
+        let original = agent.last_active_ts;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        agent.touch();
+        assert!(agent.last_active_ts >= original);
+    }
+
+    // ── MessageRow ──────────────────────────────────────────────────
+
+    #[test]
+    fn message_row_default_values() {
+        let msg = MessageRow::default();
+        assert!(msg.id.is_none());
+        assert_eq!(msg.importance, "normal");
+        assert_eq!(msg.ack_required, 0);
+        assert_eq!(msg.attachments, "[]");
+        assert!(msg.thread_id.is_none());
+    }
+
+    #[test]
+    fn message_row_ack_required_bool() {
+        let mut msg = MessageRow::default();
+        assert!(!msg.ack_required_bool());
+
+        msg.ack_required = 1;
+        assert!(msg.ack_required_bool());
+
+        msg.ack_required = 42; // any non-zero is true
+        assert!(msg.ack_required_bool());
+    }
+
+    #[test]
+    fn message_row_set_ack_required() {
+        let mut msg = MessageRow::default();
+
+        msg.set_ack_required(true);
+        assert_eq!(msg.ack_required, 1);
+        assert!(msg.ack_required_bool());
+
+        msg.set_ack_required(false);
+        assert_eq!(msg.ack_required, 0);
+        assert!(!msg.ack_required_bool());
+    }
+
+    // ── MessageRecipientRow ─────────────────────────────────────────
+
+    #[test]
+    fn message_recipient_default() {
+        let recip = MessageRecipientRow::default();
+        assert_eq!(recip.kind, "to");
+        assert!(recip.read_ts.is_none());
+        assert!(recip.ack_ts.is_none());
+    }
+
+    // ── FileReservationRow ──────────────────────────────────────────
+
+    #[test]
+    fn file_reservation_default_is_exclusive() {
+        let resv = FileReservationRow::default();
+        assert!(resv.is_exclusive());
+        assert!(resv.released_ts.is_none());
+    }
+
+    #[test]
+    fn file_reservation_is_exclusive_logic() {
+        let mut resv = FileReservationRow::default();
+        assert!(resv.is_exclusive());
+
+        resv.exclusive = 0;
+        assert!(!resv.is_exclusive());
+
+        resv.exclusive = 1;
+        assert!(resv.is_exclusive());
+    }
+
+    #[test]
+    fn file_reservation_is_active_released() {
+        let mut resv = FileReservationRow::default();
+        resv.expires_ts = now_micros() + 60_000_000;
+        assert!(resv.is_active());
+
+        resv.released_ts = Some(now_micros());
+        assert!(!resv.is_active());
+    }
+
+    #[test]
+    fn file_reservation_is_active_expired() {
+        let mut resv = FileReservationRow::default();
+        resv.expires_ts = now_micros() - 1_000_000;
+        assert!(!resv.is_active());
+    }
+
+    // ── AgentLinkRow ────────────────────────────────────────────────
+
+    #[test]
+    fn agent_link_default() {
+        let link = AgentLinkRow::default();
+        assert_eq!(link.status, "pending");
+        assert!(link.reason.is_empty());
+        assert!(link.expires_ts.is_none());
+        assert_eq!(link.created_ts, link.updated_ts);
+    }
+
+    // ── ProjectSiblingSuggestionRow ─────────────────────────────────
+
+    #[test]
+    fn sibling_suggestion_default() {
+        let sug = ProjectSiblingSuggestionRow::default();
+        assert_eq!(sug.status, "suggested");
+        assert_eq!(sug.score, 0.0);
+        assert!(sug.confirmed_ts.is_none());
+        assert!(sug.dismissed_ts.is_none());
+    }
+
+    // ── InboxStatsRow ───────────────────────────────────────────────
+
+    #[test]
+    fn inbox_stats_fields() {
+        let stats = InboxStatsRow {
+            agent_id: 1,
+            total_count: 10,
+            unread_count: 3,
+            ack_pending_count: 2,
+            last_message_ts: Some(now_micros()),
+        };
+        assert_eq!(stats.total_count, 10);
+        assert_eq!(stats.unread_count, 3);
+        assert_eq!(stats.ack_pending_count, 2);
+        assert!(stats.last_message_ts.is_some());
+    }
+
+    // ── Serialization roundtrips ────────────────────────────────────
+
+    #[test]
+    fn project_row_serde_roundtrip() {
+        let proj = ProjectRow::new("test-slug".into(), "/data/test".into());
+        let json = serde_json::to_string(&proj).unwrap();
+        let proj2: ProjectRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(proj.slug, proj2.slug);
+        assert_eq!(proj.human_key, proj2.human_key);
+        assert_eq!(proj.created_at, proj2.created_at);
+    }
+
+    #[test]
+    fn agent_row_serde_roundtrip() {
+        let agent = AgentRow::new(1, "RedFox".into(), "claude".into(), "opus".into());
+        let json = serde_json::to_string(&agent).unwrap();
+        let agent2: AgentRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(agent.name, agent2.name);
+        assert_eq!(agent.program, agent2.program);
+        assert_eq!(agent.attachments_policy, agent2.attachments_policy);
+    }
+
+    #[test]
+    fn message_row_serde_roundtrip() {
+        let mut msg = MessageRow::default();
+        msg.subject = "Hello".into();
+        msg.body_md = "World".into();
+        msg.thread_id = Some("TKT-123".into());
+        msg.set_ack_required(true);
+        let json = serde_json::to_string(&msg).unwrap();
+        let msg2: MessageRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.subject, msg2.subject);
+        assert_eq!(msg.thread_id, msg2.thread_id);
+        assert!(msg2.ack_required_bool());
+    }
+
+    #[test]
+    fn file_reservation_serde_roundtrip() {
+        let mut resv = FileReservationRow::default();
+        resv.path_pattern = "src/**/*.rs".into();
+        resv.reason = "editing".into();
+        let json = serde_json::to_string(&resv).unwrap();
+        let resv2: FileReservationRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(resv.path_pattern, resv2.path_pattern);
+        assert!(resv2.is_exclusive());
+    }
+
+    // ── ProductRow ──────────────────────────────────────────────────
+
+    #[test]
+    fn product_row_default() {
+        let prod = ProductRow::default();
+        assert!(prod.id.is_none());
+        assert!(prod.product_uid.is_empty());
+        assert!(prod.name.is_empty());
+    }
+
+    // ── Timestamp consistency ───────────────────────────────────────
+
+    #[test]
+    fn all_defaults_use_recent_timestamps() {
+        let now = now_micros();
+        let tolerance: u64 = 2_000_000; // 2 seconds
+
+        let proj = ProjectRow::default();
+        assert!((now - proj.created_at).unsigned_abs() < tolerance);
+
+        let agent = AgentRow::default();
+        assert!((now - agent.inception_ts).unsigned_abs() < tolerance);
+
+        let msg = MessageRow::default();
+        assert!((now - msg.created_ts).unsigned_abs() < tolerance);
+
+        let resv = FileReservationRow::default();
+        assert!((now - resv.created_ts).unsigned_abs() < tolerance);
+
+        let link = AgentLinkRow::default();
+        assert!((now - link.created_ts).unsigned_abs() < tolerance);
+    }
+}
