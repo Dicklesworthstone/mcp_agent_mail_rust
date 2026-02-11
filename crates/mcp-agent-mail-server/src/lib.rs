@@ -3191,6 +3191,21 @@ impl HttpState {
     }
 
     /// Dispatch a `/mail` or `/mail/…` request to the mail UI layer.
+    fn is_mail_json_route(path: &str, method_str: &str) -> bool {
+        if method_str == "POST" || path.starts_with("/mail/api/") {
+            return true;
+        }
+        if path == "/mail/archive/time-travel/snapshot" {
+            return true;
+        }
+        if let Some(rest) = path.strip_prefix("/mail/archive/browser/") {
+            if let Some((project_slug, tail)) = rest.split_once('/') {
+                return !project_slug.is_empty() && tail == "file";
+            }
+        }
+        false
+    }
+
     fn handle_mail_dispatch(&self, req: &Http1Request, path: &str) -> Http1Response {
         if !matches!(req.method, Http1Method::Get | Http1Method::Post) {
             return self.error_response(req, 405, "Method Not Allowed");
@@ -3203,7 +3218,7 @@ impl HttpState {
             "GET"
         };
         let body_str = std::str::from_utf8(&req.body).unwrap_or("");
-        let is_api = path.contains("/api/") || method_str == "POST";
+        let is_api = Self::is_mail_json_route(path, method_str);
         match mail_ui::dispatch(path, query_str, method_str, body_str) {
             Ok(Some(body)) => {
                 let content_type = if is_api {
@@ -5439,6 +5454,60 @@ mod tests {
             payload.get("locks").and_then(|v| v.as_array()).is_some(),
             "locks missing or not array: {payload}"
         );
+    }
+
+    #[test]
+    fn mail_archive_browser_file_404_still_returns_json_content_type() {
+        let storage_root = std::env::temp_dir().join(format!(
+            "mcp-agent-mail-archive-browser-json-test-{}",
+            std::process::id()
+        ));
+        let config = mcp_agent_mail_core::Config {
+            storage_root,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/mail/archive/browser/demo/file?path=messages/missing.md",
+            &[],
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json")
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("archive browser file error json");
+        assert_eq!(body["detail"], "File not found");
+    }
+
+    #[test]
+    fn mail_archive_snapshot_validation_error_returns_json_content_type() {
+        let storage_root = std::env::temp_dir().join(format!(
+            "mcp-agent-mail-archive-snapshot-json-test-{}",
+            std::process::id()
+        ));
+        let config = mcp_agent_mail_core::Config {
+            storage_root,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/mail/archive/time-travel/snapshot?project=demo&agent=bad_name&timestamp=2026-02-11T12:30",
+            &[],
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json")
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("archive snapshot error json");
+        assert_eq!(body["detail"], "Invalid agent name format");
     }
 
     #[test]

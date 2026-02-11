@@ -4946,6 +4946,223 @@ pub fn get_archive_file_content(
     Ok(Some(String::from_utf8_lossy(blob.content()).to_string()))
 }
 
+/// Get a historical snapshot of an agent inbox at a target timestamp.
+///
+/// Returns a JSON object with:
+/// - `messages`: list of message summaries
+/// - `snapshot_time`: commit time used (or null)
+/// - `commit_sha`: commit hash used (or null)
+/// - `requested_time`: original timestamp request
+/// - optional `note` or `error` fields
+pub fn get_historical_inbox_snapshot(
+    archive: &ProjectArchive,
+    agent_name: &str,
+    timestamp: &str,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    let limit = limit.clamp(1, 500);
+    let agent_name = validate_archive_component("agent name", agent_name)?;
+
+    let target_seconds = {
+        // First try RFC3339 variants, then naive datetime forms.
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+            dt.with_timezone(&Utc).timestamp()
+        } else if let Ok(naive) =
+            chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f")
+        {
+            naive.and_utc().timestamp()
+        } else if let Ok(naive) =
+            chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S")
+        {
+            naive.and_utc().timestamp()
+        } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M")
+        {
+            naive.and_utc().timestamp()
+        } else {
+            return Ok(serde_json::json!({
+                "messages": [],
+                "snapshot_time": serde_json::Value::Null,
+                "commit_sha": serde_json::Value::Null,
+                "requested_time": timestamp,
+                "error": "Invalid timestamp format",
+            }));
+        }
+    };
+
+    let repo = Repository::open(&archive.repo_root)?;
+    let inbox_path = format!("projects/{}/agents/{agent_name}/inbox", archive.slug);
+
+    let mut closest_oid: Option<git2::Oid> = None;
+
+    // Pass 1: commits touching this inbox path.
+    {
+        let mut revwalk = repo.revwalk()?;
+        if revwalk.push_head().is_ok() {
+            revwalk.set_sorting(git2::Sort::TIME)?;
+            for oid_result in revwalk {
+                let oid = oid_result?;
+                let commit = repo.find_commit(oid)?;
+                if !commit_touches_path(&repo, &commit, &inbox_path) {
+                    continue;
+                }
+                if commit.time().seconds() <= target_seconds {
+                    closest_oid = Some(oid);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Pass 2: fallback to global history if inbox path has no commits before target.
+    if closest_oid.is_none() {
+        let mut revwalk = repo.revwalk()?;
+        if revwalk.push_head().is_ok() {
+            revwalk.set_sorting(git2::Sort::TIME)?;
+            for oid_result in revwalk {
+                let oid = oid_result?;
+                let commit = repo.find_commit(oid)?;
+                if commit.time().seconds() <= target_seconds {
+                    closest_oid = Some(oid);
+                    break;
+                }
+            }
+        }
+    }
+
+    let Some(closest_oid) = closest_oid else {
+        return Ok(serde_json::json!({
+            "messages": [],
+            "snapshot_time": serde_json::Value::Null,
+            "commit_sha": serde_json::Value::Null,
+            "requested_time": timestamp,
+            "note": "No commits found before this timestamp",
+        }));
+    };
+
+    let commit = repo.find_commit(closest_oid)?;
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+
+    if let Ok(root_tree) = commit.tree() {
+        if let Ok(inbox_entry) = root_tree.get_path(Path::new(&inbox_path)) {
+            if let Ok(inbox_tree) = repo.find_tree(inbox_entry.id()) {
+                let mut stack: Vec<(git2::Oid, usize)> = vec![(inbox_tree.id(), 0)];
+                while let Some((tree_oid, depth)) = stack.pop() {
+                    if messages.len() >= limit || depth > 3 {
+                        continue;
+                    }
+
+                    let tree = match repo.find_tree(tree_oid) {
+                        Ok(tree) => tree,
+                        Err(_) => continue,
+                    };
+
+                    for item in tree.iter() {
+                        if messages.len() >= limit {
+                            break;
+                        }
+
+                        match item.kind() {
+                            Some(git2::ObjectType::Tree) if depth < 3 => {
+                                stack.push((item.id(), depth + 1));
+                            }
+                            Some(git2::ObjectType::Blob) => {
+                                let Some(name) = item.name() else {
+                                    continue;
+                                };
+                                if !name.ends_with(".md") {
+                                    continue;
+                                }
+
+                                let mut from_agent = "unknown".to_string();
+                                let mut importance = "normal".to_string();
+
+                                let filename = name.strip_suffix(".md").unwrap_or(name);
+                                let parts: Vec<&str> = filename.rsplitn(3, "__").collect();
+                                let (date_str, subject_slug, msg_id) = match parts.as_slice() {
+                                    [id, subject, date] => (*date, *subject, *id),
+                                    [subject, date] => (*date, *subject, "unknown"),
+                                    _ => continue,
+                                };
+
+                                let mut subject =
+                                    subject_slug.replace(['-', '_'], " ").trim().to_string();
+                                if subject.is_empty() {
+                                    subject = "Unknown".to_string();
+                                }
+
+                                if let Ok(blob) = repo.find_blob(item.id()) {
+                                    let blob_content =
+                                        String::from_utf8_lossy(blob.content()).to_string();
+                                    if let Some(rest) = blob_content.strip_prefix("---json\n") {
+                                        if let Some(end_idx) = rest.find("\n---\n") {
+                                            let json_str = &rest[..end_idx];
+                                            if let Ok(meta) =
+                                                serde_json::from_str::<serde_json::Value>(json_str)
+                                            {
+                                                if let Some(from) = meta
+                                                    .get("from")
+                                                    .and_then(serde_json::Value::as_str)
+                                                {
+                                                    from_agent = from.to_string();
+                                                }
+                                                if let Some(imp) = meta
+                                                    .get("importance")
+                                                    .and_then(serde_json::Value::as_str)
+                                                {
+                                                    importance = imp.to_string();
+                                                }
+                                                if let Some(subj) = meta
+                                                    .get("subject")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                {
+                                                    subject = subj.to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                messages.push(serde_json::json!({
+                                    "id": msg_id,
+                                    "subject": subject,
+                                    "date": date_str,
+                                    "from": from_agent,
+                                    "importance": importance,
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    messages.sort_by(|a, b| {
+        let a_date = a
+            .get("date")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let b_date = b
+            .get("date")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        b_date.cmp(a_date)
+    });
+
+    let snapshot_time = DateTime::<Utc>::from_timestamp(commit.time().seconds(), 0)
+        .map_or_else(String::new, |dt| dt.to_rfc3339());
+
+    Ok(serde_json::json!({
+        "messages": messages,
+        "snapshot_time": snapshot_time,
+        "commit_sha": closest_oid.to_string(),
+        "requested_time": timestamp,
+    }))
+}
+
 /// A node in the agent communication graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNode {
@@ -7358,6 +7575,65 @@ mod tests {
         let (frontmatter, body) = read_message_file(&msg_path).unwrap();
         assert!(frontmatter.is_null());
         assert_eq!(body, "Just plain text.");
+    }
+
+    #[test]
+    fn test_get_historical_inbox_snapshot_returns_message_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "snapshot-proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 42,
+            "from": "SenderAgent",
+            "subject": "Snapshot Subject",
+            "importance": "high",
+            "created_ts": "2026-01-20T12:00:00Z",
+            "thread_id": "SNAP-1",
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "snapshot body",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+        flush_async_commits();
+
+        let snapshot =
+            get_historical_inbox_snapshot(&archive, "RecipientAgent", "2100-01-01T00:00", 200)
+                .unwrap();
+        let messages = snapshot
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("messages array");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["subject"], "Snapshot Subject");
+        assert_eq!(messages[0]["from"], "SenderAgent");
+        assert_eq!(messages[0]["importance"], "high");
+        assert!(snapshot["snapshot_time"].is_string());
+        assert!(snapshot["commit_sha"].is_string());
+        assert_eq!(snapshot["requested_time"], "2100-01-01T00:00");
+    }
+
+    #[test]
+    fn test_get_historical_inbox_snapshot_invalid_timestamp_returns_error_payload() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "snapshot-invalid-ts").unwrap();
+
+        let snapshot =
+            get_historical_inbox_snapshot(&archive, "RecipientAgent", "not-a-timestamp", 200)
+                .unwrap();
+        assert_eq!(snapshot["messages"], serde_json::json!([]));
+        assert!(snapshot["snapshot_time"].is_null());
+        assert!(snapshot["commit_sha"].is_null());
+        assert_eq!(snapshot["requested_time"], "not-a-timestamp");
+        assert_eq!(snapshot["error"], "Invalid timestamp format");
     }
 
     #[test]

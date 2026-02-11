@@ -178,6 +178,36 @@ http_get() {
     return 0
 }
 
+http_get_expect_status() {
+    local case_id="$1"
+    local url="$2"
+    local expected_status="$3"
+
+    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    set +e
+    local status
+    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
+        -H "authorization: Bearer ${TOKEN}" \
+        "${url}" 2>"${curl_stderr_file}")"
+    local rc=$?
+    set -e
+
+    echo "${status}" > "${status_file}"
+    if [ "$rc" -ne 0 ]; then
+        e2e_fail "${case_id}: curl failed rc=${rc}"
+        return 1
+    fi
+    if [ "${status}" != "${expected_status}" ]; then
+        e2e_fail "${case_id}: unexpected HTTP status ${status} (expected ${expected_status})"
+        return 1
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Seed data via JSON-RPC tools
 # ---------------------------------------------------------------------------
@@ -254,5 +284,37 @@ e2e_case_banner "GET /mail/api/unified-inbox (json api)"
 http_get "mail_api_unified" "${BASE_URL}/mail/api/unified-inbox" || true
 MAIL_API_BODY="$(cat "${E2E_ARTIFACT_DIR}/mail_api_unified_body.txt")"
 e2e_assert_contains "api returns JSON array" "${MAIL_API_BODY}" "\"messages\""
+
+e2e_case_banner "GET /mail/archive/browser/{project}/file invalid path (json 400)"
+http_get_expect_status "mail_archive_file_invalid_path" "${BASE_URL}/mail/archive/browser/${PROJECT_SLUG}/file?path=../etc/passwd" "400" || true
+MAIL_ARCHIVE_FILE_INVALID_HEADERS="$(cat "${E2E_ARTIFACT_DIR}/mail_archive_file_invalid_path_headers.txt")"
+MAIL_ARCHIVE_FILE_INVALID_BODY="$(cat "${E2E_ARTIFACT_DIR}/mail_archive_file_invalid_path_body.txt")"
+e2e_assert_contains "archive file invalid path has JSON content-type" "${MAIL_ARCHIVE_FILE_INVALID_HEADERS}" "application/json"
+e2e_assert_contains "archive file invalid path body has detail" "${MAIL_ARCHIVE_FILE_INVALID_BODY}" "\"detail\""
+e2e_assert_contains "archive file invalid path message" "${MAIL_ARCHIVE_FILE_INVALID_BODY}" "Invalid file path"
+
+e2e_case_banner "GET /mail/archive/browser/{project}/file missing file (json 404)"
+http_get_expect_status "mail_archive_file_not_found" "${BASE_URL}/mail/archive/browser/${PROJECT_SLUG}/file?path=messages/missing.md" "404" || true
+MAIL_ARCHIVE_FILE_NOT_FOUND_HEADERS="$(cat "${E2E_ARTIFACT_DIR}/mail_archive_file_not_found_headers.txt")"
+MAIL_ARCHIVE_FILE_NOT_FOUND_BODY="$(cat "${E2E_ARTIFACT_DIR}/mail_archive_file_not_found_body.txt")"
+e2e_assert_contains "archive file missing has JSON content-type" "${MAIL_ARCHIVE_FILE_NOT_FOUND_HEADERS}" "application/json"
+e2e_assert_contains "archive file missing has detail" "${MAIL_ARCHIVE_FILE_NOT_FOUND_BODY}" "\"detail\""
+e2e_assert_contains "archive file missing message" "${MAIL_ARCHIVE_FILE_NOT_FOUND_BODY}" "File not found"
+
+SNAP_TS="$(
+python3 - <<'PY'
+from datetime import datetime, timezone
+print(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M"))
+PY
+)"
+e2e_case_banner "GET /mail/archive/time-travel/snapshot (json 200)"
+http_get "mail_archive_snapshot" "${BASE_URL}/mail/archive/time-travel/snapshot?project=${PROJECT_SLUG}&agent=BlueBear&timestamp=${SNAP_TS}" || true
+MAIL_ARCHIVE_SNAPSHOT_HEADERS="$(cat "${E2E_ARTIFACT_DIR}/mail_archive_snapshot_headers.txt")"
+MAIL_ARCHIVE_SNAPSHOT_BODY="$(cat "${E2E_ARTIFACT_DIR}/mail_archive_snapshot_body.txt")"
+e2e_assert_contains "archive snapshot has JSON content-type" "${MAIL_ARCHIVE_SNAPSHOT_HEADERS}" "application/json"
+e2e_assert_contains "archive snapshot has messages key" "${MAIL_ARCHIVE_SNAPSHOT_BODY}" "\"messages\""
+e2e_assert_contains "archive snapshot has snapshot_time key" "${MAIL_ARCHIVE_SNAPSHOT_BODY}" "\"snapshot_time\""
+e2e_assert_contains "archive snapshot has commit_sha key" "${MAIL_ARCHIVE_SNAPSHOT_BODY}" "\"commit_sha\""
+e2e_assert_contains "archive snapshot has requested_time key" "${MAIL_ARCHIVE_SNAPSHOT_BODY}" "\"requested_time\""
 
 e2e_summary

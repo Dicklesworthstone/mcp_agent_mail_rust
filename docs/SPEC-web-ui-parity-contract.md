@@ -402,13 +402,15 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/archive/browser/{project}/file",
       "rust_path": "/mail/archive/browser/{project}/file",
       "policy": "must_match",
-      "status": "partial",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.8"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py",
-        "crates/mcp-agent-mail-server/src/mail_ui.rs (render_archive_browser_file)"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (render_archive_browser_file)",
+        "crates/mcp-agent-mail-server/src/lib.rs (handle_mail_dispatch/is_mail_json_route)",
+        "crates/mcp-agent-mail-server/src/lib.rs (tests::mail_archive_browser_file_404_still_returns_json_content_type)"
       ],
-      "notes": "Both expose file content, but content-type/shape/size limits must be pinned."
+      "notes": "Now aligned: strict route shape, JSON string payload parity, and JSON content-type/error semantics."
     },
     {
       "id": "mail_archive_network_html_get",
@@ -447,14 +449,17 @@ CI parses the JSON block below and fails if any row:
       "python_path": "/mail/archive/time-travel/snapshot",
       "rust_path": "/mail/archive/time-travel/snapshot",
       "policy": "must_match",
-      "status": "partial",
+      "status": "implemented",
       "owner_beads": ["br-3vwi.13.2", "br-3vwi.13.8"],
       "evidence": [
         "legacy_python_mcp_agent_mail_code/mcp_agent_mail/src/mcp_agent_mail/http.py",
         "crates/mcp-agent-mail-server/src/mail_ui.rs (render_archive_time_travel_snapshot)",
-        "crates/mcp-agent-mail-server/src/mail_ui.rs (utility_tests::time_travel_timestamp_validation_python_parity)"
+        "crates/mcp-agent-mail-server/src/mail_ui.rs (utility_tests::time_travel_timestamp_validation_python_parity)",
+        "crates/mcp-agent-mail-storage/src/lib.rs (get_historical_inbox_snapshot)",
+        "crates/mcp-agent-mail-storage/src/lib.rs (tests::test_get_historical_inbox_snapshot_returns_message_metadata)",
+        "crates/mcp-agent-mail-server/src/lib.rs (tests::mail_archive_snapshot_validation_error_returns_json_content_type)"
       ],
-      "notes": "Validation and JSON schema prefix now aligned (project slug, agent format, timestamp prefix + messages/snapshot_time/commit_sha/requested_time keys). Still partial because full historical commit-based retrieval parity needs deeper conformance coverage."
+      "notes": "Now aligned on validator behavior, JSON response shape, and commit-based historical retrieval with parity-style fallback error payload."
     },
     {
       "id": "mail_security_xss_escaped",
