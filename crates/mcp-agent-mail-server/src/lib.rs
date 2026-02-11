@@ -1086,11 +1086,7 @@ fn run_tui_main_thread(
 
     let model = tui_app::MailAppModel::with_config(Arc::clone(tui_state), config);
 
-    let tui_config = ftui_runtime::program::ProgramConfig {
-        screen_mode: ftui_runtime::terminal_writer::ScreenMode::AltScreen,
-        mouse: true,
-        ..ftui_runtime::program::ProgramConfig::default()
-    };
+    let tui_config = ftui_runtime::program::ProgramConfig::fullscreen().with_mouse();
 
     let mut program = Program::with_config(model, tui_config)?;
     program.run()

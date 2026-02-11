@@ -2,7 +2,7 @@
 
 Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 
-**Primary Bead:** br-3vwi.12.1
+**Primary Beads:** br-3vwi.12.1, br-3vwi.12.2
 **Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
 **Last Updated:** 2026-02-11
 
@@ -19,12 +19,26 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 
 ### Measurable Promotion Criteria (All phases)
 
-- [ ] Correctness: required suites report zero failures
-- [ ] Security/privacy: search scope and secret-redaction checks are clean
-- [ ] Accessibility: keyboard-only path and focus checks are clean
-- [ ] Performance: no budget regressions; p95 not worse than 2x baseline
-- [ ] Determinism: static export and golden outputs match expected checksums
-- [ ] Governance: sign-off ledger has owner + UTC timestamp + evidence links
+| Gate family | Hard threshold (promotion blocker) | Machine-check source | Artifact evidence |
+|-------------|------------------------------------|----------------------|-------------------|
+| Unit + integration correctness | Pass rate = `100%` (`fail=0`) | `cargo test --workspace` and CI gate entry `Unit + integration tests=status:pass` | CI logs + gate report JSON |
+| Dual-mode E2E correctness | Pass rate = `100%` (`fail=0`) for `E2E dual-mode` and `E2E mode matrix` | `bash scripts/e2e_dual_mode.sh`, `bash scripts/e2e_mode_matrix.sh`, and CI gate report | `tests/artifacts/dual_mode/*/run_summary.json` |
+| Security/privacy | Pass rate = `100%` (`fail=0`) for `E2E security/privacy` | `bash tests/e2e/test_security_privacy.sh` and CI gate report | `tests/artifacts/security_privacy/*/*` |
+| Accessibility | Pass rate = `100%` (`fail=0`) for `E2E TUI accessibility` | `bash scripts/e2e_tui_a11y.sh` and CI gate report | `tests/artifacts/tui_a11y/*/*` |
+| Performance budgets | `perf_security_regressions=status:pass` and no p95 regression > `2.0x` baseline | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture` and CI gate report | perf/security test logs + benchmark artifacts |
+| Determinism | Golden/export checks report zero mismatches | `bash scripts/bench_golden.sh validate` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
+| Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, and sign-off row completed | `bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json` | `tests/artifacts/ci/gate_report.json`, sign-off ledger row |
+
+### Gate-to-Bead Evidence Map
+
+| Gate family | Required bead outputs | Evidence path |
+|-------------|------------------------|---------------|
+| Unit/integration + harness coverage | `br-3vwi.10` track outputs (`mode_matrix_harness`, `semantic_conformance`) | CI logs + `tests/artifacts/dual_mode/*` |
+| Security/privacy | `br-3vwi.10.14` security/privacy E2E suite | `tests/artifacts/security_privacy/*` |
+| Accessibility | `br-3vwi.10.13` keyboard/focus/contrast suite | `tests/artifacts/tui_a11y/*` |
+| Performance | `br-3vwi.10.11` perf regression script pack | perf regression logs and trend artifacts |
+| Deterministic replay/export | `br-3vwi.10.19` + `br-3vwi.10.22` | replay artifacts + share/export artifacts |
+| Rollout governance + operator readiness | `br-3vwi.11.1` + `br-3vwi.12.1` + `br-3vwi.12.2` | `docs/ROLLOUT_PLAYBOOK.md`, `docs/RELEASE_CHECKLIST.md`, CI gate report |
 
 ## Functional Readiness
 
@@ -148,6 +162,11 @@ bash scripts/bench_golden.sh validate
 # 5. Golden denial fixtures exist
 ls tests/fixtures/golden_snapshots/mcp_deny_*.txt
 # At least 5 files (share, guard, doctor, archive, migrate)
+
+# 6. Machine-readable gate report exists and is release-eligible
+bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json
+jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifacts/ci/gate_report.json
+# decision must be "go", release_eligible must be true, thresholds must have zero failed_gates
 ```
 
 ## Rollout Validation
@@ -156,7 +175,13 @@ ls tests/fixtures/golden_snapshots/mcp_deny_*.txt
 
 1. Run the full CI suite (includes all dual-mode gates):
    ```bash
-   bash scripts/ci.sh
+   bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json
+   ```
+
+   Confirm gate report decision:
+   ```bash
+   jq '.decision' tests/artifacts/ci/gate_report.json
+   # "go" required for promotion
    ```
 
 2. Or run individual gates:
@@ -169,6 +194,8 @@ ls tests/fixtures/golden_snapshots/mcp_deny_*.txt
    cargo test -p mcp-agent-mail-cli --test help_snapshots
    bash scripts/e2e_dual_mode.sh
    bash scripts/e2e_mode_matrix.sh
+   bash tests/e2e/test_security_privacy.sh
+   bash scripts/e2e_tui_a11y.sh
    ```
 
 3. Manual smoke test:
@@ -274,6 +301,14 @@ curl -s http://127.0.0.1:8765/mcp/ \
 ## Release Sign-Off Ledger (Required)
 
 Fill one row per phase promotion decision.
+
+### Sign-Off Workflow (Required For Every Promotion)
+
+1. Run full gates and emit report: `bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json`.
+2. Confirm report fields: `decision == "go"` and `release_eligible == true`.
+3. Attach at least one artifact link per gate family (correctness, security/privacy, accessibility, performance, determinism).
+4. Record owner, UTC timestamp, and rationale in the ledger row for the phase transition.
+5. If any threshold fails, mark decision `no-go`, document blocker bead IDs, and do not promote.
 
 | Phase | Decision (`go`/`no-go`) | Owner | UTC timestamp | Rationale | Evidence links |
 |------|--------------------------|-------|---------------|-----------|----------------|

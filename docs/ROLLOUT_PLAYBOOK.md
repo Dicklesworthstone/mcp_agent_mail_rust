@@ -1,6 +1,6 @@
 # Dual-Mode Rollout and Kill-Switch Playbook
 
-**Primary Bead:** br-3vwi.12.1
+**Primary Beads:** br-3vwi.12.1, br-3vwi.12.2
 **Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
 **Depends on:** security/privacy E2E, stress/soak harness, CI gate automation, dual-mode invariants
 **Last Updated:** 2026-02-11
@@ -45,6 +45,7 @@ Every promotion decision must reference versioned evidence in git:
 - `docs/ROLLOUT_PLAYBOOK.md` (this staged policy)
 - `docs/RELEASE_CHECKLIST.md` (gate state and sign-off ledger)
 - `docs/DUAL_MODE_ROLLOUT_PLAYBOOK.md` (dual-mode specific operational runbook)
+- `tests/artifacts/ci/gate_report.json` (machine-readable go/no-go gate report)
 - `tests/artifacts/**/bundle.json` and `summary.json` outputs from required suites
 
 Sign-off entries must include: gate owner, UTC timestamp, decision (`go`/`no-go`),
@@ -120,13 +121,16 @@ cargo test -p mcp-agent-mail-db --test stress -- --nocapture
 # Expected: all 9 stress scenarios pass (concurrent agents, pool exhaustion, etc.)
 ```
 
-### 2.9 CI Pipeline
+### 2.9 CI Pipeline and Machine-Readable Gate Report
 
 If `.github/workflows/ci.yml` is active, verify the latest main branch CI run
 shows green across all jobs: `build`, `test`, `clippy`, `conformance`, `e2e`.
 
 ```bash
 gh run list --branch main --limit 1
+bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json
+jq '.decision, .release_eligible, .summary.fail' tests/artifacts/ci/gate_report.json
+# Expected: "go", true, 0
 ```
 
 ### 2.10 Security and Privacy Gates
@@ -166,11 +170,13 @@ cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture
 
 Promotion from each phase requires all of:
 
-- Test correctness: all required suites above report `fail=0`.
-- Security/privacy: no leakage assertions fail in security/privacy suite artifacts.
-- Accessibility: keyboard-only suite passes with no focus/contrast regressions.
-- Performance: no perf/security budget test failures; no p95 regressions above 2x baseline.
-- Operational readiness: release checklist sign-off ledger completed for the phase.
+- Unit/integration pass rate = `100%` (`fail=0`).
+- Dual-mode E2E pass rate = `100%` (`fail=0` for both `E2E dual-mode` and `E2E mode matrix`).
+- Security/privacy pass rate = `100%` (`fail=0` in `E2E security/privacy`).
+- Accessibility pass rate = `100%` (`fail=0` in `E2E TUI accessibility`).
+- Performance gate status = pass (`perf_security_regressions` green, no p95 regression above `2.0x` baseline).
+- CI gate report indicates `decision="go"` and `release_eligible=true`.
+- Release checklist sign-off ledger completed for the phase (owner + UTC timestamp + rationale + evidence paths).
 
 ---
 
@@ -186,6 +192,7 @@ Promotion from each phase requires all of:
 |-----------|----------|
 | All unit tests pass | `cargo test` output |
 | Dual-mode E2E passes | `tests/artifacts/dual_mode/*/run_summary.json` |
+| Machine-readable gate decision is promotable | `tests/artifacts/ci/gate_report.json` (`decision="go"`, `release_eligible=true`) |
 | Golden snapshots stable | `bench_golden.sh validate` |
 | Denial messages match contract | `tests/fixtures/golden_snapshots/mcp_deny_*.txt` |
 

@@ -335,9 +335,11 @@ e2e_assert_eq "CLI agents list --help exits 0" "0" "$exit_code"
 # Summary
 # ═══════════════════════════════════════════════════════════════════════
 
-# Count step artifacts
-total_steps=$(ls "${STEPS_DIR}"/step_*.json 2>/dev/null | wc -l || echo 0)
-fail_count=$(ls "${FAILURES_DIR}"/fail_*.json 2>/dev/null | wc -l || echo 0)
+# Count step artifacts.
+# Use `find` instead of `ls|wc` so `set -o pipefail` never yields a duplicate
+# fallback value in command substitution when no files match.
+total_steps=$(find "${STEPS_DIR}" -maxdepth 1 -type f -name 'step_*.json' | wc -l | tr -d '[:space:]')
+fail_count=$(find "${FAILURES_DIR}" -maxdepth 1 -type f -name 'fail_*.json' | wc -l | tr -d '[:space:]')
 
 e2e_save_artifact "run_summary.json" "{
   \"suite\": \"dual_mode\",

@@ -33,7 +33,7 @@ use ftui_runtime::program::Model;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
-use mcp_agent_mail_server::tui_screens::{MailScreenId, ALL_SCREEN_IDS};
+use mcp_agent_mail_server::tui_screens::{ALL_SCREEN_IDS, MailScreenId};
 
 // ── Configuration ────────────────────────────────────────────────────
 
