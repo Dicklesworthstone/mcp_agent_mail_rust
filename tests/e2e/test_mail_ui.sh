@@ -9,6 +9,8 @@
 # Artifacts:
 # - Server logs: tests/artifacts/mail_ui/<timestamp>/server.log
 # - Per-route HTML/JSON responses + headers + curl stderr
+# - Network traces: tests/artifacts/mail_ui/<timestamp>/network_trace.jsonl
+# - Policy traces: tests/artifacts/mail_ui/<timestamp>/policy_trace.json
 # - Seed tool calls (JSON-RPC request/response) for debugging
 
 set -euo pipefail
@@ -85,6 +87,114 @@ if ! e2e_wait_port 127.0.0.1 "${PORT}" 10; then
 fi
 
 API_URL="http://127.0.0.1:${PORT}/api/"
+NETWORK_TRACE_FILE="${E2E_ARTIFACT_DIR}/network_trace.jsonl"
+POLICY_TRACE_FILE="${E2E_ARTIFACT_DIR}/policy_trace.json"
+touch "${NETWORK_TRACE_FILE}"
+
+append_network_trace() {
+    local case_id="$1"
+    local kind="$2"
+    local method="$3"
+    local url="$4"
+    local status="$5"
+    local expected_status="$6"
+    local auth_mode="$7"
+    local rc="$8"
+    local elapsed_ms="$9"
+    local headers_file="${10}"
+    local body_file="${11}"
+    local stderr_file="${12}"
+
+    python3 - "${NETWORK_TRACE_FILE}" \
+        "${case_id}" "${kind}" "${method}" "${url}" "${status}" "${expected_status}" "${auth_mode}" "${rc}" "${elapsed_ms}" \
+        "${headers_file}" "${body_file}" "${stderr_file}" <<'PY'
+import datetime as dt
+import json
+import os
+import sys
+
+(
+    trace_path,
+    case_id,
+    kind,
+    method,
+    url,
+    status,
+    expected_status,
+    auth_mode,
+    rc,
+    elapsed_ms,
+    headers_path,
+    body_path,
+    stderr_path,
+) = sys.argv[1:]
+
+event = {
+    "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "suite": "mail_ui",
+    "case_id": case_id,
+    "kind": kind,
+    "request": {"method": method, "url": url, "auth_mode": auth_mode},
+    "response": {
+        "status": status,
+        "expected_status": expected_status,
+        "curl_rc": int(rc),
+        "elapsed_ms": int(elapsed_ms),
+    },
+    "artifacts": {
+        "headers_path": os.path.basename(headers_path),
+        "body_path": os.path.basename(body_path),
+        "stderr_path": os.path.basename(stderr_path),
+    },
+}
+
+with open(trace_path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(event, sort_keys=True) + "\n")
+PY
+}
+
+write_policy_trace() {
+    python3 - "${POLICY_TRACE_FILE}" \
+        "${E2E_ARTIFACT_DIR}/mail_index_status.txt" \
+        "${E2E_ARTIFACT_DIR}/mail_no_auth_status.txt" \
+        "${E2E_ARTIFACT_DIR}/mail_invalid_token_status.txt" <<'PY'
+import datetime as dt
+import json
+import os
+import sys
+
+out_path, index_path, no_auth_path, bad_token_path = sys.argv[1:]
+
+def read_status(path):
+    try:
+        return open(path, "r", encoding="utf-8").read().strip()
+    except OSError:
+        return None
+
+checks = [
+    {"case_id": "mail_index", "auth_mode": "bearer_valid", "expected_status": "200", "actual_status": read_status(index_path)},
+    {"case_id": "mail_no_auth", "auth_mode": "none", "expected_status": "401", "actual_status": read_status(no_auth_path)},
+    {"case_id": "mail_invalid_token", "auth_mode": "bearer_invalid", "expected_status": "401", "actual_status": read_status(bad_token_path)},
+]
+passed = all(c["actual_status"] == c["expected_status"] for c in checks)
+
+payload = {
+    "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "suite": "mail_ui",
+    "policy_inputs": {
+        "http_allow_localhost_unauthenticated": os.getenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "0"),
+        "http_rbac_enabled": os.getenv("HTTP_RBAC_ENABLED", "0"),
+        "http_rate_limit_enabled": os.getenv("HTTP_RATE_LIMIT_ENABLED", "0"),
+        "http_bearer_token_configured": bool(os.getenv("HTTP_BEARER_TOKEN")),
+    },
+    "checks": checks,
+    "passed": passed,
+}
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2, sort_keys=True)
+PY
+}
 
 rpc_call() {
     local case_id="$1"
@@ -111,6 +221,8 @@ print(json.dumps({
 
     e2e_save_artifact "seed_${case_id}_request.json" "$payload"
 
+    local start_ns end_ns elapsed_ms
+    start_ns="$(date +%s%N)"
     set +e
     local status
     status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
@@ -121,8 +233,13 @@ print(json.dumps({
         2>"${curl_stderr_file}")"
     local rc=$?
     set -e
+    end_ns="$(date +%s%N)"
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 
     echo "${status}" > "${status_file}"
+    append_network_trace \
+        "${case_id}" "mcp_rpc" "POST" "${API_URL}" "${status}" "200" "bearer_valid" "${rc}" "${elapsed_ms}" \
+        "${headers_file}" "${body_file}" "${curl_stderr_file}"
     if [ "$rc" -ne 0 ]; then
         e2e_fail "seed_${case_id}: curl failed rc=${rc}"
         return 1
@@ -158,6 +275,8 @@ http_get() {
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
 
+    local start_ns end_ns elapsed_ms
+    start_ns="$(date +%s%N)"
     set +e
     local status
     status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
@@ -165,8 +284,13 @@ http_get() {
         "${url}" 2>"${curl_stderr_file}")"
     local rc=$?
     set -e
+    end_ns="$(date +%s%N)"
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 
     echo "${status}" > "${status_file}"
+    append_network_trace \
+        "${case_id}" "http_get" "GET" "${url}" "${status}" "200" "bearer_valid" "${rc}" "${elapsed_ms}" \
+        "${headers_file}" "${body_file}" "${curl_stderr_file}"
     if [ "$rc" -ne 0 ]; then
         e2e_fail "${case_id}: curl failed rc=${rc}"
         return 1
@@ -188,6 +312,8 @@ http_get_expect_status() {
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
 
+    local start_ns end_ns elapsed_ms
+    start_ns="$(date +%s%N)"
     set +e
     local status
     status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
@@ -195,8 +321,86 @@ http_get_expect_status() {
         "${url}" 2>"${curl_stderr_file}")"
     local rc=$?
     set -e
+    end_ns="$(date +%s%N)"
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 
     echo "${status}" > "${status_file}"
+    append_network_trace \
+        "${case_id}" "http_get" "GET" "${url}" "${status}" "${expected_status}" "bearer_valid" "${rc}" "${elapsed_ms}" \
+        "${headers_file}" "${body_file}" "${curl_stderr_file}"
+    if [ "$rc" -ne 0 ]; then
+        e2e_fail "${case_id}: curl failed rc=${rc}"
+        return 1
+    fi
+    if [ "${status}" != "${expected_status}" ]; then
+        e2e_fail "${case_id}: unexpected HTTP status ${status} (expected ${expected_status})"
+        return 1
+    fi
+    return 0
+}
+
+http_get_expect_status_no_auth() {
+    local case_id="$1"
+    local url="$2"
+    local expected_status="$3"
+
+    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    local start_ns end_ns elapsed_ms
+    start_ns="$(date +%s%N)"
+    set +e
+    local status
+    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
+        "${url}" 2>"${curl_stderr_file}")"
+    local rc=$?
+    set -e
+    end_ns="$(date +%s%N)"
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    echo "${status}" > "${status_file}"
+    append_network_trace \
+        "${case_id}" "http_get" "GET" "${url}" "${status}" "${expected_status}" "none" "${rc}" "${elapsed_ms}" \
+        "${headers_file}" "${body_file}" "${curl_stderr_file}"
+    if [ "$rc" -ne 0 ]; then
+        e2e_fail "${case_id}: curl failed rc=${rc}"
+        return 1
+    fi
+    if [ "${status}" != "${expected_status}" ]; then
+        e2e_fail "${case_id}: unexpected HTTP status ${status} (expected ${expected_status})"
+        return 1
+    fi
+    return 0
+}
+
+http_get_expect_status_invalid_token() {
+    local case_id="$1"
+    local url="$2"
+    local expected_status="$3"
+
+    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+
+    local start_ns end_ns elapsed_ms
+    start_ns="$(date +%s%N)"
+    set +e
+    local status
+    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
+        -H "authorization: Bearer invalid-token" \
+        "${url}" 2>"${curl_stderr_file}")"
+    local rc=$?
+    set -e
+    end_ns="$(date +%s%N)"
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    echo "${status}" > "${status_file}"
+    append_network_trace \
+        "${case_id}" "http_get" "GET" "${url}" "${status}" "${expected_status}" "bearer_invalid" "${rc}" "${elapsed_ms}" \
+        "${headers_file}" "${body_file}" "${curl_stderr_file}"
     if [ "$rc" -ne 0 ]; then
         e2e_fail "${case_id}: curl failed rc=${rc}"
         return 1
@@ -239,6 +443,12 @@ http_get "mail_index" "${BASE_URL}/mail" || true
 MAIL_INDEX_BODY="$(cat "${E2E_ARTIFACT_DIR}/mail_index_body.txt")"
 e2e_assert_contains "index includes Projects title" "${MAIL_INDEX_BODY}" "Projects"
 e2e_assert_contains "index includes project slug" "${MAIL_INDEX_BODY}" "${PROJECT_SLUG}"
+
+e2e_case_banner "GET /mail (missing auth bearer -> 401)"
+http_get_expect_status_no_auth "mail_no_auth" "${BASE_URL}/mail" "401" || true
+
+e2e_case_banner "GET /mail (invalid auth bearer -> 401)"
+http_get_expect_status_invalid_token "mail_invalid_token" "${BASE_URL}/mail" "401" || true
 
 e2e_case_banner "GET /mail/${PROJECT_SLUG} (project view)"
 http_get "mail_project" "${BASE_URL}/mail/${PROJECT_SLUG}" || true
@@ -323,5 +533,12 @@ e2e_assert_contains "archive snapshot has messages key" "${MAIL_ARCHIVE_SNAPSHOT
 e2e_assert_contains "archive snapshot has snapshot_time key" "${MAIL_ARCHIVE_SNAPSHOT_BODY}" "\"snapshot_time\""
 e2e_assert_contains "archive snapshot has commit_sha key" "${MAIL_ARCHIVE_SNAPSHOT_BODY}" "\"commit_sha\""
 e2e_assert_contains "archive snapshot has requested_time key" "${MAIL_ARCHIVE_SNAPSHOT_BODY}" "\"requested_time\""
+
+write_policy_trace
+POLICY_TRACE_BODY="$(cat "${POLICY_TRACE_FILE}")"
+e2e_assert_contains "policy trace includes suite" "${POLICY_TRACE_BODY}" "\"suite\": \"mail_ui\""
+e2e_assert_contains "policy trace includes no-auth check" "${POLICY_TRACE_BODY}" "\"case_id\": \"mail_no_auth\""
+e2e_assert_contains "policy trace includes invalid-token check" "${POLICY_TRACE_BODY}" "\"case_id\": \"mail_invalid_token\""
+e2e_assert_contains "policy trace passed=true" "${POLICY_TRACE_BODY}" "\"passed\": true"
 
 e2e_summary
