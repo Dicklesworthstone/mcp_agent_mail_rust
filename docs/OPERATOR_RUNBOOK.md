@@ -61,13 +61,16 @@ Note: `scripts/am` is a dev wrapper around `mcp-agent-mail serve` (HTTP + TUI). 
 
 Before starting, verify:
 
-| Check           | How to verify                                  |
-|-----------------|------------------------------------------------|
-| Port available  | `ss -tlnp \| grep 8765` (should be empty)      |
-| Storage dir     | `ls -la ~/.mcp_agent_mail/` (writable)         |
-| Database URL    | `echo $DATABASE_URL` (defaults to in-memory)   |
-| Auth token      | `cat ~/.mcp_agent_mail/.env` (has token)       |
-| Disk space      | `df -h .` (>100 MB free)                       |
+| Check           | How to verify                                              |
+|-----------------|------------------------------------------------------------|
+| Port ownership  | `ss -tlnp \| grep 8765` (reuse existing Agent Mail if live) |
+| Storage dir     | `ls -la ~/.mcp_agent_mail/` (writable)                     |
+| Database URL    | `echo $DATABASE_URL` (defaults to in-memory)               |
+| Auth token      | `cat ~/.mcp_agent_mail/.env` (has token)                   |
+| Disk space      | `df -h .` (>100 MB free)                                   |
+
+If port `8765` is already used by Agent Mail, reuse it instead of force-killing.
+Use a different port only when intentionally running an isolated second server.
 
 The server runs startup probes automatically. If any fail, it prints
 remediation hints and exits. Probes check:
@@ -82,18 +85,19 @@ remediation hints and exits. Probes check:
 
 ### Global (always active)
 
-| Key         | Action            | Notes                           |
-|-------------|-------------------|---------------------------------|
-| `1`-`8`     | Jump to screen    | Suppressed during text input    |
-| `Tab`       | Next screen       |                                 |
-| `Shift+Tab` | Previous screen   |                                 |
-| `m`         | Toggle MCP/API    | Restarts transport              |
-| `Ctrl+P`    | Command palette   |                                 |
-| `:`         | Command palette   | Suppressed during text input    |
-| `T`         | Cycle theme       | Shift+T; 5 themes available     |
-| `?`         | Toggle help       |                                 |
-| `q`         | Quit              |                                 |
-| `Esc`       | Dismiss overlay   |                                 |
+| Key         | Action            | Notes                                   |
+|-------------|-------------------|-----------------------------------------|
+| `1`-`9`     | Jump to screens 1-9 | Suppressed during text input          |
+| `0`         | Jump to screen 10 | Projects screen                          |
+| `Tab`       | Next screen       | Use to reach screen 11 (Contacts)        |
+| `Shift+Tab` | Previous screen   |                                         |
+| `m`         | Toggle MCP/API    | Restarts transport                       |
+| `Ctrl+P`    | Command palette   |                                         |
+| `:`         | Command palette   | Suppressed during text input             |
+| `T`         | Cycle theme       | Shift+T; 5 themes available              |
+| `?`         | Toggle help       |                                         |
+| `q`         | Quit              |                                         |
+| `Esc`       | Dismiss overlay   |                                         |
 
 ### Screen-Specific
 
@@ -111,14 +115,28 @@ accessible via `?`. Common patterns:
 
 | # | Screen       | Purpose                                           |
 |---|--------------|---------------------------------------------------|
-| 1 | Dashboard    | Real-time event stream, sparkline, counters        |
-| 2 | Messages     | Browse messages with search, sort, filtering       |
-| 3 | Threads      | Thread view with correlation and drill-down        |
-| 4 | Agents       | Registered agents with recency indicators          |
-| 5 | Reservations | Active file reservations with TTL countdowns       |
-| 6 | ToolMetrics  | Per-tool latency histograms and call counts        |
-| 7 | SystemHealth | Connection probes, disk/memory, circuit breakers   |
-| 8 | Timeline     | Chronological event timeline with inspector         |
+| 1 | Dashboard    | Event stream, sparkline, anomaly rail, quick triage |
+| 2 | Messages     | Browse/search message content and metadata          |
+| 3 | Threads      | Thread correlation and conversation drill-down      |
+| 4 | Agents       | Registered agents, activity, and unread state       |
+| 5 | Search       | Query/facets/results/preview explorer               |
+| 6 | Reservations | Active file reservations and TTL countdowns         |
+| 7 | Tool Metrics | Per-tool latency/error/call count observability     |
+| 8 | SystemHealth | Probes, disk/memory, and circuit breaker state      |
+| 9 | Timeline     | Chronological event timeline + inspector            |
+| 10 | Projects    | Project inventory and routing helpers               |
+| 11 | Contacts    | Contact graph and policy management                 |
+
+### 4.1 Representative Operator Workflows
+
+1. Incident triage from Dashboard:
+   `1` → inspect anomaly rail and event log → `Enter` on high-signal event to deep-link Timeline → `9` verify sequence and timestamps.
+2. Ack backlog chase:
+   `2` Messages with filter/sort → locate `ack_required` high/urgent traffic → pivot to `3` Threads for context → use MCP/CLI action to acknowledge.
+3. Reservation contention diagnosis:
+   `6` Reservations to identify conflicting globs/holders → `4` Agents for ownership/activity recency → `11` Contacts if policy/linking blocks direct coordination.
+4. Tool latency regression check:
+   `7` Tool Metrics to identify slow/failing tools → `8` SystemHealth to check DB/circuit pressure → capture bundle and run troubleshooting suites from Section 7.
 
 ## 5. Transport Modes
 
@@ -225,7 +243,8 @@ ss -tlnp | grep 8765
 # or
 lsof -i :8765
 
-# Kill it or use a different port
+# If it is already Agent Mail, reuse that server.
+# Otherwise, start on a different port.
 scripts/am --port 9000
 ```
 
@@ -272,8 +291,8 @@ sqlite3 /path/to/storage.sqlite3 "PRAGMA integrity_check;"
 # 1. Back up the corrupt database
 cp storage.sqlite3 storage.sqlite3.corrupt
 
-# 2. Delete and let the server rebuild from migrations
-rm storage.sqlite3
+# 2. Quarantine the broken file (non-destructive)
+mv storage.sqlite3 "storage.sqlite3.corrupt.$(date +%Y%m%d_%H%M%S)"
 
 # 3. Restart — the server will create a fresh database
 scripts/am
@@ -292,7 +311,7 @@ See also: [RECOVERY_RUNBOOK.md](../RECOVERY_RUNBOOK.md)
 
 **Fix:**
 1. Verify the server is reachable: `curl -s http://127.0.0.1:8765/mcp/`
-2. Switch to System Health screen (`7`) to check connection probes
+2. Switch to System Health screen (`8`) to check connection probes
 3. Press `r` to force refresh
 
 ### Transport mode switch fails
@@ -318,7 +337,7 @@ grep VmRSS /proc/$(pgrep -f mcp-agent-mail)/status
 DATABASE_POOL_SIZE=10 DATABASE_MAX_OVERFLOW=20 scripts/am
 
 # Reduce event buffer capacity (in-memory event ring)
-# Check memory pressure on System Health screen (7)
+# Check memory pressure on System Health screen (8)
 ```
 
 ### Git index.lock contention
@@ -333,8 +352,9 @@ attempts) and removes stale locks older than 60 seconds as a last resort.
 # Check for stale locks
 find ~/.mcp_agent_mail -name "index.lock" -ls
 
-# If the owning process is dead, safe to remove:
-rm ~/.mcp_agent_mail/archive/projects/<slug>/.git/index.lock
+# If the owning process is dead, quarantine the stale lock:
+mv ~/.mcp_agent_mail/archive/projects/<slug>/.git/index.lock \
+   ~/.mcp_agent_mail/archive/projects/<slug>/.git/index.lock.stale
 ```
 
 ### Disk space warnings
@@ -351,6 +371,24 @@ du -sh ~/.mcp_agent_mail/
 
 # Adjust thresholds
 DISK_SPACE_WARNING_MB=200 DISK_SPACE_CRITICAL_MB=50 scripts/am
+```
+
+### Troubleshooting Suite Map (Use Before Escalation)
+
+| Symptom / Concern | Run This Suite | Expected Artifact Root |
+|-------------------|----------------|------------------------|
+| MCP/API mode drift or deny behavior mismatch | `tests/e2e/test_dual_mode.sh` | `tests/artifacts/dual_mode/<timestamp>/` |
+| TUI resize/reflow/screen rendering regressions | `tests/e2e/test_tui_compat_matrix.sh` | `tests/artifacts/tui_compat_matrix/<timestamp>/` |
+| Explorer/analytics/widgets interaction regressions | `tests/e2e/test_tui_interactions.sh` | `tests/artifacts/tui_interactions/<timestamp>/` |
+| Web UI route/action parity issues | `tests/e2e/test_mail_ui.sh` | `tests/artifacts/mail_ui/<timestamp>/` |
+| Artifact bundle schema/manifest failures | `tests/e2e/test_artifacts_schema.sh` | `tests/artifacts/artifacts_schema/<timestamp>/` |
+| Static export routing/search/hash parity | `tests/e2e/test_share.sh` | `tests/artifacts/share/<timestamp>/` |
+
+For any failing suite, validate forensic bundle structure:
+
+```bash
+source scripts/e2e_lib.sh
+e2e_validate_bundle_tree tests/artifacts
 ```
 
 ## 8. Diagnostics Collection
@@ -383,6 +421,29 @@ curl -s http://127.0.0.1:8765/mcp/ -H "Authorization: Bearer $HTTP_BEARER_TOKEN"
 # If LOG_JSON_ENABLED=true, logs are structured and can be filtered with jq
 ```
 
+### One-Command CI Artifact Retrieval + Unpack (Failing Run)
+
+From the repository root, this command downloads the latest failed CI run
+artifacts, unpacks them, and validates all discovered `bundle.json` files:
+
+```bash
+RUN_ID="$(gh run list --workflow ci.yml --status failure --limit 1 --json databaseId -q '.[0].databaseId')" && \
+OUT_DIR="/tmp/am-ci-artifacts-${RUN_ID}" && \
+mkdir -p "${OUT_DIR}" && \
+gh run download "${RUN_ID}" -D "${OUT_DIR}" && \
+bash -lc 'source scripts/e2e_lib.sh; e2e_validate_bundle_tree "'"${OUT_DIR}"'"'
+```
+
+Manual equivalent (specific run ID):
+
+```bash
+RUN_ID=<run-id>
+OUT_DIR="/tmp/am-ci-artifacts-${RUN_ID}"
+gh run download "${RUN_ID}" -D "${OUT_DIR}"
+source scripts/e2e_lib.sh
+e2e_validate_bundle_tree "${OUT_DIR}"
+```
+
 ### MCP Diagnostic Resources
 
 These resources are available via MCP `resources/read`:
@@ -410,7 +471,22 @@ Five built-in themes are available, cycled with `Shift+T`:
 Theme selection is not persisted across restarts. Set
 `CONSOLE_THEME=<name>` for a default preference.
 
-## 10. Graceful Shutdown
+## 10. Launch Safety Checklist
+
+Run this before declaring a rollout candidate:
+
+1. Security/auth:
+   confirm expected auth mode (`HTTP_BEARER_TOKEN` configured unless explicitly local-only), and verify unauthorized requests are denied when auth is on.
+2. Accessibility:
+   verify `TUI_HIGH_CONTRAST=true` readability and key workflows (`Dashboard`, `Messages`, `Reservations`, `SystemHealth`) with keyboard-only navigation.
+3. Reliability:
+   run critical suites from Section 7 and keep artifact bundles for review.
+4. Parity:
+   verify no regressions on active parity tracks (`mail_ui`, `dual_mode`, export/share suites).
+5. Rollback readiness:
+   confirm fallback launch command and prior known-good commit are recorded in incident notes before go/no-go.
+
+## 11. Graceful Shutdown
 
 Press `q` to initiate shutdown. The server:
 
@@ -422,7 +498,7 @@ Press `q` to initiate shutdown. The server:
 
 For immediate termination, send `SIGTERM` or `SIGINT` (Ctrl+C).
 
-## 11. Health Levels
+## 12. Health Levels
 
 The System Health screen shows overall health as Green/Yellow/Red:
 
@@ -435,7 +511,7 @@ The System Health screen shows overall health as Green/Yellow/Red:
 At Red level, the server may shed non-essential tools to protect core
 operations. Check the System Health screen for specifics.
 
-## 12. Common Operations
+## 13. Common Operations
 
 ### Restart without data loss
 ```bash
