@@ -244,6 +244,9 @@ jobs:
       - name: E2E mode matrix suite
         run: bash scripts/e2e_mode_matrix.sh
 
+      - name: E2E web parity suite (HTTP wrapper, includes mail_ui)
+        run: bash tests/e2e/test_http.sh
+
       - name: Validate artifact bundles
         if: always()
         run: |
