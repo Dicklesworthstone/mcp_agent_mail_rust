@@ -29,7 +29,8 @@
 #![allow(
     clippy::missing_const_for_fn,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::needless_pass_by_value
 )]
 
 use std::sync::Mutex;
@@ -264,7 +265,7 @@ impl Default for HarnessConfig {
         Self {
             seed,
             clock_base_micros: 1_704_067_200_000_000, // 2024-01-01T00:00:00Z
-            clock_step_micros: 1_000_000, // 1 second
+            clock_step_micros: 1_000_000,             // 1 second
             id_base: 1,
             test_name: String::new(),
         }
@@ -434,9 +435,7 @@ fn capitalize(s: &str) -> String {
 /// # Errors
 /// Returns `Err` if directory creation fails.
 pub fn artifact_dir(subdir: &str) -> std::io::Result<std::path::PathBuf> {
-    let ts = chrono::Utc::now()
-        .format("%Y%m%d_%H%M%S%.3fZ")
-        .to_string();
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S%.3fZ").to_string();
     let pid = std::process::id();
     // Navigate from any crate's `CARGO_MANIFEST_DIR` up to repo root.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -457,8 +456,7 @@ pub fn write_artifact(
     filename: &str,
     value: &impl serde::Serialize,
 ) -> std::io::Result<()> {
-    let json =
-        serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
     let path = dir.join(filename);
     std::fs::write(&path, json)?;
     eprintln!("artifact: {}", path.display());
