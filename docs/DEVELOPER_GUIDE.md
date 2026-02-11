@@ -351,3 +351,66 @@ cargo test -p mcp-agent-mail-server --lib -- no_screen_conflicts
 - [ ] Unit tests written
 - [ ] E2E test added for key interactions
 - [ ] Help overlay entry for screen-specific bindings
+
+## Extension Boundaries (Widgets/Search/Rendering)
+
+Use this as the contributor contract for `br-3vwi.11.3`-class changes.
+
+| Surface | Primary files | Do not bypass |
+|---------|---------------|---------------|
+| Widgets + screen composition | `crates/mcp-agent-mail-server/src/tui_widgets.rs`, `crates/mcp-agent-mail-server/src/tui_screens/*.rs`, `crates/mcp-agent-mail-server/src/tui_layout.rs` | Screen registry, keybinding conflict checks, theme palette usage |
+| Search query behavior | `crates/mcp-agent-mail-db/src/search_planner.rs`, `crates/mcp-agent-mail-db/src/search_service.rs`, `crates/mcp-agent-mail-db/src/search_scope.rs` | `sanitize_fts_query` path, scope policy enforcement, search audit semantics |
+| Markdown rendering/sanitization | `crates/mcp-agent-mail-server/src/markdown.rs`, `crates/mcp-agent-mail-server/src/tui_markdown.rs`, `crates/mcp-agent-mail-server/src/mail_ui.rs` | `render_markdown_to_safe_html` sanitizer flow and allowed-tag constraints |
+| Artifact schema + replay evidence | `scripts/e2e_lib.sh`, `docs/SPEC-artifacts-bundle-schema.md` | `bundle.json`/`summary.json`/`repro.*` contract and schema validator |
+
+## Non-Negotiable Invariants
+
+### 1) Query-dialect parity
+
+- Preserve existing search query semantics (`keyword`, `"phrase"`, `prefix*`, `AND/OR`, empty query behavior).
+- Keep malformed/hostile query handling deterministic and non-crashing.
+- Validate with:
+  - `tests/e2e/test_search_cockpit.sh`
+  - web parity checks in `tests/e2e/test_mail_ui.sh`
+
+### 2) Permission + redaction safety
+
+- Never expose blocked cross-project data in raw or preview forms.
+- Keep deny/redact audit semantics consistent with scope policy.
+- Validate with:
+  - `cargo test -p mcp-agent-mail-db --test scope_policy_property -- --nocapture`
+  - `tests/e2e/test_security_privacy.sh`
+
+### 3) Markdown sanitization invariants
+
+- All web-markdown rendering must go through `render_markdown_to_safe_html`.
+- Script/style/event-handler vectors must be stripped; allowed styling must remain constrained.
+- Validate with:
+  - `cargo test -p mcp-agent-mail-server markdown -- --nocapture`
+  - hostile markdown assertions in `tests/e2e/test_security_privacy.sh`
+
+### 4) Artifact-schema compliance
+
+- Every new/changed E2E flow must emit schema-valid bundle artifacts with replay metadata.
+- Do not introduce ad-hoc artifact formats that bypass `bundle.json` indexing.
+- Validate with:
+  - `tests/e2e/test_artifacts_schema.sh`
+  - `source scripts/e2e_lib.sh && e2e_validate_bundle_tree tests/artifacts`
+
+## Required Validation Matrix Before Merge
+
+| Change type | Required commands | Evidence artifacts to link in bead/comment |
+|-------------|-------------------|--------------------------------------------|
+| Search behavior/query dialect | `bash tests/e2e/test_search_cockpit.sh` | `tests/artifacts/search_cockpit/<timestamp>/case_*.txt`, `bundle.json` |
+| Scope/redaction policy | `cargo test -p mcp-agent-mail-db --test scope_policy_property -- --nocapture` and `bash tests/e2e/test_security_privacy.sh` | `tests/artifacts/security_privacy/<timestamp>/case_01_search_scope.txt`, `case_09_secret_body.txt` |
+| Widget/screen interaction changes | `bash tests/e2e/test_tui_interactions.sh` and `bash tests/e2e/test_tui_compat_matrix.sh` | `tests/artifacts/tui_interactions/<timestamp>/trace/analytics_widgets_timeline.tsv`, matrix profile captures |
+| Markdown rendering/sanitization | `cargo test -p mcp-agent-mail-server markdown -- --nocapture` and `bash tests/e2e/test_mail_ui.sh` | mail UI and security/privacy artifacts showing sanitized output |
+| E2E harness/artifact format changes | `bash tests/e2e/test_artifacts_schema.sh` | `tests/artifacts/artifacts_schema/<timestamp>/bundle.json` |
+
+## Contributor Workflow for Extension Changes
+
+1. Identify which surface(s) your change touches using the boundary table above.
+2. Implement only within the owning module path; avoid parallel logic branches that skip shared policy/sanitizer/planner code.
+3. Run the matching validation matrix entries and keep the generated artifact roots.
+4. Record evidence in the bead comment: command, pass/fail counts, and artifact paths.
+5. Only then close the bead or request review.
