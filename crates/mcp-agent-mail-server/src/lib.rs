@@ -3566,7 +3566,9 @@ impl HttpState {
         let budget = if self.request_timeout_secs == 0 {
             Budget::INFINITE
         } else {
-            Budget::with_deadline_secs(self.request_timeout_secs)
+            // Use wall_now() + duration for a RELATIVE deadline, not an absolute epoch time.
+            let deadline = wall_now() + std::time::Duration::from_secs(self.request_timeout_secs);
+            Budget::new().with_deadline(deadline)
         };
         let cx = Cx::for_request_with_budget(budget);
 
@@ -3664,7 +3666,9 @@ impl HttpState {
         let budget = if self.request_timeout_secs == 0 {
             Budget::INFINITE
         } else {
-            Budget::with_deadline_secs(self.request_timeout_secs)
+            // Use wall_now() + duration for a RELATIVE deadline, not an absolute epoch time.
+            let deadline = wall_now() + std::time::Duration::from_secs(self.request_timeout_secs);
+            Budget::new().with_deadline(deadline)
         };
         let cx = Cx::for_request_with_budget(budget);
         let mut session = Session::new(self.server_info.clone(), self.server_capabilities.clone());
@@ -4905,6 +4909,69 @@ mod tests {
 
     static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    /// Regression test: Budget deadline must be relative to wall_now(), not absolute.
+    ///
+    /// BUG HISTORY: Budget::with_deadline_secs(30) created a deadline of 30 seconds
+    /// since epoch (1970-01-01 00:00:30), but wall_now() returns time relative to
+    /// process start. Since wall_now() > 30 seconds, the deadline was always exceeded
+    /// immediately, causing all MCP requests to timeout.
+    ///
+    /// FIX: Use wall_now() + Duration::from_secs(timeout) for a relative deadline.
+    #[test]
+    fn budget_deadline_is_relative_to_wall_now_not_absolute() {
+        // Get current wall time
+        let now = wall_now();
+
+        // Simulate what the code does: create a budget with 30 second timeout
+        let timeout_secs: u64 = 30;
+        let deadline = now + std::time::Duration::from_secs(timeout_secs);
+        let budget = Budget::new().with_deadline(deadline);
+
+        // CRITICAL: The deadline must be in the future relative to wall_now()
+        // If this fails, MCP requests will timeout immediately
+        let check_time = wall_now();
+        assert!(
+            !budget.is_past_deadline(check_time),
+            "Budget deadline must be in the future! \
+             deadline={:?}, now={:?}, timeout={}s. \
+             This regression would cause all MCP requests to timeout immediately.",
+            deadline, check_time, timeout_secs
+        );
+
+        // The deadline should be approximately 30 seconds from now
+        // Allow some tolerance for test execution time
+        let deadline_nanos = deadline.as_nanos();
+        let now_nanos = check_time.as_nanos();
+        let diff_secs = (deadline_nanos.saturating_sub(now_nanos)) / 1_000_000_000;
+        assert!(
+            diff_secs >= 29 && diff_secs <= 31,
+            "Deadline should be ~30 seconds in the future, got {}s",
+            diff_secs
+        );
+    }
+
+    /// Verify that Budget::with_deadline_secs is NOT suitable for relative timeouts.
+    /// This test documents the API misuse that caused the bug.
+    #[test]
+    fn budget_with_deadline_secs_is_absolute_not_relative() {
+        // Budget::with_deadline_secs(30) creates an ABSOLUTE deadline of 30 seconds
+        // This is NOT 30 seconds from now - it's 30 seconds since time origin!
+        let budget = Budget::with_deadline_secs(30);
+
+        // After sleeping a bit, wall_now() should exceed 30 seconds
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let later = wall_now();
+
+        // If wall_now() is past 30 seconds (which it usually is), deadline is exceeded
+        // This demonstrates why with_deadline_secs is wrong for relative timeouts
+        if later.as_secs() > 30 {
+            assert!(
+                budget.is_past_deadline(later),
+                "with_deadline_secs(30) should be expired when wall_now() > 30s"
+            );
+        }
+    }
 
     #[test]
     fn result_preview_truncates_utf8_safely() {
