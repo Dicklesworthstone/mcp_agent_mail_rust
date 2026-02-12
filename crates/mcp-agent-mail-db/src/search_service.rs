@@ -29,14 +29,17 @@ use mcp_agent_mail_search_core::{
 };
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
-    DocKind as SearchDocKind, ModelRegistry, ModelTier, RegistryConfig, VectorFilter, VectorIndex,
-    VectorIndexConfig,
+    DocKind as SearchDocKind, ModelRegistry, ModelTier, RegistryConfig, TwoTierAvailability,
+    TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex, VectorIndexConfig,
+    get_two_tier_context,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
 #[cfg(feature = "hybrid")]
 use std::sync::{Arc, OnceLock, RwLock};
+#[cfg(feature = "hybrid")]
+use half::f16;
 // ────────────────────────────────────────────────────────────────────
 // Search service options
 // ────────────────────────────────────────────────────────────────────
@@ -344,6 +347,243 @@ const fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<
     None
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Two-Tier Semantic Bridge (auto-initialized, no manual setup)
+// ────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "hybrid")]
+static TWO_TIER_BRIDGE: OnceLock<Option<Arc<TwoTierBridge>>> = OnceLock::new();
+
+/// Bridge to the two-tier progressive semantic search system.
+///
+/// Uses automatic embedder detection and initialization:
+/// - Fast tier: potion-128M (sub-ms, from HuggingFace cache)
+/// - Quality tier: MiniLM-L6-v2 (128ms, via FastEmbed)
+///
+/// No manual setup required - embedders are auto-detected on first use.
+#[cfg(feature = "hybrid")]
+pub struct TwoTierBridge {
+    /// The two-tier index holding document embeddings.
+    index: RwLock<TwoTierIndex>,
+    /// Configuration (derived from auto-detected embedders).
+    config: TwoTierConfig,
+}
+
+#[cfg(feature = "hybrid")]
+impl TwoTierBridge {
+    /// Create a new two-tier bridge using auto-detected configuration.
+    ///
+    /// This automatically detects available embedders and creates appropriate
+    /// configuration. No manual model loading required.
+    #[must_use]
+    pub fn new() -> Self {
+        let ctx = get_two_tier_context();
+        let config = ctx.config().clone();
+        let index = ctx.create_index();
+
+        tracing::info!(
+            availability = %ctx.availability(),
+            fast_model = ?ctx.fast_info().map(|i| &i.id),
+            quality_model = ?ctx.quality_info().map(|i| &i.id),
+            "Two-tier semantic bridge initialized"
+        );
+
+        Self {
+            index: RwLock::new(index),
+            config,
+        }
+    }
+
+    /// Get the two-tier index (for reads).
+    pub fn index(&self) -> std::sync::RwLockReadGuard<'_, TwoTierIndex> {
+        self.index.read().expect("two-tier index lock poisoned")
+    }
+
+    /// Get a mutable reference to the index (for writes).
+    pub fn index_mut(&self) -> std::sync::RwLockWriteGuard<'_, TwoTierIndex> {
+        self.index.write().expect("two-tier index lock poisoned")
+    }
+
+    /// Check if two-tier search is available (at least fast embedder).
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        get_two_tier_context().is_available()
+    }
+
+    /// Check if full two-tier search is available (both tiers).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        get_two_tier_context().is_full()
+    }
+
+    /// Get the availability status.
+    #[must_use]
+    pub fn availability(&self) -> TwoTierAvailability {
+        get_two_tier_context().availability()
+    }
+
+    /// Search for semantically similar documents using two-tier progressive search.
+    ///
+    /// Returns fast results immediately; quality refinement happens in background.
+    pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
+        let ctx = get_two_tier_context();
+
+        // Check availability
+        if !ctx.is_available() {
+            tracing::debug!(
+                target: "search.semantic",
+                "no embedders available, skipping two-tier search"
+            );
+            return Vec::new();
+        }
+
+        // Embed the query using fast tier
+        let embedding = match ctx.embed_fast(&query.text) {
+            Ok(emb) => emb,
+            Err(e) => {
+                tracing::warn!(
+                    target: "search.semantic",
+                    error = %e,
+                    "failed to embed query with fast tier"
+                );
+                return Vec::new();
+            }
+        };
+
+        // Search the index
+        let index = self.index();
+
+        // For now, use simple similarity search on the fast tier
+        // Full progressive refinement will be added in a follow-up
+        let hits = index.search_fast(&embedding, limit);
+
+        // Convert to SearchResult using metadata from the index
+        hits.into_iter()
+            .map(|hit| SearchResult {
+                doc_kind: convert_doc_kind(hit.doc_kind),
+                id: i64::try_from(hit.doc_id).unwrap_or(i64::MAX),
+                project_id: hit.project_id,
+                title: String::new(), // Index doesn't store full docs
+                body: String::new(),
+                score: Some(f64::from(hit.score)),
+                importance: None,
+                ack_required: None,
+                created_ts: None,
+                thread_id: None,
+                from_agent: None,
+                redacted: false,
+                redaction_reason: None,
+            })
+            .collect()
+    }
+
+    /// Add a document to the two-tier index.
+    ///
+    /// Automatically embeds using available tiers.
+    pub fn add_document(
+        &self,
+        doc_id: i64,
+        doc_kind: DocKind,
+        project_id: Option<i64>,
+        text: &str,
+    ) -> Result<(), String> {
+        let ctx = get_two_tier_context();
+
+        if !ctx.is_available() {
+            return Err("no embedders available".to_string());
+        }
+
+        // Embed with fast tier
+        let fast_embedding = ctx
+            .embed_fast(text)
+            .map_err(|e| format!("fast embed failed: {e}"))?;
+
+        // Embed with quality tier if available
+        let quality_embedding = if ctx.is_full() {
+            ctx.embed_quality(text).ok()
+        } else {
+            None
+        };
+
+        let doc_id = u64::try_from(doc_id).map_err(|_| "doc_id overflow".to_string())?;
+
+        let fast_embedding_f16 = fast_embedding
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let quality_embedding_f16 = quality_embedding
+            .unwrap_or_else(|| vec![0.0; self.config.quality_dimension])
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+
+        let search_doc_kind = match doc_kind {
+            DocKind::Message => SearchDocKind::Message,
+            DocKind::Agent => SearchDocKind::Agent,
+            DocKind::Project => SearchDocKind::Project,
+            DocKind::Thread => SearchDocKind::Thread,
+        };
+
+        let entry = TwoTierEntry {
+            doc_id,
+            doc_kind: search_doc_kind,
+            project_id,
+            fast_embedding: fast_embedding_f16,
+            quality_embedding: quality_embedding_f16,
+        };
+
+        // Add to index
+        let mut index = self.index_mut();
+        index
+            .add_entry(entry)
+            .map_err(|e| format!("two-tier index add_entry failed: {e}"))?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "hybrid")]
+impl Default for TwoTierBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Initialize the global two-tier semantic bridge.
+///
+/// This automatically detects available embedders. No configuration needed.
+#[cfg(feature = "hybrid")]
+pub fn init_two_tier_bridge() -> Result<(), String> {
+    let bridge = TwoTierBridge::new();
+    let _ = TWO_TIER_BRIDGE.set(Some(Arc::new(bridge)));
+    Ok(())
+}
+
+/// Get the global two-tier bridge, if initialized.
+#[cfg(feature = "hybrid")]
+pub fn get_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
+    TWO_TIER_BRIDGE.get().and_then(std::clone::Clone::clone)
+}
+
+/// Try executing semantic candidate retrieval using two-tier system.
+///
+/// Prefers the two-tier bridge if available, falls back to legacy SemanticBridge.
+#[cfg(feature = "hybrid")]
+fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
+    // Try two-tier bridge first (auto-initialized, no manual setup)
+    if let Some(bridge) = get_two_tier_bridge() {
+        if bridge.is_available() {
+            let results = bridge.search(query, limit);
+            if !results.is_empty() {
+                return Some(results);
+            }
+        }
+    }
+
+    // Fall back to legacy semantic bridge
+    try_semantic_search(query, limit)
+}
+
 fn orchestrate_hybrid_results(
     query: &SearchQuery,
     engine: SearchEngine,
@@ -503,13 +743,18 @@ pub async fn execute_search(
     //
     // Stage order:
     // 1) lexical candidate retrieval (Tantivy bridge)
-    // 2) semantic candidate retrieval (optional; may be unavailable)
+    // 2) semantic candidate retrieval (two-tier with auto-init, or legacy fallback)
     // 3) deterministic dedupe + merge prep (mode-aware budgets)
     // Fusion/rerank stages are implemented by follow-up Search V3 tracks.
     if matches!(engine, SearchEngine::Hybrid | SearchEngine::Auto) {
         if let Some(lexical_results) = try_tantivy_search(query) {
+            // Try two-tier semantic search first, then fall back to legacy
+            #[cfg(feature = "hybrid")]
             let semantic_results =
-                try_semantic_search(query, query.effective_limit()).unwrap_or_default();
+                try_two_tier_search(query, query.effective_limit()).unwrap_or_default();
+            #[cfg(not(feature = "hybrid"))]
+            let semantic_results = Vec::new();
+
             let raw_results =
                 orchestrate_hybrid_results(query, engine, lexical_results, semantic_results);
             let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);

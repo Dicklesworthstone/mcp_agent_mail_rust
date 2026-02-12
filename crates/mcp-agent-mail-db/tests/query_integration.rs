@@ -740,14 +740,18 @@ fn search_engine_legacy_routes_to_fts_even_with_bridge_available() {
         execute_search(&cx, &pool2, &query, &opts).await
     });
 
+    // Legacy mode routes through FTS layer. With FTS tables present, it succeeds
+    // (returns empty results since no matching data exists).
     match result {
-        Outcome::Err(DbError::Sqlite(msg)) => {
+        Outcome::Ok(resp) => {
             assert!(
-                msg.contains("fts_messages"),
-                "expected legacy path to touch FTS layer, got: {msg}"
+                resp.results.is_empty(),
+                "expected empty results for non-existent token, got {} results",
+                resp.results.len()
             );
         }
-        other => panic!("expected legacy FTS-layer error, got: {other:?}"),
+        Outcome::Err(e) => panic!("legacy FTS search should succeed, got: {e:?}"),
+        other => panic!("unexpected outcome: {other:?}"),
     }
 }
 
@@ -788,14 +792,14 @@ fn search_engine_shadow_records_parity_comparison_metrics() {
         execute_search(&cx, &pool2, &query, &opts).await
     });
 
+    // Shadow mode compares Tantivy and legacy FTS. With FTS tables present,
+    // both paths execute successfully (FTS returns empty, Tantivy may find the doc).
     match result {
-        Outcome::Err(DbError::Sqlite(msg)) => {
-            assert!(
-                msg.contains("fts_messages"),
-                "expected shadow primary path to hit legacy FTS layer, got: {msg}"
-            );
+        Outcome::Ok(_resp) => {
+            // Shadow mode succeeded - both search paths worked
         }
-        other => panic!("expected shadow legacy-path error, got: {other:?}"),
+        Outcome::Err(e) => panic!("shadow search should succeed with FTS available, got: {e:?}"),
+        other => panic!("unexpected outcome: {other:?}"),
     }
 }
 

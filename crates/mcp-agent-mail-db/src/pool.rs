@@ -347,8 +347,8 @@ impl DbPool {
 
                     // For file-backed DBs, run DB-wide init (journal mode, migrations) with
                     // C-backed SqliteConnection BEFORE opening FrankenConnection.
-                    // FrankenConnection and SqliteConnection must never be open on the
-                    // same file simultaneously — concurrent access corrupts the database.
+                    // Run one-time DB initialization (schema + migrations) via a separate
+                    // connection to ensure atomic setup before pool connections open.
                     if sqlite_path != ":memory:" {
                         let init_gate = sqlite_init_gate(&sqlite_path);
                         let run_migrations = run_migrations;
@@ -360,12 +360,9 @@ impl DbPool {
                                 async move {
                                     // Use C-backed SqliteConnection for DB-wide init.
                                     //
-                                    // IMPORTANT: Use base-safe DB init pragmas (no WAL mode)
-                                    // and only run *base* migrations (no FTS5 virtual
-                                    // tables, no triggers). FrankenConnection cannot open
-                                    // database files that contain FTS5 shadow table pages
-                                    // ("cell has no rowid" error). Search falls back to LIKE
-                                    // automatically when FTS5 tables are absent.
+                                    // Since DbConn = SqliteConnection (not FrankenConnection),
+                                    // we can safely run full migrations including FTS5 virtual
+                                    // tables and triggers for optimal search performance.
                                     if let Err(e) =
                                         ensure_sqlite_file_healthy(Path::new(&sqlite_path))
                                     {
@@ -381,8 +378,7 @@ impl DbPool {
                                         return Err(Outcome::Err(e));
                                     }
                                     if run_migrations {
-                                        match schema::migrate_to_latest_base(&cx2, &mig_conn).await
-                                        {
+                                        match schema::migrate_to_latest(&cx2, &mig_conn).await {
                                             Outcome::Ok(_) => {}
                                             Outcome::Err(e) => return Err(Outcome::Err(e)),
                                             Outcome::Cancelled(r) => {
@@ -393,10 +389,7 @@ impl DbPool {
                                             }
                                         }
                                     }
-                                    if let Err(e) = schema::enforce_base_mode_cleanup(&mig_conn) {
-                                        return Err(Outcome::Err(e));
-                                    }
-                                    // Drop SqliteConnection before FrankenConnection opens.
+                                    // Drop migration connection before pool connection opens.
                                     drop(mig_conn);
                                     Ok(())
                                 }
@@ -414,7 +407,7 @@ impl DbPool {
                         }
                     }
 
-                    // Now open FrankenConnection — SqliteConnection is fully closed.
+                    // Now open pool connection (migrations are complete).
                     let conn = if sqlite_path == ":memory:" {
                         match DbConn::open_memory() {
                             Ok(c) => c,
@@ -1329,6 +1322,103 @@ mod tests {
         assert!(
             message.contains("no healthy backup"),
             "expected clear no-backup error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn pool_startup_preserves_fts_tables_for_search() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("fts_preservation.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.display().to_string();
+
+        // Create pool - should run full migrations including FTS
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: db_url,
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+
+        // Acquire a connection to trigger migration
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+        });
+        drop(pool);
+
+        // Verify FTS tables exist after pool startup
+        let conn =
+            sqlmodel_sqlite::SqliteConnection::open_file(db_path_str).expect("reopen sqlite db");
+        let fts_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM sqlite_master \
+                 WHERE type='table' AND name = 'fts_messages'",
+                &[],
+            )
+            .expect("query fts_messages table");
+        let fts_count = fts_rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("n").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            fts_count, 1,
+            "pool startup should create fts_messages table for search functionality"
+        );
+    }
+
+    #[test]
+    fn pool_startup_preserves_identity_fts_artifacts() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("identity_fts_preserved.db");
+        let db_path_str = db_path.display().to_string();
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let config = DbPoolConfig {
+            database_url: db_url,
+            ..Default::default()
+        };
+        let parsed_path = config
+            .sqlite_path()
+            .expect("parse sqlite path from database_url");
+        assert_eq!(
+            parsed_path, db_path_str,
+            "pool must target the fixture DB path for this regression test"
+        );
+
+        // Create pool - should run full migrations including FTS
+        let pool = DbPool::new(&config).expect("create pool");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+        });
+        drop(pool);
+
+        // Verify FTS artifacts are present after pool startup
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(parsed_path).expect("reopen db");
+        let fts_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM sqlite_master \
+                 WHERE type='table' AND name IN ('fts_messages', 'fts_agents', 'fts_projects')",
+                &[],
+            )
+            .expect("query FTS tables");
+        let fts_count = fts_rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("n").ok())
+            .unwrap_or_default();
+        assert!(
+            fts_count >= 1,
+            "pool startup should preserve FTS tables for search functionality, found {fts_count}"
         );
     }
 }
