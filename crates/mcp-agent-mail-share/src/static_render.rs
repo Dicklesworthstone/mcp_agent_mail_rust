@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection as DbConn;
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value as SqlValue;
 

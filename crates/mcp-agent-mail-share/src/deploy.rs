@@ -53,6 +53,8 @@ pub enum CheckSeverity {
     Error,
     Warning,
     Info,
+    /// Check precondition not met — not evaluated.
+    Skipped,
 }
 
 /// Platform deployment information.
@@ -119,6 +121,187 @@ pub struct VerifyResult {
     pub checked_at: String,
     pub checks: Vec<DeployCheck>,
     pub all_passed: bool,
+}
+
+// ── Verify-live report (SPEC-verify-live-contract.md) ────────────────────
+
+/// Overall verification verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyVerdict {
+    /// All checks passed (or only info/skipped failures).
+    Pass,
+    /// No error-severity failures, but warning-severity failures exist.
+    Warn,
+    /// At least one error-severity check failed.
+    Fail,
+}
+
+/// A single verify-live check result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyLiveCheck {
+    /// Dotted check identifier (e.g., `remote.root`).
+    pub id: String,
+    /// Human-readable check description.
+    pub description: String,
+    /// Severity of this check.
+    pub severity: CheckSeverity,
+    /// Whether the check passed.
+    pub passed: bool,
+    /// Result detail (success or failure reason).
+    pub message: String,
+    /// Time taken for this check in milliseconds.
+    pub elapsed_ms: u64,
+    /// HTTP response status code (remote checks only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// Relevant response headers (remote checks only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers_captured: Option<BTreeMap<String, String>>,
+}
+
+/// A verification stage (local, remote, or security).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyStage {
+    /// Whether this stage was executed.
+    pub ran: bool,
+    /// Check results for this stage.
+    pub checks: Vec<VerifyLiveCheck>,
+}
+
+/// Summary counts for a verify-live report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifySummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub warnings: usize,
+    pub skipped: usize,
+    pub elapsed_ms: u64,
+}
+
+/// Configuration used for a verify-live run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyConfig {
+    pub strict: bool,
+    pub fail_fast: bool,
+    pub timeout_ms: u64,
+    pub retries: u32,
+    pub security_audit: bool,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            strict: false,
+            fail_fast: false,
+            timeout_ms: 10_000,
+            retries: 2,
+            security_audit: false,
+        }
+    }
+}
+
+/// Full verify-live report (SPEC-verify-live-contract.md schema_version 1.0.0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyLiveReport {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<String>,
+    pub verdict: VerifyVerdict,
+    pub stages: VerifyStages,
+    pub summary: VerifySummary,
+    pub config: VerifyConfig,
+}
+
+/// Container for all verification stages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyStages {
+    pub local: VerifyStage,
+    pub remote: VerifyStage,
+    pub security: VerifyStage,
+}
+
+impl VerifyLiveReport {
+    /// Compute verdict from check results.
+    #[must_use]
+    pub fn compute_verdict(stages: &VerifyStages) -> VerifyVerdict {
+        let all_checks = stages
+            .local
+            .checks
+            .iter()
+            .chain(stages.remote.checks.iter())
+            .chain(stages.security.checks.iter());
+
+        let mut has_error = false;
+        let mut has_warning = false;
+
+        for check in all_checks {
+            if !check.passed {
+                match check.severity {
+                    CheckSeverity::Error => has_error = true,
+                    CheckSeverity::Warning => has_warning = true,
+                    CheckSeverity::Info | CheckSeverity::Skipped => {}
+                }
+            }
+        }
+
+        if has_error {
+            VerifyVerdict::Fail
+        } else if has_warning {
+            VerifyVerdict::Warn
+        } else {
+            VerifyVerdict::Pass
+        }
+    }
+
+    /// Compute summary counts from stages.
+    #[must_use]
+    pub fn compute_summary(stages: &VerifyStages, total_elapsed_ms: u64) -> VerifySummary {
+        let all_checks: Vec<&VerifyLiveCheck> = stages
+            .local
+            .checks
+            .iter()
+            .chain(stages.remote.checks.iter())
+            .chain(stages.security.checks.iter())
+            .collect();
+
+        let total = all_checks.len();
+        let passed = all_checks.iter().filter(|c| c.passed).count();
+        let skipped = all_checks
+            .iter()
+            .filter(|c| c.severity == CheckSeverity::Skipped)
+            .count();
+        let warnings = all_checks
+            .iter()
+            .filter(|c| !c.passed && c.severity == CheckSeverity::Warning)
+            .count();
+        let failed = all_checks
+            .iter()
+            .filter(|c| !c.passed && c.severity == CheckSeverity::Error)
+            .count();
+
+        VerifySummary {
+            total,
+            passed,
+            failed,
+            warnings,
+            skipped,
+            elapsed_ms: total_elapsed_ms,
+        }
+    }
+
+    /// Determine exit code per SPEC-verify-live-contract.md.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self.verdict {
+            VerifyVerdict::Fail => 1,
+            VerifyVerdict::Warn if self.config.strict => 1,
+            _ => 0,
+        }
+    }
 }
 
 /// Deployment history entry for tracking deployments over time.
@@ -1528,5 +1711,287 @@ mod tests {
         assert!(report.security.cross_origin_isolation);
         assert!(!report.security.contains_database);
         assert!(report.rollback.steps.len() >= 3);
+    }
+
+    // ── verify-live contract types ──────────────────────────────────
+
+    fn make_check(id: &str, passed: bool, severity: CheckSeverity) -> VerifyLiveCheck {
+        VerifyLiveCheck {
+            id: id.to_string(),
+            description: format!("check {id}"),
+            severity,
+            passed,
+            message: if passed {
+                "ok".to_string()
+            } else {
+                "failed".to_string()
+            },
+            elapsed_ms: 10,
+            http_status: None,
+            headers_captured: None,
+        }
+    }
+
+    fn make_stages(checks: Vec<VerifyLiveCheck>) -> VerifyStages {
+        VerifyStages {
+            local: VerifyStage {
+                ran: false,
+                checks: vec![],
+            },
+            remote: VerifyStage { ran: true, checks },
+            security: VerifyStage {
+                ran: false,
+                checks: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn verdict_all_pass() {
+        let stages = make_stages(vec![
+            make_check("remote.root", true, CheckSeverity::Error),
+            make_check("remote.viewer", true, CheckSeverity::Warning),
+        ]);
+        assert_eq!(
+            VerifyLiveReport::compute_verdict(&stages),
+            VerifyVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn verdict_warning_only() {
+        let stages = make_stages(vec![
+            make_check("remote.root", true, CheckSeverity::Error),
+            make_check("remote.coop", false, CheckSeverity::Warning),
+        ]);
+        assert_eq!(
+            VerifyLiveReport::compute_verdict(&stages),
+            VerifyVerdict::Warn
+        );
+    }
+
+    #[test]
+    fn verdict_error_failure() {
+        let stages = make_stages(vec![
+            make_check("remote.root", false, CheckSeverity::Error),
+            make_check("remote.coop", false, CheckSeverity::Warning),
+        ]);
+        assert_eq!(
+            VerifyLiveReport::compute_verdict(&stages),
+            VerifyVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn verdict_skipped_does_not_affect() {
+        let stages = make_stages(vec![
+            make_check("remote.root", true, CheckSeverity::Error),
+            make_check("remote.content_match", false, CheckSeverity::Skipped),
+        ]);
+        assert_eq!(
+            VerifyLiveReport::compute_verdict(&stages),
+            VerifyVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn verdict_info_failure_does_not_affect() {
+        let stages = make_stages(vec![
+            make_check("remote.root", true, CheckSeverity::Error),
+            make_check("remote.database", false, CheckSeverity::Info),
+        ]);
+        assert_eq!(
+            VerifyLiveReport::compute_verdict(&stages),
+            VerifyVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn summary_counts() {
+        let stages = make_stages(vec![
+            make_check("remote.root", true, CheckSeverity::Error),
+            make_check("remote.viewer", true, CheckSeverity::Warning),
+            make_check("remote.coop", false, CheckSeverity::Warning),
+            make_check("remote.tls", false, CheckSeverity::Error),
+            make_check("remote.content_match", false, CheckSeverity::Skipped),
+        ]);
+        let summary = VerifyLiveReport::compute_summary(&stages, 500);
+        assert_eq!(summary.total, 5);
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.warnings, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.elapsed_ms, 500);
+    }
+
+    #[test]
+    fn exit_code_pass() {
+        let report = VerifyLiveReport {
+            schema_version: "1.0.0".to_string(),
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com".to_string(),
+            bundle_path: None,
+            verdict: VerifyVerdict::Pass,
+            stages: make_stages(vec![]),
+            summary: VerifySummary {
+                total: 0,
+                passed: 0,
+                failed: 0,
+                warnings: 0,
+                skipped: 0,
+                elapsed_ms: 0,
+            },
+            config: VerifyConfig::default(),
+        };
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[test]
+    fn exit_code_fail() {
+        let report = VerifyLiveReport {
+            schema_version: "1.0.0".to_string(),
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com".to_string(),
+            bundle_path: None,
+            verdict: VerifyVerdict::Fail,
+            stages: make_stages(vec![]),
+            summary: VerifySummary {
+                total: 1,
+                passed: 0,
+                failed: 1,
+                warnings: 0,
+                skipped: 0,
+                elapsed_ms: 100,
+            },
+            config: VerifyConfig::default(),
+        };
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn exit_code_warn_not_strict() {
+        let report = VerifyLiveReport {
+            schema_version: "1.0.0".to_string(),
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com".to_string(),
+            bundle_path: None,
+            verdict: VerifyVerdict::Warn,
+            stages: make_stages(vec![]),
+            summary: VerifySummary {
+                total: 1,
+                passed: 0,
+                failed: 0,
+                warnings: 1,
+                skipped: 0,
+                elapsed_ms: 100,
+            },
+            config: VerifyConfig::default(),
+        };
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[test]
+    fn exit_code_warn_strict() {
+        let config = VerifyConfig {
+            strict: true,
+            ..VerifyConfig::default()
+        };
+        let report = VerifyLiveReport {
+            schema_version: "1.0.0".to_string(),
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com".to_string(),
+            bundle_path: None,
+            verdict: VerifyVerdict::Warn,
+            stages: make_stages(vec![]),
+            summary: VerifySummary {
+                total: 1,
+                passed: 0,
+                failed: 0,
+                warnings: 1,
+                skipped: 0,
+                elapsed_ms: 100,
+            },
+            config,
+        };
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn verify_config_defaults() {
+        let config = VerifyConfig::default();
+        assert!(!config.strict);
+        assert!(!config.fail_fast);
+        assert_eq!(config.timeout_ms, 10_000);
+        assert_eq!(config.retries, 2);
+        assert!(!config.security_audit);
+    }
+
+    #[test]
+    fn verify_live_report_json_roundtrip() {
+        let stages = make_stages(vec![make_check("remote.root", true, CheckSeverity::Error)]);
+        let report = VerifyLiveReport {
+            schema_version: "1.0.0".to_string(),
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com".to_string(),
+            bundle_path: Some("/path/to/bundle".to_string()),
+            verdict: VerifyVerdict::Pass,
+            stages,
+            summary: VerifySummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+                warnings: 0,
+                skipped: 0,
+                elapsed_ms: 142,
+            },
+            config: VerifyConfig::default(),
+        };
+
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        let parsed: VerifyLiveReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.schema_version, "1.0.0");
+        assert_eq!(parsed.url, "https://example.com");
+        assert_eq!(parsed.verdict, VerifyVerdict::Pass);
+        assert_eq!(parsed.summary.total, 1);
+        assert_eq!(parsed.summary.passed, 1);
+        assert!(parsed.bundle_path.is_some());
+    }
+
+    #[test]
+    fn check_severity_skipped_serializes() {
+        let check = make_check("remote.content_match", false, CheckSeverity::Skipped);
+        let json = serde_json::to_string(&check).unwrap();
+        assert!(json.contains("\"skipped\""));
+    }
+
+    #[test]
+    fn verify_live_check_with_http_fields() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        );
+        let check = VerifyLiveCheck {
+            id: "remote.root".to_string(),
+            description: "Root page accessible".to_string(),
+            severity: CheckSeverity::Error,
+            passed: true,
+            message: "GET / → 200 (142ms)".to_string(),
+            elapsed_ms: 142,
+            http_status: Some(200),
+            headers_captured: Some(headers),
+        };
+        let json = serde_json::to_string_pretty(&check).unwrap();
+        assert!(json.contains("\"http_status\": 200"));
+        assert!(json.contains("\"headers_captured\""));
+        assert!(json.contains("text/html"));
+    }
+
+    #[test]
+    fn verify_live_check_omits_none_http_fields() {
+        let check = make_check("bundle.manifest", true, CheckSeverity::Error);
+        let json = serde_json::to_string(&check).unwrap();
+        assert!(!json.contains("http_status"));
+        assert!(!json.contains("headers_captured"));
     }
 }

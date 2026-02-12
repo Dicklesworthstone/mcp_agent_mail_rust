@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod deploy;
 pub mod finalize;
 pub mod hosting;
+pub mod probe;
 pub mod scope;
 pub mod scrub;
 pub mod snapshot;
@@ -20,9 +21,10 @@ pub use crypto::{
     verify_bundle as verify_bundle_crypto,
 };
 pub use deploy::{
-    BundleStats, CheckSeverity, DeployCheck, DeployReport, PlatformInfo, generate_cf_pages_config,
-    generate_cf_pages_workflow, generate_gh_pages_workflow, generate_netlify_config,
-    generate_validation_script, validate_bundle, write_deploy_tooling,
+    BundleStats, CheckSeverity, DeployCheck, DeployReport, PlatformInfo, VerifyConfig,
+    VerifyLiveCheck, VerifyLiveReport, VerifyStage, VerifyStages, VerifySummary, VerifyVerdict,
+    generate_cf_pages_config, generate_cf_pages_workflow, generate_gh_pages_workflow,
+    generate_netlify_config, generate_validation_script, validate_bundle, write_deploy_tooling,
 };
 pub use finalize::{
     FinalizeResult, build_materialized_views, build_search_indexes, create_performance_indexes,

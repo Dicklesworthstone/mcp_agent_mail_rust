@@ -596,4 +596,810 @@ mod tests {
         let decrypted = std::fs::read(&output).unwrap();
         assert_eq!(original, decrypted);
     }
+
+    // =====================================================================
+    // NEW: Encryption roundtrip tests (br-3h13.6.1)
+    // =====================================================================
+
+    // --- Ed25519 sign/verify roundtrip with different key sizes ---
+
+    #[test]
+    fn sign_verify_roundtrip_32_byte_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"bundle_type":"full"}"#).unwrap();
+
+        let key_path = dir.path().join("key32.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Verify with explicit public key
+        let result = verify_bundle(dir.path(), Some(&sig.public_key)).unwrap();
+        assert!(result.signature_checked);
+        assert!(result.signature_verified);
+        assert_eq!(result.key_source.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn sign_verify_roundtrip_64_byte_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"bundle_type":"incremental"}"#).unwrap();
+
+        // 64-byte expanded key (only first 32 bytes used as seed)
+        let mut key64 = [0u8; 64];
+        for (i, byte) in key64.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let key_path = dir.path().join("key64.key");
+        std::fs::write(&key_path, key64).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        let result = verify_bundle(dir.path(), Some(&sig.public_key)).unwrap();
+        assert!(result.signature_checked);
+        assert!(result.signature_verified);
+    }
+
+    // --- Wrong key decryption failure ---
+
+    #[test]
+    fn verify_with_wrong_public_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": "wrong key"}"#).unwrap();
+
+        // Sign with key A
+        let key_a = dir.path().join("key_a.key");
+        std::fs::write(&key_a, test_key_bytes()).unwrap();
+        let sig_path = dir.path().join("manifest.sig.json");
+        sign_manifest(&manifest_path, &key_a, &sig_path, false).unwrap();
+
+        // Create key B (different seed)
+        let key_b_seed: [u8; 32] = [
+            99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80, 79, 78,
+            77, 76, 75, 74, 73, 72, 71, 70, 69, 68,
+        ];
+        let key_b_signing = ed25519_dalek::SigningKey::from_bytes(&key_b_seed);
+        let key_b_pub = base64_encode(key_b_signing.verifying_key().as_bytes());
+
+        // Verify with wrong public key should fail
+        let result = verify_bundle(dir.path(), Some(&key_b_pub)).unwrap();
+        assert!(result.signature_checked);
+        assert!(
+            !result.signature_verified,
+            "verification with wrong key should fail"
+        );
+    }
+
+    // --- Corrupted ciphertext / signature detection ---
+
+    #[test]
+    fn corrupted_signature_bytes_fails_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"data": "integrity check"}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Corrupt the signature by flipping bits
+        let sig_bytes = base64_decode(&sig.signature).unwrap();
+        let mut corrupted = sig_bytes.clone();
+        corrupted[0] ^= 0xFF;
+        corrupted[31] ^= 0xAA;
+
+        // Write corrupted sig file
+        let corrupted_sig = ManifestSignature {
+            signature: base64_encode(&corrupted),
+            ..sig
+        };
+        let json = serde_json::to_string_pretty(&corrupted_sig).unwrap();
+        std::fs::write(&sig_path, json).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.signature_checked);
+        assert!(
+            !result.signature_verified,
+            "corrupted signature should fail verification"
+        );
+    }
+
+    #[test]
+    fn truncated_signature_fails_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"data": "truncated sig"}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Truncate signature to 32 bytes (should be 64)
+        let sig_bytes = base64_decode(&sig.signature).unwrap();
+        let truncated = base64_encode(&sig_bytes[..32]);
+
+        let truncated_sig = serde_json::json!({
+            "algorithm": "ed25519",
+            "signature": truncated,
+            "manifest_sha256": sig.manifest_sha256,
+            "public_key": sig.public_key,
+            "generated_at": sig.generated_at,
+        });
+        std::fs::write(
+            &sig_path,
+            serde_json::to_string_pretty(&truncated_sig).unwrap(),
+        )
+        .unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.signature_checked);
+        assert!(
+            !result.signature_verified,
+            "truncated signature should fail verification"
+        );
+    }
+
+    // --- Empty plaintext / manifest roundtrip ---
+
+    #[test]
+    fn sign_verify_empty_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        // Empty JSON object is a valid manifest
+        std::fs::write(&manifest_path, "{}").unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+        assert_eq!(sig.algorithm, "ed25519");
+
+        let result = verify_bundle(dir.path(), Some(&sig.public_key)).unwrap();
+        assert!(result.signature_checked);
+        assert!(result.signature_verified);
+    }
+
+    #[test]
+    fn sign_verify_single_byte_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        // Single byte content (not valid JSON, but sign_manifest reads raw bytes)
+        std::fs::write(&manifest_path, b"x").unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Verification will fail at manifest parse stage, but signing should work
+        assert!(!sig.signature.is_empty());
+        assert!(!sig.manifest_sha256.is_empty());
+    }
+
+    // --- Large payload roundtrip ---
+
+    #[test]
+    fn sign_verify_large_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Generate a 1MB+ JSON manifest
+        let mut large_json = String::from(r#"{"data": ""#);
+        // Append enough data to exceed 1MB
+        let filler = "A".repeat(1_100_000);
+        large_json.push_str(&filler);
+        large_json.push_str(r#""}"#);
+        assert!(large_json.len() > 1_000_000);
+
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, &large_json).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        let result = verify_bundle(dir.path(), Some(&sig.public_key)).unwrap();
+        assert!(result.signature_checked);
+        assert!(
+            result.signature_verified,
+            "large manifest should verify correctly"
+        );
+
+        // Verify SHA256 hash is correct
+        let expected_hash = hex_sha256(large_json.as_bytes());
+        assert_eq!(sig.manifest_sha256, expected_hash);
+    }
+
+    // --- Key derivation consistency (same seed -> same key pair) ---
+
+    #[test]
+    fn same_seed_produces_same_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"determinism": true}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        // Sign twice with the same key and manifest
+        let sig_path1 = dir.path().join("sig1.json");
+        let sig1 = sign_manifest(&manifest_path, &key_path, &sig_path1, false).unwrap();
+
+        let sig_path2 = dir.path().join("sig2.json");
+        let sig2 = sign_manifest(&manifest_path, &key_path, &sig_path2, false).unwrap();
+
+        // Same seed must produce the same public key
+        assert_eq!(sig1.public_key, sig2.public_key);
+
+        // Same seed + same message must produce the same signature
+        // (Ed25519 signatures are deterministic per RFC 8032)
+        assert_eq!(sig1.signature, sig2.signature);
+
+        // Same manifest hash
+        assert_eq!(sig1.manifest_sha256, sig2.manifest_sha256);
+    }
+
+    #[test]
+    fn different_seeds_produce_different_keys() {
+        use ed25519_dalek::SigningKey;
+
+        let seed_a = test_key_bytes();
+        let mut seed_b = test_key_bytes();
+        seed_b[0] ^= 0xFF; // Flip one byte
+
+        let key_a = SigningKey::from_bytes(&seed_a);
+        let key_b = SigningKey::from_bytes(&seed_b);
+
+        assert_ne!(
+            key_a.verifying_key().as_bytes(),
+            key_b.verifying_key().as_bytes(),
+            "different seeds should produce different public keys"
+        );
+    }
+
+    // --- Nonce/IV uniqueness: Ed25519 is deterministic, but age uses random nonces ---
+
+    #[test]
+    fn age_encrypts_same_plaintext_differently_each_time() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((_identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let plaintext = b"identical plaintext for nonce test";
+
+        // Encrypt twice
+        let input1 = dir.path().join("input1.bin");
+        std::fs::write(&input1, plaintext).unwrap();
+        let enc1 = encrypt_with_age(&input1, std::slice::from_ref(&recipient)).unwrap();
+
+        let input2 = dir.path().join("input2.bin");
+        std::fs::write(&input2, plaintext).unwrap();
+        let enc2 = encrypt_with_age(&input2, &[recipient]).unwrap();
+
+        let ciphertext1 = std::fs::read(&enc1).unwrap();
+        let ciphertext2 = std::fs::read(&enc2).unwrap();
+
+        // Ciphertexts should differ due to random nonce/file key
+        assert_ne!(
+            ciphertext1, ciphertext2,
+            "age should use unique nonces; encrypting the same plaintext twice must produce different ciphertexts"
+        );
+    }
+
+    // --- Tampered authentication tag / SRI detection ---
+
+    #[test]
+    fn tampered_sri_hash_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("viewer").join("vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        std::fs::write(vendor_dir.join("app.js"), b"console.log('hello')").unwrap();
+
+        // Write manifest with a deliberately wrong SRI hash
+        let manifest = serde_json::json!({
+            "viewer": {
+                "sri": {
+                    "vendor/app.js": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                }
+            }
+        });
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.sri_checked);
+        assert!(!result.sri_valid, "tampered SRI hash should be detected");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("SRI mismatch"),
+            "error should mention SRI mismatch"
+        );
+    }
+
+    #[test]
+    fn tampered_file_content_detected_via_sri() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("viewer").join("vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+
+        let original_content = b"original script content";
+        std::fs::write(vendor_dir.join("lib.js"), original_content).unwrap();
+
+        // Compute correct SRI for original
+        let correct_sri = format!("sha256-{}", base64_encode(&sha256_bytes(original_content)));
+        let manifest = serde_json::json!({
+            "viewer": {
+                "sri": {
+                    "vendor/lib.js": correct_sri
+                }
+            }
+        });
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        // Verify passes with original content
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.sri_checked);
+        assert!(result.sri_valid);
+
+        // Now tamper with the file
+        std::fs::write(vendor_dir.join("lib.js"), b"tampered script content").unwrap();
+
+        // Verify should fail
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.sri_checked);
+        assert!(
+            !result.sri_valid,
+            "tampered file content should fail SRI verification"
+        );
+    }
+
+    // --- Age encrypt/decrypt roundtrip for different bundle types ---
+
+    #[test]
+    fn age_roundtrip_empty_file() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let input = dir.path().join("empty.bin");
+        std::fs::write(&input, b"").unwrap();
+
+        let encrypted = encrypt_with_age(&input, &[recipient]).unwrap();
+        let output = dir.path().join("empty.decrypted.bin");
+        decrypt_with_age(&encrypted, &output, Some(&identity_path), None).unwrap();
+
+        let decrypted = std::fs::read(&output).unwrap();
+        assert!(decrypted.is_empty(), "decrypted empty file should be empty");
+    }
+
+    #[test]
+    fn age_roundtrip_large_payload() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        // 1MB+ payload
+        let large_data: Vec<u8> = (0..1_100_000u32).map(|i| (i % 256) as u8).collect();
+        let input = dir.path().join("large.bin");
+        std::fs::write(&input, &large_data).unwrap();
+
+        let encrypted = encrypt_with_age(&input, &[recipient]).unwrap();
+
+        // Encrypted file should be larger (header + auth tag overhead)
+        let enc_size = std::fs::metadata(&encrypted).unwrap().len();
+        assert!(
+            enc_size > large_data.len() as u64,
+            "encrypted file should be larger than plaintext"
+        );
+
+        let output = dir.path().join("large.decrypted.bin");
+        decrypt_with_age(&encrypted, &output, Some(&identity_path), None).unwrap();
+
+        let decrypted = std::fs::read(&output).unwrap();
+        assert_eq!(
+            decrypted, large_data,
+            "large payload roundtrip should match"
+        );
+    }
+
+    #[test]
+    fn age_roundtrip_binary_data() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        // Binary data with all byte values 0x00..0xFF
+        let binary_data: Vec<u8> = (0..=255).collect();
+        let input = dir.path().join("binary.dat");
+        std::fs::write(&input, &binary_data).unwrap();
+
+        let encrypted = encrypt_with_age(&input, &[recipient]).unwrap();
+        let output = dir.path().join("binary.decrypted.dat");
+        decrypt_with_age(&encrypted, &output, Some(&identity_path), None).unwrap();
+
+        let decrypted = std::fs::read(&output).unwrap();
+        assert_eq!(decrypted, binary_data, "binary data roundtrip should match");
+    }
+
+    #[test]
+    fn age_roundtrip_zip_bundle() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        // Simulate a ZIP bundle (just use the ZIP magic bytes + some data)
+        let mut zip_data = vec![0x50, 0x4B, 0x03, 0x04]; // ZIP local file header magic
+        zip_data.extend_from_slice(&[0u8; 1024]);
+        let input = dir.path().join("bundle.zip");
+        std::fs::write(&input, &zip_data).unwrap();
+
+        let encrypted = encrypt_with_age(&input, &[recipient]).unwrap();
+        assert!(
+            encrypted.display().to_string().ends_with(".zip.age"),
+            "encrypted zip should have .zip.age extension"
+        );
+
+        let output = dir.path().join("bundle.decrypted.zip");
+        decrypt_with_age(&encrypted, &output, Some(&identity_path), None).unwrap();
+
+        let decrypted = std::fs::read(&output).unwrap();
+        assert_eq!(decrypted, zip_data, "ZIP bundle roundtrip should match");
+    }
+
+    // --- Wrong key decryption failure for age ---
+
+    #[test]
+    fn age_decrypt_with_wrong_identity_fails() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        // Generate two separate identities
+        let id_dir_a = dir.path().join("id_a");
+        std::fs::create_dir_all(&id_dir_a).unwrap();
+        let Some((_identity_a, recipient_a)) = try_generate_age_identity(&id_dir_a) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let id_dir_b = dir.path().join("id_b");
+        std::fs::create_dir_all(&id_dir_b).unwrap();
+        let Some((identity_b, _recipient_b)) = try_generate_age_identity(&id_dir_b) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        // Encrypt with recipient A
+        let input = dir.path().join("secret.txt");
+        std::fs::write(&input, b"secret data").unwrap();
+        let encrypted = encrypt_with_age(&input, &[recipient_a]).unwrap();
+
+        // Try to decrypt with identity B (wrong key)
+        let output = dir.path().join("decrypted.txt");
+        let result = decrypt_with_age(&encrypted, &output, Some(&identity_b), None);
+        assert!(
+            result.is_err(),
+            "decryption with wrong identity should fail"
+        );
+    }
+
+    // --- Corrupted ciphertext detection for age ---
+
+    #[test]
+    fn age_corrupted_ciphertext_fails_decrypt() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let input = dir.path().join("data.bin");
+        std::fs::write(&input, b"important data").unwrap();
+        let encrypted = encrypt_with_age(&input, &[recipient]).unwrap();
+
+        // Corrupt the ciphertext by flipping bytes in the middle
+        let mut ciphertext = std::fs::read(&encrypted).unwrap();
+        if ciphertext.len() > 100 {
+            // Corrupt bytes deep in the payload (past the header)
+            for i in 80..std::cmp::min(100, ciphertext.len()) {
+                ciphertext[i] ^= 0xFF;
+            }
+        }
+        let corrupted_path = dir.path().join("corrupted.age");
+        std::fs::write(&corrupted_path, &ciphertext).unwrap();
+
+        let output = dir.path().join("decrypted.bin");
+        let result = decrypt_with_age(&corrupted_path, &output, Some(&identity_path), None);
+        assert!(
+            result.is_err(),
+            "decryption of corrupted ciphertext should fail"
+        );
+    }
+
+    // --- Age encryption parameter validation ---
+
+    #[test]
+    fn age_encrypt_no_recipients_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("test.bin");
+        std::fs::write(&input, b"data").unwrap();
+
+        let result = encrypt_with_age(&input, &[]);
+        assert!(result.is_err(), "encryption with no recipients should fail");
+    }
+
+    #[test]
+    fn age_decrypt_both_identity_and_passphrase_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted = dir.path().join("test.age");
+        std::fs::write(&encrypted, b"fake").unwrap();
+        let output = dir.path().join("out.bin");
+        let id_path = dir.path().join("id.txt");
+        std::fs::write(&id_path, b"fake identity").unwrap();
+
+        let result = decrypt_with_age(&encrypted, &output, Some(&id_path), Some("password"));
+        assert!(result.is_err(), "cannot combine identity and passphrase");
+    }
+
+    #[test]
+    fn age_decrypt_neither_identity_nor_passphrase_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted = dir.path().join("test.age");
+        std::fs::write(&encrypted, b"fake").unwrap();
+        let output = dir.path().join("out.bin");
+
+        let result = decrypt_with_age(&encrypted, &output, None, None);
+        assert!(
+            result.is_err(),
+            "must provide either identity or passphrase"
+        );
+    }
+
+    // --- SHA256 and base64 helpers: edge cases ---
+
+    #[test]
+    fn hex_sha256_empty_input() {
+        let hash = hex_sha256(b"");
+        // SHA-256 of empty string is well-known
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_bytes_matches_hex_sha256() {
+        let data = b"cross-check";
+        let hex_hash = hex_sha256(data);
+        let raw_bytes = sha256_bytes(data);
+        let hex_from_bytes = hex::encode(&raw_bytes);
+        assert_eq!(hex_hash, hex_from_bytes);
+    }
+
+    #[test]
+    fn base64_roundtrip_empty() {
+        let encoded = base64_encode(b"");
+        let decoded = base64_decode(&encoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn base64_roundtrip_all_byte_values() {
+        let data: Vec<u8> = (0..=255).collect();
+        let encoded = base64_encode(&data);
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn base64_decode_invalid_input() {
+        let result = base64_decode("not valid base64!!!");
+        assert!(result.is_err());
+    }
+
+    // --- Signature field integrity ---
+
+    #[test]
+    fn signature_metadata_fields_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"check":"fields"}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        assert_eq!(sig.algorithm, "ed25519");
+        assert!(!sig.signature.is_empty());
+        assert!(!sig.manifest_sha256.is_empty());
+        assert!(!sig.public_key.is_empty());
+        assert!(!sig.generated_at.is_empty());
+
+        // Signature should be valid base64 decoding to 64 bytes
+        let sig_bytes = base64_decode(&sig.signature).unwrap();
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signature must be 64 bytes");
+
+        // Public key should be valid base64 decoding to 32 bytes
+        let pk_bytes = base64_decode(&sig.public_key).unwrap();
+        assert_eq!(pk_bytes.len(), 32, "Ed25519 public key must be 32 bytes");
+
+        // manifest_sha256 should be a 64-character hex string
+        assert_eq!(sig.manifest_sha256.len(), 64);
+        assert!(sig.manifest_sha256.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // generated_at should be a parseable timestamp
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&sig.generated_at).is_ok(),
+            "generated_at should be valid RFC3339"
+        );
+    }
+
+    #[test]
+    fn sign_overwrite_produces_valid_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let key_path = dir.path().join("test.key");
+        let sig_path = dir.path().join("manifest.sig.json");
+
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        // Sign first version
+        std::fs::write(&manifest_path, r#"{"version": 1}"#).unwrap();
+        sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Update manifest and re-sign with overwrite
+        std::fs::write(&manifest_path, r#"{"version": 2}"#).unwrap();
+        let sig2 = sign_manifest(&manifest_path, &key_path, &sig_path, true).unwrap();
+
+        // Verify the new signature matches the new manifest
+        let result = verify_bundle(dir.path(), Some(&sig2.public_key)).unwrap();
+        assert!(result.signature_checked);
+        assert!(
+            result.signature_verified,
+            "overwritten signature should verify against updated manifest"
+        );
+    }
+
+    // --- Combined sign + SRI verification ---
+
+    #[test]
+    fn full_bundle_sign_and_sri_verify() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Set up viewer files with SRI
+        let vendor_dir = dir.path().join("viewer").join("vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        let js_content = b"function main() { return 42; }";
+        let css_content = b"body { margin: 0; }";
+        std::fs::write(vendor_dir.join("app.js"), js_content).unwrap();
+        std::fs::write(vendor_dir.join("style.css"), css_content).unwrap();
+
+        let js_sri = format!("sha256-{}", base64_encode(&sha256_bytes(js_content)));
+        let css_sri = format!("sha256-{}", base64_encode(&sha256_bytes(css_content)));
+
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "viewer": {
+                "sri": {
+                    "vendor/app.js": js_sri,
+                    "vendor/style.css": css_sri,
+                }
+            }
+        });
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // Sign the manifest
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Full verify: SRI + signature
+        let result = verify_bundle(dir.path(), Some(&sig.public_key)).unwrap();
+        assert!(result.sri_checked);
+        assert!(result.sri_valid, "SRI should be valid");
+        assert!(result.signature_checked);
+        assert!(result.signature_verified, "signature should verify");
+        assert!(result.error.is_none());
+        assert_eq!(result.key_source.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn tampered_public_key_in_sig_file_fails_with_explicit_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test":"tampered pk"}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let sig_path = dir.path().join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+
+        // Create a different key pair and use its public key as "explicit"
+        let other_seed: [u8; 32] = [0xAA; 32];
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&other_seed);
+        let other_pub = base64_encode(other_key.verifying_key().as_bytes());
+
+        // The signature was made with original key, but we verify with other key
+        let result = verify_bundle(dir.path(), Some(&other_pub)).unwrap();
+        assert!(result.signature_checked);
+        assert!(
+            !result.signature_verified,
+            "verification with mismatched explicit key should fail"
+        );
+
+        // But embedded key should still work (self-consistency)
+        let result2 = verify_bundle(dir.path(), None).unwrap();
+        assert!(result2.signature_checked);
+        assert!(
+            result2.signature_verified,
+            "embedded key should still verify (self-signed trust model)"
+        );
+        assert_eq!(result2.key_source.as_deref(), Some("embedded"));
+
+        // And the original correct explicit key should work
+        let result3 = verify_bundle(dir.path(), Some(&sig.public_key)).unwrap();
+        assert!(result3.signature_checked);
+        assert!(result3.signature_verified);
+    }
 }

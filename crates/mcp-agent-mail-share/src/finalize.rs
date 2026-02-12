@@ -434,10 +434,19 @@ pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareE
 
 // --- helpers ---
 
-fn open_conn(path: &Path) -> Result<mcp_agent_mail_db::DbConn, ShareError> {
+/// Open a C-backed SQLite connection for offline snapshot manipulation.
+///
+/// The share crate operates on snapshot copies (not the live DB), so it uses
+/// `SqliteConnection` directly. `FrankenConnection` lacks `sqlite_master`,
+/// `VACUUM`, and `backup_to_path` support needed here.
+fn open_conn(
+    path: &Path,
+) -> Result<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection, ShareError> {
     let path_str = path.display().to_string();
-    mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
-        message: format!("cannot open {path_str}: {e}"),
+    mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(|e| {
+        ShareError::Sqlite {
+            message: format!("cannot open {path_str}: {e}"),
+        }
     })
 }
 
@@ -448,7 +457,7 @@ fn sql_err(e: impl std::fmt::Display) -> ShareError {
 }
 
 fn column_exists(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
     table: &str,
     column: &str,
 ) -> Result<bool, ShareError> {
@@ -477,7 +486,10 @@ mod tests {
     /// Create a test DB with the standard schema.
     fn create_test_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test_finalize.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .unwrap();
 
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
@@ -546,7 +558,10 @@ mod tests {
         assert!(fts_ok, "FTS5 should be available");
 
         // Verify data in FTS table
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync("SELECT COUNT(*) AS cnt FROM fts_messages", &[])
             .unwrap();
@@ -570,7 +585,10 @@ mod tests {
 
         // Simulate a legacy export that created an FTS table without newer columns like
         // "importance" and "thread_key". The export pipeline should rebuild it.
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         conn.execute_raw(
             "CREATE VIRTUAL TABLE fts_messages USING fts5(subject, body, project_slug UNINDEXED)",
         )
@@ -580,7 +598,10 @@ mod tests {
         let fts_ok = build_search_indexes(&db).unwrap();
         assert!(fts_ok, "FTS5 should be available");
 
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync("PRAGMA table_info(fts_messages)", &[])
             .unwrap();
@@ -613,7 +634,10 @@ mod tests {
         }
 
         // Verify message_overview_mv
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync("SELECT COUNT(*) AS cnt FROM message_overview_mv", &[])
             .unwrap();
@@ -651,7 +675,10 @@ mod tests {
         assert!(indexes.contains(&"idx_messages_thread".to_string()));
 
         // Verify lowercase columns populated
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync(
                 "SELECT subject_lower, sender_lower FROM messages WHERE id = 1",
@@ -672,7 +699,10 @@ mod tests {
         finalize_snapshot_for_export(&db).unwrap();
 
         // Verify journal mode
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let rows = conn.query_sync("PRAGMA journal_mode", &[]).unwrap();
         let mode: String = rows[0].get_named("journal_mode").unwrap();
         assert_eq!(mode, "delete");
@@ -694,7 +724,10 @@ mod tests {
         let db = create_test_db(dir.path());
 
         // Inflate DB then delete to leave free pages.
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let big_body = "x".repeat(10_000);
         for i in 0..200 {
             conn.execute_raw(&format!(
@@ -730,7 +763,10 @@ mod tests {
         assert!(!result.indexes_created.is_empty());
 
         // Verify everything is queryable
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
 
         // FTS search
         let rows = conn
@@ -766,7 +802,10 @@ mod tests {
         // Simulate the server schema having a different FTS layout + triggers that refer to
         // `fts_messages(message_id, ...)`. The share export pipeline rebuilds `fts_messages`, so
         // those triggers must be removed before any message updates.
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         conn.execute_raw(
             "CREATE VIRTUAL TABLE fts_messages USING fts5(message_id UNINDEXED, subject, body)",
         )
@@ -817,7 +856,10 @@ mod tests {
         assert!(fts_ok);
 
         // Verify the virtual table schema matches
-        let conn = mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            snapshot.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync(
                 "SELECT sql FROM sqlite_master WHERE name = 'fts_messages'",
@@ -853,7 +895,10 @@ mod tests {
         assert!(views.contains(&"attachments_by_message_mv".to_string()));
 
         // Verify overview has expected columns
-        let conn = mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            snapshot.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync("PRAGMA table_info(message_overview_mv)", &[])
             .unwrap();

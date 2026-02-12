@@ -90,9 +90,11 @@ pub fn bundle_attachments(
     use base64::Engine;
 
     let path_str = snapshot_path.display().to_string();
-    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
-        message: format!("cannot open snapshot: {e}"),
-    })?;
+    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(
+        |e| ShareError::Sqlite {
+            message: format!("cannot open snapshot: {e}"),
+        },
+    )?;
 
     let rows = conn
         .query_sync(
@@ -909,9 +911,11 @@ pub fn export_viewer_data(
     std::fs::create_dir_all(&data_dir)?;
 
     let path_str = snapshot_path.display().to_string();
-    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
-        message: format!("cannot open snapshot for viewer data: {e}"),
-    })?;
+    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(
+        |e| ShareError::Sqlite {
+            message: format!("cannot open snapshot for viewer data: {e}"),
+        },
+    )?;
 
     // Count total messages
     let count_rows = conn
@@ -1200,7 +1204,10 @@ mod tests {
     /// Helper to create a DB with attachment entries pointing to storage files.
     fn create_bundle_test_db(dir: &Path, msg_attachments: &[&str]) -> PathBuf {
         let db_path = dir.join("bundle_test.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         ).unwrap();
@@ -1303,7 +1310,10 @@ mod tests {
         assert_eq!(result.items[0].mode, "inline");
 
         // Verify DB was updated with data: URI
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();
@@ -1392,7 +1402,10 @@ mod tests {
         assert_eq!(result.items[3].mode, "missing");
 
         // Verify DB was updated with all 4 types
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();
@@ -1477,7 +1490,10 @@ mod tests {
         assert_eq!(result.stats.inline, 1);
 
         // Verify DB: should have 2 entries, first unchanged
-        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db.display().to_string(),
+        )
+        .unwrap();
         let rows = conn
             .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
             .unwrap();
@@ -2095,5 +2111,627 @@ mod tests {
                 "keys should be alphabetically sorted"
             );
         }
+    }
+
+    // =========================================================================
+    // Bundle corruption detection tests (br-3h13.6.2)
+    // =========================================================================
+
+    /// Opening a truncated ZIP should fail with an error.
+    #[test]
+    fn corrupt_truncated_zip_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.txt"), b"hello world").unwrap();
+
+        let zip_path = dir.path().join("bundle.zip");
+        package_directory_as_zip(&source, &zip_path).unwrap();
+
+        // Read the valid zip, then truncate it
+        let full = std::fs::read(&zip_path).unwrap();
+        assert!(full.len() > 20, "zip should be non-trivial size");
+        let truncated = &full[..full.len() / 2];
+        let truncated_path = dir.path().join("truncated.zip");
+        std::fs::write(&truncated_path, truncated).unwrap();
+
+        // Attempting to open the truncated zip as an archive should fail
+        let file = std::fs::File::open(&truncated_path).unwrap();
+        let result = zip::ZipArchive::new(file);
+        assert!(result.is_err(), "truncated zip should fail to open");
+    }
+
+    /// A zero-byte file is not a valid ZIP archive.
+    #[test]
+    fn corrupt_zero_byte_zip_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let zero_path = dir.path().join("empty.zip");
+        std::fs::write(&zero_path, b"").unwrap();
+
+        let file = std::fs::File::open(&zero_path).unwrap();
+        let result = zip::ZipArchive::new(file);
+        assert!(result.is_err(), "zero-byte file is not a valid zip");
+    }
+
+    /// Random bytes are not a valid ZIP archive (wrong magic bytes/header).
+    #[test]
+    fn corrupt_wrong_magic_bytes_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("not_a_zip.zip");
+        // ZIP magic is PK\x03\x04; use something completely different
+        let garbage: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&bad_path, &garbage).unwrap();
+
+        let file = std::fs::File::open(&bad_path).unwrap();
+        let result = zip::ZipArchive::new(file);
+        assert!(
+            result.is_err(),
+            "random bytes should not parse as valid zip"
+        );
+    }
+
+    /// A file that starts with valid ZIP magic but has corrupt content.
+    #[test]
+    fn corrupt_malformed_zip_with_magic_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("bad_magic.zip");
+        // Start with PK\x03\x04 (local file header signature) but rest is garbage
+        let mut data = vec![0x50, 0x4B, 0x03, 0x04];
+        data.extend_from_slice(&[0xFF; 200]);
+        std::fs::write(&bad_path, &data).unwrap();
+
+        let file = std::fs::File::open(&bad_path).unwrap();
+        let result = zip::ZipArchive::new(file);
+        assert!(
+            result.is_err(),
+            "zip with valid magic but corrupt body should fail"
+        );
+    }
+
+    /// Corrupted manifest JSON in a bundle directory is detected by load_bundle_export_config.
+    #[test]
+    fn corrupt_manifest_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("manifest.json"), "{ not valid json !!!").unwrap();
+
+        let result = crate::load_bundle_export_config(&bundle);
+        assert!(result.is_err(), "invalid JSON manifest should error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("manifest") || err_msg.contains("parse"),
+            "error should mention manifest/parse: {err_msg}"
+        );
+    }
+
+    /// Manifest JSON that is valid but missing required fields still loads with defaults.
+    #[test]
+    fn corrupt_manifest_missing_required_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        // Valid JSON but completely empty object - no export_config, no database, etc.
+        std::fs::write(bundle.join("manifest.json"), "{}").unwrap();
+
+        let config = crate::load_bundle_export_config(&bundle).unwrap();
+        // Should fall back to defaults
+        assert_eq!(
+            config.inline_threshold,
+            crate::INLINE_ATTACHMENT_THRESHOLD as i64
+        );
+        assert_eq!(
+            config.detach_threshold,
+            crate::DETACH_ATTACHMENT_THRESHOLD as i64
+        );
+        assert_eq!(
+            config.chunk_threshold,
+            crate::DEFAULT_CHUNK_THRESHOLD as i64
+        );
+        assert_eq!(config.chunk_size, crate::DEFAULT_CHUNK_SIZE as i64);
+        assert_eq!(config.scrub_preset, "standard");
+        assert!(config.projects.is_empty());
+    }
+
+    /// Manifest with partial fields uses provided values and defaults for missing ones.
+    #[test]
+    fn corrupt_manifest_partial_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("manifest.json"),
+            r#"{"export_config": {"scrub_preset": "strict", "inline_threshold": 1234}}"#,
+        )
+        .unwrap();
+
+        let config = crate::load_bundle_export_config(&bundle).unwrap();
+        assert_eq!(config.scrub_preset, "strict");
+        assert_eq!(config.inline_threshold, 1234);
+        // Missing fields use defaults
+        assert_eq!(
+            config.detach_threshold,
+            crate::DETACH_ATTACHMENT_THRESHOLD as i64
+        );
+        assert_eq!(
+            config.chunk_threshold,
+            crate::DEFAULT_CHUNK_THRESHOLD as i64
+        );
+    }
+
+    /// Manifest that is a JSON array instead of an object still fails gracefully.
+    #[test]
+    fn corrupt_manifest_json_array_instead_of_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("manifest.json"), "[1, 2, 3]").unwrap();
+
+        // load_bundle_export_config treats non-object as having no fields, falls to defaults
+        let config = crate::load_bundle_export_config(&bundle).unwrap();
+        assert_eq!(config.scrub_preset, "standard");
+        assert!(config.projects.is_empty());
+    }
+
+    /// No manifest.json file at all triggers ManifestNotFound error.
+    #[test]
+    fn corrupt_manifest_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        // No manifest.json written
+
+        let result = crate::load_bundle_export_config(&bundle);
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                crate::ShareError::ManifestNotFound { .. }
+            ),
+            "should be ManifestNotFound error"
+        );
+    }
+
+    /// Missing chunk files that the chunk manifest references are detected.
+    #[test]
+    fn corrupt_missing_chunk_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, vec![0xAAu8; 100_000]).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let manifest = maybe_chunk_database(&db, &out, 50_000, 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.chunk_count, 4);
+
+        // Delete chunk 2 (00001.bin) to simulate corruption
+        let deleted_chunk = out.join("chunks/00001.bin");
+        assert!(deleted_chunk.exists());
+        std::fs::remove_file(&deleted_chunk).unwrap();
+
+        // Verify the chunk is gone
+        assert!(!deleted_chunk.exists());
+
+        // Reassembly now produces wrong data because chunk is missing
+        let mut reassembled = Vec::new();
+        let mut missing_count = 0usize;
+        for i in 0..manifest.chunk_count {
+            let chunk_path = out.join(format!("chunks/{i:05}.bin"));
+            if chunk_path.exists() {
+                reassembled.extend_from_slice(&std::fs::read(&chunk_path).unwrap());
+            } else {
+                missing_count += 1;
+            }
+        }
+        assert_eq!(missing_count, 1, "one chunk should be missing");
+        assert_ne!(
+            reassembled.len(),
+            manifest.original_bytes as usize,
+            "reassembled data should be shorter due to missing chunk"
+        );
+    }
+
+    /// Corrupted chunk config JSON (bad JSON) is detected.
+    #[test]
+    fn corrupt_chunk_config_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, vec![0u8; 100_000]).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        maybe_chunk_database(&db, &out, 50_000, 30_000).unwrap();
+
+        // Overwrite the config with invalid JSON
+        let config_path = out.join("mailbox.sqlite3.config.json");
+        assert!(config_path.exists());
+        std::fs::write(&config_path, "{ not valid json !!!").unwrap();
+
+        // Trying to parse this as ChunkManifest should fail
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let result: Result<ChunkManifest, _> = serde_json::from_str(&text);
+        assert!(
+            result.is_err(),
+            "corrupt chunk config JSON should fail to parse"
+        );
+    }
+
+    /// Chunk config JSON missing required fields results in deserialization error.
+    #[test]
+    fn corrupt_chunk_config_missing_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, vec![0u8; 100_000]).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        maybe_chunk_database(&db, &out, 50_000, 30_000).unwrap();
+
+        // Overwrite with valid JSON but missing required fields
+        let config_path = out.join("mailbox.sqlite3.config.json");
+        std::fs::write(&config_path, r#"{"version": 1}"#).unwrap();
+
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let result: Result<ChunkManifest, _> = serde_json::from_str(&text);
+        assert!(
+            result.is_err(),
+            "chunk config missing required fields should fail to deserialize"
+        );
+    }
+
+    /// Checksum mismatch in chunks.sha256 can be detected.
+    #[test]
+    fn corrupt_chunk_checksum_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, vec![0xBBu8; 100_000]).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let manifest = maybe_chunk_database(&db, &out, 50_000, 30_000)
+            .unwrap()
+            .unwrap();
+
+        // Parse checksums file
+        let checksums_text = std::fs::read_to_string(out.join("chunks.sha256")).unwrap();
+        let checksums: Vec<(&str, &str)> = checksums_text
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(2, "  ").collect();
+                if parts.len() == 2 {
+                    Some((parts[0], parts[1]))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(checksums.len(), manifest.chunk_count);
+
+        // Corrupt chunk 0 by flipping bytes
+        let chunk0_path = out.join("chunks/00000.bin");
+        let mut data = std::fs::read(&chunk0_path).unwrap();
+        for byte in &mut data {
+            *byte = byte.wrapping_add(1);
+        }
+        std::fs::write(&chunk0_path, &data).unwrap();
+
+        // Verify the original checksum no longer matches
+        let actual_hash = hex_sha256(&std::fs::read(&chunk0_path).unwrap());
+        let expected_hash = checksums[0].0;
+        assert_ne!(
+            actual_hash, expected_hash,
+            "corrupted chunk should have different hash"
+        );
+    }
+
+    /// Extra unexpected files in a bundle directory don't break validation,
+    /// but chunk count should match manifest exactly.
+    #[test]
+    fn corrupt_extra_unexpected_chunk_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, vec![0xCCu8; 100_000]).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let manifest = maybe_chunk_database(&db, &out, 50_000, 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.chunk_count, 4);
+
+        // Add extra spurious chunk files
+        std::fs::write(out.join("chunks/00099.bin"), b"extra junk").unwrap();
+        std::fs::write(out.join("chunks/stray_file.txt"), b"unexpected").unwrap();
+
+        // Count actual chunk files matching the expected pattern
+        let chunk_dir = out.join("chunks");
+        let actual_files: Vec<_> = std::fs::read_dir(&chunk_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // Only count files matching the 5-digit pattern
+                name.len() == 9
+                    && name.ends_with(".bin")
+                    && name[..5].chars().all(|c| c.is_ascii_digit())
+            })
+            .collect();
+
+        // We should have 5 matching chunk files (4 real + 1 extra numbered)
+        assert_eq!(actual_files.len(), 5);
+        // But manifest says 4
+        assert_eq!(manifest.chunk_count, 4);
+        // So there's a mismatch that indicates corruption/tampering
+        assert_ne!(
+            actual_files.len(),
+            manifest.chunk_count,
+            "extra chunk files create a count mismatch with manifest"
+        );
+    }
+
+    /// Oversized manifest.json (very large) can still be parsed.
+    #[test]
+    fn corrupt_oversized_manifest_still_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+
+        // Create a manifest with a very large padding field (1 MB of data)
+        let large_value = "x".repeat(1_000_000);
+        let manifest_json = format!(
+            r#"{{"schema_version": "0.1.0", "padding": "{}", "export_config": {{"scrub_preset": "archive"}}}}"#,
+            large_value
+        );
+        std::fs::write(bundle.join("manifest.json"), &manifest_json).unwrap();
+
+        // Should still parse successfully
+        let config = crate::load_bundle_export_config(&bundle).unwrap();
+        assert_eq!(config.scrub_preset, "archive");
+    }
+
+    /// A ZIP that was truncated right after the local file header.
+    #[test]
+    fn corrupt_zip_truncated_after_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        // Create a substantial file so the zip has meaningful content
+        std::fs::write(source.join("data.bin"), vec![0x42u8; 10_000]).unwrap();
+
+        let zip_path = dir.path().join("bundle.zip");
+        package_directory_as_zip(&source, &zip_path).unwrap();
+
+        // Read and truncate to just past the first local file header (30 bytes minimum)
+        let full = std::fs::read(&zip_path).unwrap();
+        let truncated = &full[..40.min(full.len())];
+        let truncated_path = dir.path().join("truncated_header.zip");
+        std::fs::write(&truncated_path, truncated).unwrap();
+
+        let file = std::fs::File::open(&truncated_path).unwrap();
+        let result = zip::ZipArchive::new(file);
+        assert!(
+            result.is_err(),
+            "zip truncated after header should fail to parse"
+        );
+    }
+
+    /// package_directory_as_zip refuses a non-directory source.
+    #[test]
+    fn zip_refuses_file_as_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file, b"I am a file").unwrap();
+
+        let zip_path = dir.path().join("bundle.zip");
+        let result = package_directory_as_zip(&file, &zip_path);
+        assert!(result.is_err(), "should reject file as ZIP source");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("directory"),
+            "error should mention directory: {err_msg}"
+        );
+    }
+
+    /// package_directory_as_zip refuses to overwrite an existing archive.
+    #[test]
+    fn zip_refuses_overwrite_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.txt"), b"data").unwrap();
+
+        let zip_path = dir.path().join("bundle.zip");
+        package_directory_as_zip(&source, &zip_path).unwrap();
+
+        // Second call should fail because file exists
+        let result = package_directory_as_zip(&source, &zip_path);
+        assert!(result.is_err(), "should refuse to overwrite existing zip");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("overwrite") || err_msg.contains("existing"),
+            "error should mention overwrite/existing: {err_msg}"
+        );
+    }
+
+    /// Corrupted chunks.sha256 file (invalid format) can be detected.
+    #[test]
+    fn corrupt_checksums_file_invalid_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, vec![0xDDu8; 100_000]).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        maybe_chunk_database(&db, &out, 50_000, 30_000).unwrap();
+
+        // Overwrite checksums with garbage
+        let sha_path = out.join("chunks.sha256");
+        std::fs::write(&sha_path, "this is not a checksums file\nno hashes here\n").unwrap();
+
+        let text = std::fs::read_to_string(&sha_path).unwrap();
+        // Lines should not match the expected "hash  path" format
+        for line in text.lines() {
+            let parts: Vec<&str> = line.splitn(2, "  ").collect();
+            if parts.len() == 2 {
+                // If there are two parts, the first should NOT be a valid hex sha256 (64 chars)
+                assert_ne!(
+                    parts[0].len(),
+                    64,
+                    "corrupted checksum line should not look like a valid sha256"
+                );
+            }
+        }
+    }
+
+    /// Bundle with a manifest referencing a database path that does not exist.
+    #[test]
+    fn corrupt_manifest_references_nonexistent_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("manifest.json"),
+            r#"{
+                "database": {
+                    "path": "mailbox.sqlite3",
+                    "size_bytes": 999999,
+                    "sha256": "deadbeef",
+                    "chunked": false,
+                    "fts_enabled": true
+                },
+                "export_config": {
+                    "projects": ["test"],
+                    "scrub_preset": "standard"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Config loads fine (it doesn't validate file existence)
+        let config = crate::load_bundle_export_config(&bundle).unwrap();
+        assert_eq!(config.scrub_preset, "standard");
+
+        // But the referenced database does not exist
+        assert!(
+            !bundle.join("mailbox.sqlite3").exists(),
+            "database file should not exist"
+        );
+    }
+
+    /// Tampered chunk: replacing content makes reassembly produce wrong data.
+    #[test]
+    fn corrupt_tampered_chunk_reassembly_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use non-zero distinct data so we can detect changes
+        let original: Vec<u8> = (0..100_000u32).map(|i| (i % 256) as u8).collect();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, &original).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let manifest = maybe_chunk_database(&db, &out, 50_000, 30_000)
+            .unwrap()
+            .unwrap();
+
+        // Tamper with chunk 1 by replacing its content with zeros
+        let tampered_path = out.join("chunks/00001.bin");
+        let original_chunk = std::fs::read(&tampered_path).unwrap();
+        std::fs::write(&tampered_path, vec![0u8; original_chunk.len()]).unwrap();
+
+        // Reassemble all chunks
+        let mut reassembled = Vec::new();
+        for i in 0..manifest.chunk_count {
+            let chunk = std::fs::read(out.join(format!("chunks/{i:05}.bin"))).unwrap();
+            reassembled.extend_from_slice(&chunk);
+        }
+
+        // Size matches but content does not
+        assert_eq!(
+            reassembled.len(),
+            original.len(),
+            "reassembled size should match (same-size tampered chunk)"
+        );
+        assert_ne!(
+            reassembled, original,
+            "reassembled data should differ from original due to tampering"
+        );
+    }
+
+    /// Manifest with wrong value types (e.g., string where int expected) uses defaults.
+    #[test]
+    fn corrupt_manifest_wrong_value_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("manifest.json"),
+            r#"{
+                "export_config": {
+                    "inline_threshold": "not_a_number",
+                    "detach_threshold": null,
+                    "chunk_size": false,
+                    "scrub_preset": "standard"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = crate::load_bundle_export_config(&bundle).unwrap();
+        // "not_a_number" can't be parsed as i64, so falls back to default
+        assert_eq!(
+            config.inline_threshold,
+            crate::INLINE_ATTACHMENT_THRESHOLD as i64
+        );
+        // null falls back to default
+        assert_eq!(
+            config.detach_threshold,
+            crate::DETACH_ATTACHMENT_THRESHOLD as i64
+        );
+        // false falls back to default
+        assert_eq!(config.chunk_size, crate::DEFAULT_CHUNK_SIZE as i64);
+    }
+
+    /// Chunk manifest with version 0 (unexpected version) still deserializes.
+    #[test]
+    fn corrupt_chunk_config_unexpected_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("mailbox.sqlite3.config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "version": 0,
+                "chunk_size": 1024,
+                "chunk_count": 2,
+                "pattern": "chunks/{index:05d}.bin",
+                "original_bytes": 2048,
+                "threshold_bytes": 1000
+            }"#,
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let manifest: ChunkManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(manifest.version, 0);
+        assert_eq!(manifest.chunk_count, 2);
+    }
+
+    /// Empty source directory produces a valid but empty ZIP.
+    #[test]
+    fn zip_empty_directory_produces_valid_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("empty_source");
+        std::fs::create_dir_all(&source).unwrap();
+        // No files in the source
+
+        let zip_path = dir.path().join("empty_bundle.zip");
+        let result = package_directory_as_zip(&source, &zip_path).unwrap();
+        assert!(result.exists());
+
+        // The resulting zip should be openable and contain 0 files
+        let file = std::fs::File::open(&result).unwrap();
+        let archive = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(archive.len(), 0, "empty source should produce empty zip");
     }
 }
