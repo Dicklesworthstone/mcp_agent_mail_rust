@@ -18,6 +18,7 @@ chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 regex.workspace = true
+half = { workspace = true, optional = true }
 
 # sqlmodel dependencies
 sqlmodel.workspace = true
@@ -38,7 +39,7 @@ asupersync.workspace = true
 [features]
 default = ["hybrid"]
 # Enable hybrid search (lexical + semantic)
-hybrid = ["mcp-agent-mail-search-core/hybrid"]
+hybrid = ["mcp-agent-mail-search-core/hybrid", "dep:half"]
 # Enable loom model-checking tests (run with `cargo test --features loom-tests`)
 loom-tests = []
 

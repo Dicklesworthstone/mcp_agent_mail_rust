@@ -96,6 +96,15 @@ fs2 = "0.4"
 walkdir = "2"
 tantivy = "0.25"
 indexmap = "2"
+
+# Two-tier search dependencies
+half = "2"
+wide = "0.7"
+safetensors = "0.5"
+tokenizers = "0.22"
+fastembed = "4"
+rayon = "1.10"
+dirs = "5"
 smallvec = { version = "1", features = ["serde"] }
 atty = "0.2"
 

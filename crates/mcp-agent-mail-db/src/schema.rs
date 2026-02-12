@@ -117,7 +117,8 @@ CREATE TABLE IF NOT EXISTS agent_links (
     reason TEXT NOT NULL DEFAULT '',
     created_ts INTEGER NOT NULL,
     updated_ts INTEGER NOT NULL,
-    expires_ts INTEGER
+    expires_ts INTEGER,
+    UNIQUE(a_project_id, a_agent_id, b_project_id, b_agent_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_links_pair_unique
     ON agent_links(a_project_id, a_agent_id, b_project_id, b_agent_id);
