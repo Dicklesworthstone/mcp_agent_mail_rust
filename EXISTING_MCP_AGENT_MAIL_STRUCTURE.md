@@ -742,7 +742,7 @@ QUOTA_INBOX_LIMIT_COUNT=0
 
 ### Agent Naming Rules
 - MUST be adjective+noun combinations (e.g., "GreenLake", "BlueDog")
-- 62 adjectives × 69 nouns = 4,278 valid combinations
+- 62 adjectives × 70 nouns = 4,340 valid combinations
 - Case-insensitive unique per project
 - NOT descriptive role names
 

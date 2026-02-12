@@ -60,7 +60,7 @@ pub struct ProductProjectLink {
 ///
 /// # Naming Rules
 /// Agent names MUST be adjective+noun combinations (e.g., "`GreenLake`", "`BlueDog`").
-/// - 62 adjectives × 69 nouns = 4,278 valid combinations
+/// - 62 adjectives × 70 nouns = 4,340 valid combinations
 /// - Case-insensitive unique per project
 /// - NOT descriptive role names (e.g., "`BackendHarmonizer`" is INVALID)
 ///
@@ -389,7 +389,7 @@ pub const VALID_ADJECTIVES: &[&str] = &[
     "rustic",
 ];
 
-/// Valid nouns for agent names (69 total).
+/// Valid nouns for agent names (70 total).
 ///
 /// IMPORTANT: Keep this list in lockstep with legacy Python `mcp_agent_mail.utils.NOUNS`.
 pub const VALID_NOUNS: &[&str] = &[
@@ -427,6 +427,7 @@ pub const VALID_NOUNS: &[&str] = &[
     "brook",
     "glen",
     "grove",
+    "fern",
     "hollow",
     "basin",
     "cove",
@@ -489,9 +490,9 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
     Some(cleaned)
 }
 
-/// Precomputed set of all 4,278 valid lowercased agent names for O(1) lookup.
+/// Precomputed set of all 4,340 valid lowercased agent names for O(1) lookup.
 ///
-/// Initialized on first access. 62 adjectives × 69 nouns ≈ 51 KB.
+/// Initialized on first access. 62 adjectives × 70 nouns ≈ 52 KB.
 fn valid_names_set() -> &'static std::collections::HashSet<String> {
     static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -508,8 +509,8 @@ fn valid_names_set() -> &'static std::collections::HashSet<String> {
 
 /// Validates that an agent name follows the adjective+noun pattern.
 ///
-/// Uses a precomputed `HashSet` of all 4,278 valid names for O(1) lookup,
-/// replacing the previous O(62×69) linear scan.
+/// Uses a precomputed `HashSet` of all 4,340 valid names for O(1) lookup,
+/// replacing the previous O(62×70) linear scan.
 ///
 /// # Examples
 /// ```
@@ -862,9 +863,9 @@ mod tests {
 
     #[test]
     fn test_valid_name_count() {
-        // 62 adjectives x 69 nouns = 4,278 valid names
+        // 62 adjectives x 70 nouns = 4,340 valid names
         assert_eq!(VALID_ADJECTIVES.len(), 62);
-        assert_eq!(VALID_NOUNS.len(), 69);
-        assert_eq!(valid_names_set().len(), 62 * 69);
+        assert_eq!(VALID_NOUNS.len(), 70);
+        assert_eq!(valid_names_set().len(), 62 * 70);
     }
 }

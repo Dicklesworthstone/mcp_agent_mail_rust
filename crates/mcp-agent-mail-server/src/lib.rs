@@ -4955,22 +4955,22 @@ mod tests {
     /// This test documents the API misuse that caused the bug.
     #[test]
     fn budget_with_deadline_secs_is_absolute_not_relative() {
-        // Budget::with_deadline_secs(30) creates an ABSOLUTE deadline of 30 seconds
-        // This is NOT 30 seconds from now - it's 30 seconds since time origin!
-        let budget = Budget::with_deadline_secs(30);
+        // Budget::with_deadline_secs(0) creates an ABSOLUTE deadline at time origin.
+        // Since wall_now() is always > 0 for any running process, this deadline
+        // is always already exceeded. This demonstrates why with_deadline_secs
+        // is NOT suitable for relative timeouts - it uses absolute time, not
+        // "N seconds from now".
+        let budget = Budget::with_deadline_secs(0);
+        let now = wall_now();
 
-        // After sleeping a bit, wall_now() should exceed 30 seconds
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let later = wall_now();
-
-        // If wall_now() is past 30 seconds (which it usually is), deadline is exceeded
-        // This demonstrates why with_deadline_secs is wrong for relative timeouts
-        if later.as_secs() > 30 {
-            assert!(
-                budget.is_past_deadline(later),
-                "with_deadline_secs(30) should be expired when wall_now() > 30s"
-            );
-        }
+        // This assertion is deterministic: wall_now() > 0 always
+        assert!(
+            budget.is_past_deadline(now),
+            "with_deadline_secs(0) should always be expired. \
+             wall_now()={:?} is always > 0 (the absolute deadline). \
+             This demonstrates why with_deadline_secs is WRONG for relative timeouts.",
+            now
+        );
     }
 
     #[test]
