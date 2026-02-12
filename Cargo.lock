@@ -4369,6 +4369,7 @@ dependencies = [
  "criterion",
  "dirs",
  "fs2",
+ "getrandom 0.2.17",
  "loom",
  "regex",
  "serde",

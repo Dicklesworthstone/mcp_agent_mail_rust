@@ -200,6 +200,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: BeadsCommand,
     },
+    /// Detect coding agents and configure MCP server connections.
+    #[command(name = "setup")]
+    Setup {
+        #[command(subcommand)]
+        action: SetupCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -321,6 +327,63 @@ pub enum BeadsCommand {
         /// Output as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SetupCommand {
+    /// Auto-detect agents and write MCP config files (default subcommand).
+    #[command(name = "run")]
+    Run {
+        /// Target specific agents (comma-separated: claude,cursor,gemini).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Preview changes without writing files.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Non-interactive (skip confirmations).
+        #[arg(long, short = 'y', default_value_t = false)]
+        yes: bool,
+        /// Use a specific bearer token.
+        #[arg(long)]
+        token: Option<String>,
+        /// Override port (default: 8765).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// Override host (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Override MCP base path (default: /mcp/).
+        #[arg(long, default_value = "/mcp/")]
+        path: String,
+        /// Project directory for project-local configs (default: cwd).
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Skip user-level config files (project-local only).
+        #[arg(long, default_value_t = false)]
+        no_user_config: bool,
+        /// Skip Claude Code hook installation.
+        #[arg(long, default_value_t = false)]
+        no_hooks: bool,
+    },
+    /// Show current setup status: detected agents, config state.
+    #[command(name = "status")]
+    Status {
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Override port for status check (default: 8765).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// Override host for status check (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Override MCP base path (default: /mcp/).
+        #[arg(long, default_value = "/mcp/")]
+        path: String,
     },
 }
 
@@ -1343,6 +1406,7 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Macros { action } => handle_macros(action),
         Commands::Contacts { action } => handle_contacts(action),
         Commands::Beads { action } => handle_beads(action),
+        Commands::Setup { action } => handle_setup(action),
     }
 }
 
@@ -1998,6 +2062,257 @@ fn handle_config(action: ConfigCommand) -> CliResult<()> {
                 CliError::Other(format!("Failed to write {}: {e}", env_path.display()))
             })?;
             ftui_runtime::ftui_println!("Port set to {} in {}", port, env_path.display());
+            Ok(())
+        }
+    }
+}
+
+fn handle_setup(action: SetupCommand) -> CliResult<()> {
+    use mcp_agent_mail_core::setup;
+
+    match action {
+        SetupCommand::Run {
+            agent,
+            dry_run,
+            yes: _,
+            token,
+            port,
+            host,
+            path,
+            project_dir,
+            json,
+            no_user_config,
+            no_hooks,
+        } => {
+            let pdir = project_dir
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let env_file = pdir.join(".env");
+
+            // Resolve token
+            let resolved_token = setup::resolve_token(token.as_deref(), &env_file);
+
+            // Parse agent filter
+            let agents = match agent {
+                Some(a) => Some(setup::parse_agent_list(&a).map_err(|e| CliError::Other(e.to_string()))?),
+                None => None,
+            };
+
+            // Detect installed agents and filter to detected platforms
+            let detect_opts = AgentDetectOptions {
+                only_connectors: None,
+                include_undetected: false,
+                root_overrides: Vec::new(),
+            };
+            let detected_slugs: Vec<String> = match mcp_agent_mail_core::detect_installed_agents(&detect_opts) {
+                Ok(report) => report
+                    .installed_agents
+                    .iter()
+                    .filter(|e| e.detected)
+                    .map(|e| e.slug.clone())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+
+            // Resolve project identity for hooks
+            let pdir_str = pdir.display().to_string();
+            let identity = resolve_project_identity(&pdir_str);
+            let project_slug = identity.slug.clone();
+
+            // Use detected agent name (required for hooks)
+            let agent_name_val = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
+
+            // Auto-skip hooks if agent_name is empty (hooks generate malformed commands without it)
+            let no_hooks = if agent_name_val.is_empty() && !no_hooks {
+                if !json {
+                    output::warn(
+                        "AGENT_MAIL_AGENT not set — skipping Claude Code hook installation. \
+                         Set the env var or use --no-hooks to suppress this warning."
+                    );
+                }
+                true
+            } else {
+                no_hooks
+            };
+
+            // Filter agents: if explicit --agent provided, use that; otherwise use detected
+            let target_agents = match agents {
+                Some(explicit) => explicit,
+                None => {
+                    let mut platforms = Vec::new();
+                    for slug in &detected_slugs {
+                        if let Some(p) = setup::AgentPlatform::from_slug(slug) {
+                            if !platforms.contains(&p) {
+                                platforms.push(p);
+                            }
+                        }
+                    }
+                    platforms
+                }
+            };
+
+            if target_agents.is_empty() {
+                if json {
+                    ftui_runtime::ftui_println!("[]");
+                } else {
+                    output::warn("No coding agents detected. Use --agent to specify agents manually.");
+                }
+                return Ok(());
+            }
+
+            let params = setup::SetupParams {
+                host,
+                port,
+                path,
+                token: resolved_token.clone(),
+                project_dir: pdir.clone(),
+                agents: Some(target_agents),
+                dry_run,
+                skip_user_config: no_user_config,
+                skip_hooks: no_hooks,
+                project_slug,
+                agent_name: agent_name_val,
+            };
+
+            // Save token to .env (unless dry-run)
+            if !dry_run {
+                if let Err(e) = setup::save_token_to_env_file(&env_file, &resolved_token) {
+                    output::warn(&format!("Could not save token to .env: {e}"));
+                }
+            }
+
+            let results = setup::run_setup(&params);
+
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else {
+                if dry_run {
+                    output::section("Dry run — no files will be modified");
+                    ftui_runtime::ftui_println!("");
+                }
+
+                for result in &results {
+                    output::section(&format!("{}", result.platform));
+                    for action in &result.actions {
+                        ftui_runtime::ftui_println!("  {} — {}", action.file_path, action.outcome);
+                        if !action.description.is_empty() {
+                            ftui_runtime::ftui_println!("    {}", action.description);
+                        }
+                    }
+                }
+
+                let total_actions: usize = results.iter().map(|r| r.actions.len()).sum();
+                let created = results
+                    .iter()
+                    .flat_map(|r| &r.actions)
+                    .filter(|a| matches!(a.outcome, setup::ActionOutcome::Created))
+                    .count();
+                let updated = results
+                    .iter()
+                    .flat_map(|r| &r.actions)
+                    .filter(|a| matches!(a.outcome, setup::ActionOutcome::Updated))
+                    .count();
+                let unchanged = results
+                    .iter()
+                    .flat_map(|r| &r.actions)
+                    .filter(|a| matches!(a.outcome, setup::ActionOutcome::Unchanged))
+                    .count();
+
+                ftui_runtime::ftui_println!("");
+                output::success(&format!(
+                    "{total_actions} config files processed: {created} created, {updated} updated, {unchanged} unchanged"
+                ));
+            }
+            Ok(())
+        }
+        SetupCommand::Status {
+            json,
+            port,
+            host,
+            path,
+        } => {
+            let pdir = std::env::current_dir().unwrap_or_default();
+
+            let params = setup::SetupParams {
+                host,
+                port,
+                path,
+                project_dir: pdir,
+                skip_user_config: false,
+                ..Default::default()
+            };
+
+            // Detect agents
+            let detect_opts = AgentDetectOptions {
+                only_connectors: None,
+                include_undetected: true,
+                root_overrides: Vec::new(),
+            };
+            let detected_report = mcp_agent_mail_core::detect_installed_agents(&detect_opts).ok();
+
+            let mut statuses = setup::check_status(&params);
+
+            // Fill in detected status from agent detection
+            if let Some(report) = &detected_report {
+                for status in &mut statuses {
+                    status.detected = report
+                        .installed_agents
+                        .iter()
+                        .any(|e| e.slug == status.slug && e.detected);
+                }
+            }
+
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&statuses).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else {
+                output::section("Agent Setup Status");
+                ftui_runtime::ftui_println!("");
+
+                let mut table = output::CliTable::new(vec![
+                    "AGENT", "DETECTED", "CONFIG", "SERVER ENTRY", "URL OK",
+                ]);
+                for status in &statuses {
+                    let detected_str = if status.detected { "yes" } else { "no" };
+                    if status.config_files.is_empty() {
+                        table.add_row(vec![
+                            status.platform.clone(),
+                            detected_str.into(),
+                            "-".into(),
+                            "-".into(),
+                            "-".into(),
+                        ]);
+                    } else {
+                        for (i, cf) in status.config_files.iter().enumerate() {
+                            let platform_col = if i == 0 {
+                                status.platform.clone()
+                            } else {
+                                String::new()
+                            };
+                            let detected_col = if i == 0 {
+                                detected_str.to_string()
+                            } else {
+                                String::new()
+                            };
+                            let exists_str = if cf.exists { "exists" } else { "missing" };
+                            let server_str = if cf.has_server_entry { "yes" } else { "no" };
+                            let url_str = if cf.url_matches { "yes" } else { "no" };
+                            table.add_row(vec![
+                                platform_col,
+                                detected_col,
+                                exists_str.into(),
+                                server_str.into(),
+                                url_str.into(),
+                            ]);
+                        }
+                    }
+                }
+                table.render();
+            }
             Ok(())
         }
     }
@@ -6029,10 +6344,12 @@ fn inbox_row_to_json(
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -12722,6 +13039,59 @@ sys.exit(7)
         assert_eq!(rows.len(), 1, "expected 1 row after upsert");
         let reason: String = rows[0].get_named("reason").unwrap();
         assert_eq!(reason, "updated");
+    }
+
+    // ── truncate_str UTF-8 safety ────────────────────────────────────
+
+    #[test]
+    fn truncate_str_ascii_short() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_ascii_over() {
+        assert_eq!(truncate_str("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_str_3byte_arrow() {
+        let s = "foo → bar → baz";
+        let r = truncate_str(s, 8);
+        assert!(r.chars().count() <= 8);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_cjk() {
+        let s = "日本語テスト文字列";
+        let r = truncate_str(s, 6);
+        assert!(r.chars().count() <= 6);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_emoji() {
+        let s = "🔥🚀💡🎯🏆";
+        let r = truncate_str(s, 4);
+        assert!(r.chars().count() <= 4);
+    }
+
+    #[test]
+    fn truncate_str_multibyte_sweep() {
+        let s = "ab→cd🔥éf";
+        for max in 1..=s.chars().count() + 2 {
+            let r = truncate_str(s, max);
+            assert!(
+                r.chars().count() <= max.max(3),
+                "max={max} got {} chars: {r:?}",
+                r.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 5), "");
     }
 }
 

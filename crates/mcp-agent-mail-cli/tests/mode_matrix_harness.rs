@@ -113,8 +113,9 @@ fn stderr_str(out: &Output) -> String {
 }
 
 fn digest(s: &str) -> String {
-    if s.len() > 200 {
-        format!("{}... ({} bytes)", &s[..200], s.len())
+    if s.chars().count() > 200 {
+        let head: String = s.chars().take(200).collect();
+        format!("{head}... ({} bytes)", s.len())
     } else {
         s.to_string()
     }
@@ -148,6 +149,7 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["contacts", "--help"],
     &["beads", "--help"],
     &["file_reservations", "--help"],
+    &["setup", "--help"],
 ];
 
 /// Commands that MCP binary should deny (exit code 2).
@@ -170,6 +172,7 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["products"],
     &["file_reservations"],
     &["beads"],
+    &["setup"],
 ];
 
 /// Commands that MCP binary should allow (not deny).

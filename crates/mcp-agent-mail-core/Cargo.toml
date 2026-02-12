@@ -15,6 +15,7 @@ thiserror.workspace = true
 chrono.workspace = true
 regex.workspace = true
 dirs = "6"
+getrandom = "0.2"
 shellexpand = "3"
 sha1.workspace = true
 fs2.workspace = true

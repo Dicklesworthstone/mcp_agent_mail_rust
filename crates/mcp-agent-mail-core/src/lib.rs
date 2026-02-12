@@ -22,6 +22,7 @@ pub mod lock_order;
 pub mod memory;
 pub mod metrics;
 pub mod models;
+pub mod setup;
 pub mod slo;
 pub mod test_harness;
 pub mod toon;
