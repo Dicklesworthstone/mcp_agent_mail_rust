@@ -442,7 +442,10 @@ impl MarkdownRenderable for MessageContext {
         if !self.attachments.is_empty() {
             md.push_str(&format!("\n**Attachments:** {}\n", self.attachments.len()));
             for att in &self.attachments {
-                md.push_str(&format!("- {} ({}, {})\n", att.name, att.size, att.mime_type));
+                md.push_str(&format!(
+                    "- {} ({}, {})\n",
+                    att.name, att.size, att.mime_type
+                ));
             }
         }
 
@@ -1004,7 +1007,8 @@ fn build_status(
             headline: format!(
                 "{reservations_expiring_soon} reservation(s) expiring within 5 minutes"
             ),
-            rationale: "File reservations are about to expire which may cause edit conflicts".to_string(),
+            rationale: "File reservations are about to expire which may cause edit conflicts"
+                .to_string(),
             remediation: "am robot reservations --expiring=5".to_string(),
         });
     }
@@ -1435,9 +1439,9 @@ fn build_message(
         )
         .map_err(|e| CliError::Other(format!("message query failed: {e}")))?;
 
-    let row = rows.first().ok_or_else(|| {
-        CliError::InvalidArgument(format!("message #{message_id} not found"))
-    })?;
+    let row = rows
+        .first()
+        .ok_or_else(|| CliError::InvalidArgument(format!("message #{message_id} not found")))?;
 
     let subject: String = row.get_named("subject").unwrap_or_default();
     let body: String = row.get_named("body_md").unwrap_or_default();
@@ -1574,30 +1578,31 @@ fn build_message(
     };
 
     // Parse attachments JSON
-    let attachments: Vec<AttachmentInfo> = serde_json::from_str::<serde_json::Value>(&attachments_json)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|a| {
-                    Some(AttachmentInfo {
-                        name: a.get("name")?.as_str()?.to_string(),
-                        size: a
-                            .get("size")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        mime_type: a
-                            .get("type")
-                            .or_else(|| a.get("content_type"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("application/octet-stream")
-                            .to_string(),
+    let attachments: Vec<AttachmentInfo> =
+        serde_json::from_str::<serde_json::Value>(&attachments_json)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        Some(AttachmentInfo {
+                            name: a.get("name")?.as_str()?.to_string(),
+                            size: a
+                                .get("size")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            mime_type: a
+                                .get("type")
+                                .or_else(|| a.get("content_type"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("application/octet-stream")
+                                .to_string(),
+                        })
                     })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                    .collect()
+            })
+            .unwrap_or_default();
 
     let age_seconds = (now_us - created_ts) / 1_000_000;
     let created_iso = mcp_agent_mail_db::micros_to_iso(created_ts);
@@ -1605,7 +1610,11 @@ fn build_message(
     Ok(MessageContext {
         id: message_id,
         from: sender_name,
-        from_program: if program.is_empty() { None } else { Some(program) },
+        from_program: if program.is_empty() {
+            None
+        } else {
+            Some(program)
+        },
         from_model: if model.is_empty() { None } else { Some(model) },
         to,
         subject,
@@ -1683,10 +1692,7 @@ fn build_search(
 
     // Build additional WHERE conditions
     let mut extra_where = String::new();
-    let mut params: Vec<Value> = vec![
-        Value::Text(sanitized.clone()),
-        Value::BigInt(project_id),
-    ];
+    let mut params: Vec<Value> = vec![Value::Text(sanitized.clone()), Value::BigInt(project_id)];
 
     if let Some(imp) = importance_filter {
         extra_where.push_str(" AND m.importance = ?");
@@ -1718,9 +1724,12 @@ fn build_search(
 
     // Build results and facets
     let mut results = Vec::new();
-    let mut thread_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut agent_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut importance_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut thread_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut agent_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut importance_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     for row in &rows {
         let msg_id: i64 = row.get_named("id").unwrap_or(0);
@@ -2004,7 +2013,7 @@ fn build_timeline(
     // Default "since" to 24h ago
     let since_us = if let Some(s) = since {
         mcp_agent_mail_db::iso_to_micros(s)
-            .map_err(|e| CliError::InvalidArgument(format!("invalid --since timestamp: {e}")))?
+            .ok_or_else(|| CliError::InvalidArgument(format!("invalid --since timestamp: {s}")))?
     } else {
         now_us - 24 * 3600 * 1_000_000
     };
@@ -2039,7 +2048,10 @@ fn build_timeline(
                 seq: 0,
                 timestamp: mcp_agent_mail_db::micros_to_iso(created_ts),
                 kind: "message".to_string(),
-                summary: format!("#{id} [{importance}] {sender}: {}", truncate_str(&subject, 60)),
+                summary: format!(
+                    "#{id} [{importance}] {sender}: {}",
+                    truncate_str(&subject, 60)
+                ),
                 source: sender,
             });
         }
@@ -2209,111 +2221,6 @@ fn build_overview(conn: &SqliteConnection) -> Result<Vec<OverviewProject>, CliEr
     }
 
     Ok(projects)
-}
-
-// ── Health command implementation ────────────────────────────────────────────
-
-fn build_health(conn: &SqliteConnection) -> Result<(Vec<HealthProbe>, Vec<AnomalyCard>), CliError> {
-    let mut probes = Vec::new();
-    let mut anomalies = Vec::new();
-
-    // DB connectivity probe
-    let start = std::time::Instant::now();
-    let db_ok = conn
-        .query_sync("SELECT 1 AS ok", &[])
-        .map(|rows| !rows.is_empty())
-        .unwrap_or(false);
-    let db_latency = start.elapsed().as_secs_f64() * 1000.0;
-    probes.push(HealthProbe {
-        name: "database".to_string(),
-        status: if db_ok { "ok" } else { "error" }.to_string(),
-        latency_ms: (db_latency * 100.0).round() / 100.0,
-        detail: if db_ok {
-            "SQLite responsive".to_string()
-        } else {
-            "Database query failed".to_string()
-        },
-    });
-    if !db_ok {
-        anomalies.push(AnomalyCard {
-            severity: "error".to_string(),
-            confidence: 1.0,
-            category: "database".to_string(),
-            headline: "Database not responding".to_string(),
-            rationale: "SELECT 1 probe failed".to_string(),
-            remediation: "Check database file permissions and disk space".to_string(),
-        });
-    }
-
-    // WAL mode probe
-    let wal_rows = conn
-        .query_sync("PRAGMA journal_mode", &[])
-        .unwrap_or_default();
-    let journal_mode: String = wal_rows
-        .first()
-        .and_then(|r| r.get_named("journal_mode").ok())
-        .unwrap_or_else(|| "unknown".to_string());
-    probes.push(HealthProbe {
-        name: "wal_mode".to_string(),
-        status: if journal_mode == "wal" { "ok" } else { "warn" }.to_string(),
-        latency_ms: 0.0,
-        detail: format!("journal_mode={journal_mode}"),
-    });
-    if journal_mode != "wal" {
-        anomalies.push(AnomalyCard {
-            severity: "warn".to_string(),
-            confidence: 0.9,
-            category: "database".to_string(),
-            headline: format!("Database not in WAL mode (journal_mode={journal_mode})"),
-            rationale: "WAL provides better concurrent read/write performance".to_string(),
-            remediation: "PRAGMA journal_mode=WAL".to_string(),
-        });
-    }
-
-    // Table counts probe
-    let tables = ["projects", "agents", "messages", "file_reservations", "agent_links"];
-    for table in tables {
-        let count: i64 = conn
-            .query_sync(&format!("SELECT COUNT(*) AS cnt FROM {table}"), &[])
-            .unwrap_or_default()
-            .first()
-            .and_then(|r| r.get_named("cnt").ok())
-            .unwrap_or(0);
-        probes.push(HealthProbe {
-            name: format!("table_{table}"),
-            status: "ok".to_string(),
-            latency_ms: 0.0,
-            detail: format!("{count} rows"),
-        });
-    }
-
-    // Metrics probe
-    let snapshot = mcp_agent_mail_tools::tool_metrics_snapshot();
-    let total_errors: u64 = snapshot.iter().map(|e| e.errors).sum();
-    let total_calls: u64 = snapshot.iter().map(|e| e.calls).sum();
-    let error_rate = if total_calls > 0 {
-        (total_errors as f64 / total_calls as f64) * 100.0
-    } else {
-        0.0
-    };
-    probes.push(HealthProbe {
-        name: "tool_errors".to_string(),
-        status: if error_rate > 10.0 { "warn" } else { "ok" }.to_string(),
-        latency_ms: 0.0,
-        detail: format!("{total_errors}/{total_calls} errors ({error_rate:.1}%)"),
-    });
-    if error_rate > 10.0 {
-        anomalies.push(AnomalyCard {
-            severity: "warn".to_string(),
-            confidence: 0.8,
-            category: "tools".to_string(),
-            headline: format!("Tool error rate {error_rate:.1}%"),
-            rationale: format!("{total_errors} errors in {total_calls} calls"),
-            remediation: "am robot metrics".to_string(),
-        });
-    }
-
-    Ok((probes, anomalies))
 }
 
 // ── Analytics command implementation ────────────────────────────────────────
@@ -2641,6 +2548,175 @@ fn build_projects(conn: &SqliteConnection) -> Result<Vec<ProjectRow>, CliError> 
     Ok(projects)
 }
 
+// ── Navigate command implementation ──────────────────────────────────────────
+
+/// Resolved navigate data - wraps whatever resource was requested.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum NavigateResult {
+    Projects { projects: Vec<ProjectRow> },
+    Agents { agents: Vec<AgentRow> },
+    Inbox { entries: Vec<InboxEntry> },
+    Thread { thread: ThreadData },
+    Message { message: MessageContext },
+    Generic { resource_type: String, data: serde_json::Value },
+}
+
+fn build_navigate(
+    conn: &SqliteConnection,
+    uri: &str,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let path = uri
+        .strip_prefix("resource://")
+        .ok_or_else(|| CliError::InvalidArgument(format!("invalid URI scheme: {uri} (expected resource://)")))?;
+
+    let parts: Vec<&str> = path.split('/').collect();
+
+    match parts.as_slice() {
+        ["projects"] => {
+            let projects = build_projects(conn)?;
+            Ok((NavigateResult::Projects { projects }, None))
+        }
+        ["project", slug] => {
+            // Find project by slug and return its details
+            let row = conn
+                .query_sync(
+                    "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ?",
+                    &[Value::Text(slug.to_string())],
+                )
+                .map_err(|e| CliError::Other(format!("project query: {e}")))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| CliError::Other(format!("project not found: {slug}")))?;
+
+            let data = serde_json::json!({
+                "id": row.get_named::<i64>("id").unwrap_or(0),
+                "slug": row.get_named::<String>("slug").unwrap_or_default(),
+                "path": row.get_named::<String>("human_key").unwrap_or_default(),
+                "created_at": mcp_agent_mail_db::micros_to_iso(row.get_named::<i64>("created_at").unwrap_or(0)),
+            });
+            Ok((
+                NavigateResult::Generic {
+                    resource_type: "project".to_string(),
+                    data,
+                },
+                None,
+            ))
+        }
+        ["agents", slug] => {
+            // Get project_id for slug
+            let pid = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[Value::Text(slug.to_string())],
+                )
+                .map_err(|e| CliError::Other(format!("project lookup: {e}")))?
+                .first()
+                .and_then(|r| r.get_named::<i64>("id").ok())
+                .ok_or_else(|| CliError::Other(format!("project not found: {slug}")))?;
+
+            let agents = build_agents(conn, pid, false, None)?;
+            Ok((NavigateResult::Agents { agents }, None))
+        }
+        ["inbox", agent_name] => {
+            // Resolve agent and get inbox using simplified direct query
+            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
+            if let Some((agent_id, name)) = agent_opt {
+                let result = build_inbox(
+                    conn, project_id, project_slug, agent_id, &name,
+                    false, false, true, false, 50, false,
+                )?;
+                Ok((NavigateResult::Inbox { entries: result.entries }, None))
+            } else {
+                Ok((NavigateResult::Inbox { entries: vec![] }, None))
+            }
+        }
+        ["message", id_str] => {
+            let msg_id: i64 = id_str
+                .parse()
+                .map_err(|_| CliError::InvalidArgument(format!("invalid message id: {id_str}")))?;
+            let message = build_message(conn, project_id, msg_id)?;
+            Ok((NavigateResult::Message { message }, None))
+        }
+        ["thread", thread_id] => {
+            let thread = build_thread(conn, project_id, thread_id, Some(100), None, false)?;
+            Ok((NavigateResult::Thread { thread }, None))
+        }
+        ["file_reservations", slug] => {
+            // Get project_id for slug and return generic data
+            let pid = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ?",
+                    &[Value::Text(slug.to_string())],
+                )
+                .map_err(|e| CliError::Other(format!("project lookup: {e}")))?
+                .first()
+                .and_then(|r| r.get_named::<i64>("id").ok())
+                .ok_or_else(|| CliError::Other(format!("project not found: {slug}")))?;
+
+            let rows = conn
+                .query_sync(
+                    "SELECT fr.path_pattern, a.name, fr.exclusive, fr.expires_ts, fr.released_ts
+                     FROM file_reservations fr
+                     JOIN agents a ON a.id = fr.agent_id
+                     WHERE fr.project_id = ?
+                     ORDER BY fr.created_ts DESC LIMIT 50",
+                    &[Value::BigInt(pid)],
+                )
+                .unwrap_or_default();
+
+            let reservations: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "path": r.get_named::<String>("path_pattern").unwrap_or_default(),
+                        "agent": r.get_named::<String>("name").unwrap_or_default(),
+                        "exclusive": r.get_named::<i64>("exclusive").unwrap_or(0) == 1,
+                        "expires_ts": r.get_named::<i64>("expires_ts").unwrap_or(0),
+                        "released": r.get_named::<i64>("released_ts").ok().is_some(),
+                    })
+                })
+                .collect();
+
+            Ok((
+                NavigateResult::Generic {
+                    resource_type: "file_reservations".to_string(),
+                    data: serde_json::json!({ "reservations": reservations }),
+                },
+                None,
+            ))
+        }
+        ["mailbox", agent_name] | ["outbox", agent_name] => {
+            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
+            if let Some((agent_id, name)) = agent_opt {
+                let result = build_inbox(
+                    conn, project_id, project_slug, agent_id, &name,
+                    false, false, false, true, 50, false,
+                )?;
+                Ok((NavigateResult::Inbox { entries: result.entries }, None))
+            } else {
+                Ok((NavigateResult::Inbox { entries: vec![] }, None))
+            }
+        }
+        _ => Err(CliError::InvalidArgument(format!(
+            "unsupported resource URI pattern: {uri}\n\
+             Supported patterns:\n\
+             - resource://projects\n\
+             - resource://project/<slug>\n\
+             - resource://agents/<slug>\n\
+             - resource://inbox/<agent>\n\
+             - resource://message/<id>\n\
+             - resource://thread/<id>\n\
+             - resource://file_reservations/<slug>\n\
+             - resource://mailbox/<agent>\n\
+             - resource://outbox/<agent>"
+        ))),
+    }
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
 /// Execute a robot subcommand and print formatted output.
@@ -2809,8 +2885,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
             let agent = resolve_agent_id(&conn, project_id, agent_flag);
-            let (data, actions) =
-                build_reservations(&conn, project_id, &project_slug, agent, all, conflicts, expiring)?;
+            let (data, actions) = build_reservations(
+                &conn,
+                project_id,
+                &project_slug,
+                agent,
+                all,
+                conflicts,
+                expiring,
+            )?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = Some(project_slug);
             for a in actions {
@@ -2833,7 +2916,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     .iter()
                     .filter_map(|e| e.latency.as_ref().map(|l| l.avg_ms * e.calls as f64))
                     .sum();
-                if total_calls > 0 { sum / total_calls as f64 } else { 0.0 }
+                if total_calls > 0 {
+                    sum / total_calls as f64
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             };
@@ -2991,9 +3078,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 latency_ms: 0.0,
                 detail: format!(
                     "pool={}% wbq={}% commit={}%",
-                    signals.pool_utilization_pct,
-                    signals.wbq_depth_pct,
-                    signals.commit_depth_pct
+                    signals.pool_utilization_pct, signals.wbq_depth_pct, signals.commit_depth_pct
                 ),
             });
 
@@ -3092,7 +3177,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             {
                 env = env.with_alert(
                     "error",
-                    &format!("Disk pressure: {} ({free_mb} MB free)", disk.pressure.label()),
+                    &format!(
+                        "Disk pressure: {} ({free_mb} MB free)",
+                        disk.pressure.label()
+                    ),
                     None,
                 );
             } else if disk.pressure == mcp_agent_mail_core::disk::DiskPressure::Warning {
@@ -3109,198 +3197,6 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
             if mcp_agent_mail_db::is_full_check_due(24) {
                 env = env.with_action("Run full integrity check (last check >24h ago)");
-            }
-
-            format_output(&env, format)?
-        }
-        RobotSubcommand::Analytics => {
-            let conn = crate::open_db_sync()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let agent = resolve_agent_id(&conn, project_id, args.agent.as_deref());
-
-            let mut anomalies: Vec<AnomalyCard> = Vec::new();
-            let mut actions: Vec<String> = Vec::new();
-
-            // 1. Ack SLA violations
-            let ack_rows = conn
-                .query_sync(
-                    "SELECT m.id, m.subject, m.created_ts,
-                            (? - m.created_ts) / 1000000 AS age_secs
-                     FROM messages m
-                     JOIN message_recipients mr ON mr.message_id = m.id
-                     WHERE m.project_id = ? AND m.ack_required = 1
-                       AND mr.ack_ts IS NULL
-                       AND (? - m.created_ts) > 3600000000
-                     ORDER BY m.created_ts ASC
-                     LIMIT 10",
-                    &[
-                        Value::BigInt(mcp_agent_mail_db::now_micros()),
-                        Value::BigInt(project_id),
-                        Value::BigInt(mcp_agent_mail_db::now_micros()),
-                    ],
-                )
-                .unwrap_or_default();
-            if !ack_rows.is_empty() {
-                let count = ack_rows.len();
-                anomalies.push(AnomalyCard {
-                    severity: if count > 3 { "error" } else { "warn" }.into(),
-                    confidence: 0.95,
-                    category: "ack_sla".into(),
-                    headline: format!("{count} messages overdue for acknowledgement"),
-                    rationale: "Messages with ack_required=true have been pending >1 hour"
-                        .into(),
-                    remediation: "Run `am robot inbox --ack-overdue` to see details, then acknowledge".into(),
-                });
-                actions.push(format!(
-                    "am robot inbox --ack-overdue --project {project_slug}"
-                ));
-            }
-
-            // 2. Reservation expiry warnings
-            let now_us = mcp_agent_mail_db::now_micros();
-            let soon_us = now_us + 900_000_000; // 15 min
-            let expiring_rows = conn
-                .query_sync(
-                    "SELECT COUNT(*) as cnt FROM file_reservations
-                     WHERE project_id = ? AND released_ts IS NULL
-                       AND expires_ts > ? AND expires_ts < ?",
-                    &[
-                        Value::BigInt(project_id),
-                        Value::BigInt(now_us),
-                        Value::BigInt(soon_us),
-                    ],
-                )
-                .unwrap_or_default();
-            let expiring_count: i64 = expiring_rows
-                .first()
-                .and_then(|r| r.get_named("cnt").ok())
-                .unwrap_or(0);
-            if expiring_count > 0 {
-                anomalies.push(AnomalyCard {
-                    severity: "warn".into(),
-                    confidence: 0.90,
-                    category: "reservation_expiry".into(),
-                    headline: format!(
-                        "{expiring_count} file reservation(s) expiring within 15 minutes"
-                    ),
-                    rationale: "Reservations nearing TTL may cause unprotected concurrent edits"
-                        .into(),
-                    remediation: "Renew with `am reservations renew` or release if done".into(),
-                });
-                actions.push(format!(
-                    "am robot reservations --expiring --project {project_slug}"
-                ));
-            }
-
-            // 3. Stale agents (registered but inactive >1 hour)
-            let stale_rows = conn
-                .query_sync(
-                    "SELECT COUNT(*) as cnt FROM agents
-                     WHERE project_id = ? AND (? - last_active_ts) > 3600000000",
-                    &[
-                        Value::BigInt(project_id),
-                        Value::BigInt(now_us),
-                    ],
-                )
-                .unwrap_or_default();
-            let stale_count: i64 = stale_rows
-                .first()
-                .and_then(|r| r.get_named("cnt").ok())
-                .unwrap_or(0);
-            if stale_count > 0 {
-                anomalies.push(AnomalyCard {
-                    severity: "info".into(),
-                    confidence: 0.70,
-                    category: "stale_agents".into(),
-                    headline: format!("{stale_count} agent(s) inactive for >1 hour"),
-                    rationale: "Agents that stop polling may hold stale reservations".into(),
-                    remediation: "Check if agents are still running; force-release their reservations if not".into(),
-                });
-            }
-
-            // 4. High message volume (>100 messages in last hour)
-            let volume_rows = conn
-                .query_sync(
-                    "SELECT COUNT(*) as cnt FROM messages
-                     WHERE project_id = ? AND created_ts > ?",
-                    &[
-                        Value::BigInt(project_id),
-                        Value::BigInt(now_us - 3_600_000_000),
-                    ],
-                )
-                .unwrap_or_default();
-            let volume: i64 = volume_rows
-                .first()
-                .and_then(|r| r.get_named("cnt").ok())
-                .unwrap_or(0);
-            if volume > 100 {
-                anomalies.push(AnomalyCard {
-                    severity: "info".into(),
-                    confidence: 0.80,
-                    category: "high_volume".into(),
-                    headline: format!("{volume} messages in the last hour"),
-                    rationale: "High message volume may indicate coordination overhead or loops"
-                        .into(),
-                    remediation: "Review thread activity for potential message storms".into(),
-                });
-            }
-
-            // 5. Agent-specific: unread count if agent is known
-            if let Some((aid, aname)) = &agent {
-                let unread_rows = conn
-                    .query_sync(
-                        "SELECT COUNT(*) as cnt FROM message_recipients mr
-                         JOIN messages m ON mr.message_id = m.id
-                         WHERE m.project_id = ? AND mr.recipient_agent_id = ?
-                           AND mr.read_ts IS NULL",
-                        &[Value::BigInt(project_id), Value::BigInt(*aid)],
-                    )
-                    .unwrap_or_default();
-                let unread: i64 = unread_rows
-                    .first()
-                    .and_then(|r| r.get_named("cnt").ok())
-                    .unwrap_or(0);
-                if unread > 20 {
-                    anomalies.push(AnomalyCard {
-                        severity: "warn".into(),
-                        confidence: 0.85,
-                        category: "inbox_backlog".into(),
-                        headline: format!("{aname} has {unread} unread messages"),
-                        rationale: "Large unread backlogs can cause missed coordination signals"
-                            .into(),
-                        remediation: format!(
-                            "Run `am robot inbox --unread --project {project_slug} --agent {aname}`"
-                        ),
-                    });
-                }
-            }
-
-            #[derive(Serialize)]
-            struct AnalyticsData {
-                anomaly_count: usize,
-                anomalies: Vec<AnomalyCard>,
-            }
-
-            let count = anomalies.len();
-            let mut env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                AnalyticsData {
-                    anomaly_count: count,
-                    anomalies,
-                },
-            );
-            env._meta.project = Some(project_slug);
-            if let Some((_, aname)) = &agent {
-                env._meta.agent = Some(aname.clone());
-            }
-
-            for a in actions {
-                env = env.with_action(&a);
-            }
-
-            if count == 0 {
-                env = env.with_action("No anomalies detected — system looks healthy");
             }
 
             format_output(&env, format)?
@@ -3327,11 +3223,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
 
             let count = events.len();
-            let mut env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                TimelineData { count, events },
-            );
+            let mut env = RobotEnvelope::new(cmd_name, format, TimelineData { count, events });
             env._meta.project = Some(project_slug);
             format_output(&env, format)?
         }
@@ -3354,39 +3246,6 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     projects,
                 },
             );
-            format_output(&env, format)?
-        }
-        RobotSubcommand::Health => {
-            let conn = crate::open_db_sync()?;
-            let (probes, anomalies) = build_health(&conn)?;
-
-            let overall = if anomalies.iter().any(|a| a.severity == "error") {
-                "error"
-            } else if anomalies.iter().any(|a| a.severity == "warn") {
-                "degraded"
-            } else {
-                "healthy"
-            };
-
-            #[derive(Serialize)]
-            struct HealthData {
-                overall: String,
-                probes: Vec<HealthProbe>,
-                anomalies: Vec<AnomalyCard>,
-            }
-
-            let mut env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                HealthData {
-                    overall: overall.to_string(),
-                    probes,
-                    anomalies: anomalies.clone(),
-                },
-            );
-            for a in &anomalies {
-                env = env.with_alert(&a.severity, &a.headline, Some(a.remediation.clone()));
-            }
             format_output(&env, format)?
         }
         RobotSubcommand::Analytics => {
@@ -3428,11 +3287,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
 
             let count = agents.len();
-            let mut env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                AgentsData { count, agents },
-            );
+            let mut env = RobotEnvelope::new(cmd_name, format, AgentsData { count, agents });
             env._meta.project = Some(project_slug);
             format_output(&env, format)?
         }
@@ -3448,11 +3303,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
 
             let count = contacts.len();
-            let mut env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                ContactsData { count, contacts },
-            );
+            let mut env = RobotEnvelope::new(cmd_name, format, ContactsData { count, contacts });
             env._meta.project = Some(project_slug);
             format_output(&env, format)?
         }
@@ -3467,27 +3318,88 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
 
             let count = projects.len();
-            let env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                ProjectsData { count, projects },
-            );
+            let env = RobotEnvelope::new(cmd_name, format, ProjectsData { count, projects });
             format_output(&env, format)?
         }
-        RobotSubcommand::Navigate { .. } | RobotSubcommand::Attachments => {
-            #[derive(Serialize)]
-            struct Stub {
-                status: &'static str,
-                message: String,
+        RobotSubcommand::Attachments => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+
+            let rows = conn
+                .query_sync(
+                    "SELECT m.id, m.subject, m.attachments, a.name AS sender_name
+                     FROM messages m
+                     JOIN agents a ON a.id = m.sender_id
+                     WHERE m.project_id = ? AND m.attachments != '[]'
+                     ORDER BY m.created_ts DESC
+                     LIMIT 100",
+                    &[Value::BigInt(project_id)],
+                )
+                .map_err(|e| CliError::Other(format!("attachments query: {e}")))?;
+
+            let mut attachments: Vec<AttachmentRow> = Vec::new();
+            for row in &rows {
+                let msg_id: i64 = row.get_named("id").unwrap_or(0);
+                let subject: String = row.get_named("subject").unwrap_or_default();
+                let sender: String = row.get_named("sender_name").unwrap_or_default();
+                let att_json: String = row.get_named("attachments").unwrap_or_default();
+
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&att_json) {
+                    for att in arr {
+                        let atype = att
+                            .get("type")
+                            .or_else(|| att.get("content_type"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let size = att.get("size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        attachments.push(AttachmentRow {
+                            r#type: atype,
+                            size,
+                            sender: sender.clone(),
+                            subject: truncate_str(&subject, 60).to_string(),
+                            message_id: msg_id,
+                            project: project_slug.clone(),
+                        });
+                    }
+                }
             }
-            let env = RobotEnvelope::new(
+
+            #[derive(Serialize)]
+            struct AttachmentsData {
+                count: usize,
+                attachments: Vec<AttachmentRow>,
+            }
+
+            let count = attachments.len();
+            let mut env =
+                RobotEnvelope::new(cmd_name, format, AttachmentsData { count, attachments });
+            env._meta.project = Some(project_slug);
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Navigate { uri } => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let agent = resolve_agent_id(&conn, project_id, args.agent.as_deref());
+
+            let (result, _action) = build_navigate(&conn, &uri, project_id, &project_slug, agent)?;
+
+            #[derive(Serialize)]
+            struct NavigateData {
+                uri: String,
+                #[serde(flatten)]
+                result: NavigateResult,
+            }
+
+            let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
-                Stub {
-                    status: "stub",
-                    message: format!("{cmd_name} is not yet implemented"),
+                NavigateData {
+                    uri: uri.clone(),
+                    result,
                 },
             );
+            env._meta.project = Some(project_slug);
             format_output(&env, format)?
         }
     };
@@ -3884,7 +3796,10 @@ mod tests {
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["id"], 200);
-        assert!(json.get("body_md").is_none(), "body_md should be omitted when None");
+        assert!(
+            json.get("body_md").is_none(),
+            "body_md should be omitted when None"
+        );
     }
 
     #[test]
@@ -3922,7 +3837,11 @@ mod tests {
             ],
         };
         let mut env = RobotEnvelope::new("robot inbox", OutputFormat::Toon, data);
-        env = env.with_alert("warn", "1 message ack overdue", Some("am mail ack 1".into()));
+        env = env.with_alert(
+            "warn",
+            "1 message ack overdue",
+            Some("am mail ack 1".into()),
+        );
         env = env.with_action("am mail ack 1");
 
         // Verify TOON output
@@ -3944,7 +3863,15 @@ mod tests {
     #[test]
     fn test_inbox_priority_ordering() {
         // Verify priority labels map correctly
-        let labels = ["ack-overdue", "urgent", "ack-required", "high", "unread", "read-unacked", "read"];
+        let labels = [
+            "ack-overdue",
+            "urgent",
+            "ack-required",
+            "high",
+            "unread",
+            "read-unacked",
+            "read",
+        ];
         for (i, expected) in labels.iter().enumerate() {
             let bucket = (i + 1) as i64;
             let label = match bucket {
@@ -3991,7 +3918,10 @@ mod tests {
         assert_eq!(json["id"], 201);
         assert_eq!(json["from_program"], "claude-code");
         assert_eq!(json["attachments"][0]["name"], "api_spec.json");
-        assert_eq!(json["previous"], "#200 RedFox: I'll handle the middleware setup");
+        assert_eq!(
+            json["previous"],
+            "#200 RedFox: I'll handle the middleware setup"
+        );
         assert_eq!(json["position"], 3);
         assert_eq!(json["total_in_thread"], 8);
 
@@ -4035,8 +3965,14 @@ mod tests {
                 count: 2,
             }],
             by_agent: vec![
-                FacetEntry { value: "BlueLake".into(), count: 1 },
-                FacetEntry { value: "RedFox".into(), count: 1 },
+                FacetEntry {
+                    value: "BlueLake".into(),
+                    count: 1,
+                },
+                FacetEntry {
+                    value: "RedFox".into(),
+                    count: 1,
+                },
             ],
             by_importance: vec![FacetEntry {
                 value: "high".into(),
@@ -4130,6 +4066,896 @@ mod tests {
     #[test]
     fn test_truncate_str() {
         assert_eq!(truncate_str("hello", 10), "hello");
-        assert_eq!(truncate_str("hello world this is long", 10), "hello worl...");
+        assert_eq!(
+            truncate_str("hello world this is long", 10),
+            "hello worl..."
+        );
+    }
+
+    // ── Track 4 Tests: Monitoring & Analytics ────────────────────────────────
+
+    #[test]
+    fn test_metric_entry_serialization() {
+        let entry = MetricEntry {
+            name: "send_message".into(),
+            calls: 150,
+            errors: 3,
+            error_pct: 2.0,
+            avg_ms: 45.2,
+            p95_ms: 120.0,
+            p99_ms: 250.0,
+        };
+        let v: Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(v["name"], "send_message");
+        assert_eq!(v["calls"], 150);
+        assert_eq!(v["errors"], 3);
+        assert_eq!(v["error_pct"], 2.0);
+        assert_eq!(v["avg_ms"], 45.2);
+        assert_eq!(v["p95_ms"], 120.0);
+        assert_eq!(v["p99_ms"], 250.0);
+    }
+
+    #[test]
+    fn test_metric_entry_toon_round_trip() {
+        let entries = vec![
+            MetricEntry {
+                name: "fetch_inbox".into(),
+                calls: 500,
+                errors: 0,
+                error_pct: 0.0,
+                avg_ms: 12.3,
+                p95_ms: 30.0,
+                p99_ms: 55.0,
+            },
+            MetricEntry {
+                name: "send_message".into(),
+                calls: 200,
+                errors: 10,
+                error_pct: 5.0,
+                avg_ms: 88.1,
+                p95_ms: 200.0,
+                p99_ms: 500.0,
+            },
+        ];
+        let json = serde_json::to_string(&entries).unwrap();
+        let toon = toon::json_to_toon(&json).unwrap();
+        assert!(!toon.is_empty());
+        assert!(toon.contains("fetch_inbox"));
+        assert!(toon.contains("send_message"));
+    }
+
+    #[test]
+    fn test_health_probe_serialization() {
+        let probe = HealthProbe {
+            name: "db_connectivity".into(),
+            status: "ok".into(),
+            latency_ms: 1.5,
+            detail: "SQLite connection healthy".into(),
+        };
+        let v: Value = serde_json::to_value(&probe).unwrap();
+        assert_eq!(v["name"], "db_connectivity");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["latency_ms"], 1.5);
+        assert_eq!(v["detail"], "SQLite connection healthy");
+    }
+
+    #[test]
+    fn test_health_probe_toon_round_trip() {
+        let probes = vec![
+            HealthProbe {
+                name: "db_connectivity".into(),
+                status: "ok".into(),
+                latency_ms: 1.5,
+                detail: "Healthy".into(),
+            },
+            HealthProbe {
+                name: "circuit_breakers".into(),
+                status: "degraded".into(),
+                latency_ms: 0.0,
+                detail: "Circuit open (5 failures)".into(),
+            },
+            HealthProbe {
+                name: "disk".into(),
+                status: "warning".into(),
+                latency_ms: 0.0,
+                detail: "512 MB free".into(),
+            },
+        ];
+        let json = serde_json::to_string(&probes).unwrap();
+        let toon = toon::json_to_toon(&json).unwrap();
+        assert!(toon.contains("db_connectivity"));
+        assert!(toon.contains("degraded"));
+        assert!(toon.contains("disk"));
+    }
+
+    #[test]
+    fn test_anomaly_card_serialization() {
+        let card = AnomalyCard {
+            severity: "error".into(),
+            confidence: 0.95,
+            category: "ack_sla".into(),
+            headline: "5 messages overdue".into(),
+            rationale: "Pending >1h".into(),
+            remediation: "am robot inbox --ack-overdue".into(),
+        };
+        let v: Value = serde_json::to_value(&card).unwrap();
+        assert_eq!(v["severity"], "error");
+        assert_eq!(v["confidence"], 0.95);
+        assert_eq!(v["category"], "ack_sla");
+        assert_eq!(v["headline"], "5 messages overdue");
+        assert_eq!(v["rationale"], "Pending >1h");
+        assert_eq!(v["remediation"], "am robot inbox --ack-overdue");
+    }
+
+    #[test]
+    fn test_anomaly_card_toon_round_trip() {
+        let cards = vec![
+            AnomalyCard {
+                severity: "warn".into(),
+                confidence: 0.85,
+                category: "reservation_expiry".into(),
+                headline: "3 reservations expiring".into(),
+                rationale: "TTL < 15 min".into(),
+                remediation: "Renew reservations".into(),
+            },
+            AnomalyCard {
+                severity: "info".into(),
+                confidence: 0.70,
+                category: "stale_agents".into(),
+                headline: "2 agents inactive".into(),
+                rationale: "No activity >1h".into(),
+                remediation: "Check agent status".into(),
+            },
+        ];
+        let json = serde_json::to_string(&cards).unwrap();
+        let toon = toon::json_to_toon(&json).unwrap();
+        assert!(toon.contains("reservation_expiry"));
+        assert!(toon.contains("stale_agents"));
+    }
+
+    #[test]
+    fn test_metrics_envelope_no_tools() {
+        #[derive(Serialize)]
+        struct MetricsData {
+            total_calls: u64,
+            total_errors: u64,
+            error_rate_pct: f64,
+            avg_latency_ms: f64,
+            tools: Vec<MetricEntry>,
+        }
+
+        let env = RobotEnvelope::new(
+            "robot metrics",
+            OutputFormat::Json,
+            MetricsData {
+                total_calls: 0,
+                total_errors: 0,
+                error_rate_pct: 0.0,
+                avg_latency_ms: 0.0,
+                tools: vec![],
+            },
+        );
+
+        let json_str = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v["total_calls"], 0);
+        assert_eq!(v["tools"].as_array().unwrap().len(), 0);
+        assert!(v.get("_alerts").is_none());
+    }
+
+    #[test]
+    fn test_health_envelope_healthy_system() {
+        #[derive(Serialize)]
+        struct HealthData {
+            overall: String,
+            health_level: String,
+            probes: Vec<HealthProbe>,
+        }
+
+        let env = RobotEnvelope::new(
+            "robot health",
+            OutputFormat::Json,
+            HealthData {
+                overall: "healthy".into(),
+                health_level: "green".into(),
+                probes: vec![
+                    HealthProbe {
+                        name: "db_connectivity".into(),
+                        status: "ok".into(),
+                        latency_ms: 0.5,
+                        detail: "Fast".into(),
+                    },
+                    HealthProbe {
+                        name: "disk".into(),
+                        status: "ok".into(),
+                        latency_ms: 0.0,
+                        detail: "500 GB free".into(),
+                    },
+                ],
+            },
+        );
+
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["overall"], "healthy");
+        assert_eq!(v["health_level"], "green");
+        assert_eq!(v["probes"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_analytics_envelope_with_anomalies() {
+        #[derive(Serialize)]
+        struct AnalyticsData {
+            anomaly_count: usize,
+            anomalies: Vec<AnomalyCard>,
+        }
+
+        let mut env = RobotEnvelope::new(
+            "robot analytics",
+            OutputFormat::Json,
+            AnalyticsData {
+                anomaly_count: 2,
+                anomalies: vec![
+                    AnomalyCard {
+                        severity: "error".into(),
+                        confidence: 0.95,
+                        category: "ack_sla".into(),
+                        headline: "10 overdue".into(),
+                        rationale: "Pending >1h".into(),
+                        remediation: "Acknowledge them".into(),
+                    },
+                    AnomalyCard {
+                        severity: "warn".into(),
+                        confidence: 0.80,
+                        category: "reservation_expiry".into(),
+                        headline: "2 expiring".into(),
+                        rationale: "TTL < 15m".into(),
+                        remediation: "Renew".into(),
+                    },
+                ],
+            },
+        );
+        env = env.with_action("am robot inbox --ack-overdue");
+
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["anomaly_count"], 2);
+        assert_eq!(v["anomalies"].as_array().unwrap().len(), 2);
+        assert_eq!(v["anomalies"][0]["severity"], "error");
+        assert_eq!(v["anomalies"][1]["category"], "reservation_expiry");
+        assert_eq!(v["_actions"].as_array().unwrap().len(), 1);
+    }
+
+    // ── Track 5 Tests: Entity Views ──────────────────────────────────────────
+
+    #[test]
+    fn test_agent_row_serialization() {
+        let agent = AgentRow {
+            name: "GoldHawk".into(),
+            program: "claude-code".into(),
+            model: "opus-4.6".into(),
+            last_active: "5m ago".into(),
+            msg_count: 42,
+            status: "active".into(),
+        };
+        let v: Value = serde_json::to_value(&agent).unwrap();
+        assert_eq!(v["name"], "GoldHawk");
+        assert_eq!(v["program"], "claude-code");
+        assert_eq!(v["msg_count"], 42);
+        assert_eq!(v["status"], "active");
+    }
+
+    #[test]
+    fn test_contact_row_serialization() {
+        let contact = ContactRow {
+            from: "GoldHawk".into(),
+            to: "SilverCove".into(),
+            status: "approved".into(),
+            policy: "auto".into(),
+            reason: "handshake".into(),
+            updated: "1h ago".into(),
+        };
+        let v: Value = serde_json::to_value(&contact).unwrap();
+        assert_eq!(v["from"], "GoldHawk");
+        assert_eq!(v["to"], "SilverCove");
+        assert_eq!(v["status"], "approved");
+        assert_eq!(v["policy"], "auto");
+    }
+
+    #[test]
+    fn test_project_row_serialization() {
+        let project = ProjectRow {
+            slug: "my-project".into(),
+            path: "/data/projects/my-project".into(),
+            agents: 5,
+            messages: 120,
+            reservations: 3,
+            created: "2d ago".into(),
+        };
+        let v: Value = serde_json::to_value(&project).unwrap();
+        assert_eq!(v["slug"], "my-project");
+        assert_eq!(v["agents"], 5);
+        assert_eq!(v["messages"], 120);
+        assert_eq!(v["reservations"], 3);
+    }
+
+    #[test]
+    fn test_attachment_row_serialization() {
+        let att = AttachmentRow {
+            r#type: "image/webp".into(),
+            size: 1024,
+            sender: "RedFox".into(),
+            subject: "Screenshot".into(),
+            message_id: 77,
+            project: "my-project".into(),
+        };
+        let v: Value = serde_json::to_value(&att).unwrap();
+        assert_eq!(v["type"], "image/webp");
+        assert_eq!(v["size"], 1024);
+        assert_eq!(v["sender"], "RedFox");
+        assert_eq!(v["message_id"], 77);
+    }
+
+    #[test]
+    fn test_agents_envelope_toon() {
+        #[derive(Serialize)]
+        struct AgentsData {
+            count: usize,
+            agents: Vec<AgentRow>,
+        }
+
+        let env = RobotEnvelope::new(
+            "robot agents",
+            OutputFormat::Toon,
+            AgentsData {
+                count: 2,
+                agents: vec![
+                    AgentRow {
+                        name: "GoldHawk".into(),
+                        program: "claude-code".into(),
+                        model: "opus-4.6".into(),
+                        last_active: "2m ago".into(),
+                        msg_count: 50,
+                        status: "active".into(),
+                    },
+                    AgentRow {
+                        name: "SilverCove".into(),
+                        program: "codex-cli".into(),
+                        model: "gpt-5".into(),
+                        last_active: "1h ago".into(),
+                        msg_count: 10,
+                        status: "idle".into(),
+                    },
+                ],
+            },
+        );
+
+        let out = format_output(&env, OutputFormat::Toon).unwrap();
+        assert!(out.contains("GoldHawk"));
+        assert!(out.contains("SilverCove"));
+        assert!(out.contains("active"));
+        assert!(out.contains("idle"));
+    }
+
+    #[test]
+    fn test_projects_envelope_json() {
+        #[derive(Serialize)]
+        struct ProjectsData {
+            count: usize,
+            projects: Vec<ProjectRow>,
+        }
+
+        let env = RobotEnvelope::new(
+            "robot projects",
+            OutputFormat::Json,
+            ProjectsData {
+                count: 1,
+                projects: vec![ProjectRow {
+                    slug: "test-proj".into(),
+                    path: "/tmp/test".into(),
+                    agents: 3,
+                    messages: 50,
+                    reservations: 1,
+                    created: "5d ago".into(),
+                }],
+            },
+        );
+
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["projects"][0]["slug"], "test-proj");
+        assert_eq!(v["projects"][0]["agents"], 3);
+    }
+
+    // ── Track 2: Situational Awareness Unit Tests ────────────────────────────
+
+    #[test]
+    fn test_status_data_serialization() {
+        let data = StatusData {
+            health: "ok".into(),
+            unread: 5,
+            urgent: 1,
+            ack_required: 2,
+            ack_overdue: 0,
+            active_reservations: 5,
+            reservations_expiring_soon: 1,
+            active_agents: 3,
+            recent_messages: 12,
+            my_reservations: vec![],
+            top_threads: vec![],
+            anomalies: vec![],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("\"health\":\"ok\""));
+        assert!(json.contains("\"unread\":5"));
+        assert!(json.contains("\"active_agents\":3"));
+    }
+
+    #[test]
+    fn test_status_envelope_with_degraded_health() {
+        let data = StatusData {
+            health: "degraded".into(),
+            unread: 0,
+            urgent: 0,
+            ack_required: 0,
+            ack_overdue: 2,
+            active_reservations: 0,
+            reservations_expiring_soon: 0,
+            active_agents: 1,
+            recent_messages: 0,
+            my_reservations: vec![],
+            top_threads: vec![],
+            anomalies: vec![AnomalyCard {
+                severity: "warn".into(),
+                confidence: 0.9,
+                category: "ack_sla".into(),
+                headline: "2 acks overdue".into(),
+                rationale: "Pending acknowledgements".into(),
+                remediation: "am mail ack".into(),
+            }],
+        };
+        let env = RobotEnvelope::new("robot status", OutputFormat::Json, data)
+            .with_alert("warn", "Health degraded", None);
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["health"], "degraded");
+        assert_eq!(v["_alerts"][0]["severity"], "warn");
+    }
+
+    #[test]
+    fn test_inbox_entry_serialization_track2() {
+        let entry = InboxEntry {
+            id: 123,
+            priority: "ack-overdue".into(),
+            from: "BlueLake".into(),
+            subject: "[FEAT-1] Test".into(),
+            thread: "FEAT-1".into(),
+            age: "5m".into(),
+            ack_status: "overdue".into(),
+            importance: "high".into(),
+            body_md: Some("Message body".into()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"priority\":\"ack-overdue\""));
+        assert!(json.contains("\"from\":\"BlueLake\""));
+    }
+
+    #[test]
+    fn test_inbox_envelope_priority_buckets() {
+        #[derive(Serialize)]
+        struct InboxData {
+            count: usize,
+            messages: Vec<InboxEntry>,
+        }
+        let messages = vec![
+            InboxEntry {
+                id: 1,
+                priority: "ack-overdue".into(),
+                from: "Agent1".into(),
+                subject: "Urgent".into(),
+                thread: "".into(),
+                age: "45m".into(),
+                ack_status: "overdue".into(),
+                importance: "urgent".into(),
+                body_md: None,
+            },
+            InboxEntry {
+                id: 2,
+                priority: "urgent".into(),
+                from: "Agent2".into(),
+                subject: "High".into(),
+                thread: "".into(),
+                age: "10m".into(),
+                ack_status: "none".into(),
+                importance: "urgent".into(),
+                body_md: None,
+            },
+        ];
+        let env = RobotEnvelope::new(
+            "robot inbox",
+            OutputFormat::Json,
+            InboxData {
+                count: messages.len(),
+                messages,
+            },
+        );
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["count"], 2);
+        // First message should be ack-overdue (highest priority)
+        assert_eq!(v["messages"][0]["priority"], "ack-overdue");
+    }
+
+    #[test]
+    fn test_timeline_event_serialization() {
+        let event = TimelineEvent {
+            seq: 1,
+            timestamp: "2026-02-12T10:00:00Z".into(),
+            kind: "message".into(),
+            summary: "#42 BlueLake: Test subject".into(),
+            source: "BlueLake".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"seq\":1"));
+        assert!(json.contains("\"kind\":\"message\""));
+    }
+
+    #[test]
+    fn test_timeline_envelope_toon() {
+        #[derive(Serialize)]
+        struct TimelineData {
+            count: usize,
+            events: Vec<TimelineEvent>,
+        }
+        let events = vec![
+            TimelineEvent {
+                seq: 1,
+                timestamp: "2026-02-12T10:00:00Z".into(),
+                kind: "message".into(),
+                summary: "New message".into(),
+                source: "AgentA".into(),
+            },
+            TimelineEvent {
+                seq: 2,
+                timestamp: "2026-02-12T10:05:00Z".into(),
+                kind: "reservation".into(),
+                summary: "Reserved src/**".into(),
+                source: "AgentB".into(),
+            },
+        ];
+        let env = RobotEnvelope::new(
+            "robot timeline",
+            OutputFormat::Toon,
+            TimelineData {
+                count: events.len(),
+                events,
+            },
+        );
+        let out = format_output(&env, OutputFormat::Toon).unwrap();
+        assert!(out.contains("events[2]"));
+        assert!(out.contains("message"));
+        assert!(out.contains("reservation"));
+    }
+
+    #[test]
+    fn test_overview_project_serialization() {
+        let proj = OverviewProject {
+            slug: "backend-api".into(),
+            unread: 5,
+            urgent: 1,
+            ack_overdue: 0,
+            reservations: 3,
+        };
+        let json = serde_json::to_string(&proj).unwrap();
+        assert!(json.contains("\"slug\":\"backend-api\""));
+        assert!(json.contains("\"unread\":5"));
+    }
+
+    #[test]
+    fn test_overview_envelope_multi_project() {
+        #[derive(Serialize)]
+        struct OverviewData {
+            project_count: usize,
+            projects: Vec<OverviewProject>,
+            total_unread: usize,
+            total_urgent: usize,
+            total_ack_overdue: usize,
+        }
+        let projects = vec![
+            OverviewProject {
+                slug: "proj1".into(),
+                unread: 3,
+                urgent: 1,
+                ack_overdue: 0,
+                reservations: 2,
+            },
+            OverviewProject {
+                slug: "proj2".into(),
+                unread: 2,
+                urgent: 0,
+                ack_overdue: 1,
+                reservations: 0,
+            },
+        ];
+        let env = RobotEnvelope::new(
+            "robot overview",
+            OutputFormat::Json,
+            OverviewData {
+                project_count: projects.len(),
+                total_unread: 5,
+                total_urgent: 1,
+                total_ack_overdue: 1,
+                projects,
+            },
+        );
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["project_count"], 2);
+        assert_eq!(v["total_unread"], 5);
+    }
+
+    #[test]
+    fn test_overview_empty_projects() {
+        #[derive(Serialize)]
+        struct OverviewData {
+            project_count: usize,
+            projects: Vec<OverviewProject>,
+        }
+        let env = RobotEnvelope::new(
+            "robot overview",
+            OutputFormat::Json,
+            OverviewData {
+                project_count: 0,
+                projects: vec![],
+            },
+        );
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["project_count"], 0);
+        assert!(v["projects"].as_array().unwrap().is_empty());
+    }
+
+    // ── Track 3: Context & Discovery Unit Tests ──────────────────────────────
+
+    #[test]
+    fn test_thread_message_serialization() {
+        let msg = ThreadMessage {
+            position: 1,
+            from: "BlueLake".into(),
+            to: "RedFox".into(),
+            age: "2h".into(),
+            importance: "high".into(),
+            ack: "required".into(),
+            subject: "[FEAT-1] Starting work".into(),
+            body: Some("I'm starting on this feature.".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"position\":1"));
+        assert!(json.contains("\"from\":\"BlueLake\""));
+    }
+
+    #[test]
+    fn test_thread_data_serialization() {
+        let data = ThreadData {
+            thread_id: "FEAT-123".into(),
+            subject: "Add authentication".into(),
+            message_count: 5,
+            participants: vec!["BlueLake".into(), "RedFox".into()],
+            last_activity: "10m".into(),
+            messages: vec![],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("\"thread_id\":\"FEAT-123\""));
+        assert!(json.contains("\"message_count\":5"));
+    }
+
+    #[test]
+    fn test_thread_envelope_markdown() {
+        let data = ThreadData {
+            thread_id: "BUG-42".into(),
+            subject: "Fix login issue".into(),
+            message_count: 2,
+            participants: vec!["Alice".into(), "Bob".into()],
+            last_activity: "5m".into(),
+            messages: vec![
+                ThreadMessage {
+                    position: 1,
+                    from: "Alice".into(),
+                    to: "Bob".into(),
+                    age: "1h".into(),
+                    importance: "normal".into(),
+                    ack: "none".into(),
+                    subject: "[BUG-42] Login failing".into(),
+                    body: Some("Users report login failures.".into()),
+                },
+            ],
+        };
+        let env = RobotEnvelope::new("robot thread", OutputFormat::Markdown, data);
+        let out = format_output(&env, OutputFormat::Markdown).unwrap();
+        assert!(out.contains("BUG-42"));
+        assert!(out.contains("Alice"));
+    }
+
+    #[test]
+    fn test_search_result_serialization() {
+        let result = SearchResult {
+            id: 42,
+            relevance: 0.95,
+            from: "BlueLake".into(),
+            subject: "JWT implementation".into(),
+            thread: "AUTH-1".into(),
+            snippet: "...using JWT with JWKS...".into(),
+            age: "2h".into(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"relevance\":0.95"));
+        assert!(json.contains("\"snippet\""));
+    }
+
+    #[test]
+    fn test_search_data_facets() {
+        let data = SearchData {
+            query: "authentication".into(),
+            total_results: 10,
+            results: vec![],
+            by_thread: vec![FacetEntry { value: "AUTH-1".into(), count: 5 }],
+            by_agent: vec![FacetEntry { value: "BlueLake".into(), count: 6 }],
+            by_importance: vec![FacetEntry { value: "high".into(), count: 3 }],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("\"query\":\"authentication\""));
+        assert!(json.contains("\"by_thread\""));
+        assert!(json.contains("AUTH-1"));
+    }
+
+    #[test]
+    fn test_search_empty_results() {
+        let data = SearchData {
+            query: "nonexistent".into(),
+            total_results: 0,
+            results: vec![],
+            by_thread: vec![],
+            by_agent: vec![],
+            by_importance: vec![],
+        };
+        let env = RobotEnvelope::new("robot search", OutputFormat::Json, data);
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["total_results"], 0);
+        assert!(v["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_message_context_serialization() {
+        let msg = MessageContext {
+            id: 201,
+            from: "BlueLake".into(),
+            from_program: Some("claude-code".into()),
+            from_model: Some("opus-4.5".into()),
+            to: vec!["RedFox".into()],
+            subject: "[FEAT-123] Implementation plan".into(),
+            body: "Here is the plan...".into(),
+            thread: "FEAT-123".into(),
+            position: 3,
+            total_in_thread: 8,
+            importance: "high".into(),
+            ack_status: "required".into(),
+            created: "2026-02-12T10:00:00Z".into(),
+            age: "2h".into(),
+            attachments: vec![],
+            previous: None,
+            next: Some("RedFox: Sounds good".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"position\":3"));
+        assert!(json.contains("\"from_program\":\"claude-code\""));
+    }
+
+    #[test]
+    fn test_message_first_in_thread_track3() {
+        let msg = MessageContext {
+            id: 100,
+            from: "Starter".into(),
+            from_program: None,
+            from_model: None,
+            to: vec!["Team".into()],
+            subject: "Kickoff".into(),
+            body: "Starting project".into(),
+            thread: "INIT-1".into(),
+            position: 1,
+            total_in_thread: 3,
+            importance: "normal".into(),
+            ack_status: "none".into(),
+            created: "2026-02-11T10:00:00Z".into(),
+            age: "1d".into(),
+            attachments: vec![],
+            previous: None, // No previous
+            next: Some("Response".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        // previous is Option<String> - when None it's omitted, not null
+        assert!(!json.contains("\"previous\""));
+        assert!(json.contains("\"next\":\"Response\""));
+    }
+
+    #[test]
+    fn test_message_last_in_thread_track3() {
+        let msg = MessageContext {
+            id: 300,
+            from: "Closer".into(),
+            from_program: None,
+            from_model: None,
+            to: vec!["Team".into()],
+            subject: "Done".into(),
+            body: "Task completed".into(),
+            thread: "DONE-1".into(),
+            position: 5,
+            total_in_thread: 5,
+            importance: "normal".into(),
+            ack_status: "done".into(),
+            created: "2026-02-12T12:00:00Z".into(),
+            age: "10m".into(),
+            attachments: vec![],
+            previous: Some("Previous msg".into()),
+            next: None, // No next
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"previous\":\"Previous msg\""));
+        // next is Option<String> with skip_serializing_if - when None it's omitted
+        assert!(!json.contains("\"next\""));
+    }
+
+    #[test]
+    fn test_navigate_result_projects() {
+        let result = NavigateResult::Projects {
+            projects: vec![ProjectRow {
+                slug: "test".into(),
+                path: "/data/test".into(),
+                agents: 2,
+                messages: 10,
+                reservations: 1,
+                created: "1d".into(),
+            }],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"slug\":\"test\""));
+    }
+
+    #[test]
+    fn test_navigate_result_agents() {
+        let result = NavigateResult::Agents {
+            agents: vec![AgentRow {
+                name: "TestAgent".into(),
+                program: "claude-code".into(),
+                model: "opus".into(),
+                status: "active".into(),
+                msg_count: 5,
+                last_active: "5m".into(),
+            }],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"name\":\"TestAgent\""));
+    }
+
+    #[test]
+    fn test_navigate_envelope_with_uri() {
+        #[derive(Serialize)]
+        struct NavigateData {
+            uri: String,
+            #[serde(flatten)]
+            result: NavigateResult,
+        }
+        let env = RobotEnvelope::new(
+            "robot navigate",
+            OutputFormat::Json,
+            NavigateData {
+                uri: "resource://projects".into(),
+                result: NavigateResult::Projects { projects: vec![] },
+            },
+        );
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["uri"], "resource://projects");
     }
 }
