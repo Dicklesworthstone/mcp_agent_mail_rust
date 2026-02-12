@@ -389,8 +389,18 @@ impl DbPool {
                                             }
                                         }
                                     }
-                                    // Drop migration connection before pool connection opens.
+                                    // Close migration connection first. Some paths can leave
+                                    // implicit transaction state when no migrations are applied.
                                     drop(mig_conn);
+
+                                    let cleanup_conn =
+                                        sqlmodel_sqlite::SqliteConnection::open_file(&sqlite_path)
+                                            .map_err(Outcome::<(), SqlError>::Err)?;
+                                    if let Err(e) = schema::enforce_base_mode_cleanup(&cleanup_conn)
+                                    {
+                                        return Err(Outcome::Err(e));
+                                    }
+                                    drop(cleanup_conn);
                                     Ok(())
                                 }
                             })
