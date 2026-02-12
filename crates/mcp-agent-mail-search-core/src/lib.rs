@@ -64,9 +64,7 @@ pub use lexical_parser::{SanitizedQuery, extract_terms, sanitize_query};
 #[cfg(feature = "tantivy-engine")]
 pub use lexical_response::{ResponseConfig, execute_search};
 pub use lexical_response::{find_highlights, generate_snippet};
-pub use rollout::{
-    RolloutController, ShadowComparison, ShadowMetrics, ShadowMetricsSnapshot,
-};
+pub use rollout::{RolloutController, ShadowComparison, ShadowMetrics, ShadowMetricsSnapshot};
 
 #[cfg(feature = "semantic")]
 pub use embedder::{

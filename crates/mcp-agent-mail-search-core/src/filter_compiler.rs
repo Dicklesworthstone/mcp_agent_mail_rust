@@ -17,6 +17,7 @@ use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 #[cfg(feature = "tantivy-engine")]
 use tantivy::schema::{Field, IndexRecordOption};
 
+#[cfg(any(feature = "tantivy-engine", test))]
 use crate::document::DocKind;
 use crate::query::{ImportanceFilter, SearchFilter};
 

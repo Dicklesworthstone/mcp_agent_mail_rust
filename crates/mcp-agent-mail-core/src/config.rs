@@ -258,7 +258,7 @@ impl std::fmt::Display for AppEnvironment {
 /// Search engine backend selection.
 ///
 /// Controls which search implementation is used:
-/// - `Legacy` — SQLite FTS5 (current default for stability)
+/// - `Legacy` — `SQLite` FTS5 (current default for stability)
 /// - `Lexical` — Tantivy-based lexical search (Search V3)
 /// - `Semantic` — vector embedding search (requires semantic feature)
 /// - `Hybrid` — two-tier fusion: lexical + semantic + rerank
@@ -266,7 +266,7 @@ impl std::fmt::Display for AppEnvironment {
 /// - `Shadow` — (deprecated) run both and compare; use `SearchShadowMode` instead
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchEngine {
-    /// SQLite FTS5 (legacy, current default for stability)
+    /// `SQLite` FTS5 (legacy, current default for stability)
     #[default]
     Legacy,
     /// Tantivy-based lexical search (Search V3)
@@ -286,6 +286,7 @@ pub enum SearchEngine {
 impl SearchEngine {
     /// Parse from string value, with aliases for backwards compatibility.
     #[must_use]
+    #[allow(clippy::match_same_arms)]
     pub fn parse(value: &str) -> Self {
         #[allow(deprecated)]
         match value.trim().to_ascii_lowercase().as_str() {
@@ -309,7 +310,10 @@ impl SearchEngine {
     #[must_use]
     #[allow(deprecated)]
     pub const fn uses_lexical(self) -> bool {
-        matches!(self, Self::Legacy | Self::Lexical | Self::Hybrid | Self::Auto | Self::Shadow)
+        matches!(
+            self,
+            Self::Legacy | Self::Lexical | Self::Hybrid | Self::Auto | Self::Shadow
+        )
     }
 
     /// Returns `true` if this is shadow mode (deprecated variant).
@@ -431,8 +435,9 @@ impl SearchRolloutConfig {
         // Apply kill switch degradation
         match base {
             SearchEngine::Semantic if !self.semantic_enabled => SearchEngine::Legacy,
-            SearchEngine::Hybrid if !self.semantic_enabled => SearchEngine::Lexical,
-            SearchEngine::Auto if !self.semantic_enabled => SearchEngine::Lexical,
+            SearchEngine::Hybrid | SearchEngine::Auto if !self.semantic_enabled => {
+                SearchEngine::Lexical
+            }
             other => other,
         }
     }
@@ -1131,9 +1136,7 @@ impl Config {
 
         // Search V3 rollout configuration
         // Primary engine: AM_SEARCH_ENGINE (legacy | lexical | semantic | hybrid | auto)
-        if let Some(v) = env_value("AM_SEARCH_ENGINE")
-            .or_else(|| env_value("SEARCH_ENGINE"))
-        {
+        if let Some(v) = env_value("AM_SEARCH_ENGINE").or_else(|| env_value("SEARCH_ENGINE")) {
             config.search_rollout.engine = SearchEngine::parse(&v);
         }
         // Shadow mode: AM_SEARCH_SHADOW_MODE (off | log_only | compare)
@@ -1159,7 +1162,10 @@ impl Config {
             if let Some(tool_name) = key.strip_prefix("AM_SEARCH_ENGINE_FOR_") {
                 let tool_name = tool_name.to_lowercase();
                 let engine = SearchEngine::parse(&value);
-                config.search_rollout.surface_overrides.insert(tool_name, engine);
+                config
+                    .search_rollout
+                    .surface_overrides
+                    .insert(tool_name, engine);
             }
         }
 
