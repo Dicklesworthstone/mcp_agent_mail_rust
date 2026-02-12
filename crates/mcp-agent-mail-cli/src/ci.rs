@@ -425,6 +425,8 @@ pub struct GateReport {
     pub release_eligible: bool,
     /// Reference to release checklist documentation.
     pub checklist_reference: String,
+    /// Total elapsed time across all gates in seconds.
+    pub total_elapsed_seconds: u64,
     /// Summary counts (total/pass/fail/skip).
     pub summary: GateSummary,
     /// Per-category threshold information.
@@ -475,6 +477,7 @@ impl GateReport {
         };
 
         let generated_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let total_elapsed_seconds = results.iter().map(|r| r.elapsed_seconds).sum();
 
         Self {
             schema_version: GATE_REPORT_SCHEMA_VERSION.to_string(),
@@ -484,6 +487,7 @@ impl GateReport {
             decision_reason,
             release_eligible,
             checklist_reference: DEFAULT_CHECKLIST_REFERENCE.to_string(),
+            total_elapsed_seconds,
             summary,
             thresholds,
             gate_logic,
@@ -517,6 +521,84 @@ impl GateReport {
     /// Returns an error if serialization fails.
     pub fn to_json_compact(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    /// Writes the report to a file as pretty-printed JSON.
+    ///
+    /// # Arguments
+    /// * `path` - The file path to write to.
+    ///
+    /// # Errors
+    /// Returns an error if serialization or file writing fails.
+    pub fn write_to_file(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        use std::io::Write;
+        let json = self
+            .to_json()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(json.as_bytes())?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+
+    /// Reads a report from a JSON file.
+    ///
+    /// # Arguments
+    /// * `path` - The file path to read from.
+    ///
+    /// # Errors
+    /// Returns an error if file reading or deserialization fails.
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Parses a report from a JSON string.
+    ///
+    /// # Errors
+    /// Returns an error if deserialization fails.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// Returns the list of failed gates.
+    #[must_use]
+    pub fn failed_gates(&self) -> Vec<&GateResult> {
+        self.gates
+            .iter()
+            .filter(|g| g.status == GateStatus::Fail)
+            .collect()
+    }
+
+    /// Returns the list of skipped gates.
+    #[must_use]
+    pub fn skipped_gates(&self) -> Vec<&GateResult> {
+        self.gates
+            .iter()
+            .filter(|g| g.status == GateStatus::Skip)
+            .collect()
+    }
+
+    /// Returns a formatted failure summary for triage.
+    #[must_use]
+    pub fn failure_summary(&self) -> String {
+        let failed = self.failed_gates();
+        if failed.is_empty() {
+            return String::from("No failures.");
+        }
+
+        let mut lines = vec![format!("{} gate(s) failed:", failed.len())];
+        for gate in failed {
+            lines.push(format!("  - {} [{}]", gate.name, gate.category));
+            if let Some(ref tail) = gate.stderr_tail {
+                // Include first line of stderr for quick context
+                if let Some(first_line) = tail.lines().next() {
+                    lines.push(format!("      {}", first_line));
+                }
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -1388,5 +1470,171 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
         let err = GateRunnerError::SpawnFailed(io_err);
         assert!(format!("{err}").contains("failed to spawn subprocess"));
+    }
+
+    // ── JSON Report Generator Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_gate_report_total_elapsed_seconds() {
+        let results = vec![
+            GateResult {
+                name: "Gate 1".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Pass,
+                elapsed_seconds: 10,
+                command: "test".to_string(),
+                stderr_tail: None,
+            },
+            GateResult {
+                name: "Gate 2".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Pass,
+                elapsed_seconds: 25,
+                command: "test".to_string(),
+                stderr_tail: None,
+            },
+        ];
+
+        let report = GateReport::new(RunMode::Full, results);
+        assert_eq!(report.total_elapsed_seconds, 35);
+    }
+
+    #[test]
+    fn test_gate_report_failed_gates() {
+        let results = vec![
+            GateResult {
+                name: "Pass Gate".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Pass,
+                elapsed_seconds: 10,
+                command: "test".to_string(),
+                stderr_tail: None,
+            },
+            GateResult {
+                name: "Fail Gate".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Fail,
+                elapsed_seconds: 5,
+                command: "test".to_string(),
+                stderr_tail: Some("error".to_string()),
+            },
+        ];
+
+        let report = GateReport::new(RunMode::Full, results);
+        let failed = report.failed_gates();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].name, "Fail Gate");
+    }
+
+    #[test]
+    fn test_gate_report_skipped_gates() {
+        let results = vec![
+            GateResult {
+                name: "Pass Gate".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Pass,
+                elapsed_seconds: 10,
+                command: "test".to_string(),
+                stderr_tail: None,
+            },
+            GateResult {
+                name: "Skip Gate".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Skip,
+                elapsed_seconds: 0,
+                command: "--quick".to_string(),
+                stderr_tail: None,
+            },
+        ];
+
+        let report = GateReport::new(RunMode::Quick, results);
+        let skipped = report.skipped_gates();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "Skip Gate");
+    }
+
+    #[test]
+    fn test_gate_report_failure_summary_no_failures() {
+        let results = vec![GateResult {
+            name: "Pass Gate".to_string(),
+            category: GateCategory::Quality,
+            status: GateStatus::Pass,
+            elapsed_seconds: 10,
+            command: "test".to_string(),
+            stderr_tail: None,
+        }];
+
+        let report = GateReport::new(RunMode::Full, results);
+        assert_eq!(report.failure_summary(), "No failures.");
+    }
+
+    #[test]
+    fn test_gate_report_failure_summary_with_failures() {
+        let results = vec![GateResult {
+            name: "Clippy".to_string(),
+            category: GateCategory::Quality,
+            status: GateStatus::Fail,
+            elapsed_seconds: 5,
+            command: "cargo clippy".to_string(),
+            stderr_tail: Some("error: unused variable\n  --> src/main.rs:5".to_string()),
+        }];
+
+        let report = GateReport::new(RunMode::Full, results);
+        let summary = report.failure_summary();
+        assert!(summary.contains("1 gate(s) failed:"));
+        assert!(summary.contains("Clippy"));
+        assert!(summary.contains("unused variable"));
+    }
+
+    #[test]
+    fn test_gate_report_roundtrip_json() {
+        let results = vec![GateResult {
+            name: "Test Gate".to_string(),
+            category: GateCategory::Quality,
+            status: GateStatus::Pass,
+            elapsed_seconds: 15,
+            command: "cargo test".to_string(),
+            stderr_tail: None,
+        }];
+
+        let report = GateReport::new(RunMode::Full, results);
+        let json = report.to_json().expect("serialization should work");
+        let parsed = GateReport::from_json(&json).expect("deserialization should work");
+
+        assert_eq!(parsed.schema_version, report.schema_version);
+        assert_eq!(parsed.mode, report.mode);
+        assert_eq!(parsed.decision, report.decision);
+        assert_eq!(parsed.total_elapsed_seconds, report.total_elapsed_seconds);
+        assert_eq!(parsed.gates.len(), 1);
+        assert_eq!(parsed.gates[0].name, "Test Gate");
+    }
+
+    #[test]
+    fn test_gate_report_write_and_read_file() {
+        use std::fs;
+
+        let results = vec![GateResult {
+            name: "File IO Test".to_string(),
+            category: GateCategory::Quality,
+            status: GateStatus::Pass,
+            elapsed_seconds: 5,
+            command: "test".to_string(),
+            stderr_tail: None,
+        }];
+
+        let report = GateReport::new(RunMode::Full, results);
+        let temp_path = "/tmp/gate_report_test.json";
+
+        // Write to file
+        report.write_to_file(temp_path).expect("write should work");
+
+        // Read back
+        let loaded = GateReport::from_file(temp_path).expect("read should work");
+
+        assert_eq!(loaded.schema_version, report.schema_version);
+        assert_eq!(loaded.gates[0].name, "File IO Test");
+
+        // Cleanup
+        let _ = fs::remove_file(temp_path);
     }
 }
