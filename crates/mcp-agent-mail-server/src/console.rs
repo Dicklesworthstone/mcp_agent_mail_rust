@@ -695,12 +695,13 @@ pub fn render_http_request_panel(
     // Title: "METHOD  PATH  STATUS  DUR"
     let reserved: usize = method.len() + status_str.len() + dur_str.len() + 8;
     let max_path: usize = inner_width.saturating_sub(reserved).max(1);
-    let display_path = if path.len() <= max_path {
+    let display_path = if path.chars().count() <= max_path {
         path.to_string()
     } else if max_path <= 3 {
-        path[..max_path].to_string()
+        path.chars().take(max_path).collect()
     } else {
-        format!("{}...", &path[..(max_path - 3)])
+        let head: String = path.chars().take(max_path - 3).collect();
+        format!("{head}...")
     };
 
     let title_plain = format!("{method}  {display_path}  {status_str}  {dur_str}");
@@ -728,12 +729,13 @@ pub fn render_http_request_panel(
     if body_plain.len() > inner_width {
         let reserved_ip: usize = " client: ".len();
         let max_ip: usize = inner_width.saturating_sub(reserved_ip).max(1);
-        let ip = if client_ip.len() <= max_ip {
+        let ip = if client_ip.chars().count() <= max_ip {
             client_ip.to_string()
         } else if max_ip <= 3 {
-            client_ip[..max_ip].to_string()
+            client_ip.chars().take(max_ip).collect()
         } else {
-            format!("{}...", &client_ip[..(max_ip - 3)])
+            let head: String = client_ip.chars().take(max_ip - 3).collect();
+            format!("{head}...")
         };
         body_plain = format!(" client: {ip}");
     }
@@ -780,14 +782,16 @@ pub fn render_http_request_panel(
 
 /// Compact a filesystem path to fit within `max_chars`.
 fn compact_path(input: &str, max_chars: usize) -> String {
-    if input.len() <= max_chars {
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
         return input.to_string();
     }
     if max_chars <= 5 {
-        return input[..max_chars].to_string();
+        return input.chars().take(max_chars).collect();
     }
     let keep = max_chars - 3;
-    format!("...{}", &input[input.len() - keep..])
+    let tail: String = input.chars().skip(char_count - keep).collect();
+    format!("...{tail}")
 }
 
 /// Strip ANSI escape sequences and return the visible character count.
@@ -3728,5 +3732,55 @@ mod tests {
         assert_eq!(ConsoleEventKind::ToolCallStart.label(), "tool_start");
         assert_eq!(ConsoleEventKind::ToolCallEnd.label(), "tool_end");
         assert_eq!(ConsoleEventKind::HttpRequest.label(), "http");
+    }
+
+    // ── compact_path UTF-8 safety ────────────────────────────────────
+
+    #[test]
+    fn compact_path_short_unchanged() {
+        assert_eq!(compact_path("/usr/bin", 20), "/usr/bin");
+    }
+
+    #[test]
+    fn compact_path_3byte_chars() {
+        let s = "/home/→/→/→/→/file";
+        let r = compact_path(s, 10);
+        assert!(r.chars().count() <= 10, "got {} chars", r.chars().count());
+        assert!(r.starts_with("..."));
+    }
+
+    #[test]
+    fn compact_path_cjk() {
+        let s = "/home/日本語/テスト/ファイル";
+        let r = compact_path(s, 12);
+        assert!(r.chars().count() <= 12);
+        assert!(r.starts_with("..."));
+    }
+
+    #[test]
+    fn compact_path_emoji() {
+        let s = "/🔥/🚀/💡/🎯/🏆/file.txt";
+        let r = compact_path(s, 10);
+        assert!(r.chars().count() <= 10);
+    }
+
+    #[test]
+    fn compact_path_tiny_max() {
+        let s = "/very/long/path";
+        let r = compact_path(s, 3);
+        assert!(r.chars().count() <= 3);
+    }
+
+    #[test]
+    fn compact_path_multibyte_sweep() {
+        let s = "/a→b🔥c/dé/f";
+        for max in 1..=s.chars().count() + 2 {
+            let r = compact_path(s, max);
+            assert!(
+                r.chars().count() <= max.max(3),
+                "max={max} got {} chars: {r:?}",
+                r.chars().count()
+            );
+        }
     }
 }

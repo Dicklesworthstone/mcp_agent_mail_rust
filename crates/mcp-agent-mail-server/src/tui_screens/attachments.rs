@@ -448,8 +448,9 @@ impl AttachmentExplorerScreen {
                 let e = &self.entries[idx];
                 let date = micros_to_iso(e.created_ts);
                 let date_short = if date.len() > 19 { &date[..19] } else { &date };
-                let subject_trunc: String = if e.subject.len() > 40 {
-                    format!("{}...", &e.subject[..37])
+                let subject_trunc: String = if e.subject.chars().count() > 40 {
+                    let head: String = e.subject.chars().take(37).collect();
+                    format!("{head}...")
                 } else {
                     e.subject.clone()
                 };

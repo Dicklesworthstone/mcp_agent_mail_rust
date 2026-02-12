@@ -1608,10 +1608,11 @@ fn viewport_range(total: usize, visible: usize, cursor: usize) -> (usize, usize)
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
         s.to_string()
     } else {
-        let mut t = s[..max_chars.saturating_sub(1)].to_string();
+        let mut t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         t.push('\u{2026}');
         t
     }
@@ -2125,5 +2126,81 @@ mod tests {
             importance: importance.to_string(),
             ..test_entry(id, ts, Direction::Inbound)
         }
+    }
+
+    // ── truncate_str UTF-8 safety ────────────────────────────────────
+
+    #[test]
+    fn truncate_str_ascii_short() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_ascii_exact() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_ascii_over() {
+        let r = truncate_str("hello world", 6);
+        assert_eq!(r.chars().count(), 6); // 5 + ellipsis
+        assert!(r.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_str_2byte_chars() {
+        // é is 2 bytes in UTF-8
+        let s = "héllo wörld";
+        let r = truncate_str(s, 6);
+        assert_eq!(r.chars().count(), 6);
+        assert!(r.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_str_3byte_arrow() {
+        // → is 3 bytes in UTF-8 — this was the original crash
+        let s = "foo → bar → baz";
+        let r = truncate_str(s, 7);
+        assert_eq!(r.chars().count(), 7);
+        assert!(r.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_str_cjk() {
+        // CJK chars are 3 bytes each
+        let s = "日本語テスト文字列";
+        let r = truncate_str(s, 5);
+        assert_eq!(r.chars().count(), 5);
+        assert!(r.ends_with('\u{2026}'));
+        assert!(r.starts_with("日本語テ"));
+    }
+
+    #[test]
+    fn truncate_str_emoji_4byte() {
+        // Emoji are 4 bytes each
+        let s = "🔥🚀💡🎯🏆";
+        let r = truncate_str(s, 3);
+        assert_eq!(r.chars().count(), 3);
+        assert!(r.ends_with('\u{2026}'));
+        assert!(r.starts_with("🔥🚀"));
+    }
+
+    #[test]
+    fn truncate_str_mixed_multibyte() {
+        let s = "abc→def🔥ghi";
+        let r = truncate_str(s, 6);
+        assert_eq!(r.chars().count(), 6);
+        assert!(r.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_str_max_one() {
+        let r = truncate_str("hello", 1);
+        assert_eq!(r, "\u{2026}");
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 5), "");
     }
 }

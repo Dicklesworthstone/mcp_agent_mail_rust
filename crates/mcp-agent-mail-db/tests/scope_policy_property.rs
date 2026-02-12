@@ -628,7 +628,7 @@ fn adversarial_unicode_agent_names() {
                 ScopeVerdict::Allow | ScopeVerdict::Redact | ScopeVerdict::Deny
             ),
             "invalid verdict for name {:?}",
-            &name[..name.len().min(20)]
+            name.chars().take(20).collect::<String>()
         );
     }
 }

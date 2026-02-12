@@ -1690,10 +1690,11 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
-    if s.len() <= max_chars {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
         s.to_string()
     } else {
-        let mut t = s[..max_chars.saturating_sub(1)].to_string();
+        let mut t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         t.push('\u{2026}');
         t
     }
@@ -3000,5 +3001,67 @@ mod tests {
             actions.contains(&"Timeline at time"),
             "keybindings should include 'Timeline at time'"
         );
+    }
+
+    // ── truncate_str UTF-8 safety ────────────────────────────────────
+
+    #[test]
+    fn truncate_str_ascii_unchanged() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_ascii_exact_boundary() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_ascii_truncated() {
+        let r = truncate_str("hello world", 6);
+        assert_eq!(r.chars().count(), 6);
+        assert!(r.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_str_zero_returns_empty() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_str_3byte_arrow_no_panic() {
+        let s = "foo → bar → baz → qux";
+        let r = truncate_str(s, 8);
+        assert_eq!(r.chars().count(), 8);
+        assert!(r.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_str_cjk_no_panic() {
+        let s = "日本語テスト文字列";
+        let r = truncate_str(s, 5);
+        assert_eq!(r.chars().count(), 5);
+        assert!(r.starts_with("日本語テ"));
+    }
+
+    #[test]
+    fn truncate_str_emoji_no_panic() {
+        let s = "🔥🚀💡🎯🏆😊";
+        let r = truncate_str(s, 4);
+        assert_eq!(r.chars().count(), 4);
+        assert!(r.starts_with("🔥🚀💡"));
+    }
+
+    #[test]
+    fn truncate_str_mixed_multibyte() {
+        let s = "hello→world🔥test";
+        for max in 1..=s.chars().count() {
+            let r = truncate_str(s, max);
+            assert!(r.chars().count() <= max, "max={max} got {}", r.chars().count());
+        }
+    }
+
+    #[test]
+    fn truncate_str_empty_input() {
+        assert_eq!(truncate_str("", 5), "");
     }
 }

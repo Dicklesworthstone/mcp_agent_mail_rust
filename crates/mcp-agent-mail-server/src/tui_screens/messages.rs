@@ -983,7 +983,7 @@ fn viewport_range(total: usize, height: usize, cursor: usize) -> (usize, usize) 
 
 /// Truncate a string to at most `max_len` characters, adding "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else if max_len <= 3 {
         s.chars().take(max_len).collect()
@@ -1623,5 +1623,54 @@ mod tests {
         let screen = MessageBrowserScreen::new();
         let bindings = screen.keybindings();
         assert!(bindings.iter().any(|b| b.key == "p/P"));
+    }
+
+    // ── truncate_str UTF-8 safety ────────────────────────────────────
+
+    #[test]
+    fn truncate_str_ascii_short() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_ascii_over() {
+        assert_eq!(truncate_str("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_str_3byte_arrow() {
+        let s = "foo → bar → baz";
+        let r = truncate_str(s, 7);
+        assert!(r.chars().count() <= 7);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_cjk() {
+        let s = "日本語テスト文字列";
+        let r = truncate_str(s, 6);
+        assert!(r.chars().count() <= 6);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_emoji() {
+        let s = "🔥🚀💡🎯🏆";
+        let r = truncate_str(s, 5);
+        assert!(r.chars().count() <= 5);
+    }
+
+    #[test]
+    fn truncate_str_tiny_max() {
+        assert_eq!(truncate_str("hello world", 2).chars().count(), 2);
+    }
+
+    #[test]
+    fn truncate_str_multibyte_sweep() {
+        let s = "ab→cd🔥éf";
+        for max in 1..=s.chars().count() + 2 {
+            let r = truncate_str(s, max);
+            assert!(r.chars().count() <= max, "max={max} got {}", r.chars().count());
+        }
     }
 }

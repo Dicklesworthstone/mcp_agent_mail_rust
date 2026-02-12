@@ -411,14 +411,16 @@ fn format_relative_ts(ts_micros: i64) -> String {
     }
 }
 
-/// Truncate a string to `max_len`, adding "..." suffix if needed.
+/// Truncate a string to `max_len` characters, adding "..." suffix if needed.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
     } else if max_len < 4 {
         "...".to_string()
     } else {
-        format!("{}...", &s[..max_len - 3])
+        let truncated: String = s.chars().take(max_len - 3).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -604,5 +606,54 @@ mod tests {
 
         screen.move_selection(-1);
         assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    // ── truncate_str UTF-8 safety ────────────────────────────────────
+
+    #[test]
+    fn truncate_str_ascii_short() {
+        assert_eq!(truncate_str("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_str_ascii_over() {
+        assert_eq!(truncate_str("hello world!", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_str_tiny_max() {
+        assert_eq!(truncate_str("hello", 2), "...");
+    }
+
+    #[test]
+    fn truncate_str_3byte_arrow_no_panic() {
+        let s = "foo → bar → baz";
+        let r = truncate_str(s, 8);
+        assert!(r.chars().count() <= 8);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_cjk_no_panic() {
+        let s = "日本語テスト文字列";
+        let r = truncate_str(s, 6);
+        assert!(r.chars().count() <= 6);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_emoji_no_panic() {
+        let s = "🔥🚀💡🎯🏆";
+        let r = truncate_str(s, 5);
+        assert!(r.chars().count() <= 5);
+    }
+
+    #[test]
+    fn truncate_str_mixed_multibyte_sweep() {
+        let s = "a→b🔥cé";
+        for max in 1..=s.chars().count() + 2 {
+            let r = truncate_str(s, max);
+            assert!(r.chars().count() <= max.max(3), "max={max}");
+        }
     }
 }
