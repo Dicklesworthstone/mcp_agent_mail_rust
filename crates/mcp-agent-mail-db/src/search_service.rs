@@ -24,8 +24,6 @@ use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
-use sqlmodel_sqlite::SqliteConnection;
-
 // ────────────────────────────────────────────────────────────────────
 // Search service options
 // ────────────────────────────────────────────────────────────────────
@@ -97,7 +95,7 @@ fn map_sql_outcome<T>(out: Outcome<T, sqlmodel_core::Error>) -> Outcome<T, DbErr
 async fn acquire_conn(
     cx: &Cx,
     pool: &DbPool,
-) -> Outcome<sqlmodel_pool::PooledConnection<SqliteConnection>, DbError> {
+) -> Outcome<sqlmodel_pool::PooledConnection<crate::DbConn>, DbError> {
     map_sql_outcome(pool.acquire(cx).await)
 }
 

@@ -1055,7 +1055,7 @@ fn seed_search_fixture(scenario: SearchScenario) -> SearchFixture {
             Outcome::Panicked(p) => panic!("pool acquire panicked: {}", p.message()),
         };
 
-        conn.execute_raw("BEGIN IMMEDIATE").expect("begin txn");
+        conn.execute_raw("BEGIN CONCURRENT").expect("begin txn");
         for i in 0..message_count {
             let v = vocab[i % vocab.len()];
             let mut subject = format!("bench {i} {v}");
@@ -1574,7 +1574,7 @@ fn seed_share_fixture(tmp: &TempDir, scenario: ShareScenario) -> ShareFixture {
     let keep_slug = "proj_keep";
     let drop_slug = "proj_drop";
 
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(source_db.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(source_db.display().to_string())
         .expect("open source db");
 
     // Schema: only what the share pipeline needs.
@@ -1634,7 +1634,7 @@ fn seed_share_fixture(tmp: &TempDir, scenario: ShareScenario) -> ShareFixture {
     ))
     .expect("insert drop agent");
 
-    conn.execute_raw("BEGIN IMMEDIATE").expect("begin txn");
+    conn.execute_raw("BEGIN CONCURRENT").expect("begin txn");
 
     // Seed file reservations + agent links so scrub clears them.
     for i in 0..20 {

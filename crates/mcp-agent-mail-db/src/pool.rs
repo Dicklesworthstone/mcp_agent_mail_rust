@@ -14,7 +14,7 @@ use mcp_agent_mail_core::{
 };
 use sqlmodel_core::Error as SqlError;
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
-use sqlmodel_sqlite::SqliteConnection;
+use crate::DbConn;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -200,17 +200,17 @@ impl DbPoolStatsSampler {
         }
     }
 
-    pub fn sample_now(&self, pool: &Pool<SqliteConnection>) {
+    pub fn sample_now(&self, pool: &Pool<DbConn>) {
         let now_us = u64::try_from(crate::now_micros()).unwrap_or(0);
         self.sample_inner(pool, now_us, true);
     }
 
-    pub fn maybe_sample(&self, pool: &Pool<SqliteConnection>) {
+    pub fn maybe_sample(&self, pool: &Pool<DbConn>) {
         let now_us = u64::try_from(crate::now_micros()).unwrap_or(0);
         self.sample_inner(pool, now_us, false);
     }
 
-    fn sample_inner(&self, pool: &Pool<SqliteConnection>, now_us: u64, force: bool) {
+    fn sample_inner(&self, pool: &Pool<DbConn>, now_us: u64, force: bool) {
         if force {
             self.last_sample_us.store(now_us, Ordering::Relaxed);
         } else {
@@ -270,12 +270,12 @@ impl DbPoolStatsSampler {
 
 /// A configured `SQLite` connection pool with schema initialization.
 ///
-/// This wraps `sqlmodel_pool::Pool<SqliteConnection>` and encapsulates:
+/// This wraps `sqlmodel_pool::Pool<DbConn>` and encapsulates:
 /// - URL/path parsing (`sqlite+aiosqlite:///...` etc)
 /// - per-connection PRAGMAs + schema init (idempotent)
 #[derive(Clone)]
 pub struct DbPool {
-    pool: Arc<Pool<SqliteConnection>>,
+    pool: Arc<Pool<DbConn>>,
     sqlite_path: String,
     init_sql: Arc<String>,
     run_migrations: bool,
@@ -317,7 +317,7 @@ impl DbPool {
 
     /// Acquire a pooled connection, creating and initializing a new one if needed.
     #[allow(clippy::too_many_lines)]
-    pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<SqliteConnection>, SqlError> {
+    pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
         let sqlite_path = self.sqlite_path.clone();
         let init_sql = self.init_sql.clone();
         let run_migrations = self.run_migrations;
@@ -346,12 +346,12 @@ impl DbPool {
                     }
 
                     let conn = if sqlite_path == ":memory:" {
-                        match SqliteConnection::open_memory() {
+                        match DbConn::open_memory() {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
                     } else {
-                        match SqliteConnection::open_file(&sqlite_path) {
+                        match DbConn::open_file(&sqlite_path) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
@@ -446,7 +446,7 @@ impl DbPool {
         let deadline = Instant::now() + timeout;
         let mut opened = 0usize;
         // Acquire connections in batches; hold them briefly then release.
-        let mut batch: Vec<PooledConnection<SqliteConnection>> = Vec::with_capacity(n);
+        let mut batch: Vec<PooledConnection<DbConn>> = Vec::with_capacity(n);
         for _ in 0..n {
             if Instant::now() >= deadline {
                 break;
@@ -491,7 +491,7 @@ impl DbPool {
             });
         }
 
-        let conn = SqliteConnection::open_file(&self.sqlite_path)
+        let conn = DbConn::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("startup integrity check: open failed: {e}")))?;
 
         integrity::quick_check(&conn)
@@ -520,7 +520,7 @@ impl DbPool {
             });
         }
 
-        let conn = SqliteConnection::open_file(&self.sqlite_path)
+        let conn = DbConn::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("full integrity check: open failed: {e}")))?;
 
         integrity::full_check(&conn)
@@ -539,7 +539,7 @@ impl DbPool {
             return Ok(Vec::new());
         }
 
-        let conn = SqliteConnection::open_file(&self.sqlite_path)
+        let conn = DbConn::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
 
         // Query recent messages joined with projects and agents to get
@@ -607,7 +607,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
         }
-        let conn = SqliteConnection::open_file(&self.sqlite_path)
+        let conn = DbConn::open_file(&self.sqlite_path)
             .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
 
         // Apply busy_timeout so the checkpoint waits for active readers/writers.
@@ -761,10 +761,9 @@ mod tests {
     #[test]
     fn test_schema_init_in_memory() {
         use sqlmodel_core::{Row, Value};
-        use sqlmodel_sqlite::SqliteConnection;
 
         // Open in-memory connection
-        let conn = SqliteConnection::open_memory().expect("failed to open in-memory db");
+        let conn = DbConn::open_memory().expect("failed to open in-memory db");
 
         // Get schema SQL
         let sql = schema::init_schema_sql();

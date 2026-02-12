@@ -21,6 +21,7 @@ ed25519-dalek.workspace = true
 zip.workspace = true
 include_dir.workspace = true
 mcp-agent-mail-core = { workspace = true }
+mcp-agent-mail-db = { workspace = true }
 sqlmodel-sqlite.workspace = true
 sqlmodel-core.workspace = true
 

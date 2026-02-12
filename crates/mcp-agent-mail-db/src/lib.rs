@@ -64,3 +64,11 @@ pub static QUERY_TRACKER: std::sync::LazyLock<QueryTracker> =
 // Re-export sqlmodel for convenience
 pub use sqlmodel;
 pub use sqlmodel_sqlite;
+pub use sqlmodel_frankensqlite;
+
+/// The connection type used by this crate's pool and queries.
+///
+/// Currently backed by `FrankenConnection` (pure-Rust `SQLite`).
+/// Provides the same API surface as `SqliteConnection`:
+/// `open_memory()`, `open_file()`, `execute_raw()`, `query_sync()`, `execute_sync()`.
+pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;

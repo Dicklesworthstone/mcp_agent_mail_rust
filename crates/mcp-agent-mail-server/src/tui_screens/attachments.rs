@@ -12,7 +12,7 @@ use ftui_runtime::program::Cmd;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_bridge::TuiSharedState;
@@ -169,7 +169,7 @@ pub struct AttachmentExplorerScreen {
     detail_scroll: usize,
 
     // DB state
-    db_conn: Option<SqliteConnection>,
+    db_conn: Option<DbConn>,
     db_conn_attempted: bool,
     last_error: Option<String>,
     data_dirty: bool,
@@ -212,7 +212,7 @@ impl AttachmentExplorerScreen {
             ..Default::default()
         };
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = SqliteConnection::open_file(&path).ok();
+            self.db_conn = DbConn::open_file(&path).ok();
         }
     }
 

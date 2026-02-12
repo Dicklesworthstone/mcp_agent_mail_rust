@@ -16,7 +16,7 @@ use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_bridge::TuiSharedState;
@@ -153,7 +153,7 @@ pub struct MessageBrowserScreen {
     /// Whether we need to re-query.
     search_dirty: bool,
     /// Lazy-opened DB connection for message queries.
-    db_conn: Option<SqliteConnection>,
+    db_conn: Option<DbConn>,
     /// Whether we attempted to open the DB connection.
     db_conn_attempted: bool,
     /// Total result count (may be more than `results.len()`).
@@ -233,7 +233,7 @@ impl MessageBrowserScreen {
             ..Default::default()
         };
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = SqliteConnection::open_file(&path).ok();
+            self.db_conn = DbConn::open_file(&path).ok();
         }
     }
 
@@ -605,7 +605,7 @@ impl MailScreen for MessageBrowserScreen {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Fetch recent messages (empty query mode).
-fn fetch_recent_messages(conn: &SqliteConnection, limit: usize) -> (Vec<MessageEntry>, usize) {
+fn fetch_recent_messages(conn: &DbConn, limit: usize) -> (Vec<MessageEntry>, usize) {
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
          m.created_ts, \
@@ -629,7 +629,7 @@ fn fetch_recent_messages(conn: &SqliteConnection, limit: usize) -> (Vec<MessageE
 
 /// Full-text search using FTS5, returning results and the search method used.
 fn search_messages_fts(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     query: &str,
     limit: usize,
 ) -> (Vec<MessageEntry>, usize, SearchMethod) {
@@ -689,7 +689,7 @@ fn search_messages_fts(
 }
 
 /// Execute a message query and extract rows into `MessageEntry` structs.
-fn query_messages(conn: &SqliteConnection, sql: &str) -> Vec<MessageEntry> {
+fn query_messages(conn: &DbConn, sql: &str) -> Vec<MessageEntry> {
     conn.query_sync(sql, &[])
         .ok()
         .map(|rows| {
@@ -731,7 +731,7 @@ fn query_messages(conn: &SqliteConnection, sql: &str) -> Vec<MessageEntry> {
 }
 
 /// Count total messages, optionally matching a query.
-fn count_messages(conn: &SqliteConnection, _query: Option<&str>) -> usize {
+fn count_messages(conn: &DbConn, _query: Option<&str>) -> usize {
     conn.query_sync("SELECT COUNT(*) AS c FROM messages", &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())

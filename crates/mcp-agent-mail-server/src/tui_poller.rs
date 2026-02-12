@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::now_micros;
 
 use crate::tui_bridge::TuiSharedState;
@@ -180,17 +180,17 @@ fn fetch_db_stats(database_url: &str) -> DbStatSnapshot {
 }
 
 /// Open a sync `SQLite` connection from a database URL.
-fn open_sync_connection(database_url: &str) -> Option<SqliteConnection> {
+fn open_sync_connection(database_url: &str) -> Option<DbConn> {
     let cfg = DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
-    SqliteConnection::open_file(&path).ok()
+    DbConn::open_file(&path).ok()
 }
 
 /// Run a `SELECT COUNT(*) AS c FROM ...` query and return the count.
-fn count_query(conn: &SqliteConnection, sql: &str) -> u64 {
+fn count_query(conn: &DbConn, sql: &str) -> u64 {
     conn.query_sync(sql, &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())
@@ -200,7 +200,7 @@ fn count_query(conn: &SqliteConnection, sql: &str) -> u64 {
 }
 
 /// Fetch the agent list ordered by most recently active.
-fn fetch_agents_list(conn: &SqliteConnection) -> Vec<AgentSummary> {
+fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
     conn.query_sync(
         &format!(
             "SELECT name, program, last_active_ts FROM agents \
@@ -224,7 +224,7 @@ fn fetch_agents_list(conn: &SqliteConnection) -> Vec<AgentSummary> {
 }
 
 /// Fetch the project list with per-project agent/message/reservation counts.
-fn fetch_projects_list(conn: &SqliteConnection) -> Vec<ProjectSummary> {
+fn fetch_projects_list(conn: &DbConn) -> Vec<ProjectSummary> {
     conn.query_sync(
         &format!(
             "SELECT p.id, p.slug, p.human_key, p.created_at, \
@@ -276,7 +276,7 @@ fn fetch_projects_list(conn: &SqliteConnection) -> Vec<ProjectSummary> {
 }
 
 /// Fetch the contact links list with agent names resolved.
-fn fetch_contacts_list(conn: &SqliteConnection) -> Vec<ContactSummary> {
+fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
     conn.query_sync(
         &format!(
             "SELECT \
@@ -562,7 +562,7 @@ mod tests {
         let db_url = format!("sqlite:///{}", db_path.display());
 
         // Create tables
-        let conn = SqliteConnection::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
             &[],
@@ -646,7 +646,7 @@ mod tests {
         let db_url = format!("sqlite:///{}", db_path.display());
 
         // Create minimal tables (empty DB)
-        let conn = SqliteConnection::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
             .expect("create");
         conn.execute_sync(

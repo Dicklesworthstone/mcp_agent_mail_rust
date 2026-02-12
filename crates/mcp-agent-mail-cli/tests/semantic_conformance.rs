@@ -76,8 +76,8 @@ impl TestEnv {
         ]
     }
 
-    fn open_conn(&self) -> sqlmodel_sqlite::SqliteConnection {
-        sqlmodel_sqlite::SqliteConnection::open_file(self.db_path.display().to_string())
+    fn open_conn(&self) -> mcp_agent_mail_db::DbConn {
+        mcp_agent_mail_db::DbConn::open_file(self.db_path.display().to_string())
             .expect("open db")
     }
 }
@@ -94,15 +94,15 @@ fn run_am(env: &[(String, String)], args: &[&str]) -> Output {
     cmd.output().expect("spawn am")
 }
 
-fn init_schema(db_path: &Path) -> sqlmodel_sqlite::SqliteConnection {
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+fn init_schema(db_path: &Path) -> mcp_agent_mail_db::DbConn {
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
         .expect("init schema");
     conn
 }
 
-fn insert_project(conn: &sqlmodel_sqlite::SqliteConnection, id: i64, slug: &str, human_key: &str) {
+fn insert_project(conn: &mcp_agent_mail_db::DbConn, id: i64, slug: &str, human_key: &str) {
     let now = mcp_agent_mail_db::timestamps::now_micros();
     conn.execute_sync(
         "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
@@ -117,7 +117,7 @@ fn insert_project(conn: &sqlmodel_sqlite::SqliteConnection, id: i64, slug: &str,
 }
 
 fn insert_agent(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     project_id: i64,
     name: &str,
@@ -157,7 +157,7 @@ fn save_drift_report(entries: &[DriftEntry], test_name: &str) {
 }
 
 fn query_one_str(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     sql: &str,
     params: &[SqlValue],
     col: &str,
@@ -168,7 +168,7 @@ fn query_one_str(
         .and_then(|row| row.get_named::<String>(col).ok())
 }
 
-fn query_count(conn: &sqlmodel_sqlite::SqliteConnection, sql: &str, params: &[SqlValue]) -> i64 {
+fn query_count(conn: &mcp_agent_mail_db::DbConn, sql: &str, params: &[SqlValue]) -> i64 {
     conn.query_sync(sql, params)
         .ok()
         .and_then(|rows| rows.into_iter().next())

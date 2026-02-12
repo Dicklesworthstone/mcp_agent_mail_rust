@@ -345,7 +345,7 @@ fn extract_trigger_statements(sql: &str) -> Vec<&str> {
 /// Return the complete list of schema migrations.
 ///
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
-/// `sqlmodel_sqlite::SqliteConnection::execute_sync`, which only executes the first
+/// `DbConn::execute_sync`, which only executes the first
 /// prepared statement). Triggers are included as single `CREATE TRIGGER ... END;` statements.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -863,7 +863,7 @@ pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
-    use sqlmodel_sqlite::SqliteConnection;
+    use crate::DbConn;
 
     fn block_on<F, Fut, T>(f: F) -> T
     where
@@ -881,7 +881,7 @@ mod tests {
     fn migrations_apply_and_are_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_apply.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // First run applies all schema migrations.
@@ -911,7 +911,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_preserve.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // Simulate an older DB with only `projects` table.
@@ -954,7 +954,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v3_text_ts.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1132,7 +1132,7 @@ mod tests {
     fn v4_migration_creates_composite_indexes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_indexes.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // Apply all migrations.
@@ -1183,7 +1183,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_existing.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1285,7 +1285,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v5_fts.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // Apply all migrations (creates schema + FTS with porter tokenizer).
@@ -1385,7 +1385,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v7_fts_identity.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // Simulate a pre-v7 DB: identity tables exist, but there are no fts_agents/fts_projects.
@@ -1511,7 +1511,7 @@ mod tests {
     fn corrupted_migrations_table_yields_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_corrupt.db");
-        let conn = SqliteConnection::open_file(db_path.display().to_string())
+        let conn = DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite connection");
 
         // Create a tracking table with the right name but wrong schema.

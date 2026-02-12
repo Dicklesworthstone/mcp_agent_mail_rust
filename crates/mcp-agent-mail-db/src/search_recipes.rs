@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use sqlmodel::Row;
 use sqlmodel_schema::Migration;
-use sqlmodel_sqlite::SqliteConnection;
+use crate::DbConn;
 
 use crate::timestamps::now_micros;
 
@@ -294,7 +294,7 @@ pub fn recipe_migrations() -> Vec<Migration> {
 use crate::sqlmodel::Value;
 
 /// Insert a new search recipe. Returns the row ID.
-pub fn insert_recipe(conn: &SqliteConnection, recipe: &SearchRecipe) -> Result<i64, String> {
+pub fn insert_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<i64, String> {
     let sql = "INSERT INTO search_recipes \
         (name, description, query_text, doc_kind, scope_mode, scope_id, \
          importance_filter, ack_filter, sort_mode, thread_filter, \
@@ -314,7 +314,7 @@ pub fn insert_recipe(conn: &SqliteConnection, recipe: &SearchRecipe) -> Result<i
 }
 
 /// Update an existing recipe by ID.
-pub fn update_recipe(conn: &SqliteConnection, recipe: &SearchRecipe) -> Result<(), String> {
+pub fn update_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<(), String> {
     let Some(id) = recipe.id else {
         return Err("recipe has no ID".to_string());
     };
@@ -352,7 +352,7 @@ pub fn update_recipe(conn: &SqliteConnection, recipe: &SearchRecipe) -> Result<(
 }
 
 /// Delete a recipe by ID.
-pub fn delete_recipe(conn: &SqliteConnection, recipe_id: i64) -> Result<(), String> {
+pub fn delete_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
     conn.execute_sync(
         "DELETE FROM search_recipes WHERE id = ?",
         &[Value::BigInt(recipe_id)],
@@ -364,7 +364,7 @@ pub fn delete_recipe(conn: &SqliteConnection, recipe_id: i64) -> Result<(), Stri
 /// List recipes, ordered by pinned (desc) then name (asc).
 ///
 /// Returns at most [`MAX_RECIPES`] entries to prevent unbounded memory growth.
-pub fn list_recipes(conn: &SqliteConnection) -> Result<Vec<SearchRecipe>, String> {
+pub fn list_recipes(conn: &DbConn) -> Result<Vec<SearchRecipe>, String> {
     let limit_val = i64::try_from(MAX_RECIPES).unwrap_or(200);
     let sql = "SELECT id, name, description, query_text, doc_kind, scope_mode, \
         scope_id, importance_filter, ack_filter, sort_mode, thread_filter, \
@@ -380,7 +380,7 @@ pub fn list_recipes(conn: &SqliteConnection) -> Result<Vec<SearchRecipe>, String
 }
 
 /// Get a single recipe by ID.
-pub fn get_recipe(conn: &SqliteConnection, recipe_id: i64) -> Result<Option<SearchRecipe>, String> {
+pub fn get_recipe(conn: &DbConn, recipe_id: i64) -> Result<Option<SearchRecipe>, String> {
     let sql = "SELECT id, name, description, query_text, doc_kind, scope_mode, \
         scope_id, importance_filter, ack_filter, sort_mode, thread_filter, \
         created_ts, updated_ts, pinned, use_count \
@@ -393,7 +393,7 @@ pub fn get_recipe(conn: &SqliteConnection, recipe_id: i64) -> Result<Option<Sear
 }
 
 /// Increment the use count for a recipe and update its timestamp.
-pub fn touch_recipe(conn: &SqliteConnection, recipe_id: i64) -> Result<(), String> {
+pub fn touch_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
     let now = now_micros();
     conn.execute_sync(
         "UPDATE search_recipes SET use_count = use_count + 1, updated_ts = ? WHERE id = ?",
@@ -405,7 +405,7 @@ pub fn touch_recipe(conn: &SqliteConnection, recipe_id: i64) -> Result<(), Strin
 
 /// Prune old recipes, keeping pinned recipes plus the most recently updated
 /// `keep` non-pinned recipes. Returns the number of deleted rows.
-pub fn prune_recipes(conn: &SqliteConnection, keep: usize) -> Result<u64, String> {
+pub fn prune_recipes(conn: &DbConn, keep: usize) -> Result<u64, String> {
     let keep_val = i64::try_from(keep.min(10_000)).unwrap_or(200);
     // Keep all pinned recipes unconditionally, plus the `keep` most recently
     // updated non-pinned recipes.
@@ -418,7 +418,7 @@ pub fn prune_recipes(conn: &SqliteConnection, keep: usize) -> Result<u64, String
 }
 
 /// Count total recipes.
-pub fn count_recipes(conn: &SqliteConnection) -> Result<i64, String> {
+pub fn count_recipes(conn: &DbConn) -> Result<i64, String> {
     let rows = conn
         .query_sync("SELECT COUNT(*) AS cnt FROM search_recipes", &[])
         .map_err(|e| e.to_string())?;
@@ -428,7 +428,7 @@ pub fn count_recipes(conn: &SqliteConnection) -> Result<i64, String> {
 }
 
 /// Record a query execution in history.
-pub fn insert_history(conn: &SqliteConnection, entry: &QueryHistoryEntry) -> Result<i64, String> {
+pub fn insert_history(conn: &DbConn, entry: &QueryHistoryEntry) -> Result<i64, String> {
     let sql = "INSERT INTO query_history \
         (query_text, doc_kind, scope_mode, scope_id, result_count, executed_ts) \
         VALUES (?, ?, ?, ?, ?, ?)";
@@ -454,7 +454,7 @@ pub fn insert_history(conn: &SqliteConnection, entry: &QueryHistoryEntry) -> Res
 
 /// List recent query history, newest first.
 pub fn list_recent_history(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     limit: usize,
 ) -> Result<Vec<QueryHistoryEntry>, String> {
     let sql = "SELECT id, query_text, doc_kind, scope_mode, scope_id, \
@@ -471,7 +471,7 @@ pub fn list_recent_history(
 }
 
 /// Prune old history entries, keeping only the most recent `keep` entries.
-pub fn prune_history(conn: &SqliteConnection, keep: usize) -> Result<u64, String> {
+pub fn prune_history(conn: &DbConn, keep: usize) -> Result<u64, String> {
     let keep_val = i64::try_from(keep.min(10_000)).unwrap_or(500);
     let sql = "DELETE FROM query_history WHERE id NOT IN ( \
         SELECT id FROM query_history ORDER BY executed_ts DESC LIMIT ? \
@@ -481,7 +481,7 @@ pub fn prune_history(conn: &SqliteConnection, keep: usize) -> Result<u64, String
 }
 
 /// Count total history entries.
-pub fn count_history(conn: &SqliteConnection) -> Result<i64, String> {
+pub fn count_history(conn: &DbConn) -> Result<i64, String> {
     let rows = conn
         .query_sync("SELECT COUNT(*) AS cnt FROM query_history", &[])
         .map_err(|e| e.to_string())?;
@@ -569,8 +569,8 @@ fn row_to_history(row: &Row) -> QueryHistoryEntry {
 mod tests {
     use super::*;
 
-    fn open_test_db() -> SqliteConnection {
-        let conn = SqliteConnection::open_memory().expect("open in-memory db");
+    fn open_test_db() -> DbConn {
+        let conn = DbConn::open_memory().expect("open in-memory db");
         // Run v8 recipe migrations
         for mig in recipe_migrations() {
             conn.execute_sync(&mig.up, &[])
@@ -945,7 +945,7 @@ mod tests {
 
     #[test]
     fn migrations_are_idempotent() {
-        let conn = SqliteConnection::open_memory().expect("open");
+        let conn = DbConn::open_memory().expect("open");
         // Run twice — should not error
         for _ in 0..2 {
             for mig in recipe_migrations() {

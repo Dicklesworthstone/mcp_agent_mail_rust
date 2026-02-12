@@ -124,7 +124,7 @@ pub fn scrub_snapshot(
 ) -> Result<ScrubSummary, ShareError> {
     let cfg = preset_config(preset);
     let path_str = snapshot_path.display().to_string();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(|e| {
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| {
         ShareError::Sqlite {
             message: format!("cannot open snapshot {path_str}: {e}"),
         }
@@ -135,7 +135,7 @@ pub fn scrub_snapshot(
             message: format!("PRAGMA foreign_keys failed: {e}"),
         })?;
 
-    conn.execute_raw("BEGIN IMMEDIATE")
+    conn.execute_raw("BEGIN CONCURRENT")
         .map_err(|e| ShareError::Sqlite {
             message: format!("BEGIN transaction failed: {e}"),
         })?;
@@ -429,7 +429,7 @@ fn is_empty_value(v: &Value) -> bool {
     }
 }
 
-fn count_scalar(conn: &sqlmodel_sqlite::SqliteConnection, sql: &str) -> Result<i64, ShareError> {
+fn count_scalar(conn: &mcp_agent_mail_db::DbConn, sql: &str) -> Result<i64, ShareError> {
     let rows = conn.query_sync(sql, &[]).map_err(|e| ShareError::Sqlite {
         message: format!("scalar query failed: {e}"),
     })?;
@@ -440,7 +440,7 @@ fn count_scalar(conn: &sqlmodel_sqlite::SqliteConnection, sql: &str) -> Result<i
 }
 
 fn exec_count(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     sql: &str,
     params: &[SqlValue],
 ) -> Result<i64, ShareError> {
@@ -452,7 +452,7 @@ fn exec_count(
     Ok(i64::try_from(n).unwrap_or(0))
 }
 
-fn table_exists(conn: &sqlmodel_sqlite::SqliteConnection, name: &str) -> Result<bool, ShareError> {
+fn table_exists(conn: &mcp_agent_mail_db::DbConn, name: &str) -> Result<bool, ShareError> {
     let rows = conn
         .query_sync(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -582,7 +582,7 @@ mod tests {
 
         // Verify message content
         let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(snapshot.display().to_string()).unwrap();
+            mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT id, subject, body_md, ack_required, attachments FROM messages ORDER BY id",
@@ -634,7 +634,7 @@ mod tests {
     fn create_fixture_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test.sqlite3");
         let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string()).unwrap();
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         )

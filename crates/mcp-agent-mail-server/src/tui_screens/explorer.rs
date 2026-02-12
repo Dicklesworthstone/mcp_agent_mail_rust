@@ -17,7 +17,7 @@ use ftui_widgets::input::TextInput;
 use mcp_agent_mail_db::mail_explorer::{AckFilter, Direction, ExplorerStats, GroupMode, SortMode};
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::{Row, Value};
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 
 use crate::tui_bridge::TuiSharedState;
@@ -249,7 +249,7 @@ pub struct MailExplorerScreen {
     active_filter: FilterSlot,
 
     // DB/search state
-    db_conn: Option<SqliteConnection>,
+    db_conn: Option<DbConn>,
     db_conn_attempted: bool,
     last_error: Option<String>,
     debounce_remaining: u8,
@@ -323,7 +323,7 @@ impl MailExplorerScreen {
             ..Default::default()
         };
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = SqliteConnection::open_file(&path).ok();
+            self.db_conn = DbConn::open_file(&path).ok();
         }
     }
 
@@ -414,7 +414,7 @@ impl MailExplorerScreen {
     }
 
     fn query_overdue_acks(
-        conn: &SqliteConnection,
+        conn: &DbConn,
         now: i64,
     ) -> Result<Vec<AckPressureCard>, String> {
         let threshold = now - ACK_SLA_THRESHOLD_MICROS;
@@ -455,7 +455,7 @@ impl MailExplorerScreen {
             })
     }
 
-    fn query_unread_hotspots(conn: &SqliteConnection) -> Result<Vec<UnreadPressureCard>, String> {
+    fn query_unread_hotspots(conn: &DbConn) -> Result<Vec<UnreadPressureCard>, String> {
         let sql = "SELECT a.name AS agent_name, p.slug AS project_slug, \
                    COUNT(CASE WHEN r.read_ts IS NULL THEN 1 END) AS unread_count, \
                    COUNT(*) AS total_inbound \
@@ -491,7 +491,7 @@ impl MailExplorerScreen {
     }
 
     fn query_reservation_pressure(
-        conn: &SqliteConnection,
+        conn: &DbConn,
         now: i64,
     ) -> Result<Vec<ReservationPressureCard>, String> {
         let sql = "SELECT fr.path_pattern, fr.exclusive, fr.expires_ts, \
@@ -528,7 +528,7 @@ impl MailExplorerScreen {
 
     fn fetch_inbound(
         &self,
-        conn: &SqliteConnection,
+        conn: &DbConn,
         text_filter: &str,
     ) -> Result<Vec<DisplayEntry>, String> {
         let mut conditions = Vec::new();
@@ -601,7 +601,7 @@ impl MailExplorerScreen {
 
     fn fetch_outbound(
         &self,
-        conn: &SqliteConnection,
+        conn: &DbConn,
         text_filter: &str,
     ) -> Result<Vec<DisplayEntry>, String> {
         let mut conditions = Vec::new();

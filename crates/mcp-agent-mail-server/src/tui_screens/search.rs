@@ -23,7 +23,7 @@ use mcp_agent_mail_db::search_recipes::{
     list_recent_history, list_recipes, touch_recipe,
 };
 use mcp_agent_mail_db::sqlmodel::Value;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 
 use crate::tui_bridge::TuiSharedState;
@@ -555,7 +555,7 @@ pub struct SearchCockpitScreen {
     active_facet: FacetSlot,
 
     // Search state
-    db_conn: Option<SqliteConnection>,
+    db_conn: Option<DbConn>,
     db_conn_attempted: bool,
     last_query: String,
     last_error: Option<String>,
@@ -641,7 +641,7 @@ impl SearchCockpitScreen {
             ..Default::default()
         };
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = SqliteConnection::open_file(&path).ok();
+            self.db_conn = DbConn::open_file(&path).ok();
             if self.db_conn.is_some() {
                 self.ensure_recipes_loaded();
             }
@@ -743,7 +743,7 @@ impl SearchCockpitScreen {
     /// Run a search for a single doc kind using sync queries.
     fn run_kind_search(
         &mut self,
-        conn: &SqliteConnection,
+        conn: &DbConn,
         kind: DocKind,
         raw: &str,
     ) -> Vec<ResultEntry> {
@@ -755,7 +755,7 @@ impl SearchCockpitScreen {
     }
 
     /// Search messages using the global planner for non-empty queries.
-    fn search_messages(&mut self, conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
+    fn search_messages(&mut self, conn: &DbConn, raw: &str) -> Vec<ResultEntry> {
         if raw.is_empty() {
             return self.search_messages_recent(conn);
         }
@@ -797,7 +797,7 @@ impl SearchCockpitScreen {
     }
 
     /// Recent messages view (empty query).
-    fn search_messages_recent(&mut self, conn: &SqliteConnection) -> Vec<ResultEntry> {
+    fn search_messages_recent(&mut self, conn: &DbConn) -> Vec<ResultEntry> {
         let mut where_clauses: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 
@@ -845,7 +845,7 @@ impl SearchCockpitScreen {
     }
 
     /// Search agents.
-    fn search_agents(conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
+    fn search_agents(conn: &DbConn, raw: &str) -> Vec<ResultEntry> {
         if raw.is_empty() {
             let sql = "SELECT id, name, task_description, project_id, 0.0 AS score \
                        FROM agents ORDER BY name LIMIT 100";
@@ -867,7 +867,7 @@ impl SearchCockpitScreen {
     }
 
     /// Search projects.
-    fn search_projects(conn: &SqliteConnection, raw: &str) -> Vec<ResultEntry> {
+    fn search_projects(conn: &DbConn, raw: &str) -> Vec<ResultEntry> {
         if raw.is_empty() {
             let sql = "SELECT id, slug, human_key, 0.0 AS score \
                        FROM projects ORDER BY slug LIMIT 100";
@@ -1588,7 +1588,7 @@ fn plan_param_to_value(param: &mcp_agent_mail_db::search_planner::PlanParam) -> 
 }
 
 fn query_message_rows(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     sql: &str,
     params: &[Value],
     highlight_terms: &[QueryTerm],
@@ -1626,7 +1626,7 @@ fn query_message_rows(
         })
 }
 
-fn query_agent_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> Vec<ResultEntry> {
+fn query_agent_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultEntry> {
     conn.query_sync(sql, params)
         .ok()
         .map(|rows| {
@@ -1656,7 +1656,7 @@ fn query_agent_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> Vec
         .unwrap_or_default()
 }
 
-fn query_project_rows(conn: &SqliteConnection, sql: &str, params: &[Value]) -> Vec<ResultEntry> {
+fn query_project_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultEntry> {
     conn.query_sync(sql, params)
         .ok()
         .map(|rows| {

@@ -38,6 +38,7 @@ sqlmodel-schema = { path = "../sqlmodel_rust/crates/sqlmodel-schema" }
 sqlmodel-session = { path = "../sqlmodel_rust/crates/sqlmodel-session" }
 sqlmodel-pool = { path = "../sqlmodel_rust/crates/sqlmodel-pool" }
 sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+sqlmodel-frankensqlite = { path = "../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
 
 ftui = { path = "../frankentui/crates/ftui", features = ["crossterm"] }
 ftui-runtime = { path = "../frankentui/crates/ftui-runtime", features = ["crossterm-compat"] }

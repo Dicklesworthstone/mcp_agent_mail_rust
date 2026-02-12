@@ -118,13 +118,13 @@ fn run_am(
 }
 
 fn init_cli_schema(db_path: &Path) {
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
         .expect("init schema");
 }
 
-fn insert_project(conn: &sqlmodel_sqlite::SqliteConnection, id: i64, slug: &str, human_key: &str) {
+fn insert_project(conn: &mcp_agent_mail_db::DbConn, id: i64, slug: &str, human_key: &str) {
     conn.execute_sync(
         "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
         &[
@@ -138,7 +138,7 @@ fn insert_project(conn: &sqlmodel_sqlite::SqliteConnection, id: i64, slug: &str,
 }
 
 fn insert_message(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     project_id: i64,
     sender_id: i64,
@@ -165,7 +165,7 @@ fn insert_message(
     .expect("insert message");
 }
 
-fn insert_recipient(conn: &sqlmodel_sqlite::SqliteConnection, message_id: i64, agent_id: i64) {
+fn insert_recipient(conn: &mcp_agent_mail_db::DbConn, message_id: i64, agent_id: i64) {
     conn.execute_sync(
         "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
         &[
@@ -178,7 +178,7 @@ fn insert_recipient(conn: &sqlmodel_sqlite::SqliteConnection, message_id: i64, a
 }
 
 fn insert_file_reservation(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     project_id: i64,
     agent_id: i64,
@@ -207,7 +207,7 @@ fn insert_file_reservation(
 }
 
 fn insert_agent(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     project_id: i64,
     name: &str,
@@ -252,7 +252,7 @@ fn init_git_repo(path: &Path) {
 
 fn seed_projects_for_adopt(env: &TestEnv, same_repo: bool) -> (String, String, String, String) {
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
 
     let source_slug = "source-proj".to_string();
@@ -984,7 +984,7 @@ fn projects_adopt_same_project_is_noop_success() {
 fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
     let env = TestEnv::new();
     let (source_slug, target_slug, source_key, target_key) = seed_projects_for_adopt(&env, true);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_agent(&conn, 101, 1, "GreenCastle", "test", "test");
     insert_agent(&conn, 202, 2, "GreenCastle", "test", "test");
@@ -1248,7 +1248,7 @@ fn doctor_backups_json_empty_returns_array() {
 fn mail_status_on_seeded_project() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     let project_path = env.tmp.path().join("mail_proj");
     std::fs::create_dir_all(&project_path).expect("create project dir");
@@ -1281,7 +1281,7 @@ fn mail_status_on_seeded_project() {
 fn file_reservations_list_on_migrated_db() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "fr-list-proj", "/tmp/fr-list-proj");
 
@@ -1303,7 +1303,7 @@ fn file_reservations_list_on_migrated_db() {
 fn file_reservations_active_with_seeded_data() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "res-proj", "/tmp/res-proj");
     insert_agent(&conn, 1, 1, "RedLake", "test", "test");
@@ -1334,7 +1334,7 @@ fn file_reservations_active_with_seeded_data() {
 fn file_reservations_soon_returns_expiring() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "soon-proj", "/tmp/soon-proj");
     insert_agent(&conn, 1, 1, "BlueFox", "test", "test");
@@ -1367,7 +1367,7 @@ fn file_reservations_soon_returns_expiring() {
 fn acks_pending_empty_db() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "ack-pend", "/tmp/ack-pend");
     insert_agent(&conn, 1, 1, "GoldFox", "test", "test");
@@ -1390,7 +1390,7 @@ fn acks_pending_empty_db() {
 fn acks_overdue_empty_db() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "ack-over", "/tmp/ack-over");
     insert_agent(&conn, 1, 1, "GoldFox", "test", "test");
@@ -1413,7 +1413,7 @@ fn acks_overdue_empty_db() {
 fn list_acks_with_seeded_project() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "ack-proj", "/tmp/ack-proj");
     insert_agent(&conn, 1, 1, "GoldFox", "test", "test");
@@ -1572,7 +1572,7 @@ fn archive_save_and_list_roundtrip() {
     init_cli_schema(&env.db_path);
     // Archive save requires the storage root to exist and at least one project
     std::fs::create_dir_all(&env.storage_root).expect("create storage root");
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "archive-proj", "/tmp/archive-proj");
 
@@ -1618,7 +1618,7 @@ fn archive_save_and_list_roundtrip() {
 fn share_export_dry_run_succeeds() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "export-proj", "/tmp/export-proj");
     insert_agent(&conn, 1, 1, "GoldHawk", "test", "test");
@@ -1752,7 +1752,7 @@ fn docs_insert_blurbs_applies_end_markers() {
 fn list_projects_with_agents_shows_agent_names() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(env.db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
         .expect("open sqlite db");
     insert_project(&conn, 1, "agent-proj", "/tmp/agent-proj");
     insert_agent(&conn, 1, 1, "GoldHawk", "test", "test");

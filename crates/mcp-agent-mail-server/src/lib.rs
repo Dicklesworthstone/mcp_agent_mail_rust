@@ -2716,7 +2716,7 @@ fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
     let Ok(path) = cfg.sqlite_path() else {
         return DashboardDbStats::default();
     };
-    let Ok(conn) = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path) else {
+    let Ok(conn) = mcp_agent_mail_db::DbConn::open_file(&path) else {
         return DashboardDbStats::default();
     };
     let agents_list = conn
@@ -2758,7 +2758,7 @@ fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
     }
 }
 
-fn dashboard_count(conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection, sql: &str) -> u64 {
+fn dashboard_count(conn: &mcp_agent_mail_db::DbConn, sql: &str) -> u64 {
     conn.query_sync(sql, &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())

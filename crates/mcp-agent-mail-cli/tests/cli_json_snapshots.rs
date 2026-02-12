@@ -160,7 +160,7 @@ fn seed_cli_json_db(db_path: &Path, root: &Path) -> (String, String) {
     let proj_alpha_key = proj_alpha_dir.canonicalize().unwrap().display().to_string();
     let proj_beta_key = proj_beta_dir.canonicalize().unwrap().display().to_string();
 
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
         .expect("init schema");
@@ -359,7 +359,7 @@ fn seed_cli_json_db_product_only(db_path: &Path) -> String {
 
     let created_at_us = 1_704_067_200_000_000i64; // 2024-01-01T00:00:00Z
 
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
         .expect("init schema");
@@ -387,7 +387,7 @@ fn seed_cli_acks_db(db_path: &Path, root: &Path) -> (String, String, i64) {
     std::fs::create_dir_all(&proj_alpha_dir).unwrap();
     let proj_alpha_key = proj_alpha_dir.canonicalize().unwrap().display().to_string();
 
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
         .expect("init schema");

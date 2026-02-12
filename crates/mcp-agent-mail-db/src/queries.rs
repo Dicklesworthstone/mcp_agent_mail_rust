@@ -26,17 +26,17 @@ use sqlmodel_query::{raw_execute, raw_query};
 // =============================================================================
 
 struct TrackedConnection<'conn> {
-    inner: &'conn sqlmodel_sqlite::SqliteConnection,
+    inner: &'conn crate::DbConn,
 }
 
 impl<'conn> TrackedConnection<'conn> {
-    fn new(inner: &'conn sqlmodel_sqlite::SqliteConnection) -> Self {
+    fn new(inner: &'conn crate::DbConn) -> Self {
         Self { inner }
     }
 }
 
 struct TrackedTransaction<'conn> {
-    inner: sqlmodel_sqlite::SqliteTransaction<'conn>,
+    inner: sqlmodel_frankensqlite::FrankenTransaction<'conn>,
 }
 
 impl TransactionOps for TrackedTransaction<'_> {
@@ -328,11 +328,11 @@ fn placeholders(count: usize) -> String {
 async fn acquire_conn(
     cx: &Cx,
     pool: &DbPool,
-) -> Outcome<sqlmodel_pool::PooledConnection<sqlmodel_sqlite::SqliteConnection>, DbError> {
+) -> Outcome<sqlmodel_pool::PooledConnection<crate::DbConn>, DbError> {
     map_sql_outcome(pool.acquire(cx).await)
 }
 
-fn tracked(conn: &sqlmodel_sqlite::SqliteConnection) -> TrackedConnection<'_> {
+fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
     TrackedConnection::new(conn)
 }
 
@@ -340,9 +340,9 @@ fn tracked(conn: &sqlmodel_sqlite::SqliteConnection) -> TrackedConnection<'_> {
 // Transaction helpers
 // =============================================================================
 
-/// Begin an immediate write transaction (acquires the WAL write lock).
-async fn begin_immediate_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
-    map_sql_outcome(tracked.execute(cx, "BEGIN IMMEDIATE", &[]).await).map(|_| ())
+/// Begin a concurrent write transaction (frankensqlite MVCC — optimistic page-level locking).
+async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    map_sql_outcome(tracked.execute(cx, "BEGIN CONCURRENT", &[]).await).map(|_| ())
 }
 
 /// Commit the current transaction (single fsync in WAL mode).
@@ -900,7 +900,7 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
     let tracked = tracked(&*conn);
 
     // Batch all updates in a single transaction
-    match map_sql_outcome(traw_execute(cx, &tracked, "BEGIN IMMEDIATE", &[]).await) {
+    match map_sql_outcome(traw_execute(cx, &tracked, "BEGIN CONCURRENT", &[]).await) {
         Outcome::Ok(_) => {}
         other => {
             re_enqueue_touches(&pending);
@@ -1130,7 +1130,7 @@ pub async fn create_message_with_recipients(
 
     let tracked = tracked(&*conn);
 
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
     // Insert message
     let mut row = MessageRow {
@@ -2083,7 +2083,7 @@ pub async fn add_recipients(
     let tracked = tracked(&*conn);
 
     // Batch all recipient inserts in a single transaction (1 fsync instead of N).
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
     for (agent_id, kind) in recipients {
         let row = MessageRecipientRow {
@@ -2349,7 +2349,7 @@ pub async fn create_file_reservations(
     let tracked = tracked(&*conn);
 
     // Batch all reservation inserts in a single transaction (1 fsync instead of N).
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
     let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
     for path in paths {
@@ -2504,7 +2504,7 @@ pub async fn renew_reservations(
 
     // Wrap entire read-modify-write in a transaction so partial renewals
     // cannot occur if the process crashes or is cancelled mid-loop.
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
     // Fetch candidate reservations first (so tools can report old/new expiry).
     let mut sql = String::from(
@@ -3285,7 +3285,7 @@ pub async fn link_product_to_projects(
 
     let tracked = tracked(&*conn);
 
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
     let mut linked = 0usize;
     let now = now_micros();

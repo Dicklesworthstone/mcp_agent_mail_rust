@@ -17,7 +17,7 @@ use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers};
 use ftui_runtime::program::Cmd;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_bridge::TuiSharedState;
@@ -173,7 +173,7 @@ pub struct ThreadExplorerScreen {
     /// Current focus pane.
     focus: Focus,
     /// Lazy-opened DB connection.
-    db_conn: Option<SqliteConnection>,
+    db_conn: Option<DbConn>,
     /// Whether we attempted to open the DB connection.
     db_conn_attempted: bool,
     /// Last refresh time for periodic re-query.
@@ -270,7 +270,7 @@ impl ThreadExplorerScreen {
             ..Default::default()
         };
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = SqliteConnection::open_file(&path).ok();
+            self.db_conn = DbConn::open_file(&path).ok();
         }
     }
 
@@ -680,7 +680,7 @@ impl MailScreen for ThreadExplorerScreen {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Fetch thread summaries grouped by `thread_id`, sorted by last activity.
-fn fetch_threads(conn: &SqliteConnection, filter: &str, limit: usize) -> Vec<ThreadSummary> {
+fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary> {
     let filter_clause = if filter.is_empty() {
         String::new()
     } else {
@@ -794,7 +794,7 @@ fn fetch_threads(conn: &SqliteConnection, filter: &str, limit: usize) -> Vec<Thr
 
 /// Fetch all messages in a thread, sorted chronologically.
 fn fetch_thread_messages(
-    conn: &SqliteConnection,
+    conn: &DbConn,
     thread_id: &str,
     limit: usize,
 ) -> Vec<ThreadMessage> {

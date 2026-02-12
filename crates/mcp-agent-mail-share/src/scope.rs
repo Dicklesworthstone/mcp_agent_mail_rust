@@ -60,7 +60,7 @@ pub fn apply_project_scope(
     identifiers: &[String],
 ) -> Result<ProjectScopeResult, ShareError> {
     let path_str = snapshot_path.display().to_string();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_str).map_err(|e| {
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| {
         ShareError::Sqlite {
             message: format!("cannot open snapshot {path_str}: {e}"),
         }
@@ -164,7 +164,7 @@ pub fn apply_project_scope(
     let placeholders = build_placeholders(matched_ids.len());
     let id_values: Vec<Value> = matched_ids.iter().map(|&id| Value::BigInt(id)).collect();
 
-    conn.execute_sync("BEGIN IMMEDIATE", &[])
+    conn.execute_sync("BEGIN CONCURRENT", &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("BEGIN transaction failed: {e}"),
         })?;
@@ -297,7 +297,7 @@ fn build_placeholders(n: usize) -> String {
 }
 
 /// Check if a table exists in the database.
-fn table_exists(conn: &sqlmodel_sqlite::SqliteConnection, name: &str) -> Result<bool, ShareError> {
+fn table_exists(conn: &mcp_agent_mail_db::DbConn, name: &str) -> Result<bool, ShareError> {
     let rows = conn
         .query_sync(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -311,7 +311,7 @@ fn table_exists(conn: &sqlmodel_sqlite::SqliteConnection, name: &str) -> Result<
 
 /// Execute a statement with parameters, mapping errors to [`ShareError`].
 fn exec(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     sql: &str,
     params: &[Value],
 ) -> Result<u64, ShareError> {
@@ -323,7 +323,7 @@ fn exec(
 
 /// Count remaining rows in all relevant tables.
 fn count_remaining(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
 ) -> Result<RemainingCounts, ShareError> {
     Ok(RemainingCounts {
         projects: count_table(conn, "projects")?,
@@ -336,7 +336,7 @@ fn count_remaining(
     })
 }
 
-fn count_table(conn: &sqlmodel_sqlite::SqliteConnection, table: &str) -> Result<i64, ShareError> {
+fn count_table(conn: &mcp_agent_mail_db::DbConn, table: &str) -> Result<i64, ShareError> {
     // Table names cannot be bound parameters; keep a strict allowlist to avoid
     // accidental SQL injection if this helper is ever reused.
     let sql = match table {
@@ -363,7 +363,7 @@ fn count_table(conn: &sqlmodel_sqlite::SqliteConnection, table: &str) -> Result<
 }
 
 fn count_if_exists(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     table: &str,
 ) -> Result<i64, ShareError> {
     if table_exists(conn, table)? {
@@ -381,7 +381,7 @@ mod tests {
     fn create_test_db(dir: &Path) -> PathBuf {
         let db_path = dir.join("test.sqlite3");
         let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string()).unwrap();
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -585,7 +585,7 @@ mod tests {
     fn count_table_rejects_unknown_table_name() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_file(db.display().to_string()).unwrap();
         let result = count_table(&conn, "unknown_table");
         assert!(matches!(result, Err(ShareError::Sqlite { .. })));
     }

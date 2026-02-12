@@ -2001,7 +2001,7 @@ fn handle_list_projects_with_database_url(
 /// Open a synchronous SQLite connection for CLI commands.
 fn open_db_sync_with_database_url(
     database_url: &str,
-) -> CliResult<sqlmodel_sqlite::SqliteConnection> {
+) -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -2009,7 +2009,7 @@ fn open_db_sync_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path)
+    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path)
         .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
     // Run schema init so tables exist even if first use
     let init_sql = mcp_agent_mail_db::schema::init_schema_sql();
@@ -2018,7 +2018,7 @@ fn open_db_sync_with_database_url(
     Ok(conn)
 }
 
-fn open_db_sync() -> CliResult<sqlmodel_sqlite::SqliteConnection> {
+fn open_db_sync() -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     open_db_sync_with_database_url(&cfg.database_url)
 }
@@ -2194,7 +2194,7 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 }
 
                 for result in &results {
-                    output::section(&format!("{}", result.platform));
+                    output::section(&result.platform.to_string());
                     for action in &result.actions {
                         ftui_runtime::ftui_println!("  {} — {}", action.file_path, action.outcome);
                         if !action.description.is_empty() {
@@ -2324,7 +2324,7 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
 }
 
 fn handle_file_reservations_with_conn(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
     action: FileReservationsCommand,
 ) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -2885,7 +2885,7 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
 }
 
 fn handle_acks_with_conn(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
     action: AcksCommand,
 ) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -3047,7 +3047,7 @@ fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
 }
 
 fn handle_contacts_with_conn(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
     action: ContactsCommand,
 ) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
@@ -3691,7 +3691,7 @@ fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResul
 }
 
 fn handle_list_acks_with_conn(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
     project_key: &str,
     agent_name: &str,
     limit: i64,
@@ -3749,7 +3749,7 @@ fn handle_list_acks_with_conn(
 fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
     use asupersync::runtime::RuntimeBuilder;
     use mcp_agent_mail_db::schema;
-    use sqlmodel_sqlite::SqliteConnection;
+    use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
@@ -3759,7 +3759,7 @@ fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
 
-    let conn = SqliteConnection::open_file(&path)
+    let conn = DbConn::open_file(&path)
         .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
     conn.execute_raw(schema::PRAGMA_SETTINGS_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply PRAGMAs: {e}")))?;
@@ -4179,7 +4179,7 @@ fn git_common_dir(path: &Path) -> Option<PathBuf> {
 }
 
 fn find_project_for_adopt(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
     slug_or_key: &str,
 ) -> CliResult<ProjectsAdoptRecord> {
     let rows = conn
@@ -4420,7 +4420,7 @@ fn handle_project_discovery_init(project_path: &Path, product: Option<String>) -
 
 #[allow(clippy::too_many_lines)]
 fn handle_projects_adopt_with_conn(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
     config: &Config,
     source: &str,
     target: &str,
@@ -4883,7 +4883,7 @@ fn handle_mail(action: MailCommand) -> CliResult<()> {
 }
 
 fn handle_mail_status_sync(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
     action: MailCommand,
 ) -> CliResult<()> {
     let MailCommand::Status { project_path } = action else {
@@ -7624,7 +7624,7 @@ sys.exit(7)
 
         handle_migrate_with_database_url(&url).unwrap();
 
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
             .expect("reopen");
         let tables = conn
             .query_sync(
@@ -7676,7 +7676,7 @@ sys.exit(7)
 
         handle_migrate_with_database_url(&url).unwrap();
 
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
             .expect("reopen");
         let tables = conn
             .query_sync(
@@ -7799,7 +7799,7 @@ sys.exit(7)
     }
 
     fn seed_mailbox_db(db_path: &Path) {
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
             .expect("open test sqlite db");
         conn.execute_raw(
             "CREATE TABLE projects (\
@@ -8084,7 +8084,7 @@ sys.exit(7)
 
         // Restored DB should contain only the scoped project.
         let restored_conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(restore_db.display().to_string()).unwrap();
+            mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(restore_db.display().to_string()).unwrap();
         let rows = restored_conn
             .query_sync("SELECT slug FROM projects ORDER BY id", &[])
             .unwrap();
@@ -8277,7 +8277,7 @@ sys.exit(7)
         let proj_beta_key = proj_beta_dir.canonicalize().unwrap().display().to_string();
 
         let db_path = root.path().join("mailbox.sqlite3");
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
             .expect("open products test sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
@@ -8527,7 +8527,7 @@ sys.exit(7)
 
         // Normalize created_at for stable snapshots.
         let conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string()).unwrap();
+            mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string()).unwrap();
         conn.execute_sync(
             "UPDATE products SET created_at = ? WHERE product_uid = ?",
             &[
@@ -11041,10 +11041,10 @@ sys.exit(7)
     }
 
     /// Helper: seed a DB with projects, agents, messages, and file_reservations for CLI tests.
-    fn seed_acks_and_reservations_db(db_path: &Path) -> sqlmodel_sqlite::SqliteConnection {
+    fn seed_acks_and_reservations_db(db_path: &Path) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
             .expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
@@ -11639,10 +11639,10 @@ sys.exit(7)
     fn seed_mail_status_db(
         db_path: &Path,
         project_path: &str,
-    ) -> sqlmodel_sqlite::SqliteConnection {
+    ) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
             .expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
@@ -11823,10 +11823,10 @@ sys.exit(7)
         db_path: &Path,
         source_human_key: &Path,
         target_human_key: &Path,
-    ) -> sqlmodel_sqlite::SqliteConnection {
+    ) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
             .expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
@@ -14535,7 +14535,7 @@ fn iso_from_micros(micros: i64) -> String {
 
 fn projects_included_from_snapshot(snapshot_path: &Path) -> CliResult<Vec<serde_json::Value>> {
     let path_str = snapshot_path.display().to_string();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_str)
+    let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path_str)
         .map_err(|e| CliError::Other(format!("cannot open snapshot for metadata: {e}")))?;
     let rows = conn
         .query_sync(

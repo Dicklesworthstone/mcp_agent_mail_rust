@@ -47,23 +47,23 @@ impl FixtureEnv {
         Self { _tmp: tmp, db_path }
     }
 
-    fn conn(&self) -> sqlmodel_sqlite::SqliteConnection {
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(self.db_path.display().to_string())
+    fn conn(&self) -> mcp_agent_mail_db::DbConn {
+        let conn = mcp_agent_mail_db::DbConn::open_file(self.db_path.display().to_string())
             .expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
         conn
     }
 
-    fn open_conn(&self) -> sqlmodel_sqlite::SqliteConnection {
-        sqlmodel_sqlite::SqliteConnection::open_file(self.db_path.display().to_string())
+    fn open_conn(&self) -> mcp_agent_mail_db::DbConn {
+        mcp_agent_mail_db::DbConn::open_file(self.db_path.display().to_string())
             .expect("open sqlite db")
     }
 }
 
 // ── DB insertion helpers ────────────────────────────────────────────────
 
-fn insert_project(conn: &sqlmodel_sqlite::SqliteConnection, id: i64, slug: &str, human_key: &str) {
+fn insert_project(conn: &mcp_agent_mail_db::DbConn, id: i64, slug: &str, human_key: &str) {
     conn.execute_sync(
         "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
         &[
@@ -77,7 +77,7 @@ fn insert_project(conn: &sqlmodel_sqlite::SqliteConnection, id: i64, slug: &str,
 }
 
 fn insert_agent(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     project_id: i64,
     name: &str,
@@ -106,7 +106,7 @@ fn insert_agent(
 }
 
 fn insert_message(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     project_id: i64,
     sender_id: i64,
@@ -142,7 +142,7 @@ fn insert_message(
 }
 
 fn insert_recipient(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     message_id: i64,
     agent_id: i64,
     kind: &str,
@@ -159,7 +159,7 @@ fn insert_recipient(
 }
 
 fn insert_file_reservation(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     project_id: i64,
     agent_id: i64,
@@ -195,7 +195,7 @@ fn insert_file_reservation(
 }
 
 fn insert_agent_link(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::DbConn,
     id: i64,
     a_project_id: i64,
     a_agent_id: i64,
@@ -226,7 +226,7 @@ fn insert_agent_link(
 
 // ── Entity count query ──────────────────────────────────────────────────
 
-fn count_table(conn: &sqlmodel_sqlite::SqliteConnection, table: &str) -> i64 {
+fn count_table(conn: &mcp_agent_mail_db::DbConn, table: &str) -> i64 {
     let rows = conn
         .query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
         .expect("count query");
@@ -253,7 +253,7 @@ struct EntityInventory {
 }
 
 impl EntityInventory {
-    fn from_db(conn: &sqlmodel_sqlite::SqliteConnection) -> Self {
+    fn from_db(conn: &mcp_agent_mail_db::DbConn) -> Self {
         Self {
             projects: count_table(conn, "projects"),
             agents: count_table(conn, "agents"),
@@ -308,7 +308,7 @@ fn write_report(scenario: &str, report: &FixtureReport) {
 // ── Scenario builders ───────────────────────────────────────────────────
 
 /// Baseline: 1 project, 2 agents, 5 messages.
-fn seed_baseline(conn: &sqlmodel_sqlite::SqliteConnection) {
+fn seed_baseline(conn: &mcp_agent_mail_db::DbConn) {
     insert_project(conn, 1, "baseline-proj", "/tmp/baseline");
     insert_agent(conn, 1, 1, "AlphaAgent", "claude-code", "claude-opus-4-6");
     insert_agent(conn, 2, 1, "BetaAgent", "codex", "gpt-5");
@@ -333,7 +333,7 @@ fn seed_baseline(conn: &sqlmodel_sqlite::SqliteConnection) {
 }
 
 /// Multi-project: 3 projects, 8 agents, cross-project contacts, 30+ messages.
-fn seed_multi_project(conn: &sqlmodel_sqlite::SqliteConnection) {
+fn seed_multi_project(conn: &mcp_agent_mail_db::DbConn) {
     // Projects
     insert_project(conn, 1, "frontend-app", "/data/projects/frontend");
     insert_project(conn, 2, "backend-api", "/data/projects/backend");
@@ -413,7 +413,7 @@ fn seed_multi_project(conn: &sqlmodel_sqlite::SqliteConnection) {
 }
 
 /// Contention-heavy: many overlapping file reservations.
-fn seed_contention(conn: &sqlmodel_sqlite::SqliteConnection) {
+fn seed_contention(conn: &mcp_agent_mail_db::DbConn) {
     insert_project(conn, 1, "contention-proj", "/data/projects/contention");
 
     for i in 1..=6 {
@@ -486,7 +486,7 @@ fn seed_contention(conn: &sqlmodel_sqlite::SqliteConnection) {
 }
 
 /// High-traffic: 500+ messages, many threads, mixed importance.
-fn seed_high_traffic(conn: &sqlmodel_sqlite::SqliteConnection) {
+fn seed_high_traffic(conn: &mcp_agent_mail_db::DbConn) {
     insert_project(conn, 1, "high-traffic-proj", "/data/projects/traffic");
 
     let agent_count = 10;
@@ -587,10 +587,10 @@ fn validate_min(validations: &mut Vec<Validation>, check: &str, min: i64, actual
 
 // ── Scenario runner ─────────────────────────────────────────────────────
 
-fn run_scenario<F: FnOnce(&sqlmodel_sqlite::SqliteConnection)>(
+fn run_scenario<F: FnOnce(&mcp_agent_mail_db::DbConn)>(
     name: &str,
     seed_fn: F,
-    validate_fn: impl FnOnce(&sqlmodel_sqlite::SqliteConnection, &EntityInventory) -> Vec<Validation>,
+    validate_fn: impl FnOnce(&mcp_agent_mail_db::DbConn, &EntityInventory) -> Vec<Validation>,
 ) -> FixtureReport {
     let env = FixtureEnv::new();
     let conn = env.conn();
@@ -701,7 +701,7 @@ fn fixture_seed_performance() {
 
     let scenarios: Vec<(
         &str,
-        Box<dyn FnOnce(&sqlmodel_sqlite::SqliteConnection)>,
+        Box<dyn FnOnce(&mcp_agent_mail_db::DbConn)>,
         u64,
     )> = vec![
         ("baseline", Box::new(seed_baseline), 100),
@@ -772,7 +772,7 @@ fn fixture_seed_performance() {
 /// Matrix test: run all scenarios and produce a combined report.
 #[test]
 fn fixture_matrix_combined_report() {
-    let scenarios: Vec<(&str, Box<dyn FnOnce(&sqlmodel_sqlite::SqliteConnection)>)> = vec![
+    let scenarios: Vec<(&str, Box<dyn FnOnce(&mcp_agent_mail_db::DbConn)>)> = vec![
         ("baseline", Box::new(seed_baseline)),
         ("multi_project", Box::new(seed_multi_project)),
         ("contention", Box::new(seed_contention)),
