@@ -18,8 +18,8 @@ use serde::Serialize;
 use crate::backpressure::{self, HealthLevel, HealthSignals};
 use crate::lock_order::{LockContentionEntry, lock_contention_snapshot};
 use crate::metrics::{
-    DbMetricsSnapshot, GlobalMetricsSnapshot, HttpMetricsSnapshot, StorageMetricsSnapshot,
-    SystemMetricsSnapshot, ToolsMetricsSnapshot, global_metrics,
+    DbMetricsSnapshot, GlobalMetricsSnapshot, HttpMetricsSnapshot, SearchMetricsSnapshot,
+    StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot, global_metrics,
 };
 
 /// Maximum serialized report size in bytes (100KB).
@@ -50,6 +50,8 @@ pub struct DiagnosticReport {
     pub database: DbMetricsSnapshot,
     /// Storage (WBQ + commit queue) metrics.
     pub storage: StorageMetricsSnapshot,
+    /// Search V3 metrics (query volume, fallback, shadow, index health).
+    pub search: SearchMetricsSnapshot,
     /// Disk usage metrics.
     pub disk: SystemMetricsSnapshot,
     /// Lock contention metrics.
@@ -273,6 +275,46 @@ fn operational_recommendations(
             ),
         });
     }
+
+    // Search rollout health
+    let search = &snap.search;
+    if search.fallback_to_legacy_total > 0 {
+        recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "search",
+            message: format!(
+                "Search V3 fallback-to-legacy count is {}. Investigate Tantivy/V3 availability.",
+                search.fallback_to_legacy_total
+            ),
+        });
+    }
+    if search.shadow_v3_errors_total > 0 {
+        recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "search",
+            message: format!(
+                "Shadow mode observed {} V3 errors. Review Search V3 logs before widening rollout.",
+                search.shadow_v3_errors_total
+            ),
+        });
+    }
+    if search.shadow_comparisons_total >= 10 && search.shadow_equivalent_pct < 80.0 {
+        recs.push(Recommendation {
+            severity: "warning",
+            subsystem: "search",
+            message: format!(
+                "Shadow equivalence is {:.1}% over {} comparisons; below 80% parity target.",
+                search.shadow_equivalent_pct, search.shadow_comparisons_total
+            ),
+        });
+    }
+    if search.queries_v3_total > 0 && search.tantivy_doc_count == 0 {
+        recs.push(Recommendation {
+            severity: "critical",
+            subsystem: "search",
+            message: "V3 queries are executing but Tantivy doc_count is 0. Validate index build and ingest.".to_string(),
+        });
+    }
 }
 
 fn generate_recommendations(
@@ -322,6 +364,7 @@ impl DiagnosticReport {
             slow_tools,
             database: snap.db,
             storage: snap.storage,
+            search: snap.search,
             disk: snap.system,
             locks: lock_snap,
             recommendations: recs,
@@ -405,6 +448,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(parsed.get("generated_at").is_some());
         assert!(parsed.get("health").is_some());
+        assert!(parsed.get("search").is_some());
         assert!(parsed.get("recommendations").is_some());
     }
 
