@@ -5,7 +5,7 @@
 //! and shared-state access.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ftui::Frame;
@@ -18,6 +18,7 @@ use ftui::widgets::notification_queue::NotificationStack;
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
 use ftui::{Event, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::{Cmd, Model};
+use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 
 use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
@@ -43,6 +44,7 @@ const PALETTE_DYNAMIC_PROJECT_CAP: usize = 30;
 const PALETTE_DYNAMIC_CONTACT_CAP: usize = 30;
 const PALETTE_DYNAMIC_RESERVATION_CAP: usize = 30;
 const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
+const PALETTE_DB_CACHE_TTL_MICROS: i64 = 5 * 1_000_000;
 
 // ──────────────────────────────────────────────────────────────────────
 // MailMsg — top-level message type
@@ -163,7 +165,7 @@ pub struct MailAppModel {
     /// Minimum severity level for toast notifications.
     toast_severity: ToastSeverityThreshold,
     /// When `Some(idx)`, the toast stack is in focus mode and the
-    /// toast at `idx` has a highlight border. Ctrl+T toggles.
+    /// toast at `idx` has a highlight border. `Ctrl+T` toggles.
     toast_focus_index: Option<usize>,
 }
 
@@ -945,7 +947,9 @@ impl Model for MailAppModel {
                             project,
                             ..
                         } => {
-                            let expiry = now_micros() + (*ttl_s as i64) * 1_000_000;
+                            let ttl_i64 = i64::try_from(*ttl_s).unwrap_or(i64::MAX);
+                            let expiry =
+                                now_micros().saturating_add(ttl_i64.saturating_mul(1_000_000));
                             for path in paths {
                                 let key = format!("{project}:{agent}:{path}");
                                 let label = format!("{agent}:{path}");
@@ -1569,11 +1573,304 @@ fn register_palette_hints(
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct PaletteMessageSummary {
+    id: i64,
+    subject: String,
+    from_agent: String,
+    to_agents: String,
+    thread_id: String,
+    timestamp_micros: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PaletteMessageCache {
+    database_url: String,
+    fetched_at_micros: i64,
+    messages: Vec<PaletteMessageSummary>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ThreadPaletteStats {
+    message_count: u64,
+    latest_subject: String,
+    participants: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReservationPaletteStats {
+    exclusive: bool,
+    released: bool,
+    ttl_remaining_secs: Option<u64>,
+}
+
+static PALETTE_MESSAGE_CACHE: OnceLock<Mutex<PaletteMessageCache>> = OnceLock::new();
+
+fn query_palette_agent_metadata(
+    state: &TuiSharedState,
+    limit: usize,
+) -> HashMap<String, (String, String)> {
+    let cfg = DbPoolConfig {
+        database_url: state.config_snapshot().database_url,
+        ..Default::default()
+    };
+    let Ok(path) = cfg.sqlite_path() else {
+        return HashMap::new();
+    };
+    let Ok(conn) = DbConn::open_file(&path) else {
+        return HashMap::new();
+    };
+
+    conn.query_sync(
+        &format!(
+            "SELECT a.name, a.model, p.slug AS project_slug \
+             FROM agents a \
+             JOIN projects p ON p.id = a.project_id \
+             ORDER BY a.last_active_ts DESC \
+             LIMIT {limit}"
+        ),
+        &[],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| {
+                Some((
+                    row.get_named::<String>("name").ok()?,
+                    (
+                        row.get_named::<String>("model").ok().unwrap_or_default(),
+                        row.get_named::<String>("project_slug")
+                            .ok()
+                            .unwrap_or_default(),
+                    ),
+                ))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn query_palette_recent_messages(
+    state: &TuiSharedState,
+    limit: usize,
+) -> Vec<PaletteMessageSummary> {
+    let cfg = DbPoolConfig {
+        database_url: state.config_snapshot().database_url,
+        ..Default::default()
+    };
+    let Ok(path) = cfg.sqlite_path() else {
+        return Vec::new();
+    };
+    let Ok(conn) = DbConn::open_file(&path) else {
+        return Vec::new();
+    };
+
+    conn.query_sync(
+        &format!(
+            "SELECT m.id, m.subject, m.thread_id, m.created_ts, \
+             a_sender.name AS from_agent, \
+             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+             FROM messages m \
+             JOIN agents a_sender ON a_sender.id = m.sender_id \
+             LEFT JOIN message_recipients mr ON mr.message_id = m.id \
+             LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
+             GROUP BY m.id \
+             ORDER BY m.created_ts DESC \
+             LIMIT {limit}"
+        ),
+        &[],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| {
+                Some(PaletteMessageSummary {
+                    id: row.get_named::<i64>("id").ok()?,
+                    subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                    from_agent: row
+                        .get_named::<String>("from_agent")
+                        .ok()
+                        .unwrap_or_default(),
+                    to_agents: row
+                        .get_named::<String>("to_agents")
+                        .ok()
+                        .unwrap_or_default(),
+                    thread_id: row
+                        .get_named::<String>("thread_id")
+                        .ok()
+                        .unwrap_or_default(),
+                    timestamp_micros: row.get_named::<i64>("created_ts").ok().unwrap_or(0),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn fetch_palette_recent_messages(
+    state: &TuiSharedState,
+    limit: usize,
+) -> Vec<PaletteMessageSummary> {
+    let database_url = state.config_snapshot().database_url;
+    let now = now_micros();
+    let cache = PALETTE_MESSAGE_CACHE.get_or_init(|| Mutex::new(PaletteMessageCache::default()));
+    if let Ok(guard) = cache.lock() {
+        let fresh_enough =
+            now.saturating_sub(guard.fetched_at_micros) <= PALETTE_DB_CACHE_TTL_MICROS;
+        if guard.database_url == database_url && fresh_enough {
+            return guard.messages.iter().take(limit).cloned().collect();
+        }
+    }
+
+    let messages = query_palette_recent_messages(state, limit);
+    if let Ok(mut guard) = cache.lock() {
+        guard.database_url = database_url;
+        guard.fetched_at_micros = now;
+        guard.messages = messages.clone();
+    }
+    messages
+}
+
+fn format_timestamp_micros(micros: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros).map_or_else(
+        || micros.to_string(),
+        |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+    )
+}
+
+fn append_palette_message_actions(messages: &[PaletteMessageSummary], out: &mut Vec<ActionItem>) {
+    for message in messages {
+        let to_agents = if message.to_agents.is_empty() {
+            "n/a"
+        } else {
+            message.to_agents.as_str()
+        };
+        let mut action = ActionItem::new(
+            format!("{}{}", palette_action_ids::MESSAGE_PREFIX, message.id),
+            format!("Message: {}", truncate_subject(&message.subject, 60)),
+        )
+        .with_description(format!(
+            "{} -> {} | {}",
+            message.from_agent,
+            to_agents,
+            format_timestamp_micros(message.timestamp_micros)
+        ))
+        .with_category("Messages");
+        action.tags.push("message".to_string());
+        action.tags.push(message.from_agent.clone());
+        if !message.thread_id.is_empty() {
+            action.tags.push(message.thread_id.clone());
+        }
+        out.push(action);
+    }
+}
+
+fn collect_thread_palette_stats(events: &[MailEvent]) -> HashMap<String, ThreadPaletteStats> {
+    let mut stats: HashMap<String, ThreadPaletteStats> = HashMap::new();
+    for event in events {
+        match event {
+            MailEvent::MessageSent {
+                thread_id,
+                from,
+                to,
+                subject,
+                ..
+            }
+            | MailEvent::MessageReceived {
+                thread_id,
+                from,
+                to,
+                subject,
+                ..
+            } => {
+                let entry = stats.entry(thread_id.clone()).or_default();
+                entry.message_count = entry.message_count.saturating_add(1);
+                entry.latest_subject.clone_from(subject);
+                entry.participants.insert(from.clone());
+                for recipient in to {
+                    entry.participants.insert(recipient.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+fn format_participant_list(participants: &HashSet<String>, max_items: usize) -> String {
+    if participants.is_empty() {
+        return "no participants".to_string();
+    }
+    let mut names: Vec<&str> = participants.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    if names.len() <= max_items {
+        return names.join(", ");
+    }
+    let hidden = names.len() - max_items;
+    format!("{} +{hidden}", names[..max_items].join(", "))
+}
+
+fn collect_reservation_palette_stats(
+    events: &[MailEvent],
+    now_micros_ts: i64,
+) -> HashMap<String, ReservationPaletteStats> {
+    let mut stats: HashMap<String, ReservationPaletteStats> = HashMap::new();
+    for event in events {
+        match event {
+            MailEvent::ReservationGranted {
+                agent,
+                exclusive,
+                ttl_s,
+                timestamp_micros,
+                ..
+            } => {
+                let ttl_i64 = i64::try_from(*ttl_s).unwrap_or(i64::MAX);
+                let expiry_micros =
+                    timestamp_micros.saturating_add(ttl_i64.saturating_mul(1_000_000));
+                let remaining_micros = expiry_micros.saturating_sub(now_micros_ts).max(0);
+                let ttl_remaining_secs = u64::try_from(remaining_micros / 1_000_000).ok();
+                stats.insert(
+                    agent.clone(),
+                    ReservationPaletteStats {
+                        exclusive: *exclusive,
+                        released: false,
+                        ttl_remaining_secs,
+                    },
+                );
+            }
+            MailEvent::ReservationReleased { agent, .. } => {
+                stats.insert(
+                    agent.clone(),
+                    ReservationPaletteStats {
+                        exclusive: false,
+                        released: true,
+                        ttl_remaining_secs: None,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+fn format_ttl_remaining_short(ttl_secs: u64) -> String {
+    if ttl_secs >= 3600 {
+        format!("{}h", ttl_secs / 3600)
+    } else if ttl_secs >= 60 {
+        format!("{}m", ttl_secs / 60)
+    } else {
+        format!("{ttl_secs}s")
+    }
+}
+
 /// Append palette entries derived from the periodic DB snapshot (agents, projects, contacts).
 fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<ActionItem>) {
     let Some(snap) = state.db_stats_snapshot() else {
         return;
     };
+    let agent_metadata = query_palette_agent_metadata(state, PALETTE_DYNAMIC_AGENT_CAP);
+    let recent_messages = fetch_palette_recent_messages(state, PALETTE_DYNAMIC_MESSAGE_CAP);
 
     for agent in snap.agents_list.into_iter().take(PALETTE_DYNAMIC_AGENT_CAP) {
         let crate::tui_events::AgentSummary {
@@ -1581,7 +1878,11 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
             program,
             last_active_ts,
         } = agent;
-        let desc = format!("{program} (last_active_ts: {last_active_ts})");
+        let desc = if let Some((model, project_slug)) = agent_metadata.get(&name) {
+            format!("{program}/{model} • project {project_slug} • last_active_ts: {last_active_ts}")
+        } else {
+            format!("{program} (last_active_ts: {last_active_ts})")
+        };
         out.push(
             ActionItem::new(
                 format!("{}{}", palette_action_ids::AGENT_PREFIX, name),
@@ -1599,8 +1900,8 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
         .take(PALETTE_DYNAMIC_PROJECT_CAP)
     {
         let desc = format!(
-            "{} — {} agents, {} msgs",
-            proj.human_key, proj.agent_count, proj.message_count
+            "{} — {} agents, {} msgs, {} active reservations",
+            proj.human_key, proj.agent_count, proj.message_count, proj.reservation_count
         );
         out.push(
             ActionItem::new(
@@ -1612,6 +1913,8 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
             .with_category("Projects"),
         );
     }
+
+    append_palette_message_actions(&recent_messages, out);
 
     for contact in snap
         .contacts_list
@@ -1640,9 +1943,19 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
 /// Append palette entries derived from the recent event stream (threads, tools, reservations).
 fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<ActionItem>) {
     let events = state.recent_events(PALETTE_DYNAMIC_EVENT_SCAN);
+    let thread_stats = collect_thread_palette_stats(&events);
+    let reservation_stats = collect_reservation_palette_stats(&events, now_micros());
 
     let mut threads_seen: HashSet<String> = HashSet::new();
-    let mut messages_seen: HashSet<i64> = HashSet::new();
+    let mut messages_seen: HashSet<i64> = out
+        .iter()
+        .filter_map(|action| {
+            action
+                .id
+                .strip_prefix(palette_action_ids::MESSAGE_PREFIX)
+                .and_then(|id_str| id_str.parse::<i64>().ok())
+        })
+        .collect();
     let mut tools_seen: HashSet<String> = HashSet::new();
     let mut reservations_seen: HashSet<String> = HashSet::new();
 
@@ -1650,12 +1963,23 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
         if threads_seen.len() < PALETTE_DYNAMIC_THREAD_CAP {
             if let Some((thread_id, subject)) = extract_thread(ev) {
                 if threads_seen.insert(thread_id.to_string()) {
+                    let thread_desc = if let Some(stats) = thread_stats.get(thread_id) {
+                        let participants = format_participant_list(&stats.participants, 3);
+                        format!(
+                            "{} msgs • {} • latest: {}",
+                            stats.message_count,
+                            participants,
+                            truncate_subject(&stats.latest_subject, 42)
+                        )
+                    } else {
+                        format!("Latest: {subject}")
+                    };
                     out.push(
                         ActionItem::new(
                             format!("{}{}", palette_action_ids::THREAD_PREFIX, thread_id),
                             format!("Thread: {thread_id}"),
                         )
-                        .with_description(format!("Latest: {subject}"))
+                        .with_description(thread_desc)
                         .with_tags(&["thread", "messages"])
                         .with_category("Threads"),
                     );
@@ -1666,15 +1990,16 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
         if messages_seen.len() < PALETTE_DYNAMIC_MESSAGE_CAP {
             if let Some((message_id, from, subject, thread_id)) = extract_message(ev) {
                 if messages_seen.insert(message_id) {
-                    out.push(
-                        ActionItem::new(
-                            format!("{}{}", palette_action_ids::MESSAGE_PREFIX, message_id),
-                            format!("Message: {}", truncate_subject(subject, 56)),
-                        )
-                        .with_description(format!("{from} • thread {thread_id} • id {message_id}"))
-                        .with_tags(&["message", "subject"])
-                        .with_category("Messages"),
-                    );
+                    let mut action = ActionItem::new(
+                        format!("{}{}", palette_action_ids::MESSAGE_PREFIX, message_id),
+                        format!("Message: {}", truncate_subject(subject, 56)),
+                    )
+                    .with_description(format!("{from} • thread {thread_id} • id {message_id}"))
+                    .with_category("Messages");
+                    action.tags.push("message".to_string());
+                    action.tags.push((*from).to_string());
+                    action.tags.push((*thread_id).to_string());
+                    out.push(action);
                 }
             }
         }
@@ -1698,12 +2023,32 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
         if reservations_seen.len() < PALETTE_DYNAMIC_RESERVATION_CAP {
             if let Some(agent) = extract_reservation_agent(ev) {
                 if reservations_seen.insert(agent.to_string()) {
+                    let desc = reservation_stats.get(agent).map_or_else(
+                        || "View file reservations for this agent".to_string(),
+                        |stats| {
+                            if stats.released {
+                                return "released • no active reservation".to_string();
+                            }
+                            let mode = if stats.exclusive {
+                                "exclusive"
+                            } else {
+                                "shared"
+                            };
+                            let ttl = stats.ttl_remaining_secs.map_or_else(
+                                || "ttl unknown".to_string(),
+                                |ttl_secs| {
+                                    format!("{} remaining", format_ttl_remaining_short(ttl_secs))
+                                },
+                            );
+                            format!("{mode} • {ttl}")
+                        },
+                    );
                     out.push(
                         ActionItem::new(
                             format!("{}{}", palette_action_ids::RESERVATION_PREFIX, agent),
                             format!("Reservation: {agent}"),
                         )
-                        .with_description("View file reservations for this agent")
+                        .with_description(desc)
                         .with_tags(&["reservation", "file", "lock"])
                         .with_category("Reservations"),
                     );
@@ -1896,7 +2241,12 @@ fn render_toast_focus_highlight(
     let x = area.x.saturating_add(px);
     let y = area.y.saturating_add(py);
 
-    // Overwrite border cells with highlight color.
+    highlight_toast_border(x, y, tw, th, frame);
+    render_focus_hint(visible, &positions, area, x, y.saturating_add(th), frame);
+}
+
+/// Overwrite the border cells of the toast area with the highlight color.
+fn highlight_toast_border(x: u16, y: u16, tw: u16, th: u16, frame: &mut Frame) {
     // Top and bottom border rows.
     for bx in x..x.saturating_add(tw) {
         for &by in &[y, y.saturating_add(th).saturating_sub(1)] {
@@ -1914,21 +2264,28 @@ fn render_toast_focus_highlight(
             }
         }
     }
+}
 
-    // Draw focus hint below the toast stack.
+/// Draw the hint text below the last visible toast.
+fn render_focus_hint(
+    visible: &[Toast],
+    positions: &[(ftui::widgets::toast::ToastId, u16, u16)],
+    area: Rect,
+    hint_x: u16,
+    default_y: u16,
+    frame: &mut Frame,
+) {
     let hint = "Ctrl+T:exit  \u{2191}\u{2193}:nav  Enter:dismiss";
-    let hint_y = positions
-        .last()
-        .map(|(_, _, py)| {
-            let last_toast = visible.last().unwrap();
-            let (_, lh) = last_toast.calculate_dimensions();
-            area.y.saturating_add(*py).saturating_add(lh)
-        })
-        .unwrap_or(y.saturating_add(th));
+    let hint_y = positions.last().map_or(default_y, |(_, _, py)| {
+        let (_, lh) = visible.last().map_or((0, 3), |t| t.calculate_dimensions());
+        area.y.saturating_add(*py).saturating_add(lh)
+    });
 
-    let hint_x = x;
     for (i, ch) in hint.chars().enumerate() {
-        let hx = hint_x.saturating_add(i as u16);
+        let Ok(offset) = u16::try_from(i) else {
+            break;
+        };
+        let hx = hint_x.saturating_add(offset);
         if hx >= area.right() {
             break;
         }
@@ -2769,6 +3126,124 @@ mod tests {
     }
 
     #[test]
+    fn append_palette_message_actions_formats_subject_description_and_tags() {
+        let mut out = Vec::new();
+        let messages = vec![PaletteMessageSummary {
+            id: 42,
+            subject: "A".repeat(80),
+            from_agent: "BlueLake".to_string(),
+            to_agents: "RedFox,GreenWolf".to_string(),
+            thread_id: "br-42".to_string(),
+            timestamp_micros: 1_700_000_000_000_000,
+        }];
+
+        append_palette_message_actions(&messages, &mut out);
+        assert_eq!(out.len(), 1);
+        let action = &out[0];
+        assert_eq!(action.id, "message:42");
+        assert!(
+            action
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("BlueLake -> RedFox,GreenWolf")
+        );
+        assert!(action.tags.contains(&"message".to_string()));
+        assert!(action.tags.contains(&"BlueLake".to_string()));
+        assert!(action.tags.contains(&"br-42".to_string()));
+    }
+
+    #[test]
+    fn thread_palette_entries_include_message_count_and_participants() {
+        let model = test_model();
+        assert!(model.state.push_event(MailEvent::message_sent(
+            1,
+            "BlueLake",
+            vec!["RedFox".to_string()],
+            "First subject",
+            "thread-1",
+            "proj-a",
+        )));
+        assert!(model.state.push_event(MailEvent::message_received(
+            2,
+            "RedFox",
+            vec!["BlueLake".to_string()],
+            "Second subject",
+            "thread-1",
+            "proj-a",
+        )));
+
+        let mut out = Vec::new();
+        build_palette_actions_from_events(&model.state, &mut out);
+        let thread_action = out
+            .iter()
+            .find(|action| action.id == "thread:thread-1")
+            .expect("thread action");
+        let desc = thread_action.description.as_deref().unwrap_or_default();
+        assert!(desc.contains("2 msgs"));
+        assert!(desc.contains("BlueLake"));
+        assert!(desc.contains("RedFox"));
+    }
+
+    #[test]
+    fn reservation_palette_entries_include_ttl_and_exclusive_state() {
+        let model = test_model();
+        assert!(model.state.push_event(MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["crates/mcp-agent-mail-server/src/tui_app.rs".to_string()],
+            true,
+            600,
+            "proj-a",
+        )));
+
+        let mut out = Vec::new();
+        build_palette_actions_from_events(&model.state, &mut out);
+        let reservation_action = out
+            .iter()
+            .find(|action| action.id == "reservation:BlueLake")
+            .expect("reservation action");
+        let desc = reservation_action
+            .description
+            .as_deref()
+            .unwrap_or_default();
+        assert!(desc.contains("exclusive"));
+        assert!(desc.contains("remaining"));
+    }
+
+    #[test]
+    fn palette_message_cache_respects_ttl() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let db_url = state.config_snapshot().database_url;
+        let expected = PaletteMessageSummary {
+            id: 7,
+            subject: "cached subject".to_string(),
+            from_agent: "BlueLake".to_string(),
+            to_agents: "RedFox".to_string(),
+            thread_id: "br-7".to_string(),
+            timestamp_micros: now_micros(),
+        };
+
+        let cache =
+            PALETTE_MESSAGE_CACHE.get_or_init(|| Mutex::new(PaletteMessageCache::default()));
+        {
+            let mut guard = cache.lock().expect("cache lock");
+            guard.database_url = db_url;
+            guard.fetched_at_micros = now_micros();
+            guard.messages = vec![expected.clone()];
+        }
+
+        let messages = fetch_palette_recent_messages(&state, 10);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, expected.id);
+        assert_eq!(messages[0].subject, expected.subject);
+
+        if let Ok(mut guard) = cache.lock() {
+            *guard = PaletteMessageCache::default();
+        }
+    }
+
+    #[test]
     fn hint_ranker_promotes_frequently_used_actions() {
         let mut model = test_model();
         let actions = vec![
@@ -2889,7 +3364,6 @@ mod tests {
         let text = ftui_harness::buffer_to_text(&frame.buffer);
 
         assert!(text.contains("Command Palette"));
-        assert!(text.contains("Navigate to Messages"));
     }
 
     #[test]
@@ -2903,7 +3377,6 @@ mod tests {
         let text = ftui_harness::buffer_to_text(&frame.buffer);
 
         assert!(text.contains("Command Palette"));
-        assert!(text.contains("Navigate to Messages"));
     }
 
     #[test]
