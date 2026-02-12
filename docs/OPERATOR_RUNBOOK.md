@@ -49,7 +49,7 @@ Examples:
 
 ```bash
 # Wrong binary (denied, exit 2)
-cargo run -p mcp-agent-mail -- share export
+cargo run -p mcp-agent-mail -- share deploy verify-live https://example.github.io/agent-mail
 
 # Correct binary (CLI)
 cargo run -p mcp-agent-mail-cli -- --help   # runs `am`
@@ -373,6 +373,32 @@ du -sh ~/.mcp_agent_mail/
 DISK_SPACE_WARNING_MB=200 DISK_SPACE_CRITICAL_MB=50 scripts/am
 ```
 
+### Deployment Validation (`verify-live`)
+
+Use native verify-live for operator checks and release gates:
+
+```bash
+# Create bundle artifact (local pre-flight input)
+am share export -o /tmp/agent-mail-bundle --no-zip
+
+# Verify deployed host against the local bundle
+am share deploy verify-live https://example.github.io/agent-mail \
+  --bundle /tmp/agent-mail-bundle \
+  --json > /tmp/verify-live.json
+
+# Fast triage view
+jq '{verdict, summary, remote_checks: [.stages.remote.checks[] | {id, severity, passed, message}]}' /tmp/verify-live.json
+```
+
+Interpretation:
+- Exit `0`: pass, or warning-only in non-strict mode.
+- Exit `1`: at least one error check failed, or warning-only with `--strict`.
+- Stage-level details and per-check messages are in the JSON report.
+
+Compatibility-only wrapper behavior:
+- Generated `scripts/validate_deploy.sh` should be treated as compatibility fallback.
+- Prefer native command path in docs/CI/runbooks: `am share deploy verify-live`.
+
 ### Troubleshooting Suite Map (Use Before Escalation)
 
 | Symptom / Concern | Run This Suite | Expected Artifact Root |
@@ -383,6 +409,7 @@ DISK_SPACE_WARNING_MB=200 DISK_SPACE_CRITICAL_MB=50 scripts/am
 | Web UI route/action parity issues | `tests/e2e/test_mail_ui.sh` | `tests/artifacts/mail_ui/<timestamp>/` |
 | Artifact bundle schema/manifest failures | `tests/e2e/test_artifacts_schema.sh` | `tests/artifacts/artifacts_schema/<timestamp>/` |
 | Static export routing/search/hash parity | `tests/e2e/test_share.sh` | `tests/artifacts/share/<timestamp>/` |
+| Verify-live exit-code/severity/compatibility regressions | `tests/e2e/test_share_verify_live.sh` | `tests/artifacts/share_verify_live/<timestamp>/` |
 
 For any failing suite, validate forensic bundle structure:
 

@@ -25,7 +25,7 @@ switch (see ADR-001).
 | Operator CLI (`am`) workflows | Phase 0 → 1 → 2 → 3 | Operator binary path + command allowlist | Roll back `am` binary to last known good |
 | TUI operations console | Phase 0 → 1 → 2 → 3 | `TUI_ENABLED=true` and `scripts/am` profile | Start headless with `--no-tui` |
 | Web parity surfaces (`/mail/*`) | Phase 0 → 1 → 2 → 3 | Deployment cohort (host/project ring), no hidden compatibility shim | Roll back server binary and redeploy previous release |
-| Static export (GH Pages / Cloudflare Pages) | Phase 0 → 1 → 2 → 3 | Publish workflow gating + `am share export` verification | Disable publish jobs and hold new exports |
+| Static export (GH Pages / Cloudflare Pages) | Phase 0 → 1 → 2 → 3 | Publish workflow gating + `am share export` + `am share deploy verify-live` validation | Disable publish jobs and hold new exports |
 | Build slots / worktree behavior | Phase 0 → 1 → 2 → 3 | `WORKTREES_ENABLED=true` only after canary evidence | Set `WORKTREES_ENABLED=false`, restart |
 | Local auth strictness | Phase 0 → 1 → 2 → 3 | `HTTP_BEARER_TOKEN` + `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` policy | Re-enable strict auth (`HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0`) |
 
@@ -155,7 +155,15 @@ bash tests/e2e/test_tui_a11y.sh
 
 ```bash
 bash tests/e2e/test_share.sh
-# Expected: 0 failures with deterministic bundle manifests
+bash tests/e2e/test_share_verify_live.sh
+# Expected: 0 failures (or deterministic SKIP with explicit reason when verify-live command is unavailable in current binary)
+```
+
+Native operator validation command (authoritative path):
+```bash
+am share deploy verify-live https://example.github.io/agent-mail \
+  --bundle /tmp/agent-mail-bundle \
+  --json > /tmp/verify-live.json
 ```
 
 ### 2.13 Performance and Determinism Gates
@@ -174,6 +182,7 @@ Promotion from each phase requires all of:
 - Dual-mode E2E pass rate = `100%` (`fail=0` for both `E2E dual-mode` and `E2E mode matrix`).
 - Security/privacy pass rate = `100%` (`fail=0` in `E2E security/privacy`).
 - Accessibility pass rate = `100%` (`fail=0` in `E2E TUI accessibility`).
+- Static export/verify-live pass rate = `100%` (`fail=0` in `test_share.sh`; `test_share_verify_live.sh` either passes or emits deterministic skip reason in environments without the command surface).
 - Performance gate status = pass (`perf_security_regressions` green, no p95 regression above `2.0x` baseline).
 - CI gate report indicates `decision="go"` and `release_eligible=true`.
 - Release checklist sign-off ledger completed for the phase (owner + UTC timestamp + rationale + evidence paths).
@@ -389,7 +398,18 @@ curl -s http://127.0.0.1:8765/mcp/ \
 tail -f /var/log/mcp-agent-mail.log | grep -iE 'panic|fatal|corrupt|SIGABRT'
 ```
 
-### 5.5 Artifact Preservation
+### 5.5 Deployment Validation Spot-Checks (Per Promotion Step)
+
+```bash
+# Run native deployment validation against the staged URL and inspect verdict
+am share deploy verify-live "$STAGED_URL" --bundle "$BUNDLE_DIR" --json > /tmp/verify-live.json
+jq '.verdict, .summary, .config' /tmp/verify-live.json
+
+# Optional strict gate for promotion cutovers
+am share deploy verify-live "$STAGED_URL" --bundle "$BUNDLE_DIR" --strict
+```
+
+### 5.6 Artifact Preservation
 
 After each E2E run, archive the structured artifacts:
 ```bash
@@ -481,3 +501,5 @@ cp tests/artifacts/dual_mode/*/run_summary.json tests/artifacts/dry_run/
 | Mode invariants | br-3vwi.12.1 (rollout gate reference) | `docs/ADR-001-dual-mode-invariants.md` |
 | Parity matrix | br-3vwi.12.1 (rollout gate reference) | `docs/SPEC-parity-matrix.md` |
 | Golden benchmark checksums | br-3vwi.12.1 (rollout gate reference) | `benches/golden/checksums.sha256` |
+| Verify-live E2E matrix artifacts | br-dl1g / br-3efsl follow-through | `tests/artifacts/share_verify_live/*/` |
+| Verify-live contract + compatibility policy | br-dl1g / br-3tr5 follow-through | `docs/SPEC-verify-live-contract.md` |

@@ -51,6 +51,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 - [x] All 20+ MCP resources return correct data
 - [x] Startup probes catch and report common failures (port, storage, DB)
 - [x] Graceful shutdown flushes commit queue
+- [x] Native deploy verification path available: `am share deploy verify-live <url> --bundle <bundle_dir>`
 
 ## Dual-Mode Interface (ADR-001)
 
@@ -89,6 +90,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 - [x] E2E: MCP/API mode switching
 - [x] E2E: stdio transport
 - [x] E2E: CLI commands
+- [x] E2E: verify-live failure matrix + compatibility-wrapper delegation checks
 - [x] Stress tests pass (concurrent agents, pool exhaustion)
 
 ### Dual-Mode Test Suites
@@ -136,6 +138,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 - [x] Migration guide: before/after command mappings
 - [x] Rollout playbook: phased plan + kill-switch procedure
 - [x] AGENTS.md: dual-mode reminder for agents
+- [x] Verify-live contract + compatibility strategy documented (`docs/SPEC-verify-live-contract.md`)
 
 ## Artifact Sanity Checks
 
@@ -159,11 +162,17 @@ ls tests/artifacts/dual_mode/*/steps/step_*.json | wc -l
 bash scripts/bench_golden.sh validate
 # All checksums must match
 
-# 5. Golden denial fixtures exist
+# 5. Verify-live E2E artifacts exist (native path authoritative)
+bash tests/e2e/test_share_verify_live.sh
+ls tests/artifacts/share_verify_live/*/case_*/command.txt
+ls tests/artifacts/share_verify_live/*/case_*/check_trace.jsonl
+# If command unavailable in current binary, suite emits deterministic SKIP with reason
+
+# 6. Golden denial fixtures exist
 ls tests/fixtures/golden_snapshots/mcp_deny_*.txt
 # At least 5 files (share, guard, doctor, archive, migrate)
 
-# 6. Machine-readable gate report exists and is release-eligible
+# 7. Machine-readable gate report exists and is release-eligible
 bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json
 jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifacts/ci/gate_report.json
 # decision must be "go", release_eligible must be true, thresholds must have zero failed_gates
@@ -206,6 +215,10 @@ jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifact
    # CLI accepts all commands:
    am share --help                  # Should exit 0
    am doctor check --json           # Should exit 0 with JSON output
+
+   # Native deployment validation path:
+   am share deploy verify-live https://example.github.io/agent-mail --bundle /tmp/agent-mail-bundle --json > /tmp/verify-live.json
+   jq '.verdict, .summary' /tmp/verify-live.json
 
    # MCP server starts:
    mcp-agent-mail serve --help      # Should exit 0

@@ -232,6 +232,20 @@ Severity indicators:
 - `[FAIL]` — red
 - `[SKIP]` — dim/gray
 
+## Compatibility Strategy (`validate_deploy.sh`)
+
+`am share deploy verify-live` is the authoritative validation path.
+
+The generated `scripts/validate_deploy.sh` is compatibility-only and follows this policy:
+
+1. If `am` is available, it delegates to native commands:
+   - With URL: `am share deploy verify-live <url> --bundle <bundle_dir>`
+   - Without URL: `am share deploy validate <bundle_dir>`
+2. If `am` is unavailable, it runs a minimal fallback checker (structure + basic HTTP probes) and clearly labels the run as compatibility mode.
+3. The wrapper prints explicit before/after command mapping and migration guidance.
+
+This keeps legacy automation functioning while preventing script-first ambiguity.
+
 ## Timeout and Retry Semantics
 
 ### Per-Request Timeout

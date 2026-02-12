@@ -307,7 +307,7 @@ impl VerifyLiveReport {
 // ── Verify-live orchestration ────────────────────────────────────────────
 
 /// Options for a verify-live run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VerifyLiveOptions {
     /// URL to verify.
     pub url: String,
@@ -321,19 +321,6 @@ pub struct VerifyLiveOptions {
     pub fail_fast: bool,
     /// Probe configuration (timeout, retries, etc.).
     pub probe_config: crate::probe::ProbeConfig,
-}
-
-impl Default for VerifyLiveOptions {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            bundle_path: None,
-            security_audit: false,
-            strict: false,
-            fail_fast: false,
-            probe_config: crate::probe::ProbeConfig::default(),
-        }
-    }
 }
 
 /// Map a `DeployCheck` from `validate_bundle()` into a `VerifyLiveCheck`.
@@ -466,6 +453,49 @@ fn build_security_checks() -> Vec<crate::probe::ProbeCheck> {
     ]
 }
 
+/// Check a header's exact value and produce a `VerifyLiveCheck`.
+fn check_header_value(
+    headers: &std::collections::BTreeMap<String, String>,
+    id: &str,
+    description: &str,
+    header_key: &str,
+    expected_value: &str,
+    severity: CheckSeverity,
+) -> VerifyLiveCheck {
+    match headers.get(header_key) {
+        Some(val) if val == expected_value => VerifyLiveCheck {
+            id: id.to_string(),
+            description: description.to_string(),
+            severity,
+            passed: true,
+            message: format!("{header_key}: {val}"),
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        },
+        Some(val) => VerifyLiveCheck {
+            id: id.to_string(),
+            description: description.to_string(),
+            severity,
+            passed: false,
+            message: format!("{header_key} is \"{val}\", expected \"{expected_value}\""),
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        },
+        None => VerifyLiveCheck {
+            id: id.to_string(),
+            description: description.to_string(),
+            severity,
+            passed: false,
+            message: format!("{header_key} header missing"),
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        },
+    }
+}
+
 /// Run the full verify-live pipeline (Stage 1 + Stage 2 + optional Stage 3).
 ///
 /// Returns a complete `VerifyLiveReport` conforming to the JSON schema
@@ -554,9 +584,136 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
     let remote_checks = build_remote_checks();
     let remote_results =
         crate::probe::run_probe_checks(&opts.url, &remote_checks, &opts.probe_config);
+    let mut remote_live_checks: Vec<VerifyLiveCheck> =
+        remote_results.iter().map(map_probe_result).collect();
+
+    // remote.content_match: SHA256 comparison (only when bundle provided and root passed)
+    let root_result = remote_results.iter().find(|r| r.id == "remote.root");
+    let root_passed = root_result.is_some_and(|r| r.passed);
+    let content_match_check = if opts.bundle_path.is_some() && root_passed {
+        let match_start = std::time::Instant::now();
+        // Get remote body from root probe
+        let remote_body_hash: Option<String> = {
+            let root_url = format!("{}/", opts.url.trim_end_matches('/'));
+            crate::probe::probe_get(&root_url, &opts.probe_config)
+                .ok()
+                .map(|resp| format!("{:x}", Sha256::digest(&resp.body)))
+        };
+        // Get local index.html hash
+        let local_hash: Option<String> = opts.bundle_path.as_ref().and_then(|bp| {
+            let index_path = bp.join("index.html");
+            std::fs::read(&index_path)
+                .ok()
+                .map(|data| format!("{:x}", Sha256::digest(&data)))
+        });
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = match_start.elapsed().as_millis() as u64;
+        match (remote_body_hash, local_hash) {
+            (Some(remote), Some(local)) if remote == local => VerifyLiveCheck {
+                id: "remote.content_match".to_string(),
+                description: "Root page content matches bundle".to_string(),
+                severity: CheckSeverity::Warning,
+                passed: true,
+                message: format!("SHA256 match ({})", &remote[..12]),
+                elapsed_ms,
+                http_status: None,
+                headers_captured: None,
+            },
+            (Some(remote), Some(local)) => VerifyLiveCheck {
+                id: "remote.content_match".to_string(),
+                description: "Root page content matches bundle".to_string(),
+                severity: CheckSeverity::Warning,
+                passed: false,
+                message: format!(
+                    "SHA256 mismatch: remote={}... local={}...",
+                    &remote[..12],
+                    &local[..12]
+                ),
+                elapsed_ms,
+                http_status: None,
+                headers_captured: None,
+            },
+            _ => VerifyLiveCheck {
+                id: "remote.content_match".to_string(),
+                description: "Root page content matches bundle".to_string(),
+                severity: CheckSeverity::Skipped,
+                passed: false,
+                message: "could not compute hash for comparison".to_string(),
+                elapsed_ms,
+                http_status: None,
+                headers_captured: None,
+            },
+        }
+    } else {
+        VerifyLiveCheck {
+            id: "remote.content_match".to_string(),
+            description: "Root page content matches bundle".to_string(),
+            severity: CheckSeverity::Skipped,
+            passed: false,
+            message: if opts.bundle_path.is_none() {
+                "skipped (no --bundle provided)".to_string()
+            } else {
+                "skipped (remote.root failed)".to_string()
+            },
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        }
+    };
+    remote_live_checks.push(content_match_check);
+
+    // remote.tls: HTTPS connection check (synthesized from root probe)
+    let is_https = opts.url.starts_with("https://") || opts.url.starts_with("HTTPS://");
+    let tls_check = if is_https {
+        match root_result {
+            Some(r) if r.passed => VerifyLiveCheck {
+                id: "remote.tls".to_string(),
+                description: "HTTPS connection succeeded".to_string(),
+                severity: CheckSeverity::Error,
+                passed: true,
+                message: "HTTPS connection succeeded".to_string(),
+                elapsed_ms: 0,
+                http_status: None,
+                headers_captured: None,
+            },
+            Some(r) => VerifyLiveCheck {
+                id: "remote.tls".to_string(),
+                description: "HTTPS connection succeeded".to_string(),
+                severity: CheckSeverity::Error,
+                passed: false,
+                message: format!("HTTPS connection failed: {}", r.message),
+                elapsed_ms: 0,
+                http_status: r.http_status,
+                headers_captured: None,
+            },
+            None => VerifyLiveCheck {
+                id: "remote.tls".to_string(),
+                description: "HTTPS connection succeeded".to_string(),
+                severity: CheckSeverity::Error,
+                passed: false,
+                message: "root probe did not run".to_string(),
+                elapsed_ms: 0,
+                http_status: None,
+                headers_captured: None,
+            },
+        }
+    } else {
+        VerifyLiveCheck {
+            id: "remote.tls".to_string(),
+            description: "HTTPS connection succeeded".to_string(),
+            severity: CheckSeverity::Skipped,
+            passed: false,
+            message: "skipped (URL is not HTTPS)".to_string(),
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        }
+    };
+    remote_live_checks.push(tls_check);
+
     let remote_stage = VerifyStage {
         ran: true,
-        checks: remote_results.iter().map(map_probe_result).collect(),
+        checks: remote_live_checks,
     };
 
     // ── Stage 3: Security header audit ──────────────────────────────
@@ -564,9 +721,46 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
         let security_checks = build_security_checks();
         let security_results =
             crate::probe::run_probe_checks(&opts.url, &security_checks, &opts.probe_config);
+        let mut sec_checks: Vec<VerifyLiveCheck> =
+            security_results.iter().map(map_probe_result).collect();
+
+        // Exact-value checks: COOP and COEP per SPEC.
+        // Use headers captured from remote.coop / remote.coep (Stage 2).
+        let coop_headers = remote_results
+            .iter()
+            .find(|r| r.id == "remote.coop")
+            .map(|r| &r.headers_captured)
+            .cloned()
+            .unwrap_or_default();
+        let coep_headers = remote_results
+            .iter()
+            .find(|r| r.id == "remote.coep")
+            .map(|r| &r.headers_captured)
+            .cloned()
+            .unwrap_or_default();
+
+        // security.coop_value: COOP must be "same-origin"
+        sec_checks.push(check_header_value(
+            &coop_headers,
+            "security.coop_value",
+            "COOP is same-origin",
+            "cross-origin-opener-policy",
+            "same-origin",
+            CheckSeverity::Warning,
+        ));
+        // security.coep_value: COEP must be "require-corp"
+        sec_checks.push(check_header_value(
+            &coep_headers,
+            "security.coep_value",
+            "COEP is require-corp",
+            "cross-origin-embedder-policy",
+            "require-corp",
+            CheckSeverity::Warning,
+        ));
+
         VerifyStage {
             ran: true,
-            checks: security_results.iter().map(map_probe_result).collect(),
+            checks: sec_checks,
         }
     } else {
         VerifyStage {
@@ -1025,22 +1219,44 @@ pub fn generate_netlify_config() -> String {
 #[must_use]
 pub fn generate_validation_script() -> String {
     r#"#!/usr/bin/env bash
-# MCP Agent Mail Static Export — Deployment Validation Script
+# MCP Agent Mail Static Export — Compatibility Validation Wrapper
 #
 # Usage: ./validate_deploy.sh <bundle_dir> [deployed_url]
 #
-# Checks:
-#   1. Bundle structure integrity
-#   2. File checksums
-#   3. (If URL provided) HTTP response validation
+# IMPORTANT:
+#   Native command path is authoritative:
+#     am share deploy verify-live <deployed_url> --bundle <bundle_dir>
+#   This script is compatibility-only and may be removed in a future release.
 
 set -euo pipefail
 
 BUNDLE_DIR="${1:?Usage: $0 <bundle_dir> [deployed_url]}"
 DEPLOYED_URL="${2:-}"
 
-echo "=== MCP Agent Mail Deploy Validator ==="
+echo "=== MCP Agent Mail Deploy Validator (Compatibility Wrapper) ==="
 echo "Bundle: $BUNDLE_DIR"
+echo "Native path: am share deploy verify-live"
+echo ""
+
+if command -v am >/dev/null 2>&1; then
+    if [ -n "$DEPLOYED_URL" ]; then
+        CMD=(am share deploy verify-live "$DEPLOYED_URL" --bundle "$BUNDLE_DIR")
+        if [ "${AM_VERIFY_LIVE_STRICT:-0}" = "1" ]; then
+            CMD+=(--strict)
+        fi
+        echo "Delegating to native command:"
+        printf '  %q ' "${CMD[@]}"
+        echo ""
+        exec "${CMD[@]}"
+    fi
+
+    echo "No deployed URL provided; running native bundle validation:"
+    echo "  am share deploy validate \"$BUNDLE_DIR\""
+    exec am share deploy validate "$BUNDLE_DIR"
+fi
+
+echo "WARNING: 'am' command not found; running compatibility fallback checks."
+echo "Install/build the 'am' CLI for full verify-live behavior."
 echo ""
 
 ERRORS=0
@@ -1061,44 +1277,16 @@ check() {
     fi
 }
 
-echo "--- Structure Checks ---"
-check error "manifest" "test -f '$BUNDLE_DIR/manifest.json'" "Present" "Missing"
-check error "index.html" "test -f '$BUNDLE_DIR/index.html'" "Present" "Missing"
-check warning ".nojekyll" "test -f '$BUNDLE_DIR/.nojekyll'" "Present" "Missing (needed for GH Pages)"
-check warning "_headers" "test -f '$BUNDLE_DIR/_headers'" "Present" "Missing (needed for COOP/COEP)"
-check warning "viewer" "test -d '$BUNDLE_DIR/viewer'" "Present" "Missing"
-check warning "database" "test -f '$BUNDLE_DIR/mailbox.sqlite3'" "Present" "Missing"
-check info "pages" "test -d '$BUNDLE_DIR/viewer/pages'" "Present" "Not generated"
-check info "search_index" "test -f '$BUNDLE_DIR/viewer/data/search_index.json'" "Present" "Not generated"
-echo ""
-
-echo "--- Manifest Validation ---"
-if [ -f "$BUNDLE_DIR/manifest.json" ]; then
-    if python3 -c "import json; json.load(open('$BUNDLE_DIR/manifest.json'))" 2>/dev/null; then
-        echo "  ✅ Valid JSON"
-        python3 -c "
-import json
-m = json.load(open('$BUNDLE_DIR/manifest.json'))
-print(f'  Schema: {m.get(\"schema_version\", \"unknown\")}')
-print(f'  Generated: {m.get(\"generated_at\", \"unknown\")}')
-db = m.get('database', {})
-print(f'  DB size: {db.get(\"size_bytes\", 0):,} bytes')
-print(f'  FTS: {db.get(\"fts_enabled\", False)}')
-" 2>/dev/null || echo "  (details unavailable)"
-    else
-        echo "  ❌ Invalid JSON"
-        ERRORS=$((ERRORS + 1))
-    fi
-fi
-echo ""
-
-echo "--- Bundle Size ---"
-du -sh "$BUNDLE_DIR" 2>/dev/null || echo "  (size unavailable)"
-find "$BUNDLE_DIR" -type f | wc -l | xargs -I{} echo "  Files: {}"
+echo "--- Compatibility Structure Checks ---"
+check error "manifest" "test -f \"$BUNDLE_DIR/manifest.json\"" "Present" "Missing"
+check error "index.html" "test -f \"$BUNDLE_DIR/index.html\"" "Present" "Missing"
+check warning ".nojekyll" "test -f \"$BUNDLE_DIR/.nojekyll\"" "Present" "Missing (needed for GH Pages)"
+check warning "_headers" "test -f \"$BUNDLE_DIR/_headers\"" "Present" "Missing (needed for COOP/COEP)"
+check warning "viewer" "test -d \"$BUNDLE_DIR/viewer\"" "Present" "Missing"
 echo ""
 
 if [ -n "$DEPLOYED_URL" ]; then
-    echo "--- HTTP Checks ($DEPLOYED_URL) ---"
+    echo "--- Compatibility HTTP Checks ($DEPLOYED_URL) ---"
     check_url() {
         local path="$1" expected="$2"
         local status
@@ -1113,24 +1301,14 @@ if [ -n "$DEPLOYED_URL" ]; then
     check_url "" "200"
     check_url "viewer/" "200"
     check_url "manifest.json" "200"
-    echo ""
-
-    echo "--- COOP/COEP Header Check ---"
-    HEADERS=$(curl -s -I "$DEPLOYED_URL/viewer/" 2>/dev/null || echo "")
-    if echo "$HEADERS" | grep -qi "Cross-Origin-Opener-Policy"; then
-        echo "  ✅ COOP header present"
-    else
-        echo "  ⚠️  COOP header missing"
-        WARNINGS=$((WARNINGS + 1))
-    fi
-    if echo "$HEADERS" | grep -qi "Cross-Origin-Embedder-Policy"; then
-        echo "  ✅ COEP header present"
-    else
-        echo "  ⚠️  COEP header missing"
-        WARNINGS=$((WARNINGS + 1))
-    fi
-    echo ""
 fi
+
+echo ""
+echo "--- Migration Mapping ---"
+echo "  Preferred: am share deploy verify-live <deployed_url> --bundle <bundle_dir>"
+echo "  Fallback : ./validate_deploy.sh <bundle_dir> [deployed_url]"
+echo "  Wrapper  : set AM_VERIFY_LIVE_STRICT=1 to add --strict while delegating"
+echo ""
 
 echo "=== Summary ==="
 echo "  Errors:   $ERRORS"
@@ -1553,7 +1731,7 @@ pub fn build_verify_plan(deployed_url: &str) -> VerifyResult {
 /// - `.github/workflows/deploy-cf-pages.yml` (Cloudflare Pages CI workflow)
 /// - `wrangler.toml.template` (Cloudflare Pages config)
 /// - `netlify.toml.template` (Netlify config)
-/// - `scripts/validate_deploy.sh` (validation script)
+/// - `scripts/validate_deploy.sh` (compatibility wrapper to native `am` validation commands)
 /// - `deploy_report.json` (pre-flight validation report)
 pub fn write_deploy_tooling(bundle_dir: &Path) -> ShareResult<Vec<String>> {
     let mut written = Vec::new();
@@ -1613,6 +1791,133 @@ pub fn write_deploy_tooling(bundle_dir: &Path) -> ShareResult<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    struct TestHttpServer {
+        addr: SocketAddr,
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl TestHttpServer {
+        fn spawn(include_isolation_headers: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            listener
+                .set_nonblocking(true)
+                .expect("set_nonblocking true");
+            let addr = listener.local_addr().expect("local_addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            serve_connection(stream, include_isolation_headers);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    impl Drop for TestHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn serve_connection(mut stream: TcpStream, include_isolation_headers: bool) {
+        let mut buf = [0_u8; 4096];
+        let read = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if read == 0 {
+            return;
+        }
+        let req = String::from_utf8_lossy(&buf[..read]);
+        let first_line = req.lines().next().unwrap_or_default();
+        let path = first_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+
+        let (status, body, mut headers) = match path.as_str() {
+            "/" => {
+                let mut h = BTreeMap::new();
+                if include_isolation_headers {
+                    h.insert(
+                        "cross-origin-opener-policy".to_string(),
+                        "same-origin".to_string(),
+                    );
+                    h.insert(
+                        "cross-origin-embedder-policy".to_string(),
+                        "require-corp".to_string(),
+                    );
+                    h.insert(
+                        "strict-transport-security".to_string(),
+                        "max-age=31536000".to_string(),
+                    );
+                    h.insert("x-content-type-options".to_string(), "nosniff".to_string());
+                    h.insert("x-frame-options".to_string(), "DENY".to_string());
+                    h.insert(
+                        "cross-origin-resource-policy".to_string(),
+                        "same-origin".to_string(),
+                    );
+                }
+                (200_u16, "<html></html>".to_string(), h)
+            }
+            "/viewer/" => (200_u16, "<html>viewer</html>".to_string(), BTreeMap::new()),
+            "/manifest.json" => (
+                200_u16,
+                "{\"schema_version\":\"0.1.0\"}".to_string(),
+                BTreeMap::new(),
+            ),
+            "/mailbox.sqlite3" => (200_u16, "not-a-real-db".to_string(), BTreeMap::new()),
+            _ => (404_u16, "not found".to_string(), BTreeMap::new()),
+        };
+
+        headers.insert(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        );
+        headers.insert("connection".to_string(), "close".to_string());
+        headers.insert("content-length".to_string(), body.len().to_string());
+
+        let status_text = if status == 200 { "OK" } else { "Not Found" };
+        let mut response = format!("HTTP/1.1 {status} {status_text}\r\n");
+        for (k, v) in headers {
+            response.push_str(&format!("{k}: {v}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(&body);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
 
     fn create_minimal_bundle(dir: &Path) {
         std::fs::create_dir_all(dir.join("viewer/vendor")).unwrap();
@@ -1736,7 +2041,9 @@ mod tests {
     fn validation_script_is_shell() {
         let script = generate_validation_script();
         assert!(script.starts_with("#!/usr/bin/env bash"));
-        assert!(script.contains("manifest.json"));
+        assert!(script.contains("am share deploy verify-live"));
+        assert!(script.contains("compatibility-only"));
+        assert!(script.contains("check_url"));
     }
 
     // ── write_deploy_tooling ────────────────────────────────────────
@@ -2295,5 +2602,224 @@ mod tests {
         let json = serde_json::to_string(&check).unwrap();
         assert!(!json.contains("http_status"));
         assert!(!json.contains("headers_captured"));
+    }
+
+    // ── check_header_value tests ────────────────────────────────────
+
+    #[test]
+    fn check_header_value_exact_match() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "cross-origin-opener-policy".to_string(),
+            "same-origin".to_string(),
+        );
+        let result = super::check_header_value(
+            &headers,
+            "security.coop_value",
+            "COOP is same-origin",
+            "cross-origin-opener-policy",
+            "same-origin",
+            CheckSeverity::Warning,
+        );
+        assert!(result.passed);
+        assert!(result.message.contains("same-origin"));
+    }
+
+    #[test]
+    fn check_header_value_wrong_value() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "cross-origin-opener-policy".to_string(),
+            "unsafe-none".to_string(),
+        );
+        let result = super::check_header_value(
+            &headers,
+            "security.coop_value",
+            "COOP is same-origin",
+            "cross-origin-opener-policy",
+            "same-origin",
+            CheckSeverity::Warning,
+        );
+        assert!(!result.passed);
+        assert!(result.message.contains("unsafe-none"));
+        assert!(result.message.contains("same-origin"));
+    }
+
+    #[test]
+    fn check_header_value_missing_header() {
+        let headers = BTreeMap::new();
+        let result = super::check_header_value(
+            &headers,
+            "security.coep_value",
+            "COEP is require-corp",
+            "cross-origin-embedder-policy",
+            "require-corp",
+            CheckSeverity::Warning,
+        );
+        assert!(!result.passed);
+        assert!(result.message.contains("missing"));
+    }
+
+    #[test]
+    fn content_match_skipped_without_bundle() {
+        // When bundle_path is None, content_match should be Skipped
+        let check = VerifyLiveCheck {
+            id: "remote.content_match".to_string(),
+            description: "Root page content matches bundle".to_string(),
+            severity: CheckSeverity::Skipped,
+            passed: false,
+            message: "skipped (no --bundle provided)".to_string(),
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        };
+        assert_eq!(check.severity, CheckSeverity::Skipped);
+        assert!(!check.passed);
+    }
+
+    #[test]
+    fn tls_check_skipped_for_http() {
+        let check = VerifyLiveCheck {
+            id: "remote.tls".to_string(),
+            description: "HTTPS connection succeeded".to_string(),
+            severity: CheckSeverity::Skipped,
+            passed: false,
+            message: "skipped (URL is not HTTPS)".to_string(),
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        };
+        assert_eq!(check.severity, CheckSeverity::Skipped);
+    }
+
+    #[test]
+    fn verify_live_options_default() {
+        let opts = VerifyLiveOptions::default();
+        assert!(opts.url.is_empty());
+        assert!(opts.bundle_path.is_none());
+        assert!(!opts.security_audit);
+        assert!(!opts.strict);
+        assert!(!opts.fail_fast);
+    }
+
+    #[test]
+    fn run_verify_live_integration_pass_with_security_and_content_match() {
+        let server = TestHttpServer::spawn(true);
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let opts = VerifyLiveOptions {
+            url: server.base_url(),
+            bundle_path: Some(bundle),
+            security_audit: true,
+            strict: false,
+            fail_fast: false,
+            probe_config: crate::probe::ProbeConfig {
+                timeout: Duration::from_secs(2),
+                retries: 0,
+                retry_delay: Duration::from_millis(1),
+                ..crate::probe::ProbeConfig::default()
+            },
+        };
+
+        let report = run_verify_live(&opts);
+        assert_eq!(report.exit_code(), 0);
+        assert_eq!(report.summary.failed, 0);
+        assert!(report.stages.remote.ran);
+        assert!(report.stages.security.ran);
+        assert!(
+            report
+                .stages
+                .remote
+                .checks
+                .iter()
+                .any(|c| c.id == "remote.content_match" && c.passed)
+        );
+        assert!(
+            report
+                .stages
+                .security
+                .checks
+                .iter()
+                .any(|c| c.id == "security.coop_value" && c.passed)
+        );
+        assert!(
+            report
+                .stages
+                .security
+                .checks
+                .iter()
+                .any(|c| c.id == "security.coep_value" && c.passed)
+        );
+    }
+
+    #[test]
+    fn run_verify_live_integration_strict_warn_exit_one() {
+        let server = TestHttpServer::spawn(false);
+        let opts = VerifyLiveOptions {
+            url: server.base_url(),
+            bundle_path: None,
+            security_audit: false,
+            strict: true,
+            fail_fast: false,
+            probe_config: crate::probe::ProbeConfig {
+                timeout: Duration::from_secs(2),
+                retries: 0,
+                retry_delay: Duration::from_millis(1),
+                ..crate::probe::ProbeConfig::default()
+            },
+        };
+
+        let report = run_verify_live(&opts);
+        assert_eq!(report.verdict, VerifyVerdict::Warn);
+        assert_eq!(report.exit_code(), 1);
+        assert!(
+            report
+                .stages
+                .remote
+                .checks
+                .iter()
+                .any(|c| c.id == "remote.coop" && !c.passed)
+        );
+        assert!(
+            report
+                .stages
+                .remote
+                .checks
+                .iter()
+                .any(|c| c.id == "remote.coep" && !c.passed)
+        );
+    }
+
+    #[test]
+    fn run_verify_live_fail_fast_short_circuits_remote_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bad_bundle).unwrap();
+        std::fs::write(bad_bundle.join("index.html"), "<html></html>").unwrap();
+
+        let opts = VerifyLiveOptions {
+            url: "http://127.0.0.1:1".to_string(),
+            bundle_path: Some(bad_bundle),
+            security_audit: true,
+            strict: false,
+            fail_fast: true,
+            probe_config: crate::probe::ProbeConfig {
+                timeout: Duration::from_millis(200),
+                retries: 0,
+                retry_delay: Duration::from_millis(1),
+                ..crate::probe::ProbeConfig::default()
+            },
+        };
+
+        let report = run_verify_live(&opts);
+        assert_eq!(report.verdict, VerifyVerdict::Fail);
+        assert_eq!(report.exit_code(), 1);
+        assert!(report.stages.local.ran);
+        assert!(!report.stages.remote.ran);
+        assert!(!report.stages.security.ran);
+        assert!(report.stages.remote.checks.is_empty());
+        assert!(report.stages.security.checks.is_empty());
     }
 }

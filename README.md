@@ -51,7 +51,7 @@ This repo exposes **two command surfaces** from a single `mcp-agent-mail` binary
 produces a deterministic denial on `stderr` with exit code `2`:
 
 ```bash
-cargo run -p mcp-agent-mail -- share export
+cargo run -p mcp-agent-mail -- share deploy verify-live https://example.github.io/agent-mail
 # Error: "share" is not an MCP server command.
 # Agent Mail MCP server accepts: serve, config
 # For operator CLI commands, use: am share
@@ -84,6 +84,31 @@ For the canonical contract/specs:
 - `docs/SPEC-interface-mode-switch.md`
 - `docs/SPEC-denial-ux-contract.md`
 - `docs/SPEC-parity-matrix.md`
+
+## Deployment Validation
+
+Native deployment verification is authoritative:
+
+```bash
+# 1) Export a bundle to deploy
+am share export -o /tmp/agent-mail-bundle --no-zip
+
+# 2) Verify the live deployment against that bundle
+am share deploy verify-live https://example.github.io/agent-mail \
+  --bundle /tmp/agent-mail-bundle \
+  --json > /tmp/verify-live.json
+
+# 3) Inspect verdict + counts
+jq '.verdict, .summary, .config' /tmp/verify-live.json
+```
+
+Exit semantics:
+- `0`: pass, or warn in non-strict mode
+- `1`: fail, or warn when `--strict` is enabled
+
+Compatibility note:
+- Generated `scripts/validate_deploy.sh` wrappers are compatibility-only.
+- Prefer `am share deploy verify-live` for CI/release gates and operator runbooks.
 
 ## TUI Controls
 
