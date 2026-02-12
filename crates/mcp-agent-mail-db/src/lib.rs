@@ -68,7 +68,7 @@ pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
-/// Backed by `SqliteConnection` (C-backed `SQLite`).
-/// `FrankenConnection` (pure-Rust) lacks `CREATE TRIGGER`, `sqlite_master`,
-/// and some complex query patterns, so it is not usable here yet.
-pub type DbConn = sqlmodel_sqlite::SqliteConnection;
+/// Backed by `FrankenConnection` (pure-Rust `SQLite`).
+/// The share crate's snapshot module uses `SqliteConnection` directly
+/// for `backup_to_path()` which `FrankenConnection` does not expose.
+pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;

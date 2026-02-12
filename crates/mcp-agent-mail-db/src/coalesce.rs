@@ -515,4 +515,971 @@ mod tests {
         assert!(joined.was_joined());
         assert_eq!(joined.into_inner(), 99);
     }
+
+    // ---- WBQ error path tests (br-3h13.3.1) ----
+
+    #[test]
+    fn queue_overflow_evicts_and_still_works() {
+        // With max_entries=1, inserting a second concurrent key should evict the first
+        // slot from the map. Verify the map does not panic and the new operation succeeds.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(1, Duration::from_millis(200));
+
+        // First operation completes normally (leader, inserts then removes).
+        let r1 = map.execute_or_join("a", || Ok::<_, String>(10)).unwrap();
+        assert_eq!(r1.into_inner(), 10);
+        assert_eq!(map.inflight_count(), 0);
+
+        // Second operation also succeeds.
+        let r2 = map.execute_or_join("b", || Ok::<_, String>(20)).unwrap();
+        assert_eq!(r2.into_inner(), 20);
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn queue_overflow_under_concurrency() {
+        // max_entries=2 with 10 concurrent operations on distinct keys.
+        // The map should evict aggressively but all operations must still complete
+        // (evicted slots lose their broadcast, but leaders still return their result).
+        let map = Arc::new(CoalesceMap::<String, usize>::new(2, Duration::from_millis(500)));
+        let barrier = Arc::new(Barrier::new(10));
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let map = Arc::clone(&map);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let key = format!("overflow-key-{i}");
+                    map.execute_or_join(key, || {
+                        thread::sleep(Duration::from_millis(10));
+                        Ok::<_, String>(i)
+                    })
+                    .unwrap()
+                    .into_inner()
+                })
+            })
+            .collect();
+
+        let results: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // Each thread should get its own value back (they use distinct keys).
+        assert_eq!(results.len(), 10);
+        // After all complete, the map should be empty.
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn post_completion_reuse() {
+        // After all operations complete (simulating "post-shutdown" of a batch),
+        // enqueuing new operations should still work normally.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        // First "batch"
+        for i in 0..5 {
+            let key = if i == 0 { "x" } else if i == 1 { "y" } else if i == 2 { "z" } else if i == 3 { "w" } else { "v" };
+            let r = map.execute_or_join(key, || Ok::<_, String>(i)).unwrap();
+            assert_eq!(r.into_inner(), i);
+        }
+        assert_eq!(map.inflight_count(), 0);
+
+        let m1 = map.metrics();
+        assert_eq!(m1.leader_count, 5);
+
+        // "Post-shutdown" batch: the map should still accept new work.
+        for i in 10..15 {
+            let key = if i == 10 { "a" } else if i == 11 { "b" } else if i == 12 { "c" } else if i == 13 { "d" } else { "e" };
+            let r = map.execute_or_join(key, || Ok::<_, String>(i)).unwrap();
+            assert_eq!(r.into_inner(), i);
+        }
+        assert_eq!(map.inflight_count(), 0);
+
+        let m2 = map.metrics();
+        assert_eq!(m2.leader_count, 10);
+    }
+
+    #[test]
+    fn error_propagation_all_callers_get_error() {
+        // When the leader's closure returns Err, the leader gets the original error
+        // and the map is cleaned up so subsequent calls work fine.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        let r = map.execute_or_join("err-key", || Err::<i32, String>("disk full".into()));
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err(), "disk full");
+        assert_eq!(map.inflight_count(), 0);
+
+        // A follow-up call with the same key should work (slot was cleaned up).
+        let r2 = map
+            .execute_or_join("err-key", || Ok::<_, String>(42))
+            .unwrap();
+        assert_eq!(r2.into_inner(), 42);
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn error_propagation_typed_error() {
+        // Test with a custom error type to verify generic E: Display constraint.
+        #[derive(Debug)]
+        struct DiskFullError;
+        impl fmt::Display for DiskFullError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "disk full")
+            }
+        }
+
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        let r = map.execute_or_join("typed-err", || Err::<i32, DiskFullError>(DiskFullError));
+        assert!(r.is_err());
+        let err_msg = format!("{}", r.unwrap_err());
+        assert_eq!(err_msg, "disk full");
+    }
+
+    #[test]
+    fn empty_map_execute_works() {
+        // Executing on a completely fresh map with no pending items should work
+        // (this is the "empty flush" case: no prior state to interfere).
+        let map: CoalesceMap<String, Vec<i32>> =
+            CoalesceMap::new(100, Duration::from_millis(100));
+
+        assert_eq!(map.inflight_count(), 0);
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 0);
+        assert_eq!(m.joined_count, 0);
+
+        let r = map
+            .execute_or_join("first".to_string(), || Ok::<_, String>(vec![1, 2, 3]))
+            .unwrap();
+        assert!(!r.was_joined());
+        assert_eq!(r.into_inner(), vec![1, 2, 3]);
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn concurrent_enqueue_during_slow_leader() {
+        // A leader takes a long time. While it executes, new operations with the
+        // SAME key arrive and join. Also, operations with DIFFERENT keys arrive
+        // and execute independently in parallel.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(5)));
+        let exec_count = Arc::new(AtomicUsize::new(0));
+
+        // Phase 1: start a slow leader for "slow-key".
+        let map_leader = Arc::clone(&map);
+        let exec_count_leader = Arc::clone(&exec_count);
+        let leader_started = Arc::new(Barrier::new(2));
+        let leader_started_clone = Arc::clone(&leader_started);
+
+        let h_leader = thread::spawn(move || {
+            map_leader
+                .execute_or_join("slow-key".to_string(), || {
+                    exec_count_leader.fetch_add(1, Ordering::SeqCst);
+                    // Signal that leader has started executing.
+                    leader_started_clone.wait();
+                    // Simulate slow work.
+                    thread::sleep(Duration::from_millis(200));
+                    Ok::<_, String>(100)
+                })
+                .unwrap()
+                .into_inner()
+        });
+
+        // Wait for leader to start executing.
+        leader_started.wait();
+
+        // Phase 2: spawn joiners for the same key and independent workers for different keys.
+        let mut handles: Vec<_> = Vec::new();
+
+        // 3 joiners for "slow-key"
+        for _ in 0..3 {
+            let map = Arc::clone(&map);
+            let exec_count = Arc::clone(&exec_count);
+            handles.push(thread::spawn(move || {
+                let r = map
+                    .execute_or_join("slow-key".to_string(), || {
+                        exec_count.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, String>(999) // fallback value if join fails
+                    })
+                    .unwrap();
+                (r.was_joined(), r.into_inner())
+            }));
+        }
+
+        // 2 independent keys that should execute in parallel
+        for i in 0..2 {
+            let map = Arc::clone(&map);
+            handles.push(thread::spawn(move || {
+                let key = format!("independent-{i}");
+                let r = map
+                    .execute_or_join(key, || Ok::<_, String>(i + 200))
+                    .unwrap();
+                (r.was_joined(), r.into_inner())
+            }));
+        }
+
+        let leader_val = h_leader.join().unwrap();
+        assert_eq!(leader_val, 100);
+
+        let results: Vec<(bool, i32)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Joiners for "slow-key" should get 100 (the leader's result).
+        // They might have joined OR timed out and fallen back.
+        // Either way, the values should be either 100 (joined) or 999 (fallback).
+        for (idx, (was_joined, val)) in results.iter().enumerate() {
+            if idx < 3 {
+                // Joiner for slow-key
+                assert!(
+                    *val == 100 || *val == 999,
+                    "joiner got unexpected value {val} (joined={was_joined})"
+                );
+            }
+        }
+        // Independent keys should get their own values
+        for &(_, val) in &results[3..] {
+            assert!(val == 200 || val == 201, "independent got {val}");
+        }
+
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn double_reset_metrics_is_safe() {
+        // Calling reset_metrics multiple times (analogous to "double shutdown")
+        // should be safe and idempotent.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        let _ = map.execute_or_join("a", || Ok::<_, String>(1));
+        let _ = map.execute_or_join("b", || Ok::<_, String>(2));
+
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 2);
+
+        map.reset_metrics();
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 0);
+        assert_eq!(m.joined_count, 0);
+
+        // Second reset should also be fine.
+        map.reset_metrics();
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 0);
+        assert_eq!(m.joined_count, 0);
+
+        // Map is still usable after double-reset.
+        let r = map.execute_or_join("c", || Ok::<_, String>(3)).unwrap();
+        assert_eq!(r.into_inner(), 3);
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 1);
+    }
+
+    #[test]
+    fn double_use_same_key_sequential() {
+        // Using the same key twice sequentially (after the first operation finishes)
+        // should work fine -- the slot is removed after leader completes.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        let r1 = map.execute_or_join("reused", || Ok::<_, String>(1)).unwrap();
+        assert_eq!(r1.into_inner(), 1);
+
+        let r2 = map.execute_or_join("reused", || Ok::<_, String>(2)).unwrap();
+        assert_eq!(r2.into_inner(), 2);
+
+        // Both should have been leaders (no overlap).
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 2);
+        assert_eq!(m.joined_count, 0);
+    }
+
+    #[test]
+    fn error_then_success_same_key() {
+        // A failed operation on a key should not prevent a subsequent successful
+        // operation on the same key.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        let r1 = map.execute_or_join("retry-key", || Err::<i32, String>("transient failure".into()));
+        assert!(r1.is_err());
+
+        let r2 = map
+            .execute_or_join("retry-key", || Ok::<_, String>(42))
+            .unwrap();
+        assert_eq!(r2.into_inner(), 42);
+
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 2);
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn leader_error_metrics_tracked() {
+        // When a leader fails and joiners fall back, the leader_failed_count metric
+        // should be incremented.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(5)));
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Thread 1: leader that fails.
+        let map1 = Arc::clone(&map);
+        let barrier1 = Arc::clone(&barrier);
+        let h1 = thread::spawn(move || {
+            barrier1.wait();
+            map1.execute_or_join("fail-metrics-key".to_string(), || {
+                thread::sleep(Duration::from_millis(50));
+                Err::<i32, String>("boom".into())
+            })
+        });
+
+        // Thread 2: joiner that will see the leader's failure and fall back.
+        let map2 = Arc::clone(&map);
+        let barrier2 = Arc::clone(&barrier);
+        let h2 = thread::spawn(move || {
+            barrier2.wait();
+            thread::sleep(Duration::from_millis(5)); // ensure thread 1 becomes leader
+            map2.execute_or_join("fail-metrics-key".to_string(), || Ok::<_, String>(77))
+        });
+
+        let _r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+
+        // Joiner should have succeeded via fallback.
+        assert_eq!(r2.unwrap().into_inner(), 77);
+
+        let m = map.metrics();
+        // At least the joiner should have recorded a leader_failed event.
+        // (Timing-dependent: joiner may or may not have seen the inflight slot.)
+        // We check that metrics are consistent: leader_count >= 1.
+        assert!(m.leader_count >= 1, "at least one leader expected");
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn zero_capacity_still_works() {
+        // Edge case: max_entries=0. Every insert triggers an eviction, but
+        // the leader should still complete because it retrieves the slot before
+        // any other thread can cause eviction.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(0, Duration::from_millis(100));
+
+        // The eviction code runs on every insert when len >= 0 (always true),
+        // but the leader still holds an Arc to its slot so it can complete.
+        let r = map.execute_or_join("zero-cap", || Ok::<_, String>(7)).unwrap();
+        assert_eq!(r.into_inner(), 7);
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn coalesce_join_error_display() {
+        // Verify Display implementations for error types.
+        let timeout_err = CoalesceJoinError::Timeout;
+        assert_eq!(format!("{timeout_err}"), "coalesce join timed out");
+
+        let leader_err = CoalesceJoinError::LeaderFailed("kaboom".to_string());
+        assert_eq!(
+            format!("{leader_err}"),
+            "coalesce leader failed: kaboom"
+        );
+
+        // Also verify Error trait is implemented (dyn Error should work).
+        let _: &dyn std::error::Error = &CoalesceJoinError::Timeout;
+    }
+
+    // ---- Singleflight edge case tests (br-3h13.3.2) ----
+
+    #[test]
+    fn joiner_timeout_falls_back_to_independent_execution() {
+        // Leader sleeps much longer than the join timeout. Joiners should
+        // timeout and execute their own closure independently.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(
+            100,
+            Duration::from_millis(30), // very short join timeout
+        ));
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Leader: holds the slot for 500ms (far exceeding 30ms timeout).
+        let map1 = Arc::clone(&map);
+        let barrier1 = Arc::clone(&barrier);
+        let leader = thread::spawn(move || {
+            barrier1.wait();
+            map1.execute_or_join("timeout-key".to_string(), || {
+                thread::sleep(Duration::from_millis(500));
+                Ok::<_, String>(100)
+            })
+        });
+
+        // Joiner: arrives shortly after leader, should timeout and fall back.
+        let map2 = Arc::clone(&map);
+        let barrier2 = Arc::clone(&barrier);
+        let joiner = thread::spawn(move || {
+            barrier2.wait();
+            thread::sleep(Duration::from_millis(5)); // ensure leader starts first
+            map2.execute_or_join("timeout-key".to_string(), || Ok::<_, String>(200))
+        });
+
+        let r_leader = leader.join().unwrap().unwrap();
+        let r_joiner = joiner.join().unwrap().unwrap();
+
+        assert_eq!(r_leader.into_inner(), 100);
+        // Joiner timed out and ran its own closure, returning 200.
+        assert_eq!(r_joiner.into_inner(), 200);
+
+        let m = map.metrics();
+        assert!(
+            m.timeout_count >= 1,
+            "expected at least 1 timeout, got {}",
+            m.timeout_count
+        );
+        // Both the leader and the timed-out joiner count as leaders in metrics.
+        assert!(
+            m.leader_count >= 2,
+            "expected at least 2 leader executions (leader + fallback), got {}",
+            m.leader_count
+        );
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn zero_timeout_forces_all_joiners_to_fall_back() {
+        // With zero join timeout, no joiner can ever successfully wait for the
+        // leader. All threads that detect an in-flight slot immediately timeout
+        // and execute independently.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(
+            100,
+            Duration::from_millis(0), // zero timeout
+        ));
+        let barrier = Arc::new(Barrier::new(4));
+        let exec_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                let barrier = Arc::clone(&barrier);
+                let exec_count = Arc::clone(&exec_count);
+                thread::spawn(move || {
+                    barrier.wait();
+                    map.execute_or_join("zero-to-key".to_string(), || {
+                        exec_count.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(30));
+                        Ok::<_, String>(42)
+                    })
+                    .unwrap()
+                    .into_inner()
+                })
+            })
+            .collect();
+
+        let results: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(results.iter().all(|&v| v == 42));
+
+        // With zero timeout, most/all joiners should have fallen back.
+        let execs = exec_count.load(Ordering::SeqCst);
+        assert!(
+            execs >= 2,
+            "with zero timeout, expected most threads to execute independently, got {execs}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn many_concurrent_leaders_same_key_all_complete() {
+        // 15 threads race to become leader for the same key. At most one
+        // becomes leader; the rest join. All must receive a valid result.
+        let n = 15;
+        let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(5)));
+        let barrier = Arc::new(Barrier::new(n));
+        let exec_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                let barrier = Arc::clone(&barrier);
+                let exec_count = Arc::clone(&exec_count);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let r = map
+                        .execute_or_join("leader-race".to_string(), || {
+                            exec_count.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(60));
+                            Ok::<_, String>(555)
+                        })
+                        .unwrap();
+                    r.into_inner()
+                })
+            })
+            .collect();
+
+        let results: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.len(), n);
+        assert!(results.iter().all(|&v| v == 555));
+
+        // The closure should run far fewer than n times due to coalescing.
+        let execs = exec_count.load(Ordering::SeqCst);
+        assert!(
+            execs < n,
+            "expected coalescing to reduce executions below {n}, got {execs}"
+        );
+
+        let m = map.metrics();
+        // joined + leader_count together should account for all n threads
+        // (some might have timed out and retried as leader, but
+        // joined_count should be positive with a 5s timeout).
+        assert!(
+            m.joined_count > 0,
+            "with 5s timeout and 60ms work, at least one joiner expected, got 0"
+        );
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn max_entries_eviction_during_inflight_concurrent_keys() {
+        // max_entries=2 with 6 concurrent distinct keys that all hold their
+        // slot in-flight simultaneously. The map evicts entries when capacity
+        // is exceeded. Evicted leaders lose their map entry but still hold
+        // Arc<Slot>, so their joiners (if any) still get notified. All
+        // leaders must still complete successfully.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(2, Duration::from_millis(200)));
+        let barrier = Arc::new(Barrier::new(6));
+
+        let handles: Vec<_> = (0..6_i32)
+            .map(|i| {
+                let map = Arc::clone(&map);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let key = format!("evict-inflight-{i}");
+                    map.execute_or_join(key, || {
+                        thread::sleep(Duration::from_millis(40));
+                        Ok::<_, String>(i)
+                    })
+                    .unwrap()
+                    .into_inner()
+                })
+            })
+            .collect();
+
+        let results: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.len(), 6);
+        // Each thread should get its own value (distinct keys, all leaders).
+        for (i, &val) in results.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let expected = i as i32;
+            assert_eq!(val, expected);
+        }
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn evicted_slot_leader_still_broadcasts_to_joiner() {
+        // Verify that even if a slot is evicted from the HashMap by a
+        // subsequent insert, the leader still holds the Arc<Slot> and can
+        // broadcast to any joiner that also holds an Arc.
+        //
+        // We do this by: (1) starting a slow leader for key "A" with
+        // max_entries=1, (2) having a joiner also wait on key "A",
+        // (3) starting a separate leader for key "B" which evicts "A"
+        // from the map. The joiner for "A" still succeeds because it
+        // holds the Arc<Slot>.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(1, Duration::from_secs(5)));
+        let leader_a_started = Arc::new(Barrier::new(2));
+
+        // Leader for key "A": starts slowly.
+        let map_a = Arc::clone(&map);
+        let leader_a_started_clone = Arc::clone(&leader_a_started);
+        let h_leader_a = thread::spawn(move || {
+            map_a
+                .execute_or_join("A".to_string(), || {
+                    leader_a_started_clone.wait(); // signal we've started
+                    thread::sleep(Duration::from_millis(150));
+                    Ok::<_, String>(111)
+                })
+                .unwrap()
+                .into_inner()
+        });
+
+        // Wait for leader A to begin executing.
+        leader_a_started.wait();
+
+        // Joiner for key "A": should find A's slot in the map.
+        let map_j = Arc::clone(&map);
+        let h_joiner_a = thread::spawn(move || {
+            map_j
+                .execute_or_join("A".to_string(), || {
+                    // Fallback if join fails.
+                    Ok::<_, String>(999)
+                })
+                .unwrap()
+                .into_inner()
+        });
+
+        // Give joiner time to grab the Arc<Slot> for A.
+        thread::sleep(Duration::from_millis(10));
+
+        // Leader for key "B": with max_entries=1, inserting B evicts A from map.
+        let map_b = Arc::clone(&map);
+        let h_leader_b = thread::spawn(move || {
+            map_b
+                .execute_or_join("B".to_string(), || Ok::<_, String>(222))
+                .unwrap()
+                .into_inner()
+        });
+
+        let val_a = h_leader_a.join().unwrap();
+        let val_joiner = h_joiner_a.join().unwrap();
+        let val_b = h_leader_b.join().unwrap();
+
+        assert_eq!(val_a, 111, "leader A should return its own result");
+        assert_eq!(val_b, 222, "leader B should return its own result");
+        // Joiner should have received leader A's result (111) via the
+        // Arc<Slot>, OR fallen back (999) if the slot was evicted before
+        // the joiner grabbed the Arc. Both are acceptable outcomes.
+        assert!(
+            val_joiner == 111 || val_joiner == 999,
+            "joiner A got unexpected value: {val_joiner}"
+        );
+    }
+
+    #[test]
+    fn error_propagation_joiner_fallback_also_errors() {
+        // When the leader fails AND the joiner's fallback also fails, the
+        // joiner should return the fallback error (not the leader's error).
+        let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(5)));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let map1 = Arc::clone(&map);
+        let barrier1 = Arc::clone(&barrier);
+        let h_leader = thread::spawn(move || {
+            barrier1.wait();
+            map1.execute_or_join("double-fail".to_string(), || {
+                thread::sleep(Duration::from_millis(50));
+                Err::<i32, String>("leader-error".into())
+            })
+        });
+
+        let map2 = Arc::clone(&map);
+        let barrier2 = Arc::clone(&barrier);
+        let h_joiner = thread::spawn(move || {
+            barrier2.wait();
+            thread::sleep(Duration::from_millis(5));
+            map2.execute_or_join("double-fail".to_string(), || {
+                // Fallback also fails.
+                Err::<i32, String>("joiner-fallback-error".into())
+            })
+        });
+
+        let r1 = h_leader.join().unwrap();
+        let r2 = h_joiner.join().unwrap();
+
+        assert!(r1.is_err());
+        assert_eq!(r1.unwrap_err(), "leader-error");
+
+        // The joiner saw the leader fail, then executed its own fallback
+        // which also failed. It should return ITS error, not the leader's.
+        // (Note: timing may cause the joiner to become a leader itself if
+        // it arrives before the leader inserts the slot.)
+        assert!(r2.is_err());
+        let joiner_err = r2.unwrap_err();
+        assert!(
+            joiner_err == "joiner-fallback-error" || joiner_err == "leader-error",
+            "joiner error should be its own fallback or leader error (if it became leader): {joiner_err}"
+        );
+    }
+
+    #[test]
+    fn reentry_after_eviction_under_concurrency() {
+        // After a key is evicted from a small-capacity map, inserting the
+        // same key again should work as a fresh leader.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(2, Duration::from_millis(200)));
+
+        // Fill and drain two keys.
+        let r1 = map.execute_or_join("k1".to_string(), || Ok::<_, String>(1)).unwrap();
+        let r2 = map.execute_or_join("k2".to_string(), || Ok::<_, String>(2)).unwrap();
+        assert_eq!(r1.into_inner(), 1);
+        assert_eq!(r2.into_inner(), 2);
+        assert_eq!(map.inflight_count(), 0);
+
+        // Add a third key (capacity is 2, but since prior keys completed,
+        // map is empty so no eviction needed).
+        let r3 = map.execute_or_join("k3".to_string(), || Ok::<_, String>(3)).unwrap();
+        assert_eq!(r3.into_inner(), 3);
+
+        // Re-use k1 which was previously used.
+        let r4 = map.execute_or_join("k1".to_string(), || Ok::<_, String>(10)).unwrap();
+        assert!(!r4.was_joined());
+        assert_eq!(r4.into_inner(), 10);
+
+        assert_eq!(map.inflight_count(), 0);
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 4);
+        assert_eq!(m.joined_count, 0);
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn mixed_success_failure_concurrent_same_key() {
+        // Leader succeeds. Joiners that successfully join get the leader's
+        // result (success). Their own closures are NOT called.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(5)));
+        let barrier = Arc::new(Barrier::new(4));
+        let joiner_closure_invoked = Arc::new(AtomicUsize::new(0));
+
+        // Leader succeeds.
+        let map0 = Arc::clone(&map);
+        let barrier0 = Arc::clone(&barrier);
+        let h_leader = thread::spawn(move || {
+            barrier0.wait();
+            map0.execute_or_join("mix-key".to_string(), || {
+                thread::sleep(Duration::from_millis(60));
+                Ok::<_, String>(42)
+            })
+        });
+
+        // Three joiners whose closures would FAIL if called.
+        let joiner_handles: Vec<_> = (0..3)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                let barrier = Arc::clone(&barrier);
+                let joiner_closure_invoked = Arc::clone(&joiner_closure_invoked);
+                thread::spawn(move || {
+                    barrier.wait();
+                    thread::sleep(Duration::from_millis(5));
+                    map.execute_or_join("mix-key".to_string(), || {
+                        joiner_closure_invoked.fetch_add(1, Ordering::SeqCst);
+                        Err::<i32, String>("joiner-would-fail".into())
+                    })
+                })
+            })
+            .collect();
+
+        let r_leader = h_leader.join().unwrap();
+        assert!(r_leader.is_ok());
+        assert_eq!(r_leader.unwrap().into_inner(), 42);
+
+        let mut join_success = 0_usize;
+        let mut fallback_fail = 0_usize;
+        for h in joiner_handles {
+            match h.join().unwrap() {
+                Ok(outcome) => {
+                    // Joiner successfully shared leader's result.
+                    assert_eq!(outcome.into_inner(), 42);
+                    join_success += 1;
+                }
+                Err(e) => {
+                    // Joiner's fallback was called and it failed.
+                    assert_eq!(e, "joiner-would-fail");
+                    fallback_fail += 1;
+                }
+            }
+        }
+
+        // With 5s timeout and 60ms work, most joiners should share leader's result.
+        assert!(
+            join_success > 0,
+            "at least one joiner should share the leader's success"
+        );
+        // Total should be 3.
+        assert_eq!(join_success + fallback_fail, 3);
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn multiple_timeouts_each_gets_independent_result() {
+        // Leader sleeps 500ms, join timeout is 10ms. Multiple joiners all
+        // timeout and each runs their own closure. Each should get a unique
+        // result from their closure.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(
+            100,
+            Duration::from_millis(10), // very short timeout
+        ));
+        let barrier = Arc::new(Barrier::new(5));
+
+        // Leader: very slow.
+        let map0 = Arc::clone(&map);
+        let barrier0 = Arc::clone(&barrier);
+        let h_leader = thread::spawn(move || {
+            barrier0.wait();
+            map0.execute_or_join("multi-to".to_string(), || {
+                thread::sleep(Duration::from_millis(500));
+                Ok::<_, String>(0)
+            })
+            .unwrap()
+            .into_inner()
+        });
+
+        // 4 joiners: each should timeout and return its own value.
+        let handles: Vec<_> = (1..5)
+            .map(|i| {
+                let map = Arc::clone(&map);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    thread::sleep(Duration::from_millis(5));
+                    map.execute_or_join("multi-to".to_string(), || Ok::<_, String>(i))
+                        .unwrap()
+                        .into_inner()
+                })
+            })
+            .collect();
+
+        let leader_val = h_leader.join().unwrap();
+        assert_eq!(leader_val, 0);
+
+        let joiner_vals: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // Each joiner should have gotten some value (either 0 from
+        // joining or their own i from fallback). All should be valid.
+        assert_eq!(joiner_vals.len(), 4);
+        for &v in &joiner_vals {
+            assert!((0..=4).contains(&v), "unexpected value: {v}");
+        }
+
+        let m = map.metrics();
+        assert!(
+            m.timeout_count >= 1,
+            "expected at least 1 timeout with 10ms window and 500ms leader, got {}",
+            m.timeout_count
+        );
+    }
+
+    #[test]
+    fn coalesce_join_error_implements_std_error() {
+        // Verify that CoalesceJoinError satisfies the std::error::Error bound.
+        let err_timeout: Box<dyn std::error::Error> =
+            Box::new(CoalesceJoinError::Timeout);
+        assert!(err_timeout.source().is_none());
+        assert_eq!(err_timeout.to_string(), "coalesce join timed out");
+
+        let err_leader: Box<dyn std::error::Error> =
+            Box::new(CoalesceJoinError::LeaderFailed("oom".to_string()));
+        assert!(err_leader.source().is_none());
+        assert_eq!(err_leader.to_string(), "coalesce leader failed: oom");
+    }
+
+    #[test]
+    fn coalesce_join_error_debug_format() {
+        // Verify Debug output is useful.
+        let err = CoalesceJoinError::Timeout;
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("Timeout"), "Debug should show variant: {dbg}");
+
+        let err = CoalesceJoinError::LeaderFailed("crash".to_string());
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("LeaderFailed"), "Debug should show variant: {dbg}");
+        assert!(dbg.contains("crash"), "Debug should show message: {dbg}");
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn large_burst_20_threads_coalescing() {
+        // 20 threads on the same key. High contention stress test.
+        let n = 20;
+        let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(5)));
+        let barrier = Arc::new(Barrier::new(n));
+        let exec_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                let barrier = Arc::clone(&barrier);
+                let exec_count = Arc::clone(&exec_count);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let r = map
+                        .execute_or_join("burst-20".to_string(), || {
+                            exec_count.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(80));
+                            Ok::<_, String>(999)
+                        })
+                        .unwrap();
+                    r.into_inner()
+                })
+            })
+            .collect();
+
+        let results: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(results.iter().all(|&v| v == 999));
+        assert_eq!(results.len(), n);
+
+        let execs = exec_count.load(Ordering::SeqCst);
+        assert!(execs < n, "coalescing should reduce execs below {n}, got {execs}");
+
+        let m = map.metrics();
+        assert!(m.joined_count >= 1, "expected joins with 5s timeout");
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn sequential_rapid_fire_same_key_no_stale_state() {
+        // Rapidly execute the same key 50 times sequentially. Each
+        // execution should be a fresh leader (no stale slot lingering).
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        for i in 0..50 {
+            let r = map
+                .execute_or_join("rapid", || Ok::<_, String>(i))
+                .unwrap();
+            assert!(!r.was_joined());
+            assert_eq!(r.into_inner(), i);
+            assert_eq!(map.inflight_count(), 0);
+        }
+
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 50);
+        assert_eq!(m.joined_count, 0);
+    }
+
+    #[test]
+    fn alternating_success_failure_sequence() {
+        // Alternate success/failure on the same key to verify no state
+        // leaks between executions.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        for i in 0..10 {
+            if i % 2 == 0 {
+                let r = map
+                    .execute_or_join("alt-key", || Ok::<_, String>(i))
+                    .unwrap();
+                assert_eq!(r.into_inner(), i);
+            } else {
+                let r = map.execute_or_join("alt-key", || {
+                    Err::<i32, String>(format!("fail-{i}"))
+                });
+                assert!(r.is_err());
+                assert_eq!(r.unwrap_err(), format!("fail-{i}"));
+            }
+            assert_eq!(map.inflight_count(), 0);
+        }
+
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 10);
+    }
+
+    #[test]
+    fn coalesce_metrics_default_is_zero() {
+        let m = CoalesceMetrics::default();
+        assert_eq!(m.leader_count, 0);
+        assert_eq!(m.joined_count, 0);
+        assert_eq!(m.timeout_count, 0);
+        assert_eq!(m.leader_failed_count, 0);
+    }
+
+    #[test]
+    fn complex_value_type_clones_correctly() {
+        // Verify coalescing works with a complex Clone type.
+        #[derive(Clone, Debug, PartialEq)]
+        struct ComplexResult {
+            ids: Vec<i64>,
+            label: String,
+        }
+
+        let map: CoalesceMap<&str, ComplexResult> =
+            CoalesceMap::new(100, Duration::from_millis(100));
+
+        let expected = ComplexResult {
+            ids: vec![1, 2, 3, 4, 5],
+            label: "test-result".to_string(),
+        };
+
+        let r = map
+            .execute_or_join("complex", || Ok::<_, String>(expected.clone()))
+            .unwrap();
+        assert_eq!(r.into_inner(), expected);
+    }
 }

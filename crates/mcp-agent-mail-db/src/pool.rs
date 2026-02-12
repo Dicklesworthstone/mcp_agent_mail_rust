@@ -345,6 +345,69 @@ impl DbPool {
                         }
                     }
 
+                    // For file-backed DBs, run DB-wide init (WAL mode, migrations) with
+                    // C-backed SqliteConnection BEFORE opening FrankenConnection.
+                    // FrankenConnection and SqliteConnection must never be open on the
+                    // same file simultaneously — concurrent access corrupts the database.
+                    if sqlite_path != ":memory:" {
+                        let init_gate = sqlite_init_gate(&sqlite_path);
+                        let run_migrations = run_migrations;
+
+                        let gate_out = init_gate
+                            .get_or_try_init(|| {
+                                let cx2 = cx2.clone();
+                                let sqlite_path = sqlite_path.clone();
+                                async move {
+                                    // Use C-backed SqliteConnection for DB-wide init.
+                                    //
+                                    // IMPORTANT: Only run *base* migrations (no FTS5 virtual
+                                    // tables, no triggers). FrankenConnection cannot open
+                                    // database files that contain FTS5 shadow table pages
+                                    // ("cell has no rowid" error). Search falls back to LIKE
+                                    // automatically when FTS5 tables are absent.
+                                    let mig_conn = sqlmodel_sqlite::SqliteConnection::open_file(
+                                        &sqlite_path,
+                                    )
+                                    .map_err(Outcome::<(), SqlError>::Err)?;
+
+                                    if let Err(e) =
+                                        mig_conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
+                                    {
+                                        return Err(Outcome::Err(e));
+                                    }
+                                    if run_migrations {
+                                        match schema::migrate_to_latest_base(&cx2, &mig_conn)
+                                            .await
+                                        {
+                                            Outcome::Ok(_) => {}
+                                            Outcome::Err(e) => return Err(Outcome::Err(e)),
+                                            Outcome::Cancelled(r) => {
+                                                return Err(Outcome::Cancelled(r));
+                                            }
+                                            Outcome::Panicked(p) => {
+                                                return Err(Outcome::Panicked(p));
+                                            }
+                                        }
+                                    }
+                                    // Drop SqliteConnection before FrankenConnection opens.
+                                    drop(mig_conn);
+                                    Ok(())
+                                }
+                            })
+                            .await;
+
+                        match gate_out {
+                            Ok(()) => {}
+                            Err(Outcome::Err(e)) => return Outcome::Err(e),
+                            Err(Outcome::Cancelled(r)) => return Outcome::Cancelled(r),
+                            Err(Outcome::Panicked(p)) => return Outcome::Panicked(p),
+                            Err(Outcome::Ok(())) => {
+                                unreachable!("sqlite init gate returned Err(Outcome::Ok(()))")
+                            }
+                        }
+                    }
+
+                    // Now open FrankenConnection — SqliteConnection is fully closed.
                     let conn = if sqlite_path == ":memory:" {
                         match DbConn::open_memory() {
                             Ok(c) => c,
@@ -360,61 +423,6 @@ impl DbPool {
                     // Per-connection PRAGMAs matching legacy Python `db.py` event listeners.
                     if let Err(e) = conn.execute_raw(&init_sql) {
                         return Outcome::Err(e);
-                    }
-
-                    if sqlite_path == ":memory:" {
-                        // In-memory DB connections do not share state. Each connection must run
-                        // migrations independently.
-                        if run_migrations {
-                            match schema::migrate_to_latest(&cx2, &conn).await {
-                                Outcome::Ok(_) => {}
-                                Outcome::Err(e) => return Outcome::Err(e),
-                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                                Outcome::Panicked(p) => return Outcome::Panicked(p),
-                            }
-                        }
-                    } else {
-                        // File-backed DB: apply DB-wide initialization exactly once per sqlite file.
-                        // This avoids high-concurrency races where multiple new connections try to
-                        // set WAL mode and/or run migrations simultaneously.
-                        let init_gate = sqlite_init_gate(&sqlite_path);
-                        let run_migrations = run_migrations;
-                        let conn_ref = &conn;
-
-                        let gate_out = init_gate
-                            .get_or_try_init(|| {
-                                let cx2 = cx2.clone();
-                                async move {
-                                    if let Err(e) = conn_ref.execute_raw(schema::PRAGMA_DB_INIT_SQL)
-                                    {
-                                        return Err(Outcome::Err(e));
-                                    }
-                                    if run_migrations {
-                                        match schema::migrate_to_latest(&cx2, conn_ref).await {
-                                            Outcome::Ok(_) => {}
-                                            Outcome::Err(e) => return Err(Outcome::Err(e)),
-                                            Outcome::Cancelled(r) => {
-                                                return Err(Outcome::Cancelled(r));
-                                            }
-                                            Outcome::Panicked(p) => {
-                                                return Err(Outcome::Panicked(p));
-                                            }
-                                        }
-                                    }
-                                    Ok(())
-                                }
-                            })
-                            .await;
-
-                        match gate_out {
-                            Ok(()) => {}
-                            Err(Outcome::Err(e)) => return Outcome::Err(e),
-                            Err(Outcome::Cancelled(r)) => return Outcome::Cancelled(r),
-                            Err(Outcome::Panicked(p)) => return Outcome::Panicked(p),
-                            Err(Outcome::Ok(())) => {
-                                unreachable!("sqlite init gate returned Err(Outcome::Ok(()))")
-                            }
-                        }
                     }
 
                     Outcome::Ok(conn)
@@ -760,35 +768,27 @@ mod tests {
 
     #[test]
     fn test_schema_init_in_memory() {
-        use sqlmodel_core::{Row, Value};
+        // Use base schema (no FTS5/triggers) because DbConn is FrankenConnection.
 
         // Open in-memory connection
         let conn = DbConn::open_memory().expect("failed to open in-memory db");
 
-        // Get schema SQL
-        let sql = schema::init_schema_sql();
+        // Get base schema SQL (no FTS5 virtual tables or triggers)
+        let sql = schema::init_schema_sql_base();
         println!("Schema SQL length: {} bytes", sql.len());
 
         // Execute it
         conn.execute_raw(&sql).expect("failed to init schema");
 
-        // Verify a table exists by querying it
-        let rows: Vec<Row> = conn
-            .query_sync(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-                &[],
-            )
-            .expect("failed to query tables");
-
-        let table_names: Vec<String> = rows
+        // Verify tables exist by querying them directly (FrankenConnection
+        // does not support sqlite_master; use simple SELECT to verify).
+        let table_names: Vec<String> = ["projects", "agents", "messages"]
             .iter()
-            .filter_map(|r: &Row| {
-                if let Some(Value::Text(s)) = r.get_by_name("name") {
-                    Some(s.clone())
-                } else {
-                    None
-                }
+            .filter(|&&t| {
+                conn.query_sync(&format!("SELECT 1 FROM {t} LIMIT 0"), &[])
+                    .is_ok()
             })
+            .map(ToString::to_string)
             .collect();
 
         println!("Created tables: {table_names:?}");

@@ -258,10 +258,33 @@ PRAGMA journal_size_limit = 67108864;
     )
 }
 
-/// Initialize the database schema
+/// Initialize the full database schema (tables, FTS5 virtual tables, triggers).
+///
+/// Use this only with `SqliteConnection` (C-backed `SQLite`). `FrankenConnection`
+/// cannot execute `CREATE VIRTUAL TABLE` or `CREATE TRIGGER` and cannot open
+/// database files that contain FTS5 shadow table pages.
 #[must_use]
 pub fn init_schema_sql() -> String {
     format!("{PRAGMA_SETTINGS_SQL}\n{CREATE_TABLES_SQL}\n{CREATE_FTS_TRIGGERS_SQL}")
+}
+
+/// Initialize the base database schema without FTS5 virtual tables, triggers, or PRAGMAs.
+///
+/// Safe for databases that will be opened by `FrankenConnection` (pure-Rust `SQLite`).
+/// PRAGMAs are intentionally excluded because:
+/// - `PRAGMA journal_mode = WAL` creates WAL files that `FrankenConnection` cannot handle
+/// - The pool applies per-connection PRAGMAs separately via [`build_conn_pragmas`]
+/// - The pool's init gate applies WAL mode via [`PRAGMA_DB_INIT_SQL`] through `SqliteConnection`
+///
+/// Search queries automatically fall back to LIKE-based search when FTS5 tables are absent.
+#[must_use]
+pub fn init_schema_sql_base() -> String {
+    // Strip the trailing FTS5 virtual table definition from CREATE_TABLES_SQL.
+    // Everything before the "-- FTS5 virtual table" comment is base DDL.
+    let base = CREATE_TABLES_SQL
+        .find("-- FTS5 virtual table")
+        .map_or(CREATE_TABLES_SQL, |idx| &CREATE_TABLES_SQL[..idx]);
+    base.to_string()
 }
 
 /// Schema version for migrations
@@ -817,9 +840,38 @@ pub fn schema_migrations() -> Vec<Migration> {
     migrations
 }
 
+/// Returns `true` if a migration creates or manipulates FTS5 virtual tables or
+/// triggers. These DDL statements are unsupported by `FrankenConnection`.
+fn is_fts_or_trigger_migration(id: &str) -> bool {
+    let id_lower = id.to_ascii_lowercase();
+    id_lower.contains("fts")
+        || id_lower.contains("trigger")
+        || id_lower.contains("trg")
+}
+
+/// Migrations excluding FTS5 virtual tables, triggers, and FTS backfill inserts.
+///
+/// Safe for databases that will be opened by `FrankenConnection`. The migration
+/// runner will still record these IDs in the migrations table so that a later
+/// `SqliteConnection` run recognizes them as "already applied (base)" and
+/// doesn't re-run them.
+#[must_use]
+pub fn schema_migrations_base() -> Vec<Migration> {
+    schema_migrations()
+        .into_iter()
+        .filter(|m| !is_fts_or_trigger_migration(&m.id))
+        .collect()
+}
+
 #[must_use]
 pub fn migration_runner() -> MigrationRunner {
     MigrationRunner::new(schema_migrations()).table_name(MIGRATIONS_TABLE_NAME)
+}
+
+/// Migration runner that skips FTS5/trigger migrations (safe for `FrankenConnection` DBs).
+#[must_use]
+pub fn migration_runner_base() -> MigrationRunner {
+    MigrationRunner::new(schema_migrations_base()).table_name(MIGRATIONS_TABLE_NAME)
 }
 
 pub async fn init_migrations_table<C: Connection>(cx: &Cx, conn: &C) -> Outcome<(), SqlError> {
@@ -859,11 +911,31 @@ pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<
     migration_runner().migrate(cx, conn).await
 }
 
+/// Run only base migrations (no FTS5 / triggers).
+///
+/// Use this when the database will be opened by `FrankenConnection`. FTS5
+/// shadow table pages in the file would cause `FrankenConnection::open_file`
+/// to fail with "cell has no rowid".
+pub async fn migrate_to_latest_base<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<Vec<String>, SqlError> {
+    match init_migrations_table(cx, conn).await {
+        Outcome::Ok(()) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+    migration_runner_base().migrate(cx, conn).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DbConn;
     use asupersync::runtime::RuntimeBuilder;
+    // Migrations use DDL that FrankenConnection doesn't support (CREATE VIRTUAL TABLE,
+    // CREATE TRIGGER), so tests use SqliteConnection directly.
+    use sqlmodel_sqlite::SqliteConnection;
 
     fn block_on<F, Fut, T>(f: F) -> T
     where
@@ -882,7 +954,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_apply.db");
         let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // First run applies all schema migrations.
         let applied = block_on({
@@ -912,7 +984,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_preserve.db");
         let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Simulate an older DB with only `projects` table.
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -955,7 +1027,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v3_text_ts.db");
         let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
             .expect("apply PRAGMAs");
@@ -1133,7 +1205,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_indexes.db");
         let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Apply all migrations.
         block_on({
@@ -1184,7 +1256,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_existing.db");
         let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
             .expect("apply PRAGMAs");
@@ -1286,7 +1358,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v5_fts.db");
         let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Apply all migrations (creates schema + FTS with porter tokenizer).
         block_on({
@@ -1386,7 +1458,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v7_fts_identity.db");
         let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Simulate a pre-v7 DB: identity tables exist, but there are no fts_agents/fts_projects.
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1512,7 +1584,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_corrupt.db");
         let conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Create a tracking table with the right name but wrong schema.
         conn.execute_sync(

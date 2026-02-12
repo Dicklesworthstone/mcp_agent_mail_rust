@@ -20,7 +20,8 @@ use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_db::schema::{
     self, MIGRATIONS_TABLE_NAME, PRAGMA_SETTINGS_SQL, migrate_to_latest, migration_status,
 };
-use mcp_agent_mail_db::{DbConn, DbPool, DbPoolConfig};
+use mcp_agent_mail_db::{DbPool, DbPoolConfig};
+use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use sqlmodel_core::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -42,13 +43,15 @@ where
     rt.block_on(f(cx))
 }
 
-/// Create a file-backed `DbConn` in a temporary directory.
-fn open_temp_db() -> (DbConn, tempfile::TempDir) {
+/// Create a file-backed `SqliteConnection` in a temporary directory.
+/// Uses C-backed `SQLite` so tests can query `sqlite_master` for schema verification.
+fn open_temp_db() -> (SqliteConnection, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("create tempdir");
     let db_path = dir
         .path()
         .join(format!("schema_mig_{}.db", unique_suffix()));
-    let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+    let conn =
+        SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
     (conn, dir)
 }
 
@@ -1524,4 +1527,305 @@ fn data_survives_complete_migration_roundtrip() {
         rows[0].get_named::<i64>("ack_pending_count").unwrap_or(0),
         1
     );
+}
+
+/// Test whether FrankenConnection corrupts a DB created by SqliteConnection.
+/// Reproduces the "malformed database schema (agent_links) - duplicate column name" error.
+#[test]
+fn frankenconnection_does_not_corrupt_schema() {
+    use mcp_agent_mail_db::DbConn;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("test_corruption.db");
+    let path_str = db_path.display().to_string();
+
+    // 1. Create DB with SqliteConnection (base schema, no FTS5/triggers)
+    let conn = SqliteConnection::open_file(&path_str).expect("open sqlite");
+    conn.execute_raw(&schema::init_schema_sql_base())
+        .expect("init base schema");
+    conn.execute_sync(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp/test', 0)",
+        &[],
+    )
+    .expect("insert project");
+    drop(conn);
+
+    // 2. Verify schema is valid + dump sqlite_master
+    let conn = SqliteConnection::open_file(&path_str).expect("reopen sqlite");
+    conn.query_sync("SELECT * FROM agent_links", &[])
+        .expect("query agent_links before FrankenConnection");
+
+    // 2b. Dump sqlite_master schema SQL BEFORE FrankenConnection
+    let schema_before: Vec<String> = conn
+        .query_sync("SELECT type, name, sql FROM sqlite_master ORDER BY rowid", &[])
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let typ: String = r.get_named("type").unwrap_or_default();
+            let name: String = r.get_named("name").unwrap_or_default();
+            let sql: String = r.get_named("sql").unwrap_or_default();
+            format!("{typ}: {name} => {}", &sql[..sql.len().min(100)])
+        })
+        .collect();
+    eprintln!("BEFORE FrankenConnection ({} entries):", schema_before.len());
+    for s in &schema_before {
+        eprintln!("  {s}");
+    }
+    drop(conn);
+
+    // 3. Open with FrankenConnection and do a write
+    let fconn = DbConn::open_file(&path_str).expect("open franken");
+    fconn
+        .execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (2, 'test2', '/tmp/test2', 0)",
+            &[],
+        )
+        .expect("franken insert");
+    drop(fconn);
+
+    // 4. Re-verify with SqliteConnection — schema should still be valid
+    let conn = SqliteConnection::open_file(&path_str).expect("reopen sqlite after franken");
+
+    // 4a. Dump sqlite_master schema SQL AFTER FrankenConnection
+    match conn.query_sync("SELECT type, name, sql FROM sqlite_master ORDER BY rowid", &[]) {
+        Ok(rows) => {
+            eprintln!("AFTER FrankenConnection ({} entries):", rows.len());
+            for r in &rows {
+                let typ: String = r.get_named("type").unwrap_or_default();
+                let name: String = r.get_named("name").unwrap_or_default();
+                let sql: String = r.get_named("sql").unwrap_or_default();
+                eprintln!("  {typ}: {name} => {}", &sql[..sql.len().min(200)]);
+            }
+        }
+        Err(e) => eprintln!("AFTER: Failed to read sqlite_master: {e}"),
+    }
+
+    match conn.query_sync("SELECT * FROM agent_links", &[]) {
+        Ok(_) => {} // Schema is fine
+        Err(e) => panic!("FrankenConnection corrupted DB schema: {e}"),
+    }
+    conn.execute_sync("UPDATE projects SET slug = 'updated' WHERE id = 1", &[])
+        .expect("update after franken should work");
+}
+
+/// Does FrankenConnection corrupt even without writing (just open + close)?
+#[test]
+fn frankenconnection_open_close_no_write() {
+    use mcp_agent_mail_db::DbConn;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("test_nowrite.db");
+    let path_str = db_path.display().to_string();
+
+    // Create DB with our schema
+    let conn = SqliteConnection::open_file(&path_str).expect("open");
+    conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+    conn.execute_sync(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp/test', 0)",
+        &[],
+    ).unwrap();
+    drop(conn);
+
+    // Just open and close FrankenConnection without writing
+    let fconn = DbConn::open_file(&path_str).expect("franken open");
+    drop(fconn);
+
+    // Check if schema is still valid
+    let conn = SqliteConnection::open_file(&path_str).expect("reopen");
+    match conn.query_sync("SELECT * FROM agent_links", &[]) {
+        Ok(_) => eprintln!("open_close_no_write: schema OK"),
+        Err(e) => panic!("FrankenConnection corrupted schema just by opening: {e}"),
+    }
+}
+
+/// Does corruption happen with AUTOINCREMENT specifically?
+#[test]
+fn frankenconnection_autoincrement_write() {
+    use mcp_agent_mail_db::DbConn;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Test A: Write to table WITHOUT AUTOINCREMENT (manual ID)
+    {
+        let db_path = dir.path().join("test_no_autoincrement.db");
+        let path_str = db_path.display().to_string();
+        let conn = SqliteConnection::open_file(&path_str).expect("open");
+        conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+        drop(conn);
+
+        let fconn = DbConn::open_file(&path_str).expect("franken open");
+        // Insert with explicit id, bypassing sqlite_sequence
+        fconn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (999, 'x', '/x', 0)",
+            &[],
+        ).unwrap();
+        drop(fconn);
+
+        let conn = SqliteConnection::open_file(&path_str).expect("reopen");
+        match conn.query_sync("SELECT * FROM agent_links", &[]) {
+            Ok(_) => eprintln!("no_autoincrement (explicit id): schema OK"),
+            Err(e) => eprintln!("no_autoincrement (explicit id): CORRUPTED: {e}"),
+        }
+    }
+
+    // Test B: Write to AUTOINCREMENT table (triggers sqlite_sequence update)
+    {
+        let db_path = dir.path().join("test_autoincrement.db");
+        let path_str = db_path.display().to_string();
+        let conn = SqliteConnection::open_file(&path_str).expect("open");
+        conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+        drop(conn);
+
+        let fconn = DbConn::open_file(&path_str).expect("franken open");
+        // Insert without explicit id — triggers AUTOINCREMENT / sqlite_sequence
+        fconn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('y', '/y', 0)",
+            &[],
+        ).unwrap();
+        drop(fconn);
+
+        let conn = SqliteConnection::open_file(&path_str).expect("reopen");
+        match conn.query_sync("SELECT * FROM agent_links", &[]) {
+            Ok(_) => eprintln!("autoincrement: schema OK"),
+            Err(e) => eprintln!("autoincrement: CORRUPTED: {e}"),
+        }
+    }
+
+    // Test C: Write to non-AUTOINCREMENT table
+    {
+        let db_path = dir.path().join("test_no_ai_table.db");
+        let path_str = db_path.display().to_string();
+        let conn = SqliteConnection::open_file(&path_str).expect("open");
+        conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+        // Pre-populate required references
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 't', '/t', 0)",
+            &[],
+        ).unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (1, 1, 'GreenCastle', 'test', 'test', '', 0, 0, 'auto', 'auto')",
+            &[],
+        ).unwrap();
+        drop(conn);
+
+        let fconn = DbConn::open_file(&path_str).expect("franken open");
+        // message_recipients has no AUTOINCREMENT
+        fconn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to')",
+            &[],
+        ).unwrap_or_default(); // May fail on FK but we care about corruption
+        drop(fconn);
+
+        let conn = SqliteConnection::open_file(&path_str).expect("reopen");
+        match conn.query_sync("SELECT * FROM agent_links", &[]) {
+            Ok(_) => eprintln!("non-AI table write: schema OK"),
+            Err(e) => eprintln!("non-AI table write: CORRUPTED: {e}"),
+        }
+    }
+}
+
+/// Does FrankenConnection corrupt with a read-only query?
+#[test]
+fn frankenconnection_read_only_no_corruption() {
+    use mcp_agent_mail_db::DbConn;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("test_readonly.db");
+    let path_str = db_path.display().to_string();
+
+    // Create DB with our schema
+    let conn = SqliteConnection::open_file(&path_str).expect("open");
+    conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+    conn.execute_sync(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp/test', 0)",
+        &[],
+    ).unwrap();
+    drop(conn);
+
+    // Open FrankenConnection and only do reads
+    let fconn = DbConn::open_file(&path_str).expect("franken open");
+    let _rows = fconn.query_sync("SELECT id, slug FROM projects", &[]).unwrap();
+    drop(fconn);
+
+    // Check if schema is still valid
+    let conn = SqliteConnection::open_file(&path_str).expect("reopen");
+    match conn.query_sync("SELECT * FROM agent_links", &[]) {
+        Ok(_) => eprintln!("read_only: schema OK"),
+        Err(e) => panic!("FrankenConnection corrupted schema with read-only: {e}"),
+    }
+}
+
+/// Minimal reproduction: does FrankenConnection corrupt even a tiny schema?
+#[test]
+fn frankenconnection_tiny_schema_no_corruption() {
+    use mcp_agent_mail_db::DbConn;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("test_tiny.db");
+    let path_str = db_path.display().to_string();
+
+    // 1. Create a tiny DB
+    let conn = SqliteConnection::open_file(&path_str).expect("open");
+    conn.execute_raw("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute_raw("CREATE TABLE t2 (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)").unwrap();
+    conn.execute_sync("INSERT INTO t1 VALUES (1, 'hello')", &[]).unwrap();
+    drop(conn);
+
+    // 2. FrankenConnection writes
+    let fconn = DbConn::open_file(&path_str).expect("franken open");
+    fconn.execute_sync("INSERT INTO t1 VALUES (2, 'world')", &[]).unwrap();
+    drop(fconn);
+
+    // 3. SqliteConnection verifies
+    let conn = SqliteConnection::open_file(&path_str).expect("reopen");
+    let rows = conn.query_sync("SELECT * FROM t1", &[]).unwrap();
+    assert_eq!(rows.len(), 2, "expected 2 rows");
+    conn.query_sync("SELECT * FROM t2", &[]).expect("t2 schema should be intact");
+}
+
+/// Test with progressively more tables to find corruption threshold.
+#[test]
+fn frankenconnection_many_tables_corruption_threshold() {
+    use mcp_agent_mail_db::DbConn;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    for n_tables in [2, 5, 8, 10, 12] {
+        let db_path = dir.path().join(format!("test_{n_tables}.db"));
+        let path_str = db_path.display().to_string();
+
+        // Create DB with N tables
+        let conn = SqliteConnection::open_file(&path_str).expect("open");
+        for i in 0..n_tables {
+            let sql = format!(
+                "CREATE TABLE table_{i} (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 col_a INTEGER NOT NULL, col_b TEXT NOT NULL DEFAULT '', col_c INTEGER)"
+            );
+            conn.execute_raw(&sql).unwrap();
+        }
+        conn.execute_sync("INSERT INTO table_0 (col_a, col_b) VALUES (1, 'test')", &[]).unwrap();
+        drop(conn);
+
+        // FrankenConnection writes
+        let fconn = DbConn::open_file(&path_str).expect("franken open");
+        fconn.execute_sync("INSERT INTO table_0 (col_a, col_b) VALUES (2, 'world')", &[]).unwrap();
+        drop(fconn);
+
+        // SqliteConnection verifies ALL tables
+        let conn = SqliteConnection::open_file(&path_str).expect("reopen");
+        for i in 0..n_tables {
+            match conn.execute_sync(&format!("SELECT count(*) FROM table_{i}"), &[]) {
+                Ok(_) => {}
+                Err(e) => panic!("Corruption at {n_tables} tables, table_{i}: {e}"),
+            }
+        }
+        // Also check via sqlite_master
+        match conn.query_sync(
+            "SELECT count(*) FROM sqlite_master WHERE type='table'",
+            &[],
+        ) {
+            Ok(_) => eprintln!("OK: {n_tables} tables, no corruption"),
+            Err(e) => panic!("sqlite_master corrupted at {n_tables} tables: {e}"),
+        }
+    }
 }
