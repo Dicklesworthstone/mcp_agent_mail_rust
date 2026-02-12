@@ -86,6 +86,9 @@ pub enum Commands {
         /// Output JSON to stdout instead of human-readable format.
         #[arg(long)]
         json: bool,
+        /// Run independent gates in parallel (faster execution).
+        #[arg(long, short = 'p')]
+        parallel: bool,
     },
     Lint,
     Typecheck,
@@ -1483,7 +1486,7 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Archive { action } => handle_archive(action),
         Commands::ServeHttp { host, port, path } => handle_serve_http(host, port, path),
         Commands::ServeStdio => handle_serve_stdio(),
-        Commands::Ci { quick, report, json } => handle_ci(quick, report, json),
+        Commands::Ci { quick, report, json, parallel } => handle_ci(quick, report, json, parallel),
         Commands::Lint => handle_lint(),
         Commands::Typecheck => handle_typecheck(),
         Commands::Migrate => handle_migrate(),
@@ -4308,9 +4311,10 @@ fn handle_ci(
     quick: bool,
     report_path: Option<std::path::PathBuf>,
     json_output: bool,
+    parallel: bool,
 ) -> CliResult<()> {
     use ci::{
-        default_gates, print_gate_summary, run_gates, Decision, GateRunnerConfig, RunMode,
+        default_gates, print_gate_summary, run_gates, run_gates_parallel, Decision, GateRunnerConfig, RunMode,
     };
 
     let mode = if quick { RunMode::Quick } else { RunMode::Full };
@@ -4322,7 +4326,7 @@ fn handle_ci(
         .mode(mode)
         .timeout_secs(600);
 
-    // Progress callback
+    // Progress callback (only used in sequential mode)
     let on_start: fn(&str, usize, usize) = |name, idx, total| {
         ftui_runtime::ftui_println!("━━━ GATE [{}/{}]: {} ━━━", idx + 1, total, name);
     };
@@ -4332,9 +4336,14 @@ fn handle_ci(
         ..runner_config
     };
 
-    // Run all gates
+    // Run all gates (parallel or sequential)
     let gates = default_gates();
-    let report = run_gates(&gates, &runner_config);
+    let report = if parallel {
+        ftui_runtime::ftui_println!("Running gates in parallel mode...");
+        run_gates_parallel(&gates, &runner_config)
+    } else {
+        run_gates(&gates, &runner_config)
+    };
 
     // Write report to file if requested
     if let Some(ref path) = report_path {

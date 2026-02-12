@@ -1277,6 +1277,148 @@ pub fn run_default_gates(runner_config: &GateRunnerConfig) -> GateReport {
     run_gates(&gates, runner_config)
 }
 
+/// Runs all gates in parallel where possible and returns a report.
+///
+/// Gates are run concurrently using a thread pool. Each gate runs in its own
+/// subprocess, so isolation is maintained. Stdout/stderr are captured per-gate
+/// to avoid interleaving.
+///
+/// The compile group (fmt, clippy, build) must complete before the test group
+/// runs to ensure build artifacts exist. Other groups can run in parallel.
+///
+/// # Arguments
+/// * `gates` - List of gate configurations to run.
+/// * `runner_config` - Runner configuration.
+///
+/// # Returns
+/// A `GateReport` with all results and summary.
+pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig) -> GateReport {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let total = gates.len();
+
+    // Separate gates into phases:
+    // Phase 1: Compile gates (must run first and complete)
+    // Phase 2: All other gates (can run in parallel)
+    let compile_gates: Vec<_> = gates
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| {
+            g.name == "Format check"
+                || g.name == "Clippy"
+                || g.name == "Build workspace"
+        })
+        .collect();
+
+    let other_gates: Vec<_> = gates
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| {
+            g.name != "Format check"
+                && g.name != "Clippy"
+                && g.name != "Build workspace"
+        })
+        .collect();
+
+    let results: Arc<Mutex<Vec<(usize, GateResult)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Phase 1: Run compile gates in parallel
+    eprintln!("Phase 1: Running compile gates in parallel...");
+    {
+        let handles: Vec<_> = compile_gates
+            .iter()
+            .map(|(idx, gate)| {
+                let gate = (*gate).clone();
+                let config = runner_config.clone();
+                let idx = *idx;
+                let results = Arc::clone(&results);
+                thread::spawn(move || {
+                    eprintln!("  [{}] Starting: {}", idx + 1, gate.name);
+                    let result = run_gate(&gate, &config);
+                    eprintln!(
+                        "  [{}] Finished: {} - {}",
+                        idx + 1,
+                        gate.name,
+                        result.status.as_str()
+                    );
+                    let mut locked = results.lock().unwrap();
+                    locked.push((idx, result));
+                })
+            })
+            .collect();
+
+        // Wait for all compile gates to complete
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    // Check if compile phase failed - if so, skip remaining gates
+    let compile_failed = {
+        let locked = results.lock().unwrap();
+        locked.iter().any(|(_, r)| r.status == GateStatus::Fail)
+    };
+
+    // Phase 2: Run remaining gates in parallel (if compile passed)
+    if compile_failed {
+        eprintln!("Phase 2: Skipping remaining gates due to compile failures...");
+        // Add skip results for remaining gates
+        let mut locked = results.lock().unwrap();
+        for (idx, gate) in &other_gates {
+            locked.push((
+                *idx,
+                GateResult::skip(gate, "skipped due to compile failure"),
+            ));
+        }
+    } else {
+        eprintln!("Phase 2: Running remaining {} gates in parallel...", other_gates.len());
+        let handles: Vec<_> = other_gates
+            .iter()
+            .map(|(idx, gate)| {
+                let gate = (*gate).clone();
+                let config = runner_config.clone();
+                let idx = *idx;
+                let results = Arc::clone(&results);
+                thread::spawn(move || {
+                    eprintln!("  [{}] Starting: {}", idx + 1, gate.name);
+                    let result = run_gate(&gate, &config);
+                    eprintln!(
+                        "  [{}] Finished: {} - {}",
+                        idx + 1,
+                        gate.name,
+                        result.status.as_str()
+                    );
+                    let mut locked = results.lock().unwrap();
+                    locked.push((idx, result));
+                })
+            })
+            .collect();
+
+        // Wait for all gates to complete
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    // Sort results by original gate order
+    let mut final_results: Vec<_> = {
+        let locked = results.lock().unwrap();
+        locked.clone()
+    };
+    final_results.sort_by_key(|(idx, _)| *idx);
+    let results: Vec<GateResult> = final_results.into_iter().map(|(_, r)| r).collect();
+
+    // Verify we have all gates
+    assert_eq!(
+        results.len(),
+        total,
+        "parallel run must produce same number of results"
+    );
+
+    GateReport::new(runner_config.mode, results)
+}
+
 /// Prints a human-readable summary of gate results to stdout.
 pub fn print_gate_summary(report: &GateReport) {
     println!();
@@ -2151,5 +2293,184 @@ error[E0425]: another error
         // error field should not appear in JSON for passing gates
         assert!(!json.contains("\"error\":"));
         assert!(!json.contains("\"error_category\""));
+    }
+
+    // ── Parallel Execution Tests (T1.5) ───────────────────────────────────────
+
+    #[test]
+    fn test_parallel_execution_produces_same_results_as_sequential() {
+        // Create simple test gates that will pass
+        let gates = vec![
+            GateConfig::new("Pass 1", GateCategory::Quality, ["true"]),
+            GateConfig::new("Pass 2", GateCategory::Quality, ["true"]),
+            GateConfig::new("Pass 3", GateCategory::Performance, ["true"]),
+        ];
+        let config = GateRunnerConfig::default().mode(RunMode::Full);
+
+        // Run sequentially
+        let seq_report = run_gates(&gates, &config);
+
+        // Run in parallel
+        let par_report = run_gates_parallel(&gates, &config);
+
+        // Same number of gates
+        assert_eq!(seq_report.gates.len(), par_report.gates.len());
+
+        // Same overall decision
+        assert_eq!(seq_report.decision, par_report.decision);
+
+        // Same summary counts
+        assert_eq!(seq_report.summary.total, par_report.summary.total);
+        assert_eq!(seq_report.summary.pass, par_report.summary.pass);
+        assert_eq!(seq_report.summary.fail, par_report.summary.fail);
+        assert_eq!(seq_report.summary.skip, par_report.summary.skip);
+
+        // Same gate names and statuses (order should be preserved)
+        for (seq_gate, par_gate) in seq_report.gates.iter().zip(par_report.gates.iter()) {
+            assert_eq!(seq_gate.name, par_gate.name);
+            assert_eq!(seq_gate.status, par_gate.status);
+        }
+    }
+
+    #[test]
+    fn test_parallel_execution_handles_failures() {
+        // Create gates with one failure
+        let gates = vec![
+            GateConfig::new("Pass 1", GateCategory::Quality, ["true"]),
+            GateConfig::new("Fail gate", GateCategory::Quality, ["false"]),
+            GateConfig::new("Pass 2", GateCategory::Performance, ["true"]),
+        ];
+        let config = GateRunnerConfig::default().mode(RunMode::Full);
+
+        let report = run_gates_parallel(&gates, &config);
+
+        // Should report all gates
+        assert_eq!(report.gates.len(), 3);
+
+        // Should have the correct decision
+        assert_eq!(report.decision, Decision::NoGo);
+
+        // Should have correct counts
+        assert_eq!(report.summary.total, 3);
+        assert!(report.summary.fail >= 1);
+    }
+
+    #[test]
+    fn test_parallel_preserves_gate_order_in_results() {
+        // Create gates with distinct names
+        let gates = vec![
+            GateConfig::new("Alpha", GateCategory::Quality, ["true"]),
+            GateConfig::new("Beta", GateCategory::Quality, ["true"]),
+            GateConfig::new("Gamma", GateCategory::Performance, ["true"]),
+            GateConfig::new("Delta", GateCategory::Security, ["true"]),
+        ];
+        let config = GateRunnerConfig::default().mode(RunMode::Full);
+
+        let report = run_gates_parallel(&gates, &config);
+
+        // Results should be in the same order as input gates
+        assert_eq!(report.gates[0].name, "Alpha");
+        assert_eq!(report.gates[1].name, "Beta");
+        assert_eq!(report.gates[2].name, "Gamma");
+        assert_eq!(report.gates[3].name, "Delta");
+    }
+
+    #[test]
+    fn test_parallel_captures_stderr_per_gate() {
+        // Create a failing gate that produces stderr
+        let gates = vec![
+            GateConfig::new(
+                "Stderr producer",
+                GateCategory::Quality,
+                ["bash", "-c", "echo 'unique_error_marker_12345' >&2 && exit 1"],
+            ),
+        ];
+        let config = GateRunnerConfig::default().mode(RunMode::Full);
+
+        let report = run_gates_parallel(&gates, &config);
+
+        assert_eq!(report.gates.len(), 1);
+        assert_eq!(report.gates[0].status, GateStatus::Fail);
+        assert!(report.gates[0].stderr_tail.is_some());
+        assert!(report.gates[0]
+            .stderr_tail
+            .as_ref()
+            .unwrap()
+            .contains("unique_error_marker_12345"));
+    }
+
+    #[test]
+    fn test_parallel_no_interleaved_output() {
+        // Create multiple gates that each produce distinct output
+        let gates = vec![
+            GateConfig::new(
+                "Gate A",
+                GateCategory::Quality,
+                ["bash", "-c", "echo 'GATE_A_OUTPUT' >&2 && exit 1"],
+            ),
+            GateConfig::new(
+                "Gate B",
+                GateCategory::Performance,
+                ["bash", "-c", "echo 'GATE_B_OUTPUT' >&2 && exit 1"],
+            ),
+        ];
+        let config = GateRunnerConfig::default().mode(RunMode::Full);
+
+        let report = run_gates_parallel(&gates, &config);
+
+        // Each gate should have only its own output, not interleaved
+        let gate_a = &report.gates[0];
+        let gate_b = &report.gates[1];
+
+        assert!(gate_a.stderr_tail.as_ref().unwrap().contains("GATE_A_OUTPUT"));
+        assert!(!gate_a.stderr_tail.as_ref().unwrap().contains("GATE_B_OUTPUT"));
+
+        assert!(gate_b.stderr_tail.as_ref().unwrap().contains("GATE_B_OUTPUT"));
+        assert!(!gate_b.stderr_tail.as_ref().unwrap().contains("GATE_A_OUTPUT"));
+    }
+
+    #[test]
+    fn test_parallel_respects_quick_mode() {
+        let gates = vec![
+            GateConfig::new("Normal gate", GateCategory::Quality, ["true"]),
+            GateConfig::new("E2E gate", GateCategory::Quality, ["true"]).skip_in_quick(),
+        ];
+        let config = GateRunnerConfig::default().mode(RunMode::Quick);
+
+        let report = run_gates_parallel(&gates, &config);
+
+        // Normal gate should pass
+        assert_eq!(report.gates[0].status, GateStatus::Pass);
+        // E2E gate should be skipped
+        assert_eq!(report.gates[1].status, GateStatus::Skip);
+    }
+
+    #[test]
+    fn test_parallel_report_json_structure_matches_sequential() {
+        let gates = vec![
+            GateConfig::new("Test 1", GateCategory::Quality, ["true"]),
+            GateConfig::new("Test 2", GateCategory::Performance, ["true"]),
+        ];
+        let config = GateRunnerConfig::default().mode(RunMode::Full);
+
+        let seq_report = run_gates(&gates, &config);
+        let par_report = run_gates_parallel(&gates, &config);
+
+        let seq_json = seq_report.to_json().expect("seq serialization");
+        let par_json = par_report.to_json().expect("par serialization");
+
+        // Both should have the same schema version
+        assert!(seq_json.contains("\"schema_version\": \"am_ci_gate_report.v1\""));
+        assert!(par_json.contains("\"schema_version\": \"am_ci_gate_report.v1\""));
+
+        // Both should have same decision
+        assert!(seq_json.contains("\"decision\": \"go\""));
+        assert!(par_json.contains("\"decision\": \"go\""));
+
+        // Both should have same gate names
+        assert!(seq_json.contains("\"name\": \"Test 1\""));
+        assert!(par_json.contains("\"name\": \"Test 1\""));
+        assert!(seq_json.contains("\"name\": \"Test 2\""));
+        assert!(par_json.contains("\"name\": \"Test 2\""));
     }
 }
