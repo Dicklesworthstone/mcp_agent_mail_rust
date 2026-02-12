@@ -393,7 +393,10 @@ impl DbPool {
                                     // artifacts. These can be reintroduced by historical/full
                                     // migration paths and have caused post-crash rowid/index
                                     // mismatch failures (e.g. fts_projects corruption paths).
-                                    if let Err(e) = schema::enforce_base_mode_cleanup(&mig_conn) {
+                                    // Use the runtime variant so message FTS triggers stay intact.
+                                    if let Err(e) =
+                                        schema::enforce_runtime_identity_fts_cleanup(&mig_conn)
+                                    {
                                         return Err(Outcome::Err(e));
                                     }
                                     // Close migration connection first. Some paths can leave

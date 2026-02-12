@@ -2184,7 +2184,8 @@ pub fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
 }
 
 /// Escape LIKE wildcards for literal substring matching.
-fn like_escape(term: &str) -> String {
+#[must_use]
+pub fn like_escape(term: &str) -> String {
     term.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")

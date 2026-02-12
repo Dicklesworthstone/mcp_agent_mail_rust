@@ -952,6 +952,13 @@ fn base_trigger_cleanup_migrations() -> Vec<Migration> {
         .collect()
 }
 
+fn identity_fts_cleanup_migrations() -> Vec<Migration> {
+    base_trigger_cleanup_migrations()
+        .into_iter()
+        .filter(|migration| migration.id.starts_with("base_v2_"))
+        .collect()
+}
+
 /// Re-apply base-mode cleanup statements at startup.
 ///
 /// This is intentionally separate from migration history so servers can recover
@@ -960,6 +967,21 @@ fn base_trigger_cleanup_migrations() -> Vec<Migration> {
 #[allow(clippy::result_large_err)]
 pub fn enforce_base_mode_cleanup(conn: &SqliteConnection) -> std::result::Result<(), SqlError> {
     for migration in base_trigger_cleanup_migrations() {
+        conn.execute_raw(&migration.up)?;
+    }
+    Ok(())
+}
+
+/// Re-apply runtime-safe cleanup statements for legacy identity FTS artifacts.
+///
+/// Unlike [`enforce_base_mode_cleanup`], this keeps message FTS triggers intact
+/// so normal runtime indexing behavior is preserved while removing known
+/// corruption-prone identity FTS objects (`fts_agents`/`fts_projects`).
+#[allow(clippy::result_large_err)]
+pub fn enforce_runtime_identity_fts_cleanup(
+    conn: &SqliteConnection,
+) -> std::result::Result<(), SqlError> {
+    for migration in identity_fts_cleanup_migrations() {
         conn.execute_raw(&migration.up)?;
     }
     Ok(())
@@ -1401,6 +1423,65 @@ mod tests {
         assert!(
             fts_rows.is_empty(),
             "base cleanup should remove identity FTS tables"
+        );
+    }
+
+    #[test]
+    fn enforce_runtime_identity_cleanup_keeps_message_triggers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime_cleanup_identity_fts.db");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
+
+        conn.execute_raw(PRAGMA_DB_INIT_SQL).expect("apply PRAGMAs");
+        let conn_ref = &conn;
+        block_on(|cx| async move {
+            migrate_to_latest(&cx, conn_ref)
+                .await
+                .into_result()
+                .expect("apply full migrations");
+        });
+
+        enforce_runtime_identity_fts_cleanup(&conn).expect("runtime identity cleanup");
+
+        let message_trigger_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='trigger' AND name IN ('messages_ai', 'messages_ad', 'messages_au')",
+                &[],
+            )
+            .expect("query message trigger names");
+        assert_eq!(
+            message_trigger_rows.len(),
+            3,
+            "runtime cleanup should keep message FTS triggers"
+        );
+
+        let identity_trigger_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='trigger' AND name IN (\
+                     'agents_ai', 'agents_ad', 'agents_au',\
+                     'projects_ai', 'projects_ad', 'projects_au'\
+                 )",
+                &[],
+            )
+            .expect("query identity trigger names");
+        assert!(
+            identity_trigger_rows.is_empty(),
+            "runtime cleanup should remove identity FTS triggers"
+        );
+
+        let identity_fts_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='table' AND name IN ('fts_agents', 'fts_projects')",
+                &[],
+            )
+            .expect("query identity fts table names");
+        assert!(
+            identity_fts_rows.is_empty(),
+            "runtime cleanup should remove identity FTS tables"
         );
     }
 
