@@ -83,7 +83,7 @@ fn base_mode_cleanup_strips_identity_and_message_fts_artifacts() {
 }
 
 #[test]
-fn startup_runtime_keeps_message_fts_triggers() {
+fn startup_runtime_strips_identity_fts_and_keeps_message_triggers() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("identity_fts_cleanup_no_migrations.db");
     let db_path_str = db_path.display().to_string();
@@ -92,7 +92,6 @@ fn startup_runtime_keeps_message_fts_triggers() {
 
     let config = DbPoolConfig {
         database_url: db_url,
-        run_migrations: false,
         ..Default::default()
     };
     let parsed_path = config
@@ -119,14 +118,15 @@ fn startup_runtime_keeps_message_fts_triggers() {
         3,
         "startup must keep message FTS triggers for runtime connections"
     );
-    assert!(
-        count_identity_fts_artifacts(&conn) > 0,
-        "startup should preserve identity FTS artifacts in runtime mode"
+    assert_eq!(
+        count_identity_fts_artifacts(&conn),
+        0,
+        "startup must remove identity FTS artifacts in runtime mode"
     );
 }
 
 #[test]
-fn startup_runtime_keeps_identity_fts_artifacts_with_migrations_disabled() {
+fn startup_runtime_strips_identity_fts_with_migrations_disabled() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir
         .path()
@@ -164,8 +164,9 @@ fn startup_runtime_keeps_identity_fts_artifacts_with_migrations_disabled() {
         3,
         "startup must keep message FTS triggers even when migrations are disabled"
     );
-    assert!(
-        count_identity_fts_artifacts(&conn) > 0,
-        "startup should preserve identity FTS artifacts in runtime mode"
+    assert_eq!(
+        count_identity_fts_artifacts(&conn),
+        0,
+        "startup must remove identity FTS artifacts even when migrations are disabled"
     );
 }
