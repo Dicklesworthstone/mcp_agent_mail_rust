@@ -71,5 +71,5 @@ pub use sqlmodel_sqlite;
 /// The connection type used by this crate's pool and queries.
 ///
 /// We use `SqliteConnection` for runtime durability and parity with CLI/share
-/// tooling that also operates through the C-backed SQLite driver.
+/// tooling that also operates through the C-backed `SQLite` driver.
 pub type DbConn = sqlmodel_sqlite::SqliteConnection;
