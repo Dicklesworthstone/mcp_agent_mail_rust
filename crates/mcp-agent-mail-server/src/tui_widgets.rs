@@ -6,7 +6,6 @@
 //! - [`PercentileRibbon`]: p50/p95/p99 latency bands over time
 //! - [`Leaderboard`]: Ranked list with change indicators and delta values
 //! - [`AnomalyCard`]: Compact anomaly alert card with severity/confidence badges
-//! - [`BrailleActivity`]: Braille-resolution activity sparkline chart (DEPRECATED: use ftui_widgets::Sparkline)
 //! - [`MetricTile`]: Compact metric display with inline sparkline
 //! - [`ReservationGauge`]: Reservation pressure bar (ProgressBar-backed)
 //! - [`AgentHeatmap`]: Agent-to-agent communication frequency grid
@@ -25,7 +24,6 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Cell, Frame, PackedRgba, Style};
-use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_extras::charts::heatmap_gradient;
 use ftui_widgets::progress::ProgressBar;
 use ftui_widgets::sparkline::Sparkline;
@@ -1123,196 +1121,6 @@ fn contrast_text(bg: PackedRgba) -> PackedRgba {
         PackedRgba::rgb(0, 0, 0)
     } else {
         PackedRgba::rgb(255, 255, 255)
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// BrailleActivity — braille-canvas activity sparkline
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Braille-resolution activity visualization using 2x4 sub-pixel rendering.
-///
-/// Renders a time-series as a filled area chart using Unicode braille characters
-/// for much higher visual fidelity than character-level sparklines.
-///
-/// Each terminal cell encodes 2x4 = 8 sub-pixels, yielding 4x vertical
-/// resolution compared to normal text.
-///
-/// # Fallback
-///
-/// At `NoStyling`, renders a simple ASCII bar chart.
-/// At `Skeleton`, nothing is rendered.
-///
-/// # Deprecation Notice (br-2bbt.4.1)
-///
-/// This widget is **deprecated** in favor of [`ftui_widgets::sparkline::Sparkline`].
-/// New code should use `Sparkline` directly. This struct will be removed in a future
-/// release (see br-2bbt.4.4).
-#[deprecated(
-    since = "0.2.0",
-    note = "Use ftui_widgets::Sparkline instead (br-2bbt.4.1)"
-)]
-#[derive(Debug, Clone)]
-pub struct BrailleActivity<'a> {
-    /// Time-series values (left = oldest, right = newest).
-    values: &'a [f64],
-    /// Explicit max bound (auto-derived if `None`).
-    max: Option<f64>,
-    /// Block border.
-    block: Option<Block<'a>>,
-    /// Foreground color for the braille dots.
-    color: PackedRgba,
-    /// Optional label rendered at the top-left.
-    label: Option<&'a str>,
-}
-
-impl<'a> BrailleActivity<'a> {
-    /// Create a new braille activity chart from time-series data.
-    #[must_use]
-    pub const fn new(values: &'a [f64]) -> Self {
-        Self {
-            values,
-            max: None,
-            block: None,
-            color: PackedRgba::rgb(80, 200, 120),
-            label: None,
-        }
-    }
-
-    /// Set explicit maximum value.
-    #[must_use]
-    pub const fn max(mut self, max: f64) -> Self {
-        self.max = Some(max);
-        self
-    }
-
-    /// Set a block border.
-    #[must_use]
-    pub const fn block(mut self, block: Block<'a>) -> Self {
-        self.block = Some(block);
-        self
-    }
-
-    /// Set the foreground color for braille dots.
-    #[must_use]
-    pub const fn color(mut self, color: PackedRgba) -> Self {
-        self.color = color;
-        self
-    }
-
-    /// Set an optional label.
-    #[must_use]
-    pub const fn label(mut self, label: &'a str) -> Self {
-        self.label = Some(label);
-        self
-    }
-
-    fn auto_max(&self) -> f64 {
-        self.max
-            .unwrap_or_else(|| self.values.iter().copied().fold(0.0_f64, f64::max).max(1.0))
-    }
-}
-
-impl Widget for BrailleActivity<'_> {
-    fn render(&self, area: Rect, frame: &mut Frame) {
-        if area.is_empty() || self.values.is_empty() {
-            return;
-        }
-
-        if !frame.buffer.degradation.render_content() {
-            return;
-        }
-
-        let inner = self.block.as_ref().map_or(area, |block| {
-            let inner = block.inner(area);
-            block.clone().render(area, frame);
-            inner
-        });
-
-        if inner.width == 0 || inner.height == 0 {
-            return;
-        }
-
-        // Label row.
-        let data_area = if let Some(lbl) = self.label {
-            if inner.height > 2 {
-                for (i, ch) in lbl.chars().enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let x = inner.x + i as u16;
-                    if x >= inner.right() {
-                        break;
-                    }
-                    let mut cell = Cell::from_char(ch);
-                    cell.fg = PackedRgba::rgb(180, 180, 180);
-                    frame.buffer.set_fast(x, inner.y, cell);
-                }
-                Rect {
-                    x: inner.x,
-                    y: inner.y + 1,
-                    width: inner.width,
-                    height: inner.height - 1,
-                }
-            } else {
-                inner
-            }
-        } else {
-            inner
-        };
-
-        let no_styling =
-            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
-
-        if no_styling {
-            // Fallback: simple ASCII bar per column.
-            let max_val = self.auto_max();
-            let width = data_area.width as usize;
-            let start_idx = self.values.len().saturating_sub(width);
-            for (col, &val) in self.values[start_idx..].iter().enumerate() {
-                #[allow(clippy::cast_possible_truncation)]
-                let x = data_area.x + col as u16;
-                if x >= data_area.right() {
-                    break;
-                }
-                let ratio = (val / max_val).clamp(0.0, 1.0);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let filled = (ratio * f64::from(data_area.height)).round() as u16;
-                for row in 0..filled {
-                    let y = data_area.bottom().saturating_sub(1).saturating_sub(row);
-                    if y >= data_area.y {
-                        frame.buffer.set_fast(x, y, Cell::from_char('\u{2588}'));
-                    }
-                }
-            }
-            return;
-        }
-
-        // Braille rendering: use Painter for sub-pixel precision.
-        let mut painter = Painter::for_area(data_area, Mode::Braille);
-        painter.clear();
-
-        let max_val = self.auto_max();
-        let sub_w = data_area.width * Mode::Braille.cols_per_cell();
-        let sub_h = data_area.height * Mode::Braille.rows_per_cell();
-
-        // Map values to sub-pixel columns, right-aligned.
-        let num_samples = self.values.len().min(sub_w as usize);
-        let start_idx = self.values.len().saturating_sub(num_samples);
-
-        for (i, &val) in self.values[start_idx..].iter().enumerate() {
-            let ratio = (val / max_val).clamp(0.0, 1.0);
-            #[allow(clippy::cast_possible_truncation)]
-            let filled_h = (ratio * f64::from(sub_h)).round() as i32;
-
-            let x = (sub_w as usize).saturating_sub(num_samples) + i;
-            // Fill from bottom up.
-            for dy in 0..filled_h {
-                let y = i32::from(sub_h) - 1 - dy;
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                painter.point_colored(x as i32, y, self.color);
-            }
-        }
-
-        CanvasRef::from_painter(&painter).render(data_area, frame);
     }
 }
 
@@ -3146,42 +2954,6 @@ mod tests {
         assert_ne!(cell.bg, PackedRgba::TRANSPARENT);
     }
 
-    // ─── BrailleActivity tests ─────────────────────────────────────────
-
-    #[test]
-    fn braille_activity_empty() {
-        let values: Vec<f64> = vec![];
-        let widget = BrailleActivity::new(&values);
-        let out = render_widget(&widget, 40, 10);
-        assert!(out.chars().filter(|&c| c != ' ' && c != '\n').count() == 0);
-    }
-
-    #[test]
-    fn braille_activity_single_value() {
-        let values = vec![50.0];
-        let widget = BrailleActivity::new(&values).max(100.0);
-        // Should not panic.
-        let _out = render_widget(&widget, 40, 10);
-    }
-
-    #[test]
-    fn braille_activity_many_values() {
-        let values: Vec<f64> = (0..100).map(|i| f64::from(i).sin().abs() * 100.0).collect();
-        let widget = BrailleActivity::new(&values)
-            .label("Activity")
-            .color(PackedRgba::rgb(100, 200, 255));
-        let out = render_widget(&widget, 60, 15);
-        assert!(out.contains("Activity"), "should show label");
-    }
-
-    #[test]
-    fn braille_activity_tiny_area() {
-        let values = vec![1.0, 2.0, 3.0];
-        let widget = BrailleActivity::new(&values);
-        // Should not panic even at 1x1.
-        let _out = render_widget(&widget, 1, 1);
-    }
-
     // ─── MetricTile tests ──────────────────────────────────────────────
 
     #[test]
@@ -3412,15 +3184,6 @@ mod tests {
             .rationale("5x increase in error rate over 60s window")
             .next_steps(steps);
         render_perf(&widget, 60, 8, 1000, 200);
-    }
-
-    #[test]
-    fn perf_braille_activity_200_values() {
-        let values: Vec<f64> = (0..200)
-            .map(|i| (f64::from(i) * 0.05).sin().abs() * 100.0)
-            .collect();
-        let widget = BrailleActivity::new(&values).label("Activity");
-        render_perf(&widget, 80, 20, 200, 2000);
     }
 
     #[test]
