@@ -4,21 +4,26 @@
 //! stream search.  Results are displayed in a split-pane layout with
 //! keyboard-first navigation.
 
+use std::cell::RefCell;
 use std::time::Instant;
 
 use ftui::layout::Rect;
-use ftui::widgets::Widget;
+use ftui::text::{Line, Span, Text};
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers};
+use ftui::widgets::Widget;
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
+use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
+use ftui_widgets::StatefulWidget;
 
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
+use mcp_agent_mail_db::DbConn;
 
+use crate::tui_action_menu::{messages_actions, ActionEntry};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEventKind;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -123,6 +128,107 @@ struct MessageEntry {
     body_md: String,
     importance: String,
     ack_required: bool,
+    /// Whether to display the project column (true in Global mode).
+    show_project: bool,
+}
+
+impl RenderItem for MessageEntry {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::widgets::Widget;
+        if area.height == 0 || area.width < 10 {
+            return;
+        }
+        let inner_w = area.width as usize;
+
+        // Marker for selected row
+        let marker = if selected { '>' } else { ' ' };
+        let cursor_style = Style::default().bold().reverse();
+
+        // Importance badge
+        let badge = match self.importance.as_str() {
+            "high" => "!",
+            "urgent" => "!!",
+            _ => " ",
+        };
+
+        // ID or "LIVE" marker
+        let id_str = if self.id >= 0 {
+            format!("#{}", self.id)
+        } else {
+            "LIVE".to_string()
+        };
+
+        // Compact timestamp (HH:MM:SS from ISO string)
+        let time_short = if self.timestamp_iso.len() >= 19 {
+            &self.timestamp_iso[11..19]
+        } else {
+            &self.timestamp_iso
+        };
+
+        // Project badge (only in Global mode)
+        let project_badge = if self.show_project && !self.project_slug.is_empty() {
+            // Show first 8 chars of project slug
+            let slug = if self.project_slug.len() > 8 {
+                &self.project_slug[..8]
+            } else {
+                &self.project_slug
+            };
+            format!("[{slug:>8}] ")
+        } else {
+            String::new()
+        };
+
+        let prefix = format!("{marker} {badge:>2} {id_str:>6} {time_short} {project_badge}");
+        let remaining = inner_w.saturating_sub(prefix.len());
+        let subj = truncate_str(&self.subject, remaining);
+
+        let mut line = Line::from_spans([Span::raw(format!("{prefix}{subj}"))]);
+        if selected {
+            line.apply_base_style(cursor_style);
+        }
+        let paragraph = Paragraph::new(Text::from_line(line));
+        paragraph.render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Inbox mode: Local vs Global
+// ──────────────────────────────────────────────────────────────────────
+
+/// Viewing mode for the Messages screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxMode {
+    /// Show messages from a single project.
+    Local(String),
+    /// Show messages from ALL projects.
+    Global,
+}
+
+impl Default for InboxMode {
+    fn default() -> Self {
+        Self::Global
+    }
+}
+
+impl InboxMode {
+    /// Display label for the mode indicator.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Local(slug) => format!("Local: {slug}"),
+            Self::Global => "Global: all projects".to_string(),
+        }
+    }
+
+    /// True if in Global mode.
+    #[must_use]
+    pub fn is_global(&self) -> bool {
+        matches!(self, Self::Global)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -146,6 +252,8 @@ pub struct MessageBrowserScreen {
     cursor: usize,
     detail_scroll: usize,
     focus: Focus,
+    /// VirtualizedList state for efficient rendering.
+    list_state: RefCell<VirtualizedListState>,
     /// Last search term that was actually executed.
     last_search: String,
     /// Ticks remaining before executing a search after input changes.
@@ -166,6 +274,11 @@ pub struct MessageBrowserScreen {
     search_method: SearchMethod,
     /// Synthetic event for the focused message (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
+    /// Inbox mode: Local (single project) or Global (all projects).
+    inbox_mode: InboxMode,
+    /// Last active project slug when switching from Local to Global
+    /// (used to restore when switching back).
+    last_local_project: Option<String>,
 }
 
 impl MessageBrowserScreen {
@@ -179,6 +292,7 @@ impl MessageBrowserScreen {
             cursor: 0,
             detail_scroll: 0,
             focus: Focus::ResultList,
+            list_state: RefCell::new(VirtualizedListState::default()),
             last_search: String::new(),
             debounce_remaining: 0,
             search_dirty: true, // Initial load
@@ -189,7 +303,48 @@ impl MessageBrowserScreen {
             preset_index: 0,
             search_method: SearchMethod::None,
             focused_synthetic: None,
+            inbox_mode: InboxMode::Global,
+            last_local_project: None,
         }
+    }
+
+    /// Toggle between Local and Global inbox modes.
+    ///
+    /// When switching Global -> Local, uses the last known project or the
+    /// currently focused message's project. When switching Local -> Global,
+    /// remembers the current project for later restoration.
+    fn toggle_inbox_mode(&mut self) {
+        match &self.inbox_mode {
+            InboxMode::Global => {
+                // Switch to Local mode
+                // Use the last local project, or infer from the focused message
+                let project_slug = self
+                    .last_local_project
+                    .clone()
+                    .or_else(|| {
+                        self.results
+                            .get(self.cursor)
+                            .map(|m| m.project_slug.clone())
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or_else(|| "default".to_string());
+                self.inbox_mode = InboxMode::Local(project_slug);
+            }
+            InboxMode::Local(slug) => {
+                // Remember current project before switching to Global
+                self.last_local_project = Some(slug.clone());
+                self.inbox_mode = InboxMode::Global;
+            }
+        }
+        // Trigger a re-query with the new mode
+        self.search_dirty = true;
+        self.debounce_remaining = 0;
+    }
+
+    /// Sync the VirtualizedListState with our cursor position.
+    fn sync_list_state(&self) {
+        let mut state = self.list_state.borrow_mut();
+        state.select(Some(self.cursor));
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected message.
@@ -247,13 +402,23 @@ impl MessageBrowserScreen {
         let query = self.search_input.value().trim().to_string();
         self.last_refresh = Some(Instant::now());
 
+        // Determine if we should show project column (Global mode)
+        let show_project = self.inbox_mode.is_global();
+
+        // Get optional project filter for Local mode
+        let project_filter = match &self.inbox_mode {
+            InboxMode::Local(slug) => Some(slug.as_str()),
+            InboxMode::Global => None,
+        };
+
         let (results, total, method) = if query.is_empty() {
             self.last_search.clear();
-            let (r, t) = fetch_recent_messages(conn, PAGE_SIZE);
+            let (r, t) = fetch_recent_messages(conn, PAGE_SIZE, project_filter, show_project);
             (r, t, SearchMethod::Recent)
         } else {
             self.last_search.clone_from(&query);
-            let (r, t, m) = search_messages_fts(conn, &query, MAX_RESULTS);
+            let (r, t, m) =
+                search_messages_fts(conn, &query, MAX_RESULTS, project_filter, show_project);
             (r, t, m)
         };
         self.search_method = method;
@@ -302,6 +467,7 @@ impl MessageBrowserScreen {
                         body_md: summary,
                         importance: "normal".to_string(),
                         ack_required: false,
+                        show_project: false,
                     })
                 } else {
                     None
@@ -374,9 +540,14 @@ impl MailScreen for MessageBrowserScreen {
                                     self.detail_scroll = 0;
                                 }
                             }
-                            KeyCode::Char('g') | KeyCode::Home => {
+                            KeyCode::Home => {
                                 self.cursor = 0;
                                 self.detail_scroll = 0;
+                            }
+                            // Toggle inbox mode (Local/Global)
+                            KeyCode::Char('g') => {
+                                self.toggle_inbox_mode();
+                                return Cmd::None;
                             }
                             // Page navigation
                             KeyCode::Char('d') | KeyCode::PageDown => {
@@ -485,7 +656,7 @@ impl MailScreen for MessageBrowserScreen {
         let search_area = Rect::new(area.x, area.y, area.width, search_height);
         let content_area = Rect::new(area.x, area.y + search_height, area.width, content_height);
 
-        // Render search bar with explainability
+        // Render search bar with explainability and mode indicator
         let method_label = match self.search_method {
             SearchMethod::None => "",
             SearchMethod::Recent => "recent",
@@ -497,6 +668,7 @@ impl MailScreen for MessageBrowserScreen {
         } else {
             ""
         };
+        let mode_label = self.inbox_mode.label();
         render_search_bar(
             frame,
             search_area,
@@ -505,6 +677,7 @@ impl MailScreen for MessageBrowserScreen {
             matches!(self.focus, Focus::SearchBar),
             method_label,
             preset_label,
+            &mode_label,
         );
 
         // Split content: 45% results, 55% detail (if wide enough)
@@ -524,7 +697,11 @@ impl MailScreen for MessageBrowserScreen {
                 content_area.height,
             );
 
-            render_results_list(frame, results_area, &self.results, self.cursor);
+            // Sync and borrow list state for rendering
+            self.sync_list_state();
+            let mut list_state = self.list_state.borrow_mut();
+            render_results_list(frame, results_area, &self.results, &mut list_state);
+            drop(list_state);
             render_detail_panel(
                 frame,
                 detail_area,
@@ -533,7 +710,9 @@ impl MailScreen for MessageBrowserScreen {
             );
         } else {
             // Narrow: results only
-            render_results_list(frame, content_area, &self.results, self.cursor);
+            self.sync_list_state();
+            let mut list_state = self.list_state.borrow_mut();
+            render_results_list(frame, content_area, &self.results, &mut list_state);
         }
 
         // Also merge live events into display if searching
@@ -557,8 +736,12 @@ impl MailScreen for MessageBrowserScreen {
                 action: "Page down/up",
             },
             HelpEntry {
-                key: "G/g",
-                action: "End / Home",
+                key: "G/Home",
+                action: "End / Start",
+            },
+            HelpEntry {
+                key: "g",
+                action: "Toggle Local/Global",
             },
             HelpEntry {
                 key: "Enter",
@@ -591,6 +774,24 @@ impl MailScreen for MessageBrowserScreen {
         matches!(self.focus, Focus::SearchBar)
     }
 
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        let message = self.results.get(self.cursor)?;
+
+        let thread_id = if message.thread_id.is_empty() {
+            None
+        } else {
+            Some(message.thread_id.as_str())
+        };
+
+        let actions = messages_actions(message.id, thread_id, &message.from_agent);
+
+        // Anchor row is cursor position + header offset
+        let anchor_row = (self.cursor as u16).saturating_add(3);
+        let context_id = message.id.to_string();
+
+        Some((actions, anchor_row, context_id))
+    }
+
     fn title(&self) -> &'static str {
         "Messages"
     }
@@ -605,7 +806,22 @@ impl MailScreen for MessageBrowserScreen {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Fetch recent messages (empty query mode).
-fn fetch_recent_messages(conn: &DbConn, limit: usize) -> (Vec<MessageEntry>, usize) {
+///
+/// If `project_filter` is Some, only fetch messages from that project (Local mode).
+/// Otherwise, fetch from all projects (Global mode).
+fn fetch_recent_messages(
+    conn: &DbConn,
+    limit: usize,
+    project_filter: Option<&str>,
+    show_project: bool,
+) -> (Vec<MessageEntry>, usize) {
+    let where_clause = if let Some(slug) = project_filter {
+        let escaped_slug = slug.replace('\'', "''");
+        format!("WHERE p.slug = '{escaped_slug}'")
+    } else {
+        String::new()
+    };
+
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
          m.created_ts, \
@@ -617,27 +833,41 @@ fn fetch_recent_messages(conn: &DbConn, limit: usize) -> (Vec<MessageEntry>, usi
          JOIN projects p ON p.id = m.project_id \
          LEFT JOIN message_recipients mr ON mr.message_id = m.id \
          LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
+         {where_clause} \
          GROUP BY m.id \
          ORDER BY m.created_ts DESC \
          LIMIT {limit}"
     );
 
-    let total = count_messages(conn, None);
-    let results = query_messages(conn, &sql);
+    let total = count_messages(conn, project_filter);
+    let results = query_messages(conn, &sql, show_project);
     (results, total)
 }
 
 /// Full-text search using FTS5, returning results and the search method used.
+///
+/// If `project_filter` is Some, only search within that project (Local mode).
+/// Otherwise, search across all projects (Global mode).
 fn search_messages_fts(
     conn: &DbConn,
     query: &str,
     limit: usize,
+    project_filter: Option<&str>,
+    show_project: bool,
 ) -> (Vec<MessageEntry>, usize, SearchMethod) {
     // Sanitize the FTS query
     let sanitized = sanitize_fts_query(query);
     if sanitized.is_empty() {
         return (Vec::new(), 0, SearchMethod::LikeFallback);
     }
+
+    // Build project filter for SQL
+    let project_condition = if let Some(slug) = project_filter {
+        let escaped_slug = slug.replace('\'', "''");
+        format!("AND p.slug = '{escaped_slug}'")
+    } else {
+        String::new()
+    };
 
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
@@ -651,14 +881,14 @@ fn search_messages_fts(
          JOIN projects p ON p.id = m.project_id \
          LEFT JOIN message_recipients mr ON mr.message_id = m.id \
          LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-         WHERE fts_messages MATCH '{sanitized}' \
+         WHERE fts_messages MATCH '{sanitized}' {project_condition} \
          GROUP BY m.id \
          ORDER BY rank \
          LIMIT {limit}"
     );
 
     // Try FTS first, fall back to LIKE
-    let results = query_messages(conn, &sql);
+    let results = query_messages(conn, &sql, show_project);
     if !results.is_empty() {
         let total = results.len();
         return (results, total, SearchMethod::Fts);
@@ -666,6 +896,16 @@ fn search_messages_fts(
 
     // LIKE fallback
     let escaped = query.replace('\'', "''");
+    let like_where = if let Some(slug) = project_filter {
+        let escaped_slug = slug.replace('\'', "''");
+        format!(
+            "WHERE (m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%') \
+             AND p.slug = '{escaped_slug}'"
+        )
+    } else {
+        format!("WHERE m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%'")
+    };
+
     let like_sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
          m.created_ts, \
@@ -677,19 +917,19 @@ fn search_messages_fts(
          JOIN projects p ON p.id = m.project_id \
          LEFT JOIN message_recipients mr ON mr.message_id = m.id \
          LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-         WHERE m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%' \
+         {like_where} \
          GROUP BY m.id \
          ORDER BY m.created_ts DESC \
          LIMIT {limit}"
     );
 
-    let results = query_messages(conn, &like_sql);
+    let results = query_messages(conn, &like_sql, show_project);
     let total = results.len();
     (results, total, SearchMethod::LikeFallback)
 }
 
 /// Execute a message query and extract rows into `MessageEntry` structs.
-fn query_messages(conn: &DbConn, sql: &str) -> Vec<MessageEntry> {
+fn query_messages(conn: &DbConn, sql: &str, show_project: bool) -> Vec<MessageEntry> {
     conn.query_sync(sql, &[])
         .ok()
         .map(|rows| {
@@ -723,6 +963,7 @@ fn query_messages(conn: &DbConn, sql: &str) -> Vec<MessageEntry> {
                             .ok()
                             .unwrap_or_else(|| "normal".to_string()),
                         ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
+                        show_project,
                     })
                 })
                 .collect()
@@ -730,9 +971,20 @@ fn query_messages(conn: &DbConn, sql: &str) -> Vec<MessageEntry> {
         .unwrap_or_default()
 }
 
-/// Count total messages, optionally matching a query.
-fn count_messages(conn: &DbConn, _query: Option<&str>) -> usize {
-    conn.query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+/// Count total messages, optionally filtered by project.
+fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
+    let sql = if let Some(slug) = project_filter {
+        let escaped_slug = slug.replace('\'', "''");
+        format!(
+            "SELECT COUNT(*) AS c FROM messages m \
+             JOIN projects p ON p.id = m.project_id \
+             WHERE p.slug = '{escaped_slug}'"
+        )
+    } else {
+        "SELECT COUNT(*) AS c FROM messages".to_string()
+    };
+
+    conn.query_sync(&sql, &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())
         .and_then(|row| row.get_named::<i64>("c").ok())
@@ -767,7 +1019,7 @@ fn sanitize_fts_query(query: &str) -> String {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-/// Render the search bar with explainability metadata.
+/// Render the search bar with explainability metadata and mode indicator.
 fn render_search_bar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -776,6 +1028,7 @@ fn render_search_bar(
     focused: bool,
     method_label: &str,
     preset_label: &str,
+    mode_label: &str,
 ) {
     let mut title = if focused {
         format!("Search ({total_results} results) [EDITING]")
@@ -790,6 +1043,10 @@ fn render_search_bar(
     if !preset_label.is_empty() {
         let _ = std::fmt::Write::write_fmt(&mut title, format_args!(" | Preset: {preset_label}"));
     }
+    // Show inbox mode indicator
+    if !mode_label.is_empty() {
+        let _ = std::fmt::Write::write_fmt(&mut title, format_args!(" | [{mode_label}]"));
+    }
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded);
@@ -802,8 +1059,13 @@ fn render_search_bar(
     }
 }
 
-/// Render the results list.
-fn render_results_list(frame: &mut Frame<'_>, area: Rect, results: &[MessageEntry], cursor: usize) {
+/// Render the results list using VirtualizedList.
+fn render_results_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    results: &[MessageEntry],
+    list_state: &mut VirtualizedListState,
+) {
     let block = Block::default()
         .title("Results")
         .border_type(BorderType::Rounded);
@@ -814,56 +1076,18 @@ fn render_results_list(frame: &mut Frame<'_>, area: Rect, results: &[MessageEntr
         return;
     }
 
-    let visible_height = inner.height as usize;
-
     if results.is_empty() {
         let p = Paragraph::new("  No messages found.");
         p.render(inner, frame);
         return;
     }
 
-    // Viewport centering
-    let total = results.len();
-    let cursor_clamped = cursor.min(total.saturating_sub(1));
-    let (start, end) = viewport_range(total, visible_height, cursor_clamped);
-    let viewport = &results[start..end];
+    let list = VirtualizedList::new(results)
+        .style(Style::default())
+        .highlight_style(Style::default().bold().reverse())
+        .show_scrollbar(true);
 
-    let inner_w = inner.width as usize;
-    let mut lines = Vec::with_capacity(viewport.len());
-    for (view_idx, entry) in viewport.iter().enumerate() {
-        let abs_idx = start + view_idx;
-        let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
-
-        // Importance badge
-        let badge = match entry.importance.as_str() {
-            "high" => "!",
-            "urgent" => "!!",
-            _ => " ",
-        };
-
-        // Truncate subject to fit
-        let id_str = if entry.id >= 0 {
-            format!("#{}", entry.id)
-        } else {
-            "LIVE".to_string()
-        };
-
-        // Compact timestamp (HH:MM:SS from ISO string)
-        let time_short = if entry.timestamp_iso.len() >= 19 {
-            &entry.timestamp_iso[11..19]
-        } else {
-            &entry.timestamp_iso
-        };
-
-        let prefix = format!("{marker} {badge:>2} {id_str:>6} {time_short} ");
-        let remaining = inner_w.saturating_sub(prefix.len());
-        let subj = truncate_str(&entry.subject, remaining);
-        lines.push(format!("{prefix}{subj}"));
-    }
-
-    let text = lines.join("\n");
-    let p = Paragraph::new(text);
-    p.render(inner, frame);
+    StatefulWidget::render(&list, inner, frame, list_state);
 }
 
 /// Render the detail panel for the selected message.
@@ -970,6 +1194,8 @@ fn render_detail_panel(
 // ──────────────────────────────────────────────────────────────────────
 
 /// Compute the viewport [start, end) to keep cursor visible.
+/// (Retained for test coverage; VirtualizedList handles this internally.)
+#[allow(dead_code)]
 fn viewport_range(total: usize, height: usize, cursor: usize) -> (usize, usize) {
     if total <= height {
         return (0, total);
@@ -1077,6 +1303,7 @@ mod tests {
                 body_md: "Body text".to_string(),
                 importance: "normal".to_string(),
                 ack_required: false,
+                show_project: false,
             });
         }
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
@@ -1096,9 +1323,9 @@ mod tests {
         screen.update(&g_upper, &state);
         assert_eq!(screen.cursor, 9);
 
-        // g jumps to start
-        let g_lower = Event::Key(ftui::KeyEvent::new(KeyCode::Char('g')));
-        screen.update(&g_lower, &state);
+        // Home jumps to start
+        let home = Event::Key(ftui::KeyEvent::new(KeyCode::Home));
+        screen.update(&home, &state);
         assert_eq!(screen.cursor, 0);
     }
 
@@ -1118,6 +1345,7 @@ mod tests {
                 body_md: String::new(),
                 importance: "normal".to_string(),
                 ack_required: false,
+                show_project: false,
             });
         }
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
@@ -1152,6 +1380,7 @@ mod tests {
             body_md: "Long body\nwith\nmany\nlines".to_string(),
             importance: "normal".to_string(),
             ack_required: false,
+            show_project: false,
         });
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
@@ -1264,6 +1493,7 @@ mod tests {
             false,
             "FTS",
             "",
+            "", // mode_label
         );
     }
 
@@ -1271,7 +1501,8 @@ mod tests {
     fn render_results_empty_no_panic() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_results_list(&mut frame, Rect::new(0, 0, 40, 20), &[], 0);
+        let mut list_state = VirtualizedListState::default();
+        render_results_list(&mut frame, Rect::new(0, 0, 40, 20), &[], &mut list_state);
     }
 
     #[test]
@@ -1289,6 +1520,7 @@ mod tests {
                 body_md: "Hello world".to_string(),
                 importance: "high".to_string(),
                 ack_required: true,
+                show_project: false,
             },
             MessageEntry {
                 id: 2,
@@ -1302,11 +1534,19 @@ mod tests {
                 body_md: "Body content".to_string(),
                 importance: "normal".to_string(),
                 ack_required: false,
+                show_project: false,
             },
         ];
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_results_list(&mut frame, Rect::new(0, 0, 40, 20), &entries, 0);
+        let mut list_state = VirtualizedListState::default();
+        list_state.select(Some(0));
+        render_results_list(
+            &mut frame,
+            Rect::new(0, 0, 40, 20),
+            &entries,
+            &mut list_state,
+        );
     }
 
     #[test]
@@ -1331,6 +1571,7 @@ mod tests {
                 .to_string(),
             importance: "urgent".to_string(),
             ack_required: true,
+            show_project: false,
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
@@ -1354,6 +1595,7 @@ mod tests {
                 .join("\n"),
             importance: "normal".to_string(),
             ack_required: false,
+            show_project: false,
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
@@ -1439,6 +1681,7 @@ mod tests {
             body_md: String::new(),
             importance: "normal".to_string(),
             ack_required: false,
+            show_project: false,
         });
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
@@ -1480,6 +1723,7 @@ mod tests {
                 body_md: String::new(),
                 importance: "normal".to_string(),
                 ack_required: false,
+                show_project: false,
             });
         }
 
@@ -1607,6 +1851,7 @@ mod tests {
             false,
             "FTS",
             "Urgent",
+            "", // mode_label
         );
     }
 
@@ -1615,7 +1860,16 @@ mod tests {
         let input = TextInput::new().with_placeholder("Search...");
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_search_bar(&mut frame, Rect::new(0, 0, 80, 3), &input, 0, true, "", "");
+        render_search_bar(
+            &mut frame,
+            Rect::new(0, 0, 80, 3),
+            &input,
+            0,
+            true,
+            "",
+            "",
+            "",
+        );
     }
 
     #[test]
@@ -1676,5 +1930,101 @@ mod tests {
                 r.chars().count()
             );
         }
+    }
+
+    // ── InboxMode tests ────────────────────────────────────────────────
+
+    #[test]
+    fn inbox_mode_default_is_global() {
+        let screen = MessageBrowserScreen::new();
+        assert!(matches!(screen.inbox_mode, InboxMode::Global));
+    }
+
+    #[test]
+    fn inbox_mode_label_global() {
+        let mode = InboxMode::Global;
+        assert_eq!(mode.label(), "Global: all projects");
+        assert!(mode.is_global());
+    }
+
+    #[test]
+    fn inbox_mode_label_local() {
+        let mode = InboxMode::Local("my-project".to_string());
+        assert_eq!(mode.label(), "Local: my-project");
+        assert!(!mode.is_global());
+    }
+
+    #[test]
+    fn g_key_toggles_inbox_mode() {
+        let mut screen = MessageBrowserScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        // Start in Global mode
+        assert!(matches!(screen.inbox_mode, InboxMode::Global));
+
+        // Press 'g' to toggle to Local mode
+        let g = Event::Key(ftui::KeyEvent::new(KeyCode::Char('g')));
+        screen.update(&g, &state);
+        assert!(matches!(screen.inbox_mode, InboxMode::Local(_)));
+        assert!(screen.search_dirty);
+
+        // Press 'g' again to toggle back to Global mode
+        screen.search_dirty = false;
+        screen.update(&g, &state);
+        assert!(matches!(screen.inbox_mode, InboxMode::Global));
+        assert!(screen.search_dirty);
+    }
+
+    #[test]
+    fn toggle_inbox_mode_remembers_last_project() {
+        let mut screen = MessageBrowserScreen::new();
+
+        // Start in Local mode with a project
+        screen.inbox_mode = InboxMode::Local("my-project".to_string());
+
+        // Toggle to Global (should remember "my-project")
+        screen.toggle_inbox_mode();
+        assert!(matches!(screen.inbox_mode, InboxMode::Global));
+        assert_eq!(screen.last_local_project, Some("my-project".to_string()));
+
+        // Toggle back to Local (should restore "my-project")
+        screen.toggle_inbox_mode();
+        assert!(matches!(screen.inbox_mode, InboxMode::Local(ref s) if s == "my-project"));
+    }
+
+    #[test]
+    fn toggle_inbox_mode_infers_project_from_cursor() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.results.push(MessageEntry {
+            id: 1,
+            subject: "Test".to_string(),
+            from_agent: String::new(),
+            to_agents: String::new(),
+            project_slug: "inferred-project".to_string(),
+            thread_id: String::new(),
+            timestamp_iso: String::new(),
+            timestamp_micros: 0,
+            body_md: String::new(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        });
+        screen.cursor = 0;
+
+        // Start in Global mode, no last_local_project set
+        assert!(screen.last_local_project.is_none());
+
+        // Toggle to Local should infer from current message
+        screen.toggle_inbox_mode();
+        assert!(matches!(screen.inbox_mode, InboxMode::Local(ref s) if s == "inferred-project"));
+    }
+
+    #[test]
+    fn keybindings_include_inbox_mode() {
+        let screen = MessageBrowserScreen::new();
+        let bindings = screen.keybindings();
+        assert!(bindings
+            .iter()
+            .any(|b| b.key == "g" && b.action.contains("Local/Global")));
     }
 }

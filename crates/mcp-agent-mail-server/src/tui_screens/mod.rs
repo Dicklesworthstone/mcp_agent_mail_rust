@@ -23,6 +23,7 @@ pub mod tool_metrics;
 use ftui::layout::Rect;
 use ftui_runtime::program::Cmd;
 
+use crate::tui_action_menu::ActionEntry;
 use crate::tui_bridge::TuiSharedState;
 
 // Re-export the Event type that screens use
@@ -167,6 +168,14 @@ pub trait MailScreen {
         None
     }
 
+    /// Return contextual actions for the currently selected item.
+    ///
+    /// Called when the user presses `.` (period) to open the action menu.
+    /// Returns `(actions, anchor_row, context_id)` or `None` if no selection.
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        None
+    }
+
     /// Title shown in the help overlay header.
     fn title(&self) -> &'static str;
 
@@ -224,6 +233,24 @@ pub enum DeepLinkTarget {
     ContactByPair(String, String),
     /// Jump to the Explorer filtered for a specific agent.
     ExplorerForAgent(String),
+}
+
+impl DeepLinkTarget {
+    /// Returns the screen ID that this deep-link targets.
+    #[must_use]
+    pub const fn target_screen(&self) -> MailScreenId {
+        match self {
+            Self::TimelineAtTime(_) => MailScreenId::Timeline,
+            Self::MessageById(_) => MailScreenId::Messages,
+            Self::ThreadById(_) => MailScreenId::Threads,
+            Self::AgentByName(_) => MailScreenId::Agents,
+            Self::ToolByName(_) => MailScreenId::ToolMetrics,
+            Self::ProjectBySlug(_) => MailScreenId::Projects,
+            Self::ReservationByAgent(_) => MailScreenId::Reservations,
+            Self::ContactByPair(_, _) => MailScreenId::Contacts,
+            Self::ExplorerForAgent(_) => MailScreenId::Explorer,
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

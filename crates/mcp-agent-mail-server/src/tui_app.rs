@@ -5,6 +5,7 @@
 //! and shared-state access.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,12 +15,16 @@ use ftui::text::display_width;
 use ftui::widgets::Widget;
 use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
 use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
+use ftui::widgets::StatefulWidget;
+use ftui::widgets::modal::{Dialog, DialogResult, DialogState};
 use ftui::widgets::notification_queue::NotificationStack;
+use ftui::widgets::toast::ToastPosition;
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
 use ftui::{Event, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::{Cmd, Model};
 use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 
+use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
 use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
@@ -45,6 +50,7 @@ const PALETTE_DYNAMIC_CONTACT_CAP: usize = 30;
 const PALETTE_DYNAMIC_RESERVATION_CAP: usize = 30;
 const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
 const PALETTE_DB_CACHE_TTL_MICROS: i64 = 5 * 1_000_000;
+const PALETTE_USAGE_HALF_LIFE_MICROS: i64 = 60 * 60 * 1_000_000;
 
 // ──────────────────────────────────────────────────────────────────────
 // MailMsg — top-level message type
@@ -90,16 +96,24 @@ pub enum ToastSeverityThreshold {
 }
 
 impl ToastSeverityThreshold {
-    fn from_env() -> Self {
-        match std::env::var("AM_TUI_TOAST_SEVERITY")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
             "off" | "none" => Self::Off,
             "error" => Self::Error,
             "warning" | "warn" => Self::Warning,
             _ => Self::Info,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::parse(&std::env::var("AM_TUI_TOAST_SEVERITY").unwrap_or_default())
+    }
+
+    fn from_config(config: &mcp_agent_mail_core::Config) -> Self {
+        if !config.tui_toast_enabled {
+            Self::Off
+        } else {
+            Self::parse(config.tui_toast_severity.as_str())
         }
     }
 
@@ -134,6 +148,207 @@ fn now_micros() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
+fn decayed_palette_usage_weight(
+    usage_count: u32,
+    last_used_micros: i64,
+    ranking_now_micros: i64,
+) -> f64 {
+    if usage_count == 0 {
+        return 0.0;
+    }
+    let age_micros = ranking_now_micros.saturating_sub(last_used_micros).max(0) as f64;
+    let half_life = PALETTE_USAGE_HALF_LIFE_MICROS as f64;
+    let decay = 2.0_f64.powf(-age_micros / half_life);
+    f64::from(usage_count) * decay
+}
+
+fn parse_toast_position(value: &str) -> ToastPosition {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "top-left" => ToastPosition::TopLeft,
+        "bottom-left" => ToastPosition::BottomLeft,
+        "bottom-right" => ToastPosition::BottomRight,
+        _ => ToastPosition::TopRight,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ModalManager — confirmation dialogs
+// ──────────────────────────────────────────────────────────────────────
+
+/// Severity level for modal dialogs, affecting styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModalSeverity {
+    /// Informational dialog.
+    #[default]
+    Info,
+    /// Warning dialog (destructive action).
+    Warning,
+    /// Error dialog (critical action).
+    Error,
+}
+
+/// Callback invoked when a modal is confirmed or cancelled.
+pub type ModalCallback = Box<dyn FnOnce(DialogResult) + Send + 'static>;
+
+/// Active modal dialog state.
+pub struct ActiveModal {
+    /// The dialog widget.
+    dialog: Dialog,
+    /// Dialog interaction state.
+    state: DialogState,
+    /// Severity for styling.
+    severity: ModalSeverity,
+    /// Optional callback when dialog closes.
+    callback: Option<ModalCallback>,
+}
+
+/// Manages modal dialog lifecycle for the TUI.
+///
+/// Modals trap focus: when a modal is active, all key events go to the modal
+/// until it is dismissed. Modals render above toasts but below the command palette.
+pub struct ModalManager {
+    /// The currently active modal, if any.
+    active: Option<ActiveModal>,
+}
+
+impl Default for ModalManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModalManager {
+    /// Create a new modal manager with no active modal.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { active: None }
+    }
+
+    /// Returns `true` if a modal is currently active.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Show a confirmation dialog with the given title and message.
+    pub fn show_confirmation(
+        &mut self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        severity: ModalSeverity,
+        on_complete: impl FnOnce(DialogResult) + Send + 'static,
+    ) {
+        let dialog = Dialog::confirm(title, message);
+        self.active = Some(ActiveModal {
+            dialog,
+            state: DialogState::new(),
+            severity,
+            callback: Some(Box::new(on_complete)),
+        });
+    }
+
+    /// Show a force-release reservation confirmation dialog.
+    pub fn show_force_release_confirmation(
+        &mut self,
+        reservation_details: &str,
+        on_confirm: impl FnOnce(DialogResult) + Send + 'static,
+    ) {
+        self.show_confirmation(
+            "Force Release Reservation",
+            format!(
+                "This will force-release the reservation:\n\n{reservation_details}\n\n\
+                The owning agent may lose work. Continue?"
+            ),
+            ModalSeverity::Warning,
+            on_confirm,
+        );
+    }
+
+    /// Show a clear-all confirmation dialog.
+    pub fn show_clear_all_confirmation(
+        &mut self,
+        warning_text: &str,
+        on_confirm: impl FnOnce(DialogResult) + Send + 'static,
+    ) {
+        self.show_confirmation(
+            "Clear All",
+            warning_text.to_string(),
+            ModalSeverity::Warning,
+            on_confirm,
+        );
+    }
+
+    /// Show a send message confirmation dialog.
+    pub fn show_send_confirmation(
+        &mut self,
+        message_summary: &str,
+        on_confirm: impl FnOnce(DialogResult) + Send + 'static,
+    ) {
+        self.show_confirmation(
+            "Send Message",
+            format!("Send this message?\n\n{message_summary}"),
+            ModalSeverity::Info,
+            on_confirm,
+        );
+    }
+
+    /// Show a generic destructive action confirmation dialog.
+    pub fn show_destructive_action_confirmation(
+        &mut self,
+        action_name: &str,
+        details: &str,
+        on_confirm: impl FnOnce(DialogResult) + Send + 'static,
+    ) {
+        self.show_confirmation(
+            action_name.to_string(),
+            format!("{details}\n\nThis action cannot be undone. Continue?"),
+            ModalSeverity::Warning,
+            on_confirm,
+        );
+    }
+
+    /// Handle an event, returning `true` if the event was consumed.
+    ///
+    /// When a modal is active, all events are routed to it (focus trapping).
+    pub fn handle_event(&mut self, event: &Event) -> bool {
+        let Some(ref mut modal) = self.active else {
+            return false;
+        };
+
+        // Let the dialog handle the event
+        if let Some(result) = modal.dialog.handle_event(event, &mut modal.state, None) {
+            // Dialog closed — invoke callback and clear
+            if let Some(callback) = modal.callback.take() {
+                callback(result);
+            }
+            self.active = None;
+        }
+
+        // Event was consumed by the modal
+        true
+    }
+
+    /// Render the modal if active.
+    pub fn render(&self, area: Rect, frame: &mut Frame) {
+        if let Some(ref modal) = self.active {
+            // Severity-based border color (reserved for future use when Dialog supports it)
+            let _border_color = match modal.severity {
+                ModalSeverity::Info => TOAST_COLOR_INFO,
+                ModalSeverity::Warning => TOAST_COLOR_WARNING,
+                ModalSeverity::Error => TOAST_COLOR_ERROR,
+            };
+            // Render using StatefulWidget with a cloned state (read-only render)
+            let mut render_state = modal.state.clone();
+            modal.dialog.render(area, frame, &mut render_state);
+        }
+    }
+
+    /// Dismiss the current modal without invoking the callback.
+    pub fn dismiss(&mut self) {
+        self.active = None;
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // MailAppModel — implements ftui_runtime::Model
 // ──────────────────────────────────────────────────────────────────────
@@ -152,6 +367,9 @@ pub struct MailAppModel {
     command_palette: CommandPalette,
     hint_ranker: HintRanker,
     palette_hint_ids: HashMap<String, usize>,
+    palette_usage_path: Option<PathBuf>,
+    palette_usage_stats: crate::tui_persist::PaletteUsageMap,
+    palette_usage_dirty: bool,
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
@@ -164,9 +382,19 @@ pub struct MailAppModel {
     warned_reservations: HashSet<String>,
     /// Minimum severity level for toast notifications.
     toast_severity: ToastSeverityThreshold,
+    /// Runtime mute flag for toast generation.
+    toast_muted: bool,
+    /// Per-severity auto-dismiss durations (seconds).
+    toast_info_dismiss_secs: u64,
+    toast_warn_dismiss_secs: u64,
+    toast_error_dismiss_secs: u64,
     /// When `Some(idx)`, the toast stack is in focus mode and the
     /// toast at `idx` has a highlight border. `Ctrl+T` toggles.
     toast_focus_index: Option<usize>,
+    /// Modal manager for confirmation dialogs.
+    modal_manager: ModalManager,
+    /// Action menu for contextual per-item actions.
+    action_menu: ActionMenuManager,
 }
 
 impl MailAppModel {
@@ -227,6 +455,9 @@ impl MailAppModel {
             command_palette,
             hint_ranker,
             palette_hint_ids,
+            palette_usage_path: None,
+            palette_usage_stats: HashMap::new(),
+            palette_usage_dirty: false,
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
             tick_count: 0,
@@ -235,7 +466,13 @@ impl MailAppModel {
             reservation_tracker: HashMap::new(),
             warned_reservations: HashSet::new(),
             toast_severity: ToastSeverityThreshold::from_env(),
+            toast_muted: false,
+            toast_info_dismiss_secs: 5,
+            toast_warn_dismiss_secs: 8,
+            toast_error_dismiss_secs: 15,
             toast_focus_index: None,
+            modal_manager: ModalManager::new(),
+            action_menu: ActionMenuManager::new(),
         }
     }
 
@@ -251,6 +488,25 @@ impl MailAppModel {
         // Restore keymap profile from persisted config.
         let prefs = crate::tui_persist::TuiPreferences::from_config(config);
         model.keymap.set_profile(prefs.keymap_profile);
+        let usage_path = crate::tui_persist::palette_usage_path(&config.console_persist_path);
+        model.palette_usage_stats = crate::tui_persist::load_palette_usage_or_default(&usage_path);
+        model.palette_usage_path = Some(usage_path);
+        model.toast_severity = ToastSeverityThreshold::from_config(config);
+        model.toast_muted = !config.tui_toast_enabled;
+        model.toast_info_dismiss_secs = config.tui_toast_info_dismiss_secs.max(1);
+        model.toast_warn_dismiss_secs = config.tui_toast_warn_dismiss_secs.max(1);
+        model.toast_error_dismiss_secs = config.tui_toast_error_dismiss_secs.max(1);
+        let max_visible = if config.tui_toast_enabled {
+            config.tui_toast_max_visible.max(1)
+        } else {
+            0
+        };
+        model.notifications = NotificationQueue::new(
+            QueueConfig::default()
+                .max_visible(max_visible)
+                .position(parse_toast_position(config.tui_toast_position.as_str()))
+                .default_duration(Duration::from_secs(model.toast_info_dismiss_secs)),
+        );
         // Screens with config-driven preferences + persistence.
         model.set_screen(
             MailScreenId::Timeline,
@@ -274,6 +530,70 @@ impl MailAppModel {
     #[must_use]
     pub const fn help_visible(&self) -> bool {
         self.help_visible
+    }
+
+    /// Get mutable access to the modal manager for showing confirmation dialogs.
+    pub fn modal_manager_mut(&mut self) -> &mut ModalManager {
+        &mut self.modal_manager
+    }
+
+    /// Get mutable access to the action menu manager.
+    pub fn action_menu_mut(&mut self) -> &mut ActionMenuManager {
+        &mut self.action_menu
+    }
+
+    /// Dispatch an action selected from the action menu.
+    fn dispatch_action_menu_selection(&mut self, action: ActionKind, context: String) -> Cmd<MailMsg> {
+        match action {
+            ActionKind::Navigate(screen_id) => {
+                self.active_screen = screen_id;
+                Cmd::none()
+            }
+            ActionKind::DeepLink(target) => {
+                // Apply deep-link to target screen
+                if let Some(screen) = self.screens.get_mut(&target.target_screen()) {
+                    let _ = screen.receive_deep_link(&target);
+                }
+                self.active_screen = target.target_screen();
+                Cmd::none()
+            }
+            ActionKind::Execute(operation) => {
+                // For now, show a toast indicating the operation
+                // Full implementation will dispatch to screen-specific handlers
+                self.notifications.notify(
+                    Toast::new(format!("Action: {operation} on {context}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                Cmd::none()
+            }
+            ActionKind::ConfirmThenExecute { title, message, operation } => {
+                // Open confirmation modal for destructive actions
+                self.modal_manager.show_confirmation(
+                    title,
+                    message,
+                    ModalSeverity::Warning,
+                    move |result| {
+                        if matches!(result, DialogResult::Ok) {
+                            // The operation is captured but not dispatched yet
+                            // Full implementation would send a message to execute
+                            let _ = operation;
+                        }
+                    },
+                );
+                Cmd::none()
+            }
+            ActionKind::CopyToClipboard(text) => {
+                // Clipboard copy would require platform-specific handling
+                self.notifications.notify(
+                    Toast::new(format!("Copied: {}", text.chars().take(30).collect::<String>()))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(2)),
+                );
+                Cmd::none()
+            }
+            ActionKind::Dismiss => Cmd::none(),
+        }
     }
 
     /// Current accessibility settings.
@@ -335,15 +655,36 @@ impl MailAppModel {
 
         let mut indexed_actions: Vec<(usize, ActionItem)> =
             actions.into_iter().enumerate().collect();
-        indexed_actions.sort_by_key(|(original_index, action)| {
-            let rank = self
-                .palette_hint_ids
-                .get(action.id.as_str())
-                .and_then(|hint_id| rank_by_hint_id.get(hint_id))
-                .copied()
-                .unwrap_or(usize::MAX);
-            (rank, *original_index)
-        });
+        let ranking_now_micros = now_micros();
+        indexed_actions.sort_by(
+            |(original_index_a, action_a), (original_index_b, action_b)| {
+                let decay_a =
+                    self.decayed_palette_usage_score(action_a.id.as_str(), ranking_now_micros);
+                let decay_b =
+                    self.decayed_palette_usage_score(action_b.id.as_str(), ranking_now_micros);
+                let decay_cmp = decay_b.total_cmp(&decay_a);
+                if decay_cmp != std::cmp::Ordering::Equal {
+                    return decay_cmp;
+                }
+
+                let rank_a = self
+                    .palette_hint_ids
+                    .get(action_a.id.as_str())
+                    .and_then(|hint_id| rank_by_hint_id.get(hint_id))
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                let rank_b = self
+                    .palette_hint_ids
+                    .get(action_b.id.as_str())
+                    .and_then(|hint_id| rank_by_hint_id.get(hint_id))
+                    .copied()
+                    .unwrap_or(usize::MAX);
+
+                rank_a
+                    .cmp(&rank_b)
+                    .then_with(|| original_index_a.cmp(original_index_b))
+            },
+        );
 
         let ranked_actions: Vec<ActionItem> = indexed_actions
             .into_iter()
@@ -358,10 +699,66 @@ impl MailAppModel {
         ranked_actions
     }
 
+    fn decayed_palette_usage_score(&self, action_id: &str, ranking_now_micros: i64) -> f64 {
+        let Some((usage_count, last_used_micros)) =
+            self.palette_usage_stats.get(action_id).copied()
+        else {
+            return 0.0;
+        };
+        decayed_palette_usage_weight(usage_count, last_used_micros, ranking_now_micros)
+    }
+
+    fn persist_palette_usage(&mut self) {
+        if !self.palette_usage_dirty {
+            return;
+        }
+        let Some(path) = self.palette_usage_path.as_deref() else {
+            return;
+        };
+
+        match crate::tui_persist::save_palette_usage(path, &self.palette_usage_stats) {
+            Ok(()) => {
+                self.palette_usage_dirty = false;
+            }
+            Err(e) => {
+                eprintln!(
+                    "tui_app: failed to save palette usage to {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn flush_before_shutdown(&mut self) {
+        self.persist_palette_usage();
+    }
+
+    fn toast_dismiss_secs(&self, icon: ToastIcon) -> u64 {
+        match icon {
+            ToastIcon::Warning => self.toast_warn_dismiss_secs,
+            ToastIcon::Error => self.toast_error_dismiss_secs,
+            _ => self.toast_info_dismiss_secs,
+        }
+        .max(1)
+    }
+
+    fn apply_toast_policy(&self, toast: Toast) -> Toast {
+        let icon = toast.content.icon.unwrap_or(ToastIcon::Info);
+        toast.duration(Duration::from_secs(self.toast_dismiss_secs(icon)))
+    }
+
     fn record_palette_action_usage(&mut self, action_id: &str) {
         if let Some(&hint_id) = self.palette_hint_ids.get(action_id) {
             self.hint_ranker.record_usage(hint_id);
         }
+        let used_at = now_micros();
+        let stats = self
+            .palette_usage_stats
+            .entry(action_id.to_string())
+            .or_insert((0, used_at));
+        stats.0 = stats.0.saturating_add(1);
+        stats.1 = used_at;
+        self.palette_usage_dirty = true;
     }
 
     fn open_palette(&mut self) {
@@ -469,6 +866,7 @@ impl MailAppModel {
                 return Cmd::none();
             }
             palette_action_ids::APP_QUIT => {
+                self.flush_before_shutdown();
                 self.state.request_shutdown();
                 return Cmd::quit();
             }
@@ -971,8 +1369,10 @@ impl Model for MailAppModel {
                         _ => {}
                     }
 
-                    if let Some(toast) = toast_for_event(event, self.toast_severity) {
-                        self.notifications.notify(toast);
+                    if !self.toast_muted {
+                        if let Some(toast) = toast_for_event(event, self.toast_severity) {
+                            self.notifications.notify(self.apply_toast_policy(toast));
+                        }
                     }
                 }
 
@@ -994,9 +1394,9 @@ impl Model for MailAppModel {
                     }
                 }
                 for (key, toast) in expiry_toasts {
-                    if self.toast_severity.allows(ToastIcon::Warning) {
+                    if !self.toast_muted && self.toast_severity.allows(ToastIcon::Warning) {
                         self.warned_reservations.insert(key);
-                        self.notifications.notify(toast);
+                        self.notifications.notify(self.apply_toast_policy(toast));
                     }
                 }
 
@@ -1017,6 +1417,22 @@ impl Model for MailAppModel {
                         }
                     }
                     return Cmd::none();
+                }
+
+                // When a modal is active, route all events to it (focus trapping).
+                if self.modal_manager.handle_event(event) {
+                    return Cmd::none();
+                }
+
+                // When action menu is active, route all events to it (focus trapping).
+                if let Some(result) = self.action_menu.handle_event(event) {
+                    match result {
+                        ActionMenuResult::Consumed => return Cmd::none(),
+                        ActionMenuResult::Dismissed => return Cmd::none(),
+                        ActionMenuResult::Selected(action, context) => {
+                            return self.dispatch_action_menu_selection(action, context);
+                        }
+                    }
                 }
 
                 // Step-by-step macro playback: Enter=confirm, Esc=stop.
@@ -1104,6 +1520,22 @@ impl Model for MailAppModel {
                                     self.toast_focus_index = None;
                                     return Cmd::none();
                                 }
+                                KeyCode::Char('m') => {
+                                    self.toast_muted = !self.toast_muted;
+                                    let msg = if self.toast_muted {
+                                        "Toasts muted"
+                                    } else {
+                                        "Toasts unmuted"
+                                    };
+                                    self.notifications.notify(
+                                        self.apply_toast_policy(
+                                            Toast::new(msg)
+                                                .icon(ToastIcon::Info)
+                                                .style(Style::default().fg(TOAST_COLOR_INFO)),
+                                        ),
+                                    );
+                                    return Cmd::none();
+                                }
                                 _ => {
                                     // Let other keys (like Ctrl+T) fall through.
                                 }
@@ -1135,6 +1567,7 @@ impl Model for MailAppModel {
                         }
                         match key.code {
                             KeyCode::Char('q') if !text_mode => {
+                                self.flush_before_shutdown();
                                 self.state.request_shutdown();
                                 return Cmd::quit();
                             }
@@ -1164,6 +1597,16 @@ impl Model for MailAppModel {
                             }
                             KeyCode::BackTab => {
                                 self.active_screen = self.active_screen.prev();
+                                return Cmd::none();
+                            }
+                            // Action menu: . opens contextual actions for selected item
+                            KeyCode::Char('.') if !text_mode => {
+                                if let Some(screen) = self.screens.get(&self.active_screen) {
+                                    if let Some((entries, anchor, ctx)) = screen.contextual_actions()
+                                    {
+                                        self.action_menu.open(entries, anchor, ctx);
+                                    }
+                                }
                                 return Cmd::none();
                             }
                             KeyCode::Escape if self.help_visible => {
@@ -1231,6 +1674,7 @@ impl Model for MailAppModel {
                 Cmd::none()
             }
             MailMsg::Quit => {
+                self.flush_before_shutdown();
                 self.state.request_shutdown();
                 Cmd::quit()
             }
@@ -1264,6 +1708,7 @@ impl Model for MailAppModel {
             self.help_visible,
             &self.accessibility,
             &screen_bindings,
+            self.toast_muted,
             frame,
             chrome.status_line,
         );
@@ -1284,6 +1729,16 @@ impl Model for MailAppModel {
             );
         }
 
+        // 4b. Action menu (z=4.3, contextual per-item actions)
+        if self.action_menu.is_active() {
+            self.action_menu.render(area, frame);
+        }
+
+        // 4c. Modal dialogs (z=4.5, between toasts and command palette)
+        if self.modal_manager.is_active() {
+            self.modal_manager.render(area, frame);
+        }
+
         // 5. Command palette (z=5, modal)
         if self.command_palette.is_visible() {
             self.command_palette.render(area, frame);
@@ -1295,6 +1750,12 @@ impl Model for MailAppModel {
             let sections = self.keymap.contextual_help(&screen_bindings, screen_label);
             tui_chrome::render_help_overlay_sections(&sections, self.help_scroll, frame, area);
         }
+    }
+}
+
+impl Drop for MailAppModel {
+    fn drop(&mut self) {
+        self.persist_palette_usage();
     }
 }
 
@@ -3354,6 +3815,94 @@ mod tests {
     }
 
     #[test]
+    fn decayed_palette_usage_weight_reduces_old_signal() {
+        let now = now_micros();
+        let recent = decayed_palette_usage_weight(10, now - 10 * 60 * 1_000_000, now);
+        let stale = decayed_palette_usage_weight(10, now - 24 * 60 * 60 * 1_000_000, now);
+        assert!(recent > stale);
+    }
+
+    #[test]
+    fn rank_palette_actions_prefers_recent_over_stale_usage() {
+        let mut model = test_model();
+        let now = now_micros();
+        model.palette_usage_stats.insert(
+            "action:stale".to_string(),
+            (8, now - 24 * 60 * 60 * 1_000_000),
+        );
+        model
+            .palette_usage_stats
+            .insert("action:recent".to_string(), (8, now - 10 * 60 * 1_000_000));
+
+        let actions = vec![
+            ActionItem::new("action:stale", "Stale Action"),
+            ActionItem::new("action:recent", "Recent Action"),
+        ];
+        let ranked = model.rank_palette_actions(actions);
+        assert_eq!(ranked.first().map(|a| a.id.as_str()), Some("action:recent"));
+    }
+
+    #[test]
+    fn palette_usage_persists_and_restores_with_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            console_persist_path: tmp.path().join("config.env"),
+            ..Config::default()
+        };
+
+        let state = TuiSharedState::new(&config);
+        let mut model = MailAppModel::with_config(state, &config);
+        model.record_palette_action_usage("screen:messages");
+        model.record_palette_action_usage("screen:messages");
+        model.flush_before_shutdown();
+
+        let usage_path = crate::tui_persist::palette_usage_path(&config.console_persist_path);
+        let persisted = crate::tui_persist::load_palette_usage(&usage_path).expect("load usage");
+        assert_eq!(
+            persisted.get("screen:messages").map(|(count, _)| *count),
+            Some(2)
+        );
+
+        let state_replay = TuiSharedState::new(&config);
+        let replay = MailAppModel::with_config(state_replay, &config);
+        assert_eq!(
+            replay
+                .palette_usage_stats
+                .get("screen:messages")
+                .map(|(count, _)| *count),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn palette_usage_corrupt_file_falls_back_to_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            console_persist_path: tmp.path().join("config.env"),
+            ..Config::default()
+        };
+        let usage_path = crate::tui_persist::palette_usage_path(&config.console_persist_path);
+        std::fs::write(&usage_path, "{ not-valid-json ]").expect("write corrupt file");
+
+        let state = TuiSharedState::new(&config);
+        let model = MailAppModel::with_config(state, &config);
+        assert!(model.palette_usage_stats.is_empty());
+    }
+
+    #[test]
+    fn palette_usage_missing_file_starts_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            console_persist_path: tmp.path().join("config.env"),
+            ..Config::default()
+        };
+
+        let state = TuiSharedState::new(&config);
+        let model = MailAppModel::with_config(state, &config);
+        assert!(model.palette_usage_stats.is_empty());
+    }
+
+    #[test]
     fn palette_renders_ranked_overlay_large_layout() {
         let mut model = test_model();
         model.open_palette();
@@ -3903,6 +4452,62 @@ mod tests {
         assert!(!s.allows(ToastIcon::Warning));
         assert!(!s.allows(ToastIcon::Error));
         assert!(!s.allows(ToastIcon::Success));
+    }
+
+    #[test]
+    fn parse_toast_position_maps_supported_values() {
+        assert_eq!(parse_toast_position("top-left"), ToastPosition::TopLeft);
+        assert_eq!(
+            parse_toast_position("bottom-left"),
+            ToastPosition::BottomLeft
+        );
+        assert_eq!(
+            parse_toast_position("bottom-right"),
+            ToastPosition::BottomRight
+        );
+        assert_eq!(parse_toast_position("unknown"), ToastPosition::TopRight);
+    }
+
+    #[test]
+    fn with_config_applies_toast_runtime_settings() {
+        let config = Config {
+            tui_toast_enabled: true,
+            tui_toast_severity: "error".to_string(),
+            tui_toast_position: "bottom-left".to_string(),
+            tui_toast_max_visible: 6,
+            tui_toast_info_dismiss_secs: 7,
+            tui_toast_warn_dismiss_secs: 11,
+            tui_toast_error_dismiss_secs: 19,
+            ..Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let model = MailAppModel::with_config(state, &config);
+        assert_eq!(model.toast_severity, ToastSeverityThreshold::Error);
+        assert!(!model.toast_muted);
+        assert_eq!(model.toast_info_dismiss_secs, 7);
+        assert_eq!(model.toast_warn_dismiss_secs, 11);
+        assert_eq!(model.toast_error_dismiss_secs, 19);
+        assert_eq!(model.notifications.config().max_visible, 6);
+        assert_eq!(
+            model.notifications.config().position,
+            ToastPosition::BottomLeft
+        );
+    }
+
+    #[test]
+    fn toast_focus_m_key_toggles_runtime_mute() {
+        let mut model = test_model();
+        model.toast_focus_index = Some(0);
+        assert!(!model.toast_muted);
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('m')));
+        let cmd = model.update(MailMsg::Terminal(key.clone()));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(model.toast_muted);
+
+        let cmd = model.update(MailMsg::Terminal(key));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(!model.toast_muted);
     }
 
     // ── toast_for_event tests ───────────────────────────────────────

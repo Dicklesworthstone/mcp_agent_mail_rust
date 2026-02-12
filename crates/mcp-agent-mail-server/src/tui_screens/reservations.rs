@@ -4,16 +4,17 @@ use std::collections::HashMap;
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
+use ftui::widgets::StatefulWidget;
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::widgets::StatefulWidget;
-use ftui::widgets::Widget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::progress::ProgressBar;
 
+use crate::tui_action_menu::{reservations_actions, ActionEntry};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -57,11 +58,7 @@ impl ActiveReservation {
                 .saturating_mul(1_000_000),
         );
         let remaining = (expires_micros - now) / 1_000_000;
-        if remaining < 0 {
-            0
-        } else {
-            remaining as u64
-        }
+        if remaining < 0 { 0 } else { remaining as u64 }
     }
 
     /// Progress ratio (1.0 = full TTL remaining, 0.0 = expired).
@@ -189,11 +186,7 @@ impl ReservationsScreen {
                 COL_PROJECT => a.project.to_lowercase().cmp(&b.project.to_lowercase()),
                 _ => std::cmp::Ordering::Equal,
             };
-            if self.sort_asc {
-                cmp
-            } else {
-                cmp.reverse()
-            }
+            if self.sort_asc { cmp } else { cmp.reverse() }
         });
 
         self.sorted_keys = entries.iter().map(|(k, _)| (*k).clone()).collect();
@@ -294,6 +287,26 @@ impl MailScreen for ReservationsScreen {
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
         self.focused_synthetic.as_ref()
+    }
+
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        let selected_idx = self.table_state.selected?;
+        let key = self.sorted_keys.get(selected_idx)?;
+        let reservation = self.reservations.get(key)?;
+
+        // Get actions for this reservation (reservation_id is not available,
+        // so we use the path pattern as a pseudo-id)
+        let actions = reservations_actions(
+            selected_idx as i64, // Use index as pseudo-id for now
+            &reservation.agent,
+            &reservation.path_pattern,
+        );
+
+        // Anchor row is the selected row + header offset
+        let anchor_row = (selected_idx as u16).saturating_add(2);
+        let context_id = key.clone();
+
+        Some((actions, anchor_row, context_id))
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {

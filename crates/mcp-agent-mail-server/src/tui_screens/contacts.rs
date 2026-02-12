@@ -9,8 +9,10 @@ use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_runtime::program::Cmd;
 
+use crate::tui_action_menu::{contacts_actions, ActionEntry};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::ContactSummary;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -23,6 +25,12 @@ const COL_REASON: usize = 3;
 const COL_UPDATED: usize = 4;
 
 const SORT_LABELS: &[&str] = &["From", "To", "Status", "Reason", "Updated"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Table,
+    Graph,
+}
 
 /// Status filter modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +78,9 @@ pub struct ContactsScreen {
     filter: String,
     filter_active: bool,
     status_filter: StatusFilter,
+    view_mode: ViewMode,
+    /// (Agent Name, x, y) normalized 0.0-1.0
+    graph_nodes: Vec<(String, f64, f64)>,
 }
 
 impl ContactsScreen {
@@ -83,6 +94,8 @@ impl ContactsScreen {
             filter: String::new(),
             filter_active: false,
             status_filter: StatusFilter::All,
+            view_mode: ViewMode::Table,
+            graph_nodes: Vec::new(),
         }
     }
 
@@ -122,6 +135,7 @@ impl ContactsScreen {
         });
 
         self.contacts = rows;
+        self.layout_graph();
 
         // Clamp selection
         if let Some(sel) = self.table_state.selected {
@@ -132,6 +146,33 @@ impl ContactsScreen {
                     Some(self.contacts.len() - 1)
                 };
             }
+        }
+    }
+
+    fn layout_graph(&mut self) {
+        // Collect unique agents
+        let mut agents = std::collections::HashSet::new();
+        for c in &self.contacts {
+            agents.insert(c.from_agent.clone());
+            agents.insert(c.to_agent.clone());
+        }
+        let mut agents_vec: Vec<String> = agents.into_iter().collect();
+        agents_vec.sort();
+
+        let count = agents_vec.len();
+        self.graph_nodes.clear();
+
+        if count == 0 {
+            return;
+        }
+
+        // Circle layout
+        for (i, agent) in agents_vec.into_iter().enumerate() {
+            let angle = 2.0 * std::f64::consts::PI * (i as f64) / (count as f64);
+            // Center at 0.5, 0.5; radius 0.4
+            let x = 0.5 + 0.4 * angle.cos();
+            let y = 0.5 + 0.4 * angle.sin();
+            self.graph_nodes.push((agent, x, y));
         }
     }
 
@@ -200,6 +241,12 @@ impl MailScreen for ContactsScreen {
                         self.status_filter = self.status_filter.next();
                         self.rebuild_from_state(state);
                     }
+                    KeyCode::Char('n') => {
+                        self.view_mode = match self.view_mode {
+                            ViewMode::Table => ViewMode::Graph,
+                            ViewMode::Graph => ViewMode::Table,
+                        };
+                    }
                     KeyCode::Char('s') => {
                         self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
                         self.rebuild_from_state(state);
@@ -264,6 +311,177 @@ impl MailScreen for ContactsScreen {
         let p = Paragraph::new(info);
         p.render(header_area, frame);
 
+        if self.view_mode == ViewMode::Graph {
+            self.render_graph(frame, table_area);
+        } else {
+            self.render_table(frame, table_area);
+        }
+    }
+
+    fn keybindings(&self) -> Vec<HelpEntry> {
+        vec![
+            HelpEntry {
+                key: "j/k",
+                action: "Select contact",
+            },
+            HelpEntry {
+                key: "/",
+                action: "Search/filter",
+            },
+            HelpEntry {
+                key: "f",
+                action: "Cycle status filter",
+            },
+            HelpEntry {
+                key: "n",
+                action: "Toggle Table/Graph",
+            },
+            HelpEntry {
+                key: "s",
+                action: "Cycle sort column",
+            },
+            HelpEntry {
+                key: "S",
+                action: "Toggle sort order",
+            },
+            HelpEntry {
+                key: "Esc",
+                action: "Clear filter",
+            },
+        ]
+    }
+
+    fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
+        if let DeepLinkTarget::ContactByPair(from, to) = target {
+            if let Some(pos) = self
+                .contacts
+                .iter()
+                .position(|c| c.from_agent == *from && c.to_agent == *to)
+            {
+                self.table_state.selected = Some(pos);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn consumes_text_input(&self) -> bool {
+        self.filter_active
+    }
+
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        let selected_idx = self.table_state.selected?;
+        let contact = self.contacts.get(selected_idx)?;
+
+        let actions = contacts_actions(
+            &contact.from_agent,
+            &contact.to_agent,
+            &contact.status,
+        );
+
+        // Anchor row is the selected row + header offset
+        let anchor_row = (selected_idx as u16).saturating_add(2);
+        let context_id = format!("{}:{}", contact.from_agent, contact.to_agent);
+
+        Some((actions, anchor_row, context_id))
+    }
+
+    fn title(&self) -> &'static str {
+        "Contacts"
+    }
+
+    fn tab_label(&self) -> &'static str {
+        "Links"
+    }
+}
+
+// Helper methods for ContactsScreen (not part of MailScreen trait)
+impl ContactsScreen {
+    fn render_graph(&self, frame: &mut Frame<'_>, area: Rect) {
+        let block = Block::default()
+            .title("Network Graph")
+            .border_type(BorderType::Rounded);
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        if inner.width < 4 || inner.height < 4 {
+            return;
+        }
+
+        let mut painter = Painter::for_area(inner, Mode::Braille);
+        painter.clear();
+
+        let w = inner.width as f64 * 2.0; // Braille resolution width (2 cols per cell)
+        let h = inner.height as f64 * 4.0; // Braille resolution height (4 rows per cell)
+
+        // Draw edges
+        for contact in &self.contacts {
+            if let (Some(start), Some(end)) = (
+                self.find_node(&contact.from_agent),
+                self.find_node(&contact.to_agent),
+            ) {
+                let color = match contact.status.as_str() {
+                    "approved" => PackedRgba::rgb(80, 200, 120), // Green
+                    "blocked" => PackedRgba::rgb(220, 80, 80),   // Red
+                    _ => PackedRgba::rgb(220, 200, 60),          // Yellow
+                };
+
+                let x1 = (start.1 * w) as i32;
+                let y1 = (start.2 * h) as i32;
+                let x2 = (end.1 * w) as i32;
+                let y2 = (end.2 * h) as i32;
+
+                painter.line_colored(x1, y1, x2, y2, Some(color));
+            }
+        }
+
+        // Draw nodes (white circles)
+        for (_name, nx, ny) in &self.graph_nodes {
+            let x = (nx * w) as i32;
+            let y = (ny * h) as i32;
+            // Draw small filled area for node
+            for dx in -1..=1_i32 {
+                for dy in -1..=1_i32 {
+                    painter.point_colored(x + dx, y + dy, PackedRgba::rgb(255, 255, 255));
+                }
+            }
+        }
+
+        CanvasRef::from_painter(&painter).render(inner, frame);
+
+        // Draw labels (overlay on top of canvas)
+        for (name, nx, ny) in &self.graph_nodes {
+            // Map normalized coords back to cell coords
+            let cx = inner.x + (nx * inner.width as f64) as u16;
+            let cy = inner.y + (ny * inner.height as f64) as u16;
+
+            // Simple centering logic
+            let label: String = name.chars().take(8).collect();
+            let lx = cx.saturating_sub(label.len() as u16 / 2);
+
+            if lx >= inner.x
+                && lx + label.len() as u16 <= inner.right()
+                && cy >= inner.y
+                && cy < inner.bottom()
+            {
+                let fg_color = PackedRgba::rgb(200, 200, 255);
+                let bg_color = PackedRgba::rgb(0, 0, 0);
+                for (i, ch) in label.chars().enumerate() {
+                    if let Some(cell) = frame.buffer.get_mut(lx + i as u16, cy) {
+                        cell.content = ftui::Cell::from_char(ch).content;
+                        cell.fg = fg_color;
+                        cell.bg = bg_color;
+                    }
+                }
+            }
+        }
+    }
+
+    fn find_node(&self, name: &str) -> Option<&(String, f64, f64)> {
+        self.graph_nodes.iter().find(|n| n.0 == name)
+    }
+
+    fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
         // Build table rows
         let header = Row::new(["From", "To", "Status", "Reason", "Updated", "Expires"])
             .style(Style::default().bold());
@@ -320,62 +538,7 @@ impl MailScreen for ContactsScreen {
             );
 
         let mut ts = self.table_state.clone();
-        StatefulWidget::render(&table, table_area, frame, &mut ts);
-    }
-
-    fn keybindings(&self) -> Vec<HelpEntry> {
-        vec![
-            HelpEntry {
-                key: "j/k",
-                action: "Select contact",
-            },
-            HelpEntry {
-                key: "/",
-                action: "Search/filter",
-            },
-            HelpEntry {
-                key: "f",
-                action: "Cycle status filter",
-            },
-            HelpEntry {
-                key: "s",
-                action: "Cycle sort column",
-            },
-            HelpEntry {
-                key: "S",
-                action: "Toggle sort order",
-            },
-            HelpEntry {
-                key: "Esc",
-                action: "Clear filter",
-            },
-        ]
-    }
-
-    fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
-        if let DeepLinkTarget::ContactByPair(from, to) = target {
-            if let Some(pos) = self
-                .contacts
-                .iter()
-                .position(|c| c.from_agent == *from && c.to_agent == *to)
-            {
-                self.table_state.selected = Some(pos);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn consumes_text_input(&self) -> bool {
-        self.filter_active
-    }
-
-    fn title(&self) -> &'static str {
-        "Contacts"
-    }
-
-    fn tab_label(&self) -> &'static str {
-        "Links"
+        StatefulWidget::render(&table, area, frame, &mut ts);
     }
 }
 
