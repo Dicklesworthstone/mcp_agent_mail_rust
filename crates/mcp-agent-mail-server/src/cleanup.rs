@@ -436,6 +436,22 @@ mod tests {
 
     fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
         let db_path = tmp.path().join("db.sqlite3");
+
+        // Manually initialize schema with C-backed SqliteConnection before
+        // creating the pool. This matches the pattern used by db crate tests
+        // and avoids async migration issues in test contexts.
+        let init_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open init conn");
+        init_conn
+            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        init_conn
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        drop(init_conn);
+
         let db_url = format!(
             "sqlite:////{}",
             db_path.to_string_lossy().trim_start_matches('/')
@@ -444,9 +460,76 @@ mod tests {
             database_url: db_url,
             min_connections: 1,
             max_connections: 1,
+            run_migrations: false,
             ..Default::default()
         };
         create_pool(&pool_config).expect("create pool")
+    }
+
+    fn seed_active_reservation(
+        tmp: &tempfile::TempDir,
+    ) -> (DbPool, Cx, i64, i64, i64, String, String) {
+        let pool = make_test_pool(tmp);
+        let cx = Cx::for_testing();
+
+        let project_root = tmp.path().join("project_root_active");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let human_key = project_root.to_string_lossy().to_string();
+
+        let project = match fastmcp_core::block_on(async {
+            queries::ensure_project(&cx, &pool, &human_key).await
+        }) {
+            Outcome::Ok(p) => p,
+            other => panic!("ensure_project failed: {other:?}"),
+        };
+        let project_id = project.id.expect("project id");
+
+        let agent = match fastmcp_core::block_on(async {
+            queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenDuck",
+                "test",
+                "test",
+                None,
+                None,
+            )
+            .await
+        }) {
+            Outcome::Ok(a) => a,
+            other => panic!("register_agent failed: {other:?}"),
+        };
+        let agent_id = agent.id.expect("agent id");
+
+        let path_pattern = "src/missing_file.rs".to_string();
+        let created = match fastmcp_core::block_on(async {
+            queries::create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &[path_pattern.as_str()],
+                3_600, // active reservation (1h)
+                true,
+                "test-active",
+            )
+            .await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("create_file_reservations failed: {other:?}"),
+        };
+        let reservation_id = created[0].id.expect("reservation id");
+
+        (
+            pool,
+            cx,
+            project_id,
+            agent_id,
+            reservation_id,
+            human_key,
+            path_pattern,
+        )
     }
 
     #[test]
@@ -513,6 +596,108 @@ mod tests {
         assert!(
             row.released_ts.is_some(),
             "expired reservation should be released"
+        );
+    }
+
+    #[test]
+    fn cleanup_cycle_with_no_active_reservations_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = make_test_pool(&tmp);
+        let config = Config::from_env();
+
+        let (projects_scanned, released) = run_cleanup_cycle(&config, &pool).expect("run cleanup");
+        assert_eq!(projects_scanned, 0);
+        assert_eq!(released, 0);
+    }
+
+    #[test]
+    fn check_filesystem_activity_detects_recent_then_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let file = workspace.join("active.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let now = now_micros();
+        assert!(check_filesystem_activity(
+            workspace,
+            "active.rs",
+            now,
+            1_000_000
+        ));
+        assert!(!check_filesystem_activity(
+            workspace,
+            "active.rs",
+            now + 10_000_000,
+            1_000_000
+        ));
+    }
+
+    #[test]
+    fn check_git_activity_returns_false_outside_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("file.rs"), "fn x() {}").unwrap();
+
+        let now = now_micros();
+        assert!(!check_git_activity(tmp.path(), "file.rs", now, 1_000_000));
+    }
+
+    #[test]
+    fn detect_and_release_stale_skips_recent_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
+            seed_active_reservation(&tmp);
+
+        let mut config = Config::from_env();
+        config.file_reservation_inactivity_seconds = 86_400; // one day
+        config.file_reservation_activity_grace_seconds = 900;
+
+        let released =
+            detect_and_release_stale(&config, &pool, &cx, project_id).expect("stale pass");
+        assert_eq!(released, 0);
+
+        let rows = match fastmcp_core::block_on(async {
+            queries::list_file_reservations(&cx, &pool, project_id, false).await
+        }) {
+            Outcome::Ok(r) => r,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.id.is_some_and(|rid| rid == reservation_id))
+            .expect("reservation should exist");
+        assert!(
+            row.released_ts.is_none(),
+            "recently active agent reservation should not be released"
+        );
+    }
+
+    #[test]
+    fn detect_and_release_stale_releases_inactive_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
+            seed_active_reservation(&tmp);
+
+        let mut config = Config::from_env();
+        config.file_reservation_inactivity_seconds = 0;
+        config.file_reservation_activity_grace_seconds = 0;
+
+        let released =
+            detect_and_release_stale(&config, &pool, &cx, project_id).expect("stale pass");
+        assert_eq!(released, 1);
+
+        let rows = match fastmcp_core::block_on(async {
+            queries::list_file_reservations(&cx, &pool, project_id, false).await
+        }) {
+            Outcome::Ok(r) => r,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.id.is_some_and(|rid| rid == reservation_id))
+            .expect("reservation should exist");
+        assert!(
+            row.released_ts.is_some(),
+            "inactive agent reservation should be released"
         );
     }
 }

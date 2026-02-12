@@ -1501,6 +1501,16 @@ mod tests {
         archive
     }
 
+    fn reservation(pattern: &str, holder: &str, exclusive: bool) -> FileReservationRecord {
+        FileReservationRecord {
+            path_pattern: pattern.to_string(),
+            agent_name: holder.to_string(),
+            exclusive,
+            expires_ts: "2099-01-01T00:00:00Z".to_string(),
+            released_ts: None,
+        }
+    }
+
     #[test]
     fn read_active_reservations_filters_correctly() {
         let td = tempfile::TempDir::new().expect("tempdir");
@@ -1606,6 +1616,91 @@ mod tests {
         let conflicts = check_path_conflicts(&paths, &reservations, "SomeAgent", false);
         assert_eq!(conflicts.len(), 2, "two paths should conflict");
         assert!(conflicts.iter().all(|c| c.holder == "OtherAgent"));
+    }
+
+    #[test]
+    fn check_path_conflicts_empty_reservations_allows_all_paths() {
+        let paths = vec![
+            "app/api/users.py".to_string(),
+            "bin/tool.exe".to_string(),
+            "modules/submod".to_string(),
+        ];
+        let conflicts = check_path_conflicts(&paths, &[], "AnyAgent", false);
+        assert!(
+            conflicts.is_empty(),
+            "empty reservation set should never block"
+        );
+    }
+
+    #[test]
+    fn check_path_conflicts_submodule_pointer_path_matches_recursive_pattern() {
+        let paths = vec!["modules/submod".to_string()];
+        let reservations = vec![reservation("modules/submod/**", "OtherAgent", true)];
+        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].holder, "OtherAgent");
+    }
+
+    #[test]
+    fn check_path_conflicts_binary_file_matches_glob() {
+        let paths = vec!["bin/tool.exe".to_string()];
+        let reservations = vec![reservation("bin/*.exe", "Locker", true)];
+        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "bin/tool.exe");
+    }
+
+    #[test]
+    fn check_path_conflicts_overlapping_shared_and_exclusive_blocks_on_exclusive() {
+        let paths = vec!["app/api/users.py".to_string()];
+        let reservations = vec![
+            reservation("app/api/*.py", "SharedAgent", false),
+            reservation("app/**", "ExclusiveAgent", true),
+        ];
+        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].holder, "ExclusiveAgent");
+        assert_eq!(conflicts[0].pattern, "app/**");
+    }
+
+    #[test]
+    fn check_path_conflicts_rename_old_and_new_paths_conflict_independently() {
+        let renamed_paths = parse_name_status_z(b"R100\0src/old.rs\0src/new.rs\0").expect("parse");
+        let reservations = vec![
+            reservation("src/old.rs", "OldOwner", true),
+            reservation("src/new.rs", "NewOwner", true),
+        ];
+
+        let conflicts = check_path_conflicts(&renamed_paths, &reservations, "MyAgent", false);
+        assert_eq!(conflicts.len(), 2);
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.path == "src/old.rs" && c.holder == "OldOwner")
+        );
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.path == "src/new.rs" && c.holder == "NewOwner")
+        );
+    }
+
+    #[test]
+    fn check_path_conflicts_large_reservation_set_still_finds_match() {
+        let mut reservations = Vec::with_capacity(1_200);
+        for i in 0..1_199usize {
+            reservations.push(reservation(
+                &format!("src/no_match_{i}.rs"),
+                "BulkOwner",
+                true,
+            ));
+        }
+        reservations.push(reservation("src/target.rs", "TargetOwner", true));
+
+        let paths = vec!["src/target.rs".to_string()];
+        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].holder, "TargetOwner");
     }
 
     // -----------------------------------------------------------------------
@@ -1725,6 +1820,80 @@ mod tests {
     }
 
     #[test]
+    fn staged_paths_includes_binary_file() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(repo_dir.join("bin")).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
+        std::fs::write(repo_dir.join("init.txt"), "init").expect("write");
+        run_git(&repo_dir, &["add", "init.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "init"]);
+
+        std::fs::write(
+            repo_dir.join("bin").join("tool.exe"),
+            [0u8, 159u8, 146u8, 150u8],
+        )
+        .expect("write binary");
+        run_git(&repo_dir, &["add", "bin/tool.exe"]);
+
+        let paths = get_staged_paths(&repo_dir).expect("staged paths");
+        assert!(
+            paths.contains(&"bin/tool.exe".to_string()),
+            "expected staged binary path in output, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn staged_paths_submodule_pointer_update_included() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let super_repo = td.path().join("super");
+        let sub_repo = td.path().join("sub");
+        std::fs::create_dir_all(&super_repo).expect("mkdir super");
+        std::fs::create_dir_all(&sub_repo).expect("mkdir sub");
+
+        run_git(&sub_repo, &["init", "-q"]);
+        run_git(&sub_repo, &["config", "user.email", "test@test.com"]);
+        run_git(&sub_repo, &["config", "user.name", "test"]);
+        std::fs::write(sub_repo.join("lib.rs"), "pub fn one() {}\n").expect("write sub lib");
+        run_git(&sub_repo, &["add", "lib.rs"]);
+        run_git(&sub_repo, &["commit", "-qm", "sub init"]);
+
+        run_git(&super_repo, &["init", "-q"]);
+        run_git(&super_repo, &["config", "user.email", "test@test.com"]);
+        run_git(&super_repo, &["config", "user.name", "test"]);
+        run_git(
+            &super_repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_repo.to_str().expect("utf8"),
+                "modules/submod",
+            ],
+        );
+        run_git(&super_repo, &["commit", "-qm", "add submodule"]);
+
+        let sub_worktree = super_repo.join("modules").join("submod");
+        run_git(&sub_worktree, &["config", "user.email", "test@test.com"]);
+        run_git(&sub_worktree, &["config", "user.name", "test"]);
+        std::fs::write(sub_worktree.join("lib.rs"), "pub fn two() {}\n").expect("write sub update");
+        run_git(&sub_worktree, &["add", "lib.rs"]);
+        run_git(&sub_worktree, &["commit", "-qm", "sub update"]);
+
+        run_git(&super_repo, &["add", "modules/submod"]);
+
+        let paths = get_staged_paths(&super_repo).expect("staged paths");
+        assert!(
+            paths.contains(&"modules/submod".to_string()),
+            "expected staged submodule pointer path, got {paths:?}"
+        );
+    }
+
+    #[test]
     fn staged_paths_empty_when_nothing_staged() {
         let td = tempfile::TempDir::new().expect("tempdir");
         let repo_dir = td.path().join("repo");
@@ -1839,6 +2008,34 @@ mod tests {
         assert!(
             paths.contains(&"b.txt".to_string()),
             "expected b.txt in push paths, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn push_paths_detached_head_range_still_enumerates_changed_files() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
+        std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write base");
+        run_git(&repo_dir, &["add", "base.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let remote_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        run_git(&repo_dir, &["checkout", "--detach", "HEAD"]);
+        std::fs::write(repo_dir.join("detached.txt"), "detached\n").expect("write detached");
+        run_git(&repo_dir, &["add", "detached.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "detached commit"]);
+        let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let stdin_lines = format!("HEAD {local_sha} refs/heads/main {remote_sha}\n");
+        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        assert!(
+            paths.contains(&"detached.txt".to_string()),
+            "expected detached.txt in push paths, got {paths:?}"
         );
     }
 

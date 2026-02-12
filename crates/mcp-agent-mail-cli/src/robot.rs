@@ -2554,12 +2554,25 @@ fn build_projects(conn: &SqliteConnection) -> Result<Vec<ProjectRow>, CliError> 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum NavigateResult {
-    Projects { projects: Vec<ProjectRow> },
-    Agents { agents: Vec<AgentRow> },
-    Inbox { entries: Vec<InboxEntry> },
-    Thread { thread: ThreadData },
-    Message { message: MessageContext },
-    Generic { resource_type: String, data: serde_json::Value },
+    Projects {
+        projects: Vec<ProjectRow>,
+    },
+    Agents {
+        agents: Vec<AgentRow>,
+    },
+    Inbox {
+        entries: Vec<InboxEntry>,
+    },
+    Thread {
+        thread: ThreadData,
+    },
+    Message {
+        message: MessageContext,
+    },
+    Generic {
+        resource_type: String,
+        data: serde_json::Value,
+    },
 }
 
 fn build_navigate(
@@ -2569,9 +2582,9 @@ fn build_navigate(
     project_slug: &str,
     agent: Option<(i64, String)>,
 ) -> Result<(NavigateResult, Option<String>), CliError> {
-    let path = uri
-        .strip_prefix("resource://")
-        .ok_or_else(|| CliError::InvalidArgument(format!("invalid URI scheme: {uri} (expected resource://)")))?;
+    let path = uri.strip_prefix("resource://").ok_or_else(|| {
+        CliError::InvalidArgument(format!("invalid URI scheme: {uri} (expected resource://)"))
+    })?;
 
     let parts: Vec<&str> = path.split('/').collect();
 
@@ -2626,10 +2639,24 @@ fn build_navigate(
             let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
             if let Some((agent_id, name)) = agent_opt {
                 let result = build_inbox(
-                    conn, project_id, project_slug, agent_id, &name,
-                    false, false, true, false, 50, false,
+                    conn,
+                    project_id,
+                    project_slug,
+                    agent_id,
+                    &name,
+                    false,
+                    false,
+                    true,
+                    false,
+                    50,
+                    false,
                 )?;
-                Ok((NavigateResult::Inbox { entries: result.entries }, None))
+                Ok((
+                    NavigateResult::Inbox {
+                        entries: result.entries,
+                    },
+                    None,
+                ))
             } else {
                 Ok((NavigateResult::Inbox { entries: vec![] }, None))
             }
@@ -2693,10 +2720,24 @@ fn build_navigate(
             let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name));
             if let Some((agent_id, name)) = agent_opt {
                 let result = build_inbox(
-                    conn, project_id, project_slug, agent_id, &name,
-                    false, false, false, true, 50, false,
+                    conn,
+                    project_id,
+                    project_slug,
+                    agent_id,
+                    &name,
+                    false,
+                    false,
+                    false,
+                    true,
+                    50,
+                    false,
                 )?;
-                Ok((NavigateResult::Inbox { entries: result.entries }, None))
+                Ok((
+                    NavigateResult::Inbox {
+                        entries: result.entries,
+                    },
+                    None,
+                ))
             } else {
                 Ok((NavigateResult::Inbox { entries: vec![] }, None))
             }
@@ -4515,8 +4556,11 @@ mod tests {
                 remediation: "am mail ack".into(),
             }],
         };
-        let env = RobotEnvelope::new("robot status", OutputFormat::Json, data)
-            .with_alert("warn", "Health degraded", None);
+        let env = RobotEnvelope::new("robot status", OutputFormat::Json, data).with_alert(
+            "warn",
+            "Health degraded",
+            None,
+        );
         let out = format_output(&env, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["health"], "degraded");
@@ -4758,18 +4802,16 @@ mod tests {
             message_count: 2,
             participants: vec!["Alice".into(), "Bob".into()],
             last_activity: "5m".into(),
-            messages: vec![
-                ThreadMessage {
-                    position: 1,
-                    from: "Alice".into(),
-                    to: "Bob".into(),
-                    age: "1h".into(),
-                    importance: "normal".into(),
-                    ack: "none".into(),
-                    subject: "[BUG-42] Login failing".into(),
-                    body: Some("Users report login failures.".into()),
-                },
-            ],
+            messages: vec![ThreadMessage {
+                position: 1,
+                from: "Alice".into(),
+                to: "Bob".into(),
+                age: "1h".into(),
+                importance: "normal".into(),
+                ack: "none".into(),
+                subject: "[BUG-42] Login failing".into(),
+                body: Some("Users report login failures.".into()),
+            }],
         };
         let env = RobotEnvelope::new("robot thread", OutputFormat::Markdown, data);
         let out = format_output(&env, OutputFormat::Markdown).unwrap();
@@ -4799,9 +4841,18 @@ mod tests {
             query: "authentication".into(),
             total_results: 10,
             results: vec![],
-            by_thread: vec![FacetEntry { value: "AUTH-1".into(), count: 5 }],
-            by_agent: vec![FacetEntry { value: "BlueLake".into(), count: 6 }],
-            by_importance: vec![FacetEntry { value: "high".into(), count: 3 }],
+            by_thread: vec![FacetEntry {
+                value: "AUTH-1".into(),
+                count: 5,
+            }],
+            by_agent: vec![FacetEntry {
+                value: "BlueLake".into(),
+                count: 6,
+            }],
+            by_importance: vec![FacetEntry {
+                value: "high".into(),
+                count: 3,
+            }],
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"query\":\"authentication\""));

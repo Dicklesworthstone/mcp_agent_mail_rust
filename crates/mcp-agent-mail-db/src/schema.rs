@@ -116,9 +116,10 @@ CREATE TABLE IF NOT EXISTS agent_links (
     reason TEXT NOT NULL DEFAULT '',
     created_ts INTEGER NOT NULL,
     updated_ts INTEGER NOT NULL,
-    expires_ts INTEGER,
-    UNIQUE(a_project_id, a_agent_id, b_project_id, b_agent_id)
+    expires_ts INTEGER
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_links_pair_unique
+    ON agent_links(a_project_id, a_agent_id, b_project_id, b_agent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_a_project ON agent_links(a_project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_b_project ON agent_links(b_project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_status ON agent_links(status);
@@ -844,9 +845,7 @@ pub fn schema_migrations() -> Vec<Migration> {
 /// triggers. These DDL statements are unsupported by `FrankenConnection`.
 fn is_fts_or_trigger_migration(id: &str) -> bool {
     let id_lower = id.to_ascii_lowercase();
-    id_lower.contains("fts")
-        || id_lower.contains("trigger")
-        || id_lower.contains("trg")
+    id_lower.contains("fts") || id_lower.contains("trigger") || id_lower.contains("trg")
 }
 
 /// Migrations excluding FTS5 virtual tables, triggers, and FTS backfill inserts.
@@ -953,8 +952,8 @@ mod tests {
     fn migrations_apply_and_are_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_apply.db");
-        let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
 
         // First run applies all schema migrations.
         let applied = block_on({
@@ -983,8 +982,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_preserve.db");
-        let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
 
         // Simulate an older DB with only `projects` table.
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1026,8 +1025,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v3_text_ts.db");
-        let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
             .expect("apply PRAGMAs");
@@ -1204,8 +1203,8 @@ mod tests {
     fn v4_migration_creates_composite_indexes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_indexes.db");
-        let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
 
         // Apply all migrations.
         block_on({
@@ -1255,8 +1254,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_existing.db");
-        let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
             .expect("apply PRAGMAs");
@@ -1357,8 +1356,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v5_fts.db");
-        let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
 
         // Apply all migrations (creates schema + FTS with porter tokenizer).
         block_on({
@@ -1457,8 +1456,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v7_fts_identity.db");
-        let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
 
         // Simulate a pre-v7 DB: identity tables exist, but there are no fts_agents/fts_projects.
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1583,8 +1582,8 @@ mod tests {
     fn corrupted_migrations_table_yields_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_corrupt.db");
-        let conn =
-            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
 
         // Create a tracking table with the right name but wrong schema.
         conn.execute_sync(

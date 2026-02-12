@@ -338,7 +338,11 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
         let summary = first_compiler_msg
             .map(|m| format!("{} compiler error(s): {}", compiler_errors, m))
             .unwrap_or_else(|| format!("{} compiler error(s)", compiler_errors));
-        (Some("compiler".to_string()), Some(compiler_errors), Some(summary))
+        (
+            Some("compiler".to_string()),
+            Some(compiler_errors),
+            Some(summary),
+        )
     } else if test_failures > 0 {
         let summary = first_test_name
             .map(|t| format!("{} test failure(s), first: {}", test_failures, t))
@@ -348,16 +352,28 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
         let summary = first_clippy_msg
             .map(|m| format!("{} clippy warning(s): {}", clippy_warnings, m))
             .unwrap_or_else(|| format!("{} clippy warning(s)", clippy_warnings));
-        (Some("clippy".to_string()), Some(clippy_warnings), Some(summary))
+        (
+            Some("clippy".to_string()),
+            Some(clippy_warnings),
+            Some(summary),
+        )
     } else if format_diffs > 0 {
         let summary = first_format_file
             .map(|f| format!("{} file(s) need formatting, first: {}", format_diffs, f))
             .unwrap_or_else(|| format!("{} file(s) need formatting", format_diffs));
-        (Some("format".to_string()), Some(format_diffs), Some(summary))
+        (
+            Some("format".to_string()),
+            Some(format_diffs),
+            Some(summary),
+        )
     } else if !stderr.trim().is_empty() {
         // Unknown error with non-empty stderr
         let first_line = stderr.lines().next().unwrap_or("unknown error");
-        (Some("unknown".to_string()), None, Some(first_line.to_string()))
+        (
+            Some("unknown".to_string()),
+            None,
+            Some(first_line.to_string()),
+        )
     } else {
         (None, None, None)
     }
@@ -1305,9 +1321,7 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
         .iter()
         .enumerate()
         .filter(|(_, g)| {
-            g.name == "Format check"
-                || g.name == "Clippy"
-                || g.name == "Build workspace"
+            g.name == "Format check" || g.name == "Clippy" || g.name == "Build workspace"
         })
         .collect();
 
@@ -1315,9 +1329,7 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
         .iter()
         .enumerate()
         .filter(|(_, g)| {
-            g.name != "Format check"
-                && g.name != "Clippy"
-                && g.name != "Build workspace"
+            g.name != "Format check" && g.name != "Clippy" && g.name != "Build workspace"
         })
         .collect();
 
@@ -1372,7 +1384,10 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
             ));
         }
     } else {
-        eprintln!("Phase 2: Running remaining {} gates in parallel...", other_gates.len());
+        eprintln!(
+            "Phase 2: Running remaining {} gates in parallel...",
+            other_gates.len()
+        );
         let handles: Vec<_> = other_gates
             .iter()
             .map(|(idx, gate)| {
@@ -1805,11 +1820,13 @@ mod tests {
         let result = run_gate(&gate, &config);
 
         assert_eq!(result.status, GateStatus::Fail);
-        assert!(result
-            .stderr_tail
-            .as_ref()
-            .unwrap()
-            .contains("empty command"));
+        assert!(
+            result
+                .stderr_tail
+                .as_ref()
+                .unwrap()
+                .contains("empty command")
+        );
     }
 
     #[test]
@@ -1965,7 +1982,9 @@ mod tests {
             elapsed_seconds: 5,
             command: "cargo clippy".to_string(),
             stderr_tail: Some("error: unused variable\n  --> src/main.rs:5".to_string()),
-            error: Some(GateError::from_stderr("error: unused variable\n  --> src/main.rs:5")),
+            error: Some(GateError::from_stderr(
+                "error: unused variable\n  --> src/main.rs:5",
+            )),
         }];
 
         let report = GateReport::new(RunMode::Full, results);
@@ -2051,18 +2070,30 @@ error: aborting due to 2 previous errors"#;
 
         assert_eq!(gate_error.error_category, Some("compiler".to_string()));
         assert_eq!(gate_error.error_count, Some(2));
-        assert!(gate_error
-            .error_summary
-            .as_ref()
-            .unwrap()
-            .contains("2 compiler error(s)"));
-        assert!(gate_error
-            .error_summary
-            .as_ref()
-            .unwrap()
-            .contains("cannot find value"));
-        assert!(gate_error.affected_files.contains(&"src/main.rs".to_string()));
-        assert!(gate_error.affected_files.contains(&"src/lib.rs".to_string()));
+        assert!(
+            gate_error
+                .error_summary
+                .as_ref()
+                .unwrap()
+                .contains("2 compiler error(s)")
+        );
+        assert!(
+            gate_error
+                .error_summary
+                .as_ref()
+                .unwrap()
+                .contains("cannot find value")
+        );
+        assert!(
+            gate_error
+                .affected_files
+                .contains(&"src/main.rs".to_string())
+        );
+        assert!(
+            gate_error
+                .affected_files
+                .contains(&"src/lib.rs".to_string())
+        );
     }
 
     #[test]
@@ -2089,11 +2120,13 @@ test result: FAILED. 2 passed; 1 failed; 0 ignored"#;
 
         assert_eq!(gate_error.error_category, Some("test".to_string()));
         assert_eq!(gate_error.error_count, Some(2)); // test_fail header + panicked
-        assert!(gate_error
-            .error_summary
-            .as_ref()
-            .unwrap()
-            .contains("test failure(s)"));
+        assert!(
+            gate_error
+                .error_summary
+                .as_ref()
+                .unwrap()
+                .contains("test failure(s)")
+        );
     }
 
     #[test]
@@ -2119,11 +2152,13 @@ warning: `myproject` (bin "myproject") generated 2 warnings"#;
         assert_eq!(gate_error.error_category, Some("clippy".to_string()));
         // At least 2 warnings
         assert!(gate_error.error_count.unwrap() >= 2);
-        assert!(gate_error
-            .error_summary
-            .as_ref()
-            .unwrap()
-            .contains("clippy warning(s)"));
+        assert!(
+            gate_error
+                .error_summary
+                .as_ref()
+                .unwrap()
+                .contains("clippy warning(s)")
+        );
     }
 
     #[test]
@@ -2145,11 +2180,13 @@ warning: `myproject` (bin "myproject") generated 2 warnings"#;
 
         assert_eq!(gate_error.error_category, Some("unknown".to_string()));
         assert!(gate_error.error_count.is_none());
-        assert!(gate_error
-            .error_summary
-            .as_ref()
-            .unwrap()
-            .contains("Some random error message"));
+        assert!(
+            gate_error
+                .error_summary
+                .as_ref()
+                .unwrap()
+                .contains("Some random error message")
+        );
     }
 
     #[test]
@@ -2195,11 +2232,21 @@ error[E0425]: another error
         let gate_error = GateError::from_stderr(stderr);
 
         assert_eq!(gate_error.affected_files.len(), 3);
-        assert!(gate_error.affected_files.contains(&"src/main.rs".to_string()));
-        assert!(gate_error.affected_files.contains(&"src/lib.rs".to_string()));
-        assert!(gate_error
-            .affected_files
-            .contains(&"tests/integration.rs".to_string()));
+        assert!(
+            gate_error
+                .affected_files
+                .contains(&"src/main.rs".to_string())
+        );
+        assert!(
+            gate_error
+                .affected_files
+                .contains(&"src/lib.rs".to_string())
+        );
+        assert!(
+            gate_error
+                .affected_files
+                .contains(&"tests/integration.rs".to_string())
+        );
     }
 
     #[test]
@@ -2378,13 +2425,15 @@ error[E0425]: another error
     #[test]
     fn test_parallel_captures_stderr_per_gate() {
         // Create a failing gate that produces stderr
-        let gates = vec![
-            GateConfig::new(
-                "Stderr producer",
-                GateCategory::Quality,
-                ["bash", "-c", "echo 'unique_error_marker_12345' >&2 && exit 1"],
-            ),
-        ];
+        let gates = vec![GateConfig::new(
+            "Stderr producer",
+            GateCategory::Quality,
+            [
+                "bash",
+                "-c",
+                "echo 'unique_error_marker_12345' >&2 && exit 1",
+            ],
+        )];
         let config = GateRunnerConfig::default().mode(RunMode::Full);
 
         let report = run_gates_parallel(&gates, &config);
@@ -2392,11 +2441,13 @@ error[E0425]: another error
         assert_eq!(report.gates.len(), 1);
         assert_eq!(report.gates[0].status, GateStatus::Fail);
         assert!(report.gates[0].stderr_tail.is_some());
-        assert!(report.gates[0]
-            .stderr_tail
-            .as_ref()
-            .unwrap()
-            .contains("unique_error_marker_12345"));
+        assert!(
+            report.gates[0]
+                .stderr_tail
+                .as_ref()
+                .unwrap()
+                .contains("unique_error_marker_12345")
+        );
     }
 
     #[test]
@@ -2422,11 +2473,35 @@ error[E0425]: another error
         let gate_a = &report.gates[0];
         let gate_b = &report.gates[1];
 
-        assert!(gate_a.stderr_tail.as_ref().unwrap().contains("GATE_A_OUTPUT"));
-        assert!(!gate_a.stderr_tail.as_ref().unwrap().contains("GATE_B_OUTPUT"));
+        assert!(
+            gate_a
+                .stderr_tail
+                .as_ref()
+                .unwrap()
+                .contains("GATE_A_OUTPUT")
+        );
+        assert!(
+            !gate_a
+                .stderr_tail
+                .as_ref()
+                .unwrap()
+                .contains("GATE_B_OUTPUT")
+        );
 
-        assert!(gate_b.stderr_tail.as_ref().unwrap().contains("GATE_B_OUTPUT"));
-        assert!(!gate_b.stderr_tail.as_ref().unwrap().contains("GATE_A_OUTPUT"));
+        assert!(
+            gate_b
+                .stderr_tail
+                .as_ref()
+                .unwrap()
+                .contains("GATE_B_OUTPUT")
+        );
+        assert!(
+            !gate_b
+                .stderr_tail
+                .as_ref()
+                .unwrap()
+                .contains("GATE_A_OUTPUT")
+        );
     }
 
     #[test]

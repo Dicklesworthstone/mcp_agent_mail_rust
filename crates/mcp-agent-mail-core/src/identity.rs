@@ -92,11 +92,7 @@ fn git_cmd(repo: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn parse_remote_url(url: &str) -> Option<(String, String)> {

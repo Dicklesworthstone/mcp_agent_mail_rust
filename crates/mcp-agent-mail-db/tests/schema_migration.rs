@@ -20,8 +20,8 @@ use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_db::schema::{
     self, MIGRATIONS_TABLE_NAME, PRAGMA_SETTINGS_SQL, migrate_to_latest, migration_status,
 };
-use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use sqlmodel_core::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1557,7 +1557,10 @@ fn frankenconnection_does_not_corrupt_schema() {
 
     // 2b. Dump sqlite_master schema SQL BEFORE FrankenConnection
     let schema_before: Vec<String> = conn
-        .query_sync("SELECT type, name, sql FROM sqlite_master ORDER BY rowid", &[])
+        .query_sync(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY rowid",
+            &[],
+        )
         .unwrap()
         .iter()
         .map(|r| {
@@ -1567,7 +1570,10 @@ fn frankenconnection_does_not_corrupt_schema() {
             format!("{typ}: {name} => {}", &sql[..sql.len().min(100)])
         })
         .collect();
-    eprintln!("BEFORE FrankenConnection ({} entries):", schema_before.len());
+    eprintln!(
+        "BEFORE FrankenConnection ({} entries):",
+        schema_before.len()
+    );
     for s in &schema_before {
         eprintln!("  {s}");
     }
@@ -1587,7 +1593,10 @@ fn frankenconnection_does_not_corrupt_schema() {
     let conn = SqliteConnection::open_file(&path_str).expect("reopen sqlite after franken");
 
     // 4a. Dump sqlite_master schema SQL AFTER FrankenConnection
-    match conn.query_sync("SELECT type, name, sql FROM sqlite_master ORDER BY rowid", &[]) {
+    match conn.query_sync(
+        "SELECT type, name, sql FROM sqlite_master ORDER BY rowid",
+        &[],
+    ) {
         Ok(rows) => {
             eprintln!("AFTER FrankenConnection ({} entries):", rows.len());
             for r in &rows {
@@ -1623,7 +1632,8 @@ fn frankenconnection_open_close_no_write() {
     conn.execute_sync(
         "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp/test', 0)",
         &[],
-    ).unwrap();
+    )
+    .unwrap();
     drop(conn);
 
     // Just open and close FrankenConnection without writing
@@ -1655,10 +1665,12 @@ fn frankenconnection_autoincrement_write() {
 
         let fconn = DbConn::open_file(&path_str).expect("franken open");
         // Insert with explicit id, bypassing sqlite_sequence
-        fconn.execute_sync(
-            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (999, 'x', '/x', 0)",
-            &[],
-        ).unwrap();
+        fconn
+            .execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (999, 'x', '/x', 0)",
+                &[],
+            )
+            .unwrap();
         drop(fconn);
 
         let conn = SqliteConnection::open_file(&path_str).expect("reopen");
@@ -1678,10 +1690,12 @@ fn frankenconnection_autoincrement_write() {
 
         let fconn = DbConn::open_file(&path_str).expect("franken open");
         // Insert without explicit id — triggers AUTOINCREMENT / sqlite_sequence
-        fconn.execute_sync(
-            "INSERT INTO projects (slug, human_key, created_at) VALUES ('y', '/y', 0)",
-            &[],
-        ).unwrap();
+        fconn
+            .execute_sync(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('y', '/y', 0)",
+                &[],
+            )
+            .unwrap();
         drop(fconn);
 
         let conn = SqliteConnection::open_file(&path_str).expect("reopen");
@@ -1701,7 +1715,8 @@ fn frankenconnection_autoincrement_write() {
         conn.execute_sync(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 't', '/t', 0)",
             &[],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_sync(
             "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (1, 1, 'GreenCastle', 'test', 'test', '', 0, 0, 'auto', 'auto')",
             &[],
@@ -1710,10 +1725,12 @@ fn frankenconnection_autoincrement_write() {
 
         let fconn = DbConn::open_file(&path_str).expect("franken open");
         // message_recipients has no AUTOINCREMENT
-        fconn.execute_sync(
-            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to')",
-            &[],
-        ).unwrap_or_default(); // May fail on FK but we care about corruption
+        fconn
+            .execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to')",
+                &[],
+            )
+            .unwrap_or_default(); // May fail on FK but we care about corruption
         drop(fconn);
 
         let conn = SqliteConnection::open_file(&path_str).expect("reopen");
@@ -1739,12 +1756,15 @@ fn frankenconnection_read_only_no_corruption() {
     conn.execute_sync(
         "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp/test', 0)",
         &[],
-    ).unwrap();
+    )
+    .unwrap();
     drop(conn);
 
     // Open FrankenConnection and only do reads
     let fconn = DbConn::open_file(&path_str).expect("franken open");
-    let _rows = fconn.query_sync("SELECT id, slug FROM projects", &[]).unwrap();
+    let _rows = fconn
+        .query_sync("SELECT id, slug FROM projects", &[])
+        .unwrap();
     drop(fconn);
 
     // Check if schema is still valid
@@ -1766,21 +1786,27 @@ fn frankenconnection_tiny_schema_no_corruption() {
 
     // 1. Create a tiny DB
     let conn = SqliteConnection::open_file(&path_str).expect("open");
-    conn.execute_raw("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute_raw("CREATE TABLE t2 (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)").unwrap();
-    conn.execute_sync("INSERT INTO t1 VALUES (1, 'hello')", &[]).unwrap();
+    conn.execute_raw("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute_raw("CREATE TABLE t2 (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute_sync("INSERT INTO t1 VALUES (1, 'hello')", &[])
+        .unwrap();
     drop(conn);
 
     // 2. FrankenConnection writes
     let fconn = DbConn::open_file(&path_str).expect("franken open");
-    fconn.execute_sync("INSERT INTO t1 VALUES (2, 'world')", &[]).unwrap();
+    fconn
+        .execute_sync("INSERT INTO t1 VALUES (2, 'world')", &[])
+        .unwrap();
     drop(fconn);
 
     // 3. SqliteConnection verifies
     let conn = SqliteConnection::open_file(&path_str).expect("reopen");
     let rows = conn.query_sync("SELECT * FROM t1", &[]).unwrap();
     assert_eq!(rows.len(), 2, "expected 2 rows");
-    conn.query_sync("SELECT * FROM t2", &[]).expect("t2 schema should be intact");
+    conn.query_sync("SELECT * FROM t2", &[])
+        .expect("t2 schema should be intact");
 }
 
 /// Test with progressively more tables to find corruption threshold.
@@ -1803,12 +1829,18 @@ fn frankenconnection_many_tables_corruption_threshold() {
             );
             conn.execute_raw(&sql).unwrap();
         }
-        conn.execute_sync("INSERT INTO table_0 (col_a, col_b) VALUES (1, 'test')", &[]).unwrap();
+        conn.execute_sync("INSERT INTO table_0 (col_a, col_b) VALUES (1, 'test')", &[])
+            .unwrap();
         drop(conn);
 
         // FrankenConnection writes
         let fconn = DbConn::open_file(&path_str).expect("franken open");
-        fconn.execute_sync("INSERT INTO table_0 (col_a, col_b) VALUES (2, 'world')", &[]).unwrap();
+        fconn
+            .execute_sync(
+                "INSERT INTO table_0 (col_a, col_b) VALUES (2, 'world')",
+                &[],
+            )
+            .unwrap();
         drop(fconn);
 
         // SqliteConnection verifies ALL tables
@@ -1820,10 +1852,7 @@ fn frankenconnection_many_tables_corruption_threshold() {
             }
         }
         // Also check via sqlite_master
-        match conn.query_sync(
-            "SELECT count(*) FROM sqlite_master WHERE type='table'",
-            &[],
-        ) {
+        match conn.query_sync("SELECT count(*) FROM sqlite_master WHERE type='table'", &[]) {
             Ok(_) => eprintln!("OK: {n_tables} tables, no corruption"),
             Err(e) => panic!("sqlite_master corrupted at {n_tables} tables: {e}"),
         }

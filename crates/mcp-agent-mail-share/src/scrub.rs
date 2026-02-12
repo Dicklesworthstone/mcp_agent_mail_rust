@@ -36,18 +36,37 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // OpenAI / generic sk- keys
         Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap(),
         // Bearer tokens
-        Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{16,}").unwrap(),
+        Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\./+=]{16,}").unwrap(),
+        // URL-embedded basic auth credentials
+        Regex::new(r"(?i)https?://[^/\s:@]+:[^@\s/]+@").unwrap(),
+        // Environment-variable references likely to contain secrets
+        Regex::new(r"(?i)\$[A-Z_][A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z0-9_]*").unwrap(),
         // JWTs (three base64url segments)
         Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+").unwrap(),
         // AWS access key IDs (always start with AKIA)
         Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
-        // PEM private keys
-        Regex::new(r"-----BEGIN[A-Z ]* PRIVATE KEY-----").unwrap(),
+        // PEM private keys (multi-line block)
+        Regex::new(r"(?s)-----BEGIN[A-Z ]* PRIVATE KEY-----.*?-----END[A-Z ]* PRIVATE KEY-----")
+            .unwrap(),
         // Anthropic API keys
         Regex::new(r"(?i)sk-ant-[A-Za-z0-9\-]{20,}").unwrap(),
         // GitLab tokens
         Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap(),
     ]
+});
+
+fn normalize_redact_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '\0')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+static NORMALIZED_ATTACHMENT_REDACT_KEYS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    ATTACHMENT_REDACT_KEYS
+        .iter()
+        .map(|k| normalize_redact_key(k))
+        .collect()
 });
 
 /// Per-preset configuration flags.
@@ -378,8 +397,6 @@ fn parse_attachments_json(value: &str) -> Vec<Value> {
 /// Recursively scrub secrets in a JSON structure.
 /// Returns `(scrubbed_value, secret_replacement_count, keys_removed_count)`.
 fn scrub_structure(value: &Value) -> (Value, i64, i64) {
-    let redact_keys: HashSet<&str> = ATTACHMENT_REDACT_KEYS.iter().copied().collect();
-
     match value {
         Value::String(s) => {
             let (scrubbed, count) = scrub_text(s);
@@ -404,7 +421,7 @@ fn scrub_structure(value: &Value) -> (Value, i64, i64) {
             let mut total_reps: i64 = 0;
             let mut total_keys: i64 = 0;
             for (key, val) in obj {
-                if redact_keys.contains(key.as_str()) {
+                if NORMALIZED_ATTACHMENT_REDACT_KEYS.contains(&normalize_redact_key(key)) {
                     // Only count as removed if value is non-empty
                     if !is_empty_value(val) {
                         total_keys += 1;
@@ -493,6 +510,58 @@ mod tests {
     }
 
     #[test]
+    fn scrub_text_base64_token() {
+        let input = "Authorization: Bearer dGVzdF9rZXk6c2VjcmV0L3ZhbHVlKys9";
+        let (result, count) = scrub_text(input);
+        assert_eq!(result, "Authorization: [REDACTED]");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn scrub_text_multiline_pem_private_key() {
+        let input =
+            "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQ\n-----END PRIVATE KEY-----";
+        let (result, count) = scrub_text(input);
+        assert_eq!(result, "[REDACTED]");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn scrub_text_url_embedded_credentials() {
+        let input = "Fetch https://alice:s3cr3t@example.com/path now";
+        let (result, count) = scrub_text(input);
+        assert_eq!(result, "Fetch [REDACTED]example.com/path now");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn scrub_text_environment_variable_references() {
+        let input = "set $SECRET_KEY and $API_TOKEN before launch";
+        let (result, count) = scrub_text(input);
+        assert_eq!(result, "set [REDACTED] and [REDACTED] before launch");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn scrub_text_is_idempotent() {
+        let input = "Use sk-abcdef0123456789012345 immediately";
+        let (once, count_once) = scrub_text(input);
+        let (twice, count_twice) = scrub_text(&once);
+        assert_eq!(once, "Use [REDACTED] immediately");
+        assert_eq!(twice, once);
+        assert_eq!(count_once, 1);
+        assert_eq!(count_twice, 0);
+    }
+
+    #[test]
+    fn scrub_text_binary_safe_for_nonsecrets() {
+        let input = "\u{0}\u{1}\u{2}plain\u{7f}\u{8}";
+        let (result, count) = scrub_text(input);
+        assert_eq!(result, input);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn scrub_structure_removes_redact_keys() {
         let input: Value = serde_json::from_str(
             r#"[{"type":"file","path":"data.json","download_url":"https://secret.example.com","authorization":"Bearer abc"}]"#,
@@ -508,6 +577,59 @@ mod tests {
     }
 
     #[test]
+    fn scrub_structure_nested_secret_recursion() {
+        let input: Value = serde_json::json!([{
+            "type": "file",
+            "metadata": {
+                "nested": {
+                    "token": "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"
+                },
+                "events": [
+                    {
+                        "payload": "Bearer dGVzdF90b2tlbl9uZXN0ZWQxMjM0NTY3ODkw"
+                    }
+                ]
+            }
+        }]);
+        let (result, replacements, keys_removed) = scrub_structure(&input);
+        assert_eq!(replacements, 2);
+        assert_eq!(keys_removed, 0);
+
+        let arr = result.as_array().unwrap();
+        let root = arr[0].as_object().unwrap();
+        assert_eq!(
+            root["metadata"]["nested"]["token"].as_str(),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            root["metadata"]["events"][0]["payload"].as_str(),
+            Some("[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn scrub_structure_multiline_key_removal() {
+        let input: Value = serde_json::json!([{
+            "type": "file",
+            "path": "data.json",
+            "authorization\r\n": "Bearer abcdefghijklmnopqrstuvwxyz123456",
+            " signed_url ": "https://secret.example.com",
+            "headers\t": {"x-trace":"1"}
+        }]);
+        let (result, replacements, keys_removed) = scrub_structure(&input);
+        let arr = result.as_array().unwrap();
+        let obj = arr[0].as_object().unwrap();
+
+        assert_eq!(replacements, 0);
+        assert_eq!(keys_removed, 3);
+        assert!(obj.contains_key("type"));
+        assert!(obj.contains_key("path"));
+        assert!(!obj.contains_key("authorization\r\n"));
+        assert!(!obj.contains_key(" signed_url "));
+        assert!(!obj.contains_key("headers\t"));
+    }
+
+    #[test]
     fn archive_preset_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_fixture_db(dir.path());
@@ -519,6 +641,82 @@ mod tests {
         assert_eq!(summary.secrets_replaced, 0);
         assert_eq!(summary.bodies_redacted, 0);
         assert_eq!(summary.attachments_cleared, 0);
+    }
+
+    #[test]
+    fn scrub_presets_apply_distinct_redaction_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_db = create_fixture_db(dir.path());
+        let source_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            source_db.display().to_string(),
+        )
+        .unwrap();
+        source_conn
+            .execute_sync(
+                "UPDATE messages SET ack_required = 1, body_md = ?, attachments = ? WHERE id = 1",
+                &[
+                    SqlValue::Text("body has sk-abcdef0123456789012345".to_string()),
+                    SqlValue::Text(
+                        r#"[{"type":"file","download_url":"https://secret.example.com","authorization":"Bearer abcdefghijklmnopqrstuvwxyz123456","path":"data.json"}]"#
+                            .to_string(),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let standard_db = dir.path().join("standard.sqlite3");
+        let strict_db = dir.path().join("strict.sqlite3");
+        let archive_db = dir.path().join("archive.sqlite3");
+        crate::create_sqlite_snapshot(&source_db, &standard_db, false).unwrap();
+        crate::create_sqlite_snapshot(&source_db, &strict_db, false).unwrap();
+        crate::create_sqlite_snapshot(&source_db, &archive_db, false).unwrap();
+
+        scrub_snapshot(&standard_db, ScrubPreset::Standard).unwrap();
+        scrub_snapshot(&strict_db, ScrubPreset::Strict).unwrap();
+        scrub_snapshot(&archive_db, ScrubPreset::Archive).unwrap();
+
+        fn fetch_message_state(db_path: &std::path::Path) -> (i64, String, String) {
+            let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+                db_path.display().to_string(),
+            )
+            .unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT ack_required, body_md, attachments FROM messages WHERE id = 1",
+                    &[],
+                )
+                .unwrap();
+            let row = rows.first().unwrap();
+            let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
+            let body_md: String = row.get_named("body_md").unwrap_or_default();
+            let attachments: String = row.get_named("attachments").unwrap_or_default();
+            (ack_required, body_md, attachments)
+        }
+
+        let (std_ack, std_body, std_attachments) = fetch_message_state(&standard_db);
+        assert_eq!(std_ack, 0);
+        assert_eq!(std_body, "body has [REDACTED]");
+        let std_attachment_json: Value = serde_json::from_str(&std_attachments).unwrap();
+        let std_obj = std_attachment_json.as_array().unwrap()[0]
+            .as_object()
+            .unwrap();
+        assert!(!std_obj.contains_key("download_url"));
+        assert!(!std_obj.contains_key("authorization"));
+        assert_eq!(
+            std_obj.get("path").and_then(Value::as_str),
+            Some("data.json")
+        );
+
+        let (strict_ack, strict_body, strict_attachments) = fetch_message_state(&strict_db);
+        assert_eq!(strict_ack, 0);
+        assert_eq!(strict_body, "[Message body redacted]");
+        assert_eq!(strict_attachments, "[]");
+
+        let (archive_ack, archive_body, archive_attachments) = fetch_message_state(&archive_db);
+        assert_eq!(archive_ack, 1);
+        assert_eq!(archive_body, "body has sk-abcdef0123456789012345");
+        assert!(archive_attachments.contains("download_url"));
+        assert!(archive_attachments.contains("authorization"));
     }
 
     /// Conformance test against the Python fixture for all 3 presets.

@@ -42,7 +42,12 @@ fn create_failure_artifact(dir: &std::path::Path, test_name: &str, seed: u64) {
 fn flake_triage_scan_accepts_dir_flag() {
     let tmp = TempDir::new().unwrap();
     let output = Command::new(am_bin())
-        .args(["flake-triage", "scan", "--dir", tmp.path().to_str().unwrap()])
+        .args([
+            "flake-triage",
+            "scan",
+            "--dir",
+            tmp.path().to_str().unwrap(),
+        ])
         .output()
         .expect("am flake-triage scan");
 
@@ -189,7 +194,12 @@ fn flake_triage_scan_human_readable_output() {
     create_failure_artifact(&sub, "test_human", 123);
 
     let output = Command::new(am_bin())
-        .args(["flake-triage", "scan", "--dir", tmp.path().to_str().unwrap()])
+        .args([
+            "flake-triage",
+            "scan",
+            "--dir",
+            tmp.path().to_str().unwrap(),
+        ])
         .output()
         .expect("am flake-triage scan (human)");
 
@@ -355,9 +365,13 @@ fn flake_triage_scan_sorts_by_timestamp() {
     let tmp = TempDir::new().unwrap();
 
     // Create artifacts with different timestamps
-    for (i, ts) in ["2026-02-10T00:00:00Z", "2026-02-12T00:00:00Z", "2026-02-11T00:00:00Z"]
-        .iter()
-        .enumerate()
+    for (i, ts) in [
+        "2026-02-10T00:00:00Z",
+        "2026-02-12T00:00:00Z",
+        "2026-02-11T00:00:00Z",
+    ]
+    .iter()
+    .enumerate()
     {
         let sub = tmp.path().join(format!("run{i}"));
         std::fs::create_dir_all(&sub).unwrap();
@@ -519,7 +533,10 @@ fn flake_triage_help() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("scan"), "help should mention scan subcommand");
+    assert!(
+        stdout.contains("scan"),
+        "help should mention scan subcommand"
+    );
     assert!(
         stdout.contains("reproduce"),
         "help should mention reproduce subcommand"
@@ -541,5 +558,8 @@ fn flake_triage_scan_help() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--dir"), "scan help should document --dir");
-    assert!(stdout.contains("--json"), "scan help should document --json");
+    assert!(
+        stdout.contains("--json"),
+        "scan help should document --json"
+    );
 }

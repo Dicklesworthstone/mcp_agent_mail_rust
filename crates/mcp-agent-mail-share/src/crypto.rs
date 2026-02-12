@@ -401,6 +401,73 @@ mod tests {
         Some((identity_path, recipient))
     }
 
+    fn extract_zip_archive(zip_path: &Path, output_dir: &Path) {
+        let file = std::fs::File::open(zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let output = output_dir.join(entry.name());
+            if entry.is_dir() {
+                std::fs::create_dir_all(&output).unwrap();
+                continue;
+            }
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let mut out_file = std::fs::File::create(&output).unwrap();
+            std::io::copy(&mut entry, &mut out_file).unwrap();
+        }
+    }
+
+    fn write_signed_bundle_fixture(bundle_dir: &Path, bundle_type: &str) -> String {
+        let db_bytes = format!("mailbox-data-{bundle_type}").into_bytes();
+        std::fs::write(bundle_dir.join("mailbox.sqlite3"), &db_bytes).unwrap();
+
+        let mut sri_entries = serde_json::Map::new();
+        let viewer_files: &[(&str, &[u8])] = if bundle_type == "full" {
+            &[
+                ("vendor/app.js", b"console.log('full');"),
+                ("vendor/style.css", b"body{margin:0;}"),
+            ]
+        } else {
+            &[("vendor/incremental.js", b"console.log('incremental');")]
+        };
+        for (relative, content) in viewer_files {
+            let path = bundle_dir.join("viewer").join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+            let sri = format!("sha256-{}", base64_encode(&sha256_bytes(content)));
+            sri_entries.insert((*relative).to_string(), serde_json::Value::String(sri));
+        }
+
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "bundle_type": bundle_type,
+            "database": {
+                "path": "mailbox.sqlite3",
+                "size_bytes": db_bytes.len(),
+                "sha256": hex_sha256(&db_bytes),
+            },
+            "viewer": {
+                "sri": sri_entries,
+            },
+        });
+        let manifest_path = bundle_dir.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let key_path = bundle_dir.join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+        let sig_path = bundle_dir.join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+        sig.public_key
+    }
+
     #[test]
     fn hex_sha256_known_value() {
         let hash = hex_sha256(b"hello");
@@ -1090,6 +1157,106 @@ mod tests {
 
         let decrypted = std::fs::read(&output).unwrap();
         assert_eq!(decrypted, zip_data, "ZIP bundle roundtrip should match");
+    }
+
+    #[test]
+    fn age_roundtrip_full_bundle_zip_preserves_manifest_and_verification() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let source = dir.path().join("full_bundle_source");
+        std::fs::create_dir_all(&source).unwrap();
+        let explicit_pubkey = write_signed_bundle_fixture(&source, "full");
+
+        let zip_path = dir.path().join("full_bundle.zip");
+        crate::package_directory_as_zip(&source, &zip_path).unwrap();
+        let original_zip = std::fs::read(&zip_path).unwrap();
+
+        let encrypted = encrypt_with_age(&zip_path, &[recipient]).unwrap();
+        let decrypted_zip_path = dir.path().join("full_bundle.decrypted.zip");
+        decrypt_with_age(&encrypted, &decrypted_zip_path, Some(&identity_path), None).unwrap();
+
+        let decrypted_zip = std::fs::read(&decrypted_zip_path).unwrap();
+        assert_eq!(
+            decrypted_zip, original_zip,
+            "decrypted full bundle zip should match original bytes"
+        );
+
+        let extracted = dir.path().join("full_bundle_extracted");
+        std::fs::create_dir_all(&extracted).unwrap();
+        extract_zip_archive(&decrypted_zip_path, &extracted);
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(extracted.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest.get("bundle_type").and_then(|v| v.as_str()),
+            Some("full")
+        );
+
+        let verify = verify_bundle(&extracted, Some(&explicit_pubkey)).unwrap();
+        assert!(verify.sri_checked);
+        assert!(verify.sri_valid);
+        assert!(verify.signature_checked);
+        assert!(verify.signature_verified);
+        assert_eq!(verify.key_source.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn age_roundtrip_incremental_bundle_zip_preserves_manifest_and_verification() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let source = dir.path().join("incremental_bundle_source");
+        std::fs::create_dir_all(&source).unwrap();
+        let explicit_pubkey = write_signed_bundle_fixture(&source, "incremental");
+
+        let zip_path = dir.path().join("incremental_bundle.zip");
+        crate::package_directory_as_zip(&source, &zip_path).unwrap();
+        let original_zip = std::fs::read(&zip_path).unwrap();
+
+        let encrypted = encrypt_with_age(&zip_path, &[recipient]).unwrap();
+        let decrypted_zip_path = dir.path().join("incremental_bundle.decrypted.zip");
+        decrypt_with_age(&encrypted, &decrypted_zip_path, Some(&identity_path), None).unwrap();
+
+        let decrypted_zip = std::fs::read(&decrypted_zip_path).unwrap();
+        assert_eq!(
+            decrypted_zip, original_zip,
+            "decrypted incremental bundle zip should match original bytes"
+        );
+
+        let extracted = dir.path().join("incremental_bundle_extracted");
+        std::fs::create_dir_all(&extracted).unwrap();
+        extract_zip_archive(&decrypted_zip_path, &extracted);
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(extracted.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest.get("bundle_type").and_then(|v| v.as_str()),
+            Some("incremental")
+        );
+
+        let verify = verify_bundle(&extracted, Some(&explicit_pubkey)).unwrap();
+        assert!(verify.sri_checked);
+        assert!(verify.sri_valid);
+        assert!(verify.signature_checked);
+        assert!(verify.signature_verified);
+        assert_eq!(verify.key_source.as_deref(), Some("explicit"));
     }
 
     // --- Wrong key decryption failure for age ---

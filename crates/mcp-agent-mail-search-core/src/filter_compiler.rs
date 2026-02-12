@@ -11,11 +11,11 @@
 //! - `date_range` — timestamp range query on `created_ts`
 
 #[cfg(feature = "tantivy-engine")]
+use tantivy::Term;
+#[cfg(feature = "tantivy-engine")]
 use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 #[cfg(feature = "tantivy-engine")]
 use tantivy::schema::{Field, IndexRecordOption};
-#[cfg(feature = "tantivy-engine")]
-use tantivy::Term;
 
 use crate::document::DocKind;
 use crate::query::{ImportanceFilter, SearchFilter};
@@ -148,10 +148,7 @@ fn term_filter(field: Field, value: &str) -> (Occur, Box<dyn Query>) {
 /// `Any` produces no filter. `Urgent` matches only "urgent".
 /// `High` matches "urgent" OR "high". `Normal` matches "normal". `Low` matches "low".
 #[cfg(feature = "tantivy-engine")]
-fn importance_filter(
-    field: Field,
-    filter: ImportanceFilter,
-) -> Option<(Occur, Box<dyn Query>)> {
+fn importance_filter(field: Field, filter: ImportanceFilter) -> Option<(Occur, Box<dyn Query>)> {
     match filter {
         ImportanceFilter::Any => None,
         ImportanceFilter::Urgent => Some(term_filter(field, "urgent")),
@@ -395,14 +392,10 @@ mod tests {
             filter: &SearchFilter,
         ) -> Vec<u64> {
             let compiled = compile_filters(filter, handles);
-            let query = compiled.apply_to(
-                Box::new(tantivy::query::AllQuery) as Box<dyn Query>,
-            );
+            let query = compiled.apply_to(Box::new(tantivy::query::AllQuery) as Box<dyn Query>);
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher
-                .search(&query, &TopDocs::with_limit(100))
-                .unwrap();
+            let hits = searcher.search(&query, &TopDocs::with_limit(100)).unwrap();
             hits.iter()
                 .map(|(_score, addr)| {
                     let doc: TantivyDocument = searcher.doc(*addr).unwrap();
@@ -622,9 +615,7 @@ mod tests {
 
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher
-                .search(&result, &TopDocs::with_limit(100))
-                .unwrap();
+            let hits = searcher.search(&result, &TopDocs::with_limit(100)).unwrap();
             assert_eq!(hits.len(), 3);
         }
     }

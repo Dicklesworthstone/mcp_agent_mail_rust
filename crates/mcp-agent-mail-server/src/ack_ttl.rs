@@ -294,6 +294,22 @@ mod tests {
 
     fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
         let db_path = tmp.path().join("db.sqlite3");
+
+        // Manually initialize schema with C-backed SqliteConnection before
+        // creating the pool. This matches the pattern used by db crate tests
+        // and avoids async migration issues in test contexts.
+        let init_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open init conn");
+        init_conn
+            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        init_conn
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        drop(init_conn);
+
         let db_url = format!(
             "sqlite:////{}",
             db_path.to_string_lossy().trim_start_matches('/')
@@ -302,6 +318,7 @@ mod tests {
             database_url: db_url,
             min_connections: 1,
             max_connections: 1,
+            run_migrations: false,
             ..Default::default()
         };
         create_pool(&pool_config).expect("create pool")
@@ -451,5 +468,99 @@ mod tests {
             other => panic!("list_file_reservations failed: {other:?}"),
         };
         assert!(reservations.is_empty());
+    }
+
+    #[test]
+    fn ack_ttl_cycle_zero_when_no_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = make_test_pool(&tmp);
+
+        let mut config = Config::from_env();
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = false;
+
+        let (scanned, overdue) = run_ack_ttl_cycle(&config, &pool).expect("run cycle");
+        assert_eq!(scanned, 0);
+        assert_eq!(overdue, 0);
+    }
+
+    #[test]
+    fn ack_ttl_cycle_ignores_acknowledged_messages() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        match block_on(async {
+            queries::acknowledge_message(&cx, &pool, unacked.agent_id, unacked.message_id).await
+        }) {
+            Outcome::Ok(_) => {}
+            other => panic!("acknowledge_message failed: {other:?}"),
+        }
+
+        let mut config = Config::from_env();
+        config.ack_ttl_seconds = 0;
+        config.ack_escalation_enabled = false;
+
+        let (scanned, overdue) = run_ack_ttl_cycle(&config, &pool).expect("run cycle");
+        assert_eq!(scanned, 0);
+        assert_eq!(overdue, 0);
+    }
+
+    #[test]
+    fn escalation_with_custom_holder_uses_system_agent() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_holder_name = "OpsEscalation".to_string();
+
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("escalate");
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 1);
+
+        let holder_id = reservations[0].agent_id;
+        assert_ne!(
+            holder_id, unacked.agent_id,
+            "custom holder should not default to recipient agent"
+        );
+
+        let holder = match block_on(async { queries::get_agent_by_id(&cx, &pool, holder_id).await })
+        {
+            Outcome::Ok(agent) => agent,
+            other => panic!("get_agent_by_id failed: {other:?}"),
+        };
+        assert_eq!(holder.name, "OpsEscalation");
+    }
+
+    #[test]
+    fn escalation_applies_configured_ttl_seconds() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_ttl_seconds = 120;
+
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("escalate");
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 1);
+
+        let r = &reservations[0];
+        let ttl_us = r.expires_ts - r.created_ts;
+        assert!(
+            ttl_us >= 110_000_000 && ttl_us <= 130_000_000,
+            "reservation TTL should be close to configured 120 seconds, got {ttl_us}us"
+        );
     }
 }

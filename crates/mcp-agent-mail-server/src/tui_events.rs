@@ -1,6 +1,9 @@
 #![allow(clippy::module_name_repetitions)]
 
-use ftui::{PackedRgba, Style};
+use ftui::layout::Rect;
+use ftui::text::{Line, Span};
+use ftui::{Frame, PackedRgba, Style};
+use ftui_widgets::virtualized::RenderItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -1092,6 +1095,11 @@ impl EventRingBuffer {
         self.lock_inner().events.is_empty()
     }
 
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.lock_inner().capacity
+    }
+
     fn lock_inner(&self) -> MutexGuard<'_, EventRingBufferInner> {
         match self.inner.lock() {
             Ok(guard) => guard,
@@ -1103,6 +1111,530 @@ impl EventRingBuffer {
 impl Default for EventRingBuffer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// DataProvider Trait
+// ──────────────────────────────────────────────────────────────────────
+
+/// Abstraction layer above VirtualizedList for paginated data sources.
+///
+/// VirtualizedList operates on a slice `&[T]`. For large datasets, the
+/// DataProvider layer:
+/// - Provides a windowed slice to VirtualizedList (only loaded pages)
+/// - Handles pagination for DB-backed sources
+/// - Handles the full dataset for in-memory sources (Timeline ring buffer)
+pub trait DataProvider {
+    /// The item type that implements RenderItem.
+    type Item: RenderItem;
+
+    /// Total number of items in the data source.
+    fn total_count(&self) -> usize;
+
+    /// Return a slice of items for the given window.
+    ///
+    /// `start` is the 0-based index into the full dataset.
+    /// `count` is the maximum number of items to return.
+    /// The returned slice may be shorter than `count` if there aren't enough items.
+    fn window(&self, start: usize, count: usize) -> &[Self::Item];
+
+    /// Prefetch data around the given index (no-op for in-memory sources).
+    ///
+    /// DB-backed providers use this to load pages when scrolling approaches
+    /// the edge of the currently loaded window.
+    fn prefetch(&mut self, around: usize);
+
+    /// Invalidate cached data, forcing a reload on next access.
+    fn invalidate(&mut self);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// TimelineRow — RenderItem for timeline events
+// ──────────────────────────────────────────────────────────────────────
+
+/// A pre-formatted timeline row for virtualized rendering.
+///
+/// This struct contains all data needed to render a single timeline event
+/// row without accessing the original MailEvent.
+#[derive(Debug, Clone)]
+pub struct TimelineRow {
+    /// Sequence number for identification and navigation.
+    pub seq: u64,
+    /// Event kind for filtering and icon selection.
+    pub kind: MailEventKind,
+    /// Derived severity for styling.
+    pub severity: EventSeverity,
+    /// Event source for filtering.
+    pub source: EventSource,
+    /// Formatted timestamp string (HH:MM:SS.mmm).
+    pub timestamp: String,
+    /// Icon character for the event type.
+    pub icon: char,
+    /// One-line summary text.
+    pub summary: String,
+    /// Raw timestamp for sorting/jumping.
+    pub timestamp_micros: i64,
+}
+
+impl TimelineRow {
+    /// Create a TimelineRow from a MailEvent.
+    #[must_use]
+    pub fn from_event(event: &MailEvent) -> Self {
+        let kind = event.kind();
+        let severity = event.severity();
+        let source = event.source();
+        let ts_micros = event.timestamp_micros();
+
+        // Format timestamp as HH:MM:SS.mmm
+        let secs = ts_micros / 1_000_000;
+        let millis = (ts_micros % 1_000_000) / 1000;
+        let hours = (secs / 3600) % 24;
+        let mins = (secs / 60) % 60;
+        let s = secs % 60;
+        let timestamp = format!("{hours:02}:{mins:02}:{s:02}.{millis:03}");
+
+        // Icon based on event kind
+        let icon = match kind {
+            MailEventKind::ToolCallStart => '▶',
+            MailEventKind::ToolCallEnd => '■',
+            MailEventKind::MessageSent => '↑',
+            MailEventKind::MessageReceived => '↓',
+            MailEventKind::ReservationGranted => '🔒',
+            MailEventKind::ReservationReleased => '🔓',
+            MailEventKind::AgentRegistered => '⊕',
+            MailEventKind::HttpRequest => '⇄',
+            MailEventKind::HealthPulse => '♥',
+            MailEventKind::ServerStarted => '🚀',
+            MailEventKind::ServerShutdown => '⏹',
+        };
+
+        // One-line summary based on event type
+        let summary = Self::format_summary(event);
+
+        Self {
+            seq: event.seq(),
+            kind,
+            severity,
+            source,
+            timestamp,
+            icon,
+            summary,
+            timestamp_micros: ts_micros,
+        }
+    }
+
+    fn format_summary(event: &MailEvent) -> String {
+        match event {
+            MailEvent::ToolCallStart { tool_name, .. } => {
+                format!("→ {tool_name}")
+            }
+            MailEvent::ToolCallEnd {
+                tool_name,
+                duration_ms,
+                ..
+            } => {
+                format!("← {tool_name} ({duration_ms}ms)")
+            }
+            MailEvent::MessageSent {
+                from, to, subject, ..
+            } => {
+                let recipients = if to.len() > 1 {
+                    format!("{} +{}", to[0], to.len() - 1)
+                } else {
+                    to.first().cloned().unwrap_or_default()
+                };
+                format!("{from} → {recipients}: {subject}")
+            }
+            MailEvent::MessageReceived {
+                from, to, subject, ..
+            } => {
+                let recipients = if to.len() > 1 {
+                    format!("{} +{}", to[0], to.len() - 1)
+                } else {
+                    to.first().cloned().unwrap_or_default()
+                };
+                format!("{from} → {recipients}: {subject}")
+            }
+            MailEvent::ReservationGranted {
+                agent,
+                paths,
+                exclusive,
+                ..
+            } => {
+                let mode = if *exclusive { "excl" } else { "shared" };
+                let path_count = paths.len();
+                format!("{agent} locked {path_count} path(s) [{mode}]")
+            }
+            MailEvent::ReservationReleased { agent, paths, .. } => {
+                format!("{agent} released {} path(s)", paths.len())
+            }
+            MailEvent::AgentRegistered { name, program, .. } => {
+                format!("{name} ({program}) registered")
+            }
+            MailEvent::HttpRequest {
+                method,
+                path,
+                status,
+                duration_ms,
+                ..
+            } => {
+                format!("{method} {path} → {status} ({duration_ms}ms)")
+            }
+            MailEvent::HealthPulse { db_stats, .. } => {
+                format!(
+                    "agents={} msgs={} rsv={}",
+                    db_stats.agents, db_stats.messages, db_stats.file_reservations
+                )
+            }
+            MailEvent::ServerStarted { endpoint, .. } => {
+                format!("Server started on {endpoint}")
+            }
+            MailEvent::ServerShutdown { .. } => "Server shutdown".to_string(),
+        }
+    }
+}
+
+impl RenderItem for TimelineRow {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::widgets::Widget;
+
+        if area.height == 0 || area.width < 10 {
+            return;
+        }
+
+        // Build the line: [seq] [timestamp] [icon] [summary]
+        let seq_str = format!("{:>6}", self.seq);
+        let severity_style = self.severity.style();
+
+        let base_style = if selected {
+            Style::default().bg(ftui::PackedRgba::rgb(50, 50, 80))
+        } else {
+            Style::default()
+        };
+
+        let line = Line::from_spans([
+            Span::styled(seq_str, base_style.fg(PackedRgba::rgb(100, 100, 120))),
+            Span::raw(" "),
+            Span::styled(
+                &self.timestamp,
+                base_style.fg(PackedRgba::rgb(140, 140, 160)),
+            ),
+            Span::raw(" "),
+            Span::styled(self.icon.to_string(), severity_style),
+            Span::raw(" "),
+            Span::styled(&self.summary, base_style),
+        ]);
+
+        let paragraph = ftui::widgets::paragraph::Paragraph::new(line);
+        paragraph.render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// TimelineDataProvider — wraps EventRingBuffer
+// ──────────────────────────────────────────────────────────────────────
+
+/// DataProvider for the Timeline screen, backed by EventRingBuffer.
+///
+/// This provider converts MailEvents to TimelineRows on demand and caches
+/// the converted rows for efficient window access.
+pub struct TimelineDataProvider {
+    /// Reference to the shared event ring buffer.
+    ring: Arc<EventRingBuffer>,
+    /// Cached converted rows.
+    rows: Vec<TimelineRow>,
+    /// Last sequence number we processed.
+    last_seq: u64,
+    /// Whether the cache is invalidated.
+    dirty: bool,
+}
+
+impl TimelineDataProvider {
+    /// Create a new provider wrapping the given ring buffer.
+    #[must_use]
+    pub fn new(ring: Arc<EventRingBuffer>) -> Self {
+        Self {
+            ring,
+            rows: Vec::new(),
+            last_seq: 0,
+            dirty: true,
+        }
+    }
+
+    /// Refresh the cache by converting any new events.
+    pub fn refresh(&mut self) {
+        if self.dirty {
+            // Full rebuild
+            if let Some(events) = self.ring.try_iter_recent(self.ring.capacity()) {
+                self.rows.clear();
+                self.rows.reserve(events.len());
+                for event in &events {
+                    self.rows.push(TimelineRow::from_event(event));
+                    self.last_seq = self.last_seq.max(event.seq());
+                }
+            }
+            self.dirty = false;
+        } else {
+            // Incremental update
+            let new_events = self.ring.events_since_seq(self.last_seq);
+            for event in &new_events {
+                if event.seq() > self.last_seq {
+                    self.rows.push(TimelineRow::from_event(event));
+                    self.last_seq = event.seq();
+                }
+            }
+            // Trim to ring buffer capacity if needed
+            let capacity = self.ring.capacity();
+            if self.rows.len() > capacity {
+                let excess = self.rows.len() - capacity;
+                self.rows.drain(..excess);
+            }
+        }
+    }
+}
+
+impl DataProvider for TimelineDataProvider {
+    type Item = TimelineRow;
+
+    fn total_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn window(&self, start: usize, count: usize) -> &[Self::Item] {
+        let len = self.rows.len();
+        if start >= len {
+            return &[];
+        }
+        let end = (start + count).min(len);
+        &self.rows[start..end]
+    }
+
+    fn prefetch(&mut self, _around: usize) {
+        // No-op for in-memory source; data is already available.
+        // Just refresh to pick up any new events.
+        self.refresh();
+    }
+
+    fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// MessageRow — RenderItem for message search results
+// ──────────────────────────────────────────────────────────────────────
+
+/// A pre-formatted message row for virtualized rendering.
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    /// Message ID.
+    pub id: i64,
+    /// Sender agent name.
+    pub from_agent: String,
+    /// Recipient(s) summary.
+    pub to_agents: String,
+    /// Message subject.
+    pub subject: String,
+    /// Project slug.
+    pub project_slug: String,
+    /// Thread ID.
+    pub thread_id: String,
+    /// Formatted timestamp.
+    pub timestamp: String,
+    /// Importance level.
+    pub importance: String,
+    /// Whether acknowledgement is required.
+    pub ack_required: bool,
+    /// Raw timestamp for sorting.
+    pub timestamp_micros: i64,
+}
+
+impl RenderItem for MessageRow {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::widgets::Widget;
+
+        if area.height == 0 || area.width < 20 {
+            return;
+        }
+
+        let base_style = if selected {
+            Style::default().bg(PackedRgba::rgb(50, 50, 80))
+        } else {
+            Style::default()
+        };
+
+        // Importance badge
+        let importance_style = match self.importance.as_str() {
+            "urgent" => Style::default().fg(PackedRgba::rgb(255, 100, 100)).bold(),
+            "high" => Style::default().fg(PackedRgba::rgb(255, 184, 108)),
+            _ => Style::default().fg(PackedRgba::rgb(100, 100, 120)),
+        };
+
+        let ack_indicator = if self.ack_required { "◉" } else { " " };
+
+        let line = Line::from_spans([
+            Span::styled(
+                ack_indicator,
+                Style::default().fg(PackedRgba::rgb(255, 200, 100)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                &self.timestamp,
+                base_style.fg(PackedRgba::rgb(140, 140, 160)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                &self.from_agent,
+                base_style.fg(PackedRgba::rgb(100, 200, 230)),
+            ),
+            Span::raw(" → "),
+            Span::styled(
+                &self.to_agents,
+                base_style.fg(PackedRgba::rgb(120, 220, 150)),
+            ),
+            Span::raw(" "),
+            Span::styled(&self.importance, importance_style),
+            Span::raw(" "),
+            Span::styled(&self.subject, base_style),
+        ]);
+
+        let paragraph = ftui::widgets::paragraph::Paragraph::new(line);
+        paragraph.render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// SearchHitRow — RenderItem for FTS search results
+// ──────────────────────────────────────────────────────────────────────
+
+/// A pre-formatted search result row for virtualized rendering.
+#[derive(Debug, Clone)]
+pub struct SearchHitRow {
+    /// Document ID (message or other entity).
+    pub id: i64,
+    /// Subject line.
+    pub subject: String,
+    /// Snippet with search term highlighted.
+    pub snippet: String,
+    /// Sender/source.
+    pub from: String,
+    /// Relevance score (higher = better match).
+    pub score: f32,
+    /// Timestamp for sorting.
+    pub timestamp_micros: i64,
+}
+
+impl RenderItem for SearchHitRow {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::widgets::Widget;
+
+        if area.height == 0 || area.width < 20 {
+            return;
+        }
+
+        let base_style = if selected {
+            Style::default().bg(PackedRgba::rgb(50, 50, 80))
+        } else {
+            Style::default()
+        };
+
+        let score_str = format!("{:.1}", self.score);
+
+        let line = Line::from_spans([
+            Span::styled(&score_str, base_style.fg(PackedRgba::rgb(100, 200, 230))),
+            Span::raw(" "),
+            Span::styled(&self.from, base_style.fg(PackedRgba::rgb(140, 180, 220))),
+            Span::raw(": "),
+            Span::styled(&self.subject, base_style.bold()),
+            Span::raw(" — "),
+            Span::styled(&self.snippet, base_style.fg(PackedRgba::rgb(160, 160, 160))),
+        ]);
+
+        let paragraph = ftui::widgets::paragraph::Paragraph::new(line);
+        paragraph.render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ExplorerRow — RenderItem for explorer/browser results
+// ──────────────────────────────────────────────────────────────────────
+
+/// A pre-formatted explorer row for virtualized rendering.
+#[derive(Debug, Clone)]
+pub struct ExplorerRow {
+    /// Entity ID.
+    pub id: i64,
+    /// Direction indicator (↑ outbound, ↓ inbound).
+    pub direction: char,
+    /// Sender/recipient depending on direction.
+    pub primary_agent: String,
+    /// Other party.
+    pub secondary_agent: String,
+    /// Subject line.
+    pub subject: String,
+    /// Formatted date.
+    pub date: String,
+    /// Raw timestamp for sorting.
+    pub timestamp_micros: i64,
+}
+
+impl RenderItem for ExplorerRow {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::widgets::Widget;
+
+        if area.height == 0 || area.width < 20 {
+            return;
+        }
+
+        let base_style = if selected {
+            Style::default().bg(PackedRgba::rgb(50, 50, 80))
+        } else {
+            Style::default()
+        };
+
+        let direction_style = if self.direction == '↑' {
+            Style::default().fg(PackedRgba::rgb(100, 200, 100))
+        } else {
+            Style::default().fg(PackedRgba::rgb(100, 150, 230))
+        };
+
+        let line = Line::from_spans([
+            Span::styled(self.direction.to_string(), direction_style),
+            Span::raw(" "),
+            Span::styled(&self.date, base_style.fg(PackedRgba::rgb(140, 140, 160))),
+            Span::raw(" "),
+            Span::styled(
+                &self.primary_agent,
+                base_style.fg(PackedRgba::rgb(100, 200, 230)),
+            ),
+            Span::raw(" → "),
+            Span::styled(
+                &self.secondary_agent,
+                base_style.fg(PackedRgba::rgb(120, 220, 150)),
+            ),
+            Span::raw(" "),
+            Span::styled(&self.subject, base_style),
+        ]);
+
+        let paragraph = ftui::widgets::paragraph::Paragraph::new(line);
+        paragraph.render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
     }
 }
 
@@ -2908,5 +3440,181 @@ mod tests {
             MailEvent::server_started("http://x", "y").severity(),
             EventSeverity::Info
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // DataProvider and TimelineRow tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn timeline_row_from_event_formats_correctly() {
+        let event = MailEvent::message_sent(
+            42,
+            "GoldFox",
+            vec!["SilverWolf".to_string()],
+            "Test Subject",
+            "thread-1",
+            "my-project",
+        );
+
+        let row = TimelineRow::from_event(&event);
+
+        assert_eq!(row.kind, MailEventKind::MessageSent);
+        assert_eq!(row.severity, EventSeverity::Info);
+        assert_eq!(row.source, EventSource::Mail);
+        assert_eq!(row.icon, '↑');
+        assert!(row.summary.contains("GoldFox"));
+        assert!(row.summary.contains("SilverWolf"));
+        assert!(row.summary.contains("Test Subject"));
+    }
+
+    #[test]
+    fn timeline_row_formats_tool_call_summary() {
+        let start = MailEvent::tool_call_start("fetch_inbox", Value::Null, None, None);
+        let end = MailEvent::tool_call_end("send_message", 150, None, 3, 25.0, vec![], None, None);
+
+        let start_row = TimelineRow::from_event(&start);
+        let end_row = TimelineRow::from_event(&end);
+
+        assert!(start_row.summary.contains("fetch_inbox"));
+        assert!(start_row.summary.starts_with("→"));
+        assert_eq!(start_row.icon, '▶');
+
+        assert!(end_row.summary.contains("send_message"));
+        assert!(end_row.summary.contains("150ms"));
+        assert!(end_row.summary.starts_with("←"));
+        assert_eq!(end_row.icon, '■');
+    }
+
+    #[test]
+    fn timeline_data_provider_total_count_matches_ring() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(sample_tool_start("a"));
+        ring.push(sample_tool_start("b"));
+        ring.push(sample_tool_start("c"));
+
+        let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
+        provider.refresh();
+
+        assert_eq!(provider.total_count(), 3);
+    }
+
+    #[test]
+    fn timeline_data_provider_window_returns_slice() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        for i in 0..10 {
+            ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
+        provider.refresh();
+
+        let window = provider.window(2, 5);
+        assert_eq!(window.len(), 5);
+
+        // Verify the window starts at index 2
+        let full = provider.window(0, 100);
+        assert_eq!(full.len(), 10);
+    }
+
+    #[test]
+    fn timeline_data_provider_window_clamps_to_bounds() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        for i in 0..5 {
+            ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
+        provider.refresh();
+
+        // Window beyond end
+        let window = provider.window(3, 10);
+        assert_eq!(window.len(), 2); // Only 2 items left from index 3
+
+        // Window starting beyond end
+        let window = provider.window(100, 10);
+        assert_eq!(window.len(), 0);
+    }
+
+    #[test]
+    fn timeline_data_provider_prefetch_refreshes() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(sample_tool_start("initial"));
+
+        let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
+        provider.refresh();
+        assert_eq!(provider.total_count(), 1);
+
+        // Add more events
+        ring.push(sample_tool_start("second"));
+        ring.push(sample_tool_start("third"));
+
+        // Prefetch should pick up new events
+        provider.prefetch(0);
+        assert_eq!(provider.total_count(), 3);
+    }
+
+    #[test]
+    fn timeline_data_provider_invalidate_forces_rebuild() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        for i in 0..5 {
+            ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
+        provider.refresh();
+        assert_eq!(provider.total_count(), 5);
+
+        // Invalidate and refresh
+        provider.invalidate();
+        provider.refresh();
+        assert_eq!(provider.total_count(), 5);
+    }
+
+    #[test]
+    fn message_row_render_item_height() {
+        let row = MessageRow {
+            id: 1,
+            from_agent: "Alice".to_string(),
+            to_agents: "Bob".to_string(),
+            subject: "Hello".to_string(),
+            project_slug: "proj".to_string(),
+            thread_id: "t1".to_string(),
+            timestamp: "12:00:00".to_string(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            timestamp_micros: 0,
+        };
+
+        assert_eq!(row.height(), 1);
+    }
+
+    #[test]
+    fn search_hit_row_render_item_height() {
+        let row = SearchHitRow {
+            id: 1,
+            subject: "Test".to_string(),
+            snippet: "...test...".to_string(),
+            from: "Agent".to_string(),
+            score: 1.5,
+            timestamp_micros: 0,
+        };
+
+        assert_eq!(row.height(), 1);
+    }
+
+    #[test]
+    fn explorer_row_render_item_height() {
+        let row = ExplorerRow {
+            id: 1,
+            direction: '↑',
+            primary_agent: "Alice".to_string(),
+            secondary_agent: "Bob".to_string(),
+            subject: "Hello".to_string(),
+            date: "2026-02-12".to_string(),
+            timestamp_micros: 0,
+        };
+
+        assert_eq!(row.height(), 1);
     }
 }

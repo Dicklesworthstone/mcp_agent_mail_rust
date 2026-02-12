@@ -10,7 +10,201 @@ use mcp_agent_mail_core::{
 };
 use mcp_agent_mail_db::DbPoolConfig;
 use std::fmt;
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
+
+// ──────────────────────────────────────────────────────────────────────
+// Port detection types (br-7ri2)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Result of checking whether a port is available or already in use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortStatus {
+    /// Port is free and available for binding.
+    Free,
+    /// Port is in use by an Agent Mail server (can be reused).
+    AgentMailServer,
+    /// Port is in use by another process (cannot be reused).
+    OtherProcess {
+        /// Description of what we know about the other process.
+        description: String,
+    },
+    /// Could not determine port status due to an error.
+    Error {
+        /// The error kind.
+        kind: std::io::ErrorKind,
+        /// Human-readable error description.
+        message: String,
+    },
+}
+
+impl PortStatus {
+    /// Returns true if the port can be used (either free or Agent Mail server reuse).
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        matches!(self, Self::Free | Self::AgentMailServer)
+    }
+
+    /// Returns true if an Agent Mail server is already running.
+    #[must_use]
+    pub fn is_agent_mail_server(&self) -> bool {
+        matches!(self, Self::AgentMailServer)
+    }
+}
+
+/// Default timeout for health check connections.
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Check the status of a port: free, occupied by Agent Mail, or occupied by another process.
+///
+/// This is a cross-platform replacement for lsof-based detection. It uses:
+/// 1. `TcpListener::bind()` to check if the port is available
+/// 2. HTTP health check to identify if an existing listener is Agent Mail
+///
+/// # Arguments
+/// * `host` - The host address to check (e.g., "127.0.0.1")
+/// * `port` - The port number to check
+///
+/// # Returns
+/// A `PortStatus` indicating whether the port is free, has an Agent Mail server, or is in use by
+/// another process.
+#[must_use]
+pub fn check_port_status(host: &str, port: u16) -> PortStatus {
+    let addr = format!("{host}:{port}");
+
+    // Step 1: Try to bind to the port
+    match TcpListener::bind(&addr) {
+        Ok(_listener) => {
+            // Port is free (listener is dropped immediately, releasing the port)
+            return PortStatus::Free;
+        }
+        Err(e) => {
+            match e.kind() {
+                std::io::ErrorKind::AddrInUse => {
+                    // Port is in use - check if it's an Agent Mail server
+                }
+                kind => {
+                    // Other error (permission denied, address not available, etc.)
+                    return PortStatus::Error {
+                        kind,
+                        message: e.to_string(),
+                    };
+                }
+            }
+        }
+    }
+
+    // Step 2: Port is in use - try to identify if it's Agent Mail via health check
+    if is_agent_mail_health_check(host, port) {
+        PortStatus::AgentMailServer
+    } else {
+        PortStatus::OtherProcess {
+            description: format!("Unknown process listening on {addr}"),
+        }
+    }
+}
+
+/// Attempt to connect to a port and verify it's an Agent Mail server via health check.
+///
+/// Sends a minimal HTTP GET request to `/health` and checks for a valid response.
+fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
+    let addr = format!("{host}:{port}");
+
+    // Try to connect with a short timeout
+    let stream = match TcpStream::connect_timeout(
+        &addr.parse().unwrap_or_else(|_| {
+            // Fallback for invalid addresses
+            std::net::SocketAddr::from(([127, 0, 0, 1], port))
+        }),
+        HEALTH_CHECK_TIMEOUT,
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // Set read/write timeouts
+    let _ = stream.set_read_timeout(Some(HEALTH_CHECK_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HEALTH_CHECK_TIMEOUT));
+
+    // Send HTTP GET /health request
+    let request = format!(
+        "GET /health HTTP/1.1\r\n\
+         Host: {host}:{port}\r\n\
+         Connection: close\r\n\
+         User-Agent: mcp-agent-mail-startup-check\r\n\
+         \r\n"
+    );
+
+    let mut stream = stream;
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    // Read response
+    let mut reader = BufReader::new(&stream);
+    let mut status_line = String::new();
+    if reader.read_line(&mut status_line).is_err() {
+        return false;
+    }
+
+    // Check for valid HTTP response (2xx or 3xx status codes are acceptable)
+    // Agent Mail returns 200 OK for /health
+    if !status_line.starts_with("HTTP/1.") {
+        return false;
+    }
+
+    // Parse status code
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return false;
+    }
+
+    let status_code: u16 = match parts[1].parse() {
+        Ok(code) => code,
+        Err(_) => return false,
+    };
+
+    // 2xx responses indicate a healthy server
+    if !(200..300).contains(&status_code) {
+        return false;
+    }
+
+    // Read headers and body to look for Agent Mail signature
+    let mut headers = String::new();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if line.trim().is_empty() {
+                    break; // End of headers
+                }
+                headers.push_str(&line);
+            }
+        }
+    }
+
+    // Read body (limited to first 1KB for safety)
+    let mut body = String::new();
+    let mut body_bytes = [0u8; 1024];
+    if let Ok(n) = std::io::Read::read(&mut reader, &mut body_bytes) {
+        body = String::from_utf8_lossy(&body_bytes[..n]).to_string();
+    }
+
+    // Check for Agent Mail signatures in headers or body
+    // The server sets Server header or returns JSON with known fields
+    let combined = format!("{headers}{body}").to_lowercase();
+
+    // Agent Mail health endpoint returns JSON like {"status":"healthy"} or {"ok":true}
+    // or has mcp-agent-mail in Server header
+    combined.contains("mcp-agent-mail")
+        || combined.contains("mcp_agent_mail")
+        || combined.contains("agent-mail")
+        || (combined.contains("status") && combined.contains("healthy"))
+        || combined.contains("\"ok\":true")
+        || combined.contains("\"ok\": true")
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Probe result types
@@ -114,26 +308,39 @@ fn probe_http_path(config: &Config) -> ProbeResult {
 }
 
 /// Check that the configured port is available for binding.
+///
+/// Uses cross-platform port detection via `check_port_status()`:
+/// - If the port is free, the probe passes.
+/// - If an Agent Mail server is already running, the probe passes (server can be reused).
+/// - If another process is using the port, the probe fails with guidance.
 fn probe_port(config: &Config) -> ProbeResult {
-    let addr = format!("{}:{}", config.http_host, config.http_port);
-    match TcpListener::bind(&addr) {
-        Ok(_listener) => {
-            // Drop the listener immediately to release the port
+    match check_port_status(&config.http_host, config.http_port) {
+        PortStatus::Free => ProbeResult::Ok { name: "port" },
+
+        PortStatus::AgentMailServer => {
+            // An Agent Mail server is already running - this is OK for reuse
+            tracing::info!(
+                port = config.http_port,
+                host = %config.http_host,
+                "Agent Mail server already running on port - can be reused"
+            );
             ProbeResult::Ok { name: "port" }
         }
-        Err(e) => {
-            let kind = e.kind();
+
+        PortStatus::OtherProcess { description } => ProbeResult::Fail(ProbeFailure {
+            name: "port",
+            problem: format!(
+                "Port {} is already in use on {} by another process. {}",
+                config.http_port, config.http_host, description
+            ),
+            fix: format!(
+                "Stop the other process using port {}, or set HTTP_PORT to a different port",
+                config.http_port
+            ),
+        }),
+
+        PortStatus::Error { kind, message } => {
             let (problem, fix) = match kind {
-                std::io::ErrorKind::AddrInUse => (
-                    format!(
-                        "Port {} is already in use on {}",
-                        config.http_port, config.http_host
-                    ),
-                    format!(
-                        "Stop the other process using port {}, or set HTTP_PORT to a different port",
-                        config.http_port
-                    ),
-                ),
                 std::io::ErrorKind::PermissionDenied => (
                     format!(
                         "Permission denied binding to {}:{}",
@@ -159,7 +366,10 @@ fn probe_port(config: &Config) -> ProbeResult {
                     ),
                 ),
                 _ => (
-                    format!("Cannot bind to {addr}: {e}"),
+                    format!(
+                        "Cannot bind to {}:{}: {}",
+                        config.http_host, config.http_port, message
+                    ),
                     "Check network configuration and try a different port/host".into(),
                 ),
             };
@@ -677,5 +887,112 @@ mod tests {
         config.http_jwt_algorithms = vec!["RS256".into()];
         let result = probe_auth(&config);
         assert!(matches!(result, ProbeResult::Fail(_)));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Port status detection tests (br-7ri2)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn port_status_free_is_usable() {
+        let status = PortStatus::Free;
+        assert!(status.is_usable());
+        assert!(!status.is_agent_mail_server());
+    }
+
+    #[test]
+    fn port_status_agent_mail_is_usable() {
+        let status = PortStatus::AgentMailServer;
+        assert!(status.is_usable());
+        assert!(status.is_agent_mail_server());
+    }
+
+    #[test]
+    fn port_status_other_process_not_usable() {
+        let status = PortStatus::OtherProcess {
+            description: "nginx".into(),
+        };
+        assert!(!status.is_usable());
+        assert!(!status.is_agent_mail_server());
+    }
+
+    #[test]
+    fn port_status_error_not_usable() {
+        let status = PortStatus::Error {
+            kind: std::io::ErrorKind::PermissionDenied,
+            message: "access denied".into(),
+        };
+        assert!(!status.is_usable());
+        assert!(!status.is_agent_mail_server());
+    }
+
+    #[test]
+    fn check_port_status_free_on_random_port() {
+        // Use port 0 to get a random available port, then check a nearby high port
+        // that's almost certainly free
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+        let port = listener.local_addr().expect("get local addr").port();
+        drop(listener);
+
+        // The port we just released should be free
+        let status = check_port_status("127.0.0.1", port);
+        assert!(
+            matches!(status, PortStatus::Free),
+            "expected Free, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn check_port_status_in_use_by_other_process() {
+        // Bind to a random port and keep it held
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+        let port = listener.local_addr().expect("get local addr").port();
+
+        // The port should be detected as in use
+        let status = check_port_status("127.0.0.1", port);
+        assert!(
+            matches!(status, PortStatus::OtherProcess { .. }),
+            "expected OtherProcess, got {status:?}"
+        );
+
+        // Explicitly drop to release
+        drop(listener);
+    }
+
+    #[test]
+    fn probe_port_passes_when_free() {
+        // Find an available port
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+        let port = listener.local_addr().expect("get local addr").port();
+        drop(listener);
+
+        let mut config = default_config();
+        config.http_host = "127.0.0.1".into();
+        config.http_port = port;
+
+        let result = probe_port(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { .. }),
+            "expected Ok, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_port_fails_when_other_process() {
+        // Hold a port open
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+        let port = listener.local_addr().expect("get local addr").port();
+
+        let mut config = default_config();
+        config.http_host = "127.0.0.1".into();
+        config.http_port = port;
+
+        let result = probe_port(&config);
+        assert!(
+            matches!(result, ProbeResult::Fail(_)),
+            "expected Fail, got {result:?}"
+        );
+
+        drop(listener);
     }
 }

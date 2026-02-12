@@ -23,9 +23,9 @@ use crate::tui_layout::{
 };
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::{
-    AnomalyCard, AnomalySeverity, BrailleActivity, MetricTile, MetricTrend, PercentileRibbon,
-    PercentileSample,
+    AnomalyCard, AnomalySeverity, MetricTile, MetricTrend, PercentileRibbon, PercentileSample,
 };
+use ftui_widgets::sparkline::Sparkline;
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -37,8 +37,7 @@ const EVENT_LOG_CAPACITY: usize = 2000;
 /// Stat tiles refresh every N ticks (100ms each → 1 s).
 const STAT_REFRESH_TICKS: u64 = 10;
 
-/// Unicode block characters for sparkline rendering (bottom-aligned).
-const SPARK_CHARS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+// NOTE: SPARK_CHARS removed in br-2bbt.4.1 — now using ftui_widgets::Sparkline
 
 // ── Panel budgets ────────────────────────────────────────────────────
 
@@ -129,6 +128,8 @@ pub struct DashboardScreen {
     show_trend_panel: bool,
     /// Metadata for the most recent message event, rendered as markdown.
     recent_message_preview: Option<RecentMessagePreview>,
+    /// Animation phase for pulse effects.
+    pulse_phase: f32,
 }
 
 /// A pre-formatted event log entry.
@@ -238,6 +239,7 @@ impl DashboardScreen {
             prev_req_total: 0,
             show_trend_panel: true,
             recent_message_preview: None,
+            pulse_phase: 0.0,
         }
     }
 
@@ -495,6 +497,12 @@ impl MailScreen for DashboardScreen {
 
     #[allow(clippy::cast_precision_loss)]
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        // Update animation phase
+        self.pulse_phase += 0.2;
+        if self.pulse_phase > std::f32::consts::PI * 2.0 {
+            self.pulse_phase -= std::f32::consts::PI * 2.0;
+        }
+
         // Ingest new events every tick
         self.ingest_events(state);
 
@@ -554,7 +562,14 @@ impl MailScreen for DashboardScreen {
         let footer_area = Rect::new(area.x, y, area.width, footer_h);
 
         // ── Render bands ─────────────────────────────────────────
-        render_summary_band(frame, summary_area, state, &self.prev_db_stats, density);
+        render_summary_band(
+            frame,
+            summary_area,
+            state,
+            &self.prev_db_stats,
+            density,
+            self.pulse_phase,
+        );
 
         if anomaly_h > 0 {
             render_anomaly_rail(frame, anomaly_area, &self.anomalies);
@@ -827,6 +842,7 @@ fn render_summary_band(
     state: &TuiSharedState,
     prev_stats: &DbStatSnapshot,
     density: DensityHint,
+    pulse_phase: f32,
 ) {
     let counters = state.request_counters();
     let db = state.db_stats_snapshot().unwrap_or_default();
@@ -850,6 +866,16 @@ fn render_summary_band(
         std::cmp::Ordering::Equal => MetricTrend::Flat,
     };
 
+    // Calculate pulse color for Requests
+    let pulse = (pulse_phase.sin() + 1.0) / 2.0; // 0.0 to 1.0
+    let base_req = PackedRgba::rgb(120, 200, 255);
+    let glow_req = PackedRgba::rgb(200, 240, 255);
+    // Simple lerp
+    let r = (base_req.r() as f32 * (1.0 - pulse) + glow_req.r() as f32 * pulse) as u8;
+    let g = (base_req.g() as f32 * (1.0 - pulse) + glow_req.g() as f32 * pulse) as u8;
+    let b = (base_req.b() as f32 * (1.0 - pulse) + glow_req.b() as f32 * pulse) as u8;
+    let req_color = PackedRgba::rgb(r, g, b);
+
     // Build tiles based on density.
     let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
         DensityHint::Minimal | DensityHint::Compact => vec![
@@ -859,12 +885,7 @@ fn render_summary_band(
                 MetricTrend::Flat,
                 PackedRgba::rgb(200, 200, 200),
             ),
-            (
-                "Req",
-                &req_str,
-                MetricTrend::Flat,
-                PackedRgba::rgb(120, 200, 255),
-            ),
+            ("Req", &req_str, MetricTrend::Flat, req_color),
             ("Msg", &msg_str, msg_trend, PackedRgba::rgb(200, 200, 120)),
         ],
         DensityHint::Normal => vec![
@@ -874,12 +895,7 @@ fn render_summary_band(
                 MetricTrend::Flat,
                 PackedRgba::rgb(200, 200, 200),
             ),
-            (
-                "Requests",
-                &req_str,
-                MetricTrend::Flat,
-                PackedRgba::rgb(120, 200, 255),
-            ),
+            ("Requests", &req_str, MetricTrend::Flat, req_color),
             (
                 "Avg Lat",
                 &avg_str,
@@ -906,12 +922,7 @@ fn render_summary_band(
                 MetricTrend::Flat,
                 PackedRgba::rgb(200, 200, 200),
             ),
-            (
-                "Requests",
-                &req_str,
-                MetricTrend::Flat,
-                PackedRgba::rgb(120, 200, 255),
-            ),
+            ("Requests", &req_str, MetricTrend::Flat, req_color),
             (
                 "Avg Lat",
                 &avg_str,
@@ -1023,17 +1034,46 @@ fn render_trend_panel(
             .render(ribbon_area, frame);
     }
 
-    // Throughput activity (braille sparkline)
+    // Throughput activity sparkline (br-2bbt.4.1: now using ftui_widgets::Sparkline)
     if throughput_history.len() >= 2 {
-        let activity = BrailleActivity::new(throughput_history)
-            .label("Throughput")
-            .color(PackedRgba::rgb(80, 200, 255))
-            .block(
-                Block::default()
-                    .title("Req/interval")
-                    .border_type(BorderType::Rounded),
+        let block = Block::default()
+            .title("Req/interval")
+            .border_type(BorderType::Rounded);
+        let inner = block.inner(activity_area);
+        block.render(activity_area, frame);
+
+        // Label row.
+        if inner.height > 1 && inner.width > 0 {
+            let label =
+                Paragraph::new("Throughput").style(Style::new().fg(PackedRgba::rgb(180, 180, 180)));
+            label.render(
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: 1,
+                },
+                frame,
             );
-        activity.render(activity_area, frame);
+
+            // Sparkline below label — take most recent values that fit.
+            let spark_area = Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: inner.height.saturating_sub(1),
+            };
+            if spark_area.width > 0 && spark_area.height > 0 {
+                let start_idx = throughput_history
+                    .len()
+                    .saturating_sub(spark_area.width as usize);
+                let slice = &throughput_history[start_idx..];
+                let sparkline = Sparkline::new(slice)
+                    .min(0.0)
+                    .style(Style::new().fg(PackedRgba::rgb(80, 200, 255)));
+                sparkline.render(spark_area, frame);
+            }
+        }
     } else {
         let block = Block::default()
             .title("Throughput (collecting...)")
@@ -1223,6 +1263,8 @@ fn format_duration(d: std::time::Duration) -> String {
 }
 
 /// Render a sparkline from data points using Unicode block chars.
+///
+/// (br-2bbt.4.1: Now delegates to `ftui_widgets::Sparkline::render_to_string()`.)
 #[must_use]
 pub fn render_sparkline(data: &[f64], width: usize) -> String {
     if data.is_empty() || width == 0 {
@@ -1233,19 +1275,8 @@ pub fn render_sparkline(data: &[f64], width: usize) -> String {
     let start = data.len().saturating_sub(width);
     let slice = &data[start..];
 
-    let max = slice.iter().copied().fold(0.0_f64, f64::max);
-    if max <= 0.0 {
-        return " ".repeat(slice.len());
-    }
-
-    slice
-        .iter()
-        .map(|&v| {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let normalized = (v / max * 8.0).round() as usize;
-            SPARK_CHARS[normalized.min(SPARK_CHARS.len() - 1)]
-        })
-        .collect()
+    // Use Sparkline widget's render_to_string for consistent block-char mapping.
+    Sparkline::new(slice).min(0.0).render_to_string()
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1619,9 +1650,11 @@ mod tests {
 
     #[test]
     fn render_sparkline_all_zeros() {
+        // ftui_widgets::Sparkline renders constant values as middle-height bars (▄)
+        // since there's no variation to show relative height differences.
         let data = vec![0.0, 0.0, 0.0];
         let spark = render_sparkline(&data, 3);
-        assert_eq!(spark, "   ");
+        assert_eq!(spark, "▄▄▄");
     }
 
     #[test]
@@ -2295,5 +2328,38 @@ mod tests {
         let (dot, color) = activity_indicator(now, just_inside);
         assert_eq!(dot, '●');
         assert_eq!(color, ACTIVITY_YELLOW, "just under 5m should be yellow");
+    }
+
+    /// Test that render_sparkline uses Sparkline widget correctly (br-2bbt.4.1).
+    #[test]
+    fn render_sparkline_uses_sparkline_widget() {
+        // Verify that the sparkline produces block characters from ftui_widgets::Sparkline.
+        let data = [0.0, 25.0, 50.0, 75.0, 100.0];
+        let out = render_sparkline(&data, 10);
+        // Should produce 5 characters (data length, limited by width).
+        assert_eq!(out.chars().count(), 5);
+        // First char should be lowest (space or ▁), last should be highest (█ or similar).
+        let chars: Vec<char> = out.chars().collect();
+        // Verify it contains block chars from Sparkline (▁▂▃▄▅▆▇█ or space for 0).
+        let has_block_chars = chars
+            .iter()
+            .any(|&c| matches!(c, ' ' | '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
+        assert!(
+            has_block_chars,
+            "render_sparkline should use Sparkline block characters"
+        );
+    }
+
+    #[test]
+    fn render_sparkline_empty_data() {
+        let out = render_sparkline(&[], 10);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn render_sparkline_zero_width() {
+        let data = [1.0, 2.0, 3.0];
+        let out = render_sparkline(&data, 0);
+        assert!(out.is_empty());
     }
 }

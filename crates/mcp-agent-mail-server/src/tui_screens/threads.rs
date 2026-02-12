@@ -36,6 +36,21 @@ const MAX_THREAD_MESSAGES: usize = 200;
 /// Periodic refresh interval in seconds.
 const REFRESH_INTERVAL_SECS: u64 = 5;
 
+/// Default page size for thread pagination.
+/// Override via AM_TUI_THREAD_PAGE_SIZE environment variable.
+const DEFAULT_THREAD_PAGE_SIZE: usize = 20;
+
+/// Number of older messages to load when clicking "Load older".
+const LOAD_OLDER_BATCH_SIZE: usize = 15;
+
+/// Get the configured thread page size from environment or default.
+fn get_thread_page_size() -> usize {
+    std::env::var("AM_TUI_THREAD_PAGE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_THREAD_PAGE_SIZE)
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // ThreadSummary — a row in the thread list
 // ──────────────────────────────────────────────────────────────────────
@@ -58,8 +73,11 @@ struct ThreadSummary {
     /// Participant names (comma-separated).
     participant_names: String,
     /// First message timestamp (for velocity calculation).
-    #[allow(dead_code)]
     first_timestamp_micros: i64,
+    /// First message timestamp in ISO format (for time span display).
+    first_timestamp_iso: String,
+    /// Number of unread messages in this thread (if tracking is available).
+    unread_count: usize,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -192,11 +210,19 @@ pub struct ThreadExplorerScreen {
     sort_mode: SortMode,
     /// Synthetic event for the focused thread (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
+    /// Total message count in the current thread (for pagination).
+    total_thread_messages: usize,
+    /// How many messages are currently loaded (pagination offset).
+    loaded_message_count: usize,
+    /// Page size for pagination.
+    page_size: usize,
+    /// Whether "Load older" button is selected (when at scroll 0).
+    load_older_selected: bool,
 }
 
 impl ThreadExplorerScreen {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             threads: Vec::new(),
             cursor: 0,
@@ -213,6 +239,10 @@ impl ThreadExplorerScreen {
             view_lens: ViewLens::Activity,
             sort_mode: SortMode::LastActivity,
             focused_synthetic: None,
+            total_thread_messages: 0,
+            loaded_message_count: 0,
+            page_size: get_thread_page_size(),
+            load_older_selected: false,
         }
     }
 
@@ -312,6 +342,9 @@ impl ThreadExplorerScreen {
             self.detail_messages.clear();
             self.loaded_thread_id.clear();
             self.detail_scroll = 0;
+            self.total_thread_messages = 0;
+            self.loaded_message_count = 0;
+            self.load_older_selected = false;
             return;
         }
 
@@ -319,9 +352,71 @@ impl ThreadExplorerScreen {
             return;
         };
 
-        self.detail_messages = fetch_thread_messages(conn, current_thread_id, MAX_THREAD_MESSAGES);
+        // Get total message count for pagination
+        self.total_thread_messages = fetch_thread_message_count(conn, current_thread_id);
+
+        // Load the most recent page_size messages
+        let (messages, offset) =
+            fetch_thread_messages_paginated(conn, current_thread_id, self.page_size, 0);
+        self.detail_messages = messages;
+        self.loaded_message_count = self.detail_messages.len();
         self.loaded_thread_id = current_thread_id.to_string();
         self.detail_scroll = 0;
+        self.load_older_selected = false;
+        // If there are older messages to load, note the offset
+        let _ = offset; // offset is 0 for initial load
+    }
+
+    /// Load older messages for the current thread (pagination).
+    fn load_older_messages(&mut self) {
+        let Some(conn) = &self.db_conn else {
+            return;
+        };
+
+        if self.loaded_thread_id.is_empty() {
+            return;
+        }
+
+        // Calculate how many more to load
+        let remaining = self
+            .total_thread_messages
+            .saturating_sub(self.loaded_message_count);
+        if remaining == 0 {
+            return;
+        }
+
+        let batch = remaining.min(LOAD_OLDER_BATCH_SIZE);
+        let new_offset = self.loaded_message_count;
+
+        // Fetch older messages (they come in chronological order)
+        let (older_messages, _) =
+            fetch_thread_messages_paginated(conn, &self.loaded_thread_id, batch, new_offset);
+
+        if older_messages.is_empty() {
+            return;
+        }
+
+        // Prepend older messages (they're older, so go at the start)
+        let mut new_messages = older_messages;
+        new_messages.append(&mut self.detail_messages);
+        self.detail_messages = new_messages;
+        self.loaded_message_count += batch;
+
+        // Adjust scroll to keep the same content visible
+        // (the new messages were prepended, so add their line count to scroll)
+        self.detail_scroll += batch * 4; // rough estimate: ~4 lines per message
+        self.load_older_selected = false;
+    }
+
+    /// Check if there are more older messages to load.
+    fn has_older_messages(&self) -> bool {
+        self.loaded_message_count < self.total_thread_messages
+    }
+
+    /// Get the count of remaining older messages.
+    fn remaining_older_count(&self) -> usize {
+        self.total_thread_messages
+            .saturating_sub(self.loaded_message_count)
     }
 }
 
@@ -441,33 +536,67 @@ impl MailScreen for ThreadExplorerScreen {
                             // Back to thread list
                             KeyCode::Escape | KeyCode::Char('h') | KeyCode::Left => {
                                 self.focus = Focus::ThreadList;
+                                self.load_older_selected = false;
                             }
-                            // Scroll detail
+                            // Scroll detail / navigate load-older button
                             KeyCode::Char('j') | KeyCode::Down => {
-                                self.detail_scroll += 1;
+                                if self.load_older_selected {
+                                    // Move from load-older button into message list
+                                    self.load_older_selected = false;
+                                } else {
+                                    self.detail_scroll += 1;
+                                }
                             }
                             KeyCode::Char('k') | KeyCode::Up => {
-                                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                                if self.detail_scroll == 0 && self.has_older_messages() {
+                                    // At top and there are older messages, select the load button
+                                    self.load_older_selected = true;
+                                } else if !self.load_older_selected {
+                                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                                }
                             }
                             KeyCode::Char('d') | KeyCode::PageDown => {
+                                self.load_older_selected = false;
                                 self.detail_scroll += 20;
                             }
                             KeyCode::Char('u') | KeyCode::PageUp => {
-                                self.detail_scroll = self.detail_scroll.saturating_sub(20);
+                                self.load_older_selected = false;
+                                if self.detail_scroll < 20 && self.has_older_messages() {
+                                    // Near top with older messages available
+                                    self.detail_scroll = 0;
+                                    self.load_older_selected = true;
+                                } else {
+                                    self.detail_scroll = self.detail_scroll.saturating_sub(20);
+                                }
                             }
                             KeyCode::Char('G') | KeyCode::End => {
                                 // Jump to bottom of detail
+                                self.load_older_selected = false;
                                 self.detail_scroll = self.detail_messages.len().saturating_mul(10); // generous upper bound
                             }
                             KeyCode::Char('g') | KeyCode::Home => {
+                                // Jump to top; if there are older messages, select load button
                                 self.detail_scroll = 0;
+                                if self.has_older_messages() {
+                                    self.load_older_selected = true;
+                                }
                             }
-                            // Deep-link to message by pressing Enter on a visible message
+                            // Enter: load older messages if button selected, else deep-link
                             KeyCode::Enter => {
+                                if self.load_older_selected && self.has_older_messages() {
+                                    self.load_older_messages();
+                                    return Cmd::None;
+                                }
                                 if let Some(msg) = self.detail_messages.first() {
                                     return Cmd::msg(MailScreenMsg::DeepLink(
                                         DeepLinkTarget::MessageById(msg.id),
                                     ));
+                                }
+                            }
+                            // 'o' key: quick load older messages
+                            KeyCode::Char('o') => {
+                                if self.has_older_messages() {
+                                    self.load_older_messages();
                                 }
                             }
                             // Deep-link: jump to timeline at thread last activity.
@@ -761,6 +890,8 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
                     .ok()
                     .unwrap_or_default(),
                 first_timestamp_micros: first_ts,
+                first_timestamp_iso: micros_to_iso(first_ts),
+                unread_count: 0, // Will be updated if read tracking is available
             })
         })
         .collect();
@@ -792,9 +923,32 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
     threads
 }
 
-/// Fetch all messages in a thread, sorted chronologically.
-fn fetch_thread_messages(conn: &DbConn, thread_id: &str, limit: usize) -> Vec<ThreadMessage> {
+/// Get the total count of messages in a thread.
+fn fetch_thread_message_count(conn: &DbConn, thread_id: &str) -> usize {
     let escaped = thread_id.replace('\'', "''");
+    let sql = format!("SELECT COUNT(*) AS cnt FROM messages WHERE thread_id = '{escaped}'");
+
+    conn.query_sync(&sql, &[])
+        .ok()
+        .and_then(|mut rows| rows.pop())
+        .and_then(|row| row.get_named::<i64>("cnt").ok())
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0)
+}
+
+/// Fetch messages in a thread with pagination, returning most recent first for offset calculation.
+/// Returns (messages_in_chronological_order, offset_used).
+fn fetch_thread_messages_paginated(
+    conn: &DbConn,
+    thread_id: &str,
+    limit: usize,
+    offset: usize,
+) -> (Vec<ThreadMessage>, usize) {
+    let escaped = thread_id.replace('\'', "''");
+
+    // We want the most recent `limit` messages, but displayed in chronological order.
+    // So we fetch by DESC, then reverse the result.
+    // For "load older", we use offset to skip the most recent ones.
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.importance, m.created_ts, \
          a_sender.name AS sender_name, \
@@ -805,11 +959,12 @@ fn fetch_thread_messages(conn: &DbConn, thread_id: &str, limit: usize) -> Vec<Th
          LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
          WHERE m.thread_id = '{escaped}' \
          GROUP BY m.id \
-         ORDER BY m.created_ts ASC \
-         LIMIT {limit}"
+         ORDER BY m.created_ts DESC \
+         LIMIT {limit} OFFSET {offset}"
     );
 
-    conn.query_sync(&sql, &[])
+    let mut messages: Vec<ThreadMessage> = conn
+        .query_sync(&sql, &[])
         .ok()
         .map(|rows| {
             rows.into_iter()
@@ -837,7 +992,18 @@ fn fetch_thread_messages(conn: &DbConn, thread_id: &str, limit: usize) -> Vec<Th
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    // Reverse to get chronological order (oldest first)
+    messages.reverse();
+    (messages, offset)
+}
+
+/// Fetch all messages in a thread, sorted chronologically (legacy function for compatibility).
+#[allow(dead_code)]
+fn fetch_thread_messages(conn: &DbConn, thread_id: &str, limit: usize) -> Vec<ThreadMessage> {
+    let (messages, _) = fetch_thread_messages_paginated(conn, thread_id, limit, 0);
+    messages
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1570,6 +1736,8 @@ mod tests {
             velocity_msg_per_hr: msg_count as f64 / 2.0,
             participant_names: "GoldFox,SilverWolf".to_string(),
             first_timestamp_micros: 1_699_993_600_000_000,
+            first_timestamp_iso: "2026-02-06T10:00:00Z".to_string(),
+            unread_count: 0,
         }
     }
 

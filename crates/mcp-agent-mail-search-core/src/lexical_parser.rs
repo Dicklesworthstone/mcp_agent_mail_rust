@@ -9,14 +9,14 @@
 //! - Subject boost (2x) applied via `BoostQuery` at query time
 
 #[cfg(feature = "tantivy-engine")]
+use tantivy::Index;
+#[cfg(feature = "tantivy-engine")]
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, QueryParser,
-    QueryParserError, RegexQuery,
+    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, QueryParser, QueryParserError,
+    RegexQuery,
 };
 #[cfg(feature = "tantivy-engine")]
 use tantivy::schema::Field;
-#[cfg(feature = "tantivy-engine")]
-use tantivy::Index;
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -30,26 +30,22 @@ use crate::tantivy_schema::{BODY_BOOST, SUBJECT_BOOST};
 const BOOLEAN_OPERATORS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
 
 /// Characters that are special to Tantivy query grammar
-static SPECIAL_CHARS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[\[\]{}^~\\]").expect("special chars regex")
-});
+static SPECIAL_CHARS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\[\]{}^~\\]").expect("special chars regex"));
 
 /// Lone wildcards and punctuation-only patterns
-static UNSEARCHABLE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[\*\.\?!()]+$").expect("unsearchable regex")
-});
+static UNSEARCHABLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[\*\.\?!()]+$").expect("unsearchable regex"));
 
 /// Hyphenated token: ASCII alphanumeric segments joined by hyphens
 /// We use a simpler regex without lookbehind (not supported by `regex` crate)
 /// and handle the "already quoted" case in the replacement function.
-static HYPHENATED_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+").expect("hyphenated regex")
-});
+static HYPHENATED_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+").expect("hyphenated regex"));
 
 /// Multiple consecutive spaces
-static MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r" {2,}").expect("multi-space regex")
-});
+static MULTI_SPACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r" {2,}").expect("multi-space regex"));
 
 /// Result of query sanitization
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,8 +133,11 @@ pub fn sanitize_query(query: &str) -> SanitizedQuery {
 
 /// Check whether a string contains only boolean operators and whitespace
 fn is_operators_only(s: &str) -> bool {
-    s.split_whitespace()
-        .all(|word| BOOLEAN_OPERATORS.iter().any(|op| word.eq_ignore_ascii_case(op)))
+    s.split_whitespace().all(|word| {
+        BOOLEAN_OPERATORS
+            .iter()
+            .any(|op| word.eq_ignore_ascii_case(op))
+    })
 }
 
 /// Quote hyphenated tokens to prevent them from being split.
@@ -189,7 +188,11 @@ fn quote_hyphenated_tokens(query: &str) -> String {
 pub fn extract_terms(query: &str) -> Vec<String> {
     query
         .split_whitespace()
-        .filter(|w| !BOOLEAN_OPERATORS.iter().any(|op| w.eq_ignore_ascii_case(op)))
+        .filter(|w| {
+            !BOOLEAN_OPERATORS
+                .iter()
+                .any(|op| w.eq_ignore_ascii_case(op))
+        })
         .map(|w| {
             w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
                 .to_lowercase()
@@ -271,7 +274,10 @@ pub struct LexicalParser {
 fn regex_escape_prefix(prefix: &str) -> String {
     let mut escaped = String::with_capacity(prefix.len() + 4);
     for ch in prefix.chars() {
-        if matches!(ch, '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\') {
+        if matches!(
+            ch,
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
+        ) {
             escaped.push('\\');
         }
         escaped.push(ch);
@@ -283,11 +289,7 @@ fn regex_escape_prefix(prefix: &str) -> String {
 impl LexicalParser {
     /// Create a new parser with the given field handles and configuration.
     #[must_use]
-    pub const fn new(
-        subject_field: Field,
-        body_field: Field,
-        config: LexicalParserConfig,
-    ) -> Self {
+    pub const fn new(subject_field: Field, body_field: Field, config: LexicalParserConfig) -> Self {
         Self {
             config,
             subject_field,
@@ -324,10 +326,7 @@ impl LexicalParser {
             return ParseOutcome::Parsed(self.apply_boost(q));
         }
 
-        let mut parser = QueryParser::for_index(
-            index,
-            vec![self.subject_field, self.body_field],
-        );
+        let mut parser = QueryParser::for_index(index, vec![self.subject_field, self.body_field]);
 
         if self.config.conjunction_by_default {
             parser.set_conjunction_by_default();
@@ -407,10 +406,7 @@ impl LexicalParser {
 
         // Try each term individually as a simple query
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        let parser = QueryParser::for_index(
-            index,
-            vec![self.subject_field, self.body_field],
-        );
+        let parser = QueryParser::for_index(index, vec![self.subject_field, self.body_field]);
 
         for term in &terms {
             if let Ok(q) = parser.parse_query(term) {
@@ -647,12 +643,12 @@ mod tests {
     #[cfg(feature = "tantivy-engine")]
     mod tantivy_tests {
         use super::super::*;
+        use tantivy::TantivyDocument;
         use tantivy::collector::TopDocs;
         use tantivy::doc;
         use tantivy::schema::Value;
-        use tantivy::TantivyDocument;
 
-        use crate::tantivy_schema::{build_schema, register_tokenizer, FieldHandles};
+        use crate::tantivy_schema::{FieldHandles, build_schema, register_tokenizer};
 
         fn setup_index() -> (Index, FieldHandles) {
             let (schema, handles) = build_schema();
@@ -841,7 +837,9 @@ mod tests {
             let outcome = parser.parse(&index, "\"unclosed quote migration");
 
             assert!(outcome.used_fallback());
-            let query = outcome.into_query().expect("fallback should produce a query");
+            let query = outcome
+                .into_query()
+                .expect("fallback should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
             let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();

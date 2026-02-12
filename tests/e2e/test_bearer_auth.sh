@@ -10,9 +10,9 @@
 # - Health endpoint bypasses auth (200)
 # - Localhost bypass when http_allow_localhost_unauthenticated=true
 #
-# Artifacts:
-# - Server logs: tests/artifacts/bearer_auth/<timestamp>/server_*.log
-# - Per-case transcripts: *_status.txt, *_headers.txt, *_body.json, *_curl_stderr.txt
+# Artifacts (via e2e_lib.sh helpers):
+# - Server logs: tests/artifacts/bearer_auth/<timestamp>/logs/server_*.log
+# - Per-case directories: <case_id>/request.json, response.json, headers.txt, status.txt
 
 set -euo pipefail
 
@@ -53,97 +53,38 @@ fail_fast_if_needed() {
     fi
 }
 
-pick_port() {
-python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-}
+# bearer_server_start: Start server with bearer auth config using e2e_start_server_with_logs
+# Args: label [extra_env_vars...]
+bearer_server_start() {
+    local label="$1"
+    shift
 
-http_post_jsonrpc() {
-    local case_id="$1"
-    local url="$2"
-    shift 2
-
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
-
-    local payload='{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"health_check","arguments":{}}}'
-    e2e_save_artifact "${case_id}_request.json" "${payload}"
-
-    local args=(
-        -sS
-        -D "${headers_file}"
-        -o "${body_file}"
-        -w "%{http_code}"
-        -X POST
-        "${url}"
-        -H "content-type: application/json"
-        --data "${payload}"
+    # Bearer auth-specific env vars for hermetic testing
+    local base_env_vars=(
+        "HTTP_JWT_ENABLED=0"
+        "HTTP_RBAC_ENABLED=0"
+        "HTTP_RATE_LIMIT_ENABLED=0"
     )
-    for h in "$@"; do
-        args+=(-H "$h")
-    done
 
-    set +e
-    local status
-    status="$(curl "${args[@]}" 2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-
-    echo "${status}" > "${status_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fail "${case_id}: curl failed rc=${rc}"
+    # Start server with base env vars plus any extras passed in
+    if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "${label}" \
+        "${base_env_vars[@]}" "$@"; then
+        e2e_fail "server (${label}) failed to start"
         return 1
     fi
+
+    # Override URL to use /api/ endpoint instead of /mcp/
+    E2E_SERVER_URL="${E2E_SERVER_URL%/mcp/}/api/"
     return 0
 }
 
-start_server() {
-    local label="$1"
-    local port="$2"
-    local db_path="$3"
-    local storage_root="$4"
-    local bin="$5"
-    shift 5
-
-    local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
-    e2e_log "Starting server (${label}): 127.0.0.1:${port}"
-    e2e_log "  log: ${server_log}"
-
-    (
-        export DATABASE_URL="sqlite:////${db_path}"
-        export STORAGE_ROOT="${storage_root}"
-        export HTTP_HOST="127.0.0.1"
-        export HTTP_PORT="${port}"
-        # Disable JWT so we test pure bearer token auth
-        export HTTP_JWT_ENABLED="0"
-        export HTTP_RBAC_ENABLED="0"
-        export HTTP_RATE_LIMIT_ENABLED="0"
-
-        # Optional overrides passed as KEY=VALUE pairs in remaining args.
-        while [ $# -gt 0 ]; do
-            export "$1"
-            shift
-        done
-
-        "${bin}" serve --host 127.0.0.1 --port "${port}"
-    ) >"${server_log}" 2>&1 &
-    echo $!
-}
-
-stop_server() {
-    local pid="$1"
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill "${pid}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${pid}" 2>/dev/null || true
-    fi
+# bearer_rpc_call: Make JSON-RPC call (wraps e2e_rpc_call, tolerates non-200)
+# Args: case_id [extra_headers...]
+bearer_rpc_call() {
+    local case_id="$1"
+    shift
+    # Use e2e_rpc_call with health_check tool; suppress error return for 401s
+    e2e_rpc_call "${case_id}" "${E2E_SERVER_URL}" "health_check" "{}" "$@" || true
 }
 
 # ---------------------------------------------------------------------------
@@ -153,9 +94,7 @@ stop_server() {
 WORK="$(e2e_mktemp "e2e_bearer_auth")"
 DB_PATH="${WORK}/db.sqlite3"
 STORAGE_ROOT="${WORK}/storage_root"
-
-# e2e_ensure_binary is verbose (logs to stdout); take the last line as the path.
-BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+mkdir -p "${STORAGE_ROOT}"
 
 # Generate a test bearer token
 VALID_TOKEN="e2e-test-token-$(e2e_seeded_hex)"
@@ -167,74 +106,79 @@ e2e_save_artifact "invalid_token_meta.json" "{\"len\":${#INVALID_TOKEN},\"sha256
 # Run 1: Bearer token auth enabled (HTTP_BEARER_TOKEN set)
 # ---------------------------------------------------------------------------
 
-PORT1="$(pick_port)"
-PID1="$(start_server "bearer_enabled" "${PORT1}" "${DB_PATH}" "${STORAGE_ROOT}" "${BIN}" \
+if ! bearer_server_start "bearer_enabled" \
     "HTTP_BEARER_TOKEN=${VALID_TOKEN}" \
-    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0")"
-trap 'stop_server "${PID1}" || true' EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT1}" 10; then
-    e2e_fail "server failed to start (port not open)"
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0"; then
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
-
-URL1="http://127.0.0.1:${PORT1}/api/"
+trap 'e2e_stop_server || true' EXIT
 
 # ---------------------------------------------------------------------------
 # Case 1: Missing Authorization header -> 401
 # ---------------------------------------------------------------------------
 e2e_case_banner "Missing Authorization header -> 401"
-http_post_jsonrpc "case01_missing_auth" "${URL1}"
-e2e_assert_eq "HTTP 401" "401" "$(cat "${E2E_ARTIFACT_DIR}/case01_missing_auth_status.txt")"
-e2e_assert_contains "detail Unauthorized" "$(cat "${E2E_ARTIFACT_DIR}/case01_missing_auth_body.json" 2>/dev/null || true)" "Unauthorized"
+e2e_mark_case_start "case01_missing_auth"
+bearer_rpc_call "case01_missing_auth"
+e2e_assert_eq "HTTP 401" "401" "$(e2e_rpc_read_status "case01_missing_auth")"
+e2e_assert_contains "detail Unauthorized" "$(e2e_rpc_read_response "case01_missing_auth")" "Unauthorized"
+e2e_mark_case_end "case01_missing_auth"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
 # Case 2: Invalid token -> 401/403
 # ---------------------------------------------------------------------------
 e2e_case_banner "Invalid bearer token -> 401"
-http_post_jsonrpc "case02_invalid_token" "${URL1}" "Authorization: Bearer ${INVALID_TOKEN}"
-STATUS_CASE2="$(cat "${E2E_ARTIFACT_DIR}/case02_invalid_token_status.txt")"
+e2e_mark_case_start "case02_invalid_token"
+bearer_rpc_call "case02_invalid_token" "Authorization: Bearer ${INVALID_TOKEN}"
+STATUS_CASE2="$(e2e_rpc_read_status "case02_invalid_token")"
 if [ "$STATUS_CASE2" = "401" ] || [ "$STATUS_CASE2" = "403" ]; then
     e2e_pass "HTTP status is 401 or 403 (got ${STATUS_CASE2})"
 else
     e2e_fail "Expected 401 or 403, got ${STATUS_CASE2}"
 fi
-e2e_assert_contains "detail Unauthorized or Forbidden" "$(cat "${E2E_ARTIFACT_DIR}/case02_invalid_token_body.json" 2>/dev/null || true)" "nauthorized\|orbidden"
+e2e_assert_contains "detail Unauthorized" "$(e2e_rpc_read_response "case02_invalid_token")" "Unauthorized"
+e2e_mark_case_end "case02_invalid_token"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
 # Case 3: Bearer with empty token string -> 401
 # ---------------------------------------------------------------------------
 e2e_case_banner "Bearer with empty token -> 401"
-http_post_jsonrpc "case03_empty_token" "${URL1}" "Authorization: Bearer "
-e2e_assert_eq "HTTP 401" "401" "$(cat "${E2E_ARTIFACT_DIR}/case03_empty_token_status.txt")"
+e2e_mark_case_start "case03_empty_token"
+bearer_rpc_call "case03_empty_token" "Authorization: Bearer "
+e2e_assert_eq "HTTP 401" "401" "$(e2e_rpc_read_status "case03_empty_token")"
+e2e_mark_case_end "case03_empty_token"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
 # Case 4: Malformed - "Bearer" only (no space after) -> 401
 # ---------------------------------------------------------------------------
 e2e_case_banner "Malformed - Bearer without token -> 401"
-http_post_jsonrpc "case04_bearer_only" "${URL1}" "Authorization: Bearer"
-e2e_assert_eq "HTTP 401" "401" "$(cat "${E2E_ARTIFACT_DIR}/case04_bearer_only_status.txt")"
+e2e_mark_case_start "case04_bearer_only"
+bearer_rpc_call "case04_bearer_only" "Authorization: Bearer"
+e2e_assert_eq "HTTP 401" "401" "$(e2e_rpc_read_status "case04_bearer_only")"
+e2e_mark_case_end "case04_bearer_only"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
 # Case 5: Malformed - Basic instead of Bearer -> 401
 # ---------------------------------------------------------------------------
 e2e_case_banner "Basic auth instead of Bearer -> 401"
-http_post_jsonrpc "case05_basic_auth" "${URL1}" "Authorization: Basic dXNlcjpwYXNz"
-e2e_assert_eq "HTTP 401" "401" "$(cat "${E2E_ARTIFACT_DIR}/case05_basic_auth_status.txt")"
+e2e_mark_case_start "case05_basic_auth"
+bearer_rpc_call "case05_basic_auth" "Authorization: Basic dXNlcjpwYXNz"
+e2e_assert_eq "HTTP 401" "401" "$(e2e_rpc_read_status "case05_basic_auth")"
+e2e_mark_case_end "case05_basic_auth"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
 # Case 6: Malformed - "bearer" lowercase -> check behavior
 # ---------------------------------------------------------------------------
 e2e_case_banner "Lowercase bearer (case sensitivity check)"
-http_post_jsonrpc "case06_lowercase_bearer" "${URL1}" "Authorization: bearer ${VALID_TOKEN}"
-STATUS_CASE6="$(cat "${E2E_ARTIFACT_DIR}/case06_lowercase_bearer_status.txt")"
+e2e_mark_case_start "case06_lowercase_bearer"
+bearer_rpc_call "case06_lowercase_bearer" "Authorization: bearer ${VALID_TOKEN}"
+STATUS_CASE6="$(e2e_rpc_read_status "case06_lowercase_bearer")"
 # HTTP spec says Bearer should be case-insensitive, but implementations vary
 if [ "$STATUS_CASE6" = "200" ]; then
     e2e_pass "Server accepts lowercase 'bearer' (RFC-compliant)"
@@ -243,103 +187,102 @@ elif [ "$STATUS_CASE6" = "401" ]; then
 else
     e2e_fail "Unexpected status ${STATUS_CASE6} for lowercase bearer"
 fi
+e2e_mark_case_end "case06_lowercase_bearer"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
 # Case 7: Valid bearer token -> 200
 # ---------------------------------------------------------------------------
 e2e_case_banner "Valid bearer token -> 200"
-http_post_jsonrpc "case07_valid_token" "${URL1}" "Authorization: Bearer ${VALID_TOKEN}"
-e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case07_valid_token_status.txt")"
-e2e_assert_contains "JSON-RPC result present" "$(cat "${E2E_ARTIFACT_DIR}/case07_valid_token_body.json" 2>/dev/null || true)" "\"result\""
+e2e_mark_case_start "case07_valid_token"
+bearer_rpc_call "case07_valid_token" "Authorization: Bearer ${VALID_TOKEN}"
+e2e_assert_eq "HTTP 200" "200" "$(e2e_rpc_read_status "case07_valid_token")"
+e2e_assert_contains "JSON-RPC result present" "$(e2e_rpc_read_response "case07_valid_token")" "\"result\""
+e2e_mark_case_end "case07_valid_token"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
 # Case 8: Extra whitespace in Authorization header
 # ---------------------------------------------------------------------------
 e2e_case_banner "Extra whitespace in Authorization header"
-http_post_jsonrpc "case08_extra_whitespace" "${URL1}" "Authorization:   Bearer   ${VALID_TOKEN}  "
-STATUS_CASE8="$(cat "${E2E_ARTIFACT_DIR}/case08_extra_whitespace_status.txt")"
+e2e_mark_case_start "case08_extra_whitespace"
+bearer_rpc_call "case08_extra_whitespace" "Authorization:   Bearer   ${VALID_TOKEN}  "
+STATUS_CASE8="$(e2e_rpc_read_status "case08_extra_whitespace")"
 # Should either accept (200) or reject with 401, but not crash
 if [ "$STATUS_CASE8" = "200" ] || [ "$STATUS_CASE8" = "401" ]; then
     e2e_pass "Server handles extra whitespace gracefully (got ${STATUS_CASE8})"
 else
     e2e_fail "Unexpected status ${STATUS_CASE8} for extra whitespace"
 fi
+e2e_mark_case_end "case08_extra_whitespace"
 fail_fast_if_needed
 
-stop_server "${PID1}"
+e2e_stop_server
 trap - EXIT
 
 # ---------------------------------------------------------------------------
 # Run 2: Localhost bypass enabled
 # ---------------------------------------------------------------------------
 
-PORT2="$(pick_port)"
-PID2="$(start_server "localhost_bypass" "${PORT2}" "${DB_PATH}" "${STORAGE_ROOT}" "${BIN}" \
+if ! bearer_server_start "localhost_bypass" \
     "HTTP_BEARER_TOKEN=${VALID_TOKEN}" \
-    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1")"
-trap 'stop_server "${PID2}" || true' EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
-    e2e_fail "server (localhost_bypass) failed to start (port not open)"
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1"; then
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
-
-URL2="http://127.0.0.1:${PORT2}/api/"
+trap 'e2e_stop_server || true' EXIT
 
 # ---------------------------------------------------------------------------
 # Case 9: No auth header but localhost bypass enabled -> 200
 # ---------------------------------------------------------------------------
 e2e_case_banner "Localhost bypass: no auth -> 200"
-http_post_jsonrpc "case09_localhost_bypass" "${URL2}"
-e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case09_localhost_bypass_status.txt")"
-e2e_assert_contains "JSON-RPC result present" "$(cat "${E2E_ARTIFACT_DIR}/case09_localhost_bypass_body.json" 2>/dev/null || true)" "\"result\""
+e2e_mark_case_start "case09_localhost_bypass"
+bearer_rpc_call "case09_localhost_bypass"
+e2e_assert_eq "HTTP 200" "200" "$(e2e_rpc_read_status "case09_localhost_bypass")"
+e2e_assert_contains "JSON-RPC result present" "$(e2e_rpc_read_response "case09_localhost_bypass")" "\"result\""
+e2e_mark_case_end "case09_localhost_bypass"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
 # Case 10: Valid token still works with bypass enabled
 # ---------------------------------------------------------------------------
 e2e_case_banner "Localhost bypass: valid token still works -> 200"
-http_post_jsonrpc "case10_bypass_with_token" "${URL2}" "Authorization: Bearer ${VALID_TOKEN}"
-e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case10_bypass_with_token_status.txt")"
-e2e_assert_contains "JSON-RPC result present" "$(cat "${E2E_ARTIFACT_DIR}/case10_bypass_with_token_body.json" 2>/dev/null || true)" "\"result\""
+e2e_mark_case_start "case10_bypass_with_token"
+bearer_rpc_call "case10_bypass_with_token" "Authorization: Bearer ${VALID_TOKEN}"
+e2e_assert_eq "HTTP 200" "200" "$(e2e_rpc_read_status "case10_bypass_with_token")"
+e2e_assert_contains "JSON-RPC result present" "$(e2e_rpc_read_response "case10_bypass_with_token")" "\"result\""
+e2e_mark_case_end "case10_bypass_with_token"
 fail_fast_if_needed
 
-stop_server "${PID2}"
+e2e_stop_server
 trap - EXIT
 
 # ---------------------------------------------------------------------------
 # Run 3: No bearer token configured (auth disabled)
 # ---------------------------------------------------------------------------
 
-PORT3="$(pick_port)"
-PID3="$(start_server "no_auth" "${PORT3}" "${DB_PATH}" "${STORAGE_ROOT}" "${BIN}" \
+if ! bearer_server_start "no_auth" \
     "HTTP_BEARER_TOKEN=" \
-    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0")"
-trap 'stop_server "${PID3}" || true' EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT3}" 10; then
-    e2e_fail "server (no_auth) failed to start (port not open)"
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0"; then
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
-
-URL3="http://127.0.0.1:${PORT3}/api/"
+trap 'e2e_stop_server || true' EXIT
 
 # ---------------------------------------------------------------------------
 # Case 11: No bearer token configured - requests should pass
 # ---------------------------------------------------------------------------
 e2e_case_banner "No bearer token configured -> 200 (auth disabled)"
-http_post_jsonrpc "case11_no_auth_configured" "${URL3}"
-e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case11_no_auth_configured_status.txt")"
-e2e_assert_contains "JSON-RPC result present" "$(cat "${E2E_ARTIFACT_DIR}/case11_no_auth_configured_body.json" 2>/dev/null || true)" "\"result\""
+e2e_mark_case_start "case11_no_auth_configured"
+bearer_rpc_call "case11_no_auth_configured"
+e2e_assert_eq "HTTP 200" "200" "$(e2e_rpc_read_status "case11_no_auth_configured")"
+e2e_assert_contains "JSON-RPC result present" "$(e2e_rpc_read_response "case11_no_auth_configured")" "\"result\""
+e2e_mark_case_end "case11_no_auth_configured"
 fail_fast_if_needed
 
-stop_server "${PID3}"
+e2e_stop_server
 trap - EXIT
 
 # ---------------------------------------------------------------------------

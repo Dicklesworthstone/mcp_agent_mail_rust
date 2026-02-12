@@ -3,6 +3,7 @@
 pub mod bundle;
 pub mod crypto;
 pub mod deploy;
+pub mod detection;
 pub mod finalize;
 pub mod hosting;
 pub mod probe;
@@ -10,6 +11,7 @@ pub mod scope;
 pub mod scrub;
 pub mod snapshot;
 pub mod static_render;
+pub mod wizard;
 
 pub use bundle::{
     AttachmentConfig, AttachmentItem, AttachmentManifest, AttachmentStats, ChunkManifest,
@@ -32,11 +34,20 @@ pub use finalize::{
     finalize_export_db, finalize_snapshot_for_export,
 };
 pub use hosting::{HostingHint, detect_hosting_hints, generate_headers_file};
+pub use detection::{
+    detect_cloudflare_pages, detect_environment, detect_github_pages, detect_netlify, detect_s3,
+    extract_github_repo,
+};
 pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
 pub use scrub::{ScrubSummary, scan_for_secrets, scrub_snapshot};
 pub use snapshot::{SnapshotContext, create_snapshot_context, create_sqlite_snapshot};
 pub use static_render::{
     SearchIndexEntry, SitemapEntry, StaticRenderConfig, StaticRenderResult, render_static_site,
+};
+pub use wizard::{
+    DeploymentPlan, DetectedEnvironment, DetectedSignal, DetectionConfidence, HostingProvider,
+    PlanStep, StepOutcome, WizardError, WizardErrorCode, WizardInputs, WizardJsonOutput,
+    WizardMetadata, WizardMode, WizardResult, WIZARD_VERSION, exit_codes,
 };
 
 use serde::{Deserialize, Serialize};

@@ -28,6 +28,7 @@ pub mod search_planner;
 pub mod search_recipes;
 pub mod search_scope;
 pub mod search_service;
+pub mod search_v3;
 pub mod timestamps;
 pub mod tracking;
 

@@ -19,6 +19,7 @@ use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
 };
 use crate::tracking::record_query;
+use mcp_agent_mail_core::config::SearchEngine;
 
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,8 @@ pub struct SearchOptions {
     pub redaction_policy: Option<RedactionPolicy>,
     /// Whether to emit telemetry events for this query.
     pub track_telemetry: bool,
+    /// Search engine override. `None` = use global config default.
+    pub search_engine: Option<SearchEngine>,
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -100,6 +103,40 @@ async fn acquire_conn(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Tantivy routing helpers (feature-gated)
+// ────────────────────────────────────────────────────────────────────
+
+/// Try executing a search via the Tantivy bridge. Returns `None` if the
+/// bridge is not initialized (feature disabled or `init_bridge` not called).
+#[cfg(feature = "search-v3")]
+fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
+    let bridge = crate::search_v3::get_bridge()?;
+    Some(bridge.search(query))
+}
+
+#[cfg(not(feature = "search-v3"))]
+fn try_tantivy_search(_query: &SearchQuery) -> Option<Vec<SearchResult>> {
+    None
+}
+
+/// Log a comparison between FTS5 and Tantivy results in shadow mode.
+fn log_shadow_comparison(fts5: &[SearchResult], tantivy: &[SearchResult], query: &SearchQuery) {
+    let fts5_ids: Vec<i64> = fts5.iter().map(|r| r.id).collect();
+    let tantivy_ids: Vec<i64> = tantivy.iter().map(|r| r.id).collect();
+    let overlap = fts5_ids
+        .iter()
+        .filter(|id| tantivy_ids.contains(id))
+        .count();
+    tracing::info!(
+        query = %query.text,
+        fts5_count = fts5.len(),
+        tantivy_count = tantivy.len(),
+        overlap_count = overlap,
+        "shadow search comparison"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Core execution
 // ────────────────────────────────────────────────────────────────────
 
@@ -117,6 +154,31 @@ pub async fn execute_search(
     options: &SearchOptions,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
+    let engine = options.search_engine.unwrap_or_default();
+
+    // ── Tantivy-only fast path ──────────────────────────────────────
+    if engine == SearchEngine::Lexical {
+        if let Some(raw_results) = try_tantivy_search(query) {
+            if options.track_telemetry {
+                record_query(
+                    "search_service_tantivy",
+                    u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+            }
+            return finish_scoped_response(raw_results, query, options);
+        }
+        // Bridge not initialized → fall through to FTS5
+    }
+
+    // ── Shadow: pre-fetch Tantivy results for comparison ────────────
+    #[allow(deprecated)]
+    let shadow_tantivy = if engine.is_shadow() {
+        try_tantivy_search(query)
+    } else {
+        None
+    };
+
+    // ── FTS5 path (default + Shadow primary) ────────────────────────
 
     // Step 1: Plan the query
     let plan = plan_search(query);
@@ -163,6 +225,12 @@ pub async fn execute_search(
 
     // Step 4: Map rows to SearchResult
     let raw_results = map_rows_to_results(&rows, query.doc_kind);
+
+    // Shadow comparison logging
+    if let Some(ref tantivy_results) = shadow_tantivy {
+        log_shadow_comparison(&raw_results, tantivy_results, query);
+    }
+
     let sql_row_count = raw_results.len();
 
     // Step 5: Compute pagination cursor
@@ -206,7 +274,43 @@ pub async fn execute_search(
     })
 }
 
+/// Apply scope enforcement and build a `ScopedSearchResponse` from raw results.
+///
+/// Shared by both the Tantivy and FTS5 paths to avoid duplicating scope logic.
+fn finish_scoped_response(
+    raw_results: Vec<SearchResult>,
+    query: &SearchQuery,
+    options: &SearchOptions,
+) -> Outcome<ScopedSearchResponse, DbError> {
+    let sql_row_count = raw_results.len();
+    let next_cursor = compute_next_cursor(&raw_results, query.effective_limit());
+    let redaction = options.redaction_policy.clone().unwrap_or_default();
+    let scope_ctx = options.scope_ctx.clone().unwrap_or_else(|| ScopeContext {
+        viewer: None,
+        approved_contacts: Vec::new(),
+        viewer_project_ids: Vec::new(),
+        sender_policies: Vec::new(),
+        recipient_map: Vec::new(),
+    });
+    let (scoped_results, audit_summary) = apply_scope(raw_results, &scope_ctx, &redaction);
+    let audit = if scope_ctx.viewer.is_some() {
+        Some(audit_summary)
+    } else {
+        None
+    };
+    Outcome::Ok(ScopedSearchResponse {
+        results: scoped_results,
+        next_cursor,
+        explain: None,
+        audit_summary: audit,
+        sql_row_count,
+    })
+}
+
 /// Execute a simple (unscoped) search — for backward compatibility with existing tools.
+///
+/// Always uses the FTS5 engine regardless of global config. Callers that want
+/// Tantivy routing should use [`execute_search`] with [`SearchOptions::search_engine`].
 ///
 /// Returns a `SearchResponse` without scope enforcement or audit.
 ///

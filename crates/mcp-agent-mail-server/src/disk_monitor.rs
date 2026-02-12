@@ -144,4 +144,44 @@ mod tests {
             DiskPressure::Fatal
         ));
     }
+
+    #[test]
+    fn warning_to_critical_transition_alerts() {
+        assert!(should_emit_pressure_change_alert(
+            DiskPressure::Warning,
+            DiskPressure::Critical
+        ));
+    }
+
+    #[test]
+    fn rapid_fluctuation_alerts_every_transition() {
+        let sequence = [
+            DiskPressure::Ok,
+            DiskPressure::Warning,
+            DiskPressure::Critical,
+            DiskPressure::Warning,
+            DiskPressure::Warning,
+            DiskPressure::Ok,
+        ];
+        let transitions: Vec<bool> = sequence
+            .windows(2)
+            .map(|window| should_emit_pressure_change_alert(window[0], window[1]))
+            .collect();
+        assert_eq!(transitions, vec![true, true, true, false, true]);
+    }
+
+    #[test]
+    fn startup_warning_handles_unmounted_storage() {
+        let mut config = Config::from_env();
+        config.storage_root =
+            std::path::PathBuf::from("/definitely/nonexistent/mcp-agent-mail-root");
+        config.database_url = "sqlite:///definitely/nonexistent/mcp-agent-mail.sqlite3".to_string();
+
+        let sample = mcp_agent_mail_core::disk::sample_and_record(&config);
+        assert!(
+            sample.effective_free_bytes.is_none(),
+            "missing probe paths should produce no effective free-bytes sample"
+        );
+        assert!(!should_emit_startup_warning(sample.effective_free_bytes));
+    }
 }

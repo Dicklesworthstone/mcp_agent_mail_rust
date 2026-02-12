@@ -27,9 +27,13 @@ pub mod updater;
 pub mod filter_compiler;
 pub mod lexical_parser;
 pub mod lexical_response;
+pub mod rollout;
 
 #[cfg(feature = "tantivy-engine")]
 pub mod tantivy_schema;
+
+#[cfg(feature = "semantic")]
+pub mod embedder;
 
 // Re-export key types
 pub use canonical::{
@@ -51,12 +55,21 @@ pub use query::{DateRange, ImportanceFilter, SearchFilter, SearchMode, SearchQue
 pub use results::{ExplainReport, HighlightRange, SearchHit, SearchResults};
 pub use updater::{IncrementalUpdater, UpdaterConfig, UpdaterStats, deduplicate_changes};
 
-pub use filter_compiler::{active_filter_count, has_active_filters};
 #[cfg(feature = "tantivy-engine")]
 pub use filter_compiler::{CompiledFilters, compile_filters};
-pub use lexical_parser::{SanitizedQuery, extract_terms, sanitize_query};
-pub use lexical_response::{find_highlights, generate_snippet};
-#[cfg(feature = "tantivy-engine")]
-pub use lexical_response::{ResponseConfig, execute_search};
+pub use filter_compiler::{active_filter_count, has_active_filters};
 #[cfg(feature = "tantivy-engine")]
 pub use lexical_parser::{LexicalParser, LexicalParserConfig, ParseOutcome};
+pub use lexical_parser::{SanitizedQuery, extract_terms, sanitize_query};
+#[cfg(feature = "tantivy-engine")]
+pub use lexical_response::{ResponseConfig, execute_search};
+pub use lexical_response::{find_highlights, generate_snippet};
+pub use rollout::{
+    RolloutController, ShadowComparison, ShadowMetrics, ShadowMetricsSnapshot,
+};
+
+#[cfg(feature = "semantic")]
+pub use embedder::{
+    Embedder, EmbeddingResult, EmbeddingVec, HashEmbedder, ModelInfo, ModelRegistry, ModelTier,
+    RegistryConfig, cosine_similarity, embed_document, normalize_l2, well_known,
+};

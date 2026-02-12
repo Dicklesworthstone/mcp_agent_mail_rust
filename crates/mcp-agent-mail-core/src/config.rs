@@ -160,6 +160,9 @@ pub struct Config {
     pub ack_escalation_claim_exclusive: bool,
     pub ack_escalation_claim_holder_name: String,
 
+    // Search V3 rollout configuration
+    pub search_rollout: SearchRolloutConfig,
+
     // LLM
     pub llm_enabled: bool,
     pub llm_default_model: String,
@@ -227,6 +230,13 @@ pub struct Config {
     pub tui_key_hints: bool,
     pub tui_keymap_profile: String,
     pub tui_active_preset: String,
+    pub tui_toast_enabled: bool,
+    pub tui_toast_severity: String,
+    pub tui_toast_position: String,
+    pub tui_toast_max_visible: usize,
+    pub tui_toast_info_dismiss_secs: u64,
+    pub tui_toast_warn_dismiss_secs: u64,
+    pub tui_toast_error_dismiss_secs: u64,
 }
 
 /// Application environment
@@ -242,6 +252,195 @@ impl std::fmt::Display for AppEnvironment {
             Self::Development => write!(f, "development"),
             Self::Production => write!(f, "production"),
         }
+    }
+}
+
+/// Search engine backend selection.
+///
+/// Controls which search implementation is used:
+/// - `Legacy` — SQLite FTS5 (current default for stability)
+/// - `Lexical` — Tantivy-based lexical search (Search V3)
+/// - `Semantic` — vector embedding search (requires semantic feature)
+/// - `Hybrid` — two-tier fusion: lexical + semantic + rerank
+/// - `Auto` — adaptive engine selection based on query characteristics
+/// - `Shadow` — (deprecated) run both and compare; use `SearchShadowMode` instead
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchEngine {
+    /// SQLite FTS5 (legacy, current default for stability)
+    #[default]
+    Legacy,
+    /// Tantivy-based lexical search (Search V3)
+    Lexical,
+    /// Vector embedding search (requires semantic feature)
+    Semantic,
+    /// Two-tier fusion: lexical + semantic + rerank
+    Hybrid,
+    /// Adaptive engine selection based on query characteristics
+    Auto,
+    /// Shadow mode: execute both engines, return FTS5 results, log discrepancies.
+    /// **Deprecated:** Use `SearchShadowMode` instead for finer control.
+    #[deprecated(since = "0.2.0", note = "Use SearchShadowMode for shadow comparison")]
+    Shadow,
+}
+
+impl SearchEngine {
+    /// Parse from string value, with aliases for backwards compatibility.
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        #[allow(deprecated)]
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" | "fts5" | "fts" | "sqlite" => Self::Legacy,
+            "lexical" | "tantivy" | "v3" => Self::Lexical,
+            "semantic" | "vector" | "embedding" => Self::Semantic,
+            "hybrid" | "fusion" => Self::Hybrid,
+            "auto" | "adaptive" => Self::Auto,
+            "shadow" => Self::Shadow,
+            _ => Self::Legacy,
+        }
+    }
+
+    /// Returns `true` if this engine requires semantic search capability.
+    #[must_use]
+    pub const fn requires_semantic(self) -> bool {
+        matches!(self, Self::Semantic | Self::Hybrid | Self::Auto)
+    }
+
+    /// Returns `true` if this engine uses lexical search.
+    #[must_use]
+    #[allow(deprecated)]
+    pub const fn uses_lexical(self) -> bool {
+        matches!(self, Self::Legacy | Self::Lexical | Self::Hybrid | Self::Auto | Self::Shadow)
+    }
+
+    /// Returns `true` if this is shadow mode (deprecated variant).
+    #[must_use]
+    #[allow(deprecated)]
+    pub const fn is_shadow(self) -> bool {
+        matches!(self, Self::Shadow)
+    }
+}
+
+impl std::fmt::Display for SearchEngine {
+    #[allow(deprecated)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy => write!(f, "legacy"),
+            Self::Lexical => write!(f, "lexical"),
+            Self::Semantic => write!(f, "semantic"),
+            Self::Hybrid => write!(f, "hybrid"),
+            Self::Auto => write!(f, "auto"),
+            Self::Shadow => write!(f, "shadow"),
+        }
+    }
+}
+
+/// Shadow mode for Search V3 rollout validation.
+///
+/// Shadow mode runs both legacy and V3 engines, comparing results for validation
+/// without affecting user-visible behavior (in `LogOnly` mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchShadowMode {
+    /// Shadow mode disabled — only run the configured engine.
+    #[default]
+    Off,
+    /// Run both engines, log comparison metrics, return only legacy results.
+    LogOnly,
+    /// Run both engines, log comparison, return V3 results (with divergence warnings).
+    Compare,
+}
+
+impl SearchShadowMode {
+    /// Parse from string value.
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "log_only" | "log-only" | "logonly" | "log" => Self::LogOnly,
+            "compare" | "v3" | "new" => Self::Compare,
+            _ => Self::Off,
+        }
+    }
+
+    /// Returns `true` if shadow mode is active (any mode other than Off).
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Returns `true` if V3 results should be returned to the user.
+    #[must_use]
+    pub const fn returns_v3(self) -> bool {
+        matches!(self, Self::Compare)
+    }
+}
+
+impl std::fmt::Display for SearchShadowMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::LogOnly => write!(f, "log_only"),
+            Self::Compare => write!(f, "compare"),
+        }
+    }
+}
+
+/// Search V3 rollout configuration.
+///
+/// Provides safe rollout controls with explicit kill switches and per-surface overrides.
+#[derive(Debug, Clone)]
+pub struct SearchRolloutConfig {
+    /// Primary search engine (default: Legacy).
+    pub engine: SearchEngine,
+    /// Shadow comparison mode (default: Off).
+    pub shadow_mode: SearchShadowMode,
+    /// Kill switch for semantic search tier (default: false).
+    pub semantic_enabled: bool,
+    /// Kill switch for reranking tier (default: false).
+    pub rerank_enabled: bool,
+    /// Fall back to legacy FTS on V3 error (default: true).
+    pub fallback_on_error: bool,
+    /// Per-surface engine overrides (tool name -> engine).
+    pub surface_overrides: HashMap<String, SearchEngine>,
+}
+
+impl Default for SearchRolloutConfig {
+    fn default() -> Self {
+        Self {
+            engine: SearchEngine::default(),
+            shadow_mode: SearchShadowMode::default(),
+            semantic_enabled: false,
+            rerank_enabled: false,
+            fallback_on_error: true,
+            surface_overrides: HashMap::new(),
+        }
+    }
+}
+
+impl SearchRolloutConfig {
+    /// Resolve the effective engine for a given surface (tool name).
+    ///
+    /// Checks per-surface overrides first, then falls back to the global engine.
+    /// Applies kill switch degradation (e.g., Hybrid -> Lexical if semantic disabled).
+    #[must_use]
+    pub fn effective_engine(&self, surface: &str) -> SearchEngine {
+        let base = self
+            .surface_overrides
+            .get(surface)
+            .copied()
+            .unwrap_or(self.engine);
+
+        // Apply kill switch degradation
+        match base {
+            SearchEngine::Semantic if !self.semantic_enabled => SearchEngine::Legacy,
+            SearchEngine::Hybrid if !self.semantic_enabled => SearchEngine::Lexical,
+            SearchEngine::Auto if !self.semantic_enabled => SearchEngine::Lexical,
+            other => other,
+        }
+    }
+
+    /// Returns `true` if shadow mode should run for validation.
+    #[must_use]
+    pub const fn should_shadow(&self) -> bool {
+        self.shadow_mode.is_active()
     }
 }
 
@@ -505,6 +704,9 @@ impl Default for Config {
             ack_escalation_claim_exclusive: false,
             ack_escalation_claim_holder_name: String::new(),
 
+            // Search V3 rollout configuration
+            search_rollout: SearchRolloutConfig::default(),
+
             // LLM
             llm_enabled: true,
             llm_default_model: "gpt-4o-mini".to_string(),
@@ -584,6 +786,13 @@ impl Default for Config {
             tui_key_hints: true,
             tui_keymap_profile: "default".to_string(),
             tui_active_preset: "default".to_string(),
+            tui_toast_enabled: true,
+            tui_toast_severity: "info".to_string(),
+            tui_toast_position: "top-right".to_string(),
+            tui_toast_max_visible: 3,
+            tui_toast_info_dismiss_secs: 5,
+            tui_toast_warn_dismiss_secs: 8,
+            tui_toast_error_dismiss_secs: 15,
         }
     }
 }
@@ -920,6 +1129,40 @@ impl Config {
             config.ack_escalation_claim_holder_name = v;
         }
 
+        // Search V3 rollout configuration
+        // Primary engine: AM_SEARCH_ENGINE (legacy | lexical | semantic | hybrid | auto)
+        if let Some(v) = env_value("AM_SEARCH_ENGINE")
+            .or_else(|| env_value("SEARCH_ENGINE"))
+        {
+            config.search_rollout.engine = SearchEngine::parse(&v);
+        }
+        // Shadow mode: AM_SEARCH_SHADOW_MODE (off | log_only | compare)
+        if let Some(v) = env_value("AM_SEARCH_SHADOW_MODE") {
+            config.search_rollout.shadow_mode = SearchShadowMode::parse(&v);
+        }
+        // Kill switches
+        config.search_rollout.semantic_enabled = env_bool(
+            "AM_SEARCH_SEMANTIC_ENABLED",
+            config.search_rollout.semantic_enabled,
+        );
+        config.search_rollout.rerank_enabled = env_bool(
+            "AM_SEARCH_RERANK_ENABLED",
+            config.search_rollout.rerank_enabled,
+        );
+        config.search_rollout.fallback_on_error = env_bool(
+            "AM_SEARCH_FALLBACK_ON_ERROR",
+            config.search_rollout.fallback_on_error,
+        );
+        // Per-surface engine overrides: AM_SEARCH_ENGINE_FOR_<TOOL_NAME>
+        // e.g., AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES=hybrid
+        for (key, value) in env::vars() {
+            if let Some(tool_name) = key.strip_prefix("AM_SEARCH_ENGINE_FOR_") {
+                let tool_name = tool_name.to_lowercase();
+                let engine = SearchEngine::parse(&value);
+                config.search_rollout.surface_overrides.insert(tool_name, engine);
+            }
+        }
+
         // LLM
         config.llm_enabled = env_bool("LLM_ENABLED", config.llm_enabled);
         if let Some(v) = env_value("LLM_DEFAULT_MODEL") {
@@ -1063,6 +1306,16 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default)
         };
+        let console_usize = |key: &str, default: usize| -> usize {
+            console_value(key)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let console_u64 = |key: &str, default: u64| -> u64 {
+            console_value(key)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
 
         config.console_auto_save = console_bool("CONSOLE_AUTO_SAVE", config.console_auto_save);
         config.console_interactive_enabled =
@@ -1132,6 +1385,42 @@ impl Config {
                 config.tui_active_preset = trimmed;
             }
         }
+        config.tui_toast_enabled = console_bool("AM_TUI_TOAST_ENABLED", config.tui_toast_enabled);
+        if let Some(v) = console_value("AM_TUI_TOAST_SEVERITY") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "info" | "warning" | "warn" | "error" | "off"
+            ) {
+                config.tui_toast_severity = lower;
+            }
+        }
+        if let Some(v) = console_value("AM_TUI_TOAST_POSITION") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "top-right" | "top-left" | "bottom-right" | "bottom-left"
+            ) {
+                config.tui_toast_position = lower;
+            }
+        }
+        config.tui_toast_max_visible =
+            console_usize("AM_TUI_TOAST_MAX_VISIBLE", config.tui_toast_max_visible).clamp(1, 10);
+        config.tui_toast_info_dismiss_secs = console_u64(
+            "AM_TUI_TOAST_INFO_DISMISS_SECS",
+            config.tui_toast_info_dismiss_secs,
+        )
+        .max(1);
+        config.tui_toast_warn_dismiss_secs = console_u64(
+            "AM_TUI_TOAST_WARN_DISMISS_SECS",
+            config.tui_toast_warn_dismiss_secs,
+        )
+        .max(1);
+        config.tui_toast_error_dismiss_secs = console_u64(
+            "AM_TUI_TOAST_ERROR_DISMISS_SECS",
+            config.tui_toast_error_dismiss_secs,
+        )
+        .max(1);
 
         config
     }
@@ -2225,6 +2514,58 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("TUI_ENABLED", "true")]);
         let config = Config::from_env();
         assert!(config.tui_enabled);
+    }
+
+    #[test]
+    fn tui_toast_defaults() {
+        let config = Config::default();
+        assert!(config.tui_toast_enabled);
+        assert_eq!(config.tui_toast_severity, "info");
+        assert_eq!(config.tui_toast_position, "top-right");
+        assert_eq!(config.tui_toast_max_visible, 3);
+        assert_eq!(config.tui_toast_info_dismiss_secs, 5);
+        assert_eq!(config.tui_toast_warn_dismiss_secs, 8);
+        assert_eq!(config.tui_toast_error_dismiss_secs, 15);
+    }
+
+    #[test]
+    fn tui_toast_from_env_overrides() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_TUI_TOAST_ENABLED", "false"),
+            ("AM_TUI_TOAST_SEVERITY", "error"),
+            ("AM_TUI_TOAST_POSITION", "bottom-left"),
+            ("AM_TUI_TOAST_MAX_VISIBLE", "5"),
+            ("AM_TUI_TOAST_INFO_DISMISS_SECS", "7"),
+            ("AM_TUI_TOAST_WARN_DISMISS_SECS", "11"),
+            ("AM_TUI_TOAST_ERROR_DISMISS_SECS", "19"),
+        ]);
+        let config = Config::from_env();
+        assert!(!config.tui_toast_enabled);
+        assert_eq!(config.tui_toast_severity, "error");
+        assert_eq!(config.tui_toast_position, "bottom-left");
+        assert_eq!(config.tui_toast_max_visible, 5);
+        assert_eq!(config.tui_toast_info_dismiss_secs, 7);
+        assert_eq!(config.tui_toast_warn_dismiss_secs, 11);
+        assert_eq!(config.tui_toast_error_dismiss_secs, 19);
+    }
+
+    #[test]
+    fn tui_toast_invalid_values_fall_back_or_clamp() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_TUI_TOAST_SEVERITY", "loud"),
+            ("AM_TUI_TOAST_POSITION", "center"),
+            ("AM_TUI_TOAST_MAX_VISIBLE", "0"),
+            ("AM_TUI_TOAST_INFO_DISMISS_SECS", "0"),
+            ("AM_TUI_TOAST_WARN_DISMISS_SECS", "0"),
+            ("AM_TUI_TOAST_ERROR_DISMISS_SECS", "0"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.tui_toast_severity, "info");
+        assert_eq!(config.tui_toast_position, "top-right");
+        assert_eq!(config.tui_toast_max_visible, 1);
+        assert_eq!(config.tui_toast_info_dismiss_secs, 1);
+        assert_eq!(config.tui_toast_warn_dismiss_secs, 1);
+        assert_eq!(config.tui_toast_error_dismiss_secs, 1);
     }
 
     // -----------------------------------------------------------------------

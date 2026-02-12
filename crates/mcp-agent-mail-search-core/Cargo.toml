@@ -16,6 +16,10 @@ chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
 regex.workspace = true
+tracing.workspace = true
+
+# Core types (config, models)
+mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 
 # Optional: Tantivy lexical search engine
 tantivy = { workspace = true, optional = true }

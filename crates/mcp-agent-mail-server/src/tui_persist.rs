@@ -23,6 +23,12 @@ use crate::tui_layout::{DockLayout, DockPosition};
 
 /// Minimum interval between successive envfile writes.
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+/// JSON filename for persisted command-palette usage stats.
+const PALETTE_USAGE_FILENAME: &str = "palette_usage.json";
+
+/// Persisted command-palette usage map:
+/// action_id -> (usage_count, last_used_micros)
+pub type PaletteUsageMap = HashMap<String, (u32, i64)>;
 
 // ──────────────────────────────────────────────────────────────────────
 // TuiPreferences — the saved state
@@ -61,6 +67,61 @@ pub struct TuiPreferences {
 
 fn default_preset_name() -> String {
     "default".to_string()
+}
+
+/// Compute the path used for persisted command-palette usage stats.
+#[must_use]
+pub fn palette_usage_path(envfile_path: &Path) -> PathBuf {
+    envfile_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PALETTE_USAGE_FILENAME)
+}
+
+/// Save command-palette usage stats to disk.
+///
+/// # Errors
+///
+/// Returns an error if parent directory creation, JSON serialization,
+/// or file writing fails.
+pub fn save_palette_usage(path: &Path, usage: &PaletteUsageMap) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(usage)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, json)
+}
+
+/// Load command-palette usage stats from disk.
+///
+/// # Errors
+///
+/// Returns an error if the file does not exist, cannot be read, or contains
+/// invalid JSON for the expected schema.
+pub fn load_palette_usage(path: &Path) -> Result<PaletteUsageMap, std::io::Error> {
+    let json = std::fs::read_to_string(path)?;
+    serde_json::from_str::<PaletteUsageMap>(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Load command-palette usage stats with graceful fallback.
+///
+/// Missing or malformed files return an empty map. Malformed files are logged
+/// to stderr so operators can diagnose persistence issues.
+#[must_use]
+pub fn load_palette_usage_or_default(path: &Path) -> PaletteUsageMap {
+    match load_palette_usage(path) {
+        Ok(usage) => usage,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => {
+            eprintln!(
+                "tui_persist: failed to load palette usage from {}: {e}",
+                path.display()
+            );
+            HashMap::new()
+        }
+    }
 }
 
 impl TuiPreferences {
@@ -1038,5 +1099,51 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("TUI_KEYMAP_PROFILE=minimal"));
+    }
+
+    // ── Palette usage persistence tests ──────────────────────────
+
+    #[test]
+    fn palette_usage_path_is_next_to_envfile() {
+        let env = std::path::Path::new("/tmp/mcp-agent-mail/config.env");
+        let path = palette_usage_path(env);
+        assert_eq!(
+            path,
+            std::path::Path::new("/tmp/mcp-agent-mail/palette_usage.json")
+        );
+    }
+
+    #[test]
+    fn palette_usage_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join("config.env");
+        let usage_path = palette_usage_path(&env);
+
+        let mut usage = PaletteUsageMap::new();
+        usage.insert("screen:dashboard".to_string(), (12, 1_700_000_000_000_000));
+        usage.insert("screen:messages".to_string(), (3, 1_700_000_001_000_000));
+
+        save_palette_usage(&usage_path, &usage).expect("save palette usage");
+        let loaded = load_palette_usage(&usage_path).expect("load palette usage");
+        assert_eq!(loaded, usage);
+    }
+
+    #[test]
+    fn palette_usage_missing_file_returns_empty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage_path = dir.path().join("missing_palette_usage.json");
+        let loaded = load_palette_usage_or_default(&usage_path);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn palette_usage_corrupt_file_returns_empty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join("config.env");
+        let usage_path = palette_usage_path(&env);
+        std::fs::write(&usage_path, "{ definitely-not-valid-json ]").unwrap();
+
+        let loaded = load_palette_usage_or_default(&usage_path);
+        assert!(loaded.is_empty());
     }
 }

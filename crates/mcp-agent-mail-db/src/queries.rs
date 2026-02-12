@@ -2066,6 +2066,327 @@ pub async fn search_messages_for_product(
 }
 
 // =============================================================================
+// Global (Cross-Project) Queries — br-2bbt.14.1
+// =============================================================================
+
+/// Inbox row that includes project context for global inbox view.
+#[derive(Debug, Clone)]
+pub struct GlobalInboxRow {
+    pub message: MessageRow,
+    pub kind: String,
+    pub sender_name: String,
+    pub ack_ts: Option<i64>,
+    pub project_id: i64,
+    pub project_slug: String,
+}
+
+/// Fetch inbox across ALL projects for a given agent name.
+///
+/// Unlike `fetch_inbox` which is scoped to a single project, this returns
+/// messages from all projects where the agent exists. The agent is matched
+/// by name, not ID, since agent IDs are project-specific.
+#[allow(clippy::too_many_lines)]
+pub async fn fetch_inbox_global(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_name: &str,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Outcome<Vec<GlobalInboxRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let mut sql = String::from(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+                m.importance, m.ack_required, m.created_ts, m.attachments, \
+                r.kind, s.name as sender_name, r.ack_ts, p.slug as project_slug \
+         FROM message_recipients r \
+         JOIN agents a ON a.id = r.agent_id \
+         JOIN messages m ON m.id = r.message_id \
+         JOIN agents s ON s.id = m.sender_id \
+         JOIN projects p ON p.id = m.project_id \
+         WHERE a.name = ?",
+    );
+
+    let mut params: Vec<Value> = vec![Value::Text(agent_name.to_string())];
+
+    if urgent_only {
+        sql.push_str(" AND m.importance IN ('high', 'urgent')");
+    }
+    if let Some(ts) = since_ts {
+        sql.push_str(" AND m.created_ts > ?");
+        params.push(Value::BigInt(ts));
+    }
+
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+    sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
+    params.push(Value::BigInt(limit_i64));
+
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: i64 = row.get_named("id").unwrap_or(0);
+                let project_id: i64 = row.get_named("project_id").unwrap_or(0);
+                let sender_id: i64 = row.get_named("sender_id").unwrap_or(0);
+                let thread_id: Option<String> = row.get_named("thread_id").unwrap_or(None);
+                let subject: String = row.get_named("subject").unwrap_or_default();
+                let body_md: String = row.get_named("body_md").unwrap_or_default();
+                let importance: String = row.get_named("importance").unwrap_or_default();
+                let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
+                let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+                let attachments: String = row.get_named("attachments").unwrap_or_default();
+                let kind: String = row.get_named("kind").unwrap_or_default();
+                let sender_name: String = row.get_named("sender_name").unwrap_or_default();
+                let ack_ts: Option<i64> = row.get_named("ack_ts").unwrap_or(None);
+                let project_slug: String = row.get_named("project_slug").unwrap_or_default();
+
+                out.push(GlobalInboxRow {
+                    message: MessageRow {
+                        id: Some(id),
+                        project_id,
+                        sender_id,
+                        thread_id,
+                        subject,
+                        body_md,
+                        importance,
+                        ack_required,
+                        created_ts,
+                        attachments,
+                    },
+                    kind,
+                    sender_name,
+                    ack_ts,
+                    project_id,
+                    project_slug,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Per-project unread message counts for global inbox view.
+#[derive(Debug, Clone)]
+pub struct ProjectUnreadCount {
+    pub project_id: i64,
+    pub project_slug: String,
+    pub unread_count: i64,
+}
+
+/// Count unread messages per project for a given agent name.
+///
+/// Returns a list of (project_id, project_slug, unread_count) for all projects
+/// where the agent has unread messages.
+pub async fn count_unread_global(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_name: &str,
+) -> Outcome<Vec<ProjectUnreadCount>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let sql = "SELECT p.id as project_id, p.slug as project_slug, COUNT(*) as unread_count \
+               FROM message_recipients r \
+               JOIN agents a ON a.id = r.agent_id \
+               JOIN messages m ON m.id = r.message_id \
+               JOIN projects p ON p.id = m.project_id \
+               WHERE a.name = ? AND r.read_ts IS NULL \
+               GROUP BY p.id, p.slug \
+               ORDER BY unread_count DESC";
+
+    let params = [Value::Text(agent_name.to_string())];
+
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let project_id: i64 = row.get_named("project_id").unwrap_or(0);
+                let project_slug: String = row.get_named("project_slug").unwrap_or_default();
+                let unread_count: i64 = row.get_named("unread_count").unwrap_or(0);
+                out.push(ProjectUnreadCount {
+                    project_id,
+                    project_slug,
+                    unread_count,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Search result with project context for global search.
+#[derive(Debug, Clone)]
+pub struct GlobalSearchRow {
+    pub id: i64,
+    pub subject: String,
+    pub importance: String,
+    pub ack_required: i64,
+    pub created_ts: i64,
+    pub thread_id: Option<String>,
+    pub from: String,
+    pub body_md: String,
+    pub project_id: i64,
+    pub project_slug: String,
+}
+
+/// Full-text search across ALL projects.
+///
+/// Unlike `search_messages` which is scoped to a single project, this searches
+/// across all messages in the database and includes project context in results.
+#[allow(clippy::too_many_lines)]
+pub async fn search_messages_global(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &str,
+    limit: usize,
+) -> Outcome<Vec<GlobalSearchRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+
+    let sanitized = sanitize_fts_query(query);
+    let rows_out = if let Some(ref fts_query) = sanitized {
+        // FTS5-backed search across all projects.
+        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
+                          m.thread_id, a.name as from_name, m.body_md, \
+                          m.project_id, p.slug as project_slug \
+                   FROM fts_messages \
+                   JOIN messages m ON m.id = fts_messages.message_id \
+                   JOIN agents a ON a.id = m.sender_id \
+                   JOIN projects p ON p.id = m.project_id \
+                   WHERE fts_messages MATCH ? \
+                   ORDER BY bm25(fts_messages, 10.0, 1.0) ASC, m.id ASC \
+                   LIMIT ?";
+        let params = [Value::Text(fts_query.clone()), Value::BigInt(limit_i64)];
+        let fts_result = traw_query(cx, &tracked, sql, &params).await;
+
+        match &fts_result {
+            Outcome::Err(_) => {
+                tracing::warn!(
+                    "Global FTS query failed for '{}', attempting LIKE fallback",
+                    query
+                );
+                let terms = extract_like_terms(query, 5);
+                if terms.is_empty() {
+                    Outcome::Ok(Vec::new())
+                } else {
+                    run_like_fallback_global(cx, &tracked, &terms, limit_i64).await
+                }
+            }
+            _ => map_sql_outcome(fts_result),
+        }
+    } else {
+        Outcome::Ok(Vec::new())
+    };
+
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: i64 = row.get_named("id").unwrap_or(0);
+                let subject: String = row.get_named("subject").unwrap_or_default();
+                let importance: String = row.get_named("importance").unwrap_or_default();
+                let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
+                let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+                let thread_id: Option<String> = row.get_named("thread_id").unwrap_or(None);
+                let from: String = row.get_named("from_name").unwrap_or_default();
+                let body_md: String = row.get_named("body_md").unwrap_or_default();
+                let project_id: i64 = row.get_named("project_id").unwrap_or(0);
+                let project_slug: String = row.get_named("project_slug").unwrap_or_default();
+
+                out.push(GlobalSearchRow {
+                    id,
+                    subject,
+                    importance,
+                    ack_required,
+                    created_ts,
+                    thread_id,
+                    from,
+                    body_md,
+                    project_id,
+                    project_slug,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// LIKE fallback for global search when FTS5 fails.
+async fn run_like_fallback_global(
+    cx: &Cx,
+    conn: &TrackedConnection<'_>,
+    terms: &[String],
+    limit: i64,
+) -> Outcome<Vec<sqlmodel_core::Row>, DbError> {
+    if terms.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+
+    let mut conditions = Vec::with_capacity(terms.len());
+    let mut params: Vec<Value> = Vec::with_capacity(terms.len() + 1);
+
+    for term in terms {
+        conditions.push("(m.subject LIKE ? OR m.body_md LIKE ?)");
+        let pattern = format!("%{term}%");
+        params.push(Value::Text(pattern.clone()));
+        params.push(Value::Text(pattern));
+    }
+
+    let sql = format!(
+        "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
+                m.thread_id, a.name as from_name, m.body_md, \
+                m.project_id, p.slug as project_slug \
+         FROM messages m \
+         JOIN agents a ON a.id = m.sender_id \
+         JOIN projects p ON p.id = m.project_id \
+         WHERE {} \
+         ORDER BY m.created_ts DESC \
+         LIMIT ?",
+        conditions.join(" AND ")
+    );
+    params.push(Value::BigInt(limit));
+
+    map_sql_outcome(traw_query(cx, conn, &sql, &params).await)
+}
+
+// =============================================================================
 // MessageRecipient Queries
 // =============================================================================
 
@@ -2721,8 +3042,7 @@ pub async fn list_unreleased_file_reservations(
 
     let tracked = tracked(&*conn);
 
-    let sql =
-        "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND released_ts IS NULL ORDER BY id";
+    let sql = "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND released_ts IS NULL ORDER BY id";
     let params = vec![Value::BigInt(project_id)];
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
@@ -4142,10 +4462,117 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flaky under active local fsqlite/sqlmodel join-path churn"]
     #[allow(clippy::too_many_lines)]
     fn run_like_fallback_handles_over_100_terms() {
-        // Re-enable this integration-style test after fsqlite/sqlmodel join-path churn settles.
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("like_fallback_100_terms.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire conn");
+            let setup_tracked = tracked(&*conn);
+
+            let project_row = crate::models::ProjectRow {
+                id: None,
+                slug: format!("like-fallback-{base}"),
+                human_key: format!("/tmp/am-like-fallback-{base}"),
+                created_at: now_micros(),
+            };
+            let project_id =
+                map_sql_outcome(insert!(&project_row).execute(&cx, &setup_tracked).await)
+                    .into_result()
+                    .expect("insert project");
+
+            let sender_row = crate::models::AgentRow {
+                id: None,
+                project_id,
+                name: "BlueLake".to_string(),
+                program: "e2e-test".to_string(),
+                model: "test-model".to_string(),
+                task_description: "like fallback test".to_string(),
+                inception_ts: now_micros(),
+                last_active_ts: now_micros(),
+                attachments_policy: "auto".to_string(),
+                contact_policy: "auto".to_string(),
+            };
+            let sender_id =
+                map_sql_outcome(insert!(&sender_row).execute(&cx, &setup_tracked).await)
+                    .into_result()
+                    .expect("insert sender");
+
+            drop(conn);
+
+            create_message(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "term01 term02 term03 term04 term05",
+                "needle payload for like fallback",
+                Some("THREAD-LIKE"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire conn");
+            let search_tracked = tracked(&*conn);
+
+            let mut terms = Vec::new();
+            for _ in 0..120 {
+                terms.push("needle".to_string());
+            }
+            assert!(terms.len() > 100, "test must use >100 terms");
+
+            let rows = run_like_fallback(&cx, &search_tracked, project_id, &terms, 25)
+                .await
+                .into_result()
+                .expect("run like fallback");
+            assert_eq!(rows.len(), 1, "fallback should match the seeded message");
+
+            let subject: String = rows[0].get_named("subject").expect("subject");
+            assert!(
+                subject.contains("term01"),
+                "returned message should contain seeded subject terms"
+            );
+        });
     }
 
     #[test]
@@ -4259,16 +4686,465 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flaky under active local fsqlite/sqlmodel join-path churn"]
     #[allow(clippy::similar_names)]
     #[allow(clippy::too_many_lines)]
     fn search_messages_for_product_ranks_across_projects() {
-        // Re-enable this integration-style test after fsqlite/sqlmodel join-path churn settles.
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("product_search_across_projects.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire conn");
+            let tracked = tracked(&*conn);
+
+            let project_a_id = map_sql_outcome(
+                insert!(&crate::models::ProjectRow {
+                    id: None,
+                    slug: format!("prod-search-a-{base}"),
+                    human_key: format!("/tmp/am-prod-search-a-{base}"),
+                    created_at: now_micros(),
+                })
+                .execute(&cx, &tracked)
+                .await,
+            )
+            .into_result()
+            .expect("insert project A");
+
+            let project_b_id = map_sql_outcome(
+                insert!(&crate::models::ProjectRow {
+                    id: None,
+                    slug: format!("prod-search-b-{base}"),
+                    human_key: format!("/tmp/am-prod-search-b-{base}"),
+                    created_at: now_micros(),
+                })
+                .execute(&cx, &tracked)
+                .await,
+            )
+            .into_result()
+            .expect("insert project B");
+
+            let product_uid = format!("prod_search_rank_{base}");
+            let product_id = map_sql_outcome(
+                insert!(&crate::models::ProductRow {
+                    id: None,
+                    product_uid: product_uid.clone(),
+                    name: product_uid,
+                    created_at: now_micros(),
+                })
+                .execute(&cx, &tracked)
+                .await,
+            )
+            .into_result()
+            .expect("insert product");
+
+            let _ = map_sql_outcome(
+                insert!(&crate::models::ProductProjectLinkRow {
+                    id: None,
+                    product_id,
+                    project_id: project_a_id,
+                    created_at: now_micros(),
+                })
+                .execute(&cx, &tracked)
+                .await,
+            )
+            .into_result()
+            .expect("link product to project A");
+
+            let _ = map_sql_outcome(
+                insert!(&crate::models::ProductProjectLinkRow {
+                    id: None,
+                    product_id,
+                    project_id: project_b_id,
+                    created_at: now_micros(),
+                })
+                .execute(&cx, &tracked)
+                .await,
+            )
+            .into_result()
+            .expect("link product to project B");
+
+            let sender_a_id = map_sql_outcome(
+                insert!(&crate::models::AgentRow {
+                    id: None,
+                    project_id: project_a_id,
+                    name: "BlueLake".to_string(),
+                    program: "e2e-test".to_string(),
+                    model: "test-model".to_string(),
+                    task_description: "product search project A".to_string(),
+                    inception_ts: now_micros(),
+                    last_active_ts: now_micros(),
+                    attachments_policy: "auto".to_string(),
+                    contact_policy: "auto".to_string(),
+                })
+                .execute(&cx, &tracked)
+                .await,
+            )
+            .into_result()
+            .expect("insert sender A");
+
+            let sender_b_id = map_sql_outcome(
+                insert!(&crate::models::AgentRow {
+                    id: None,
+                    project_id: project_b_id,
+                    name: "BlueLake".to_string(),
+                    program: "e2e-test".to_string(),
+                    model: "test-model".to_string(),
+                    task_description: "product search project B".to_string(),
+                    inception_ts: now_micros(),
+                    last_active_ts: now_micros(),
+                    attachments_policy: "auto".to_string(),
+                    contact_policy: "auto".to_string(),
+                })
+                .execute(&cx, &tracked)
+                .await,
+            )
+            .into_result()
+            .expect("insert sender B");
+
+            drop(conn);
+
+            create_message(
+                &cx,
+                &pool,
+                project_a_id,
+                sender_a_id,
+                "alpha project-a signal",
+                "body A",
+                Some("THREAD-A"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create project A message");
+
+            create_message(
+                &cx,
+                &pool,
+                project_b_id,
+                sender_b_id,
+                "alpha project-b signal",
+                "body B",
+                Some("THREAD-B"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create project B message");
+
+            // Base schema intentionally omits FTS virtual tables, so this query
+            // deterministically exercises LIKE fallback across linked projects.
+            let rows = search_messages_for_product(&cx, &pool, product_id, "alpha", 25)
+                .await
+                .into_result()
+                .expect("search messages for product");
+
+            assert_eq!(rows.len(), 2, "must return hits from both linked projects");
+            assert_eq!(
+                rows[0].project_id, project_a_id,
+                "project A should rank first"
+            );
+            assert_eq!(
+                rows[1].project_id, project_b_id,
+                "project B should rank second"
+            );
+            assert_eq!(rows[0].subject, "alpha project-a signal");
+            assert_eq!(rows[1].subject, "alpha project-b signal");
+        });
     }
 
     #[test]
     fn expired_reservations_where_clause_is_inclusive() {
         assert!(EXPIRED_RESERVATIONS_WHERE_SQL.contains("expires_ts <= ?"));
         assert!(!EXPIRED_RESERVATIONS_WHERE_SQL.contains("expires_ts < ?"));
+    }
+
+    // ─── Global query tests (br-2bbt.14.1) ───────────────────────────────────
+
+    #[test]
+    fn global_inbox_row_struct_has_project_context() {
+        // Verify GlobalInboxRow struct has all required fields
+        let row = GlobalInboxRow {
+            message: MessageRow {
+                id: Some(1),
+                project_id: 10,
+                sender_id: 100,
+                thread_id: Some("t1".to_string()),
+                subject: "Test".to_string(),
+                body_md: "Body".to_string(),
+                importance: "normal".to_string(),
+                ack_required: 0,
+                created_ts: 1000,
+                attachments: "[]".to_string(),
+            },
+            kind: "to".to_string(),
+            sender_name: "Alice".to_string(),
+            ack_ts: None,
+            project_id: 10,
+            project_slug: "my-project".to_string(),
+        };
+
+        assert_eq!(row.project_id, 10);
+        assert_eq!(row.project_slug, "my-project");
+        assert_eq!(row.message.subject, "Test");
+    }
+
+    #[test]
+    fn project_unread_count_struct_has_required_fields() {
+        let count = ProjectUnreadCount {
+            project_id: 1,
+            project_slug: "backend".to_string(),
+            unread_count: 42,
+        };
+
+        assert_eq!(count.project_id, 1);
+        assert_eq!(count.project_slug, "backend");
+        assert_eq!(count.unread_count, 42);
+    }
+
+    #[test]
+    fn global_search_row_struct_has_project_context() {
+        let row = GlobalSearchRow {
+            id: 1,
+            subject: "Hello".to_string(),
+            importance: "high".to_string(),
+            ack_required: 1,
+            created_ts: 2000,
+            thread_id: Some("thread-1".to_string()),
+            from: "Bob".to_string(),
+            body_md: "Content here".to_string(),
+            project_id: 5,
+            project_slug: "frontend".to_string(),
+        };
+
+        assert_eq!(row.id, 1);
+        assert_eq!(row.project_id, 5);
+        assert_eq!(row.project_slug, "frontend");
+        assert_eq!(row.from, "Bob");
+    }
+
+    #[test]
+    fn fetch_inbox_global_empty_database_returns_empty() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("global_inbox_empty.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let _ = ensure_project(&cx, &pool, &format!("/tmp/am-global-empty-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+
+            // Query for non-existent agent
+            let rows = fetch_inbox_global(&cx, &pool, "NonExistentAgent", false, None, 25)
+                .await
+                .into_result()
+                .expect("fetch inbox global on empty");
+
+            assert!(rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn count_unread_global_empty_returns_empty() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("global_unread_empty.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let _ = ensure_project(&cx, &pool, &format!("/tmp/am-unread-empty-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+
+            let counts = count_unread_global(&cx, &pool, "NonExistentAgent")
+                .await
+                .into_result()
+                .expect("count unread global on empty");
+
+            assert!(counts.is_empty());
+        });
+    }
+
+    #[test]
+    fn search_messages_global_empty_corpus_returns_empty() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("global_search_empty.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let _ = ensure_project(&cx, &pool, &format!("/tmp/am-search-empty-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+
+            let rows = search_messages_global(&cx, &pool, "needle", 25)
+                .await
+                .into_result()
+                .expect("search global on empty corpus");
+
+            assert!(rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn search_messages_global_empty_query_returns_empty() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("global_search_empty_q.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let rows = search_messages_global(&cx, &pool, "", 25)
+                .await
+                .into_result()
+                .expect("search global with empty query");
+
+            assert!(rows.is_empty());
+        });
     }
 }

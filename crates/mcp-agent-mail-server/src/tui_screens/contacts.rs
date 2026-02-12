@@ -12,7 +12,7 @@ use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_runtime::program::Cmd;
 
-use crate::tui_action_menu::{contacts_actions, ActionEntry};
+use crate::tui_action_menu::{ActionEntry, contacts_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::ContactSummary;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -373,11 +373,7 @@ impl MailScreen for ContactsScreen {
         let selected_idx = self.table_state.selected?;
         let contact = self.contacts.get(selected_idx)?;
 
-        let actions = contacts_actions(
-            &contact.from_agent,
-            &contact.to_agent,
-            &contact.status,
-        );
+        let actions = contacts_actions(&contact.from_agent, &contact.to_agent, &contact.status);
 
         // Anchor row is the selected row + header offset
         let anchor_row = (selected_idx as u16).saturating_add(2);

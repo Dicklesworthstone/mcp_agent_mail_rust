@@ -6,7 +6,7 @@
 //! and exposes cursor position so a parent screen can render an
 //! inspector detail panel alongside.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 use ftui::layout::Rect;
@@ -17,6 +17,8 @@ use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, MouseButton, MouseEventKind, Style};
 use ftui_runtime::program::Cmd;
+use ftui_widgets::StatefulWidget;
+use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
@@ -81,6 +83,42 @@ pub(crate) struct TimelineEntry {
     pub severity: EventSeverity,
     /// Raw event for the inspector detail panel (br-10wc.7.2).
     pub raw: MailEvent,
+}
+
+impl RenderItem for TimelineEntry {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::widgets::Widget;
+
+        if area.height == 0 || area.width < 10 {
+            return;
+        }
+
+        let sev = self.severity;
+        let src_badge = source_badge(self.source);
+        let marker = if selected { '>' } else { ' ' };
+        let cursor_style = Style::default().bold().reverse();
+
+        let mut line = Line::from_spans([
+            Span::raw(format!(
+                "{marker} {:>6} {} ",
+                self.seq, self.display.timestamp
+            )),
+            sev.styled_badge(),
+            Span::raw(format!(" [{src_badge}] ")),
+            Span::styled(format!("{}", self.display.icon), sev.style()),
+            Span::raw(format!(" {}", self.display.summary)),
+        ]);
+        if selected {
+            line.apply_base_style(cursor_style);
+        }
+
+        let paragraph = Paragraph::new(Text::from_line(line));
+        paragraph.render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
 }
 
 impl TimelinePane {
@@ -288,6 +326,8 @@ enum DockDragState {
 /// timeline with cursor-based selection and an inspector detail pane.
 pub struct TimelineScreen {
     pane: TimelinePane,
+    /// State for virtualized list rendering (RefCell for interior mutability in view()).
+    list_state: RefCell<VirtualizedListState>,
     /// Dock layout controlling inspector panel position and size.
     dock: DockLayout,
     /// Current mouse drag state for dock resizing.
@@ -305,6 +345,7 @@ impl TimelineScreen {
     pub fn new() -> Self {
         Self {
             pane: TimelinePane::new(),
+            list_state: RefCell::new(VirtualizedListState::new().with_persistence_id("timeline")),
             dock: DockLayout::right_40(),
             dock_drag: DockDragState::Idle,
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
@@ -318,11 +359,20 @@ impl TimelineScreen {
         let prefs = TuiPreferences::from_config(config);
         Self {
             pane: TimelinePane::new(),
+            list_state: RefCell::new(VirtualizedListState::new().with_persistence_id("timeline")),
             dock: prefs.dock,
             dock_drag: DockDragState::Idle,
             last_area: Cell::new(Rect::new(0, 0, 0, 0)),
             persister: Some(PreferencePersister::new(config)),
         }
+    }
+
+    /// Sync VirtualizedListState with TimelinePane cursor.
+    fn sync_list_state(&self) {
+        let total = self.pane.filtered_len();
+        let cursor = self.pane.cursor().min(total.saturating_sub(1));
+        let mut state = self.list_state.borrow_mut();
+        state.select(if total > 0 { Some(cursor) } else { None });
     }
 
     /// Mark dock layout as changed (triggers debounced auto-save).
@@ -444,11 +494,15 @@ impl MailScreen for TimelineScreen {
         if self.dock != dock_before {
             self.dock_changed();
         }
+        // Sync list state with pane cursor after any changes.
+        self.sync_list_state();
         Cmd::None
     }
 
     fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
         self.pane.ingest(state);
+        // Sync list state after ingesting new events.
+        self.sync_list_state();
         // Flush debounced preference save.
         if let Some(ref mut p) = self.persister {
             let prefs = TuiPreferences {
@@ -473,7 +527,8 @@ impl MailScreen for TimelineScreen {
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         self.last_area.set(area);
         let split = self.dock.split(area);
-        render_timeline(frame, split.primary, &self.pane, self.dock);
+        let mut list_state = self.list_state.borrow_mut();
+        render_timeline(frame, split.primary, &self.pane, self.dock, &mut list_state);
         if let Some(dock_area) = split.dock {
             super::inspector::render_inspector(frame, dock_area, self.pane.selected_event());
         }
@@ -677,47 +732,23 @@ const fn source_badge(src: EventSource) -> &'static str {
     }
 }
 
-/// Render the timeline pane into the given area.
-fn render_timeline(frame: &mut Frame<'_>, area: Rect, pane: &TimelinePane, dock: DockLayout) {
+/// Render the timeline pane into the given area using VirtualizedList.
+fn render_timeline(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pane: &TimelinePane,
+    dock: DockLayout,
+    list_state: &mut VirtualizedListState,
+) {
     let inner_height = area.height.saturating_sub(2) as usize; // borders
     if inner_height == 0 {
         return;
     }
 
-    let filtered = pane.filtered_entries();
+    // Collect filtered entries (clones for VirtualizedList).
+    let filtered: Vec<TimelineEntry> = pane.filtered_entries().into_iter().cloned().collect();
     let total = filtered.len();
     let cursor = pane.cursor.min(total.saturating_sub(1));
-
-    // Compute viewport so cursor is always visible.
-    let (start, end) = viewport_range(total, inner_height, cursor);
-    let viewport = &filtered[start..end];
-
-    // Build styled text lines with colored severity badges.
-    let cursor_style = Style::default().bold().reverse();
-    let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len());
-    for (view_idx, entry) in viewport.iter().enumerate() {
-        let abs_idx = start + view_idx;
-        let is_cursor = abs_idx == cursor;
-        let marker = if is_cursor { '>' } else { ' ' };
-        let src_badge = source_badge(entry.source);
-        let sev = entry.severity;
-
-        let mut line = Line::from_spans([
-            Span::raw(format!(
-                "{marker} {:>6} {} ",
-                entry.seq, entry.display.timestamp
-            )),
-            sev.styled_badge(),
-            Span::raw(format!(" [{src_badge}] ")),
-            Span::styled(format!("{}", entry.display.icon), sev.style()),
-            Span::raw(format!(" {}", entry.display.summary)),
-        ]);
-        if is_cursor {
-            line.apply_base_style(cursor_style);
-        }
-        text_lines.push(line);
-    }
-    let text = Text::from_lines(text_lines);
 
     // Title with position info.
     let pos = if total == 0 {
@@ -735,14 +766,27 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, pane: &TimelinePane, dock:
     };
     let title = format!("Timeline ({pos}){follow_tag}{verbosity_tag}{filter_tag}{dock_tag}");
 
+    // Render block/border first.
     let block = Block::default()
         .title(&title)
         .border_type(BorderType::Rounded);
-    let p = Paragraph::new(text).block(block);
-    p.render(area, frame);
+    let inner_area = block.inner(area);
+    block.render(area, frame);
+
+    // Update list state selection to match pane cursor.
+    list_state.select(if total > 0 { Some(cursor) } else { None });
+
+    // Render VirtualizedList into inner area.
+    let list = VirtualizedList::new(&filtered)
+        .style(Style::default())
+        .highlight_style(Style::default().bold().reverse())
+        .show_scrollbar(true);
+    StatefulWidget::render(&list, inner_area, frame, list_state);
 }
 
 /// Compute the viewport [start, end) to keep cursor visible.
+/// Note: VirtualizedList now handles this internally, but kept for tests.
+#[allow(dead_code)]
 fn viewport_range(total: usize, height: usize, cursor: usize) -> (usize, usize) {
     if total <= height {
         return (0, total);
@@ -1096,7 +1140,14 @@ mod tests {
         let dock = DockLayout::right_40();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_timeline(&mut frame, Rect::new(0, 0, 80, 24), &pane, dock);
+        let mut list_state = VirtualizedListState::new();
+        render_timeline(
+            &mut frame,
+            Rect::new(0, 0, 80, 24),
+            &pane,
+            dock,
+            &mut list_state,
+        );
     }
 
     #[test]
@@ -1119,7 +1170,14 @@ mod tests {
         let dock = DockLayout::right_40();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(120, 30, &mut pool);
-        render_timeline(&mut frame, Rect::new(0, 0, 120, 30), &pane, dock);
+        let mut list_state = VirtualizedListState::new();
+        render_timeline(
+            &mut frame,
+            Rect::new(0, 0, 120, 30),
+            &pane,
+            dock,
+            &mut list_state,
+        );
     }
 
     #[test]
@@ -1128,7 +1186,14 @@ mod tests {
         let dock = DockLayout::right_40();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(40, 5, &mut pool);
-        render_timeline(&mut frame, Rect::new(0, 0, 40, 5), &pane, dock);
+        let mut list_state = VirtualizedListState::new();
+        render_timeline(
+            &mut frame,
+            Rect::new(0, 0, 40, 5),
+            &pane,
+            dock,
+            &mut list_state,
+        );
     }
 
     #[test]
@@ -1890,8 +1955,15 @@ mod tests {
         let dock = DockLayout::right_40();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(10, 5, &mut pool);
+        let mut list_state = VirtualizedListState::new();
         // Should not panic at very narrow width
-        render_timeline(&mut frame, Rect::new(0, 0, 10, 5), &pane, dock);
+        render_timeline(
+            &mut frame,
+            Rect::new(0, 0, 10, 5),
+            &pane,
+            dock,
+            &mut list_state,
+        );
     }
 
     #[test]
@@ -1900,8 +1972,15 @@ mod tests {
         let dock = DockLayout::right_40();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 1, &mut pool);
+        let mut list_state = VirtualizedListState::new();
         // Should not panic at minimum height
-        render_timeline(&mut frame, Rect::new(0, 0, 80, 1), &pane, dock);
+        render_timeline(
+            &mut frame,
+            Rect::new(0, 0, 80, 1),
+            &pane,
+            dock,
+            &mut list_state,
+        );
     }
 
     #[test]

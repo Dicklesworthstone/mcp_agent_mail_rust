@@ -675,4 +675,297 @@ mod tests {
             }
         }
     }
+
+    // ── br-3h13.6.4: Additional output formatting tests ────────────────────
+
+    #[test]
+    fn pipe_mode_no_ansi_codes_in_table() {
+        let mut table = CliTable::new(vec!["ID", "STATUS", "MESSAGE"]);
+        table.add_row(vec![
+            "1".into(),
+            "success".into(),
+            "Operation completed".into(),
+        ]);
+        table.add_row(vec!["2".into(), "error".into(), "Failed to connect".into()]);
+        let output = table.render_to_string(false);
+
+        // Verify absolutely no ANSI escape sequences
+        assert!(
+            !output.contains("\x1b["),
+            "pipe mode must not contain any ANSI escape sequences"
+        );
+        assert!(
+            !output.contains("\x1b]"),
+            "pipe mode must not contain OSC sequences"
+        );
+        // Verify no box-drawing characters (except in actual data)
+        let non_data_chars: Vec<char> = output
+            .chars()
+            .filter(|c| {
+                matches!(
+                    *c,
+                    '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼'
+                )
+            })
+            .collect();
+        assert!(
+            non_data_chars.is_empty(),
+            "pipe mode should not have box-drawing borders"
+        );
+    }
+
+    #[test]
+    fn json_mode_valid_json_structure() {
+        #[derive(serde::Serialize)]
+        struct TestData {
+            id: i64,
+            name: String,
+            active: bool,
+            tags: Vec<String>,
+        }
+
+        let data = TestData {
+            id: 42,
+            name: "test-agent".to_string(),
+            active: true,
+            tags: vec!["fast".to_string(), "reliable".to_string()],
+        };
+
+        let output = with_capture(|| {
+            json_or_table(true, &data, || {});
+        });
+
+        // Parse and validate structure
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("JSON output must be valid JSON");
+
+        // Verify field names match struct fields
+        assert!(parsed.get("id").is_some(), "must have 'id' field");
+        assert!(parsed.get("name").is_some(), "must have 'name' field");
+        assert!(parsed.get("active").is_some(), "must have 'active' field");
+        assert!(parsed.get("tags").is_some(), "must have 'tags' field");
+
+        // Verify field types
+        assert!(parsed["id"].is_i64(), "id must be integer");
+        assert!(parsed["name"].is_string(), "name must be string");
+        assert!(parsed["active"].is_boolean(), "active must be boolean");
+        assert!(parsed["tags"].is_array(), "tags must be array");
+    }
+
+    #[test]
+    fn unicode_columns_alignment_preserved() {
+        let mut table = CliTable::new(vec!["名前", "状態", "説明"]);
+        table.add_row(vec![
+            "田中太郎".into(),
+            "✓ 完了".into(),
+            "テスト完了しました".into(),
+        ]);
+        table.add_row(vec![
+            "山田花子".into(),
+            "⏳ 進行中".into(),
+            "作業中です".into(),
+        ]);
+
+        let output = table.render_to_string(false);
+        let lines: Vec<&str> = output.lines().collect();
+
+        assert_eq!(lines.len(), 3, "header + 2 data rows");
+
+        // All lines should have reasonable length (no extreme differences)
+        let lengths: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+        let max_len = *lengths.iter().max().unwrap();
+        let min_len = *lengths.iter().min().unwrap();
+
+        // Allow some variance due to Unicode width differences, but not extreme
+        assert!(
+            max_len - min_len < 20,
+            "line lengths should be reasonably aligned: {:?}",
+            lengths
+        );
+    }
+
+    #[test]
+    fn very_long_values_handled() {
+        let long_value = "x".repeat(500);
+        let mut table = CliTable::new(vec!["ID", "CONTENT"]);
+        table.add_row(vec!["1".into(), long_value.clone()]);
+        table.add_row(vec!["2".into(), "short".into()]);
+
+        let output = table.render_to_string(false);
+
+        // Table should still render without panic
+        assert!(!output.is_empty());
+
+        // The long value should be present (not truncated by CliTable itself)
+        assert!(
+            output.contains(&long_value),
+            "long value should be present in output"
+        );
+
+        // Verify structure is maintained
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 3, "should have header + 2 rows");
+    }
+
+    #[test]
+    fn json_mode_array_output_valid() {
+        let items = vec![
+            serde_json::json!({"id": 1, "name": "Alice"}),
+            serde_json::json!({"id": 2, "name": "Bob"}),
+            serde_json::json!({"id": 3, "name": "Charlie"}),
+        ];
+
+        let output = with_capture(|| {
+            json_or_table(true, &items, || {});
+        });
+
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(output.trim()).expect("must be valid JSON array");
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["name"], "Alice");
+        assert_eq!(parsed[1]["name"], "Bob");
+        assert_eq!(parsed[2]["name"], "Charlie");
+    }
+
+    #[test]
+    fn error_output_format_non_tty() {
+        let output = with_capture(|| {
+            error("connection refused: host unreachable");
+        });
+
+        // Must have error: prefix
+        assert!(output.contains("error:"), "must have error: prefix");
+        // Must have the message
+        assert!(
+            output.contains("connection refused"),
+            "must contain error message"
+        );
+        // Must not have ANSI
+        assert!(
+            !output.contains("\x1b["),
+            "non-TTY error must not have ANSI"
+        );
+    }
+
+    #[test]
+    fn single_row_result_rendering() {
+        let mut table = CliTable::new(vec!["ID", "NAME", "STATUS"]);
+        table.add_row(vec!["42".into(), "single-agent".into(), "active".into()]);
+
+        let output = table.render_to_string(false);
+        let lines: Vec<&str> = output.lines().collect();
+
+        assert_eq!(lines.len(), 2, "header + 1 data row");
+        assert!(lines[0].contains("ID"));
+        assert!(lines[1].contains("42"));
+        assert!(lines[1].contains("single-agent"));
+    }
+
+    #[test]
+    fn many_rows_performance() {
+        // Test that rendering 1000 rows doesn't take too long
+        let mut table = CliTable::new(vec!["ID", "NAME", "STATUS", "TIMESTAMP"]);
+
+        for i in 0..1000 {
+            table.add_row(vec![
+                format!("{i}"),
+                format!("agent-{i}"),
+                if i % 2 == 0 {
+                    "active".to_string()
+                } else {
+                    "inactive".to_string()
+                },
+                format!("2026-02-12T{:02}:{:02}:00", i / 60 % 24, i % 60),
+            ]);
+        }
+
+        let start = std::time::Instant::now();
+        let output = table.render_to_string(false);
+        let elapsed = start.elapsed();
+
+        // Should complete in under 100ms
+        assert!(
+            elapsed.as_millis() < 100,
+            "1000 rows should render in <100ms, took {:?}",
+            elapsed
+        );
+
+        // Verify data integrity
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 1001, "header + 1000 data rows");
+
+        // Verify first and last rows
+        assert!(lines[1].contains("agent-0"));
+        assert!(lines[1000].contains("agent-999"));
+    }
+
+    #[test]
+    fn mixed_empty_and_filled_cells() {
+        let mut table = CliTable::new(vec!["A", "B", "C"]);
+        table.add_row(vec!["1".into(), "".into(), "3".into()]);
+        table.add_row(vec!["".into(), "2".into(), "".into()]);
+        table.add_row(vec!["x".into(), "y".into(), "z".into()]);
+
+        let output = table.render_to_string(false);
+        let lines: Vec<&str> = output.lines().collect();
+
+        assert_eq!(lines.len(), 4);
+        // Empty cells should still maintain column alignment
+        assert!(lines[1].contains("1"));
+        assert!(lines[1].contains("3"));
+        assert!(lines[2].contains("2"));
+    }
+
+    #[test]
+    fn special_characters_in_data() {
+        let mut table = CliTable::new(vec!["PATH", "STATUS"]);
+        table.add_row(vec!["/path/with spaces/file.txt".into(), "ok".into()]);
+        table.add_row(vec!["file\"with'quotes".into(), "ok".into()]);
+        table.add_row(vec!["path\\with\\backslashes".into(), "ok".into()]);
+        table.add_row(vec!["tab\there".into(), "ok".into()]);
+
+        let output = table.render_to_string(false);
+
+        // All special characters should be preserved
+        assert!(output.contains("/path/with spaces/file.txt"));
+        assert!(output.contains("file\"with'quotes"));
+        assert!(output.contains("path\\with\\backslashes"));
+        // Tab might be rendered as spaces, but data should be there
+        assert!(output.contains("here"));
+    }
+
+    #[test]
+    fn json_nested_objects() {
+        #[derive(serde::Serialize)]
+        struct Nested {
+            outer: String,
+            inner: Inner,
+        }
+
+        #[derive(serde::Serialize)]
+        struct Inner {
+            value: i32,
+            list: Vec<String>,
+        }
+
+        let data = Nested {
+            outer: "test".to_string(),
+            inner: Inner {
+                value: 42,
+                list: vec!["a".to_string(), "b".to_string()],
+            },
+        };
+
+        let output = with_capture(|| {
+            json_or_table(true, &data, || {});
+        });
+
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+
+        assert_eq!(parsed["outer"], "test");
+        assert_eq!(parsed["inner"]["value"], 42);
+        assert_eq!(parsed["inner"]["list"][0], "a");
+        assert_eq!(parsed["inner"]["list"][1], "b");
+    }
 }

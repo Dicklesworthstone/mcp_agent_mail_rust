@@ -4585,6 +4585,7 @@ dependencies = [
  "mcp-agent-mail-share",
  "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
@@ -4594,6 +4595,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toon 0.1.3",
+ "walkdir",
  "zip",
 ]
 
@@ -4648,6 +4650,7 @@ dependencies = [
  "indexmap",
  "loom",
  "mcp-agent-mail-core",
+ "mcp-agent-mail-search-core",
  "regex",
  "serde",
  "serde_json",
@@ -4659,6 +4662,7 @@ dependencies = [
  "sqlmodel-schema",
  "sqlmodel-session",
  "sqlmodel-sqlite",
+ "tantivy",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -4685,6 +4689,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "hex",
+ "mcp-agent-mail-core",
  "regex",
  "serde",
  "serde_json",
@@ -4692,6 +4697,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

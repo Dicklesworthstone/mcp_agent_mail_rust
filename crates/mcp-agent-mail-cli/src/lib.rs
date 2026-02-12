@@ -15,6 +15,7 @@
 pub mod bench;
 pub mod ci;
 pub mod context;
+pub mod e2e_artifacts;
 pub mod output;
 pub mod robot;
 
@@ -71,9 +72,37 @@ pub enum Commands {
         port: Option<u16>,
         #[arg(long)]
         path: Option<String>,
+        /// Disable bearer token authentication for this run (for local development).
+        #[arg(long)]
+        no_auth: bool,
     },
     #[command(name = "serve-stdio")]
     ServeStdio,
+    /// Check agent inbox for unread messages (for git hooks and editor integrations).
+    #[command(name = "check-inbox")]
+    CheckInbox {
+        /// Agent name to check inbox for (default: AGENT_NAME or AGENT_MAIL_AGENT env var).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Minimum interval between checks in seconds (default: 120, 0 to disable).
+        #[arg(long, default_value_t = 120)]
+        rate_limit: u64,
+        /// Query DB directly instead of HTTP (faster for co-located setups).
+        #[arg(long)]
+        direct: bool,
+        /// Output JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+        /// Server host for HTTP mode (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Server port for HTTP mode (default: 8765).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// Project key to check (default: AGENT_MAIL_PROJECT env var or current directory).
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Run CI quality gates (format, lint, build, test).
     #[command(name = "ci")]
     Ci {
@@ -1484,9 +1513,28 @@ fn execute(cli: Cli) -> CliResult<()> {
             limit,
         } => handle_list_acks(&project_key, &agent_name, limit),
         Commands::Archive { action } => handle_archive(action),
-        Commands::ServeHttp { host, port, path } => handle_serve_http(host, port, path),
+        Commands::ServeHttp {
+            host,
+            port,
+            path,
+            no_auth,
+        } => handle_serve_http(host, port, path, no_auth),
         Commands::ServeStdio => handle_serve_stdio(),
-        Commands::Ci { quick, report, json, parallel } => handle_ci(quick, report, json, parallel),
+        Commands::CheckInbox {
+            agent,
+            rate_limit,
+            direct,
+            json,
+            host,
+            port,
+            project,
+        } => handle_check_inbox(agent, rate_limit, direct, json, host, port, project),
+        Commands::Ci {
+            quick,
+            report,
+            json,
+            parallel,
+        } => handle_ci(quick, report, json, parallel),
         Commands::Lint => handle_lint(),
         Commands::Typecheck => handle_typecheck(),
         Commands::Migrate => handle_migrate(),
@@ -1958,8 +2006,9 @@ fn handle_serve_http(
     host: Option<String>,
     port: Option<u16>,
     path: Option<String>,
+    no_auth: bool,
 ) -> CliResult<()> {
-    let config = build_http_config(host, port, path);
+    let config = build_http_config(host, port, path, no_auth);
     mcp_agent_mail_server::run_http(&config)?;
     Ok(())
 }
@@ -1970,7 +2019,155 @@ fn handle_serve_stdio() -> CliResult<()> {
     Ok(())
 }
 
-fn build_http_config(host: Option<String>, port: Option<u16>, path: Option<String>) -> Config {
+/// Handle the check-inbox command.
+///
+/// Checks the agent inbox for unread messages. Designed for git hooks and editor integrations.
+/// Exits silently on any error (fail-safe for hooks - never interrupt agent work).
+fn handle_check_inbox(
+    agent: Option<String>,
+    rate_limit: u64,
+    direct: bool,
+    json: bool,
+    host: String,
+    port: u16,
+    project: Option<String>,
+) -> CliResult<()> {
+    // Resolve agent name from flag or environment variables
+    let agent_name = agent
+        .or_else(|| std::env::var("AGENT_NAME").ok())
+        .or_else(|| std::env::var("AGENT_MAIL_AGENT").ok());
+
+    let Some(agent_name) = agent_name else {
+        // No agent configured - exit silently (not an error for hooks)
+        return Ok(());
+    };
+
+    // Check for template/placeholder values (exit silently if detected)
+    if value_looks_like_template(&agent_name) {
+        return Ok(());
+    }
+
+    // Resolve project key from flag or environment
+    let project_key = project
+        .or_else(|| std::env::var("AGENT_MAIL_PROJECT").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+
+    if value_looks_like_template(&project_key) {
+        return Ok(());
+    }
+
+    // Apply rate limiting (unless disabled with rate_limit=0)
+    if rate_limit > 0 {
+        let limiter = CheckInboxRateLimiter::new(&agent_name, Some(rate_limit));
+        if !limiter.should_check() {
+            // Rate limited - exit silently
+            return Ok(());
+        }
+    }
+
+    // Fetch inbox (direct or HTTP)
+    let result = if direct {
+        let config = CheckInboxDirectConfig {
+            project_key,
+            agent_name: agent_name.clone(),
+            limit: CHECK_INBOX_FETCH_LIMIT,
+        };
+        check_inbox_direct(&config)
+    } else {
+        // Build HTTP config and fetch via JSON-RPC
+        let server_url = format!("http://{}:{}/api/", host, port);
+        let bearer_token = std::env::var("AGENT_MAIL_TOKEN")
+            .or_else(|_| std::env::var("HTTP_BEARER_TOKEN"))
+            .ok()
+            .filter(|v| !v.is_empty() && !value_looks_like_template(v));
+
+        let config = CheckInboxRpcConfig {
+            server_url,
+            bearer_token,
+            project_key,
+            agent_name: agent_name.clone(),
+            limit: CHECK_INBOX_FETCH_LIMIT,
+            include_bodies: false,
+            timeout_seconds: CHECK_INBOX_RPC_TIMEOUT_SECS,
+        };
+
+        // Use a minimal runtime for the async HTTP call
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
+
+        rt.block_on(async { fetch_inbox_via_jsonrpc(&config).await })
+    };
+
+    // Handle result - exit silently on any error (fail-safe for hooks)
+    let result = match result {
+        Ok(r) => r,
+        Err(_) => return Ok(()), // Fail silently
+    };
+
+    // No messages - exit silently
+    if result.unread_count == 0 {
+        return Ok(());
+    }
+
+    // Format and print output
+    if json {
+        // JSON output mode
+        let output = serde_json::json!({
+            "agent": agent_name,
+            "unread_count": result.unread_count,
+            "urgent_or_high_count": result.urgent_or_high_count,
+            "messages": result.messages.iter().map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "subject": m.subject,
+                    "from": m.from,
+                    "importance": m.importance,
+                    "created_ts": m.created_ts,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string_pretty(&output).unwrap_or_default()
+        );
+    } else {
+        // Human-readable output with emoji
+        ftui_runtime::ftui_println!();
+        ftui_runtime::ftui_println!("📬 === INBOX REMINDER ===");
+        if result.urgent_or_high_count > 0 {
+            ftui_runtime::ftui_println!(
+                "⚠️  You have {} message(s) in your inbox ({} urgent/high priority)",
+                result.unread_count,
+                result.urgent_or_high_count
+            );
+            ftui_runtime::ftui_println!("   Use fetch_inbox to check your messages!");
+        } else {
+            ftui_runtime::ftui_println!(
+                "   You have {} recent message(s) in your inbox.",
+                result.unread_count
+            );
+            ftui_runtime::ftui_println!(
+                "   Consider checking with fetch_inbox if you haven't lately."
+            );
+        }
+        ftui_runtime::ftui_println!("=========================");
+        ftui_runtime::ftui_println!();
+    }
+
+    Ok(())
+}
+
+fn build_http_config(
+    host: Option<String>,
+    port: Option<u16>,
+    path: Option<String>,
+    no_auth: bool,
+) -> Config {
     let mut config = Config::from_env();
     if let Some(host) = host {
         config.http_host = host;
@@ -1980,6 +2177,11 @@ fn build_http_config(host: Option<String>, port: Option<u16>, path: Option<Strin
     }
     if let Some(path) = path {
         config.http_path = path;
+    }
+    if no_auth {
+        // Disable bearer token authentication for this run
+        config.http_bearer_token = None;
+        eprintln!("[info] --no-auth: Bearer token authentication disabled for this run");
     }
     config
 }
@@ -4314,7 +4516,8 @@ fn handle_ci(
     parallel: bool,
 ) -> CliResult<()> {
     use ci::{
-        default_gates, print_gate_summary, run_gates, run_gates_parallel, Decision, GateRunnerConfig, RunMode,
+        Decision, GateRunnerConfig, RunMode, default_gates, print_gate_summary, run_gates,
+        run_gates_parallel,
     };
 
     let mode = if quick { RunMode::Quick } else { RunMode::Full };
@@ -4348,9 +4551,8 @@ fn handle_ci(
     // Write report to file if requested
     if let Some(ref path) = report_path {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                CliError::Other(format!("failed to create report directory: {e}"))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CliError::Other(format!("failed to create report directory: {e}")))?;
         }
         report
             .write_to_file(path)
@@ -6736,10 +6938,181 @@ fn truncate_str(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn stdio_capture_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn check_inbox_template_detection_matches_expected_patterns() {
+        assert!(value_looks_like_template(""));
+        assert!(value_looks_like_template("YOUR_AGENT_NAME"));
+        assert!(value_looks_like_template("my_placeholder_value"));
+        assert!(value_looks_like_template("<set-me>"));
+        assert!(!value_looks_like_template("BlueLake"));
+    }
+
+    #[test]
+    fn normalize_agent_mail_url_defaults_to_api_path() {
+        assert_eq!(
+            normalize_agent_mail_url("127.0.0.1:8765"),
+            "http://127.0.0.1:8765/api/"
+        );
+        assert_eq!(
+            normalize_agent_mail_url("http://127.0.0.1:8765"),
+            "http://127.0.0.1:8765/api/"
+        );
+        assert_eq!(
+            normalize_agent_mail_url("http://127.0.0.1:8765/mcp/"),
+            "http://127.0.0.1:8765/mcp/"
+        );
+    }
+
+    #[test]
+    fn check_inbox_rpc_config_reads_agent_mail_env() {
+        let env: HashMap<String, String> = HashMap::from_iter([
+            ("AGENT_MAIL_PROJECT".to_string(), "/tmp/proj".to_string()),
+            ("AGENT_MAIL_AGENT".to_string(), "BlueLake".to_string()),
+            ("AGENT_MAIL_URL".to_string(), "127.0.0.1:8765".to_string()),
+            ("AGENT_MAIL_TOKEN".to_string(), "token-123".to_string()),
+        ]);
+
+        let cfg = check_inbox_rpc_config_from_env_reader(|key| env.get(key).cloned())
+            .expect("config should parse");
+        assert_eq!(cfg.project_key, "/tmp/proj");
+        assert_eq!(cfg.agent_name, "BlueLake");
+        assert_eq!(cfg.server_url, "http://127.0.0.1:8765/api/");
+        assert_eq!(cfg.bearer_token.as_deref(), Some("token-123"));
+        assert_eq!(cfg.limit, 10);
+        assert!(!cfg.include_bodies);
+        assert_eq!(cfg.timeout_seconds, 3);
+    }
+
+    #[test]
+    fn check_inbox_rpc_config_skips_placeholder_values() {
+        let env: HashMap<String, String> = HashMap::from_iter([
+            ("AGENT_MAIL_PROJECT".to_string(), "YOUR_PROJECT".to_string()),
+            ("AGENT_MAIL_AGENT".to_string(), "BlueLake".to_string()),
+        ]);
+        let cfg = check_inbox_rpc_config_from_env_reader(|key| env.get(key).cloned());
+        assert!(cfg.is_none(), "placeholder env values must be ignored");
+    }
+
+    #[test]
+    fn build_fetch_inbox_request_uses_jsonrpc_tools_call_shape() {
+        let cfg = CheckInboxRpcConfig {
+            server_url: "http://127.0.0.1:8765/api/".to_string(),
+            bearer_token: Some("secret".to_string()),
+            project_key: "/tmp/proj".to_string(),
+            agent_name: "BlueLake".to_string(),
+            limit: 10,
+            include_bodies: false,
+            timeout_seconds: 3,
+        };
+
+        let payload = build_fetch_inbox_jsonrpc_request(&cfg);
+        assert_eq!(payload["jsonrpc"], "2.0");
+        assert_eq!(payload["id"], "1");
+        assert_eq!(payload["method"], "tools/call");
+        assert_eq!(payload["params"]["name"], "fetch_inbox");
+        assert_eq!(payload["params"]["arguments"]["project_key"], "/tmp/proj");
+        assert_eq!(payload["params"]["arguments"]["agent_name"], "BlueLake");
+        assert_eq!(payload["params"]["arguments"]["limit"], 10);
+        assert_eq!(payload["params"]["arguments"]["include_bodies"], false);
+    }
+
+    #[test]
+    fn parse_fetch_inbox_rows_supports_array_and_result_wrapped_shapes() {
+        let direct = serde_json::json!([
+            {
+                "id": 1,
+                "subject": "hello",
+                "from": "RedHarbor",
+                "importance": "urgent",
+                "created_ts": "2026-02-12T00:00:00Z"
+            },
+            {
+                "id": 2,
+                "subject": "note",
+                "from": "CalmGorge",
+                "importance": "normal",
+                "created_ts": "2026-02-12T00:01:00Z"
+            }
+        ]);
+        let wrapped = serde_json::json!({ "result": direct.clone() });
+
+        let parsed_direct = parse_fetch_inbox_rows(direct).expect("direct parse");
+        let parsed_wrapped = parse_fetch_inbox_rows(wrapped).expect("wrapped parse");
+
+        assert_eq!(parsed_direct.unread_count, 2);
+        assert_eq!(parsed_direct.urgent_or_high_count, 1);
+        assert_eq!(parsed_direct.messages[0].from, "RedHarbor");
+        assert_eq!(parsed_direct.messages[0].importance, "urgent");
+        assert_eq!(parsed_wrapped.unread_count, 2);
+        assert_eq!(parsed_wrapped.messages[1].subject, "note");
+    }
+
+    #[test]
+    fn check_inbox_direct_config_struct_creation() {
+        let config = CheckInboxDirectConfig {
+            project_key: "/tmp/test-project".to_string(),
+            agent_name: "TestAgent".to_string(),
+            limit: 10,
+        };
+        assert_eq!(config.project_key, "/tmp/test-project");
+        assert_eq!(config.agent_name, "TestAgent");
+        assert_eq!(config.limit, 10);
+    }
+
+    #[test]
+    fn format_micros_as_iso_produces_valid_timestamp() {
+        // 2026-01-01 00:00:00 UTC in microseconds
+        let micros = 1767225600_000_000_i64;
+        let result = format_micros_as_iso(micros);
+        // Should produce ISO-8601 format
+        assert!(result.contains("2026"), "year should be 2026, got {result}");
+        assert!(result.ends_with('Z'), "should end with Z, got {result}");
+    }
+
+    #[test]
+    fn sanitize_agent_name_replaces_special_chars() {
+        assert_eq!(sanitize_agent_name("BlueLake"), "BlueLake");
+        assert_eq!(sanitize_agent_name("my-agent.v2"), "my_agent_v2");
+        assert_eq!(sanitize_agent_name("agent@host:8080"), "agent_host_8080");
+        assert_eq!(
+            sanitize_agent_name("Agent_With_Underscores"),
+            "Agent_With_Underscores"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_lockfile_path_uses_sanitized_name() {
+        let limiter = CheckInboxRateLimiter::new("BlueLake", None);
+        assert_eq!(
+            limiter.lockfile_path().to_string_lossy(),
+            "/tmp/mcp-mail-check-BlueLake"
+        );
+
+        let limiter2 = CheckInboxRateLimiter::new("my-agent.v2", None);
+        assert_eq!(
+            limiter2.lockfile_path().to_string_lossy(),
+            "/tmp/mcp-mail-check-my_agent_v2"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_default_interval_is_120_seconds() {
+        assert_eq!(CHECK_INBOX_RATE_LIMIT_DEFAULT_SECS, 120);
+        let limiter = CheckInboxRateLimiter::new("TestAgent", None);
+        assert_eq!(limiter.interval_secs, 120);
+    }
+
+    #[test]
+    fn rate_limiter_custom_interval() {
+        let limiter = CheckInboxRateLimiter::new("TestAgent", Some(60));
+        assert_eq!(limiter.interval_secs, 60);
     }
 
     #[test]
@@ -6748,10 +7121,21 @@ mod tests {
             Some("0.0.0.0".to_string()),
             Some(9000),
             Some("/api/v2/".to_string()),
+            false,
         );
         assert_eq!(config.http_host, "0.0.0.0");
         assert_eq!(config.http_port, 9000);
         assert_eq!(config.http_path, "/api/v2/");
+    }
+
+    #[test]
+    fn serve_http_no_auth_clears_token() {
+        // Verify --no-auth clears any token (whether loaded from env or not)
+        let config_no_auth = build_http_config(None, None, None, true);
+        assert!(
+            config_no_auth.http_bearer_token.is_none(),
+            "--no-auth should clear bearer token"
+        );
     }
 
     #[test]
@@ -6768,10 +7152,95 @@ mod tests {
         ])
         .expect("failed to parse serve-http flags");
         match cli.command {
-            Commands::ServeHttp { host, port, path } => {
+            Commands::ServeHttp {
+                host,
+                port,
+                path,
+                no_auth,
+            } => {
                 assert_eq!(host.as_deref(), Some("0.0.0.0"));
                 assert_eq!(port, Some(9999));
                 assert_eq!(path.as_deref(), Some("/api/x/"));
+                assert!(!no_auth);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_serve_http_no_auth() {
+        let cli = Cli::try_parse_from(["am", "serve-http", "--no-auth"])
+            .expect("failed to parse serve-http --no-auth");
+        match cli.command {
+            Commands::ServeHttp { no_auth, .. } => {
+                assert!(no_auth, "--no-auth flag should be true");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_check_inbox_defaults() {
+        let cli = Cli::try_parse_from(["am", "check-inbox"])
+            .expect("failed to parse check-inbox defaults");
+        match cli.command {
+            Commands::CheckInbox {
+                agent,
+                rate_limit,
+                direct,
+                json,
+                host,
+                port,
+                project,
+            } => {
+                assert!(agent.is_none());
+                assert_eq!(rate_limit, 120);
+                assert!(!direct);
+                assert!(!json);
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 8765);
+                assert!(project.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_check_inbox_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "check-inbox",
+            "--agent",
+            "BlueLake",
+            "--rate-limit",
+            "60",
+            "--direct",
+            "--json",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9999",
+            "--project",
+            "/tmp/proj",
+        ])
+        .expect("failed to parse check-inbox with flags");
+        match cli.command {
+            Commands::CheckInbox {
+                agent,
+                rate_limit,
+                direct,
+                json,
+                host,
+                port,
+                project,
+            } => {
+                assert_eq!(agent.as_deref(), Some("BlueLake"));
+                assert_eq!(rate_limit, 60);
+                assert!(direct);
+                assert!(json);
+                assert_eq!(host, "0.0.0.0");
+                assert_eq!(port, 9999);
+                assert_eq!(project.as_deref(), Some("/tmp/proj"));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -10926,7 +11395,7 @@ sys.exit(7)
     #[test]
     fn help_serve_http_lists_flags() {
         let h = help_text_for(&["am", "serve-http", "--help"]);
-        for flag in ["--host", "--port", "--path"] {
+        for flag in ["--host", "--port", "--path", "--no-auth"] {
             assert!(
                 h.contains(flag),
                 "serve-http help missing flag '{flag}'\n{h}"
@@ -16093,9 +16562,40 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, _yes: bool) -> Cli
 
 static PRODUCTS_HTTP_CLIENT: OnceLock<asupersync::http::h1::HttpClient> = OnceLock::new();
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CHECK_INBOX_FETCH_LIMIT: i64 = 10;
+const CHECK_INBOX_RPC_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_AGENT_MAIL_URL: &str = "127.0.0.1:8765";
 
 fn products_http_client() -> &'static asupersync::http::h1::HttpClient {
     PRODUCTS_HTTP_CLIENT.get_or_init(asupersync::http::h1::HttpClient::new)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckInboxRpcConfig {
+    pub server_url: String,
+    pub bearer_token: Option<String>,
+    pub project_key: String,
+    pub agent_name: String,
+    pub limit: i64,
+    pub include_bodies: bool,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckInboxMessage {
+    pub id: i64,
+    pub subject: String,
+    pub from: String,
+    pub importance: String,
+    pub created_ts: String,
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckInboxRpcResult {
+    pub unread_count: usize,
+    pub urgent_or_high_count: usize,
+    pub messages: Vec<CheckInboxMessage>,
 }
 
 fn collapse_whitespace(input: &str) -> String {
@@ -16206,14 +16706,475 @@ fn print_table(title: Option<&str>, headers: &[&str], rows: Vec<Vec<String>>) {
     ftui_runtime::ftui_println!("{rendered}");
 }
 
+fn value_looks_like_template(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    upper.contains("YOUR_")
+        || upper.contains("PLACEHOLDER")
+        || (trimmed.starts_with('<') && trimmed.ends_with('>'))
+}
+
+fn normalize_agent_mail_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let base = if trimmed.is_empty() {
+        DEFAULT_AGENT_MAIL_URL.to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    let with_scheme = if base.starts_with("http://") || base.starts_with("https://") {
+        base
+    } else {
+        format!("http://{base}")
+    };
+
+    if let Some((scheme, rest)) = with_scheme.split_once("://") {
+        if rest.contains('/') {
+            let mut full = format!("{scheme}://{rest}");
+            if !full.ends_with('/') {
+                full.push('/');
+            }
+            return full;
+        }
+    }
+    format!("{with_scheme}/api/")
+}
+
+fn check_inbox_rpc_config_from_env_reader<F>(read_env: F) -> Option<CheckInboxRpcConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let project_key = read_env("AGENT_MAIL_PROJECT")?;
+    let agent_name = read_env("AGENT_MAIL_AGENT")?;
+    if value_looks_like_template(&project_key) || value_looks_like_template(&agent_name) {
+        return None;
+    }
+
+    let raw_url = read_env("AGENT_MAIL_URL").unwrap_or_else(|| DEFAULT_AGENT_MAIL_URL.to_string());
+    let server_url = normalize_agent_mail_url(&raw_url);
+    let bearer_token = read_env("AGENT_MAIL_TOKEN")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && !value_looks_like_template(v));
+
+    Some(CheckInboxRpcConfig {
+        server_url,
+        bearer_token,
+        project_key: project_key.trim().to_string(),
+        agent_name: agent_name.trim().to_string(),
+        limit: CHECK_INBOX_FETCH_LIMIT,
+        include_bodies: false,
+        timeout_seconds: CHECK_INBOX_RPC_TIMEOUT_SECS,
+    })
+}
+
+pub fn check_inbox_rpc_config_from_env() -> Option<CheckInboxRpcConfig> {
+    check_inbox_rpc_config_from_env_reader(|key| std::env::var(key).ok())
+}
+
+fn build_fetch_inbox_jsonrpc_request(config: &CheckInboxRpcConfig) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "tools/call",
+        "params": {
+            "name": "fetch_inbox",
+            "arguments": {
+                "project_key": config.project_key,
+                "agent_name": config.agent_name,
+                "limit": config.limit,
+                "include_bodies": config.include_bodies,
+            }
+        }
+    })
+}
+
+fn parse_jsonrpc_error(payload: &serde_json::Value) -> Option<String> {
+    let err = payload.get("error")?;
+    let code = err.get("code").and_then(serde_json::Value::as_i64);
+    let message = err
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown JSON-RPC error");
+    let data = err.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    Some(match code {
+        Some(code) => format!("JSON-RPC error {code}: {message}; data={data}"),
+        None => format!("JSON-RPC error: {message}; data={data}"),
+    })
+}
+
+async fn post_jsonrpc_request(
+    server_url: &str,
+    bearer: Option<&str>,
+    payload: &serde_json::Value,
+    timeout_seconds: u64,
+) -> CliResult<serde_json::Value> {
+    use asupersync::http::h1::Method;
+    use asupersync::time::{timeout, wall_now};
+    use std::time::Duration;
+
+    let body = serde_json::to_vec(payload)
+        .map_err(|e| CliError::Other(format!("failed to encode JSON-RPC request: {e}")))?;
+    let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+    if let Some(tok) = bearer.filter(|s| !s.is_empty()) {
+        headers.push(("Authorization".to_string(), format!("Bearer {tok}")));
+    }
+
+    let request = Box::pin(products_http_client().request(Method::Post, server_url, headers, body));
+    let response = match timeout(wall_now(), Duration::from_secs(timeout_seconds), request).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            return Err(CliError::Other(format!(
+                "transport failure calling {server_url}: {e}"
+            )));
+        }
+        Err(_) => {
+            return Err(CliError::Other(format!(
+                "request to {server_url} timed out after {timeout_seconds}s"
+            )));
+        }
+    };
+
+    if response.status == 401 || response.status == 403 {
+        return Err(CliError::Other(format!(
+            "authentication failed (HTTP {}) while calling {server_url}; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN",
+            response.status
+        )));
+    }
+    if response.status != 200 {
+        return Err(CliError::Other(format!(
+            "unexpected HTTP status {} from {server_url}",
+            response.status
+        )));
+    }
+
+    serde_json::from_slice(&response.body).map_err(|e| {
+        CliError::Other(format!(
+            "invalid JSON in server response from {server_url}: {e}"
+        ))
+    })
+}
+
+fn normalize_fetch_inbox_rows(result_payload: serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    match coerce_tool_result_json(result_payload)? {
+        serde_json::Value::Array(rows) => Some(rows),
+        serde_json::Value::Object(map) => {
+            if let Some(rows) = map.get("result").and_then(serde_json::Value::as_array) {
+                return Some(rows.clone());
+            }
+            if let Some(rows) = map.get("messages").and_then(serde_json::Value::as_array) {
+                return Some(rows.clone());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn parse_fetch_inbox_rows(result_payload: serde_json::Value) -> CliResult<CheckInboxRpcResult> {
+    let rows = normalize_fetch_inbox_rows(result_payload)
+        .ok_or_else(|| CliError::Other("unexpected fetch_inbox response shape".to_string()))?;
+
+    let mut messages = Vec::with_capacity(rows.len());
+    let mut urgent_or_high_count = 0usize;
+
+    for row in rows {
+        let importance = row
+            .get("importance")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if importance == "urgent" || importance == "high" {
+            urgent_or_high_count += 1;
+        }
+
+        let from = row
+            .get("from")
+            .or_else(|| row.get("sender_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        messages.push(CheckInboxMessage {
+            id: row
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default(),
+            subject: row
+                .get("subject")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            from,
+            importance,
+            created_ts: row
+                .get("created_ts")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            raw: row,
+        });
+    }
+
+    Ok(CheckInboxRpcResult {
+        unread_count: messages.len(),
+        urgent_or_high_count,
+        messages,
+    })
+}
+
+pub async fn fetch_inbox_via_jsonrpc(
+    config: &CheckInboxRpcConfig,
+) -> CliResult<CheckInboxRpcResult> {
+    let request = build_fetch_inbox_jsonrpc_request(config);
+    let payload = post_jsonrpc_request(
+        &config.server_url,
+        config.bearer_token.as_deref(),
+        &request,
+        config.timeout_seconds,
+    )
+    .await?;
+
+    if let Some(error_text) = parse_jsonrpc_error(&payload) {
+        return Err(CliError::Other(error_text));
+    }
+
+    let result = payload
+        .get("result")
+        .cloned()
+        .ok_or_else(|| CliError::Other("missing JSON-RPC result payload".to_string()))?;
+
+    parse_fetch_inbox_rows(result)
+}
+
+/// Configuration for direct DB inbox check (bypasses HTTP).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckInboxDirectConfig {
+    /// Project key (path or slug) to query.
+    pub project_key: String,
+    /// Agent name to check inbox for.
+    pub agent_name: String,
+    /// Maximum messages to fetch.
+    pub limit: i64,
+}
+
+/// Check inbox via direct SQLite query (for co-located setups).
+///
+/// This bypasses the HTTP/MCP server and queries the database directly,
+/// which is faster and works even when the server is not running.
+pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInboxRpcResult> {
+    use sqlmodel_core::Value;
+
+    let conn = open_db_sync()?;
+
+    // Resolve project ID from project_key (try slug first, then human_key)
+    let project_rows = conn
+        .query_sync(
+            "SELECT id FROM projects WHERE slug = ? OR human_key = ? LIMIT 1",
+            &[
+                Value::Text(config.project_key.clone()),
+                Value::Text(config.project_key.clone()),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("project lookup failed: {e}")))?;
+
+    let project_id: i64 = project_rows
+        .first()
+        .and_then(|row| row.get_named("id").ok())
+        .ok_or_else(|| CliError::Other(format!("project not found: {}", config.project_key)))?;
+
+    // Resolve agent ID from agent_name
+    let agent_rows = conn
+        .query_sync(
+            "SELECT id FROM agents WHERE project_id = ? AND name = ? LIMIT 1",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(config.agent_name.clone()),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("agent lookup failed: {e}")))?;
+
+    let agent_id: i64 = agent_rows
+        .first()
+        .and_then(|row| row.get_named("id").ok())
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "agent '{}' not found in project '{}'",
+                config.agent_name, config.project_key
+            ))
+        })?;
+
+    // Query unread messages (where read_ts IS NULL)
+    let sql = "
+        SELECT m.id, m.subject, m.importance, m.created_ts, a.name AS sender_name
+        FROM message_recipients mr
+        JOIN messages m ON m.id = mr.message_id
+        JOIN agents a ON a.id = m.sender_id
+        WHERE mr.agent_id = ? AND m.project_id = ? AND mr.read_ts IS NULL
+        ORDER BY m.created_ts DESC
+        LIMIT ?
+    ";
+
+    let rows = conn
+        .query_sync(
+            sql,
+            &[
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+                Value::BigInt(config.limit),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
+
+    let mut messages = Vec::with_capacity(rows.len());
+    let mut urgent_or_high_count = 0usize;
+
+    for row in &rows {
+        let id: i64 = row.get_named("id").unwrap_or(0);
+        let subject: String = row.get_named("subject").unwrap_or_default();
+        let from: String = row.get_named("sender_name").unwrap_or_default();
+        let importance: String = row.get_named("importance").unwrap_or_default();
+        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+
+        // Count urgent/high priority messages
+        if importance == "urgent" || importance == "high" {
+            urgent_or_high_count += 1;
+        }
+
+        // Format timestamp as ISO-8601 string
+        let created_ts_str = format_micros_as_iso(created_ts);
+
+        let raw = serde_json::json!({
+            "id": id,
+            "subject": &subject,
+            "from": &from,
+            "importance": &importance,
+            "created_ts": created_ts,
+        });
+        messages.push(CheckInboxMessage {
+            id,
+            subject,
+            from,
+            importance,
+            created_ts: created_ts_str,
+            raw,
+        });
+    }
+
+    Ok(CheckInboxRpcResult {
+        unread_count: messages.len(),
+        urgent_or_high_count,
+        messages,
+    })
+}
+
+/// Format microsecond timestamp as ISO-8601 string.
+fn format_micros_as_iso(micros: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let secs = micros / 1_000_000;
+    let nanos = ((micros % 1_000_000) * 1000) as u32;
+    let dt = UNIX_EPOCH + Duration::new(secs as u64, nanos);
+    // Format as ISO-8601 (simplified)
+    let datetime = chrono::DateTime::<chrono::Utc>::from(dt);
+    datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Default check-inbox rate limit interval in seconds.
+pub const CHECK_INBOX_RATE_LIMIT_DEFAULT_SECS: u64 = 120;
+
+/// Rate limiter for inbox checks.
+///
+/// Prevents excessive inbox polling by tracking the last check time per agent.
+/// Uses a lockfile in /tmp with the agent name sanitized.
+#[derive(Debug, Clone)]
+pub struct CheckInboxRateLimiter {
+    /// Sanitized agent name used in lockfile path.
+    agent_sanitized: String,
+    /// Minimum interval between checks.
+    interval_secs: u64,
+}
+
+impl CheckInboxRateLimiter {
+    /// Create a new rate limiter for the given agent.
+    ///
+    /// # Arguments
+    /// - `agent_name`: Agent name (will be sanitized for filesystem)
+    /// - `interval_secs`: Minimum seconds between checks (default: 120)
+    #[must_use]
+    pub fn new(agent_name: &str, interval_secs: Option<u64>) -> Self {
+        Self {
+            agent_sanitized: sanitize_agent_name(agent_name),
+            interval_secs: interval_secs.unwrap_or(CHECK_INBOX_RATE_LIMIT_DEFAULT_SECS),
+        }
+    }
+
+    /// Get the lockfile path for this agent.
+    #[must_use]
+    pub fn lockfile_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/tmp/mcp-mail-check-{}", self.agent_sanitized))
+    }
+
+    /// Check if enough time has elapsed since the last check.
+    ///
+    /// Returns `true` if a check should proceed, `false` if rate-limited.
+    /// Updates the lockfile timestamp if proceeding.
+    ///
+    /// Errors are treated as "proceed" (fail-open) to avoid blocking agent work.
+    #[must_use]
+    pub fn should_check(&self) -> bool {
+        let path = self.lockfile_path();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Read last check timestamp from file
+        let last_check = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+
+        // Check if enough time has elapsed
+        if let Some(last) = last_check {
+            let elapsed = now.saturating_sub(last);
+            if elapsed < self.interval_secs {
+                // Rate limited - skip this check
+                return false;
+            }
+        }
+
+        // Update timestamp and proceed
+        // Write errors are ignored (fail-open)
+        let _ = std::fs::write(&path, now.to_string());
+
+        true
+    }
+
+    /// Reset the rate limiter by removing the lockfile.
+    ///
+    /// Errors are ignored.
+    pub fn reset(&self) {
+        let _ = std::fs::remove_file(self.lockfile_path());
+    }
+}
+
+/// Sanitize agent name for use in filesystem paths.
+///
+/// Replaces non-alphanumeric characters with underscore.
+#[must_use]
+pub fn sanitize_agent_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
 async fn try_call_server_tool(
     server_url: &str,
     bearer: Option<&str>,
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Option<serde_json::Value> {
-    use asupersync::http::h1::Method;
-
     let req = serde_json::json!({
         "jsonrpc": "2.0",
         "id": format!("cli-{tool_name}"),
@@ -16223,22 +17184,9 @@ async fn try_call_server_tool(
             "arguments": arguments,
         }
     });
-    let body = serde_json::to_vec(&req).ok()?;
-
-    let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-    if let Some(tok) = bearer.filter(|s| !s.is_empty()) {
-        headers.push(("Authorization".to_string(), format!("Bearer {tok}")));
-    }
-
-    let resp = products_http_client()
-        .request(Method::Post, server_url, headers, body)
+    let v = post_jsonrpc_request(server_url, bearer, &req, 10)
         .await
         .ok()?;
-    if resp.status != 200 {
-        return None;
-    }
-
-    let v: serde_json::Value = serde_json::from_slice(&resp.body).ok()?;
     v.get("result").cloned()
 }
 

@@ -24,6 +24,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        return format!("leader panicked: {msg}");
+    }
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        return format!("leader panicked: {msg}");
+    }
+    "leader panicked".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Slot: shared state between leader and joiners
 // ---------------------------------------------------------------------------
@@ -274,23 +284,37 @@ impl<K: Hash + Eq + Clone, V: Clone> CoalesceMap<K, V> {
                         .cloned()
                 };
 
-                let result = f();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
-                // Broadcast result to any joiners.
-                if let Some(slot) = slot {
-                    match &result {
-                        Ok(v) => slot.complete_ok(v),
-                        Err(e) => slot.complete_err(e.to_string()),
+                match result {
+                    Ok(result) => {
+                        // Broadcast result to any joiners.
+                        if let Some(slot) = slot {
+                            match &result {
+                                Ok(v) => slot.complete_ok(v),
+                                Err(e) => slot.complete_err(e.to_string()),
+                            }
+                        }
+
+                        // Remove from in-flight map.
+                        self.inflight
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&key);
+
+                        result.map(CoalesceOutcome::Executed)
+                    }
+                    Err(payload) => {
+                        if let Some(slot) = slot {
+                            slot.complete_err(panic_payload_message(payload.as_ref()));
+                        }
+                        self.inflight
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&key);
+                        std::panic::resume_unwind(payload);
                     }
                 }
-
-                // Remove from in-flight map.
-                self.inflight
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&key);
-
-                result.map(CoalesceOutcome::Executed)
             }
         }
     }
@@ -333,6 +357,7 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
     use std::thread;
 
     #[test]
@@ -506,6 +531,93 @@ mod tests {
     }
 
     #[test]
+    fn leader_error_metrics_exact_for_single_joiner_fallback() {
+        let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(2)));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let map1 = Arc::clone(&map);
+        let barrier1 = Arc::clone(&barrier);
+        let leader = thread::spawn(move || {
+            barrier1.wait();
+            map1.execute_or_join("metric-leader-fail".to_string(), || {
+                thread::sleep(Duration::from_millis(50));
+                Err::<i32, String>("leader-failed".into())
+            })
+        });
+
+        let map2 = Arc::clone(&map);
+        let barrier2 = Arc::clone(&barrier);
+        let joiner = thread::spawn(move || {
+            barrier2.wait();
+            thread::sleep(Duration::from_millis(5));
+            map2.execute_or_join("metric-leader-fail".to_string(), || Ok::<_, String>(7))
+        });
+
+        let leader_res = leader.join().unwrap();
+        let joiner_res = joiner.join().unwrap();
+        assert!(leader_res.is_err());
+        assert_eq!(joiner_res.unwrap().into_inner(), 7);
+
+        let metrics = map.metrics();
+        assert_eq!(metrics.leader_count, 2);
+        assert_eq!(metrics.joined_count, 0);
+        assert_eq!(metrics.timeout_count, 0);
+        assert_eq!(metrics.leader_failed_count, 1);
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn leader_panic_unblocks_joiner_and_cleans_up_slot() {
+        let map = Arc::new(CoalesceMap::<String, i32>::new(
+            100,
+            Duration::from_millis(400),
+        ));
+        let (leader_ready_tx, leader_ready_rx) = mpsc::sync_channel::<()>(1);
+        let (panic_now_tx, panic_now_rx) = mpsc::sync_channel::<()>(1);
+
+        let map1 = Arc::clone(&map);
+        let leader = thread::spawn(move || {
+            map1.execute_or_join("panic-key".to_string(), || {
+                leader_ready_tx
+                    .send(())
+                    .expect("leader should signal readiness");
+                let _ = panic_now_rx.recv();
+                panic!("boom");
+                #[allow(unreachable_code)]
+                Ok::<_, String>(1)
+            })
+        });
+
+        let map2 = Arc::clone(&map);
+        let joiner = thread::spawn(move || {
+            leader_ready_rx
+                .recv()
+                .expect("joiner should wait for leader readiness");
+            map2.execute_or_join("panic-key".to_string(), || Ok::<_, String>(77))
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        panic_now_tx
+            .send(())
+            .expect("leader should receive panic signal");
+
+        assert!(leader.join().is_err(), "leader should panic");
+        let joiner_res = joiner.join().unwrap().unwrap();
+        assert_eq!(joiner_res.into_inner(), 77);
+        assert_eq!(map.inflight_count(), 0);
+
+        let after = map
+            .execute_or_join("panic-key".to_string(), || Ok::<_, String>(123))
+            .unwrap();
+        assert_eq!(after.into_inner(), 123);
+        assert_eq!(map.inflight_count(), 0);
+
+        let metrics = map.metrics();
+        assert_eq!(metrics.timeout_count, 0);
+        assert_eq!(metrics.leader_failed_count, 1);
+    }
+
+    #[test]
     fn coalesce_outcome_into_inner() {
         let executed: CoalesceOutcome<i32> = CoalesceOutcome::Executed(42);
         assert!(!executed.was_joined());
@@ -541,7 +653,10 @@ mod tests {
         // max_entries=2 with 10 concurrent operations on distinct keys.
         // The map should evict aggressively but all operations must still complete
         // (evicted slots lose their broadcast, but leaders still return their result).
-        let map = Arc::new(CoalesceMap::<String, usize>::new(2, Duration::from_millis(500)));
+        let map = Arc::new(CoalesceMap::<String, usize>::new(
+            2,
+            Duration::from_millis(500),
+        ));
         let barrier = Arc::new(Barrier::new(10));
 
         let handles: Vec<_> = (0..10)
@@ -576,7 +691,17 @@ mod tests {
 
         // First "batch"
         for i in 0..5 {
-            let key = if i == 0 { "x" } else if i == 1 { "y" } else if i == 2 { "z" } else if i == 3 { "w" } else { "v" };
+            let key = if i == 0 {
+                "x"
+            } else if i == 1 {
+                "y"
+            } else if i == 2 {
+                "z"
+            } else if i == 3 {
+                "w"
+            } else {
+                "v"
+            };
             let r = map.execute_or_join(key, || Ok::<_, String>(i)).unwrap();
             assert_eq!(r.into_inner(), i);
         }
@@ -587,7 +712,17 @@ mod tests {
 
         // "Post-shutdown" batch: the map should still accept new work.
         for i in 10..15 {
-            let key = if i == 10 { "a" } else if i == 11 { "b" } else if i == 12 { "c" } else if i == 13 { "d" } else { "e" };
+            let key = if i == 10 {
+                "a"
+            } else if i == 11 {
+                "b"
+            } else if i == 12 {
+                "c"
+            } else if i == 13 {
+                "d"
+            } else {
+                "e"
+            };
             let r = map.execute_or_join(key, || Ok::<_, String>(i)).unwrap();
             assert_eq!(r.into_inner(), i);
         }
@@ -639,8 +774,7 @@ mod tests {
     fn empty_map_execute_works() {
         // Executing on a completely fresh map with no pending items should work
         // (this is the "empty flush" case: no prior state to interfere).
-        let map: CoalesceMap<String, Vec<i32>> =
-            CoalesceMap::new(100, Duration::from_millis(100));
+        let map: CoalesceMap<String, Vec<i32>> = CoalesceMap::new(100, Duration::from_millis(100));
 
         assert_eq!(map.inflight_count(), 0);
         let m = map.metrics();
@@ -720,8 +854,7 @@ mod tests {
         let leader_val = h_leader.join().unwrap();
         assert_eq!(leader_val, 100);
 
-        let results: Vec<(bool, i32)> =
-            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let results: Vec<(bool, i32)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         // Joiners for "slow-key" should get 100 (the leader's result).
         // They might have joined OR timed out and fallen back.
@@ -779,10 +912,14 @@ mod tests {
         // should work fine -- the slot is removed after leader completes.
         let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
 
-        let r1 = map.execute_or_join("reused", || Ok::<_, String>(1)).unwrap();
+        let r1 = map
+            .execute_or_join("reused", || Ok::<_, String>(1))
+            .unwrap();
         assert_eq!(r1.into_inner(), 1);
 
-        let r2 = map.execute_or_join("reused", || Ok::<_, String>(2)).unwrap();
+        let r2 = map
+            .execute_or_join("reused", || Ok::<_, String>(2))
+            .unwrap();
         assert_eq!(r2.into_inner(), 2);
 
         // Both should have been leaders (no overlap).
@@ -797,7 +934,9 @@ mod tests {
         // operation on the same key.
         let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
 
-        let r1 = map.execute_or_join("retry-key", || Err::<i32, String>("transient failure".into()));
+        let r1 = map.execute_or_join("retry-key", || {
+            Err::<i32, String>("transient failure".into())
+        });
         assert!(r1.is_err());
 
         let r2 = map
@@ -861,7 +1000,9 @@ mod tests {
 
         // The eviction code runs on every insert when len >= 0 (always true),
         // but the leader still holds an Arc to its slot so it can complete.
-        let r = map.execute_or_join("zero-cap", || Ok::<_, String>(7)).unwrap();
+        let r = map
+            .execute_or_join("zero-cap", || Ok::<_, String>(7))
+            .unwrap();
         assert_eq!(r.into_inner(), 7);
         assert_eq!(map.inflight_count(), 0);
     }
@@ -873,10 +1014,7 @@ mod tests {
         assert_eq!(format!("{timeout_err}"), "coalesce join timed out");
 
         let leader_err = CoalesceJoinError::LeaderFailed("kaboom".to_string());
-        assert_eq!(
-            format!("{leader_err}"),
-            "coalesce leader failed: kaboom"
-        );
+        assert_eq!(format!("{leader_err}"), "coalesce leader failed: kaboom");
 
         // Also verify Error trait is implemented (dyn Error should work).
         let _: &dyn std::error::Error = &CoalesceJoinError::Timeout;
@@ -933,6 +1071,45 @@ mod tests {
             "expected at least 2 leader executions (leader + fallback), got {}",
             m.leader_count
         );
+    }
+
+    #[test]
+    fn timeout_metrics_exact_for_single_joiner_fallback() {
+        let map = Arc::new(CoalesceMap::<String, i32>::new(
+            100,
+            Duration::from_millis(20),
+        ));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let map1 = Arc::clone(&map);
+        let barrier1 = Arc::clone(&barrier);
+        let leader = thread::spawn(move || {
+            barrier1.wait();
+            map1.execute_or_join("metric-timeout".to_string(), || {
+                thread::sleep(Duration::from_millis(120));
+                Ok::<_, String>(10)
+            })
+        });
+
+        let map2 = Arc::clone(&map);
+        let barrier2 = Arc::clone(&barrier);
+        let joiner = thread::spawn(move || {
+            barrier2.wait();
+            thread::sleep(Duration::from_millis(5));
+            map2.execute_or_join("metric-timeout".to_string(), || Ok::<_, String>(20))
+        });
+
+        let leader_res = leader.join().unwrap().unwrap();
+        let joiner_res = joiner.join().unwrap().unwrap();
+        assert_eq!(leader_res.into_inner(), 10);
+        assert_eq!(joiner_res.into_inner(), 20);
+
+        let metrics = map.metrics();
+        assert_eq!(metrics.leader_count, 2);
+        assert_eq!(metrics.joined_count, 0);
+        assert_eq!(metrics.timeout_count, 1);
+        assert_eq!(metrics.leader_failed_count, 0);
+        assert_eq!(map.inflight_count(), 0);
     }
 
     #[test]
@@ -1036,7 +1213,10 @@ mod tests {
         // is exceeded. Evicted leaders lose their map entry but still hold
         // Arc<Slot>, so their joiners (if any) still get notified. All
         // leaders must still complete successfully.
-        let map = Arc::new(CoalesceMap::<String, i32>::new(2, Duration::from_millis(200)));
+        let map = Arc::new(CoalesceMap::<String, i32>::new(
+            2,
+            Duration::from_millis(200),
+        ));
         let barrier = Arc::new(Barrier::new(6));
 
         let handles: Vec<_> = (0..6_i32)
@@ -1187,22 +1367,33 @@ mod tests {
     fn reentry_after_eviction_under_concurrency() {
         // After a key is evicted from a small-capacity map, inserting the
         // same key again should work as a fresh leader.
-        let map = Arc::new(CoalesceMap::<String, i32>::new(2, Duration::from_millis(200)));
+        let map = Arc::new(CoalesceMap::<String, i32>::new(
+            2,
+            Duration::from_millis(200),
+        ));
 
         // Fill and drain two keys.
-        let r1 = map.execute_or_join("k1".to_string(), || Ok::<_, String>(1)).unwrap();
-        let r2 = map.execute_or_join("k2".to_string(), || Ok::<_, String>(2)).unwrap();
+        let r1 = map
+            .execute_or_join("k1".to_string(), || Ok::<_, String>(1))
+            .unwrap();
+        let r2 = map
+            .execute_or_join("k2".to_string(), || Ok::<_, String>(2))
+            .unwrap();
         assert_eq!(r1.into_inner(), 1);
         assert_eq!(r2.into_inner(), 2);
         assert_eq!(map.inflight_count(), 0);
 
         // Add a third key (capacity is 2, but since prior keys completed,
         // map is empty so no eviction needed).
-        let r3 = map.execute_or_join("k3".to_string(), || Ok::<_, String>(3)).unwrap();
+        let r3 = map
+            .execute_or_join("k3".to_string(), || Ok::<_, String>(3))
+            .unwrap();
         assert_eq!(r3.into_inner(), 3);
 
         // Re-use k1 which was previously used.
-        let r4 = map.execute_or_join("k1".to_string(), || Ok::<_, String>(10)).unwrap();
+        let r4 = map
+            .execute_or_join("k1".to_string(), || Ok::<_, String>(10))
+            .unwrap();
         assert!(!r4.was_joined());
         assert_eq!(r4.into_inner(), 10);
 
@@ -1341,8 +1532,7 @@ mod tests {
     #[test]
     fn coalesce_join_error_implements_std_error() {
         // Verify that CoalesceJoinError satisfies the std::error::Error bound.
-        let err_timeout: Box<dyn std::error::Error> =
-            Box::new(CoalesceJoinError::Timeout);
+        let err_timeout: Box<dyn std::error::Error> = Box::new(CoalesceJoinError::Timeout);
         assert!(err_timeout.source().is_none());
         assert_eq!(err_timeout.to_string(), "coalesce join timed out");
 
@@ -1361,7 +1551,10 @@ mod tests {
 
         let err = CoalesceJoinError::LeaderFailed("crash".to_string());
         let dbg = format!("{err:?}");
-        assert!(dbg.contains("LeaderFailed"), "Debug should show variant: {dbg}");
+        assert!(
+            dbg.contains("LeaderFailed"),
+            "Debug should show variant: {dbg}"
+        );
         assert!(dbg.contains("crash"), "Debug should show message: {dbg}");
     }
 
@@ -1398,7 +1591,10 @@ mod tests {
         assert_eq!(results.len(), n);
 
         let execs = exec_count.load(Ordering::SeqCst);
-        assert!(execs < n, "coalescing should reduce execs below {n}, got {execs}");
+        assert!(
+            execs < n,
+            "coalescing should reduce execs below {n}, got {execs}"
+        );
 
         let m = map.metrics();
         assert!(m.joined_count >= 1, "expected joins with 5s timeout");
@@ -1412,9 +1608,7 @@ mod tests {
         let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
 
         for i in 0..50 {
-            let r = map
-                .execute_or_join("rapid", || Ok::<_, String>(i))
-                .unwrap();
+            let r = map.execute_or_join("rapid", || Ok::<_, String>(i)).unwrap();
             assert!(!r.was_joined());
             assert_eq!(r.into_inner(), i);
             assert_eq!(map.inflight_count(), 0);
@@ -1438,9 +1632,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(r.into_inner(), i);
             } else {
-                let r = map.execute_or_join("alt-key", || {
-                    Err::<i32, String>(format!("fail-{i}"))
-                });
+                let r = map.execute_or_join("alt-key", || Err::<i32, String>(format!("fail-{i}")));
                 assert!(r.is_err());
                 assert_eq!(r.unwrap_err(), format!("fail-{i}"));
             }

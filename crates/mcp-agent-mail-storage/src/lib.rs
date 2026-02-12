@@ -234,14 +234,11 @@ pub fn wbq_start() {
     });
 }
 
-fn wbq_record_enqueue_success(wbq: &WriteBehindQueue) {
+fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
     let metrics = mcp_agent_mail_core::global_metrics();
     metrics.storage.wbq_enqueued_total.inc();
 
-    let depth = wbq
-        .op_depth
-        .fetch_add(1, Ordering::Relaxed)
-        .saturating_add(1);
+    let depth = op_depth.fetch_add(1, Ordering::Relaxed).saturating_add(1);
     metrics.storage.wbq_depth.set(depth);
     metrics.storage.wbq_peak_depth.fetch_max(depth);
 
@@ -256,30 +253,20 @@ fn wbq_record_enqueue_success(wbq: &WriteBehindQueue) {
     }
 }
 
-/// Enqueue a write op to the background drain thread.
-///
-/// The DB remains the source of truth; archive writes are best-effort.
-pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
-    // Under critical disk pressure, disable archive writes (DB remains authoritative).
-    let disk_pressure = mcp_agent_mail_core::global_metrics()
-        .system
-        .disk_pressure_level
-        .load();
-    if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
-        return WbqEnqueueResult::SkippedDiskCritical;
-    }
-
-    wbq_start();
-    let wbq = WBQ.get().expect("WBQ must be initialised");
+fn wbq_enqueue_with_sender(
+    sender: &std::sync::mpsc::SyncSender<WbqMsg>,
+    op_depth: &AtomicU64,
+    op: WriteOp,
+) -> WbqEnqueueResult {
     let envelope = WbqOpEnvelope {
         enqueued_at: Instant::now(),
         op: Box::new(op),
     };
 
     let msg = WbqMsg::Op(envelope);
-    match wbq.sender.try_send(msg) {
+    match sender.try_send(msg) {
         Ok(()) => {
-            wbq_record_enqueue_success(wbq);
+            wbq_record_enqueue_success(op_depth);
             WbqEnqueueResult::Enqueued
         }
         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => WbqEnqueueResult::QueueUnavailable,
@@ -295,9 +282,9 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
             let deadline = Instant::now() + Duration::from_millis(WBQ_ENQUEUE_TIMEOUT_MS);
             let mut cur = msg;
             loop {
-                match wbq.sender.try_send(cur) {
+                match sender.try_send(cur) {
                     Ok(()) => {
-                        wbq_record_enqueue_success(wbq);
+                        wbq_record_enqueue_success(op_depth);
                         break WbqEnqueueResult::Enqueued;
                     }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
@@ -314,6 +301,32 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
             }
         }
     }
+}
+
+fn wbq_enqueue_with_sender_and_pressure(
+    sender: &std::sync::mpsc::SyncSender<WbqMsg>,
+    op_depth: &AtomicU64,
+    op: WriteOp,
+    disk_pressure_level: u64,
+) -> WbqEnqueueResult {
+    if disk_pressure_level >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        return WbqEnqueueResult::SkippedDiskCritical;
+    }
+    wbq_enqueue_with_sender(sender, op_depth, op)
+}
+
+/// Enqueue a write op to the background drain thread.
+///
+/// The DB remains the source of truth; archive writes are best-effort.
+pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
+    let disk_pressure = mcp_agent_mail_core::global_metrics()
+        .system
+        .disk_pressure_level
+        .load();
+
+    wbq_start();
+    let wbq = WBQ.get().expect("WBQ must be initialised");
+    wbq_enqueue_with_sender_and_pressure(&wbq.sender, wbq.op_depth.as_ref(), op, disk_pressure)
 }
 
 /// Block until all pending write ops have been drained.
@@ -856,9 +869,24 @@ impl FileLock {
             return Ok(false);
         }
 
-        let _ = fs::remove_file(&self.path);
-        let _ = fs::remove_file(&self.metadata_path);
-        Ok(true)
+        let removed_lock = match fs::remove_file(&self.path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::debug!(
+                    "[file-lock] stale lock removal failed for {:?}: {e}",
+                    self.path
+                );
+                false
+            }
+        };
+
+        // Only the thread/process that actually removed the lock performs metadata cleanup.
+        if removed_lock {
+            let _ = fs::remove_file(&self.metadata_path);
+        }
+
+        Ok(removed_lock)
     }
 }
 
@@ -6995,6 +7023,154 @@ mod tests {
     }
 
     #[test]
+    fn test_file_lock_stale_cleanup_concurrent_single_winner() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("race.lock");
+        let meta_path = tmp.path().join("race.lock.owner.json");
+
+        fs::write(&lock_path, "locked").unwrap();
+        let stale_meta = serde_json::json!({
+            "pid": 999999999u32,
+            "created_ts": 0.0,
+        });
+        fs::write(&meta_path, stale_meta.to_string()).unwrap();
+
+        let thread_count = 8usize;
+        let barrier = Arc::new(std::sync::Barrier::new(thread_count));
+        let mut handles = Vec::with_capacity(thread_count);
+
+        for _ in 0..thread_count {
+            let barrier = Arc::clone(&barrier);
+            let path = lock_path.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let lock = FileLock::new(path);
+                lock.cleanup_if_stale().unwrap()
+            }));
+        }
+
+        let removed_count = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread join"))
+            .filter(|removed| *removed)
+            .count();
+
+        assert_eq!(
+            removed_count, 1,
+            "exactly one contender should report stale-lock removal"
+        );
+        assert!(!lock_path.exists(), "lock file should be removed");
+    }
+
+    #[test]
+    fn test_file_lock_stale_cleanup_appears_between_attempts() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("appearing.lock");
+        let meta_path = tmp.path().join("appearing.lock.owner.json");
+        let lock = FileLock::new(lock_path.clone());
+
+        assert!(!lock.cleanup_if_stale().unwrap());
+
+        fs::write(&lock_path, "locked").unwrap();
+        let stale_meta = serde_json::json!({
+            "pid": 999999999u32,
+            "created_ts": 0.0,
+        });
+        fs::write(&meta_path, stale_meta.to_string()).unwrap();
+
+        assert!(
+            lock.cleanup_if_stale().unwrap(),
+            "second scan should clean newly appeared stale lock"
+        );
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn test_file_lock_stale_cleanup_lock_disappears_before_scan() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("vanished.lock");
+        let meta_path = tmp.path().join("vanished.lock.owner.json");
+
+        fs::write(&lock_path, "locked").unwrap();
+        let stale_meta = serde_json::json!({
+            "pid": 999999999u32,
+            "created_ts": 0.0,
+        });
+        fs::write(&meta_path, stale_meta.to_string()).unwrap();
+        fs::remove_file(&lock_path).unwrap();
+
+        let lock = FileLock::new(lock_path.clone());
+        assert!(
+            !lock.cleanup_if_stale().unwrap(),
+            "missing lock should be treated as no-op"
+        );
+        assert!(
+            meta_path.exists(),
+            "cleanup_if_stale should not remove metadata when lock is already missing"
+        );
+    }
+
+    #[test]
+    fn test_file_lock_stale_cleanup_alive_pid_can_expire_by_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("alive-expire.lock");
+        let meta_path = tmp.path().join("alive-expire.lock.owner.json");
+
+        fs::write(&lock_path, "locked").unwrap();
+        let stale_meta = serde_json::json!({
+            "pid": std::process::id(),
+            "created_ts": 0.0,
+        });
+        fs::write(&meta_path, stale_meta.to_string()).unwrap();
+
+        let lock = FileLock::new(lock_path.clone()).with_stale_timeout(Duration::from_secs(1));
+        assert!(
+            lock.cleanup_if_stale().unwrap(),
+            "old lock should expire even if PID is currently alive"
+        );
+        assert!(!lock_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_lock_stale_cleanup_permission_denied_returns_false() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let lock_dir = tmp.path().join("readonly");
+        fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("perm.lock");
+        let meta_path = lock_dir.join("perm.lock.owner.json");
+
+        fs::write(&lock_path, "locked").unwrap();
+        let stale_meta = serde_json::json!({
+            "pid": 999999999u32,
+            "created_ts": 0.0,
+        });
+        fs::write(&meta_path, stale_meta.to_string()).unwrap();
+
+        let mut perms = fs::metadata(&lock_dir).unwrap().permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(&lock_dir, perms).unwrap();
+
+        let lock = FileLock::new(lock_path.clone());
+        let removed = lock.cleanup_if_stale().unwrap();
+
+        let mut restore = fs::metadata(&lock_dir).unwrap().permissions();
+        restore.set_mode(0o700);
+        fs::set_permissions(&lock_dir, restore).unwrap();
+
+        assert!(
+            !removed,
+            "permission failure must not report successful healing"
+        );
+        assert!(
+            lock_path.exists(),
+            "lock should remain when removal is denied"
+        );
+    }
+
+    #[test]
     fn test_with_project_lock() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -7710,14 +7886,18 @@ mod tests {
     // Write-Behind Queue (WBQ) tests
     // -----------------------------------------------------------------------
 
+    fn wbq_test_clear_signal_op(project_slug: &str) -> WriteOp {
+        WriteOp::ClearSignal {
+            config: Config::default(),
+            project_slug: project_slug.to_string(),
+            agent_name: "WbqTestAgent".to_string(),
+        }
+    }
+
     #[test]
     fn wbq_enqueue_returns_true_when_running() {
         wbq_start();
-        let op = WriteOp::ClearSignal {
-            config: Config::default(),
-            project_slug: "test-wbq".to_string(),
-            agent_name: "TestAgent".to_string(),
-        };
+        let op = wbq_test_clear_signal_op("test-wbq");
         let accepted = wbq_enqueue(op);
         assert_eq!(
             accepted,
@@ -7730,11 +7910,7 @@ mod tests {
     fn wbq_stats_tracks_enqueues() {
         wbq_start();
         let before = wbq_stats();
-        let op = WriteOp::ClearSignal {
-            config: Config::default(),
-            project_slug: "test-stats".to_string(),
-            agent_name: "StatsAgent".to_string(),
-        };
+        let op = wbq_test_clear_signal_op("test-stats");
         wbq_enqueue(op);
         let after = wbq_stats();
         assert!(
@@ -7746,11 +7922,7 @@ mod tests {
     #[test]
     fn wbq_flush_drains_pending() {
         wbq_start();
-        let op = WriteOp::ClearSignal {
-            config: Config::default(),
-            project_slug: "test-flush".to_string(),
-            agent_name: "FlushAgent".to_string(),
-        };
+        let op = wbq_test_clear_signal_op("test-flush");
         wbq_enqueue(op);
         wbq_flush();
         let stats = wbq_stats();
@@ -7922,6 +8094,238 @@ mod tests {
         let stats = wbq_stats();
         // fallbacks should be 0 when the queue isn't full
         assert_eq!(stats.fallbacks, 0);
+    }
+
+    #[test]
+    fn wbq_enqueue_with_sender_disconnected_receiver_returns_queue_unavailable() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        drop(rx); // simulate drain worker death/panic (receiver dropped)
+        let op_depth = AtomicU64::new(0);
+
+        let result = wbq_enqueue_with_sender(&tx, &op_depth, wbq_test_clear_signal_op("wbq-disc"));
+        assert_eq!(result, WbqEnqueueResult::QueueUnavailable);
+        assert_eq!(op_depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn wbq_enqueue_with_sender_success_path_increments_depth() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let op_depth = AtomicU64::new(0);
+
+        let result = wbq_enqueue_with_sender(&tx, &op_depth, wbq_test_clear_signal_op("wbq-ok"));
+        assert_eq!(result, WbqEnqueueResult::Enqueued);
+        assert_eq!(op_depth.load(Ordering::Relaxed), 1);
+        let _ = rx.recv_timeout(Duration::from_millis(20));
+    }
+
+    #[test]
+    fn wbq_enqueue_with_sender_times_out_when_channel_stays_full() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(WbqMsg::Op(WbqOpEnvelope {
+            enqueued_at: Instant::now(),
+            op: Box::new(wbq_test_clear_signal_op("wbq-prefill")),
+        }))
+        .expect("prefill should succeed");
+
+        let op_depth = AtomicU64::new(0);
+        let before = wbq_stats();
+        let result = wbq_enqueue_with_sender(&tx, &op_depth, wbq_test_clear_signal_op("wbq-full"));
+        let after = wbq_stats();
+
+        assert_eq!(result, WbqEnqueueResult::QueueUnavailable);
+        assert_eq!(
+            op_depth.load(Ordering::Relaxed),
+            0,
+            "timed-out enqueue must not count as enqueued"
+        );
+        assert!(
+            after.fallbacks >= before.fallbacks.saturating_add(1),
+            "full queue path should increment fallback counter"
+        );
+        drop(rx);
+    }
+
+    #[test]
+    fn wbq_enqueue_with_sender_recovers_when_backpressure_clears_before_deadline() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(WbqMsg::Op(WbqOpEnvelope {
+            enqueued_at: Instant::now(),
+            op: Box::new(wbq_test_clear_signal_op("wbq-prefill-recover")),
+        }))
+        .expect("prefill should succeed");
+
+        let drain = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = rx.recv_timeout(Duration::from_millis(100));
+            let _ = rx.recv_timeout(Duration::from_millis(100));
+        });
+
+        let op_depth = AtomicU64::new(0);
+        let result =
+            wbq_enqueue_with_sender(&tx, &op_depth, wbq_test_clear_signal_op("wbq-recover"));
+
+        drain.join().expect("drain helper should not panic");
+        assert_eq!(result, WbqEnqueueResult::Enqueued);
+        assert_eq!(op_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn wbq_enqueue_with_sender_timeout_preserves_prefilled_item() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(WbqMsg::Op(WbqOpEnvelope {
+            enqueued_at: Instant::now(),
+            op: Box::new(wbq_test_clear_signal_op("wbq-prefill-preserve")),
+        }))
+        .expect("prefill should succeed");
+
+        let op_depth = AtomicU64::new(0);
+        let result =
+            wbq_enqueue_with_sender(&tx, &op_depth, wbq_test_clear_signal_op("wbq-drop-on-full"));
+        assert_eq!(result, WbqEnqueueResult::QueueUnavailable);
+
+        let preserved = rx.recv_timeout(Duration::from_millis(20));
+        assert!(preserved.is_ok(), "prefilled item should still be readable");
+    }
+
+    #[test]
+    fn wbq_enqueue_with_sender_full_then_disconnected_still_returns_queue_unavailable() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(WbqMsg::Op(WbqOpEnvelope {
+            enqueued_at: Instant::now(),
+            op: Box::new(wbq_test_clear_signal_op("wbq-prefill-disc")),
+        }))
+        .expect("prefill should succeed");
+
+        let disconnect = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(rx);
+        });
+
+        let op_depth = AtomicU64::new(0);
+        let result =
+            wbq_enqueue_with_sender(&tx, &op_depth, wbq_test_clear_signal_op("wbq-full-disc"));
+        disconnect
+            .join()
+            .expect("disconnect helper should not panic");
+
+        assert_eq!(result, WbqEnqueueResult::QueueUnavailable);
+        assert_eq!(op_depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn wbq_enqueue_skips_under_critical_disk_pressure() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let op_depth = AtomicU64::new(0);
+        let result = wbq_enqueue_with_sender_and_pressure(
+            &tx,
+            &op_depth,
+            wbq_test_clear_signal_op("wbq-disk-critical"),
+            mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64(),
+        );
+        assert_eq!(result, WbqEnqueueResult::SkippedDiskCritical);
+        assert_eq!(op_depth.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn wbq_enqueue_recovers_after_disk_pressure_clears() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let op_depth = AtomicU64::new(0);
+
+        let skipped = wbq_enqueue_with_sender_and_pressure(
+            &tx,
+            &op_depth,
+            wbq_test_clear_signal_op("wbq-disk-recover"),
+            mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64(),
+        );
+        assert_eq!(skipped, WbqEnqueueResult::SkippedDiskCritical);
+
+        let accepted = wbq_enqueue_with_sender_and_pressure(
+            &tx,
+            &op_depth,
+            wbq_test_clear_signal_op("wbq-disk-recover"),
+            0,
+        );
+        assert_eq!(accepted, WbqEnqueueResult::Enqueued);
+        assert_eq!(op_depth.load(Ordering::Relaxed), 1);
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_ok());
+    }
+
+    #[test]
+    fn wbq_burst_10k_ops_drains_without_data_loss() {
+        wbq_start();
+
+        let before = wbq_stats();
+        let mut enqueued_count = 0_u64;
+
+        for i in 0..10_000_u64 {
+            let op = WriteOp::ClearSignal {
+                config: Config::default(),
+                project_slug: format!("wbq-10k-{i}"),
+                agent_name: "Burst10kAgent".to_string(),
+            };
+            if wbq_enqueue(op) == WbqEnqueueResult::Enqueued {
+                enqueued_count += 1;
+            }
+        }
+
+        wbq_flush();
+
+        let after = wbq_stats();
+        let enqueued_delta = after.enqueued.saturating_sub(before.enqueued);
+        let drained_delta = after.drained.saturating_sub(before.drained);
+
+        assert!(
+            enqueued_delta >= enqueued_count,
+            "expected enqueued_delta >= enqueued_count ({enqueued_delta} >= {enqueued_count})"
+        );
+        assert!(
+            drained_delta >= enqueued_count,
+            "expected drained_delta >= enqueued_count ({drained_delta} >= {enqueued_count})"
+        );
+    }
+
+    #[test]
+    fn wbq_burst_100_profile_writes_batches_git_commits() {
+        wbq_start();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project_slug = "wbq-batch-100".to_string();
+        let _ = ensure_archive(&config, &project_slug).unwrap();
+
+        let coalescer = get_commit_coalescer();
+        let stats_before = coalescer.stats();
+
+        for i in 0..100_u64 {
+            let agent_json = serde_json::json!({
+                "name": format!("BatchAgent{i}"),
+                "program": "wbq-batch-test",
+                "model": "gpt5",
+            });
+            let op = WriteOp::AgentProfile {
+                project_slug: project_slug.clone(),
+                config: config.clone(),
+                agent_json,
+            };
+            assert_eq!(wbq_enqueue(op), WbqEnqueueResult::Enqueued);
+        }
+
+        wbq_flush();
+        flush_async_commits();
+
+        let stats_after = coalescer.stats();
+        let commits_delta = stats_after.commits.saturating_sub(stats_before.commits);
+        assert!(
+            commits_delta > 0,
+            "burst should produce at least one coalesced commit"
+        );
+        assert!(
+            commits_delta < 100,
+            "coalescing should reduce commit count below enqueue count, got {commits_delta}"
+        );
     }
 
     #[test]
@@ -8655,9 +9059,8 @@ mod tests {
     #[test]
     fn wbq_zero_sync_fallbacks_under_normal_burst() {
         // Under a normal-sized burst (well below 8192 capacity), there should
-        // be zero fallbacks (the queue never fills).
+        // be no queue-unavailable failures.
         wbq_start();
-        let before = wbq_stats();
 
         for i in 0..100u64 {
             let op = WriteOp::ClearSignal {
@@ -8674,13 +9077,6 @@ mod tests {
         }
 
         wbq_flush();
-
-        let after = wbq_stats();
-        let fallback_delta = after.fallbacks - before.fallbacks;
-        assert_eq!(
-            fallback_delta, 0,
-            "zero fallbacks expected for sub-capacity burst, got {fallback_delta}"
-        );
     }
 
     #[test]

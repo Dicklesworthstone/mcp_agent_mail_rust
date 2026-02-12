@@ -150,6 +150,7 @@ pub fn render_status_line(
     help_visible: bool,
     accessibility: &AccessibilitySettings,
     screen_bindings: &[HelpEntry],
+    toast_muted: bool,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -186,6 +187,8 @@ pub fn render_status_line(
 
     // Build right section
     let help_hint = if help_visible { "[?] Help" } else { "? help" };
+    let muted_hint = if toast_muted { " [Toasts: muted]" } else { "" };
+    let right_str = format!("{help_hint}{muted_hint}");
 
     // Calculate widths
     let title = meta.title;
@@ -193,7 +196,7 @@ pub fn render_status_line(
         u16::try_from(1 + title.len() + 12 + transport_mode.len() + uptime_str.len() + 1)
             .unwrap_or(u16::MAX);
     let center_len = u16::try_from(center_str.len()).unwrap_or(u16::MAX);
-    let right_len = u16::try_from(1 + help_hint.len() + 1).unwrap_or(u16::MAX);
+    let right_len = u16::try_from(1 + right_str.len() + 1).unwrap_or(u16::MAX);
     let available = area.width;
 
     // Optional key hints (inserted after counters if we have room).
@@ -313,7 +316,7 @@ pub fn render_status_line(
     }
 
     spans.push(Span::styled(
-        help_hint,
+        right_str,
         Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
     ));
     spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));

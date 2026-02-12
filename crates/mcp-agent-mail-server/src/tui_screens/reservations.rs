@@ -14,7 +14,7 @@ use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::progress::ProgressBar;
 
-use crate::tui_action_menu::{reservations_actions, ActionEntry};
+use crate::tui_action_menu::{ActionEntry, reservations_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};

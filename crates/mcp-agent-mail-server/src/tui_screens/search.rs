@@ -12,7 +12,10 @@ use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
+use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
+use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
+use std::cell::RefCell;
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
@@ -307,6 +310,101 @@ struct ResultEntry {
     thread_id: Option<String>,
     from_agent: Option<String>,
     project_id: Option<i64>,
+}
+
+/// Wrapper for VirtualizedList rendering of search results.
+#[derive(Debug, Clone)]
+struct SearchResultRow {
+    entry: ResultEntry,
+    /// Cached highlight terms for rendering (cloned from screen state).
+    highlight_terms: Vec<QueryTerm>,
+    /// Sort direction for displaying score or date.
+    sort_direction: SortDirection,
+}
+
+impl RenderItem for SearchResultRow {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::widgets::Widget;
+
+        if area.height == 0 || area.width < 10 {
+            return;
+        }
+
+        let w = area.width as usize;
+
+        // Marker for selected row
+        let marker = if selected { '>' } else { ' ' };
+        let cursor_style = Style::default().bold().reverse();
+
+        // Doc type badge
+        let type_badge = match self.entry.doc_kind {
+            DocKind::Message => "M",
+            DocKind::Agent => "A",
+            DocKind::Project => "P",
+        };
+
+        // Importance badge
+        let imp_badge = match self.entry.importance.as_deref() {
+            Some("urgent") => "!!",
+            Some("high") => "!",
+            _ => " ",
+        };
+
+        // Score or date prefix
+        let meta = if self.sort_direction == SortDirection::Relevance {
+            self.entry
+                .score
+                .map_or_else(|| "      ".to_string(), |s| format!("{s:>5.2} "))
+        } else {
+            self.entry.created_ts.map_or_else(
+                || "        ".to_string(),
+                |ts| {
+                    let iso = mcp_agent_mail_db::timestamps::micros_to_iso(ts);
+                    if iso.len() >= 16 {
+                        format!("{} ", &iso[5..16])
+                    } else {
+                        format!("{iso:>11} ")
+                    }
+                },
+            )
+        };
+
+        // Build prefix: marker, type badge, importance, meta
+        let prefix = format!("{marker} [{type_badge}]{imp_badge:>2} {meta}");
+        let prefix_len = prefix.chars().count();
+
+        // Title with remaining space
+        let title_space = w.saturating_sub(prefix_len);
+        let title = truncate_str(&self.entry.title, title_space);
+
+        // Build line with optional highlighting
+        let highlight_style = Style::default().fg(RESULT_CURSOR_FG).bold();
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::raw(prefix));
+
+        if self.highlight_terms.is_empty() {
+            spans.push(Span::raw(title));
+        } else {
+            spans.extend(highlight_spans(
+                &title,
+                &self.highlight_terms,
+                None,
+                highlight_style,
+            ));
+        }
+
+        let line = Line::from_spans(spans);
+        let mut para =
+            ftui::widgets::paragraph::Paragraph::new(ftui::text::Text::from_lines([line]));
+        if selected {
+            para = para.style(cursor_style);
+        }
+        para.render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -608,6 +706,7 @@ pub struct SearchCockpitScreen {
     // Focus
     focus: Focus,
     active_facet: FacetSlot,
+    query_help_visible: bool,
 
     // Search state
     db_conn: Option<DbConn>,
@@ -625,6 +724,9 @@ pub struct SearchCockpitScreen {
 
     /// Synthetic event for the focused search result (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
+
+    /// VirtualizedList state for efficient rendering of search results.
+    list_state: RefCell<VirtualizedListState>,
 }
 
 impl SearchCockpitScreen {
@@ -648,6 +750,7 @@ impl SearchCockpitScreen {
             total_sql_rows: 0,
             focus: Focus::ResultList,
             active_facet: FacetSlot::DocKind,
+            query_help_visible: false,
             db_conn: None,
             db_conn_attempted: false,
             last_query: String::new(),
@@ -659,7 +762,14 @@ impl SearchCockpitScreen {
             history_cursor: None,
             recipes_loaded: false,
             focused_synthetic: None,
+            list_state: RefCell::new(VirtualizedListState::default()),
         }
+    }
+
+    /// Sync the VirtualizedListState with our cursor position.
+    fn sync_list_state(&self) {
+        let mut state = self.list_state.borrow_mut();
+        state.select(Some(self.cursor));
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected search result.
@@ -1216,21 +1326,34 @@ impl MailScreen for SearchCockpitScreen {
             if key.kind == KeyEventKind::Press {
                 match self.focus {
                     Focus::QueryBar => match key.code {
+                        // `?` is reserved for query syntax help while query bar is focused.
+                        KeyCode::Char('?') => {
+                            self.query_help_visible = true;
+                        }
+                        // If the query-help popup is open, any key dismisses it.
+                        // We consume the first key so dismissal is predictable.
+                        _ if self.query_help_visible => {
+                            self.query_help_visible = false;
+                            return Cmd::None;
+                        }
                         KeyCode::Enter => {
                             self.search_dirty = true;
                             self.debounce_remaining = 0;
                             self.focus = Focus::ResultList;
                             self.query_input.set_focused(false);
                             self.history_cursor = None;
+                            self.query_help_visible = false;
                         }
                         KeyCode::Escape => {
                             self.focus = Focus::ResultList;
                             self.query_input.set_focused(false);
                             self.history_cursor = None;
+                            self.query_help_visible = false;
                         }
                         KeyCode::Tab => {
                             self.focus = Focus::FacetRail;
                             self.query_input.set_focused(false);
+                            self.query_help_visible = false;
                         }
                         KeyCode::Up => {
                             // Recall previous history entry
@@ -1466,6 +1589,9 @@ impl MailScreen for SearchCockpitScreen {
 
         // Render query bar
         render_query_bar(frame, query_area, &self.query_input, self);
+        if self.query_help_visible {
+            render_query_help_popup(frame, area, query_area);
+        }
 
         // Body: facet rail (left) + results + detail (right)
         let facet_w: u16 = if area.width >= 100 { 20 } else { 16 };
@@ -1491,11 +1617,12 @@ impl MailScreen for SearchCockpitScreen {
             );
 
             render_facet_rail(frame, facet_area, self);
+            self.sync_list_state();
             render_results(
                 frame,
                 results_area,
                 &self.results,
-                self.cursor,
+                &mut self.list_state.borrow_mut(),
                 &self.highlight_terms,
                 self.sort_direction,
             );
@@ -1515,11 +1642,12 @@ impl MailScreen for SearchCockpitScreen {
                 body_area.height,
             );
             render_facet_rail(frame, facet_area, self);
+            self.sync_list_state();
             render_results(
                 frame,
                 results_area,
                 &self.results,
-                self.cursor,
+                &mut self.list_state.borrow_mut(),
                 &self.highlight_terms,
                 self.sort_direction,
             );
@@ -1587,6 +1715,10 @@ impl MailScreen for SearchCockpitScreen {
             HelpEntry {
                 key: "\u{2191}/\u{2193}",
                 action: "Query history (in query bar)",
+            },
+            HelpEntry {
+                key: "?",
+                action: "Query syntax help (query bar)",
             },
             HelpEntry {
                 key: "\"phrase\"",
@@ -1808,6 +1940,7 @@ const FACET_LABEL_FG: PackedRgba = PackedRgba::rgba(0x87, 0x87, 0x87, 0xFF); // 
 const RESULT_CURSOR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0xD7, 0x00, 0xFF); // Yellow
 const ERROR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0x5F, 0x5F, 0xFF); // Red
 const ACTION_KEY_FG: PackedRgba = PackedRgba::rgba(0x87, 0xD7, 0x87, 0xFF); // Green
+const QUERY_HELP_BG: PackedRgba = PackedRgba::rgba(0x10, 0x10, 0x10, 0xFF); // Dim panel
 
 fn render_query_bar(
     frame: &mut Frame<'_>,
@@ -1868,6 +2001,45 @@ fn render_query_bar(
             .style(style)
             .render(hint_area, frame);
     }
+}
+
+fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) {
+    if area.width < 28 || area.height < 8 {
+        return;
+    }
+
+    let width = area.width.saturating_sub(2).min(60);
+    let height: u16 = 8;
+    if width < 24 || area.height <= height {
+        return;
+    }
+
+    let x = area.x + 1;
+    let desired_y = query_area.y + query_area.height.saturating_sub(1);
+    let max_y = area.y + area.height.saturating_sub(height);
+    let y = desired_y.min(max_y);
+    let popup_area = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title("Query Syntax Help")
+        .border_type(BorderType::Rounded)
+        .style(Style::default().fg(FACET_LABEL_FG).bg(QUERY_HELP_BG));
+    let inner = block.inner(popup_area);
+    block.render(popup_area, frame);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let text = "AND/OR: error AND deploy\n\
+Quotes: \"build failed\"\n\
+Prefix: deploy*\n\
+NOT: error NOT test\n\
+Column: subject:deploy\n\
+Esc/any key: close";
+
+    Paragraph::new(text)
+        .style(Style::default().fg(FACET_LABEL_FG).bg(QUERY_HELP_BG))
+        .render(inner, frame);
 }
 
 fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitScreen) {
@@ -2088,11 +2260,12 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
     Line::from_spans(spans)
 }
 
+/// Render search results using VirtualizedList for O(1) scroll performance.
 fn render_results(
     frame: &mut Frame<'_>,
     area: Rect,
     results: &[ResultEntry],
-    cursor: usize,
+    list_state: &mut VirtualizedListState,
     highlight_terms: &[QueryTerm],
     sort_direction: SortDirection,
 ) {
@@ -2114,43 +2287,28 @@ fn render_results(
         return;
     }
 
-    let visible_h = inner.height as usize;
-
     if results.is_empty() {
         Paragraph::new("  No results found.").render(inner, frame);
         return;
     }
 
-    let total = results.len();
-    let cursor_clamped = cursor.min(total.saturating_sub(1));
-    let (start, end) = viewport_range(total, visible_h, cursor_clamped);
-    let viewport = &results[start..end];
+    // Convert ResultEntry to SearchResultRow for RenderItem trait
+    let rows: Vec<SearchResultRow> = results
+        .iter()
+        .map(|entry| SearchResultRow {
+            entry: entry.clone(),
+            highlight_terms: highlight_terms.to_vec(),
+            sort_direction,
+        })
+        .collect();
 
-    let w = inner.width as usize;
-    let meta_style = Style::default().fg(FACET_LABEL_FG);
-    let cursor_style = Style::default().fg(RESULT_CURSOR_FG);
-    let snippet_style = Style::default().fg(FACET_LABEL_FG);
-    let highlight_style = Style::default().fg(RESULT_CURSOR_FG).bold();
+    // Render using VirtualizedList for efficient scrolling
+    let list = VirtualizedList::new(&rows)
+        .style(Style::default())
+        .highlight_style(Style::default().bold().reverse())
+        .show_scrollbar(true);
 
-    let cfg = ResultListRenderCfg {
-        width: w,
-        highlight_terms,
-        sort_direction,
-        meta_style,
-        cursor_style,
-        snippet_style,
-        highlight_style,
-    };
-
-    let mut lines: Vec<Line> = Vec::with_capacity(viewport.len());
-
-    for (vi, entry) in viewport.iter().enumerate() {
-        let abs_idx = start + vi;
-        let is_cursor = abs_idx == cursor_clamped;
-        lines.push(result_entry_line(entry, is_cursor, &cfg));
-    }
-
-    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+    list.render(inner, frame, list_state);
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -2848,6 +3006,107 @@ mod tests {
 
         assert!(screen.history_cursor.is_none());
         assert_eq!(screen.query_input.value(), "");
+    }
+
+    #[test]
+    fn question_mark_opens_query_help_when_query_bar_focused() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::QueryBar;
+        screen.query_input.set_focused(true);
+        screen.query_input.set_value("deploy");
+
+        let question = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('?'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&question, &state);
+
+        assert!(screen.query_help_visible);
+        assert_eq!(screen.query_input.value(), "deploy");
+    }
+
+    #[test]
+    fn question_mark_does_not_open_query_help_outside_query_bar() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::ResultList;
+
+        let question = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('?'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&question, &state);
+
+        assert!(!screen.query_help_visible);
+    }
+
+    #[test]
+    fn query_help_popup_dismisses_on_any_key() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::QueryBar;
+        screen.query_input.set_focused(true);
+        screen.query_input.set_value("deploy");
+        screen.query_help_visible = true;
+
+        let key = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('x'),
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&key, &state);
+
+        assert!(!screen.query_help_visible);
+        assert_eq!(screen.query_input.value(), "deploy");
+    }
+
+    #[test]
+    fn query_help_popup_escape_only_dismisses_popup() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::QueryBar;
+        screen.query_input.set_focused(true);
+        screen.query_help_visible = true;
+
+        let esc = Event::Key(ftui::KeyEvent {
+            code: KeyCode::Escape,
+            kind: KeyEventKind::Press,
+            modifiers: Modifiers::empty(),
+        });
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.update(&esc, &state);
+
+        assert!(!screen.query_help_visible);
+        assert_eq!(screen.focus, Focus::QueryBar);
+    }
+
+    #[test]
+    fn query_help_popup_renders_when_visible() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::QueryBar;
+        screen.query_input.set_focused(true);
+        screen.query_help_visible = true;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Query Syntax Help"),
+            "expected popup title, got:\n{text}"
+        );
+        assert!(
+            text.contains("subject:deploy"),
+            "expected column example, got:\n{text}"
+        );
     }
 
     #[test]

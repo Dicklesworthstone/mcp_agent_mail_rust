@@ -29,7 +29,7 @@ const SCHEMA_VERSION: &str = "v1";
 pub struct FieldHandles {
     /// Document database ID (u64, indexed + stored + fast)
     pub id: Field,
-    /// Document kind: "message", "agent", or "project" (string, indexed + fast)
+    /// Document kind: "message", "agent", or "project" (string, indexed + stored + fast)
     pub doc_kind: Field,
     /// Subject/title (text, indexed + stored, boost 2.0x via query-time weighting)
     pub subject: Field,
@@ -39,11 +39,11 @@ pub struct FieldHandles {
     pub sender: Field,
     /// Project slug (string, indexed + stored + fast)
     pub project_slug: Field,
-    /// Project ID (u64, indexed + fast)
+    /// Project ID (u64, indexed + stored + fast)
     pub project_id: Field,
     /// Thread ID (string, indexed + stored + fast)
     pub thread_id: Field,
-    /// Importance level: low/normal/high/urgent (string, indexed + fast)
+    /// Importance level: low/normal/high/urgent (string, indexed + stored + fast)
     pub importance: Field,
     /// Created timestamp in microseconds since epoch (i64, indexed + fast)
     pub created_ts: Field,
@@ -74,8 +74,8 @@ pub fn build_schema() -> (Schema, FieldHandles) {
 
     // ── Common fields ──
     let id = builder.add_u64_field("id", INDEXED | STORED | FAST);
-    let doc_kind = builder.add_text_field("doc_kind", STRING | FAST);
-    let project_id = builder.add_u64_field("project_id", INDEXED | FAST);
+    let doc_kind = builder.add_text_field("doc_kind", STRING | STORED | FAST);
+    let project_id = builder.add_u64_field("project_id", INDEXED | STORED | FAST);
     let project_slug = builder.add_text_field("project_slug", STRING | STORED | FAST);
     let created_ts = builder.add_i64_field("created_ts", INDEXED | STORED | FAST);
 
@@ -84,7 +84,7 @@ pub fn build_schema() -> (Schema, FieldHandles) {
     let body = builder.add_text_field("body", text_stored);
     let sender = builder.add_text_field("sender", STRING | STORED | FAST);
     let thread_id = builder.add_text_field("thread_id", STRING | STORED | FAST);
-    let importance = builder.add_text_field("importance", STRING | FAST);
+    let importance = builder.add_text_field("importance", STRING | STORED | FAST);
 
     // ── Agent-specific fields (stored for display, not full-text indexed) ──
     let program = builder.add_text_field("program", STORED);

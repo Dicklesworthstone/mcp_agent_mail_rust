@@ -8,9 +8,9 @@
 # - JWT sub identity overrides peer addr for key derivation
 # - Optional Redis backend smoke (best-effort, if REDIS_URL is set)
 #
-# Artifacts:
-# - Server logs: tests/artifacts/rate_limit/<timestamp>/server_*.log
-# - Per-case transcripts: *_status.txt, *_headers.txt, *_body.json, *_curl_stderr.txt
+# Artifacts (via e2e_lib.sh helpers):
+# - Server logs: tests/artifacts/rate_limit/<timestamp>/logs/server_*.log
+# - Per-case directories: <case_id>/request.json, response.json, headers.txt, status.txt
 # - Decision trace: decision_trace.json (+ trace.jsonl)
 
 set -euo pipefail
@@ -42,16 +42,6 @@ fi
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-pick_port() {
-python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-}
 
 # Create an HS256 JWT without external deps (PyJWT not required).
 # Args:
@@ -104,103 +94,48 @@ print(json.dumps(out))
 PY
 }
 
-http_post_tool() {
-    local case_id="$1"
-    local url="$2"
-    local tool_name="$3"
+# rate_limit_server_start: Start server with rate limit config using e2e_start_server_with_logs
+# Args: label db_path storage_root [extra_env_vars...]
+rate_limit_server_start() {
+    local label="$1"
+    local db_path="$2"
+    local storage_root="$3"
     shift 3
 
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
-
-    local payload
-    payload="$(python3 - <<PY "$tool_name"
-import json,sys
-tool=sys.argv[1]
-print(json.dumps({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":tool,"arguments":{}}}))
-PY
-)"
-    e2e_save_artifact "${case_id}_request.json" "${payload}"
-
-    local args=(
-        -sS
-        -D "${headers_file}"
-        -o "${body_file}"
-        -w "%{http_code}"
-        -X POST
-        "${url}"
-        -H "content-type: application/json"
-        --data "${payload}"
+    # Rate limit-specific env vars for hermetic testing
+    local base_env_vars=(
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0"
+        "HTTP_RBAC_ENABLED=0"
+        "HTTP_RATE_LIMIT_ENABLED=1"
+        "HTTP_RATE_LIMIT_TOOLS_PER_MINUTE=1"
+        "HTTP_RATE_LIMIT_TOOLS_BURST=1"
     )
-    for h in "$@"; do
-        args+=(-H "$h")
-    done
 
-    set +e
-    local status
-    status="$(curl "${args[@]}" 2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-
-    echo "${status}" > "${status_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fail "${case_id}: curl failed rc=${rc}"
+    # Start server with base env vars plus any extras passed in
+    if ! e2e_start_server_with_logs "${db_path}" "${storage_root}" "${label}" \
+        "${base_env_vars[@]}" "$@"; then
+        e2e_fail "server (${label}) failed to start"
         return 1
     fi
+
+    # Override URL to use /api/ endpoint instead of /mcp/
+    E2E_SERVER_URL="${E2E_SERVER_URL%/mcp/}/api/"
     return 0
 }
 
-start_server() {
-    local label="$1"
-    local port="$2"
-    local db_path="$3"
-    local storage_root="$4"
-    local bin="$5"
-    shift 5
-
-    local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
-    e2e_log "Starting server (${label}): 127.0.0.1:${port}"
-    e2e_log "  log: ${server_log}"
-
-    (
-        export DATABASE_URL="sqlite:////${db_path}"
-        export STORAGE_ROOT="${storage_root}"
-        export HTTP_HOST="127.0.0.1"
-        export HTTP_PORT="${port}"
-        export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
-        export HTTP_RBAC_ENABLED="0"
-        export HTTP_RATE_LIMIT_ENABLED="1"
-        export HTTP_RATE_LIMIT_TOOLS_PER_MINUTE="1"
-        export HTTP_RATE_LIMIT_TOOLS_BURST="1"
-
-        # Optional overrides passed as KEY=VALUE pairs in remaining args.
-        while [ $# -gt 0 ]; do
-            export "$1"
-            shift
-        done
-
-        "${bin}" serve --host 127.0.0.1 --port "${port}"
-    ) >"${server_log}" 2>&1 &
-    echo $!
-}
-
-stop_server() {
-    local pid="$1"
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill "${pid}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${pid}" 2>/dev/null || true
-    fi
+# rate_limit_rpc_call: Make JSON-RPC tool call (wraps e2e_rpc_call, tolerates non-200)
+# Args: case_id tool_name [extra_headers...]
+rate_limit_rpc_call() {
+    local case_id="$1"
+    local tool_name="$2"
+    shift 2
+    # Use e2e_rpc_call; suppress error return for 429 codes
+    e2e_rpc_call "${case_id}" "${E2E_SERVER_URL}" "${tool_name}" "{}" "$@" || true
 }
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-
-# e2e_ensure_binary is verbose (logs to stdout); take the last line as the path.
-BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
 # ---------------------------------------------------------------------------
 # Run 1: Memory backend (Bearer token auth)
@@ -211,70 +146,81 @@ e2e_banner "Run 1: Memory backend (static bearer token)"
 WORK_MEM="$(e2e_mktemp "e2e_rate_limit_mem")"
 DB_MEM="${WORK_MEM}/db.sqlite3"
 STORAGE_MEM="${WORK_MEM}/storage_root"
-PORT_MEM="$(pick_port)"
-URL_MEM="http://127.0.0.1:${PORT_MEM}/api/"
+mkdir -p "${STORAGE_MEM}"
 TOKEN="e2e-token"
 
-PID_MEM="$(start_server "memory" "${PORT_MEM}" "${DB_MEM}" "${STORAGE_MEM}" "${BIN}" \
+if ! rate_limit_server_start "memory" "${DB_MEM}" "${STORAGE_MEM}" \
     "HTTP_BEARER_TOKEN=${TOKEN}" \
     "HTTP_JWT_ENABLED=0" \
-    "HTTP_RATE_LIMIT_BACKEND=memory" \
-)"
-trap 'stop_server "${PID_MEM}"' EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT_MEM}" 10; then
-    e2e_fail "memory server failed to start (port not open)"
+    "HTTP_RATE_LIMIT_BACKEND=memory"; then
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
+trap 'e2e_stop_server || true' EXIT
 
 AUTHZ="Authorization: Bearer ${TOKEN}"
 
 e2e_case_banner "Basic allow/deny on same tool (memory)"
-http_post_tool "mem_case1_req1" "${URL_MEM}" "health_check" "${AUTHZ}"
-S1="$(cat "${E2E_ARTIFACT_DIR}/mem_case1_req1_status.txt")"
+e2e_mark_case_start "mem_case1_req1"
+rate_limit_rpc_call "mem_case1_req1" "health_check" "${AUTHZ}"
+S1="$(e2e_rpc_read_status "mem_case1_req1")"
 trace_add "memory" "basic_1" "health_check" "200" "${S1}"
 e2e_assert_eq "req1 HTTP 200" "200" "${S1}"
+e2e_mark_case_end "mem_case1_req1"
 
-http_post_tool "mem_case1_req2" "${URL_MEM}" "health_check" "${AUTHZ}"
-S2="$(cat "${E2E_ARTIFACT_DIR}/mem_case1_req2_status.txt")"
+e2e_mark_case_start "mem_case1_req2"
+rate_limit_rpc_call "mem_case1_req2" "health_check" "${AUTHZ}"
+S2="$(e2e_rpc_read_status "mem_case1_req2")"
 trace_add "memory" "basic_2" "health_check" "429" "${S2}"
 e2e_assert_eq "req2 HTTP 429" "429" "${S2}"
+e2e_mark_case_end "mem_case1_req2"
 
 e2e_case_banner "Per-tool isolation (memory)"
-http_post_tool "mem_case2_tool_a_1" "${URL_MEM}" "tool_a" "${AUTHZ}"
-SA1="$(cat "${E2E_ARTIFACT_DIR}/mem_case2_tool_a_1_status.txt")"
+e2e_mark_case_start "mem_case2_tool_a_1"
+rate_limit_rpc_call "mem_case2_tool_a_1" "tool_a" "${AUTHZ}"
+SA1="$(e2e_rpc_read_status "mem_case2_tool_a_1")"
 trace_add "memory" "per_tool_a_1" "tool_a" "200" "${SA1}"
 e2e_assert_eq "tool_a first HTTP 200" "200" "${SA1}"
+e2e_mark_case_end "mem_case2_tool_a_1"
 
-http_post_tool "mem_case2_tool_b_1" "${URL_MEM}" "tool_b" "${AUTHZ}"
-SB1="$(cat "${E2E_ARTIFACT_DIR}/mem_case2_tool_b_1_status.txt")"
+e2e_mark_case_start "mem_case2_tool_b_1"
+rate_limit_rpc_call "mem_case2_tool_b_1" "tool_b" "${AUTHZ}"
+SB1="$(e2e_rpc_read_status "mem_case2_tool_b_1")"
 trace_add "memory" "per_tool_b_1" "tool_b" "200" "${SB1}"
 e2e_assert_eq "tool_b first HTTP 200" "200" "${SB1}"
+e2e_mark_case_end "mem_case2_tool_b_1"
 
-http_post_tool "mem_case2_tool_a_2" "${URL_MEM}" "tool_a" "${AUTHZ}"
-SA2="$(cat "${E2E_ARTIFACT_DIR}/mem_case2_tool_a_2_status.txt")"
+e2e_mark_case_start "mem_case2_tool_a_2"
+rate_limit_rpc_call "mem_case2_tool_a_2" "tool_a" "${AUTHZ}"
+SA2="$(e2e_rpc_read_status "mem_case2_tool_a_2")"
 trace_add "memory" "per_tool_a_2" "tool_a" "429" "${SA2}"
 e2e_assert_eq "tool_a second HTTP 429" "429" "${SA2}"
+e2e_mark_case_end "mem_case2_tool_a_2"
 
-http_post_tool "mem_case2_tool_b_2" "${URL_MEM}" "tool_b" "${AUTHZ}"
-SB2="$(cat "${E2E_ARTIFACT_DIR}/mem_case2_tool_b_2_status.txt")"
+e2e_mark_case_start "mem_case2_tool_b_2"
+rate_limit_rpc_call "mem_case2_tool_b_2" "tool_b" "${AUTHZ}"
+SB2="$(e2e_rpc_read_status "mem_case2_tool_b_2")"
 trace_add "memory" "per_tool_b_2" "tool_b" "429" "${SB2}"
 e2e_assert_eq "tool_b second HTTP 429" "429" "${SB2}"
+e2e_mark_case_end "mem_case2_tool_b_2"
 
 e2e_case_banner "Forwarded headers do not affect identity key (memory)"
-http_post_tool "mem_case3_fwd_1" "${URL_MEM}" "forwarded_test" "${AUTHZ}" "X-Forwarded-For: 1.2.3.4"
-SF1="$(cat "${E2E_ARTIFACT_DIR}/mem_case3_fwd_1_status.txt")"
+e2e_mark_case_start "mem_case3_fwd_1"
+rate_limit_rpc_call "mem_case3_fwd_1" "forwarded_test" "${AUTHZ}" "X-Forwarded-For: 1.2.3.4"
+SF1="$(e2e_rpc_read_status "mem_case3_fwd_1")"
 trace_add "memory" "forwarded_1" "forwarded_test" "200" "${SF1}" "X-Forwarded-For=1.2.3.4"
 e2e_assert_eq "forwarded req1 HTTP 200" "200" "${SF1}"
+e2e_mark_case_end "mem_case3_fwd_1"
 
-http_post_tool "mem_case3_fwd_2" "${URL_MEM}" "forwarded_test" "${AUTHZ}" "X-Forwarded-For: 5.6.7.8"
-SF2="$(cat "${E2E_ARTIFACT_DIR}/mem_case3_fwd_2_status.txt")"
+e2e_mark_case_start "mem_case3_fwd_2"
+rate_limit_rpc_call "mem_case3_fwd_2" "forwarded_test" "${AUTHZ}" "X-Forwarded-For: 5.6.7.8"
+SF2="$(e2e_rpc_read_status "mem_case3_fwd_2")"
 trace_add "memory" "forwarded_2" "forwarded_test" "429" "${SF2}" "X-Forwarded-For=5.6.7.8"
 e2e_assert_eq "forwarded req2 HTTP 429" "429" "${SF2}"
+e2e_mark_case_end "mem_case3_fwd_2"
 
-stop_server "${PID_MEM}"
+e2e_stop_server
 trap - EXIT
 
 # ---------------------------------------------------------------------------
@@ -286,23 +232,18 @@ e2e_banner "Run 2: JWT backend (sub identity)"
 WORK_JWT="$(e2e_mktemp "e2e_rate_limit_jwt")"
 DB_JWT="${WORK_JWT}/db.sqlite3"
 STORAGE_JWT="${WORK_JWT}/storage_root"
-PORT_JWT="$(pick_port)"
-URL_JWT="http://127.0.0.1:${PORT_JWT}/api/"
+mkdir -p "${STORAGE_JWT}"
 JWT_SECRET="e2e-secret"
 
-PID_JWT="$(start_server "jwt" "${PORT_JWT}" "${DB_JWT}" "${STORAGE_JWT}" "${BIN}" \
+if ! rate_limit_server_start "jwt" "${DB_JWT}" "${STORAGE_JWT}" \
     "HTTP_BEARER_TOKEN=" \
     "HTTP_JWT_ENABLED=1" \
-    "HTTP_JWT_SECRET=${JWT_SECRET}" \
-)"
-trap 'stop_server "${PID_JWT}"' EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT_JWT}" 10; then
-    e2e_fail "jwt server failed to start (port not open)"
+    "HTTP_JWT_SECRET=${JWT_SECRET}"; then
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
+trap 'e2e_stop_server || true' EXIT
 
 JWT1="$(make_jwt_hs256 "${JWT_SECRET}" '{"sub":"user-123"}')"
 JWT2="$(make_jwt_hs256 "${JWT_SECRET}" '{"sub":"user-456"}')"
@@ -311,22 +252,28 @@ AUTHZ1="Authorization: Bearer ${JWT1}"
 AUTHZ2="Authorization: Bearer ${JWT2}"
 
 e2e_case_banner "JWT sub identity isolates buckets"
-http_post_tool "jwt_case1_user1_1" "${URL_JWT}" "health_check" "${AUTHZ1}"
-J1="$(cat "${E2E_ARTIFACT_DIR}/jwt_case1_user1_1_status.txt")"
+e2e_mark_case_start "jwt_case1_user1_1"
+rate_limit_rpc_call "jwt_case1_user1_1" "health_check" "${AUTHZ1}"
+J1="$(e2e_rpc_read_status "jwt_case1_user1_1")"
 trace_add "jwt" "sub_user1_1" "health_check" "200" "${J1}" "sub=user-123"
 e2e_assert_eq "user1 first HTTP 200" "200" "${J1}"
+e2e_mark_case_end "jwt_case1_user1_1"
 
-http_post_tool "jwt_case1_user2_1" "${URL_JWT}" "health_check" "${AUTHZ2}"
-J2="$(cat "${E2E_ARTIFACT_DIR}/jwt_case1_user2_1_status.txt")"
+e2e_mark_case_start "jwt_case1_user2_1"
+rate_limit_rpc_call "jwt_case1_user2_1" "health_check" "${AUTHZ2}"
+J2="$(e2e_rpc_read_status "jwt_case1_user2_1")"
 trace_add "jwt" "sub_user2_1" "health_check" "200" "${J2}" "sub=user-456"
 e2e_assert_eq "user2 first HTTP 200" "200" "${J2}"
+e2e_mark_case_end "jwt_case1_user2_1"
 
-http_post_tool "jwt_case1_user1_2" "${URL_JWT}" "health_check" "${AUTHZ1}"
-J3="$(cat "${E2E_ARTIFACT_DIR}/jwt_case1_user1_2_status.txt")"
+e2e_mark_case_start "jwt_case1_user1_2"
+rate_limit_rpc_call "jwt_case1_user1_2" "health_check" "${AUTHZ1}"
+J3="$(e2e_rpc_read_status "jwt_case1_user1_2")"
 trace_add "jwt" "sub_user1_2" "health_check" "429" "${J3}" "sub=user-123"
 e2e_assert_eq "user1 second HTTP 429" "429" "${J3}"
+e2e_mark_case_end "jwt_case1_user1_2"
 
-stop_server "${PID_JWT}"
+e2e_stop_server
 trap - EXIT
 
 # ---------------------------------------------------------------------------
@@ -339,34 +286,33 @@ if [ -n "${REDIS_URL:-}" ]; then
     WORK_REDIS="$(e2e_mktemp "e2e_rate_limit_redis")"
     DB_REDIS="${WORK_REDIS}/db.sqlite3"
     STORAGE_REDIS="${WORK_REDIS}/storage_root"
-    PORT_REDIS="$(pick_port)"
-    URL_REDIS="http://127.0.0.1:${PORT_REDIS}/api/"
+    mkdir -p "${STORAGE_REDIS}"
 
-    PID_REDIS="$(start_server "redis" "${PORT_REDIS}" "${DB_REDIS}" "${STORAGE_REDIS}" "${BIN}" \
+    if ! rate_limit_server_start "redis" "${DB_REDIS}" "${STORAGE_REDIS}" \
         "HTTP_BEARER_TOKEN=${TOKEN}" \
         "HTTP_JWT_ENABLED=0" \
         "HTTP_RATE_LIMIT_BACKEND=redis" \
-        "HTTP_RATE_LIMIT_REDIS_URL=${REDIS_URL}" \
-    )"
-    trap 'stop_server "${PID_REDIS}"' EXIT
-
-    if ! e2e_wait_port 127.0.0.1 "${PORT_REDIS}" 10; then
-        e2e_fail "redis server failed to start (port not open)"
+        "HTTP_RATE_LIMIT_REDIS_URL=${REDIS_URL}"; then
         e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
         e2e_summary
         exit 1
     fi
+    trap 'e2e_stop_server || true' EXIT
 
     e2e_case_banner "Basic allow/deny on same tool (redis)"
-    http_post_tool "redis_case1_req1" "${URL_REDIS}" "redis_tool" "${AUTHZ}"
-    R1="$(cat "${E2E_ARTIFACT_DIR}/redis_case1_req1_status.txt")"
+    e2e_mark_case_start "redis_case1_req1"
+    rate_limit_rpc_call "redis_case1_req1" "redis_tool" "${AUTHZ}"
+    R1="$(e2e_rpc_read_status "redis_case1_req1")"
     trace_add "redis" "basic_1" "redis_tool" "200" "${R1}"
     e2e_assert_eq "redis req1 HTTP 200" "200" "${R1}"
+    e2e_mark_case_end "redis_case1_req1"
 
-    http_post_tool "redis_case1_req2" "${URL_REDIS}" "redis_tool" "${AUTHZ}"
-    R2="$(cat "${E2E_ARTIFACT_DIR}/redis_case1_req2_status.txt")"
+    e2e_mark_case_start "redis_case1_req2"
+    rate_limit_rpc_call "redis_case1_req2" "redis_tool" "${AUTHZ}"
+    R2="$(e2e_rpc_read_status "redis_case1_req2")"
     trace_add "redis" "basic_2" "redis_tool" "429" "${R2}"
     e2e_assert_eq "redis req2 HTTP 429" "429" "${R2}"
+    e2e_mark_case_end "redis_case1_req2"
 
     # Best-effort Redis state snapshot (requires redis-cli with -u support).
     if command -v redis-cli >/dev/null 2>&1; then
@@ -380,7 +326,7 @@ if [ -n "${REDIS_URL:-}" ]; then
         e2e_skip "redis-cli not available for state snapshot"
     fi
 
-    stop_server "${PID_REDIS}"
+    e2e_stop_server
     trap - EXIT
 else
     e2e_log "REDIS_URL not set; skipping redis backend smoke"

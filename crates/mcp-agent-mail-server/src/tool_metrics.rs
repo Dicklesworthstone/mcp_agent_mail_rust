@@ -126,7 +126,11 @@ fn metrics_loop(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_agent_mail_tools::{record_call, record_error};
+    use mcp_agent_mail_tools::{
+        record_call, record_error, record_latency, reset_tool_latencies, reset_tool_metrics,
+    };
+
+    static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn snapshot_structure_and_ordering() {
@@ -183,5 +187,86 @@ mod tests {
         // Default config has tool_metrics_emit_enabled = false.
         // start() should be a no-op.
         assert!(!config.tool_metrics_emit_enabled);
+    }
+
+    #[test]
+    fn snapshot_includes_latest_latency_bucket() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_tool_metrics();
+
+        record_call("send_message");
+        record_latency("send_message", 800_000); // 800ms
+
+        let snapshot = tool_metrics_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.name == "send_message")
+            .expect("send_message present in snapshot");
+        let latency = entry.latency.as_ref().expect("latency should be captured");
+        assert!(latency.is_slow);
+        assert!(latency.p95_ms >= 500.0, "p95 should cross slow threshold");
+    }
+
+    #[test]
+    fn reset_clears_latency_histograms_between_snapshots() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_tool_metrics();
+
+        record_call("send_message");
+        record_latency("send_message", 200_000);
+        let before = tool_metrics_snapshot();
+        let before_entry = before
+            .iter()
+            .find(|e| e.name == "send_message")
+            .expect("send_message present");
+        assert!(before_entry.latency.is_some());
+
+        reset_tool_latencies();
+
+        let after = tool_metrics_snapshot();
+        let after_entry = after
+            .iter()
+            .find(|e| e.name == "send_message")
+            .expect("send_message present after reset");
+        assert!(
+            after_entry.latency.is_none(),
+            "latency histogram should be cleared while call count remains"
+        );
+    }
+
+    #[test]
+    fn concurrent_record_calls_accumulate_counts() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_tool_metrics();
+
+        let threads = 8usize;
+        let per_thread = 25usize;
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        record_call("health_check");
+                        if i % 5 == 0 {
+                            record_error("health_check");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread join");
+        }
+
+        let snapshot = tool_metrics_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.name == "health_check")
+            .expect("health_check present");
+        assert_eq!(entry.calls, u64::try_from(threads * per_thread).unwrap());
+        assert_eq!(
+            entry.errors,
+            u64::try_from(threads * 5).unwrap(),
+            "every thread records errors at i = 0,5,10,15,20"
+        );
     }
 }

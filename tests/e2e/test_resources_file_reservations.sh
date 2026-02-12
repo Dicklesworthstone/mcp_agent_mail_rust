@@ -11,7 +11,8 @@
 #   4. Verify reservation fields: id, agent, path_pattern, exclusive, expires_ts, reason
 #   5. Release one agent's reservations, re-read resource, verify count decreased
 #   6. Release remaining reservations, verify empty list
-#   7. Error case: file_reservations for nonexistent project
+#   7. Create short-TTL reservation, verify it expires and is not shown
+#   8. Error case: file_reservations for nonexistent project
 
 E2E_SUITE="resources_file_reservations"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -280,6 +281,42 @@ except Exception:
 e2e_assert_eq "GoldFox granted 2 reservations" "2" "$GF_GRANTED"
 e2e_assert_eq "SilverWolf granted 1 reservation" "1" "$SW_GRANTED"
 
+# Verify Python-parity response shape (granted/conflicts arrays)
+GF_SHAPE="$(echo "$GF_RES_TEXT" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    has_granted = isinstance(d.get('granted'), list)
+    has_conflicts = isinstance(d.get('conflicts'), list)
+    conflicts_len = len(d.get('conflicts', []))
+    print(f'has_granted={has_granted}')
+    print(f'has_conflicts={has_conflicts}')
+    print(f'conflicts_len={conflicts_len}')
+except Exception as e:
+    print(f'PARSE_ERROR: {e}')
+" 2>/dev/null)"
+SW_SHAPE="$(echo "$SW_RES_TEXT" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    has_granted = isinstance(d.get('granted'), list)
+    has_conflicts = isinstance(d.get('conflicts'), list)
+    conflicts_len = len(d.get('conflicts', []))
+    print(f'has_granted={has_granted}')
+    print(f'has_conflicts={has_conflicts}')
+    print(f'conflicts_len={conflicts_len}')
+except Exception as e:
+    print(f'PARSE_ERROR: {e}')
+" 2>/dev/null)"
+e2e_save_artifact "case_02_goldfox_shape.txt" "$GF_SHAPE"
+e2e_save_artifact "case_02_silverwolf_shape.txt" "$SW_SHAPE"
+e2e_assert_contains "GoldFox reserve response has granted array" "$GF_SHAPE" "has_granted=True"
+e2e_assert_contains "GoldFox reserve response has conflicts array" "$GF_SHAPE" "has_conflicts=True"
+e2e_assert_contains "GoldFox reserve response conflicts empty" "$GF_SHAPE" "conflicts_len=0"
+e2e_assert_contains "SilverWolf reserve response has granted array" "$SW_SHAPE" "has_granted=True"
+e2e_assert_contains "SilverWolf reserve response has conflicts array" "$SW_SHAPE" "has_conflicts=True"
+e2e_assert_contains "SilverWolf reserve response conflicts empty" "$SW_SHAPE" "conflicts_len=0"
+
 # ===========================================================================
 # Case 3: Read resource://file_reservations/{slug} - verify active reservations
 # ===========================================================================
@@ -475,23 +512,95 @@ e2e_save_artifact "case_06_parsed.txt" "$FR_EMPTY_CHECK"
 e2e_assert_contains "all released: 0 reservations" "$FR_EMPTY_CHECK" "count=0"
 
 # ===========================================================================
-# Case 7: Error case -- file_reservations for nonexistent project
+# Case 7: Short TTL reservation expires and is not shown
+# ===========================================================================
+e2e_case_banner "Short TTL reservation expires out of active view"
+
+SHORT_TTL_PATH="scratch/short_ttl_probe.txt"
+
+SHORT_TTL_RESP="$(send_jsonrpc_session "$FR_DB" \
+    "$INIT_REQ" \
+    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"paths\":[\"${SHORT_TTL_PATH}\"],\"ttl_seconds\":1,\"exclusive\":true,\"reason\":\"short ttl probe\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/${PROJECT_SLUG}\"}}" \
+)"
+e2e_save_artifact "case_07_short_ttl_create.txt" "$SHORT_TTL_RESP"
+
+SHORT_TTL_ERR="$(is_error_result "$SHORT_TTL_RESP" 70)"
+if [ "$SHORT_TTL_ERR" = "false" ]; then
+    e2e_pass "short-TTL reservation creation succeeded"
+else
+    e2e_fail "short-TTL reservation creation returned error"
+fi
+
+SHORT_TTL_TOOL_TEXT="$(extract_result "$SHORT_TTL_RESP" 70)"
+SHORT_TTL_TOOL_CHECK="$(echo "$SHORT_TTL_TOOL_TEXT" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    print(f'granted={len(d.get(\"granted\", []))}')
+    print(f'conflicts={len(d.get(\"conflicts\", []))}')
+except Exception as e:
+    print(f'PARSE_ERROR: {e}')
+" 2>/dev/null)"
+e2e_save_artifact "case_07_short_ttl_tool_check.txt" "$SHORT_TTL_TOOL_CHECK"
+e2e_assert_contains "short-TTL reserve granted exactly 1" "$SHORT_TTL_TOOL_CHECK" "granted=1"
+e2e_assert_contains "short-TTL reserve has no conflicts" "$SHORT_TTL_TOOL_CHECK" "conflicts=0"
+
+SHORT_TTL_BEFORE_TEXT="$(extract_resource_text "$SHORT_TTL_RESP" 71)"
+SHORT_TTL_BEFORE_CHECK="$(echo "$SHORT_TTL_BEFORE_TEXT" | python3 -c "
+import sys, json
+try:
+    arr = json.loads(sys.stdin.read())
+    has_short = any(r.get('path_pattern') == '${SHORT_TTL_PATH}' for r in arr)
+    print(f'has_short={has_short}')
+except Exception as e:
+    print(f'PARSE_ERROR: {e}')
+" 2>/dev/null)"
+e2e_save_artifact "case_07_short_ttl_before.txt" "$SHORT_TTL_BEFORE_CHECK"
+e2e_assert_contains "short-TTL reservation visible immediately" "$SHORT_TTL_BEFORE_CHECK" "has_short=True"
+
+sleep 2
+
+SHORT_TTL_AFTER_RESP="$(send_jsonrpc_session "$FR_DB" \
+    "$INIT_REQ" \
+    "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/${PROJECT_SLUG}\"}}" \
+)"
+e2e_save_artifact "case_07_short_ttl_after.txt" "$SHORT_TTL_AFTER_RESP"
+
+SHORT_TTL_AFTER_TEXT="$(extract_resource_text "$SHORT_TTL_AFTER_RESP" 72)"
+SHORT_TTL_AFTER_CHECK="$(echo "$SHORT_TTL_AFTER_TEXT" | python3 -c "
+import sys, json
+try:
+    arr = json.loads(sys.stdin.read())
+    has_short = any(r.get('path_pattern') == '${SHORT_TTL_PATH}' for r in arr)
+    count = len(arr)
+    print(f'count={count}')
+    print(f'has_short={has_short}')
+except Exception as e:
+    print(f'PARSE_ERROR: {e}')
+" 2>/dev/null)"
+e2e_save_artifact "case_07_short_ttl_after_check.txt" "$SHORT_TTL_AFTER_CHECK"
+e2e_assert_contains "expired reservation not present in active view" "$SHORT_TTL_AFTER_CHECK" "has_short=False"
+e2e_assert_contains "active reservations remain empty after expiry" "$SHORT_TTL_AFTER_CHECK" "count=0"
+
+# ===========================================================================
+# Case 8: Error case -- file_reservations for nonexistent project
 # ===========================================================================
 e2e_case_banner "file_reservations for nonexistent project returns error"
 
 NONEXIST_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":70,"method":"resources/read","params":{"uri":"resource://file_reservations/nonexistent-project-slug-xyz"}}' \
+    '{"jsonrpc":"2.0","id":80,"method":"resources/read","params":{"uri":"resource://file_reservations/nonexistent-project-slug-xyz"}}' \
 )"
-e2e_save_artifact "case_07_nonexistent.txt" "$NONEXIST_RESP"
+e2e_save_artifact "case_08_nonexistent.txt" "$NONEXIST_RESP"
 
-NONEXIST_ERR="$(is_error_result "$NONEXIST_RESP" 70)"
+NONEXIST_ERR="$(is_error_result "$NONEXIST_RESP" 80)"
 if [ "$NONEXIST_ERR" = "true" ]; then
     e2e_pass "file_reservations for nonexistent project correctly returned error"
 else
     # Some implementations may return an empty array instead of an error.
     # Check if the response is an empty array, which is also acceptable.
-    NONEXIST_TEXT="$(extract_resource_text "$NONEXIST_RESP" 70)"
+    NONEXIST_TEXT="$(extract_resource_text "$NONEXIST_RESP" 80)"
     NONEXIST_CHECK="$(echo "$NONEXIST_TEXT" | python3 -c "
 import sys, json
 try:

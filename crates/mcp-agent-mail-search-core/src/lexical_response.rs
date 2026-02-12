@@ -20,14 +20,15 @@ use tantivy::schema::Value;
 #[cfg(feature = "tantivy-engine")]
 use tantivy::{Index, TantivyDocument};
 
+// Always available (used by find_highlights)
+use crate::results::HighlightRange;
+
 #[cfg(feature = "tantivy-engine")]
 use crate::document::DocKind;
 #[cfg(feature = "tantivy-engine")]
 use crate::query::SearchMode;
 #[cfg(feature = "tantivy-engine")]
-use crate::results::{
-    ExplainReport, HighlightRange, HitExplanation, SearchHit, SearchResults,
-};
+use crate::results::{ExplainReport, HitExplanation, SearchHit, SearchResults};
 #[cfg(feature = "tantivy-engine")]
 use crate::tantivy_schema::FieldHandles;
 
@@ -336,10 +337,7 @@ fn build_hit(
         metadata.insert("sender".to_string(), serde_json::json!(sender));
     }
 
-    if let Some(project) = doc
-        .get_first(handles.project_slug)
-        .and_then(|v| v.as_str())
-    {
+    if let Some(project) = doc.get_first(handles.project_slug).and_then(|v| v.as_str()) {
         metadata.insert("project_slug".to_string(), serde_json::json!(project));
     }
 
@@ -583,16 +581,7 @@ mod tests {
         fn execute_search_all_docs() {
             let (index, handles) = setup_index();
             let config = ResponseConfig::default();
-            let results = execute_search(
-                &index,
-                &AllQuery,
-                &handles,
-                &[],
-                100,
-                0,
-                false,
-                &config,
-            );
+            let results = execute_search(&index, &AllQuery, &handles, &[], 100, 0, false, &config);
             assert_eq!(results.total_count, 3);
             assert_eq!(results.hits.len(), 3);
             assert_eq!(results.mode_used, SearchMode::Lexical);
@@ -603,16 +592,7 @@ mod tests {
         fn execute_search_with_limit() {
             let (index, handles) = setup_index();
             let config = ResponseConfig::default();
-            let results = execute_search(
-                &index,
-                &AllQuery,
-                &handles,
-                &[],
-                2,
-                0,
-                false,
-                &config,
-            );
+            let results = execute_search(&index, &AllQuery, &handles, &[], 2, 0, false, &config);
             // total_count reflects docs fetched (up to limit)
             assert!(results.hits.len() <= 2);
         }
@@ -621,16 +601,7 @@ mod tests {
         fn execute_search_with_offset() {
             let (index, handles) = setup_index();
             let config = ResponseConfig::default();
-            let results = execute_search(
-                &index,
-                &AllQuery,
-                &handles,
-                &[],
-                100,
-                2,
-                false,
-                &config,
-            );
+            let results = execute_search(&index, &AllQuery, &handles, &[], 100, 2, false, &config);
             // Should skip 2 results
             assert_eq!(results.hits.len(), 1);
         }
@@ -638,10 +609,7 @@ mod tests {
         #[test]
         fn execute_search_with_query() {
             let (index, handles) = setup_index();
-            let parser = QueryParser::for_index(
-                &index,
-                vec![handles.subject, handles.body],
-            );
+            let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
             let query = parser.parse_query("migration").unwrap();
             let config = ResponseConfig::default();
             let results = execute_search(
@@ -657,20 +625,19 @@ mod tests {
             assert_eq!(results.total_count, 1);
             assert_eq!(results.hits[0].doc_id, 1);
             assert!(results.hits[0].snippet.is_some());
-            assert!(results.hits[0]
-                .snippet
-                .as_ref()
-                .unwrap()
-                .contains("migration"));
+            assert!(
+                results.hits[0]
+                    .snippet
+                    .as_ref()
+                    .unwrap()
+                    .contains("migration")
+            );
         }
 
         #[test]
         fn execute_search_with_explain() {
             let (index, handles) = setup_index();
-            let parser = QueryParser::for_index(
-                &index,
-                vec![handles.subject, handles.body],
-            );
+            let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
             let query = parser.parse_query("migration").unwrap();
             let config = ResponseConfig::default();
             let results = execute_search(
@@ -695,16 +662,7 @@ mod tests {
         fn execute_search_metadata_populated() {
             let (index, handles) = setup_index();
             let config = ResponseConfig::default();
-            let results = execute_search(
-                &index,
-                &AllQuery,
-                &handles,
-                &[],
-                10,
-                0,
-                false,
-                &config,
-            );
+            let results = execute_search(&index, &AllQuery, &handles, &[], 10, 0, false, &config);
 
             // Find doc 1
             let hit = results.hits.iter().find(|h| h.doc_id == 1).unwrap();
@@ -743,10 +701,7 @@ mod tests {
         #[test]
         fn execute_search_empty_results() {
             let (index, handles) = setup_index();
-            let parser = QueryParser::for_index(
-                &index,
-                vec![handles.subject, handles.body],
-            );
+            let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
             let query = parser.parse_query("nonexistent_xyzzy").unwrap();
             let config = ResponseConfig::default();
             let results = execute_search(
@@ -768,16 +723,7 @@ mod tests {
             let (index, handles) = setup_index();
             // AllQuery gives same score to all docs — tie-breaking by ID desc
             let config = ResponseConfig::default();
-            let results = execute_search(
-                &index,
-                &AllQuery,
-                &handles,
-                &[],
-                100,
-                0,
-                false,
-                &config,
-            );
+            let results = execute_search(&index, &AllQuery, &handles, &[], 100, 0, false, &config);
             // After tie-breaking: IDs should be in descending order
             for window in results.hits.windows(2) {
                 if (window[0].score - window[1].score).abs() < f64::EPSILON {

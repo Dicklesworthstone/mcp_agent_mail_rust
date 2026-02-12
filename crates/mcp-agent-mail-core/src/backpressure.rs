@@ -12,7 +12,7 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::metrics::{global_metrics, GlobalMetricsSnapshot};
+use crate::metrics::{GlobalMetricsSnapshot, global_metrics};
 use crate::slo;
 
 // ---------------------------------------------------------------------------
@@ -301,11 +301,7 @@ const fn pct(value: u64, total: u64) -> u64 {
         return 0;
     }
     let p = value.saturating_mul(100).saturating_div(total);
-    if p > 100 {
-        100
-    } else {
-        p
-    }
+    if p > 100 { 100 } else { p }
 }
 
 /// Current time in microseconds (Unix epoch). Infallible.

@@ -231,7 +231,12 @@ impl<'a> ActionMenu<'a> {
         }
 
         // Build text lines manually
-        let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
+        let inner = Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
 
         for (i, entry) in self.state.entries.iter().enumerate() {
             if i >= inner.height as usize {
@@ -296,20 +301,32 @@ impl<'a> ActionMenu<'a> {
         for col in (area.x + 1)..area.right().saturating_sub(1) {
             frame.buffer.set_fast(col, area.y, border_cell('─'));
         }
-        frame.buffer.set_fast(area.right().saturating_sub(1), area.y, border_cell('┐'));
+        frame
+            .buffer
+            .set_fast(area.right().saturating_sub(1), area.y, border_cell('┐'));
 
         // Side borders
         for row in (area.y + 1)..area.bottom().saturating_sub(1) {
             frame.buffer.set_fast(area.x, row, border_cell('│'));
-            frame.buffer.set_fast(area.right().saturating_sub(1), row, border_cell('│'));
+            frame
+                .buffer
+                .set_fast(area.right().saturating_sub(1), row, border_cell('│'));
         }
 
         // Bottom border
-        frame.buffer.set_fast(area.x, area.bottom().saturating_sub(1), border_cell('└'));
+        frame
+            .buffer
+            .set_fast(area.x, area.bottom().saturating_sub(1), border_cell('└'));
         for col in (area.x + 1)..area.right().saturating_sub(1) {
-            frame.buffer.set_fast(col, area.bottom().saturating_sub(1), border_cell('─'));
+            frame
+                .buffer
+                .set_fast(col, area.bottom().saturating_sub(1), border_cell('─'));
         }
-        frame.buffer.set_fast(area.right().saturating_sub(1), area.bottom().saturating_sub(1), border_cell('┘'));
+        frame.buffer.set_fast(
+            area.right().saturating_sub(1),
+            area.bottom().saturating_sub(1),
+            border_cell('┘'),
+        );
 
         // Title
         let title = " Actions ";
@@ -439,7 +456,11 @@ impl ActionMenuManager {
 
 /// Build actions for the Messages screen.
 #[must_use]
-pub fn messages_actions(message_id: i64, thread_id: Option<&str>, sender: &str) -> Vec<ActionEntry> {
+pub fn messages_actions(
+    message_id: i64,
+    thread_id: Option<&str>,
+    sender: &str,
+) -> Vec<ActionEntry> {
     let mut actions = vec![
         ActionEntry::new("View body", ActionKind::Execute("view_body".into()))
             .with_keybinding("v")
@@ -602,12 +623,14 @@ pub fn timeline_actions(event_kind: &str, event_source: &str) -> Vec<ActionEntry
 /// Build actions for the Contacts screen.
 #[must_use]
 pub fn contacts_actions(from_agent: &str, to_agent: &str, status: &str) -> Vec<ActionEntry> {
-    let mut actions = vec![ActionEntry::new(
-        "View agent",
-        ActionKind::DeepLink(DeepLinkTarget::AgentByName(to_agent.to_string())),
-    )
-    .with_keybinding("v")
-    .with_description("View target agent profile")];
+    let mut actions = vec![
+        ActionEntry::new(
+            "View agent",
+            ActionKind::DeepLink(DeepLinkTarget::AgentByName(to_agent.to_string())),
+        )
+        .with_keybinding("v")
+        .with_description("View target agent profile"),
+    ];
 
     if status == "pending" {
         actions.push(

@@ -12,7 +12,10 @@ use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
+use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
+use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
+use std::cell::RefCell;
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::mail_explorer::{AckFilter, Direction, ExplorerStats, GroupMode, SortMode};
@@ -167,6 +170,87 @@ struct DisplayEntry {
     ack_ts: Option<i64>,
 }
 
+/// Wrapper for VirtualizedList rendering of explorer results.
+#[derive(Debug, Clone)]
+struct ExplorerDisplayRow {
+    entry: DisplayEntry,
+}
+
+impl RenderItem for ExplorerDisplayRow {
+    fn render(&self, area: Rect, frame: &mut Frame, selected: bool) {
+        use ftui::text::{Line, Span};
+
+        if area.height == 0 || area.width < 10 {
+            return;
+        }
+
+        let w = area.width as usize;
+
+        // Marker for selected row
+        let marker = if selected { '>' } else { ' ' };
+        let cursor_style = Style::default().bold().reverse();
+
+        // Direction badge
+        let dir_badge = match self.entry.direction {
+            Direction::Inbound => "\u{2190}",  // ←
+            Direction::Outbound => "\u{2192}", // →
+            Direction::All => " ",
+        };
+
+        // Importance badge
+        let imp_badge = match self.entry.importance.as_str() {
+            "urgent" => "!!",
+            "high" => "!",
+            _ => " ",
+        };
+
+        // Ack badge
+        let ack_badge = if self.entry.ack_required {
+            if self.entry.ack_ts.is_some() {
+                "\u{2713}" // ✓
+            } else {
+                "?"
+            }
+        } else {
+            " "
+        };
+
+        // Time column
+        let time = {
+            let iso = micros_to_iso(self.entry.created_ts);
+            if iso.len() >= 19 {
+                iso[11..19].to_string()
+            } else {
+                iso
+            }
+        };
+
+        // Build prefix
+        let prefix = format!(
+            "{marker}{dir_badge}{imp_badge:>2}{ack_badge} #{:<5} {time:>8} ",
+            self.entry.message_id
+        );
+        let prefix_len = prefix.chars().count();
+
+        // Title with remaining space
+        let title_space = w.saturating_sub(prefix_len);
+        let title = truncate_str(&self.entry.subject, title_space);
+
+        // Build line
+        let mut line = Line::from_spans([Span::raw(prefix), Span::raw(title)]);
+        if selected {
+            line.apply_base_style(cursor_style);
+        }
+
+        ftui::widgets::paragraph::Paragraph::new(ftui::text::Text::from_line(line))
+            .render(area, frame);
+    }
+
+    fn height(&self) -> u16 {
+        1
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Pressure board data
 // ──────────────────────────────────────────────────────────────────────
@@ -263,6 +347,9 @@ pub struct MailExplorerScreen {
 
     /// Synthetic event for the focused message (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
+
+    /// VirtualizedList state for O(1) scrolling.
+    list_state: RefCell<VirtualizedListState>,
 }
 
 impl MailExplorerScreen {
@@ -295,7 +382,14 @@ impl MailExplorerScreen {
             pressure_dirty: true,
 
             focused_synthetic: None,
+            list_state: RefCell::new(VirtualizedListState::default()),
         }
+    }
+
+    /// Sync the VirtualizedListState selection with the current cursor.
+    fn sync_list_state(&self) {
+        let mut state = self.list_state.borrow_mut();
+        state.select(Some(self.cursor));
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected message.
@@ -845,6 +939,9 @@ impl MailScreen for MailExplorerScreen {
             return;
         }
 
+        // Sync list state with cursor before rendering
+        self.sync_list_state();
+
         // Layout: header (3-4h) + body
         let header_h: u16 = if area.height >= 6 { 4 } else { 3 };
         let body_h = area.height.saturating_sub(header_h);
@@ -881,7 +978,12 @@ impl MailScreen for MailExplorerScreen {
                 );
 
                 render_filter_rail(frame, filter_area, self);
-                render_results(frame, results_area, &self.entries, self.cursor);
+                render_results(
+                    frame,
+                    results_area,
+                    &self.entries,
+                    &mut self.list_state.borrow_mut(),
+                );
                 render_detail(
                     frame,
                     detail_area,
@@ -896,7 +998,12 @@ impl MailScreen for MailExplorerScreen {
                     body_area.height,
                 );
                 render_filter_rail(frame, filter_area, self);
-                render_results(frame, results_area, &self.entries, self.cursor);
+                render_results(
+                    frame,
+                    results_area,
+                    &self.entries,
+                    &mut self.list_state.borrow_mut(),
+                );
             }
         }
     }
@@ -1282,7 +1389,12 @@ fn render_filter_rail(frame: &mut Frame<'_>, area: Rect, screen: &MailExplorerSc
     }
 }
 
-fn render_results(frame: &mut Frame<'_>, area: Rect, entries: &[DisplayEntry], cursor: usize) {
+fn render_results(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entries: &[DisplayEntry],
+    list_state: &mut VirtualizedListState,
+) {
     let block = Block::default()
         .title("Messages")
         .border_type(BorderType::Rounded);
@@ -1293,69 +1405,22 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, entries: &[DisplayEntry], c
         return;
     }
 
-    let visible_h = inner.height as usize;
-
     if entries.is_empty() {
         Paragraph::new("  No messages found.").render(inner, frame);
         return;
     }
 
-    let total = entries.len();
-    let cursor_clamped = cursor.min(total.saturating_sub(1));
-    let (start, end) = viewport_range(total, visible_h, cursor_clamped);
-    let viewport = &entries[start..end];
+    // Build rows for VirtualizedList
+    let rows: Vec<ExplorerDisplayRow> = entries
+        .iter()
+        .map(|entry| ExplorerDisplayRow {
+            entry: entry.clone(),
+        })
+        .collect();
 
-    let w = inner.width as usize;
-    let mut lines = Vec::with_capacity(viewport.len());
-
-    for (vi, entry) in viewport.iter().enumerate() {
-        let abs_idx = start + vi;
-        let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
-
-        let dir_badge = match entry.direction {
-            Direction::Inbound => "\u{2190}",  // ←
-            Direction::Outbound => "\u{2192}", // →
-            Direction::All => " ",
-        };
-
-        let imp_badge = match entry.importance.as_str() {
-            "urgent" => "!!",
-            "high" => "!",
-            _ => " ",
-        };
-
-        let ack_badge = if entry.ack_required {
-            if entry.ack_ts.is_some() {
-                "\u{2713}" // ✓
-            } else {
-                "?"
-            }
-        } else {
-            " "
-        };
-
-        let time = Some(entry.created_ts)
-            .map(|ts: i64| {
-                let iso = micros_to_iso(ts);
-                if iso.len() >= 19 {
-                    iso[11..19].to_string()
-                } else {
-                    iso
-                }
-            })
-            .unwrap_or_default();
-
-        let prefix = format!(
-            "{marker}{dir_badge}{imp_badge:>2}{ack_badge} #{:<5} {time:>8} ",
-            entry.message_id
-        );
-        let remaining = w.saturating_sub(prefix.len());
-        let title = truncate_str(&entry.subject, remaining);
-        lines.push(format!("{prefix}{title}"));
-    }
-
-    let text = lines.join("\n");
-    Paragraph::new(text).render(inner, frame);
+    VirtualizedList::new(&rows)
+        .show_scrollbar(true)
+        .render(inner, frame, list_state);
 }
 
 #[allow(clippy::cast_possible_truncation)]

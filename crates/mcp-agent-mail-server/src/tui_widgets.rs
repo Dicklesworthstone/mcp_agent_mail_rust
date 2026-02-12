@@ -6,7 +6,7 @@
 //! - [`PercentileRibbon`]: p50/p95/p99 latency bands over time
 //! - [`Leaderboard`]: Ranked list with change indicators and delta values
 //! - [`AnomalyCard`]: Compact anomaly alert card with severity/confidence badges
-//! - [`BrailleActivity`]: Braille-resolution activity sparkline chart
+//! - [`BrailleActivity`]: Braille-resolution activity sparkline chart (DEPRECATED: use ftui_widgets::Sparkline)
 //! - [`MetricTile`]: Compact metric display with inline sparkline
 //! - [`ReservationGauge`]: Reservation pressure bar (ProgressBar-backed)
 //! - [`AgentHeatmap`]: Agent-to-agent communication frequency grid
@@ -21,9 +21,9 @@
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::Widget;
 use ftui::{Cell, Frame, PackedRgba, Style};
 use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_extras::charts::heatmap_gradient;
@@ -1142,6 +1142,16 @@ fn contrast_text(bg: PackedRgba) -> PackedRgba {
 ///
 /// At `NoStyling`, renders a simple ASCII bar chart.
 /// At `Skeleton`, nothing is rendered.
+///
+/// # Deprecation Notice (br-2bbt.4.1)
+///
+/// This widget is **deprecated** in favor of [`ftui_widgets::sparkline::Sparkline`].
+/// New code should use `Sparkline` directly. This struct will be removed in a future
+/// release (see br-2bbt.4.4).
+#[deprecated(
+    since = "0.2.0",
+    note = "Use ftui_widgets::Sparkline instead (br-2bbt.4.1)"
+)]
 #[derive(Debug, Clone)]
 pub struct BrailleActivity<'a> {
     /// Time-series values (left = oldest, right = newest).
@@ -1404,10 +1414,7 @@ impl<'a> MetricTile<'a> {
     }
 }
 
-/// Unicode sparkline characters (8 levels of vertical bar).
-const SPARK_CHARS: &[char] = &[
-    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
-];
+// NOTE: SPARK_CHARS removed in br-2bbt.4.1 — now using ftui_widgets::Sparkline
 
 impl Widget for MetricTile<'_> {
     fn render(&self, area: Rect, frame: &mut Frame) {
@@ -1466,22 +1473,16 @@ impl Widget for MetricTile<'_> {
             Span::styled(trend_str.to_string(), Style::new().fg(trend_color)),
         ];
 
-        // Inline sparkline from recent history.
+        // Inline sparkline from recent history (br-2bbt.4.1: now using ftui_widgets::Sparkline).
         if let Some(data) = self.sparkline {
             let used_len: usize = self.value.len() + 1 + trend_str.len();
             let spark_width = (inner.width as usize).saturating_sub(used_len + 2);
             if spark_width > 0 && !data.is_empty() {
-                let max = data.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+                // Take last spark_width values for right-aligned display.
                 let start_idx = data.len().saturating_sub(spark_width);
-                let spark_str: String = data[start_idx..]
-                    .iter()
-                    .map(|&v| {
-                        let ratio = (v / max).clamp(0.0, 1.0);
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let idx = (ratio * 7.0).round() as usize;
-                        SPARK_CHARS[idx.min(7)]
-                    })
-                    .collect();
+                let slice = &data[start_idx..];
+                // Use Sparkline widget's render_to_string() for consistent block-char mapping.
+                let spark_str = Sparkline::new(slice).min(0.0).render_to_string();
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     spark_str,
@@ -2092,14 +2093,610 @@ impl AnimationBudget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// MessageCard — expandable message card for thread view (br-2bbt.19.1)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Expansion state for a message card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageCardState {
+    /// Collapsed view: sender line + 80-char preview snippet.
+    #[default]
+    Collapsed,
+    /// Expanded view: full header + separator + markdown body + footer hints.
+    Expanded,
+}
+
+/// Message importance level for badge rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageImportance {
+    /// Normal priority — no badge shown.
+    #[default]
+    Normal,
+    /// Low priority.
+    Low,
+    /// High priority — shows amber badge.
+    High,
+    /// Urgent — shows red badge.
+    Urgent,
+}
+
+impl MessageImportance {
+    /// Badge label for display (if any).
+    #[must_use]
+    pub const fn badge_label(self) -> Option<&'static str> {
+        match self {
+            Self::Normal | Self::Low => None,
+            Self::High => Some("HIGH"),
+            Self::Urgent => Some("URGENT"),
+        }
+    }
+
+    /// Badge color.
+    #[must_use]
+    pub const fn badge_color(self) -> PackedRgba {
+        match self {
+            Self::Normal | Self::Low => PackedRgba::rgb(140, 140, 140),
+            Self::High => PackedRgba::rgb(220, 160, 50), // amber
+            Self::Urgent => PackedRgba::rgb(255, 80, 80), // red
+        }
+    }
+}
+
+/// Palette of 8 distinct colors for sender initial badges.
+/// Chosen for good contrast on dark backgrounds and color-blindness friendliness.
+const SENDER_BADGE_COLORS: [PackedRgba; 8] = [
+    PackedRgba::rgb(66, 133, 244), // blue
+    PackedRgba::rgb(52, 168, 83),  // green
+    PackedRgba::rgb(251, 188, 4),  // gold
+    PackedRgba::rgb(234, 67, 53),  // red
+    PackedRgba::rgb(103, 58, 183), // purple
+    PackedRgba::rgb(0, 172, 193),  // cyan
+    PackedRgba::rgb(255, 112, 67), // orange
+    PackedRgba::rgb(124, 179, 66), // lime
+];
+
+/// Compute a deterministic color index from a sender name.
+///
+/// Uses a simple hash (djb2 variant) to map names to one of 8 badge colors.
+/// The same name always produces the same color.
+#[must_use]
+pub fn sender_color_hash(name: &str) -> PackedRgba {
+    let mut hash: u32 = 5381;
+    for byte in name.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(u32::from(byte));
+    }
+    let idx = (hash % 8) as usize;
+    SENDER_BADGE_COLORS[idx]
+}
+
+/// Truncate a body string to approximately `max_chars` characters, breaking at word boundary.
+///
+/// If truncation occurs, appends "…" ellipsis. Respects word boundaries to avoid
+/// cutting words in the middle.
+#[must_use]
+pub fn truncate_at_word_boundary(body: &str, max_chars: usize) -> String {
+    if body.chars().count() <= max_chars {
+        return body.to_string();
+    }
+
+    // Take characters up to max_chars.
+    let truncated: String = body.chars().take(max_chars).collect();
+
+    // Find the last space within the truncated portion for word boundary.
+    if let Some(last_space) = truncated.rfind(' ') {
+        if last_space > max_chars / 2 {
+            // Only break at space if it's not too early in the string.
+            return format!("{}…", &truncated[..last_space]);
+        }
+    }
+
+    // No good word boundary found — hard truncate.
+    format!("{truncated}…")
+}
+
+/// Expandable message card widget for thread conversation view.
+///
+/// Renders a single message in either collapsed or expanded state.
+/// Collapsed shows a 2-line preview; expanded shows the full message body
+/// with markdown rendering.
+///
+/// # Collapsed Layout (2 lines)
+///
+/// ```text
+/// ┌──────────────────────────────────────────────────────────────────────┐
+/// │ [A] AlphaDog · 2m ago · HIGH                                         │
+/// │ This is a preview of the message body truncated at word boundary…    │
+/// └──────────────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// # Expanded Layout (variable height)
+///
+/// ```text
+/// ┌──────────────────────────────────────────────────────────────────────┐
+/// │ [A] AlphaDog · 2m ago · HIGH · #1234                                 │
+/// ├──────────────────────────────────────────────────────────────────────┤
+/// │ Full message body rendered with markdown formatting.                 │
+/// │                                                                      │
+/// │ - Bullet points                                                      │
+/// │ - Code blocks                                                        │
+/// ├──────────────────────────────────────────────────────────────────────┤
+/// │ [View Full] [Jump to Sender]                                         │
+/// └──────────────────────────────────────────────────────────────────────┘
+/// ```
+#[derive(Debug, Clone)]
+pub struct MessageCard<'a> {
+    /// Sender name (e.g., "AlphaDog").
+    sender: &'a str,
+    /// Timestamp display string (e.g., "2m ago", "Jan 5").
+    timestamp: &'a str,
+    /// Message importance level.
+    importance: MessageImportance,
+    /// Message ID (shown in expanded view).
+    message_id: Option<i64>,
+    /// Message body (markdown content).
+    body: &'a str,
+    /// Current expansion state.
+    state: MessageCardState,
+    /// Whether this card is selected/focused.
+    selected: bool,
+    /// Optional block border override.
+    block: Option<Block<'a>>,
+}
+
+impl<'a> MessageCard<'a> {
+    /// Create a new message card.
+    #[must_use]
+    pub const fn new(sender: &'a str, timestamp: &'a str, body: &'a str) -> Self {
+        Self {
+            sender,
+            timestamp,
+            importance: MessageImportance::Normal,
+            message_id: None,
+            body,
+            state: MessageCardState::Collapsed,
+            selected: false,
+            block: None,
+        }
+    }
+
+    /// Set the message importance level.
+    #[must_use]
+    pub const fn importance(mut self, importance: MessageImportance) -> Self {
+        self.importance = importance;
+        self
+    }
+
+    /// Set the message ID (shown in expanded view header).
+    #[must_use]
+    pub const fn message_id(mut self, id: i64) -> Self {
+        self.message_id = Some(id);
+        self
+    }
+
+    /// Set the expansion state.
+    #[must_use]
+    pub const fn state(mut self, state: MessageCardState) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// Mark this card as selected/focused (highlight border).
+    #[must_use]
+    pub const fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    /// Set a custom block border.
+    #[must_use]
+    pub const fn block(mut self, block: Block<'a>) -> Self {
+        self.block = Some(block);
+        self
+    }
+
+    /// Get the sender's initial (first character, uppercase).
+    fn sender_initial(&self) -> char {
+        self.sender
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_ascii_uppercase()
+    }
+
+    /// Get the sender badge color.
+    fn sender_color(&self) -> PackedRgba {
+        sender_color_hash(self.sender)
+    }
+
+    /// Height required to render this card in its current state.
+    #[must_use]
+    pub fn required_height(&self) -> u16 {
+        match self.state {
+            MessageCardState::Collapsed => {
+                // 2 content lines + 2 border lines.
+                4
+            }
+            MessageCardState::Expanded => {
+                // Header: 1 line
+                // Separator: 1 line
+                // Body: estimate lines from body length (rough: 80 chars/line).
+                // Footer: 1 line
+                // Borders: 2 lines
+                let body_chars = self.body.chars().count();
+                #[allow(clippy::cast_possible_truncation)]
+                let body_lines = ((body_chars / 60).max(1) + 1) as u16;
+                2 + 1 + 1 + body_lines + 1 + 2
+            }
+        }
+    }
+}
+
+impl Widget for MessageCard<'_> {
+    fn render(&self, area: Rect, frame: &mut Frame) {
+        if area.is_empty() || area.width < 10 {
+            return;
+        }
+
+        if !frame.buffer.degradation.render_content() {
+            return;
+        }
+
+        // Determine border color based on selection and importance.
+        let border_color = if self.selected {
+            PackedRgba::rgb(100, 160, 255) // soft blue for focus
+        } else {
+            PackedRgba::rgb(60, 60, 70) // dim border
+        };
+
+        // Create block with rounded corners.
+        let block = self
+            .block
+            .clone()
+            .unwrap_or_else(|| {
+                Block::new()
+                    .borders(ftui::widgets::borders::Borders::ALL)
+                    .border_type(ftui::widgets::borders::BorderType::Rounded)
+            })
+            .border_style(Style::new().fg(border_color));
+
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        if inner.width < 8 || inner.height == 0 {
+            return;
+        }
+
+        match self.state {
+            MessageCardState::Collapsed => self.render_collapsed(inner, frame),
+            MessageCardState::Expanded => self.render_expanded(inner, frame),
+        }
+    }
+}
+
+impl MessageCard<'_> {
+    /// Render collapsed state: sender line + preview snippet.
+    fn render_collapsed(&self, inner: Rect, frame: &mut Frame) {
+        let mut y = inner.y;
+
+        // Line 1: [Initial] Sender · timestamp · importance badge
+        {
+            let sender_color = self.sender_color();
+            let initial = self.sender_initial();
+
+            // Build spans.
+            let mut spans = vec![
+                // Badge with colored background.
+                Span::styled(
+                    format!("[{initial}]"),
+                    Style::new()
+                        .fg(PackedRgba::rgb(255, 255, 255))
+                        .bg(sender_color),
+                ),
+                Span::raw(" "),
+                // Sender name (bold via brighter color).
+                Span::styled(
+                    self.sender.to_string(),
+                    Style::new().fg(PackedRgba::rgb(240, 240, 240)),
+                ),
+                Span::styled(" · ", Style::new().fg(PackedRgba::rgb(100, 100, 100))),
+                // Timestamp (dim).
+                Span::styled(
+                    self.timestamp.to_string(),
+                    Style::new().fg(PackedRgba::rgb(140, 140, 140)),
+                ),
+            ];
+
+            // Importance badge (if high/urgent).
+            if let Some(badge) = self.importance.badge_label() {
+                spans.push(Span::styled(
+                    " · ",
+                    Style::new().fg(PackedRgba::rgb(100, 100, 100)),
+                ));
+                spans.push(Span::styled(
+                    badge.to_string(),
+                    Style::new().fg(self.importance.badge_color()),
+                ));
+            }
+
+            let line = Line::from_spans(spans);
+            Paragraph::new(line).render(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                frame,
+            );
+            y += 1;
+        }
+
+        if y >= inner.bottom() {
+            return;
+        }
+
+        // Line 2: Preview snippet (80 chars max, truncated at word boundary).
+        {
+            // Normalize body: collapse whitespace, remove newlines.
+            let normalized: String = self
+                .body
+                .chars()
+                .map(|c| if c.is_whitespace() { ' ' } else { c })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let preview = truncate_at_word_boundary(&normalized, 80);
+            let max_display = (inner.width as usize).saturating_sub(1);
+            let display: String = preview.chars().take(max_display).collect();
+
+            let line = Line::styled(display, Style::new().fg(PackedRgba::rgb(160, 160, 160)));
+            Paragraph::new(line).render(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                frame,
+            );
+        }
+    }
+
+    /// Render expanded state: full header + separator + body + footer.
+    fn render_expanded(&self, inner: Rect, frame: &mut Frame) {
+        let mut y = inner.y;
+
+        // Header line: [Initial] Sender · timestamp · importance badge · #message_id
+        {
+            let sender_color = self.sender_color();
+            let initial = self.sender_initial();
+
+            let mut spans = vec![
+                Span::styled(
+                    format!("[{initial}]"),
+                    Style::new()
+                        .fg(PackedRgba::rgb(255, 255, 255))
+                        .bg(sender_color),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    self.sender.to_string(),
+                    Style::new().fg(PackedRgba::rgb(240, 240, 240)),
+                ),
+                Span::styled(" · ", Style::new().fg(PackedRgba::rgb(100, 100, 100))),
+                Span::styled(
+                    self.timestamp.to_string(),
+                    Style::new().fg(PackedRgba::rgb(140, 140, 140)),
+                ),
+            ];
+
+            if let Some(badge) = self.importance.badge_label() {
+                spans.push(Span::styled(
+                    " · ",
+                    Style::new().fg(PackedRgba::rgb(100, 100, 100)),
+                ));
+                spans.push(Span::styled(
+                    badge.to_string(),
+                    Style::new().fg(self.importance.badge_color()),
+                ));
+            }
+
+            if let Some(id) = self.message_id {
+                spans.push(Span::styled(
+                    " · ",
+                    Style::new().fg(PackedRgba::rgb(100, 100, 100)),
+                ));
+                spans.push(Span::styled(
+                    format!("#{id}"),
+                    Style::new().fg(PackedRgba::rgb(100, 100, 100)),
+                ));
+            }
+
+            let line = Line::from_spans(spans);
+            Paragraph::new(line).render(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                frame,
+            );
+            y += 1;
+        }
+
+        if y >= inner.bottom() {
+            return;
+        }
+
+        // Separator line: thin horizontal rule.
+        {
+            let rule: String = "─".repeat(inner.width as usize);
+            let line = Line::styled(rule, Style::new().fg(PackedRgba::rgb(60, 60, 70)));
+            Paragraph::new(line).render(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                frame,
+            );
+            y += 1;
+        }
+
+        if y >= inner.bottom() {
+            return;
+        }
+
+        // Body area: render message body.
+        // Reserve 1 line for footer separator and 1 for footer hints.
+        let footer_height: u16 = 2;
+        let body_height = inner
+            .bottom()
+            .saturating_sub(y)
+            .saturating_sub(footer_height);
+
+        if body_height > 0 {
+            // Render body as simple wrapped text.
+            // TODO: Use MarkdownRenderer when available (ftui_extras::markdown).
+            let body_area = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: body_height,
+            };
+
+            // Word-wrap the body manually for now.
+            let wrapped = wrap_text(self.body, inner.width as usize);
+            let lines: Vec<Line> = wrapped
+                .iter()
+                .take(body_height as usize)
+                .map(|s| Line::styled(s.clone(), Style::new().fg(PackedRgba::rgb(220, 220, 220))))
+                .collect();
+
+            Paragraph::new(Text::from_lines(lines)).render(body_area, frame);
+            y += body_height;
+        }
+
+        if y >= inner.bottom() {
+            return;
+        }
+
+        // Footer separator.
+        {
+            let rule: String = "─".repeat(inner.width as usize);
+            let line = Line::styled(rule, Style::new().fg(PackedRgba::rgb(60, 60, 70)));
+            Paragraph::new(line).render(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                frame,
+            );
+            y += 1;
+        }
+
+        if y >= inner.bottom() {
+            return;
+        }
+
+        // Footer hints.
+        {
+            let hints = Line::from_spans([
+                Span::styled(
+                    "[View Full]",
+                    Style::new().fg(PackedRgba::rgb(100, 140, 180)),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "[Jump to Sender]",
+                    Style::new().fg(PackedRgba::rgb(100, 140, 180)),
+                ),
+            ]);
+            Paragraph::new(hints).render(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                frame,
+            );
+        }
+    }
+}
+
+/// Simple word-wrapping for text at a given width.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![];
+    }
+
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
+            if !current_line.is_empty() {
+                lines.push(current_line.clone());
+                current_line.clear();
+            }
+            lines.push(String::new());
+            continue;
+        }
+
+        for word in line.split_whitespace() {
+            if current_line.is_empty() {
+                current_line = word.to_string();
+            } else if current_line.len() + 1 + word.len() <= width {
+                current_line.push(' ');
+                current_line.push_str(word);
+            } else {
+                lines.push(current_line.clone());
+                current_line = word.to_string();
+            }
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    lines
+}
+
+impl DrillDownWidget for MessageCard<'_> {
+    fn drill_down_actions(&self, _selected_index: usize) -> Vec<DrillDownAction> {
+        let mut actions = vec![DrillDownAction {
+            label: format!("View sender: {}", self.sender),
+            target: DrillDownTarget::Agent(self.sender.to_string()),
+        }];
+
+        if let Some(id) = self.message_id {
+            actions.push(DrillDownAction {
+                label: format!("View message #{id}"),
+                target: DrillDownTarget::Message(id),
+            });
+        }
+
+        actions
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ftui::layout::Rect;
     use ftui::GraphemePool;
+    use ftui::layout::Rect;
 
     fn render_widget(widget: &impl Widget, width: u16, height: u16) -> String {
         let mut pool = GraphemePool::new();
@@ -2631,6 +3228,24 @@ mod tests {
         assert_ne!(colors[0], colors[2]);
     }
 
+    /// Test that MetricTile sparkline uses Sparkline widget correctly (br-2bbt.4.1).
+    #[test]
+    fn metric_tile_sparkline_uses_sparkline_widget() {
+        // Verify that the sparkline renders block characters from ftui_widgets::Sparkline.
+        let history = [0.0, 25.0, 50.0, 75.0, 100.0];
+        let widget = MetricTile::new("Test", "100", MetricTrend::Up).sparkline(&history);
+        let out = render_widget(&widget, 60, 3);
+        // Should contain block chars from Sparkline: ▁▂▃▄▅▆▇█
+        // At minimum, the output should contain some Unicode block characters.
+        let has_block_chars = out
+            .chars()
+            .any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
+        assert!(
+            has_block_chars,
+            "MetricTile sparkline should render block characters from Sparkline widget"
+        );
+    }
+
     // ─── ReservationGauge tests ────────────────────────────────────────
 
     #[test]
@@ -3103,5 +3718,352 @@ mod tests {
             (budget.utilization() - 1.0).abs() < f64::EPSILON,
             "zero limit should show 100% utilization"
         );
+    }
+
+    // ─── MessageCard tests (br-2bbt.19.1) ────────────────────────────────
+
+    #[test]
+    fn message_card_collapsed_truncates_at_word_boundary() {
+        // Body longer than 80 chars should truncate at word boundary.
+        let long_body = "This is a very long message that should be truncated at a word boundary when rendered in collapsed mode so it fits nicely on the screen.";
+        let truncated = truncate_at_word_boundary(long_body, 80);
+
+        assert!(
+            truncated.len() <= 81,
+            "truncated length {} should be <= 81 (80 + ellipsis)",
+            truncated.len()
+        );
+        assert!(truncated.ends_with('…'), "should end with ellipsis");
+        assert!(
+            !truncated.ends_with(" …"),
+            "should not have space before ellipsis"
+        );
+    }
+
+    #[test]
+    fn message_card_truncate_short_body_unchanged() {
+        let short = "Hello world";
+        let result = truncate_at_word_boundary(short, 80);
+        assert_eq!(result, short, "short body should not be truncated");
+    }
+
+    #[test]
+    fn message_card_truncate_exact_length() {
+        let exact = "a".repeat(80);
+        let result = truncate_at_word_boundary(&exact, 80);
+        assert_eq!(result, exact, "exact length should not be truncated");
+    }
+
+    #[test]
+    fn message_card_truncate_no_spaces() {
+        let no_spaces = "a".repeat(100);
+        let result = truncate_at_word_boundary(&no_spaces, 80);
+        assert_eq!(
+            result.chars().count(),
+            81,
+            "no-space body hard truncates at 80 + ellipsis"
+        );
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn sender_color_hash_deterministic() {
+        // Same name should always produce same color.
+        let color1 = sender_color_hash("AlphaDog");
+        let color2 = sender_color_hash("AlphaDog");
+        assert_eq!(color1, color2, "same name should produce same color");
+
+        // Different names should produce potentially different colors.
+        let color_other = sender_color_hash("BetaCat");
+        // Note: different names may or may not produce different colors due to hash collisions,
+        // but the hash should be deterministic.
+        let color_other2 = sender_color_hash("BetaCat");
+        assert_eq!(
+            color_other, color_other2,
+            "same name should always produce same color"
+        );
+    }
+
+    #[test]
+    fn sender_color_hash_produces_distinct_colors() {
+        // 8 different names should map to potentially different colors.
+        let names = [
+            "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta",
+        ];
+
+        let colors: Vec<PackedRgba> = names.iter().map(|n| sender_color_hash(n)).collect();
+
+        // Count distinct colors.
+        let mut unique = colors.clone();
+        unique.sort_by_key(|c| (c.r(), c.g(), c.b()));
+        unique.dedup();
+
+        // We expect at least 4 distinct colors from 8 names (due to hash collisions).
+        assert!(
+            unique.len() >= 4,
+            "should have at least 4 distinct colors, got {}",
+            unique.len()
+        );
+    }
+
+    #[test]
+    fn sender_color_hash_all_8_palette_colors_reachable() {
+        // Verify that all 8 palette colors are reachable by some name.
+        let mut found_colors = std::collections::HashSet::new();
+
+        // Try many names to find all palette entries.
+        for i in 0..1000 {
+            let name = format!("agent_{i}");
+            found_colors.insert(sender_color_hash(&name));
+
+            if found_colors.len() == 8 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            found_colors.len(),
+            8,
+            "all 8 palette colors should be reachable"
+        );
+    }
+
+    #[test]
+    fn message_card_collapsed_basic() {
+        let widget = MessageCard::new("AlphaDog", "2m ago", "Hello world, this is a test message.")
+            .importance(MessageImportance::Normal);
+        let out = render_widget(&widget, 60, 6);
+        assert!(out.contains('A'), "should show sender initial");
+        assert!(out.contains("AlphaDog"), "should show sender name");
+        assert!(out.contains("2m ago"), "should show timestamp");
+        assert!(out.contains("Hello"), "should show preview");
+    }
+
+    #[test]
+    fn message_card_collapsed_with_importance() {
+        let widget = MessageCard::new("BetaCat", "5m ago", "Urgent message here")
+            .importance(MessageImportance::Urgent);
+        let out = render_widget(&widget, 60, 6);
+        assert!(out.contains("URGENT"), "should show urgent badge");
+    }
+
+    #[test]
+    fn message_card_expanded_basic() {
+        let widget = MessageCard::new(
+            "GammaDog",
+            "10m ago",
+            "Full message body content.\n\nWith multiple paragraphs.",
+        )
+        .state(MessageCardState::Expanded)
+        .message_id(1234);
+        let out = render_widget(&widget, 60, 12);
+        assert!(out.contains('G'), "should show sender initial");
+        assert!(out.contains("GammaDog"), "should show sender name");
+        assert!(out.contains("#1234"), "should show message ID");
+        assert!(out.contains("View Full"), "should show footer hints");
+    }
+
+    #[test]
+    fn message_card_expanded_with_importance() {
+        let widget = MessageCard::new("DeltaFox", "1h ago", "High priority content")
+            .importance(MessageImportance::High)
+            .state(MessageCardState::Expanded);
+        let out = render_widget(&widget, 60, 10);
+        assert!(out.contains("HIGH"), "should show high priority badge");
+    }
+
+    #[test]
+    fn message_card_required_height_collapsed() {
+        let widget = MessageCard::new("Test", "now", "Body").state(MessageCardState::Collapsed);
+        assert_eq!(
+            widget.required_height(),
+            4,
+            "collapsed = 2 content + 2 border"
+        );
+    }
+
+    #[test]
+    fn message_card_required_height_expanded() {
+        let widget =
+            MessageCard::new("Test", "now", "Short body").state(MessageCardState::Expanded);
+        // Expanded: header(1) + sep(1) + body(1-2) + footer(1) + sep(1) + border(2)
+        let h = widget.required_height();
+        assert!(h >= 7, "expanded should be at least 7 lines, got {h}");
+    }
+
+    #[test]
+    fn message_card_selected_state() {
+        let widget = MessageCard::new("Sender", "now", "Content").selected(true);
+        // Should not panic.
+        let _out = render_widget(&widget, 60, 6);
+    }
+
+    #[test]
+    fn message_card_tiny_area() {
+        let widget = MessageCard::new("S", "now", "Body");
+        // Should not panic on tiny area.
+        let _out = render_widget(&widget, 5, 2);
+    }
+
+    #[test]
+    fn message_card_drill_down_actions() {
+        let widget = MessageCard::new("AlphaDog", "now", "Content").message_id(42);
+        let actions = widget.drill_down_actions(0);
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].label.contains("AlphaDog"));
+        assert_eq!(
+            actions[0].target,
+            DrillDownTarget::Agent("AlphaDog".to_string())
+        );
+        assert!(actions[1].label.contains("#42"));
+        assert_eq!(actions[1].target, DrillDownTarget::Message(42));
+    }
+
+    #[test]
+    fn message_card_drill_down_no_id() {
+        let widget = MessageCard::new("BetaCat", "now", "Content");
+        let actions = widget.drill_down_actions(0);
+        assert_eq!(actions.len(), 1, "no message_id = only sender action");
+    }
+
+    #[test]
+    fn message_importance_badges() {
+        assert!(MessageImportance::Normal.badge_label().is_none());
+        assert!(MessageImportance::Low.badge_label().is_none());
+        assert_eq!(MessageImportance::High.badge_label(), Some("HIGH"));
+        assert_eq!(MessageImportance::Urgent.badge_label(), Some("URGENT"));
+    }
+
+    #[test]
+    fn message_importance_colors_distinct() {
+        let high = MessageImportance::High.badge_color();
+        let urgent = MessageImportance::Urgent.badge_color();
+        assert_ne!(high, urgent, "high and urgent should have different colors");
+    }
+
+    #[test]
+    fn wrap_text_basic() {
+        let text = "Hello world this is a test";
+        let wrapped = wrap_text(text, 12);
+        assert!(!wrapped.is_empty());
+        for line in &wrapped {
+            assert!(line.len() <= 12, "line should fit width");
+        }
+    }
+
+    #[test]
+    fn wrap_text_empty() {
+        let wrapped = wrap_text("", 80);
+        assert!(wrapped.is_empty());
+    }
+
+    #[test]
+    fn wrap_text_zero_width() {
+        let wrapped = wrap_text("Hello", 0);
+        assert!(wrapped.is_empty());
+    }
+
+    #[test]
+    fn wrap_text_preserves_paragraphs() {
+        let text = "First paragraph.\n\nSecond paragraph.";
+        let wrapped = wrap_text(text, 80);
+        // Should have blank line between paragraphs.
+        assert!(
+            wrapped.iter().any(|l| l.is_empty()),
+            "should preserve blank lines"
+        );
+    }
+
+    // ─── MessageCard snapshot tests ──────────────────────────────────────
+
+    #[test]
+    fn snapshot_message_card_collapsed() {
+        let widget = MessageCard::new(
+            "AlphaDog",
+            "2m ago",
+            "This is a preview of the message that should be shown in collapsed mode.",
+        )
+        .importance(MessageImportance::Normal);
+        let out = render_widget(&widget, 70, 6);
+
+        // Verify key elements are present.
+        assert!(out.contains("[A]"), "should show sender badge");
+        assert!(out.contains("AlphaDog"), "should show sender name");
+        assert!(out.contains("2m ago"), "should show timestamp");
+        assert!(out.contains("preview"), "should show body preview");
+    }
+
+    #[test]
+    fn snapshot_message_card_expanded() {
+        let widget = MessageCard::new(
+            "BetaCat",
+            "5m ago",
+            "# Heading\n\nThis is the full message body.\n\n- Item 1\n- Item 2",
+        )
+        .importance(MessageImportance::High)
+        .message_id(1234)
+        .state(MessageCardState::Expanded);
+        let out = render_widget(&widget, 70, 14);
+
+        assert!(out.contains("[B]"), "should show sender badge");
+        assert!(out.contains("BetaCat"), "should show sender name");
+        assert!(out.contains("HIGH"), "should show importance");
+        assert!(out.contains("#1234"), "should show message ID");
+        assert!(out.contains("Heading"), "should show body content");
+        assert!(out.contains("[View Full]"), "should show footer");
+    }
+
+    #[test]
+    fn snapshot_message_cards_stacked() {
+        // Render 3 cards: 2 collapsed, 1 expanded.
+        let card1 = MessageCard::new("AlphaDog", "1m ago", "First message preview here")
+            .state(MessageCardState::Collapsed);
+        let card2 = MessageCard::new(
+            "BetaCat",
+            "3m ago",
+            "Full expanded message content\n\nWith details.",
+        )
+        .importance(MessageImportance::High)
+        .message_id(100)
+        .state(MessageCardState::Expanded);
+        let card3 = MessageCard::new("GammaDog", "10m ago", "Third message preview")
+            .state(MessageCardState::Collapsed);
+
+        // Render each card individually (stacking simulation).
+        let out1 = render_widget(&card1, 70, 6);
+        let out2 = render_widget(&card2, 70, 12);
+        let out3 = render_widget(&card3, 70, 6);
+
+        assert!(out1.contains("AlphaDog"));
+        assert!(out2.contains("BetaCat"));
+        assert!(
+            out2.contains("[View Full]"),
+            "expanded card should have footer"
+        );
+        assert!(out3.contains("GammaDog"));
+    }
+
+    #[test]
+    fn perf_message_card_collapsed() {
+        let widget = MessageCard::new(
+            "PerformanceTest",
+            "now",
+            "This is a performance test message with some content to render.",
+        )
+        .importance(MessageImportance::Normal);
+        render_perf(&widget, 80, 6, 500, 300);
+    }
+
+    #[test]
+    fn perf_message_card_expanded() {
+        let widget = MessageCard::new(
+            "PerformanceTest",
+            "now",
+            "# Performance Test\n\nThis is a longer message body.\n\n- Item 1\n- Item 2\n- Item 3\n\nWith multiple paragraphs of content.",
+        )
+        .importance(MessageImportance::Urgent)
+        .message_id(9999)
+        .state(MessageCardState::Expanded);
+        render_perf(&widget, 80, 20, 500, 500);
     }
 }

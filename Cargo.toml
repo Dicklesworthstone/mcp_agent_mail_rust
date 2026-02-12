@@ -93,6 +93,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
 fs2 = "0.4"
+walkdir = "2"
 tantivy = "0.25"
 indexmap = "2"
 smallvec = { version = "1", features = ["serde"] }

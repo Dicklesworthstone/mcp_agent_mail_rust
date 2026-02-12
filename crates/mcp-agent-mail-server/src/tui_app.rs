@@ -12,10 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ftui::Frame;
 use ftui::layout::Rect;
 use ftui::text::display_width;
+use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
 use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
-use ftui::widgets::StatefulWidget;
 use ftui::widgets::modal::{Dialog, DialogResult, DialogState};
 use ftui::widgets::notification_queue::NotificationStack;
 use ftui::widgets::toast::ToastPosition;
@@ -543,7 +543,11 @@ impl MailAppModel {
     }
 
     /// Dispatch an action selected from the action menu.
-    fn dispatch_action_menu_selection(&mut self, action: ActionKind, context: String) -> Cmd<MailMsg> {
+    fn dispatch_action_menu_selection(
+        &mut self,
+        action: ActionKind,
+        context: String,
+    ) -> Cmd<MailMsg> {
         match action {
             ActionKind::Navigate(screen_id) => {
                 self.active_screen = screen_id;
@@ -567,7 +571,11 @@ impl MailAppModel {
                 );
                 Cmd::none()
             }
-            ActionKind::ConfirmThenExecute { title, message, operation } => {
+            ActionKind::ConfirmThenExecute {
+                title,
+                message,
+                operation,
+            } => {
                 // Open confirmation modal for destructive actions
                 self.modal_manager.show_confirmation(
                     title,
@@ -586,9 +594,12 @@ impl MailAppModel {
             ActionKind::CopyToClipboard(text) => {
                 // Clipboard copy would require platform-specific handling
                 self.notifications.notify(
-                    Toast::new(format!("Copied: {}", text.chars().take(30).collect::<String>()))
-                        .icon(ToastIcon::Info)
-                        .duration(Duration::from_secs(2)),
+                    Toast::new(format!(
+                        "Copied: {}",
+                        text.chars().take(30).collect::<String>()
+                    ))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(2)),
                 );
                 Cmd::none()
             }
@@ -1602,7 +1613,8 @@ impl Model for MailAppModel {
                             // Action menu: . opens contextual actions for selected item
                             KeyCode::Char('.') if !text_mode => {
                                 if let Some(screen) = self.screens.get(&self.active_screen) {
-                                    if let Some((entries, anchor, ctx)) = screen.contextual_actions()
+                                    if let Some((entries, anchor, ctx)) =
+                                        screen.contextual_actions()
                                     {
                                         self.action_menu.open(entries, anchor, ctx);
                                     }

@@ -9,6 +9,9 @@ use ftui_extras::theme::{self, ThemeId};
 
 use crate::tui_events::{EventSeverity, MailEventKind};
 
+static CUSTOM_THEME_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // ──────────────────────────────────────────────────────────────────────
 // TuiThemePalette
 // ──────────────────────────────────────────────────────────────────────
@@ -50,6 +53,50 @@ pub struct TuiThemePalette {
 }
 
 impl TuiThemePalette {
+    /// Frankenstein's Monster Theme (Showcase)
+    pub fn frankenstein() -> Self {
+        // Palette:
+        // Dark Green BG: 20, 30, 20
+        // Electric Green FG: 100, 255, 100
+        // Purple Accent: 180, 100, 255
+        // Stitch Gray: 100, 100, 100
+        // Blood Red: 200, 50, 50
+
+        let bg_deep = PackedRgba::rgb(10, 20, 10);
+        let bg_surface = PackedRgba::rgb(20, 40, 20);
+        let fg_primary = PackedRgba::rgb(180, 255, 150);
+        let fg_muted = PackedRgba::rgb(80, 120, 80);
+        let accent = PackedRgba::rgb(180, 80, 220); // Purple stitches
+        let warning = PackedRgba::rgb(220, 200, 50); // Lightning yellow
+        let _error = PackedRgba::rgb(220, 50, 50); // Blood red (reserved for future use)
+
+        Self {
+            tab_active_bg: bg_surface,
+            tab_active_fg: fg_primary,
+            tab_inactive_bg: bg_deep,
+            tab_inactive_fg: fg_muted,
+            tab_key_fg: accent,
+
+            status_bg: bg_deep,
+            status_fg: fg_primary,
+            status_accent: accent,
+            status_good: fg_primary,
+            status_warn: warning,
+
+            help_bg: bg_deep,
+            help_fg: fg_primary,
+            help_key_fg: accent,
+            help_border_fg: accent,
+            help_category_fg: warning,
+
+            sparkline_lo: fg_muted,
+            sparkline_hi: fg_primary,
+
+            table_header_fg: accent,
+            table_row_alt_bg: bg_surface,
+        }
+    }
+
     /// Resolve a palette from a specific theme ID.
     #[must_use]
     pub fn for_theme(id: ThemeId) -> Self {
@@ -87,6 +134,9 @@ impl TuiThemePalette {
     /// Resolve a palette from the currently active ftui theme.
     #[must_use]
     pub fn current() -> Self {
+        if CUSTOM_THEME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            return Self::frankenstein();
+        }
         Self::for_theme(theme::current_theme())
     }
 }
@@ -185,13 +235,31 @@ pub fn style_for_ttl(remaining_secs: u64) -> Style {
 /// palette action. It calls `ftui_extras::theme::cycle_theme()`.
 #[must_use]
 pub fn cycle_and_get_name() -> &'static str {
+    // If currently override, disable it and go to first ftui theme.
+    if CUSTOM_THEME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        CUSTOM_THEME_OVERRIDE.store(false, std::sync::atomic::Ordering::Relaxed);
+        theme::set_theme(ThemeId::CyberpunkAurora);
+        return theme::current_theme_name();
+    }
+
+    // Cycle ftui themes
     theme::cycle_theme();
+
+    // If cycled back to start (default), enable override
+    if theme::current_theme() == ThemeId::CyberpunkAurora {
+        CUSTOM_THEME_OVERRIDE.store(true, std::sync::atomic::Ordering::Relaxed);
+        return "Frankenstein";
+    }
+
     theme::current_theme_name()
 }
 
 /// Get the current theme display name.
 #[must_use]
 pub fn current_theme_name() -> &'static str {
+    if CUSTOM_THEME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return "Frankenstein";
+    }
     theme::current_theme_name()
 }
 

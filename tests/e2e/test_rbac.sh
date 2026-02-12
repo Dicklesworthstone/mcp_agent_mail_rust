@@ -8,9 +8,9 @@
 # - Unknown role is denied for all tools
 # - RBAC error responses include role information
 #
-# Artifacts:
-# - Server logs: tests/artifacts/rbac/<timestamp>/server_*.log
-# - Per-case transcripts: *_status.txt, *_headers.txt, *_body.json, *_curl_stderr.txt
+# Artifacts (via e2e_lib.sh helpers):
+# - Server logs: tests/artifacts/rbac/<timestamp>/logs/server_*.log
+# - Per-case directories: <case_id>/request.json, response.json, headers.txt, status.txt
 
 set -euo pipefail
 
@@ -51,16 +51,6 @@ fail_fast_if_needed() {
     fi
 }
 
-pick_port() {
-python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-}
-
 # Create an HS256 JWT without external deps
 # Args:
 #   $1: secret
@@ -97,65 +87,54 @@ print(json.dumps({"len": int(sys.argv[1]), "sha256": sys.argv[2]}))
 PY
 }
 
-# Make an MCP JSON-RPC tool call request
-make_tool_request() {
-    local tool_name="$1"
-    local arguments="$2"
-    echo "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":1,\"params\":{\"name\":\"${tool_name}\",\"arguments\":${arguments}}}"
-}
+# rbac_server_start: Start server with RBAC config using e2e_start_server_with_logs
+# Args: label [extra_env_vars...]
+rbac_server_start() {
+    local label="$1"
+    shift
 
-http_post_jsonrpc_tool() {
-    local case_id="$1"
-    local url="$2"
-    local tool_name="$3"
-    local arguments="$4"
-    shift 4
-
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
-
-    local payload
-    payload="$(make_tool_request "$tool_name" "$arguments")"
-    e2e_save_artifact "${case_id}_request.json" "${payload}"
-
-    local args=(
-        -sS
-        -D "${headers_file}"
-        -o "${body_file}"
-        -w "%{http_code}"
-        -X POST
-        "${url}"
-        -H "content-type: application/json"
-        --data "${payload}"
+    # RBAC-specific env vars for hermetic testing
+    local base_env_vars=(
+        "HTTP_JWT_ENABLED=1"
+        "HTTP_JWT_SECRET=e2e-rbac-secret"
+        "HTTP_BEARER_TOKEN="
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0"
+        "HTTP_RATE_LIMIT_ENABLED=0"
     )
-    for h in "$@"; do
-        args+=(-H "$h")
-    done
 
-    set +e
-    local status
-    status="$(curl "${args[@]}" 2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-
-    echo "${status}" > "${status_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fail "${case_id}: curl failed rc=${rc}"
+    # Start server with base env vars plus any extras passed in
+    if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "${label}" \
+        "${base_env_vars[@]}" "$@"; then
+        e2e_fail "server (${label}) failed to start"
         return 1
     fi
+
+    # Override URL to use /api/ endpoint instead of /mcp/
+    E2E_SERVER_URL="${E2E_SERVER_URL%/mcp/}/api/"
     return 0
 }
 
+# rbac_rpc_call: Make JSON-RPC tool call (wraps e2e_rpc_call, tolerates non-200)
+# Args: case_id tool_name arguments [extra_headers...]
+rbac_rpc_call() {
+    local case_id="$1"
+    local tool_name="$2"
+    local arguments="$3"
+    shift 3
+    # Use e2e_rpc_call; suppress error return for non-200 codes
+    e2e_rpc_call "${case_id}" "${E2E_SERVER_URL}" "${tool_name}" "${arguments}" "$@" || true
+}
+
 # Check if response is a JSON-RPC error or MCP tool error
+# Args: case_id
 is_error_response() {
-    local body_file="$1"
-    python3 - <<'PY' "$body_file"
+    local case_id="$1"
+    local body
+    body="$(e2e_rpc_read_response "${case_id}")"
+    python3 - <<'PY' "$body"
 import json, sys
 try:
-    with open(sys.argv[1], 'r') as f:
-        d = json.load(f)
+    d = json.loads(sys.argv[1])
     # JSON-RPC level error
     if "error" in d:
         print("true")
@@ -171,13 +150,15 @@ PY
 }
 
 # Check if response contains a permission denied / forbidden error
+# Args: case_id
 is_permission_denied() {
-    local body_file="$1"
-    python3 - <<'PY' "$body_file"
-import json, sys
+    local case_id="$1"
+    local body
+    body="$(e2e_rpc_read_response "${case_id}")"
+    python3 - <<'PY' "$body"
+import sys
 try:
-    with open(sys.argv[1], 'r') as f:
-        content = f.read()
+    content = sys.argv[1]
     # Check for common permission denied indicators
     indicators = ["forbidden", "permission", "denied", "unauthorized", "role", "rbac", "access"]
     content_lower = content.lower()
@@ -191,51 +172,6 @@ except Exception:
 PY
 }
 
-start_server() {
-    local label="$1"
-    local port="$2"
-    local db_path="$3"
-    local storage_root="$4"
-    local bin="$5"
-    shift 5
-
-    local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
-    e2e_log "Starting server (${label}): 127.0.0.1:${port}"
-    e2e_log "  log: ${server_log}"
-
-    (
-        export DATABASE_URL="sqlite:////${db_path}"
-        export STORAGE_ROOT="${storage_root}"
-        export HTTP_HOST="127.0.0.1"
-        export HTTP_PORT="${port}"
-        # Enable JWT for role-based tokens
-        export HTTP_JWT_ENABLED="1"
-        export HTTP_JWT_SECRET="e2e-rbac-secret"
-        # Disable bearer token (use JWT only)
-        export HTTP_BEARER_TOKEN=""
-        export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
-        export HTTP_RATE_LIMIT_ENABLED="0"
-
-        # Optional overrides passed as KEY=VALUE pairs in remaining args.
-        while [ $# -gt 0 ]; do
-            export "$1"
-            shift
-        done
-
-        "${bin}" serve --host 127.0.0.1 --port "${port}"
-    ) >"${server_log}" 2>&1 &
-    echo $!
-}
-
-stop_server() {
-    local pid="$1"
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill "${pid}" 2>/dev/null || true
-        sleep 0.2
-        kill -9 "${pid}" 2>/dev/null || true
-    fi
-}
-
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -244,9 +180,7 @@ WORK="$(e2e_mktemp "e2e_rbac")"
 DB_PATH="${WORK}/db.sqlite3"
 STORAGE_ROOT="${WORK}/storage_root"
 PROJECT_PATH="${WORK}/test_project"
-mkdir -p "${PROJECT_PATH}"
-
-BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+mkdir -p "${PROJECT_PATH}" "${STORAGE_ROOT}"
 
 # ---------------------------------------------------------------------------
 # Create JWT tokens with different roles
@@ -266,64 +200,64 @@ e2e_save_artifact "token_no_role_meta.json" "$(token_meta_json "$NO_ROLE_TOKEN")
 # Run 1: RBAC enabled with read/write role enforcement
 # ---------------------------------------------------------------------------
 
-PORT1="$(pick_port)"
-PID1="$(start_server "rbac_enabled" "${PORT1}" "${DB_PATH}" "${STORAGE_ROOT}" "${BIN}" \
-    "HTTP_RBAC_ENABLED=1")"
-trap 'stop_server "${PID1}" || true' EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT1}" 10; then
-    e2e_fail "server failed to start (port not open)"
+if ! rbac_server_start "rbac_enabled" "HTTP_RBAC_ENABLED=1"; then
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
-
-URL1="http://127.0.0.1:${PORT1}/api/"
+trap 'e2e_stop_server || true' EXIT
 
 # First, set up the project and an agent with writer token
 e2e_case_banner "Setup: ensure_project with writer token"
-http_post_jsonrpc_tool "setup_project" "${URL1}" "ensure_project" "{\"human_key\":\"${PROJECT_PATH}\"}" \
+e2e_mark_case_start "setup_project"
+rbac_rpc_call "setup_project" "ensure_project" "{\"human_key\":\"${PROJECT_PATH}\"}" \
     "Authorization: Bearer ${WRITER_TOKEN}"
-SETUP_STATUS="$(cat "${E2E_ARTIFACT_DIR}/setup_project_status.txt")"
+SETUP_STATUS="$(e2e_rpc_read_status "setup_project")"
 if [ "$SETUP_STATUS" = "200" ]; then
     e2e_pass "ensure_project succeeded with writer token"
 else
     e2e_fail "ensure_project failed with status ${SETUP_STATUS}"
 fi
+e2e_mark_case_end "setup_project"
 
 e2e_case_banner "Setup: register_agent with writer token"
-http_post_jsonrpc_tool "setup_agent" "${URL1}" "register_agent" \
+e2e_mark_case_start "setup_agent"
+rbac_rpc_call "setup_agent" "register_agent" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-rbac\",\"model\":\"test\",\"name\":\"RbacTestAgent\"}" \
     "Authorization: Bearer ${WRITER_TOKEN}"
-AGENT_STATUS="$(cat "${E2E_ARTIFACT_DIR}/setup_agent_status.txt")"
+AGENT_STATUS="$(e2e_rpc_read_status "setup_agent")"
 if [ "$AGENT_STATUS" = "200" ]; then
     e2e_pass "register_agent succeeded with writer token"
 else
     e2e_fail "register_agent failed with status ${AGENT_STATUS}"
 fi
+e2e_mark_case_end "setup_agent"
 
 # ---------------------------------------------------------------------------
 # Case 1-4: Reader role - read operations should succeed
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "Reader role: health_check (should succeed)"
-http_post_jsonrpc_tool "case01_reader_health" "${URL1}" "health_check" "{}" \
+e2e_mark_case_start "case01_reader_health"
+rbac_rpc_call "case01_reader_health" "health_check" "{}" \
     "Authorization: Bearer ${READER_TOKEN}"
-e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case01_reader_health_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case01_reader_health_body.json")"
+e2e_assert_eq "HTTP 200" "200" "$(e2e_rpc_read_status "case01_reader_health")"
+IS_ERROR="$(is_error_response "case01_reader_health")"
 if [ "$IS_ERROR" = "false" ]; then
     e2e_pass "health_check succeeded for reader role"
 else
     e2e_fail "health_check failed for reader role"
 fi
+e2e_mark_case_end "case01_reader_health"
 fail_fast_if_needed
 
 e2e_case_banner "Reader role: whois (read operation - should succeed)"
-http_post_jsonrpc_tool "case02_reader_whois" "${URL1}" "whois" \
+e2e_mark_case_start "case02_reader_whois"
+rbac_rpc_call "case02_reader_whois" "whois" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RbacTestAgent\"}" \
     "Authorization: Bearer ${READER_TOKEN}"
-STATUS_CASE2="$(cat "${E2E_ARTIFACT_DIR}/case02_reader_whois_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case02_reader_whois_body.json")"
+STATUS_CASE2="$(e2e_rpc_read_status "case02_reader_whois")"
+IS_ERROR="$(is_error_response "case02_reader_whois")"
 if [ "$STATUS_CASE2" = "200" ] && [ "$IS_ERROR" = "false" ]; then
     e2e_pass "whois succeeded for reader role"
 else
@@ -334,30 +268,35 @@ else
         e2e_fail "whois denied for reader role (status=${STATUS_CASE2})"
     fi
 fi
+e2e_mark_case_end "case02_reader_whois"
 fail_fast_if_needed
 
 e2e_case_banner "Reader role: fetch_inbox (read operation - should succeed)"
-http_post_jsonrpc_tool "case03_reader_inbox" "${URL1}" "fetch_inbox" \
+e2e_mark_case_start "case03_reader_inbox"
+rbac_rpc_call "case03_reader_inbox" "fetch_inbox" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RbacTestAgent\"}" \
     "Authorization: Bearer ${READER_TOKEN}"
-STATUS_CASE3="$(cat "${E2E_ARTIFACT_DIR}/case03_reader_inbox_status.txt")"
+STATUS_CASE3="$(e2e_rpc_read_status "case03_reader_inbox")"
 if [ "$STATUS_CASE3" = "200" ]; then
     e2e_pass "fetch_inbox accessible for reader role (HTTP 200)"
 else
     e2e_fail "fetch_inbox denied for reader role (status=${STATUS_CASE3})"
 fi
+e2e_mark_case_end "case03_reader_inbox"
 fail_fast_if_needed
 
 e2e_case_banner "Reader role: search_messages (read operation - should succeed)"
-http_post_jsonrpc_tool "case04_reader_search" "${URL1}" "search_messages" \
+e2e_mark_case_start "case04_reader_search"
+rbac_rpc_call "case04_reader_search" "search_messages" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"query\":\"test\"}" \
     "Authorization: Bearer ${READER_TOKEN}"
-STATUS_CASE4="$(cat "${E2E_ARTIFACT_DIR}/case04_reader_search_status.txt")"
+STATUS_CASE4="$(e2e_rpc_read_status "case04_reader_search")"
 if [ "$STATUS_CASE4" = "200" ]; then
     e2e_pass "search_messages accessible for reader role (HTTP 200)"
 else
     e2e_fail "search_messages denied for reader role (status=${STATUS_CASE4})"
 fi
+e2e_mark_case_end "case04_reader_search"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
@@ -365,16 +304,17 @@ fail_fast_if_needed
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "Reader role: send_message (write operation - should be denied)"
-http_post_jsonrpc_tool "case05_reader_send" "${URL1}" "send_message" \
+e2e_mark_case_start "case05_reader_send"
+rbac_rpc_call "case05_reader_send" "send_message" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"RbacTestAgent\",\"to\":[\"RbacTestAgent\"],\"subject\":\"Test\",\"body_md\":\"Body\"}" \
     "Authorization: Bearer ${READER_TOKEN}"
-STATUS_CASE5="$(cat "${E2E_ARTIFACT_DIR}/case05_reader_send_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case05_reader_send_body.json")"
+STATUS_CASE5="$(e2e_rpc_read_status "case05_reader_send")"
+IS_ERROR="$(is_error_response "case05_reader_send")"
 # Reader should be denied - either 403 or tool error
 if [ "$STATUS_CASE5" = "403" ]; then
     e2e_pass "send_message correctly denied with 403 for reader role"
 elif [ "$IS_ERROR" = "true" ]; then
-    IS_PERM_DENIED="$(is_permission_denied "${E2E_ARTIFACT_DIR}/case05_reader_send_body.json")"
+    IS_PERM_DENIED="$(is_permission_denied "case05_reader_send")"
     if [ "$IS_PERM_DENIED" = "true" ]; then
         e2e_pass "send_message correctly denied (tool error with permission message) for reader role"
     else
@@ -386,14 +326,16 @@ elif [ "$STATUS_CASE5" = "200" ]; then
 else
     e2e_fail "Unexpected status ${STATUS_CASE5} for reader send_message"
 fi
+e2e_mark_case_end "case05_reader_send"
 fail_fast_if_needed
 
 e2e_case_banner "Reader role: register_agent (write operation - should be denied)"
-http_post_jsonrpc_tool "case06_reader_register" "${URL1}" "register_agent" \
+e2e_mark_case_start "case06_reader_register"
+rbac_rpc_call "case06_reader_register" "register_agent" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e\",\"model\":\"test\",\"name\":\"NewAgent\"}" \
     "Authorization: Bearer ${READER_TOKEN}"
-STATUS_CASE6="$(cat "${E2E_ARTIFACT_DIR}/case06_reader_register_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case06_reader_register_body.json")"
+STATUS_CASE6="$(e2e_rpc_read_status "case06_reader_register")"
+IS_ERROR="$(is_error_response "case06_reader_register")"
 if [ "$STATUS_CASE6" = "403" ]; then
     e2e_pass "register_agent correctly denied with 403 for reader role"
 elif [ "$IS_ERROR" = "true" ]; then
@@ -403,14 +345,16 @@ elif [ "$STATUS_CASE6" = "200" ]; then
 else
     e2e_fail "Unexpected status ${STATUS_CASE6} for reader register_agent"
 fi
+e2e_mark_case_end "case06_reader_register"
 fail_fast_if_needed
 
 e2e_case_banner "Reader role: file_reservation_paths (write operation - should be denied)"
-http_post_jsonrpc_tool "case07_reader_reserve" "${URL1}" "file_reservation_paths" \
+e2e_mark_case_start "case07_reader_reserve"
+rbac_rpc_call "case07_reader_reserve" "file_reservation_paths" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RbacTestAgent\",\"paths\":[\"src/**\"]}" \
     "Authorization: Bearer ${READER_TOKEN}"
-STATUS_CASE7="$(cat "${E2E_ARTIFACT_DIR}/case07_reader_reserve_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case07_reader_reserve_body.json")"
+STATUS_CASE7="$(e2e_rpc_read_status "case07_reader_reserve")"
+IS_ERROR="$(is_error_response "case07_reader_reserve")"
 if [ "$STATUS_CASE7" = "403" ]; then
     e2e_pass "file_reservation_paths correctly denied with 403 for reader role"
 elif [ "$IS_ERROR" = "true" ]; then
@@ -420,6 +364,7 @@ elif [ "$STATUS_CASE7" = "200" ]; then
 else
     e2e_fail "Unexpected status ${STATUS_CASE7} for reader file_reservation_paths"
 fi
+e2e_mark_case_end "case07_reader_reserve"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
@@ -427,18 +372,21 @@ fail_fast_if_needed
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "Writer role: whois (read operation - should succeed)"
-http_post_jsonrpc_tool "case08_writer_whois" "${URL1}" "whois" \
+e2e_mark_case_start "case08_writer_whois"
+rbac_rpc_call "case08_writer_whois" "whois" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RbacTestAgent\"}" \
     "Authorization: Bearer ${WRITER_TOKEN}"
-e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/case08_writer_whois_status.txt")"
+e2e_assert_eq "HTTP 200" "200" "$(e2e_rpc_read_status "case08_writer_whois")"
+e2e_mark_case_end "case08_writer_whois"
 fail_fast_if_needed
 
 e2e_case_banner "Writer role: send_message (write operation - should succeed)"
-http_post_jsonrpc_tool "case09_writer_send" "${URL1}" "send_message" \
+e2e_mark_case_start "case09_writer_send"
+rbac_rpc_call "case09_writer_send" "send_message" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"RbacTestAgent\",\"to\":[\"RbacTestAgent\"],\"subject\":\"Writer Test\",\"body_md\":\"Writer body\"}" \
     "Authorization: Bearer ${WRITER_TOKEN}"
-STATUS_CASE9="$(cat "${E2E_ARTIFACT_DIR}/case09_writer_send_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case09_writer_send_body.json")"
+STATUS_CASE9="$(e2e_rpc_read_status "case09_writer_send")"
+IS_ERROR="$(is_error_response "case09_writer_send")"
 if [ "$STATUS_CASE9" = "200" ] && [ "$IS_ERROR" = "false" ]; then
     e2e_pass "send_message succeeded for writer role"
 elif [ "$STATUS_CASE9" = "200" ]; then
@@ -446,18 +394,21 @@ elif [ "$STATUS_CASE9" = "200" ]; then
 else
     e2e_fail "send_message failed for writer role (status=${STATUS_CASE9})"
 fi
+e2e_mark_case_end "case09_writer_send"
 fail_fast_if_needed
 
 e2e_case_banner "Writer role: file_reservation_paths (write operation - should succeed)"
-http_post_jsonrpc_tool "case10_writer_reserve" "${URL1}" "file_reservation_paths" \
+e2e_mark_case_start "case10_writer_reserve"
+rbac_rpc_call "case10_writer_reserve" "file_reservation_paths" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RbacTestAgent\",\"paths\":[\"docs/**\"],\"ttl_seconds\":60}" \
     "Authorization: Bearer ${WRITER_TOKEN}"
-STATUS_CASE10="$(cat "${E2E_ARTIFACT_DIR}/case10_writer_reserve_status.txt")"
+STATUS_CASE10="$(e2e_rpc_read_status "case10_writer_reserve")"
 if [ "$STATUS_CASE10" = "200" ]; then
     e2e_pass "file_reservation_paths accessible for writer role (HTTP 200)"
 else
     e2e_fail "file_reservation_paths failed for writer role (status=${STATUS_CASE10})"
 fi
+e2e_mark_case_end "case10_writer_reserve"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
@@ -465,9 +416,10 @@ fail_fast_if_needed
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "Unknown role: health_check (should be denied or limited)"
-http_post_jsonrpc_tool "case11_unknown_health" "${URL1}" "health_check" "{}" \
+e2e_mark_case_start "case11_unknown_health"
+rbac_rpc_call "case11_unknown_health" "health_check" "{}" \
     "Authorization: Bearer ${UNKNOWN_ROLE_TOKEN}"
-STATUS_CASE11="$(cat "${E2E_ARTIFACT_DIR}/case11_unknown_health_status.txt")"
+STATUS_CASE11="$(e2e_rpc_read_status "case11_unknown_health")"
 # Unknown role might be denied entirely or allowed for health checks
 if [ "$STATUS_CASE11" = "401" ] || [ "$STATUS_CASE11" = "403" ]; then
     e2e_pass "unknown role denied access (status=${STATUS_CASE11})"
@@ -477,14 +429,16 @@ elif [ "$STATUS_CASE11" = "200" ]; then
 else
     e2e_fail "Unexpected status ${STATUS_CASE11} for unknown role health_check"
 fi
+e2e_mark_case_end "case11_unknown_health"
 fail_fast_if_needed
 
 e2e_case_banner "Unknown role: send_message (should be denied)"
-http_post_jsonrpc_tool "case12_unknown_send" "${URL1}" "send_message" \
+e2e_mark_case_start "case12_unknown_send"
+rbac_rpc_call "case12_unknown_send" "send_message" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"RbacTestAgent\",\"to\":[\"RbacTestAgent\"],\"subject\":\"Unknown\",\"body_md\":\"Body\"}" \
     "Authorization: Bearer ${UNKNOWN_ROLE_TOKEN}"
-STATUS_CASE12="$(cat "${E2E_ARTIFACT_DIR}/case12_unknown_send_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case12_unknown_send_body.json")"
+STATUS_CASE12="$(e2e_rpc_read_status "case12_unknown_send")"
+IS_ERROR="$(is_error_response "case12_unknown_send")"
 if [ "$STATUS_CASE12" = "401" ] || [ "$STATUS_CASE12" = "403" ]; then
     e2e_pass "unknown role denied send_message (status=${STATUS_CASE12})"
 elif [ "$IS_ERROR" = "true" ]; then
@@ -494,6 +448,7 @@ elif [ "$STATUS_CASE12" = "200" ]; then
 else
     e2e_fail "Unexpected status ${STATUS_CASE12} for unknown role send_message"
 fi
+e2e_mark_case_end "case12_unknown_send"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
@@ -501,9 +456,10 @@ fail_fast_if_needed
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "No role: health_check (should be denied or limited)"
-http_post_jsonrpc_tool "case13_norole_health" "${URL1}" "health_check" "{}" \
+e2e_mark_case_start "case13_norole_health"
+rbac_rpc_call "case13_norole_health" "health_check" "{}" \
     "Authorization: Bearer ${NO_ROLE_TOKEN}"
-STATUS_CASE13="$(cat "${E2E_ARTIFACT_DIR}/case13_norole_health_status.txt")"
+STATUS_CASE13="$(e2e_rpc_read_status "case13_norole_health")"
 if [ "$STATUS_CASE13" = "401" ] || [ "$STATUS_CASE13" = "403" ]; then
     e2e_pass "no-role token denied access (status=${STATUS_CASE13})"
 elif [ "$STATUS_CASE13" = "200" ]; then
@@ -511,14 +467,16 @@ elif [ "$STATUS_CASE13" = "200" ]; then
 else
     e2e_fail "Unexpected status ${STATUS_CASE13} for no-role health_check"
 fi
+e2e_mark_case_end "case13_norole_health"
 fail_fast_if_needed
 
 e2e_case_banner "No role: send_message (should be denied)"
-http_post_jsonrpc_tool "case14_norole_send" "${URL1}" "send_message" \
+e2e_mark_case_start "case14_norole_send"
+rbac_rpc_call "case14_norole_send" "send_message" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"RbacTestAgent\",\"to\":[\"RbacTestAgent\"],\"subject\":\"NoRole\",\"body_md\":\"Body\"}" \
     "Authorization: Bearer ${NO_ROLE_TOKEN}"
-STATUS_CASE14="$(cat "${E2E_ARTIFACT_DIR}/case14_norole_send_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case14_norole_send_body.json")"
+STATUS_CASE14="$(e2e_rpc_read_status "case14_norole_send")"
+IS_ERROR="$(is_error_response "case14_norole_send")"
 if [ "$STATUS_CASE14" = "401" ] || [ "$STATUS_CASE14" = "403" ]; then
     e2e_pass "no-role token denied send_message (status=${STATUS_CASE14})"
 elif [ "$IS_ERROR" = "true" ]; then
@@ -528,6 +486,7 @@ elif [ "$STATUS_CASE14" = "200" ]; then
 else
     e2e_fail "Unexpected status ${STATUS_CASE14} for no-role send_message"
 fi
+e2e_mark_case_end "case14_norole_send"
 fail_fast_if_needed
 
 # ---------------------------------------------------------------------------
@@ -535,44 +494,40 @@ fail_fast_if_needed
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "Reader role: list_contacts (read operation - should succeed)"
-http_post_jsonrpc_tool "case15_reader_contacts" "${URL1}" "list_contacts" \
+e2e_mark_case_start "case15_reader_contacts"
+rbac_rpc_call "case15_reader_contacts" "list_contacts" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RbacTestAgent\"}" \
     "Authorization: Bearer ${READER_TOKEN}"
-STATUS_CASE15="$(cat "${E2E_ARTIFACT_DIR}/case15_reader_contacts_status.txt")"
+STATUS_CASE15="$(e2e_rpc_read_status "case15_reader_contacts")"
 if [ "$STATUS_CASE15" = "200" ]; then
     e2e_pass "list_contacts accessible for reader role (HTTP 200)"
 else
     e2e_fail "list_contacts denied for reader role (status=${STATUS_CASE15})"
 fi
+e2e_mark_case_end "case15_reader_contacts"
 fail_fast_if_needed
 
-stop_server "${PID1}"
+e2e_stop_server
 trap - EXIT
 
 # ---------------------------------------------------------------------------
 # Run 2: RBAC disabled - all operations should succeed regardless of role
 # ---------------------------------------------------------------------------
 
-PORT2="$(pick_port)"
-PID2="$(start_server "rbac_disabled" "${PORT2}" "${DB_PATH}" "${STORAGE_ROOT}" "${BIN}" \
-    "HTTP_RBAC_ENABLED=0")"
-trap 'stop_server "${PID2}" || true' EXIT
-
-if ! e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
-    e2e_fail "server (rbac_disabled) failed to start (port not open)"
+if ! rbac_server_start "rbac_disabled" "HTTP_RBAC_ENABLED=0"; then
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
 fi
-
-URL2="http://127.0.0.1:${PORT2}/api/"
+trap 'e2e_stop_server || true' EXIT
 
 e2e_case_banner "RBAC disabled: reader can send_message"
-http_post_jsonrpc_tool "case16_disabled_reader_send" "${URL2}" "send_message" \
+e2e_mark_case_start "case16_disabled_reader_send"
+rbac_rpc_call "case16_disabled_reader_send" "send_message" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"RbacTestAgent\",\"to\":[\"RbacTestAgent\"],\"subject\":\"No RBAC\",\"body_md\":\"Should work\"}" \
     "Authorization: Bearer ${READER_TOKEN}"
-STATUS_CASE16="$(cat "${E2E_ARTIFACT_DIR}/case16_disabled_reader_send_status.txt")"
-IS_ERROR="$(is_error_response "${E2E_ARTIFACT_DIR}/case16_disabled_reader_send_body.json")"
+STATUS_CASE16="$(e2e_rpc_read_status "case16_disabled_reader_send")"
+IS_ERROR="$(is_error_response "case16_disabled_reader_send")"
 if [ "$STATUS_CASE16" = "200" ] && [ "$IS_ERROR" = "false" ]; then
     e2e_pass "send_message succeeded for reader when RBAC disabled"
 elif [ "$STATUS_CASE16" = "200" ]; then
@@ -580,9 +535,10 @@ elif [ "$STATUS_CASE16" = "200" ]; then
 else
     e2e_fail "send_message failed when RBAC disabled (status=${STATUS_CASE16})"
 fi
+e2e_mark_case_end "case16_disabled_reader_send"
 fail_fast_if_needed
 
-stop_server "${PID2}"
+e2e_stop_server
 trap - EXIT
 
 # ---------------------------------------------------------------------------
