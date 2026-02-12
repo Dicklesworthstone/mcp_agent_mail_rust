@@ -44,7 +44,7 @@ pub enum WidgetKind {
     Leaderboard,
     /// `HeatmapGrid` — 2D color-coded matrix.
     Heatmap,
-    /// `Sparkline` — block-char trend sparkline (ftui_widgets).
+    /// `Sparkline` — block-char trend sparkline (`ftui_widgets`).
     Sparkline,
     /// Event log (scrollable filtered list).
     EventLog,

@@ -376,7 +376,7 @@ pub struct MailAppModel {
     accessibility: crate::tui_persist::AccessibilitySettings,
     macro_engine: MacroEngine,
     /// Tracks active reservations for expiry warnings.
-    /// Key: "{project}:{agent}:{path}", Value: (display_label, expiry_timestamp_micros).
+    /// Key: "{project}:{agent}:{path}", Value: (`display_label`, `expiry_timestamp_micros`).
     reservation_tracker: HashMap<String, (String, i64)>,
     /// Reservations already warned about (prevent duplicate warnings).
     warned_reservations: HashSet<String>,
@@ -5063,16 +5063,12 @@ mod tests {
         // Toast overlay should add < 1ms (1000µs) to frame time at p95
         assert!(
             p95_us < 1000,
-            "Toast overlay p95 exceeds 1ms: p50={}µs, p95={}µs, p99={}µs",
-            p50_us,
-            p95_us,
-            p99_us
+            "Toast overlay p95 exceeds 1ms: p50={p50_us}µs, p95={p95_us}µs, p99={p99_us}µs",
         );
 
         eprintln!(
             "[perf] Toast overlay render (3 toasts, 160x48): \
-             p50={}µs p95={}µs p99={}µs",
-            p50_us, p95_us, p99_us
+             p50={p50_us}µs p95={p95_us}µs p99={p99_us}µs",
         );
     }
 
@@ -5118,16 +5114,12 @@ mod tests {
         // Sparkline should render in < 500µs at p95
         assert!(
             p95_us < 500,
-            "Sparkline p95 exceeds 500µs: p50={}µs, p95={}µs, p99={}µs",
-            p50_us,
-            p95_us,
-            p99_us
+            "Sparkline p95 exceeds 500µs: p50={p50_us}µs, p95={p95_us}µs, p99={p99_us}µs",
         );
 
         eprintln!(
             "[perf] Sparkline render (100 points, 80 cols): \
-             p50={}µs p95={}µs p99={}µs",
-            p50_us, p95_us, p99_us
+             p50={p50_us}µs p95={p95_us}µs p99={p99_us}µs",
         );
     }
 
@@ -5171,16 +5163,12 @@ mod tests {
         // Modal overlay should add < 1ms (1000µs) at p95
         assert!(
             p95_us < 1000,
-            "Modal overlay p95 exceeds 1ms: p50={}µs, p95={}µs, p99={}µs",
-            p50_us,
-            p95_us,
-            p99_us
+            "Modal overlay p95 exceeds 1ms: p50={p50_us}µs, p95={p95_us}µs, p99={p99_us}µs",
         );
 
         eprintln!(
             "[perf] Modal overlay render (160x48): \
-             p50={}µs p95={}µs p99={}µs",
-            p50_us, p95_us, p99_us
+             p50={p50_us}µs p95={p95_us}µs p99={p99_us}µs",
         );
     }
 
@@ -5210,8 +5198,7 @@ mod tests {
                     format!("Action Item Number {} Description", i),
                 )
                 .with_description(format!(
-                    "This is action {} which does something useful in category {}",
-                    i, category
+                    "This is action {i} which does something useful in category {category}",
                 ))
                 .with_category(category)
                 .with_tags(&[&format!("tag{}", i % 10), category.to_lowercase().as_str()]),
@@ -5252,16 +5239,12 @@ mod tests {
         // Fuzzy search should complete in < 2ms (2000µs) at p95
         assert!(
             p95_us < 2000,
-            "Command palette fuzzy search p95 exceeds 2ms: p50={}µs, p95={}µs, p99={}µs",
-            p50_us,
-            p95_us,
-            p99_us
+            "Command palette fuzzy search p95 exceeds 2ms: p50={p50_us}µs, p95={p95_us}µs, p99={p99_us}µs",
         );
 
         eprintln!(
             "[perf] Command palette fuzzy search (100 entries): \
-             p50={}µs p95={}µs p99={}µs",
-            p50_us, p95_us, p99_us
+             p50={p50_us}µs p95={p95_us}µs p99={p99_us}µs",
         );
     }
 }

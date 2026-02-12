@@ -27,7 +27,7 @@ const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const PALETTE_USAGE_FILENAME: &str = "palette_usage.json";
 
 /// Persisted command-palette usage map:
-/// action_id -> (usage_count, last_used_micros)
+/// `action_id` -> (`usage_count`, `last_used_micros`)
 pub type PaletteUsageMap = HashMap<String, (u32, i64)>;
 
 // ──────────────────────────────────────────────────────────────────────

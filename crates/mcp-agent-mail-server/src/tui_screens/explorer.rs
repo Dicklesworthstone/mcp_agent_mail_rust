@@ -170,7 +170,7 @@ struct DisplayEntry {
     ack_ts: Option<i64>,
 }
 
-/// Wrapper for VirtualizedList rendering of explorer results.
+/// Wrapper for `VirtualizedList` rendering of explorer results.
 #[derive(Debug, Clone)]
 struct ExplorerDisplayRow {
     entry: DisplayEntry,
@@ -348,7 +348,7 @@ pub struct MailExplorerScreen {
     /// Synthetic event for the focused message (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
 
-    /// VirtualizedList state for O(1) scrolling.
+    /// `VirtualizedList` state for O(1) scrolling.
     list_state: RefCell<VirtualizedListState>,
 }
 

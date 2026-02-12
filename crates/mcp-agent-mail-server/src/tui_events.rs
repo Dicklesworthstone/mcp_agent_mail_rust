@@ -1118,15 +1118,15 @@ impl Default for EventRingBuffer {
 // DataProvider Trait
 // ──────────────────────────────────────────────────────────────────────
 
-/// Abstraction layer above VirtualizedList for paginated data sources.
+/// Abstraction layer above `VirtualizedList` for paginated data sources.
 ///
-/// VirtualizedList operates on a slice `&[T]`. For large datasets, the
-/// DataProvider layer:
-/// - Provides a windowed slice to VirtualizedList (only loaded pages)
+/// `VirtualizedList` operates on a slice `&[T]`. For large datasets, the
+/// `DataProvider` layer:
+/// - Provides a windowed slice to `VirtualizedList` (only loaded pages)
 /// - Handles pagination for DB-backed sources
 /// - Handles the full dataset for in-memory sources (Timeline ring buffer)
 pub trait DataProvider {
-    /// The item type that implements RenderItem.
+    /// The item type that implements `RenderItem`.
     type Item: RenderItem;
 
     /// Total number of items in the data source.
@@ -1156,7 +1156,7 @@ pub trait DataProvider {
 /// A pre-formatted timeline row for virtualized rendering.
 ///
 /// This struct contains all data needed to render a single timeline event
-/// row without accessing the original MailEvent.
+/// row without accessing the original `MailEvent`.
 #[derive(Debug, Clone)]
 pub struct TimelineRow {
     /// Sequence number for identification and navigation.
@@ -1178,7 +1178,7 @@ pub struct TimelineRow {
 }
 
 impl TimelineRow {
-    /// Create a TimelineRow from a MailEvent.
+    /// Create a `TimelineRow` from a `MailEvent`.
     #[must_use]
     pub fn from_event(event: &MailEvent) -> Self {
         let kind = event.kind();
@@ -1339,9 +1339,9 @@ impl RenderItem for TimelineRow {
 // TimelineDataProvider — wraps EventRingBuffer
 // ──────────────────────────────────────────────────────────────────────
 
-/// DataProvider for the Timeline screen, backed by EventRingBuffer.
+/// `DataProvider` for the Timeline screen, backed by `EventRingBuffer`.
 ///
-/// This provider converts MailEvents to TimelineRows on demand and caches
+/// This provider converts `MailEvents` to `TimelineRows` on demand and caches
 /// the converted rows for efficient window access.
 pub struct TimelineDataProvider {
     /// Reference to the shared event ring buffer.
