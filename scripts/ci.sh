@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # ci.sh - Local CI runner: runs the same suite as .github/workflows/ci.yml
 #
+# DEPRECATION NOTICE:
+#   This bash script is DEPRECATED. Use the native `am ci` command instead:
+#
+#     am ci              # Run all gates (full mode)
+#     am ci --quick      # Skip long-running E2E gates
+#     am ci --parallel   # Run independent gates concurrently
+#     am ci --report X   # Write JSON report to custom path
+#     am ci --json       # Output JSON to stdout
+#
+#   The native command provides parallel execution, better error capture,
+#   structured JSON reports, and is the authoritative CI implementation.
+#
+#   This script is retained for emergency fallback only. It may be removed
+#   in a future release. Please update your workflows to use `am ci`.
+#
 # Usage:
 #   bash scripts/ci.sh          # Run all gates
 #   bash scripts/ci.sh --quick  # Skip E2E (faster)
@@ -11,6 +26,11 @@
 #   1 = one or more gates failed
 
 set -euo pipefail
+
+# Print deprecation warning to stderr (once per invocation)
+echo >&2 "WARNING: scripts/ci.sh is deprecated. Use 'am ci' instead."
+echo >&2 "         Run 'am ci --help' for usage details."
+echo >&2 ""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

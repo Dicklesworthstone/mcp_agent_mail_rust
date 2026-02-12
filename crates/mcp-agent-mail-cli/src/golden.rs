@@ -416,10 +416,11 @@ mod tests {
 
     #[test]
     fn capture_and_normalize_command_applies_rules_to_both_streams() {
+        // Use \033 (octal) instead of \x1b (hex) because /bin/sh printf doesn't support \xNN escapes
         let command = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "printf '\\x1b[32mok\\x1b[0m pid=42\\n'; \
+            "printf '\\033[32mok\\033[0m pid=42\\n'; \
              printf 'ts=2026-02-12T07:30:59Z pid=100\\n' 1>&2"
                 .to_string(),
         ];

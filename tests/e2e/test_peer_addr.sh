@@ -88,36 +88,31 @@ PAYLOAD='{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"health_
 http_post() {
     local case_id="$1"
     shift
+
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local request_file="${E2E_ARTIFACT_DIR}/${case_id}_request.json"
     local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
 
-    e2e_save_artifact "${case_id}_request.json" "${PAYLOAD}"
+    e2e_mark_case_start "${case_id}"
+    if ! e2e_rpc_call_raw "${case_id}" "${URL}" "${PAYLOAD}" "$@"; then
+        :
+    fi
 
-    local args=(
-        -sS
-        -D "${headers_file}"
-        -o "${body_file}"
-        -w "%{http_code}"
-        -X POST
-        "${URL}"
-        -H "content-type: application/json"
-        --data "${PAYLOAD}"
-    )
-    for h in "$@"; do
-        args+=(-H "$h")
-    done
+    cp "${case_dir}/request.json" "${request_file}" 2>/dev/null || e2e_save_artifact "${case_id}_request.json" "${PAYLOAD}"
+    cp "${case_dir}/headers.txt" "${headers_file}" 2>/dev/null || true
+    cp "${case_dir}/response.json" "${body_file}" 2>/dev/null || true
+    cp "${case_dir}/status.txt" "${status_file}" 2>/dev/null || true
+    cp "${case_dir}/timing.txt" "${timing_file}" 2>/dev/null || true
+    cp "${case_dir}/curl_stderr.txt" "${curl_stderr_file}" 2>/dev/null || true
 
-    set +e
     local status
-    status="$(curl "${args[@]}" 2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-
-    echo "${status}" > "${status_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fail "${case_id}: curl failed rc=${rc}"
+    status="$(cat "${status_file}" 2>/dev/null || echo "")"
+    if [ -z "${status}" ] || [ "${status}" = "000" ]; then
+        e2e_fail "${case_id}: curl failed (status=${status:-missing})"
         return 1
     fi
     return 0

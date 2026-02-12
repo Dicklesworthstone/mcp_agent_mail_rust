@@ -193,14 +193,17 @@ rpc_call_bg() {
     : "${args:="{}"}"
     local id="${4:-1}"
     local label="${5:-bg}"
-    local pfile
+    local pfile payload
     pfile="$(build_payload "$tool" "$args" "$id")"
+    payload="$(cat "${pfile}" 2>/dev/null || echo "")"
+    rm -f "$pfile"
+
     (
-        curl -sS -X POST "${url}" \
-            -H "content-type: application/json" \
-            --data-binary "@${pfile}" \
-            >"${E2E_ARTIFACT_DIR}/${label}_resp.json" 2>/dev/null
-        rm -f "$pfile"
+        e2e_mark_case_start "${label}"
+        if ! e2e_rpc_call_raw "${label}" "${url}" "${payload}"; then
+            :
+        fi
+        cp "${E2E_ARTIFACT_DIR}/${label}/response.json" "${E2E_ARTIFACT_DIR}/${label}_resp.json" 2>/dev/null || true
     ) &
 }
 
@@ -354,6 +357,13 @@ e2e_assert_contains "register BluePeak" "$RESP" 'BluePeak'
 
 RESP="$(rpc_call "${URL}" "register_agent" '{"project_key":"/test/project_beta","program":"test","model":"test-1","name":"GoldHawk","task_description":"crash test agent 3"}')"
 e2e_assert_contains "register GoldHawk" "$RESP" 'GoldHawk'
+
+# Open sender policies so crash invariants test message durability, not contact gating.
+RESP="$(rpc_call "${URL}" "set_contact_policy" '{"project_key":"/test/project_alpha","agent_name":"RedLake","policy":"open"}')"
+e2e_assert_contains "set_contact_policy RedLake open" "$RESP" 'open'
+
+RESP="$(rpc_call "${URL}" "set_contact_policy" '{"project_key":"/test/project_alpha","agent_name":"BluePeak","policy":"open"}')"
+e2e_assert_contains "set_contact_policy BluePeak open" "$RESP" 'open'
 
 # Send messages
 for i in $(seq 1 5); do

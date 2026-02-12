@@ -171,35 +171,20 @@ rpc_call() {
     local tool_name="$2"
     local args_json="$3"
 
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
 
-    local payload
-    payload="$(python3 - <<'PY' "$tool_name" "$args_json"
-import json, sys
-tool = sys.argv[1]
-args = json.loads(sys.argv[2])
-print(json.dumps({
-  "jsonrpc": "2.0",
-  "method": "tools/call",
-  "id": 1,
-  "params": { "name": tool, "arguments": args }
-}))
-PY
-)"
+    e2e_mark_case_start "${case_id}"
+    if ! e2e_rpc_call "${case_id}" "${API_URL}" "${tool_name}" "${args_json}" "authorization: Bearer ${TOKEN}"; then
+        :
+    fi
 
-    set +e
+    cp "${case_dir}/response.json" "${body_file}" 2>/dev/null || true
+
     local status
-    status="$(curl -sS -o "${body_file}" -w "%{http_code}" \
-        -X POST "${API_URL}" \
-        -H "content-type: application/json" \
-        -H "authorization: Bearer ${TOKEN}" \
-        --data "${payload}" \
-        2>/dev/null)"
-    local rc=$?
-    set -e
-
-    if [ "$rc" -ne 0 ] || [ "${status}" != "200" ]; then
-        e2e_fatal "${case_id}: RPC failed (curl rc=${rc}, HTTP ${status})"
+    status="$(e2e_rpc_read_status "${case_id}")"
+    if [ -z "${status}" ] || [ "${status}" != "200" ]; then
+        e2e_fatal "${case_id}: RPC failed (HTTP ${status:-missing})"
     fi
 }
 
@@ -235,6 +220,17 @@ rpc_call "reg_bob" "register_agent" "$(python3 -c "
 import json,sys
 print(json.dumps({'project_key': sys.argv[1], 'program': 'e2e', 'model': 'test', 'name': 'BlueBear', 'task_description': 'e2e share test'}))
 " "${PROJECT_DIR}")"
+
+# Open contact policy to keep share-flow assertions focused on export behavior.
+rpc_call "policy_alice_open" "set_contact_policy" "{\"project_key\":\"${PROJECT_DIR}\",\"agent_name\":\"RedFox\",\"policy\":\"open\"}"
+if rpc_has_error "${E2E_ARTIFACT_DIR}/policy_alice_open_body.json"; then
+    e2e_fatal "set_contact_policy RedFox failed"
+fi
+
+rpc_call "policy_bob_open" "set_contact_policy" "{\"project_key\":\"${PROJECT_DIR}\",\"agent_name\":\"BlueBear\",\"policy\":\"open\"}"
+if rpc_has_error "${E2E_ARTIFACT_DIR}/policy_bob_open_body.json"; then
+    e2e_fatal "set_contact_policy BlueBear failed"
+fi
 
 # Send messages to create realistic mailbox content
 for i in 1 2 3; do

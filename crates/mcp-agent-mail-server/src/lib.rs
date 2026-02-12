@@ -11549,10 +11549,13 @@ mod tests {
             ..Default::default()
         };
         let state = build_state(config);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_secs() as i64;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_secs(),
+        )
+        .expect("timestamp fits i64");
         let claims = serde_json::json!({
             "sub": "user-123",
             "role": "writer",

@@ -1,4 +1,4 @@
-//! ActionMenu — contextual per-item action overlay for TUI screens.
+//! `ActionMenu` — contextual per-item action overlay for TUI screens.
 //!
 //! Each screen can provide a set of actions relevant to the currently focused item.
 //! The action menu appears as a floating overlay near the selected row, triggered

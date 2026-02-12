@@ -30,6 +30,8 @@ pub struct SearchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub result: Vec<SearchResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistance: Option<mcp_agent_mail_db::QueryAssistance>,
 }
 
 /// Mention count entry
@@ -274,7 +276,10 @@ pub async fn search_messages(
     // Legacy parity: empty query returns an empty result set (no DB call).
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        let response = SearchResponse { result: Vec::new() };
+        let response = SearchResponse {
+            result: Vec::new(),
+            assistance: None,
+        };
         return serde_json::to_string(&response)
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }
@@ -319,7 +324,10 @@ pub async fn search_messages(
         results.len()
     );
 
-    let response = SearchResponse { result: results };
+    let response = SearchResponse {
+        result: results,
+        assistance: planner_response.assistance,
+    };
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
@@ -645,6 +653,31 @@ mod tests {
     #[test]
     fn ordered_prefix_letter_start() {
         assert!(!is_ordered_prefix("a. letter"));
+    }
+
+    #[test]
+    fn search_response_omits_assistance_when_absent() {
+        let resp = SearchResponse {
+            result: Vec::new(),
+            assistance: None,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize search response");
+        assert!(!json.contains("assistance"));
+    }
+
+    #[test]
+    fn search_response_includes_assistance_when_present() {
+        let resp = SearchResponse {
+            result: Vec::new(),
+            assistance: Some(mcp_agent_mail_db::QueryAssistance {
+                query_text: "thread:br-123 migration".to_string(),
+                applied_filter_hints: Vec::new(),
+                did_you_mean: Vec::new(),
+            }),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize assisted search response");
+        assert!(json.contains("assistance"));
+        assert!(json.contains("thread:br-123"));
     }
 
     // -----------------------------------------------------------------------

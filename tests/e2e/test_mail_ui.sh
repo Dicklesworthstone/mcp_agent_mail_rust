@@ -417,6 +417,10 @@ PROJECT_SLUG="$(python3 -c "import json, sys; print(json.loads(sys.argv[1])['slu
 rpc_call "register_agent_sender" "register_agent" "{\"project_key\": \"${PROJECT_DIR}\", \"program\": \"e2e\", \"model\": \"test\", \"name\": \"RedFox\", \"task_description\": \"e2e seed\"}" || true
 rpc_call "register_agent_recipient" "register_agent" "{\"project_key\": \"${PROJECT_DIR}\", \"program\": \"e2e\", \"model\": \"test\", \"name\": \"BlueBear\", \"task_description\": \"e2e seed\"}" || true
 
+# Keep seed messaging focused on UI behavior (avoid contact-policy gating).
+rpc_call "set_policy_sender_open" "set_contact_policy" "{\"project_key\": \"${PROJECT_DIR}\", \"agent_name\": \"RedFox\", \"policy\": \"open\"}" || true
+rpc_call "set_policy_recipient_open" "set_contact_policy" "{\"project_key\": \"${PROJECT_DIR}\", \"agent_name\": \"BlueBear\", \"policy\": \"open\"}" || true
+
 XSS_MD=$'Hello <script>alert(1)</script>\\n\\n[click](javascript:alert(2))\\n\\n<img src=\"x\" onerror=\"alert(3)\">\\n'
 rpc_call "send_message" "send_message" "$(python3 -c "import json,sys; print(json.dumps({\"project_key\": sys.argv[1], \"sender_name\": \"RedFox\", \"to\": [\"BlueBear\"], \"subject\": \"[br-123] XSS probe\", \"body_md\": sys.argv[2], \"thread_id\": \"br-123\"}))" "${PROJECT_DIR}" "${XSS_MD}")" || true
 

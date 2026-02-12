@@ -17,7 +17,6 @@ use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 use std::cell::RefCell;
 
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
     DocKind, Importance, RankingMode, SearchQuery, plan_search,
@@ -28,6 +27,7 @@ use mcp_agent_mail_db::search_recipes::{
 };
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
+use mcp_agent_mail_db::{DbConn, QueryAssistance, parse_query_assistance};
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_markdown;
@@ -345,6 +345,7 @@ impl RenderItem for SearchResultRow {
             DocKind::Message => "M",
             DocKind::Agent => "A",
             DocKind::Project => "P",
+            DocKind::Thread => "T",
         };
 
         // Importance badge
@@ -717,6 +718,7 @@ pub struct SearchCockpitScreen {
     db_conn_attempted: bool,
     last_query: String,
     last_error: Option<String>,
+    query_assistance: Option<QueryAssistance>,
     debounce_remaining: u8,
     search_dirty: bool,
 
@@ -759,6 +761,7 @@ impl SearchCockpitScreen {
             db_conn_attempted: false,
             last_query: String::new(),
             last_error: None,
+            query_assistance: None,
             debounce_remaining: 0,
             search_dirty: true,
             saved_recipes: Vec::new(),
@@ -780,14 +783,16 @@ impl SearchCockpitScreen {
     fn sync_focused_event(&mut self) {
         self.focused_synthetic = self.results.get(self.cursor).and_then(|entry| {
             match entry.doc_kind {
-                DocKind::Message => Some(crate::tui_events::MailEvent::message_sent(
-                    entry.id,
-                    entry.from_agent.as_deref().unwrap_or(""),
-                    vec![], // to-agents not stored in search results
-                    &entry.title,
-                    entry.thread_id.as_deref().unwrap_or(""),
-                    "", // project slug not directly available
-                )),
+                DocKind::Message | DocKind::Thread => {
+                    Some(crate::tui_events::MailEvent::message_sent(
+                        entry.id,
+                        entry.from_agent.as_deref().unwrap_or(""),
+                        vec![], // to-agents not stored in search results
+                        &entry.title,
+                        entry.thread_id.as_deref().unwrap_or(""),
+                        "", // project slug not directly available
+                    ))
+                }
                 DocKind::Agent => Some(crate::tui_events::MailEvent::agent_registered(
                     &entry.title,
                     "",
@@ -861,6 +866,7 @@ impl SearchCockpitScreen {
         self.last_query.clone_from(&raw);
         self.last_error = validate_query_syntax(&raw);
         if self.last_error.is_some() {
+            self.query_assistance = None;
             self.highlight_terms.clear();
             self.results.clear();
             self.total_sql_rows = 0;
@@ -869,6 +875,17 @@ impl SearchCockpitScreen {
             self.search_dirty = false;
             return;
         }
+
+        self.query_assistance = if raw.is_empty() {
+            None
+        } else {
+            let assistance = parse_query_assistance(&raw);
+            if assistance.applied_filter_hints.is_empty() && assistance.did_you_mean.is_empty() {
+                None
+            } else {
+                Some(assistance)
+            }
+        };
 
         self.highlight_terms = extract_query_terms(&raw);
 
@@ -916,6 +933,7 @@ impl SearchCockpitScreen {
             DocKind::Message => self.search_messages(conn, raw),
             DocKind::Agent => Self::search_agents(conn, raw),
             DocKind::Project => Self::search_projects(conn, raw),
+            DocKind::Thread => self.search_messages(conn, raw),
         }
     }
 
@@ -1234,6 +1252,34 @@ impl SearchCockpitScreen {
         }
         out
     }
+
+    fn assistance_hint_line(&self) -> Option<String> {
+        let assistance = self.query_assistance.as_ref()?;
+        let mut parts = Vec::new();
+        if !assistance.applied_filter_hints.is_empty() {
+            let applied = assistance
+                .applied_filter_hints
+                .iter()
+                .map(|hint| format!("{}={}", hint.field, hint.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Filters: {applied}"));
+        }
+        if !assistance.did_you_mean.is_empty() {
+            let suggestions = assistance
+                .did_you_mean
+                .iter()
+                .map(|hint| format!("{} -> {}", hint.token, hint.suggested_field))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Did you mean: {suggestions}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" | "))
+        }
+    }
 }
 
 fn validate_query_syntax(raw: &str) -> Option<String> {
@@ -1264,6 +1310,7 @@ const fn doc_kind_order(kind: DocKind) -> u8 {
         DocKind::Message => 0,
         DocKind::Agent => 1,
         DocKind::Project => 2,
+        DocKind::Thread => 3,
     }
 }
 
@@ -1449,115 +1496,123 @@ impl MailScreen for SearchCockpitScreen {
                         _ => {}
                     },
 
-                    Focus::ResultList => match key.code {
-                        KeyCode::Char('/') => {
-                            self.focus = Focus::QueryBar;
-                            self.query_input.set_focused(true);
-                        }
-                        KeyCode::Tab | KeyCode::Char('f') => {
-                            self.focus = Focus::FacetRail;
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !self.results.is_empty() {
-                                self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                                self.detail_scroll = 0;
+                    Focus::ResultList => {
+                        match key.code {
+                            KeyCode::Char('/') => {
+                                self.focus = Focus::QueryBar;
+                                self.query_input.set_focused(true);
                             }
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            self.cursor = self.cursor.saturating_sub(1);
-                            self.detail_scroll = 0;
-                        }
-                        KeyCode::Char('G') | KeyCode::End => {
-                            if !self.results.is_empty() {
-                                self.cursor = self.results.len() - 1;
-                                self.detail_scroll = 0;
+                            KeyCode::Tab | KeyCode::Char('f') => {
+                                self.focus = Focus::FacetRail;
                             }
-                        }
-                        KeyCode::Char('g') | KeyCode::Home => {
-                            self.cursor = 0;
-                            self.detail_scroll = 0;
-                        }
-                        KeyCode::Char('d') | KeyCode::PageDown => {
-                            if !self.results.is_empty() {
-                                self.cursor = (self.cursor + 20).min(self.results.len() - 1);
-                                self.detail_scroll = 0;
-                            }
-                        }
-                        KeyCode::Char('u') | KeyCode::PageUp => {
-                            self.cursor = self.cursor.saturating_sub(20);
-                            self.detail_scroll = 0;
-                        }
-                        KeyCode::Char('J') => {
-                            self.detail_scroll += 1;
-                        }
-                        KeyCode::Char('K') => {
-                            self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                        }
-                        // Deep-link: Enter on result
-                        KeyCode::Enter => {
-                            if let Some(entry) = self.results.get(self.cursor) {
-                                return Cmd::msg(match entry.doc_kind {
-                                    DocKind::Message => MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::MessageById(entry.id),
-                                    ),
-                                    DocKind::Agent => MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::AgentByName(entry.title.clone()),
-                                    ),
-                                    DocKind::Project => MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::ProjectBySlug(entry.title.clone()),
-                                    ),
-                                });
-                            }
-                        }
-                        // Cycle doc kind from results
-                        KeyCode::Char('t') => {
-                            self.doc_kind_filter = self.doc_kind_filter.next();
-                            self.search_dirty = true;
-                            self.debounce_remaining = 0;
-                        }
-                        // Cycle importance from results
-                        KeyCode::Char('i') => {
-                            self.importance_filter = self.importance_filter.next();
-                            self.search_dirty = true;
-                            self.debounce_remaining = 0;
-                        }
-                        // Jump to thread (messages only)
-                        KeyCode::Char('o') => {
-                            if let Some(entry) = self.results.get(self.cursor) {
-                                if let Some(ref tid) = entry.thread_id {
-                                    return Cmd::msg(MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::ThreadById(tid.clone()),
-                                    ));
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if !self.results.is_empty() {
+                                    self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                                    self.detail_scroll = 0;
                                 }
                             }
-                        }
-                        // Jump to agent profile
-                        KeyCode::Char('a') => {
-                            if let Some(entry) = self.results.get(self.cursor) {
-                                if let Some(ref agent) = entry.from_agent {
-                                    return Cmd::msg(MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::AgentByName(agent.clone()),
-                                    ));
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                self.cursor = self.cursor.saturating_sub(1);
+                                self.detail_scroll = 0;
+                            }
+                            KeyCode::Char('G') | KeyCode::End => {
+                                if !self.results.is_empty() {
+                                    self.cursor = self.results.len() - 1;
+                                    self.detail_scroll = 0;
                                 }
                             }
-                        }
-                        // Jump to timeline at message time
-                        KeyCode::Char('T') => {
-                            if let Some(entry) = self.results.get(self.cursor) {
-                                if let Some(ts) = entry.created_ts {
-                                    return Cmd::msg(MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::TimelineAtTime(ts),
-                                    ));
+                            KeyCode::Char('g') | KeyCode::Home => {
+                                self.cursor = 0;
+                                self.detail_scroll = 0;
+                            }
+                            KeyCode::Char('d') | KeyCode::PageDown => {
+                                if !self.results.is_empty() {
+                                    self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                                    self.detail_scroll = 0;
                                 }
                             }
+                            KeyCode::Char('u') | KeyCode::PageUp => {
+                                self.cursor = self.cursor.saturating_sub(20);
+                                self.detail_scroll = 0;
+                            }
+                            KeyCode::Char('J') => {
+                                self.detail_scroll += 1;
+                            }
+                            KeyCode::Char('K') => {
+                                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                            }
+                            // Deep-link: Enter on result
+                            KeyCode::Enter => {
+                                if let Some(entry) = self.results.get(self.cursor) {
+                                    return Cmd::msg(match entry.doc_kind {
+                                        DocKind::Message => MailScreenMsg::DeepLink(
+                                            DeepLinkTarget::MessageById(entry.id),
+                                        ),
+                                        DocKind::Agent => MailScreenMsg::DeepLink(
+                                            DeepLinkTarget::AgentByName(entry.title.clone()),
+                                        ),
+                                        DocKind::Project => MailScreenMsg::DeepLink(
+                                            DeepLinkTarget::ProjectBySlug(entry.title.clone()),
+                                        ),
+                                        DocKind::Thread => MailScreenMsg::DeepLink(
+                                            entry.thread_id.as_ref().map_or(
+                                                DeepLinkTarget::MessageById(entry.id),
+                                                |tid| DeepLinkTarget::ThreadById(tid.clone()),
+                                            ),
+                                        ),
+                                    });
+                                }
+                            }
+                            // Cycle doc kind from results
+                            KeyCode::Char('t') => {
+                                self.doc_kind_filter = self.doc_kind_filter.next();
+                                self.search_dirty = true;
+                                self.debounce_remaining = 0;
+                            }
+                            // Cycle importance from results
+                            KeyCode::Char('i') => {
+                                self.importance_filter = self.importance_filter.next();
+                                self.search_dirty = true;
+                                self.debounce_remaining = 0;
+                            }
+                            // Jump to thread (messages only)
+                            KeyCode::Char('o') => {
+                                if let Some(entry) = self.results.get(self.cursor) {
+                                    if let Some(ref tid) = entry.thread_id {
+                                        return Cmd::msg(MailScreenMsg::DeepLink(
+                                            DeepLinkTarget::ThreadById(tid.clone()),
+                                        ));
+                                    }
+                                }
+                            }
+                            // Jump to agent profile
+                            KeyCode::Char('a') => {
+                                if let Some(entry) = self.results.get(self.cursor) {
+                                    if let Some(ref agent) = entry.from_agent {
+                                        return Cmd::msg(MailScreenMsg::DeepLink(
+                                            DeepLinkTarget::AgentByName(agent.clone()),
+                                        ));
+                                    }
+                                }
+                            }
+                            // Jump to timeline at message time
+                            KeyCode::Char('T') => {
+                                if let Some(entry) = self.results.get(self.cursor) {
+                                    if let Some(ts) = entry.created_ts {
+                                        return Cmd::msg(MailScreenMsg::DeepLink(
+                                            DeepLinkTarget::TimelineAtTime(ts),
+                                        ));
+                                    }
+                                }
+                            }
+                            // Clear search
+                            KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                                self.query_input.clear();
+                                self.reset_facets();
+                            }
+                            _ => {}
                         }
-                        // Clear search
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
-                            self.query_input.clear();
-                            self.reset_facets();
-                        }
-                        _ => {}
-                    },
+                    }
                 }
             }
         }
@@ -1987,7 +2042,9 @@ fn render_query_bar(
         let w = inner.width as usize;
         let (hint, style) = screen.last_error.as_ref().map_or_else(
             || {
-                if screen.focus == Focus::QueryBar {
+                if let Some(line) = screen.assistance_hint_line() {
+                    (line, Style::default().fg(FACET_LABEL_FG))
+                } else if screen.focus == Focus::QueryBar {
                     (
                         "Syntax: \"phrase\" term* AND/OR/NOT (no leading *)".to_string(),
                         Style::default().fg(FACET_LABEL_FG),
@@ -2180,6 +2237,7 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
         DocKind::Message => "M",
         DocKind::Agent => "A",
         DocKind::Project => "P",
+        DocKind::Thread => "T",
     };
 
     let imp_badge = match entry.importance.as_deref() {
@@ -2666,6 +2724,28 @@ mod tests {
         assert!(
             text.contains("Unbalanced quotes"),
             "expected validation error, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn query_bar_renders_query_assistance_hint_line() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_input.set_value("form:BlueLake thread:br-123");
+        screen.query_assistance = Some(parse_query_assistance(screen.query_input.value()));
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 10, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 80, 10), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Did you mean:"),
+            "expected assistance hint, got:\n{text}"
+        );
+        assert!(
+            text.contains("thread=br-123"),
+            "expected applied filter hint, got:\n{text}"
         );
     }
 

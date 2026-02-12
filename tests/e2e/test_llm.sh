@@ -104,21 +104,23 @@ URL="http://127.0.0.1:${PORT}/api"
 mcp_call() {
     local tool="$1"
     local args="$2"
-    local payload
-    payload=$(python3 -c "
-import json, sys
-print(json.dumps({
-    'jsonrpc': '2.0',
-    'id': 1,
-    'method': 'tools/call',
-    'params': {'name': sys.argv[1], 'arguments': json.loads(sys.argv[2])}
-}))
-" "$tool" "$args")
+    MCP_CALL_SEQ="${MCP_CALL_SEQ:-0}"
+    MCP_CALL_SEQ=$((MCP_CALL_SEQ + 1))
+    local case_id
+    case_id="$(printf "mcp_call_%03d_%s" "${MCP_CALL_SEQ}" "${tool}")"
 
-    curl -sS -X POST "${URL}" \
-        -H "content-type: application/json" \
-        -H "Authorization: Bearer ${TOKEN}" \
-        --data "${payload}" 2>/dev/null
+    e2e_mark_case_start "${case_id}"
+    if ! e2e_rpc_call "${case_id}" "${URL}" "${tool}" "${args}" "Authorization: Bearer ${TOKEN}"; then
+        :
+    fi
+
+    local status
+    status="$(e2e_rpc_read_status "${case_id}")"
+    if [ -z "${status}" ] || [ "${status}" = "000" ]; then
+        return 1
+    fi
+
+    e2e_rpc_read_response "${case_id}"
 }
 
 # Helper: extract text content from MCP response
