@@ -187,6 +187,12 @@ for agent_name in "$SENDER" "$RECIPIENT_TO" "$RECIPIENT_CC" "$RECIPIENT_BCC"; do
     e2e_save_artifact "setup_register_${agent_name}.json" "$reg_result"
 done
 
+for agent_name in "$SENDER" "$RECIPIENT_TO" "$RECIPIENT_CC" "$RECIPIENT_BCC"; do
+    policy_result="$(mcp_call set_contact_policy "{\"project_key\": \"/tmp/e2e_notify_project\", \"agent_name\": \"${agent_name}\", \"policy\": \"open\"}")"
+    e2e_save_artifact "setup_policy_${agent_name}.json" "$policy_result"
+    e2e_assert_not_contains "set_contact_policy ${agent_name} has no error" "$policy_result" "\"error\""
+done
+
 e2e_pass "project and agents created"
 
 # ---------------------------------------------------------------------------

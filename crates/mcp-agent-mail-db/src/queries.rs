@@ -500,10 +500,17 @@ fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
 
 /// Begin a concurrent write transaction (MVCC page-level concurrent writes).
 ///
-/// `FrankenConnection` supports `BEGIN CONCURRENT` for optimistic
-/// page-level concurrency in WAL mode.
+/// Falls back to `BEGIN IMMEDIATE` on backends that do not support
+/// `BEGIN CONCURRENT`.
 async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
-    map_sql_outcome(tracked.execute(cx, "BEGIN CONCURRENT", &[]).await).map(|_| ())
+    match map_sql_outcome(tracked.execute(cx, "BEGIN CONCURRENT", &[]).await).map(|_| ()) {
+        Outcome::Err(DbError::Sqlite(msg))
+            if msg.to_ascii_lowercase().contains("near \"concurrent\"") =>
+        {
+            begin_immediate_tx(cx, tracked).await
+        }
+        out => out,
+    }
 }
 
 /// Commit the current transaction (single fsync in WAL mode).
@@ -1191,8 +1198,8 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
 
     let tracked = tracked(&*conn);
 
-    // Batch all updates in a single transaction
-    match map_sql_outcome(traw_execute(cx, &tracked, "BEGIN CONCURRENT", &[]).await) {
+    // Batch all updates in a single transaction.
+    match begin_concurrent_tx(cx, &tracked).await {
         Outcome::Ok(_) => {}
         other => {
             re_enqueue_touches(&pending);
