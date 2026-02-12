@@ -76,12 +76,30 @@ default_env_file() {
   fi
 }
 
+# CLI subcommands that should passthrough to the binary with AM_INTERFACE_MODE=cli
+CLI_SUBCOMMANDS="ci doctor guard file-reservations acks archive check-inbox lint typecheck e2e migrate list-projects clear-and-reset-everything config amctl am-run projects mail products docs agents tooling macros contacts beads setup golden flake-triage robot"
+
 if [[ $# -gt 0 ]]; then
   case "$1" in
     serve) shift ;;
     help|-h|--help)
       usage
       exit 0
+      ;;
+    *)
+      # Check if first arg is a CLI subcommand
+      for cmd in $CLI_SUBCOMMANDS; do
+        if [[ "$1" == "$cmd" ]]; then
+          # Passthrough to CLI mode
+          cd "$repo_root"
+          binary="${CARGO_TARGET_DIR:-${repo_root}/target}/release/mcp-agent-mail"
+          if [[ -x "$binary" ]]; then
+            exec env AM_INTERFACE_MODE=cli "$binary" "$@"
+          else
+            exec env AM_INTERFACE_MODE=cli cargo run --release -p mcp-agent-mail -- "$@"
+          fi
+        fi
+      done
       ;;
   esac
 fi

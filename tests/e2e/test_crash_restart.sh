@@ -298,6 +298,22 @@ else:
 " "$db_path"
 }
 
+# Run an arbitrary scalar SQL query (first row, first column).
+sqlite_scalar_query() {
+    local db_path="$1"
+    local sql="$2"
+    python3 -c "
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.execute(sys.argv[2])
+row = cur.fetchone()
+if row is None:
+    print('')
+else:
+    print(row[0])
+" "$db_path" "$sql"
+}
+
 # ---------------------------------------------------------------------------
 # Build binary
 # ---------------------------------------------------------------------------
@@ -450,6 +466,12 @@ e2e_case_banner "Phase 3: Direct DB integrity validation"
 # Run SQLite integrity check on the crashed DB
 INTEGRITY="$(sqlite_integrity_check "${DB}")"
 e2e_assert_eq "PRAGMA integrity_check passes" "ok" "${INTEGRITY}"
+
+# Regression guard: base-runtime DB must not retain identity FTS artifacts
+# (fts_projects/fts_agents + legacy rowid triggers), which previously caused
+# `no such column: rowid in table fts_projects` failures.
+IDENTITY_FTS_ARTIFACTS="$(sqlite_scalar_query "${DB}" "SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('fts_agents','fts_projects')) OR (type='trigger' AND name IN ('agents_ai','agents_ad','agents_au','projects_ai','projects_ad','projects_au'))")"
+e2e_assert_eq "identity FTS artifacts absent after crash path" "0" "${IDENTITY_FTS_ARTIFACTS}"
 
 # Verify pre-crash data survived
 POST_MSG_COUNT="$(count_rows "${DB}" "messages")"

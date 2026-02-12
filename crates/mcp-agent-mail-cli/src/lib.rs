@@ -9512,6 +9512,49 @@ sys.exit(7)
     }
 
     #[test]
+    fn native_wizard_json_failure_reports_missing_required_option_code() {
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let bundle_dir = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        std::fs::write(bundle_dir.join("manifest.json"), "{}").expect("write manifest");
+
+        let args = ShareWizardArgs {
+            bundle: Some(bundle_dir),
+            provider: Some("github".to_string()),
+            github_repo: None, // required for github provider
+            github_branch: "gh-pages".to_string(),
+            cloudflare_project: None,
+            netlify_site: None,
+            s3_bucket: None,
+            cloudfront_id: None,
+            base_url: None,
+            output: None,
+            yes: true,
+            dry_run: true,
+            non_interactive: true,
+            json: true,
+        };
+
+        let result = run_native_wizard(args);
+        let expected_code = i32::from(share::WizardErrorCode::MissingRequiredOption.code());
+        assert!(
+            matches!(result, Err(CliError::ExitCode(code)) if code == expected_code),
+            "expected missing-required-option exit code, got: {result:?}"
+        );
+
+        let output = capture.drain_to_string();
+        let parsed: serde_json::Value = serde_json::from_str(output.trim())
+            .unwrap_or_else(|_| panic!("failed to parse wizard JSON failure output: {output}"));
+        assert_eq!(parsed["success"], serde_json::Value::Bool(false));
+        assert_eq!(parsed["error_code"], "MISSING_REQUIRED_OPTION");
+    }
+
+    #[test]
     fn native_wizard_json_output_format() {
         let _capture_lock = stdio_capture_lock()
             .lock()
