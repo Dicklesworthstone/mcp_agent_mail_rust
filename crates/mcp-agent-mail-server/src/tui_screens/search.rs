@@ -211,6 +211,57 @@ enum SortDirection {
     Relevance,
 }
 
+/// Field scope for limiting FTS search to subject, body, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FieldScope {
+    /// Search both subject and body (default FTS behavior).
+    #[default]
+    SubjectAndBody,
+    /// Search subject field only.
+    SubjectOnly,
+    /// Search body field only.
+    BodyOnly,
+}
+
+impl FieldScope {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SubjectAndBody => "Both",
+            Self::SubjectOnly => "Subject",
+            Self::BodyOnly => "Body",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::SubjectAndBody => Self::SubjectOnly,
+            Self::SubjectOnly => Self::BodyOnly,
+            Self::BodyOnly => Self::SubjectAndBody,
+        }
+    }
+
+    const fn prev(self) -> Self {
+        match self {
+            Self::SubjectAndBody => Self::BodyOnly,
+            Self::SubjectOnly => Self::SubjectAndBody,
+            Self::BodyOnly => Self::SubjectOnly,
+        }
+    }
+
+    /// Apply field scope to a query string for FTS5 column filtering.
+    /// Returns the query wrapped with column prefix for SubjectOnly/BodyOnly.
+    fn apply_to_query(self, query: &str) -> String {
+        if query.is_empty() {
+            return query.to_string();
+        }
+        match self {
+            Self::SubjectAndBody => query.to_string(),
+            Self::SubjectOnly => format!("subject:{query}"),
+            Self::BodyOnly => format!("body_md:{query}"),
+        }
+    }
+}
+
 impl SortDirection {
     const fn label(self) -> &'static str {
         match self {
@@ -502,6 +553,7 @@ enum FacetSlot {
     Importance,
     AckStatus,
     SortOrder,
+    FieldScope,
 }
 
 impl FacetSlot {
@@ -511,17 +563,19 @@ impl FacetSlot {
             Self::DocKind => Self::Importance,
             Self::Importance => Self::AckStatus,
             Self::AckStatus => Self::SortOrder,
-            Self::SortOrder => Self::Scope,
+            Self::SortOrder => Self::FieldScope,
+            Self::FieldScope => Self::Scope,
         }
     }
 
     const fn prev(self) -> Self {
         match self {
-            Self::Scope => Self::SortOrder,
+            Self::Scope => Self::FieldScope,
             Self::DocKind => Self::Scope,
             Self::Importance => Self::DocKind,
             Self::AckStatus => Self::Importance,
             Self::SortOrder => Self::AckStatus,
+            Self::FieldScope => Self::SortOrder,
         }
     }
 }
@@ -541,6 +595,7 @@ pub struct SearchCockpitScreen {
     importance_filter: ImportanceFilter,
     ack_filter: AckFilter,
     sort_direction: SortDirection,
+    field_scope: FieldScope,
     thread_filter: Option<String>,
     highlight_terms: Vec<QueryTerm>,
 
@@ -584,6 +639,7 @@ impl SearchCockpitScreen {
             importance_filter: ImportanceFilter::Any,
             ack_filter: AckFilter::Any,
             sort_direction: SortDirection::NewestFirst,
+            field_scope: FieldScope::default(),
             thread_filter: None,
             highlight_terms: Vec::new(),
             results: Vec::new(),
@@ -755,8 +811,11 @@ impl SearchCockpitScreen {
             return self.search_messages_recent(conn);
         }
 
+        // Apply field scope to constrain search to subject/body/both
+        let scoped_query = self.field_scope.apply_to_query(raw);
+
         let mut query = SearchQuery {
-            text: raw.to_string(),
+            text: scoped_query,
             doc_kind: DocKind::Message,
             limit: Some(MAX_RESULTS),
             ..Default::default()
@@ -892,6 +951,7 @@ impl SearchCockpitScreen {
             FacetSlot::Importance => self.importance_filter = self.importance_filter.next(),
             FacetSlot::AckStatus => self.ack_filter = self.ack_filter.next(),
             FacetSlot::SortOrder => self.sort_direction = self.sort_direction.next(),
+            FacetSlot::FieldScope => self.field_scope = self.field_scope.next(),
         }
         self.search_dirty = true;
         self.debounce_remaining = 0;
@@ -904,6 +964,7 @@ impl SearchCockpitScreen {
         self.importance_filter = ImportanceFilter::Any;
         self.ack_filter = AckFilter::Any;
         self.sort_direction = SortDirection::NewestFirst;
+        self.field_scope = FieldScope::default();
         self.thread_filter = None;
         self.search_dirty = true;
         self.debounce_remaining = 0;
@@ -1247,6 +1308,9 @@ impl MailScreen for SearchCockpitScreen {
                                 }
                                 FacetSlot::SortOrder => {
                                     self.sort_direction = self.sort_direction.next();
+                                }
+                                FacetSlot::FieldScope => {
+                                    self.field_scope = self.field_scope.prev();
                                 }
                             }
                             self.search_dirty = true;
@@ -1830,6 +1894,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
         ),
         (FacetSlot::AckStatus, "Ack", screen.ack_filter.label()),
         (FacetSlot::SortOrder, "Sort", screen.sort_direction.label()),
+        (FacetSlot::FieldScope, "Field", screen.field_scope.label()),
     ];
 
     for (i, &(slot, label, value)) in facets.iter().enumerate() {
@@ -1990,8 +2055,9 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
     };
 
     let title = truncate_str(&entry.title, title_w);
+    // Use extract_snippet to center the preview around the first match
     let snippet = if include_snippet {
-        truncate_str(&entry.body_preview, snippet_w)
+        extract_snippet(&entry.body_preview, cfg.highlight_terms, snippet_w)
     } else {
         String::new()
     };
@@ -2030,8 +2096,16 @@ fn render_results(
     highlight_terms: &[QueryTerm],
     sort_direction: SortDirection,
 ) {
+    // Show match count in header: "Results (42 matches)" or "Results"
+    let title = if results.is_empty() {
+        "Results".to_string()
+    } else {
+        let count = results.len();
+        let plural = if count == 1 { "match" } else { "matches" };
+        format!("Results ({count} {plural})")
+    };
     let block = Block::default()
-        .title("Results")
+        .title(&title)
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     block.render(area, frame);
@@ -2326,6 +2400,8 @@ mod tests {
         s = s.next();
         assert_eq!(s, FacetSlot::SortOrder);
         s = s.next();
+        assert_eq!(s, FacetSlot::FieldScope);
+        s = s.next();
         assert_eq!(s, FacetSlot::Scope);
     }
 
@@ -2334,6 +2410,8 @@ mod tests {
         let mut s = FacetSlot::DocKind;
         s = s.prev();
         assert_eq!(s, FacetSlot::Scope);
+        s = s.prev();
+        assert_eq!(s, FacetSlot::FieldScope);
         s = s.prev();
         assert_eq!(s, FacetSlot::SortOrder);
         s = s.prev();
@@ -2584,7 +2662,75 @@ mod tests {
         s = s.prev();
         assert_eq!(s, FacetSlot::Scope);
         s = s.prev();
-        assert_eq!(s, FacetSlot::SortOrder);
+        assert_eq!(s, FacetSlot::FieldScope);
+    }
+
+    #[test]
+    fn field_scope_cycles_correctly() {
+        let mut fs = FieldScope::SubjectAndBody;
+        fs = fs.next();
+        assert_eq!(fs, FieldScope::SubjectOnly);
+        fs = fs.next();
+        assert_eq!(fs, FieldScope::BodyOnly);
+        fs = fs.next();
+        assert_eq!(fs, FieldScope::SubjectAndBody);
+    }
+
+    #[test]
+    fn field_scope_prev_cycles_correctly() {
+        let mut fs = FieldScope::SubjectAndBody;
+        fs = fs.prev();
+        assert_eq!(fs, FieldScope::BodyOnly);
+        fs = fs.prev();
+        assert_eq!(fs, FieldScope::SubjectOnly);
+        fs = fs.prev();
+        assert_eq!(fs, FieldScope::SubjectAndBody);
+    }
+
+    #[test]
+    fn field_scope_subject_only_produces_fts5_column_filter() {
+        let scope = FieldScope::SubjectOnly;
+        let query = scope.apply_to_query("test query");
+        assert_eq!(query, "subject:test query");
+    }
+
+    #[test]
+    fn field_scope_body_only_produces_fts5_column_filter() {
+        let scope = FieldScope::BodyOnly;
+        let query = scope.apply_to_query("test query");
+        assert_eq!(query, "body_md:test query");
+    }
+
+    #[test]
+    fn field_scope_subject_and_body_preserves_query() {
+        let scope = FieldScope::SubjectAndBody;
+        let query = scope.apply_to_query("test query");
+        assert_eq!(query, "test query");
+    }
+
+    #[test]
+    fn field_scope_empty_query_returns_empty() {
+        assert_eq!(FieldScope::SubjectOnly.apply_to_query(""), "");
+        assert_eq!(FieldScope::BodyOnly.apply_to_query(""), "");
+        assert_eq!(FieldScope::SubjectAndBody.apply_to_query(""), "");
+    }
+
+    #[test]
+    fn toggle_active_facet_field_scope() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.active_facet = FacetSlot::FieldScope;
+        screen.search_dirty = false;
+        screen.toggle_active_facet();
+        assert_eq!(screen.field_scope, FieldScope::SubjectOnly);
+        assert!(screen.search_dirty);
+    }
+
+    #[test]
+    fn reset_facets_clears_field_scope() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.field_scope = FieldScope::BodyOnly;
+        screen.reset_facets();
+        assert_eq!(screen.field_scope, FieldScope::SubjectAndBody);
     }
 
     #[test]
