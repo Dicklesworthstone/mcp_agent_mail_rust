@@ -24,11 +24,28 @@ mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 # Optional: Tantivy lexical search engine
 tantivy = { workspace = true, optional = true }
 
+# Two-tier semantic search dependencies (all optional, enabled by "semantic" feature)
+half = { workspace = true, optional = true }
+wide = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
+
 [features]
 # Enable Tantivy-based lexical search engine
 tantivy-engine = ["dep:tantivy"]
-# Enable vector/semantic search engine
-semantic = []
+# Enable vector/semantic search engine with two-tier support
+semantic = [
+    "dep:half",
+    "dep:wide",
+    "dep:safetensors",
+    "dep:tokenizers",
+    "dep:fastembed",
+    "dep:rayon",
+    "dep:dirs",
+]
 # Enable hybrid fusion (requires both tantivy and semantic)
 hybrid = ["tantivy-engine", "semantic"]
 
