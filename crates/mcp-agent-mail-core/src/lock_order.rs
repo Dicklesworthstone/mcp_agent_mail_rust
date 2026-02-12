@@ -350,7 +350,8 @@ thread_local! {
 }
 
 #[inline]
-fn check_before_acquire(_level: LockLevel) {
+#[allow(unused_variables)]
+fn check_before_acquire(level: LockLevel) {
     #[cfg(debug_assertions)]
     HELD_LOCKS.with(|held| {
         let held = held.borrow();
@@ -358,9 +359,9 @@ fn check_before_acquire(_level: LockLevel) {
             return;
         };
         assert!(
-            _level.rank() > last.rank(),
+            level.rank() > last.rank(),
             "lock order violation: attempting to acquire {} while holding {}. held={:?}",
-            _level,
+            level,
             last,
             held.as_slice()
         );
@@ -368,21 +369,23 @@ fn check_before_acquire(_level: LockLevel) {
 }
 
 #[inline]
-fn did_acquire(_level: LockLevel) {
+#[allow(unused_variables)]
+fn did_acquire(level: LockLevel) {
     #[cfg(debug_assertions)]
-    HELD_LOCKS.with(|held| held.borrow_mut().push(_level));
+    HELD_LOCKS.with(|held| held.borrow_mut().push(level));
 }
 
 #[inline]
-fn did_release(_level: LockLevel) {
+#[allow(unused_variables)]
+fn did_release(level: LockLevel) {
     #[cfg(debug_assertions)]
     HELD_LOCKS.with(|held| {
         let mut held = held.borrow_mut();
         let last = held.pop();
         assert!(
-            last == Some(_level),
+            last == Some(level),
             "lock tracking corrupted: expected to release {}, popped={:?}, held={:?}",
-            _level,
+            level,
             last,
             held.as_slice()
         );
