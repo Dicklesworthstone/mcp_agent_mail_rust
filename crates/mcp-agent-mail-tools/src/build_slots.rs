@@ -442,4 +442,205 @@ mod tests {
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].agent, "agent-valid");
     }
+
+    // -----------------------------------------------------------------------
+    // worktrees_required error (br-3h13.4.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktrees_required_error_contains_feature_disabled() {
+        let err = worktrees_required();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("FEATURE_DISABLED") || msg.contains("disabled"),
+            "error should mention FEATURE_DISABLED: {msg}"
+        );
+    }
+
+    #[test]
+    fn worktrees_required_error_mentions_env_var() {
+        let err = worktrees_required();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("WORKTREES_ENABLED"),
+            "error should mention WORKTREES_ENABLED env var: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BuildSlotLease serde (br-3h13.4.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lease_round_trip_serde() {
+        let now = chrono::Utc::now();
+        let lease = BuildSlotLease {
+            slot: "build-1".to_string(),
+            agent: "GoldFox".to_string(),
+            branch: Some("main".to_string()),
+            exclusive: true,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            released_ts: None,
+        };
+        let json = serde_json::to_string(&lease).unwrap();
+        let parsed: BuildSlotLease = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.slot, "build-1");
+        assert_eq!(parsed.agent, "GoldFox");
+        assert_eq!(parsed.branch, Some("main".to_string()));
+        assert!(parsed.exclusive);
+        assert!(parsed.released_ts.is_none());
+    }
+
+    #[test]
+    fn lease_with_released_ts() {
+        let now = chrono::Utc::now();
+        let lease = BuildSlotLease {
+            slot: "build-2".to_string(),
+            agent: "SilverWolf".to_string(),
+            branch: None,
+            exclusive: false,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: now.to_rfc3339(),
+            released_ts: Some(now.to_rfc3339()),
+        };
+        let json = serde_json::to_string(&lease).unwrap();
+        let parsed: BuildSlotLease = serde_json::from_str(&json).unwrap();
+        assert!(parsed.released_ts.is_some());
+        assert!(!parsed.exclusive);
+        assert!(parsed.branch.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Response serde (br-3h13.4.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn acquire_response_serde() {
+        let now = chrono::Utc::now();
+        let granted = BuildSlotLease {
+            slot: "slot-x".to_string(),
+            agent: "AgentA".to_string(),
+            branch: Some("feature".to_string()),
+            exclusive: true,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            released_ts: None,
+        };
+        let conflict = BuildSlotLease {
+            slot: "slot-x".to_string(),
+            agent: "AgentB".to_string(),
+            branch: Some("main".to_string()),
+            exclusive: true,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            released_ts: None,
+        };
+        let response = AcquireBuildSlotResponse {
+            granted,
+            conflicts: vec![conflict],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: AcquireBuildSlotResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.granted.slot, "slot-x");
+        assert_eq!(parsed.conflicts.len(), 1);
+        assert_eq!(parsed.conflicts[0].agent, "AgentB");
+    }
+
+    #[test]
+    fn renew_response_serde() {
+        let response = RenewBuildSlotResponse {
+            renewed: true,
+            expires_ts: "2026-02-12T12:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: RenewBuildSlotResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.renewed);
+        assert!(parsed.expires_ts.contains("2026"));
+    }
+
+    #[test]
+    fn release_response_serde() {
+        let response = ReleaseBuildSlotResponse {
+            released: true,
+            released_at: "2026-02-12T13:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: ReleaseBuildSlotResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.released);
+        assert!(parsed.released_at.contains("2026"));
+    }
+
+    // -----------------------------------------------------------------------
+    // read_active_leases edge cases (br-3h13.4.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_active_leases_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let leases = read_active_leases(dir.path(), now);
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn read_active_leases_non_json_files_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+
+        std::fs::write(dir.path().join("readme.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("config.yaml"), "key: value").unwrap();
+
+        let leases = read_active_leases(dir.path(), now);
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn read_active_leases_expired_lease_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+
+        let expired = BuildSlotLease {
+            slot: "slot-expired".to_string(),
+            agent: "agent-old".to_string(),
+            branch: Some("main".to_string()),
+            exclusive: true,
+            acquired_ts: (now - chrono::Duration::hours(2)).to_rfc3339(),
+            expires_ts: (now - chrono::Duration::hours(1)).to_rfc3339(), // expired
+            released_ts: None,
+        };
+        std::fs::write(
+            dir.path().join("expired.json"),
+            serde_json::to_string(&expired).unwrap(),
+        )
+        .unwrap();
+
+        let leases = read_active_leases(dir.path(), now);
+        assert!(leases.is_empty(), "expired lease should be excluded");
+    }
+
+    #[test]
+    fn read_active_leases_malformed_json_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+
+        std::fs::write(dir.path().join("malformed.json"), "{ not valid json }").unwrap();
+
+        let leases = read_active_leases(dir.path(), now);
+        assert!(
+            leases.is_empty(),
+            "malformed JSON should be silently ignored"
+        );
+    }
+
+    #[test]
+    fn read_active_leases_nonexistent_directory() {
+        let now = chrono::Utc::now();
+        let nonexistent = std::path::Path::new("/nonexistent/path/that/does/not/exist");
+        let leases = read_active_leases(nonexistent, now);
+        assert!(
+            leases.is_empty(),
+            "nonexistent directory should return empty vec"
+        );
+    }
 }

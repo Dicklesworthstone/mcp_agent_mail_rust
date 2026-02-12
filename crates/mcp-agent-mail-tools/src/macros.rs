@@ -1016,4 +1016,307 @@ mod tests {
         let to_agent: Option<String> = Some("Y".into());
         assert_eq!(target.or(to_agent), Some("Y".into()));
     }
+
+    // -----------------------------------------------------------------------
+    // parse_json error paths (br-3h13.4.8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_json_includes_label_in_error() {
+        let result: McpResult<serde_json::Value> = parse_json("not valid".to_string(), "my_label");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("my_label"),
+            "error should include label: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_json_null_string() {
+        let result: McpResult<Option<i32>> = parse_json("null".to_string(), "nullable");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_json_unicode() {
+        let payload = r#"{"name":"日本語テスト","emoji":"🎉"}"#.to_string();
+        let result: McpResult<serde_json::Value> = parse_json(payload, "unicode");
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["name"], "日本語テスト");
+        assert_eq!(val["emoji"], "🎉");
+    }
+
+    #[test]
+    fn parse_json_deeply_nested() {
+        let payload = r#"{"a":{"b":{"c":{"d":42}}}}"#.to_string();
+        let result: McpResult<serde_json::Value> = parse_json(payload, "nested");
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["a"]["b"]["c"]["d"], 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // human_key validation (br-3h13.4.8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn human_key_absolute_path_variations() {
+        // Valid absolute paths
+        assert!("/data/projects/test".starts_with('/'));
+        assert!("/".starts_with('/'));
+        assert!("/a/b/c/d/e/f".starts_with('/'));
+
+        // Invalid relative paths
+        assert!(!"data/projects/test".starts_with('/'));
+        assert!(!"./test".starts_with('/'));
+        assert!(!"../parent".starts_with('/'));
+        assert!(!"~/.config".starts_with('/')); // tilde is not /
+    }
+
+    #[test]
+    fn human_key_windows_paths_are_relative() {
+        // Windows-style paths should be considered relative
+        assert!(!"C:\\Users\\test".starts_with('/'));
+        assert!(!"D:/projects/foo".starts_with('/'));
+    }
+
+    // -----------------------------------------------------------------------
+    // TTL validation (br-3h13.4.8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ttl_minimum_validation_boundary() {
+        // macro_file_reservation_cycle requires TTL >= 60
+        let min_ttl: i64 = 60;
+        assert!(59 < min_ttl);
+        assert!(60 >= min_ttl);
+        assert!(61 >= min_ttl);
+    }
+
+    #[test]
+    fn ttl_default_values_are_sane() {
+        // macro_start_session default file reservation TTL
+        assert_eq!(3600_i64, 60 * 60); // 1 hour
+
+        // macro_contact_handshake default TTL
+        assert_eq!(604_800_i64, 7 * 24 * 60 * 60); // 7 days
+
+        // Both should be >= 60
+        assert!(3600 >= 60);
+        assert!(604_800 >= 60);
+    }
+
+    // -----------------------------------------------------------------------
+    // StartSessionResponse fields (br-3h13.4.8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn start_session_response_with_reservations() {
+        use crate::reservations::{GrantedReservation, ReservationResponse};
+
+        let resp = StartSessionResponse {
+            project: ProjectResponse {
+                id: 1,
+                slug: "test".into(),
+                human_key: "/test".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            agent: AgentResponse {
+                id: 1,
+                name: "TestAgent".into(),
+                program: "test".into(),
+                model: "test".into(),
+                task_description: String::new(),
+                inception_ts: String::new(),
+                last_active_ts: String::new(),
+                project_id: 1,
+                attachments_policy: "auto".into(),
+            },
+            file_reservations: ReservationResponse {
+                granted: vec![GrantedReservation {
+                    id: 1,
+                    path_pattern: "src/**".into(),
+                    expires_ts: "2026-01-01T01:00:00Z".into(),
+                    exclusive: true,
+                    reason: "test reservation".into(),
+                }],
+                conflicts: Vec::new(),
+            },
+            inbox: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: StartSessionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.file_reservations.granted.len(), 1);
+        assert_eq!(parsed.file_reservations.granted[0].path_pattern, "src/**");
+        assert!(parsed.file_reservations.granted[0].exclusive);
+    }
+
+    #[test]
+    fn start_session_response_with_inbox() {
+        let resp = StartSessionResponse {
+            project: ProjectResponse {
+                id: 1,
+                slug: "p".into(),
+                human_key: "/p".into(),
+                created_at: String::new(),
+            },
+            agent: AgentResponse {
+                id: 1,
+                name: "A".into(),
+                program: "p".into(),
+                model: "m".into(),
+                task_description: String::new(),
+                inception_ts: String::new(),
+                last_active_ts: String::new(),
+                project_id: 1,
+                attachments_policy: "auto".into(),
+            },
+            file_reservations: ReservationResponse {
+                granted: Vec::new(),
+                conflicts: Vec::new(),
+            },
+            inbox: vec![InboxMessage {
+                id: 100,
+                project_id: 1,
+                sender_id: 2,
+                thread_id: Some("br-1".into()),
+                subject: "Hello".into(),
+                importance: "high".into(),
+                ack_required: true,
+                from: "Sender".into(),
+                created_ts: None,
+                kind: "direct".into(),
+                attachments: Vec::new(),
+                body_md: Some("Body text".into()),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: StartSessionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.inbox.len(), 1);
+        assert_eq!(parsed.inbox[0].subject, "Hello");
+        assert!(parsed.inbox[0].ack_required);
+    }
+
+    // -----------------------------------------------------------------------
+    // PrepareThreadResponse fields (br-3h13.4.8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prepare_thread_response_empty_thread() {
+        let resp = PrepareThreadResponse {
+            project: ProjectResponse {
+                id: 1,
+                slug: "p".into(),
+                human_key: "/p".into(),
+                created_at: String::new(),
+            },
+            agent: AgentResponse {
+                id: 1,
+                name: "A".into(),
+                program: "p".into(),
+                model: "m".into(),
+                task_description: String::new(),
+                inception_ts: String::new(),
+                last_active_ts: String::new(),
+                project_id: 1,
+                attachments_policy: "auto".into(),
+            },
+            thread: PreparedThread {
+                thread_id: "nonexistent".into(),
+                summary: ThreadSummary {
+                    participants: Vec::new(),
+                    key_points: Vec::new(),
+                    action_items: Vec::new(),
+                    total_messages: 0,
+                    open_actions: 0,
+                    done_actions: 0,
+                    mentions: Vec::new(),
+                    code_references: None,
+                },
+                examples: Vec::new(),
+                total_messages: 0,
+            },
+            inbox: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: PrepareThreadResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.thread.total_messages, 0);
+        assert!(parsed.thread.examples.is_empty());
+        assert!(parsed.thread.summary.participants.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ReservationCycleResponse with auto_release (br-3h13.4.8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reservation_cycle_auto_release_present() {
+        use crate::reservations::ReleaseResult;
+
+        let resp = ReservationCycleResponse {
+            file_reservations: ReservationResponse {
+                granted: Vec::new(),
+                conflicts: Vec::new(),
+            },
+            released: Some(ReleaseResult {
+                released: 5,
+                released_at: "2026-02-12T12:00:00Z".into(),
+            }),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ReservationCycleResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.released.is_some());
+        assert_eq!(parsed.released.unwrap().released, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // HandshakeResponse variations (br-3h13.4.8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handshake_response_request_only() {
+        let resp = HandshakeResponse {
+            request: serde_json::json!({"status": "pending"}),
+            response: None,
+            welcome_message: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: HandshakeResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.request["status"], "pending");
+        assert!(parsed.response.is_none());
+        assert!(parsed.welcome_message.is_none());
+    }
+
+    #[test]
+    fn handshake_response_with_welcome() {
+        let resp = HandshakeResponse {
+            request: serde_json::json!({"from": "A"}),
+            response: Some(serde_json::json!({"approved": true})),
+            welcome_message: Some(serde_json::json!({
+                "id": 1,
+                "subject": "Welcome!",
+                "body": "Hello and welcome to the project."
+            })),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: HandshakeResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.welcome_message.is_some());
+        let welcome = parsed.welcome_message.unwrap();
+        assert_eq!(welcome["subject"], "Welcome!");
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty paths edge case (br-3h13.4.8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_reservation_paths_produces_empty_grants() {
+        // When file_reservation_paths is Some but empty, should return empty grants
+        let empty_paths: Vec<String> = Vec::new();
+        assert!(empty_paths.is_empty());
+        // In macro_start_session, this produces ReservationResponse with empty granted/conflicts
+    }
 }

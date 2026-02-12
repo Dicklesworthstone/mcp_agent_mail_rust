@@ -692,4 +692,279 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("disabled") || msg.contains("FEATURE_DISABLED"));
     }
+
+    // -----------------------------------------------------------------------
+    // worktrees_required error details (br-3h13.4.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktrees_required_mentions_env_var() {
+        let err = worktrees_required();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("WORKTREES_ENABLED"),
+            "error should mention WORKTREES_ENABLED: {msg}"
+        );
+    }
+
+    #[test]
+    fn worktrees_required_mentions_product_bus() {
+        let err = worktrees_required();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("Product Bus"),
+            "error should mention Product Bus: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ProductResponse serde (br-3h13.4.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn product_response_round_trip() {
+        let resp = ProductResponse {
+            id: 42,
+            product_uid: "abc123def456".to_string(),
+            name: "Test Product".to_string(),
+            created_at: "2026-02-12T12:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ProductResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, 42);
+        assert_eq!(parsed.product_uid, "abc123def456");
+        assert_eq!(parsed.name, "Test Product");
+        assert!(parsed.created_at.contains("2026"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ProductSummary and ProjectSummary serde (br-3h13.4.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn product_summary_serde() {
+        let summary = ProductSummary {
+            id: 1,
+            product_uid: "uid123".to_string(),
+            name: "My Product".to_string(),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let parsed: ProductSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, 1);
+        assert_eq!(parsed.product_uid, "uid123");
+        assert_eq!(parsed.name, "My Product");
+    }
+
+    #[test]
+    fn project_summary_serde() {
+        let summary = ProjectSummary {
+            id: 5,
+            slug: "my-project".to_string(),
+            human_key: "/data/projects/my-project".to_string(),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let parsed: ProjectSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, 5);
+        assert_eq!(parsed.slug, "my-project");
+        assert!(parsed.human_key.contains("/data/projects"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ProductsLinkResponse serde (br-3h13.4.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn products_link_response_serde() {
+        let resp = ProductsLinkResponse {
+            product: ProductSummary {
+                id: 1,
+                product_uid: "prod123".to_string(),
+                name: "Product A".to_string(),
+            },
+            project: ProjectSummary {
+                id: 2,
+                slug: "proj-a".to_string(),
+                human_key: "/path/to/proj-a".to_string(),
+            },
+            linked: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ProductsLinkResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.linked);
+        assert_eq!(parsed.product.product_uid, "prod123");
+        assert_eq!(parsed.project.slug, "proj-a");
+    }
+
+    #[test]
+    fn products_link_response_not_linked() {
+        let resp = ProductsLinkResponse {
+            product: ProductSummary {
+                id: 1,
+                product_uid: "uid".to_string(),
+                name: "name".to_string(),
+            },
+            project: ProjectSummary {
+                id: 2,
+                slug: "slug".to_string(),
+                human_key: "/path".to_string(),
+            },
+            linked: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ProductsLinkResponse = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.linked);
+    }
+
+    // -----------------------------------------------------------------------
+    // ProductSearchItem and ProductSearchResponse serde (br-3h13.4.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn product_search_item_serde() {
+        let item = ProductSearchItem {
+            id: 100,
+            subject: "Test message".to_string(),
+            importance: "high".to_string(),
+            ack_required: 1,
+            created_ts: Some("2026-02-12T10:00:00Z".to_string()),
+            thread_id: Some("br-123".to_string()),
+            from: "GoldFox".to_string(),
+            project_id: 5,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let parsed: ProductSearchItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, 100);
+        assert_eq!(parsed.subject, "Test message");
+        assert_eq!(parsed.importance, "high");
+        assert_eq!(parsed.ack_required, 1);
+        assert_eq!(parsed.thread_id, Some("br-123".to_string()));
+        assert_eq!(parsed.from, "GoldFox");
+        assert_eq!(parsed.project_id, 5);
+    }
+
+    #[test]
+    fn product_search_item_nullable_fields() {
+        let item = ProductSearchItem {
+            id: 1,
+            subject: "Msg".to_string(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: None,
+            thread_id: None,
+            from: "Agent".to_string(),
+            project_id: 1,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let parsed: ProductSearchItem = serde_json::from_str(&json).unwrap();
+        assert!(parsed.created_ts.is_none());
+        assert!(parsed.thread_id.is_none());
+    }
+
+    #[test]
+    fn product_search_response_empty() {
+        let resp = ProductSearchResponse { result: Vec::new() };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.result.is_empty());
+    }
+
+    #[test]
+    fn product_search_response_with_items() {
+        let resp = ProductSearchResponse {
+            result: vec![
+                ProductSearchItem {
+                    id: 1,
+                    subject: "First".to_string(),
+                    importance: "high".to_string(),
+                    ack_required: 1,
+                    created_ts: None,
+                    thread_id: None,
+                    from: "A".to_string(),
+                    project_id: 1,
+                },
+                ProductSearchItem {
+                    id: 2,
+                    subject: "Second".to_string(),
+                    importance: "low".to_string(),
+                    ack_required: 0,
+                    created_ts: None,
+                    thread_id: None,
+                    from: "B".to_string(),
+                    project_id: 2,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.result.len(), 2);
+        assert_eq!(parsed.result[0].subject, "First");
+        assert_eq!(parsed.result[1].subject, "Second");
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_product_uid determinism (br-3h13.4.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn product_uid_from_different_pids_differs() {
+        // UIDs include PID component, so sequential calls in same process differ via counter
+        let a = generate_product_uid(1_000_000);
+        let b = generate_product_uid(1_000_000);
+        assert_ne!(
+            a, b,
+            "UIDs should differ even with same timestamp due to counter"
+        );
+    }
+
+    #[test]
+    fn product_uid_pads_to_20_chars() {
+        // Even with a very small input, should pad to 20 chars
+        let uid = generate_product_uid(1);
+        assert_eq!(uid.len(), 20);
+    }
+
+    #[test]
+    fn product_uid_large_timestamp() {
+        let large_ts = 9_999_999_999_999_i64;
+        let uid = generate_product_uid(large_ts);
+        assert_eq!(uid.len(), 20);
+        assert!(uid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_hex_uid boundary cases (br-3h13.4.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hex_uid_exactly_8_chars() {
+        assert!(is_hex_uid("abcdef12"));
+        assert!(is_hex_uid("12345678"));
+    }
+
+    #[test]
+    fn hex_uid_exactly_64_chars() {
+        assert!(is_hex_uid(&"f".repeat(64)));
+    }
+
+    #[test]
+    fn hex_uid_7_chars_rejected() {
+        assert!(!is_hex_uid("abcdef1"));
+    }
+
+    #[test]
+    fn hex_uid_65_chars_rejected() {
+        assert!(!is_hex_uid(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn hex_uid_special_chars_rejected() {
+        assert!(!is_hex_uid("abcdef1g")); // 'g' is not hex
+        assert!(!is_hex_uid("abcdef12!")); // '!' is not hex
+        assert!(!is_hex_uid("abc def12")); // space
+    }
+
+    #[test]
+    fn hex_uid_whitespace_only_rejected() {
+        assert!(!is_hex_uid("        ")); // 8 spaces after trim = empty
+    }
 }
