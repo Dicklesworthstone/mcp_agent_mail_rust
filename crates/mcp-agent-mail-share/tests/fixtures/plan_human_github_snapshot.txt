@@ -1,0 +1,17 @@
+Deployment Plan: /tmp/bundle -> GitHub Pages
+────────────────────────────────────────────────────────────
+Expected URL: https://example.github.io/repo
+
+Steps:
+  1. Prepare workflow (optional) [confirm]
+     $ echo prepare
+  2. Deploy bundle
+     $ gh workflow run deploy.yml
+
+Warnings:
+  ⚠ Ensure Pages source is set to GitHub Actions
+  ⚠ First deployment may take a few minutes
+
+Files to generate:
+  - /tmp/bundle/.nojekyll
+  - /tmp/bundle/_headers

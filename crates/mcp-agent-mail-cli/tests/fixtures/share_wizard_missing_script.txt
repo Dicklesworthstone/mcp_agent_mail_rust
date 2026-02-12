@@ -1,0 +1,8 @@
+Launching deployment wizard...
+Wizard script not found.
+Expected locations:
+  - <SOURCE_SCRIPT>
+  - <CWD_SCRIPT>
+
+This command only works when running from source.
+Run the wizard directly: python scripts/share_to_github_pages.py
