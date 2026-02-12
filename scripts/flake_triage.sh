@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════
+# DEPRECATED: Use `am flake-triage` instead.
+#
+# Native Rust implementation with no python3 dependency.
+# Equivalent commands:
+#   am flake-triage scan [--dir DIR] [--json]     # Scan for artifacts
+#   am flake-triage reproduce <artifact.json>     # Reproduce from artifact
+#   am flake-triage detect <test> [--seeds N]     # Multi-seed flake detection
+#
+# This script is maintained for backward compatibility only.
+# ═══════════════════════════════════════════════════════════════════════════
+#
 # br-3vwi.10.5: Flake triage CLI — analyze and reproduce test failures.
 #
 # Usage:
@@ -12,6 +24,9 @@
 #   scripts/flake_triage.sh --multi-seed my_test_name 20
 
 set -euo pipefail
+
+# ── Deprecation Warning ──────────────────────────────────────────────────
+echo -e "\033[0;33m[DEPRECATED]\033[0m scripts/flake_triage.sh is deprecated. Use 'am flake-triage' instead." >&2
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
