@@ -1382,6 +1382,358 @@ e2e_wait_port() {
 }
 
 # ---------------------------------------------------------------------------
+# JSON-RPC Request/Response Capture (br-3h13.12.1)
+# ---------------------------------------------------------------------------
+#
+# e2e_rpc_call: Composable JSON-RPC caller with full artifact capture.
+#
+# Usage:
+#   e2e_rpc_call <case_id> <url> <tool_name> [arguments_json] [extra_headers...]
+#
+# Artifacts saved to ${E2E_ARTIFACT_DIR}/<case_id>/:
+#   request.json   - Full JSON-RPC request body
+#   response.json  - Full response body
+#   headers.txt    - HTTP response headers
+#   timing.txt     - Elapsed time in milliseconds
+#   status.txt     - HTTP status code
+#   curl_stderr.txt - curl stderr output (for debugging)
+#   diagnostics.txt - Auto-saved on non-200 status or error
+#
+# Returns:
+#   0 on success (HTTP 200), 1 otherwise
+#   Response body is saved to ${E2E_ARTIFACT_DIR}/<case_id>/response.json
+#
+# Environment variables:
+#   E2E_RPC_CALL_HOOK - Optional: path to script called after each request.
+#       Receives: $1=case_id, $2=status_code, $3=elapsed_ms, $4=artifact_dir
+#
+# Example:
+#   e2e_rpc_call "test_health_check" "http://127.0.0.1:8765/mcp/" "health_check"
+#   e2e_rpc_call "test_ensure" "http://127.0.0.1:8765/mcp/" "ensure_project" '{"human_key":"/tmp/test"}'
+#   e2e_rpc_call "test_auth" "http://127.0.0.1:8765/mcp/" "health_check" '{}' "Authorization: Bearer tok123"
+
+e2e_rpc_call() {
+    local case_id="$1"
+    local url="$2"
+    local tool_name="$3"
+    local args_json="${4:-{\}}"
+    shift 4 2>/dev/null || shift 3 2>/dev/null || true
+
+    # Create case-specific artifact directory
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    mkdir -p "${case_dir}"
+
+    local request_file="${case_dir}/request.json"
+    local response_file="${case_dir}/response.json"
+    local headers_file="${case_dir}/headers.txt"
+    local timing_file="${case_dir}/timing.txt"
+    local status_file="${case_dir}/status.txt"
+    local curl_stderr_file="${case_dir}/curl_stderr.txt"
+    local diagnostics_file="${case_dir}/diagnostics.txt"
+
+    # Build JSON-RPC request payload
+    local payload
+    payload="$(cat <<EOJSON
+{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"${tool_name}","arguments":${args_json}}}
+EOJSON
+)"
+    echo "${payload}" > "${request_file}"
+
+    # Build curl arguments
+    local curl_args=(
+        -sS
+        -D "${headers_file}"
+        -o "${response_file}"
+        -w "%{http_code}|%{time_total}"
+        -X POST
+        "${url}"
+        -H "content-type: application/json"
+        --data "@${request_file}"
+    )
+
+    # Add extra headers from remaining args
+    for h in "$@"; do
+        curl_args+=(-H "$h")
+    done
+
+    # Execute curl
+    set +e
+    local curl_output
+    curl_output="$(curl "${curl_args[@]}" 2>"${curl_stderr_file}")"
+    local curl_rc=$?
+    set -e
+
+    # Parse curl output (status|time_total)
+    local http_status time_total elapsed_ms
+    http_status="${curl_output%%|*}"
+    time_total="${curl_output##*|}"
+    # Convert time_total (seconds with decimals) to milliseconds
+    if command -v python3 >/dev/null 2>&1; then
+        elapsed_ms="$(python3 -c "print(int(float('${time_total}') * 1000))" 2>/dev/null || echo "0")"
+    else
+        elapsed_ms="$(echo "${time_total} * 1000 / 1" | bc 2>/dev/null || echo "0")"
+    fi
+
+    echo "${http_status}" > "${status_file}"
+    echo "${elapsed_ms}" > "${timing_file}"
+
+    # Handle curl failure
+    if [ "$curl_rc" -ne 0 ]; then
+        {
+            echo "CURL_FAILURE"
+            echo "curl_rc=${curl_rc}"
+            echo "case_id=${case_id}"
+            echo "url=${url}"
+            echo "tool=${tool_name}"
+            echo ""
+            echo "=== curl stderr ==="
+            cat "${curl_stderr_file}" 2>/dev/null || echo "(empty)"
+            echo ""
+            echo "=== request ==="
+            cat "${request_file}"
+        } > "${diagnostics_file}"
+        _e2e_trace_event "rpc_call_fail" "curl_rc=${curl_rc}" "${case_id}"
+        return 1
+    fi
+
+    # Handle non-200 status
+    if [ "${http_status}" != "200" ]; then
+        {
+            echo "HTTP_ERROR"
+            echo "status=${http_status}"
+            echo "case_id=${case_id}"
+            echo "url=${url}"
+            echo "tool=${tool_name}"
+            echo "elapsed_ms=${elapsed_ms}"
+            echo ""
+            echo "=== response headers ==="
+            cat "${headers_file}" 2>/dev/null || echo "(no headers)"
+            echo ""
+            echo "=== response body ==="
+            cat "${response_file}" 2>/dev/null || echo "(no body)"
+            echo ""
+            echo "=== request ==="
+            cat "${request_file}"
+        } > "${diagnostics_file}"
+        _e2e_trace_event "rpc_call_fail" "status=${http_status}" "${case_id}"
+
+        # Call hook if defined
+        if [ -n "${E2E_RPC_CALL_HOOK:-}" ] && [ -x "${E2E_RPC_CALL_HOOK}" ]; then
+            "${E2E_RPC_CALL_HOOK}" "${case_id}" "${http_status}" "${elapsed_ms}" "${case_dir}" || true
+        fi
+
+        return 1
+    fi
+
+    # Success - trace event and call hook
+    _e2e_trace_event "rpc_call_ok" "status=200 elapsed_ms=${elapsed_ms}" "${case_id}"
+
+    if [ -n "${E2E_RPC_CALL_HOOK:-}" ] && [ -x "${E2E_RPC_CALL_HOOK}" ]; then
+        "${E2E_RPC_CALL_HOOK}" "${case_id}" "${http_status}" "${elapsed_ms}" "${case_dir}" || true
+    fi
+
+    return 0
+}
+
+# e2e_rpc_call_raw: Like e2e_rpc_call but with raw JSON-RPC payload (for non-tools/call)
+#
+# Usage:
+#   e2e_rpc_call_raw <case_id> <url> <payload_json> [extra_headers...]
+
+e2e_rpc_call_raw() {
+    local case_id="$1"
+    local url="$2"
+    local payload="$3"
+    shift 3 2>/dev/null || true
+
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    mkdir -p "${case_dir}"
+
+    local request_file="${case_dir}/request.json"
+    local response_file="${case_dir}/response.json"
+    local headers_file="${case_dir}/headers.txt"
+    local timing_file="${case_dir}/timing.txt"
+    local status_file="${case_dir}/status.txt"
+    local curl_stderr_file="${case_dir}/curl_stderr.txt"
+    local diagnostics_file="${case_dir}/diagnostics.txt"
+
+    echo "${payload}" > "${request_file}"
+
+    local curl_args=(
+        -sS
+        -D "${headers_file}"
+        -o "${response_file}"
+        -w "%{http_code}|%{time_total}"
+        -X POST
+        "${url}"
+        -H "content-type: application/json"
+        --data "@${request_file}"
+    )
+
+    for h in "$@"; do
+        curl_args+=(-H "$h")
+    done
+
+    set +e
+    local curl_output
+    curl_output="$(curl "${curl_args[@]}" 2>"${curl_stderr_file}")"
+    local curl_rc=$?
+    set -e
+
+    local http_status time_total elapsed_ms
+    http_status="${curl_output%%|*}"
+    time_total="${curl_output##*|}"
+    if command -v python3 >/dev/null 2>&1; then
+        elapsed_ms="$(python3 -c "print(int(float('${time_total}') * 1000))" 2>/dev/null || echo "0")"
+    else
+        elapsed_ms="$(echo "${time_total} * 1000 / 1" | bc 2>/dev/null || echo "0")"
+    fi
+
+    echo "${http_status}" > "${status_file}"
+    echo "${elapsed_ms}" > "${timing_file}"
+
+    if [ "$curl_rc" -ne 0 ]; then
+        {
+            echo "CURL_FAILURE"
+            echo "curl_rc=${curl_rc}"
+            echo "case_id=${case_id}"
+            echo "url=${url}"
+            echo ""
+            echo "=== curl stderr ==="
+            cat "${curl_stderr_file}" 2>/dev/null || echo "(empty)"
+            echo ""
+            echo "=== request ==="
+            cat "${request_file}"
+        } > "${diagnostics_file}"
+        _e2e_trace_event "rpc_call_fail" "curl_rc=${curl_rc}" "${case_id}"
+        return 1
+    fi
+
+    if [ "${http_status}" != "200" ]; then
+        {
+            echo "HTTP_ERROR"
+            echo "status=${http_status}"
+            echo "case_id=${case_id}"
+            echo "url=${url}"
+            echo "elapsed_ms=${elapsed_ms}"
+            echo ""
+            echo "=== response headers ==="
+            cat "${headers_file}" 2>/dev/null || echo "(no headers)"
+            echo ""
+            echo "=== response body ==="
+            cat "${response_file}" 2>/dev/null || echo "(no body)"
+            echo ""
+            echo "=== request ==="
+            cat "${request_file}"
+        } > "${diagnostics_file}"
+        _e2e_trace_event "rpc_call_fail" "status=${http_status}" "${case_id}"
+
+        if [ -n "${E2E_RPC_CALL_HOOK:-}" ] && [ -x "${E2E_RPC_CALL_HOOK}" ]; then
+            "${E2E_RPC_CALL_HOOK}" "${case_id}" "${http_status}" "${elapsed_ms}" "${case_dir}" || true
+        fi
+
+        return 1
+    fi
+
+    _e2e_trace_event "rpc_call_ok" "status=200 elapsed_ms=${elapsed_ms}" "${case_id}"
+
+    if [ -n "${E2E_RPC_CALL_HOOK:-}" ] && [ -x "${E2E_RPC_CALL_HOOK}" ]; then
+        "${E2E_RPC_CALL_HOOK}" "${case_id}" "${http_status}" "${elapsed_ms}" "${case_dir}" || true
+    fi
+
+    return 0
+}
+
+# e2e_rpc_read_response: Helper to read and parse response.json from a case
+#
+# Usage:
+#   local body
+#   body="$(e2e_rpc_read_response "test_case")"
+
+e2e_rpc_read_response() {
+    local case_id="$1"
+    cat "${E2E_ARTIFACT_DIR}/${case_id}/response.json" 2>/dev/null || echo ""
+}
+
+# e2e_rpc_read_status: Helper to read HTTP status code from a case
+#
+# Usage:
+#   local status
+#   status="$(e2e_rpc_read_status "test_case")"
+
+e2e_rpc_read_status() {
+    local case_id="$1"
+    cat "${E2E_ARTIFACT_DIR}/${case_id}/status.txt" 2>/dev/null || echo ""
+}
+
+# e2e_rpc_read_timing: Helper to read elapsed time in ms from a case
+#
+# Usage:
+#   local ms
+#   ms="$(e2e_rpc_read_timing "test_case")"
+
+e2e_rpc_read_timing() {
+    local case_id="$1"
+    cat "${E2E_ARTIFACT_DIR}/${case_id}/timing.txt" 2>/dev/null || echo "0"
+}
+
+# e2e_rpc_assert_success: Assert an RPC call succeeded (HTTP 200 + no JSON-RPC error)
+#
+# Usage:
+#   e2e_rpc_assert_success "test_case" "health check succeeds"
+
+e2e_rpc_assert_success() {
+    local case_id="$1"
+    local label="$2"
+    local status response
+
+    status="$(e2e_rpc_read_status "${case_id}")"
+    if [ "${status}" != "200" ]; then
+        e2e_fail "${label} (HTTP ${status})"
+        return 1
+    fi
+
+    response="$(e2e_rpc_read_response "${case_id}")"
+    if echo "${response}" | grep -q '"error"'; then
+        e2e_fail "${label} (JSON-RPC error in response)"
+        return 1
+    fi
+
+    e2e_pass "${label}"
+    return 0
+}
+
+# e2e_rpc_assert_error: Assert an RPC call returned HTTP non-200 or JSON-RPC error
+#
+# Usage:
+#   e2e_rpc_assert_error "test_case" "invalid auth fails" "401"
+
+e2e_rpc_assert_error() {
+    local case_id="$1"
+    local label="$2"
+    local expected_status="${3:-}"
+    local status
+
+    status="$(e2e_rpc_read_status "${case_id}")"
+    if [ -n "${expected_status}" ] && [ "${status}" != "${expected_status}" ]; then
+        e2e_fail "${label} (expected HTTP ${expected_status}, got ${status})"
+        return 1
+    fi
+
+    if [ "${status}" = "200" ]; then
+        local response
+        response="$(e2e_rpc_read_response "${case_id}")"
+        if ! echo "${response}" | grep -q '"error"'; then
+            e2e_fail "${label} (expected error, got success)"
+            return 1
+        fi
+    fi
+
+    e2e_pass "${label}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Environment dump (redact secrets)
 # ---------------------------------------------------------------------------
 
