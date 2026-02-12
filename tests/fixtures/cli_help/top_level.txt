@@ -5,8 +5,11 @@ Usage: am <COMMAND>
 Commands:
   serve-http
   serve-stdio
+  check-inbox                 Check agent inbox for unread messages (for git hooks and editor integrations)
+  ci                          Run CI quality gates (format, lint, build, test)
   lint
   typecheck
+  e2e                         Run E2E test suites
   share
   archive
   guard
@@ -31,6 +34,9 @@ Commands:
   contacts                    Contact request/approve/reject/policy lifecycle
   beads                       Query beads (issue tracker) status for the current project
   setup                       Detect coding agents and configure MCP server connections
+  golden                      Capture, verify, and inspect deterministic golden CLI artifacts
+  flake-triage                Flake triage: scan artifacts, reproduce failures, detect flaky tests
+  robot                       Agent-optimized commands with TOON/JSON/Markdown output
   help                        Print this message or the help of the given subcommand(s)
 
 Options:

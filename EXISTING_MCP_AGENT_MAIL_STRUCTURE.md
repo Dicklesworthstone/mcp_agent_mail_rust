@@ -103,7 +103,8 @@ Structured CLI inventory artifact: `crates/mcp-agent-mail-conformance/tests/conf
   - `--output` defaults to filename without `.age` (or adds `_decrypted` suffix).
   - `--identity` (age key file) is mutually exclusive with `--passphrase`.
 - `share wizard`:
-  - Launches `scripts/share_to_github_pages.py` from repo (source-only); errors if not found.
+  - Runs the native Rust deployment wizard (`run_interactive_wizard` + `execute_plan`).
+  - In non-interactive mode, validates required provider-specific options and returns structured JSON failures when `--json` is set.
 
 ### Doctor Commands (CLI)
 - `doctor check`:
@@ -742,7 +743,7 @@ QUOTA_INBOX_LIMIT_COUNT=0
 
 ### Agent Naming Rules
 - MUST be adjective+noun combinations (e.g., "GreenLake", "BlueDog")
-- 62 adjectives × 70 nouns = 4,340 valid combinations
+- 62 adjectives × 73 nouns = 4,526 valid combinations
 - Case-insensitive unique per project
 - NOT descriptive role names
 
@@ -1452,7 +1453,7 @@ After copying viewer assets, compute SHA256 SRI hashes for `.js`, `.css`, `.wasm
 - `share preview` defaults: host=127.0.0.1, port=9000, no auto-open. Keys: `r`=reload, `d`=deploy (exit 42), `q`=quit.
 - `share verify` validates SRI hashes + optional Ed25519 signature.
 - `share decrypt` resolves output from filename (strip `.age` or add `_decrypted`). Identity and passphrase are mutually exclusive.
-- `share wizard` launches `scripts/share_to_github_pages.py` (source-only; errors if not found).
+- `share wizard` uses the native Rust implementation (no runtime dependency on `scripts/share_to_github_pages.py`).
 
 ### Bundle Directory Layout
 

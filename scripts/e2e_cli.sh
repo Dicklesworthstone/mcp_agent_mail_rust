@@ -13,7 +13,7 @@
 #   9. amctl env output
 #  10. mcp-agent-mail bind failure reports non-zero exit (port in use)
 #  11. JSON mode coverage for archive/doctor/list-projects
-#  12. share wizard missing-script error path
+#  12. share wizard native validation error path
 #  13. Additional command coverage: list-acks, docs insert-blurbs, am-run, archive restore/save, products error semantics
 
 E2E_SUITE="cli"
@@ -480,20 +480,22 @@ e2e_assert_exit_code "am list-acks exits 0" "0" "$LIST_ACKS_RC"
 e2e_assert_contains "list-acks empty-state message" "$LIST_ACKS_OUT" "No ack-required messages"
 
 # ===========================================================================
-# Case 24: share wizard missing-script error path
+# Case 24: share wizard native validation error path
 # ===========================================================================
-e2e_case_banner "share wizard missing script error path"
+e2e_case_banner "share wizard non-interactive validation error path"
 
 WIZARD_CWD="$(e2e_mktemp "e2e_cli_wizard")"
+WIZARD_BUNDLE="${WORK}/wizard_bundle_ok"
+mkdir -p "${WIZARD_BUNDLE}"
+printf '{}' > "${WIZARD_BUNDLE}/manifest.json"
 set +e
-WIZARD_OUT="$(cd "$WIZARD_CWD" && am share wizard 2>&1)"
+WIZARD_OUT="$(cd "$WIZARD_CWD" && am share wizard --bundle "$WIZARD_BUNDLE" --non-interactive --yes --dry-run --json 2>&1)"
 WIZARD_RC=$?
 set -e
 
-e2e_save_artifact "case_24_share_wizard_missing_script.txt" "$WIZARD_OUT"
-e2e_assert_exit_code "am share wizard exits 1 when script missing" "1" "$WIZARD_RC"
-e2e_assert_contains "wizard reports missing script" "$WIZARD_OUT" "Wizard script not found."
-e2e_assert_contains "wizard suggests direct python invocation" "$WIZARD_OUT" "Run the wizard directly: python scripts/share_to_github_pages.py"
+e2e_save_artifact "case_24_share_wizard_native_validation.txt" "$WIZARD_OUT"
+e2e_assert_exit_code "am share wizard exits 1 when required options are missing" "1" "$WIZARD_RC"
+e2e_assert_contains "wizard reports native missing required option code" "$WIZARD_OUT" "\"error_code\": \"MISSING_REQUIRED_OPTION\""
 
 # ===========================================================================
 # Case 25: bind failure returns non-zero when port is already in use
