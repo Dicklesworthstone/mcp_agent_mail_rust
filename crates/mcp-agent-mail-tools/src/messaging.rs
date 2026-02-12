@@ -29,7 +29,7 @@ use crate::tool_util::{
 ///
 /// Uses the write-behind queue when available. If the queue is unavailable,
 /// logs a warning and skips the archive write (DB remains the source of truth).
-fn try_write_message_archive(
+pub fn try_write_message_archive(
     config: &Config,
     project_slug: &str,
     message_json: &serde_json::Value,

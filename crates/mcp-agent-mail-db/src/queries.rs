@@ -313,6 +313,10 @@ fn map_sql_outcome<T>(out: Outcome<T, SqlError>) -> Outcome<T, DbError> {
     }
 }
 
+fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> {
+    ProjectRow::from_row(row).map_err(|e| map_sql_error(&e))
+}
+
 /// `SQLite` default `SQLITE_MAX_VARIABLE_NUMBER` is 999 (32766 in newer builds).
 /// We cap IN-clause item counts well below that to prevent excessively large
 /// SQL strings and parameter arrays from untrusted input.
@@ -415,25 +419,46 @@ pub async fn ensure_project(
     let tracked = tracked(&*conn);
 
     // Match legacy semantics: slug is the stable identity; `human_key` is informative.
-    let existing = map_sql_outcome(
-        select!(ProjectRow)
-            .filter(Expr::col("slug").eq(slug.as_str()))
-            .first(cx, &tracked)
-            .await,
-    );
-    match existing {
-        Outcome::Ok(Some(row)) => {
-            crate::cache::read_cache().put_project(&row);
-            Outcome::Ok(row)
-        }
-        Outcome::Ok(None) => {
+    let select_sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
+    let select_params = [Value::Text(slug.clone())];
+    match map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await) {
+        Outcome::Ok(rows) => {
+            if let Some(r) = rows.first() {
+                match decode_project_row(r) {
+                    Ok(row) => {
+                        crate::cache::read_cache().put_project(&row);
+                        return Outcome::Ok(row);
+                    }
+                    Err(e) => return Outcome::Err(e),
+                }
+            }
+
             let mut row = ProjectRow::new(slug.clone(), human_key.to_string());
             let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
-                Outcome::Ok(id) => {
-                    row.id = Some(id);
-                    crate::cache::read_cache().put_project(&row);
-                    Outcome::Ok(row)
+                Outcome::Ok(_) => {
+                    match map_sql_outcome(
+                        traw_query(cx, &tracked, select_sql, &select_params).await,
+                    ) {
+                        Outcome::Ok(rows) => {
+                            if let Some(r) = rows.first() {
+                                match decode_project_row(r) {
+                                    Ok(fresh) => {
+                                        crate::cache::read_cache().put_project(&fresh);
+                                        Outcome::Ok(fresh)
+                                    }
+                                    Err(err) => Outcome::Err(err),
+                                }
+                            } else {
+                                row.id = Some(0);
+                                crate::cache::read_cache().put_project(&row);
+                                Outcome::Ok(row)
+                            }
+                        }
+                        Outcome::Err(err) => Outcome::Err(err),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
+                    }
                 }
                 Outcome::Err(e) => {
                     // Concurrency/race hardening: if another caller created the project after our
@@ -453,16 +478,21 @@ pub async fn ensure_project(
                     }
 
                     match map_sql_outcome(
-                        select!(ProjectRow)
-                            .filter(Expr::col("slug").eq(slug.as_str()))
-                            .first(cx, &tracked)
-                            .await,
+                        traw_query(cx, &tracked, select_sql, &select_params).await,
                     ) {
-                        Outcome::Ok(Some(row)) => {
-                            crate::cache::read_cache().put_project(&row);
-                            Outcome::Ok(row)
+                        Outcome::Ok(rows) => {
+                            if let Some(r) = rows.first() {
+                                match decode_project_row(r) {
+                                    Ok(row) => {
+                                        crate::cache::read_cache().put_project(&row);
+                                        Outcome::Ok(row)
+                                    }
+                                    Err(err) => Outcome::Err(err),
+                                }
+                            } else {
+                                Outcome::Err(e)
+                            }
                         }
-                        Outcome::Ok(None) => Outcome::Err(e),
                         Outcome::Err(select_err) => Outcome::Err(select_err),
                         Outcome::Cancelled(r) => Outcome::Cancelled(r),
                         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -497,17 +527,22 @@ pub async fn get_project_by_slug(
 
     let tracked = tracked(&*conn);
 
-    match map_sql_outcome(
-        select!(ProjectRow)
-            .filter(Expr::col("slug").eq(slug))
-            .first(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(Some(row)) => {
-            crate::cache::read_cache().put_project(&row);
-            Outcome::Ok(row)
+    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
+    let params = [Value::Text(slug.to_string())];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            if let Some(r) = rows.first() {
+                match decode_project_row(r) {
+                    Ok(row) => {
+                        crate::cache::read_cache().put_project(&row);
+                        Outcome::Ok(row)
+                    }
+                    Err(e) => Outcome::Err(e),
+                }
+            } else {
+                Outcome::Err(DbError::not_found("Project", slug))
+            }
         }
-        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", slug)),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -533,17 +568,22 @@ pub async fn get_project_by_human_key(
 
     let tracked = tracked(&*conn);
 
-    match map_sql_outcome(
-        select!(ProjectRow)
-            .filter(Expr::col("human_key").eq(human_key))
-            .first(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(Some(row)) => {
-            crate::cache::read_cache().put_project(&row);
-            Outcome::Ok(row)
+    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE human_key = ? LIMIT 1";
+    let params = [Value::Text(human_key.to_string())];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            if let Some(r) = rows.first() {
+                match decode_project_row(r) {
+                    Ok(row) => {
+                        crate::cache::read_cache().put_project(&row);
+                        Outcome::Ok(row)
+                    }
+                    Err(e) => Outcome::Err(e),
+                }
+            } else {
+                Outcome::Err(DbError::not_found("Project", human_key))
+            }
         }
-        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -565,14 +605,19 @@ pub async fn get_project_by_id(
 
     let tracked = tracked(&*conn);
 
-    match map_sql_outcome(
-        select!(ProjectRow)
-            .filter(Expr::col("id").eq(project_id))
-            .first(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
-        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", project_id.to_string())),
+    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE id = ? LIMIT 1";
+    let params = [Value::BigInt(project_id)];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            if let Some(r) = rows.first() {
+                match decode_project_row(r) {
+                    Ok(row) => Outcome::Ok(row),
+                    Err(e) => Outcome::Err(e),
+                }
+            } else {
+                Outcome::Err(DbError::not_found("Project", project_id.to_string()))
+            }
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -590,7 +635,22 @@ pub async fn list_projects(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, D
 
     let tracked = tracked(&*conn);
 
-    map_sql_outcome(select!(ProjectRow).all(cx, &tracked).await)
+    let sql = "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                match decode_project_row(r) {
+                    Ok(row) => out.push(row),
+                    Err(e) => return Outcome::Err(e),
+                }
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 // =============================================================================
@@ -628,50 +688,55 @@ pub async fn register_agent(
 
     let tracked = tracked(&*conn);
 
-    // Atomic upsert: INSERT ... ON CONFLICT(project_id, name) DO UPDATE.
-    // Avoids TOCTOU race between SELECT and INSERT that could trigger a
-    // UNIQUE constraint violation under concurrent registration.
     let task_desc = task_description.unwrap_or_default();
     let attach_pol = attachments_policy.unwrap_or("auto");
-
-    let upsert_sql = "\
-        INSERT INTO agents (project_id, name, program, model, task_description, \
-                            inception_ts, last_active_ts, attachments_policy, contact_policy) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto') \
-        ON CONFLICT(project_id, name) DO UPDATE SET \
-            program = excluded.program, \
-            model = excluded.model, \
-            task_description = excluded.task_description, \
-            last_active_ts = excluded.last_active_ts, \
-            attachments_policy = excluded.attachments_policy \
-        RETURNING *";
-    let params = [
-        Value::BigInt(project_id),
-        Value::Text(name.to_string()),
-        Value::Text(program.to_string()),
-        Value::Text(model.to_string()),
-        Value::Text(task_desc.to_string()),
-        Value::BigInt(now),
-        Value::BigInt(now),
-        Value::Text(attach_pol.to_string()),
-    ];
-
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, upsert_sql, &params).await);
-    match rows_out {
-        Outcome::Ok(rows) => rows.into_iter().next().map_or_else(
-            || {
-                Outcome::Err(DbError::Internal(
-                    "register_agent: upsert RETURNING produced no rows".to_string(),
-                ))
-            },
-            |r| match AgentRow::from_row(&r) {
-                Ok(row) => {
-                    crate::cache::read_cache().put_agent(&row);
-                    Outcome::Ok(row)
+    match map_sql_outcome(
+        select!(AgentRow)
+            .filter(Expr::col("project_id").eq(project_id))
+            .all(cx, &tracked)
+            .await,
+    ) {
+        Outcome::Ok(rows) => {
+            if let Some(mut row) = rows.into_iter().find(|r| r.name == name) {
+                row.program = program.to_string();
+                row.model = model.to_string();
+                row.task_description = task_desc.to_string();
+                row.last_active_ts = now;
+                row.attachments_policy = attach_pol.to_string();
+                match map_sql_outcome(update!(&row).execute(cx, &tracked).await) {
+                    Outcome::Ok(_) => {
+                        crate::cache::read_cache().put_agent(&row);
+                        Outcome::Ok(row)
+                    }
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
                 }
-                Err(e) => Outcome::Err(map_sql_error(&e)),
-            },
-        ),
+            } else {
+                let mut row = AgentRow {
+                    id: None,
+                    project_id,
+                    name: name.to_string(),
+                    program: program.to_string(),
+                    model: model.to_string(),
+                    task_description: task_desc.to_string(),
+                    inception_ts: now,
+                    last_active_ts: now,
+                    attachments_policy: attach_pol.to_string(),
+                    contact_policy: "auto".to_string(),
+                };
+                match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
+                    Outcome::Ok(id) => {
+                        row.id = Some(id);
+                        crate::cache::read_cache().put_agent(&row);
+                        Outcome::Ok(row)
+                    }
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                }
+            }
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -719,44 +784,41 @@ pub async fn create_agent(
     let task_desc = task_description.unwrap_or_default();
     let attach_pol = attachments_policy.unwrap_or("auto");
 
-    // Atomic insert-if-absent: ON CONFLICT DO NOTHING means no row is
-    // returned when the name already exists in this project.
-    let insert_sql = "\
-        INSERT INTO agents (project_id, name, program, model, task_description, \
-                            inception_ts, last_active_ts, attachments_policy, contact_policy) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto') \
-        ON CONFLICT(project_id, name) DO NOTHING \
-        RETURNING *";
-    let params = [
-        Value::BigInt(project_id),
-        Value::Text(name.to_string()),
-        Value::Text(program.to_string()),
-        Value::Text(model.to_string()),
-        Value::Text(task_desc.to_string()),
-        Value::BigInt(now),
-        Value::BigInt(now),
-        Value::Text(attach_pol.to_string()),
-    ];
-
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, insert_sql, &params).await);
-    match rows_out {
+    match map_sql_outcome(
+        select!(AgentRow)
+            .filter(Expr::col("project_id").eq(project_id))
+            .all(cx, &tracked)
+            .await,
+    ) {
         Outcome::Ok(rows) => {
-            rows.into_iter().next().map_or_else(
-                // No rows returned: name already exists (ON CONFLICT DO NOTHING)
-                || {
-                    Outcome::Err(DbError::duplicate(
-                        "agent",
-                        format!("{name} (project {project_id})"),
-                    ))
-                },
-                |r| match AgentRow::from_row(&r) {
-                    Ok(row) => {
-                        crate::cache::read_cache().put_agent(&row);
-                        Outcome::Ok(row)
-                    }
-                    Err(e) => Outcome::Err(map_sql_error(&e)),
-                },
-            )
+            if rows.iter().any(|r| r.name == name) {
+                return Outcome::Err(DbError::duplicate(
+                    "agent",
+                    format!("{name} (project {project_id})"),
+                ));
+            }
+            let mut row = AgentRow {
+                id: None,
+                project_id,
+                name: name.to_string(),
+                program: program.to_string(),
+                model: model.to_string(),
+                task_description: task_desc.to_string(),
+                inception_ts: now,
+                last_active_ts: now,
+                attachments_policy: attach_pol.to_string(),
+                contact_policy: "auto".to_string(),
+            };
+            match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
+                Outcome::Ok(id) => {
+                    row.id = Some(id);
+                    crate::cache::read_cache().put_agent(&row);
+                    Outcome::Ok(row)
+                }
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            }
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -787,16 +849,16 @@ pub async fn get_agent(
     match map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(project_id))
-            .filter(Expr::col("name").eq(name))
-            .first(cx, &tracked)
+            .all(cx, &tracked)
             .await,
     ) {
-        Outcome::Ok(Some(row)) => {
-            crate::cache::read_cache().put_agent(&row);
-            Outcome::Ok(row)
-        }
-        Outcome::Ok(None) => {
-            Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")))
+        Outcome::Ok(rows) => {
+            if let Some(row) = rows.into_iter().find(|r| r.name == name) {
+                crate::cache::read_cache().put_agent(&row);
+                Outcome::Ok(row)
+            } else {
+                Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")))
+            }
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -851,12 +913,17 @@ pub async fn list_agents(
 
     let tracked = tracked(&*conn);
 
-    map_sql_outcome(
+    match map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(project_id))
             .all(cx, &tracked)
             .await,
-    )
+    ) {
+        Outcome::Ok(rows) => Outcome::Ok(rows),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// Touch agent (deferred).
@@ -1020,9 +1087,7 @@ pub async fn set_agent_contact_policy(
                     crate::cache::read_cache().put_agent(&row);
                     Outcome::Ok(row)
                 }
-                Outcome::Ok(None) => {
-                    Outcome::Err(DbError::not_found("Agent", agent_id.to_string()))
-                }
+                Outcome::Ok(None) => Outcome::Err(DbError::not_found("Agent", agent_id.to_string())),
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -3515,15 +3580,13 @@ pub async fn is_contact_allowed(
     }
 
     // Check if target agent has "open" or "auto" contact policy (allows all contacts)
-    let target_agent = map_sql_outcome(
+    match map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(to_project_id))
             .filter(Expr::col("id").eq(to_agent_id))
             .first(cx, &tracked)
             .await,
-    );
-
-    match target_agent {
+    ) {
         Outcome::Ok(Some(agent)) => {
             Outcome::Ok(matches!(agent.contact_policy.as_str(), "auto" | "open"))
         }
@@ -4210,12 +4273,14 @@ pub async fn insert_system_agent(
     match map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(project_id))
-            .filter(Expr::col("name").eq(name))
-            .first(cx, &tracked)
+            .all(cx, &tracked)
             .await,
     ) {
-        Outcome::Ok(Some(row)) => return Outcome::Ok(row),
-        Outcome::Ok(None) => {}
+        Outcome::Ok(rows) => {
+            if let Some(row) = rows.into_iter().find(|r| r.name == name) {
+                return Outcome::Ok(row);
+            }
+        }
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),

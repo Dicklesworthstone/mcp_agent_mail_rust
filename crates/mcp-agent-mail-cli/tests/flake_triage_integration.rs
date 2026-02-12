@@ -449,11 +449,20 @@ fn flake_triage_reproduce_with_missing_artifact() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("No such file")
-            || stderr.contains("not found")
-            || stderr.contains("error")
-            || stderr.to_lowercase().contains("failed"),
-        "should report error for missing artifact: {stderr}"
+        stderr.contains("artifact not found"),
+        "should report missing artifact path: {stderr}"
+    );
+    assert!(
+        stderr.contains("Expected artifact filename: failure_context.json"),
+        "should include expected filename guidance: {stderr}"
+    );
+    assert!(
+        stderr.contains("For more information, try '--help'."),
+        "should include --help remediation guidance: {stderr}"
+    );
+    assert!(
+        stderr.contains("Verify the path points to an existing flake artifact file."),
+        "should include path remediation guidance: {stderr}"
     );
 }
 

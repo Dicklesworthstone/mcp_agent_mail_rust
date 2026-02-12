@@ -9444,6 +9444,183 @@ sys.exit(7)
     }
 
     // -----------------------------------------------------------------------
+    // Native Wizard Integration Tests (br-2xfi)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clap_parses_share_wizard_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "share",
+            "wizard",
+            "--bundle",
+            "/tmp/bundle",
+            "--provider",
+            "github",
+            "--github-repo",
+            "owner/repo",
+            "--github-branch",
+            "main",
+            "--output",
+            "/tmp/output",
+            "--yes",
+            "--dry-run",
+            "--non-interactive",
+            "--json",
+        ])
+        .expect("failed to parse share wizard flags");
+        match cli.command {
+            Commands::Share {
+                action: ShareCommand::Wizard(args),
+            } => {
+                assert_eq!(args.bundle, Some(PathBuf::from("/tmp/bundle")));
+                assert_eq!(args.provider, Some("github".to_string()));
+                assert_eq!(args.github_repo, Some("owner/repo".to_string()));
+                assert_eq!(args.github_branch, "main");
+                assert_eq!(args.output, Some(PathBuf::from("/tmp/output")));
+                assert!(args.yes);
+                assert!(args.dry_run);
+                assert!(args.non_interactive);
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_wizard_non_interactive_requires_provider() {
+        // Test that non-interactive mode fails without provider
+        let args = ShareWizardArgs {
+            bundle: Some(PathBuf::from("/tmp/nonexistent")),
+            provider: None,
+            github_repo: None,
+            github_branch: "gh-pages".to_string(),
+            cloudflare_project: None,
+            netlify_site: None,
+            s3_bucket: None,
+            cloudfront_id: None,
+            base_url: None,
+            output: None,
+            yes: false,
+            dry_run: false,
+            non_interactive: true,
+            json: false,
+        };
+        let result = run_native_wizard(args);
+        // Should fail because provider is required in non-interactive mode
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_wizard_json_output_format() {
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+
+        // Create a valid bundle directory
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let bundle_dir = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        std::fs::write(bundle_dir.join("manifest.json"), "{}").expect("write manifest");
+
+        let args = ShareWizardArgs {
+            bundle: Some(bundle_dir),
+            provider: Some("custom".to_string()),
+            github_repo: None,
+            github_branch: "gh-pages".to_string(),
+            cloudflare_project: None,
+            netlify_site: None,
+            s3_bucket: None,
+            cloudfront_id: None,
+            base_url: None,
+            output: None,
+            yes: true,     // Skip confirmation
+            dry_run: true, // Don't actually execute
+            non_interactive: true,
+            json: true,
+        };
+        let _ = run_native_wizard(args);
+
+        let output = capture.drain_to_string();
+        // JSON output should be parseable
+        let parsed: serde_json::Value = serde_json::from_str(&output.trim())
+            .unwrap_or_else(|_| panic!("Failed to parse JSON output: {output}"));
+
+        // Verify essential fields are present
+        assert!(parsed.get("success").is_some(), "missing 'success' field");
+        assert!(parsed.get("provider").is_some(), "missing 'provider' field");
+    }
+
+    #[test]
+    fn native_wizard_dry_run_does_not_execute() {
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+
+        // Create a valid bundle directory
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let bundle_dir = temp.path().join("bundle");
+        let output_dir = temp.path().join("output");
+        std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        std::fs::write(bundle_dir.join("manifest.json"), "{}").expect("write manifest");
+
+        let args = ShareWizardArgs {
+            bundle: Some(bundle_dir),
+            provider: Some("github".to_string()),
+            github_repo: Some("owner/repo".to_string()),
+            github_branch: "gh-pages".to_string(),
+            cloudflare_project: None,
+            netlify_site: None,
+            s3_bucket: None,
+            cloudfront_id: None,
+            base_url: None,
+            output: Some(output_dir.clone()),
+            yes: true,
+            dry_run: true,
+            non_interactive: true,
+            json: false,
+        };
+        let result = run_native_wizard(args);
+        assert!(result.is_ok(), "dry-run should succeed");
+
+        let output = capture.drain_to_string();
+        assert!(
+            output.contains("Dry run") || output.contains("dry-run") || output.contains("dry run"),
+            "output should mention dry-run: {output}"
+        );
+
+        // Output directory should NOT be created in dry-run mode
+        assert!(
+            !output_dir.exists(),
+            "output directory should not be created in dry-run mode"
+        );
+    }
+
+    #[test]
+    fn native_wizard_validates_bundle_path() {
+        let args = ShareWizardArgs {
+            bundle: Some(PathBuf::from("/nonexistent/bundle/path")),
+            provider: Some("custom".to_string()),
+            github_repo: None,
+            github_branch: "gh-pages".to_string(),
+            cloudflare_project: None,
+            netlify_site: None,
+            s3_bucket: None,
+            cloudfront_id: None,
+            base_url: None,
+            output: None,
+            yes: true,
+            dry_run: true,
+            non_interactive: true,
+            json: false,
+        };
+        let result = run_native_wizard(args);
+        assert!(result.is_err(), "should fail with nonexistent bundle");
+    }
+
+    // -----------------------------------------------------------------------
     // Archive subcommand argument parsing tests
     // -----------------------------------------------------------------------
 
@@ -12297,6 +12474,31 @@ sys.exit(7)
                 assert!(!verbose);
             }
             other => panic!("expected Golden Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_golden_list_with_filter() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "golden",
+            "list",
+            "--dir",
+            "benches/golden",
+            "--filter",
+            "mcp_deny_*",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Golden {
+                action: GoldenCommand::List { dir, filter, json },
+            } => {
+                assert_eq!(dir, Some(PathBuf::from("benches/golden")));
+                assert_eq!(filter, Some("mcp_deny_*".to_string()));
+                assert!(json);
+            }
+            other => panic!("expected Golden List, got {other:?}"),
         }
     }
 

@@ -14,7 +14,7 @@ use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{
-    DbPool, DbPoolConfig, create_pool, now_micros,
+    DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros,
     queries::{self, list_unacknowledged_messages},
 };
 use std::sync::OnceLock;
@@ -163,6 +163,13 @@ fn escalate(
         return Ok(());
     }
 
+    // Fetch project to get slug for archive write.
+    let project =
+        match block_on(async { queries::get_project_by_id(cx, pool, row.project_id).await }) {
+            Outcome::Ok(p) => p,
+            other => return Err(format!("failed to fetch project: {other:?}")),
+        };
+
     // Build the inbox path pattern from the created_ts timestamp.
     let ts_secs = row.created_ts / 1_000_000;
     let dt = chrono::DateTime::from_timestamp(ts_secs, 0)
@@ -184,10 +191,10 @@ fn escalate(
     };
 
     // Determine holder agent.
-    let holder_name = &config.ack_escalation_claim_holder_name;
-    let holder_agent_id = if holder_name.is_empty() {
+    let holder_name_cfg = &config.ack_escalation_claim_holder_name;
+    let (holder_agent_id, holder_agent_name) = if holder_name_cfg.is_empty() {
         // Use the recipient agent as the holder.
-        row.agent_id
+        (row.agent_id, recipient_name)
     } else {
         // Look up or create the custom holder agent.
         match block_on(async {
@@ -195,15 +202,15 @@ fn escalate(
                 cx,
                 pool,
                 row.project_id,
-                holder_name,
+                holder_name_cfg,
                 "ops",
                 "system",
                 "ops-escalation",
             )
             .await
         }) {
-            Outcome::Ok(agent) => agent.id.unwrap_or(row.agent_id),
-            _ => row.agent_id, // Fallback to recipient.
+            Outcome::Ok(agent) => (agent.id.unwrap_or(row.agent_id), agent.name),
+            _ => (row.agent_id, recipient_name), // Fallback to recipient.
         }
     };
 
@@ -232,6 +239,39 @@ fn escalate(
                 reservations_created = reservations.len(),
                 "ACK escalation: created file reservation"
             );
+
+            // Write reservation artifacts to git archive (best-effort).
+            if !reservations.is_empty() {
+                let res_jsons: Vec<serde_json::Value> = reservations
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id.unwrap_or(0),
+                            "agent": &holder_agent_name,
+                            "path_pattern": &r.path_pattern,
+                            "exclusive": r.exclusive != 0,
+                            "reason": &r.reason,
+                            "expires_ts": micros_to_iso(r.expires_ts),
+                        })
+                    })
+                    .collect();
+                let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+                    project_slug: project.slug.clone(),
+                    config: config.clone(),
+                    reservations: res_jsons,
+                };
+                match mcp_agent_mail_storage::wbq_enqueue(op) {
+                    mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+                    | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
+                    mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                        warn!(
+                            "WBQ enqueue failed; skipping reservation artifacts archive write project={}",
+                            project.slug
+                        );
+                    }
+                }
+            }
+
             Ok(())
         }
         other => Err(format!(
@@ -293,23 +333,15 @@ mod tests {
     }
 
     fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
+        // NOTE: These tests are currently blocked by a FrankenSQLite limitation.
+        // FrankenConnection cannot properly read schemas created by SqliteConnection,
+        // and it doesn't support querying sqlite_master. This is being tracked and
+        // fixed in the sqlmodel_rust/frankensqlite projects.
+        //
+        // The pool with run_migrations: true works in production because the pool
+        // init gate uses SqliteConnection for migrations, but FrankenConnection
+        // still cannot read the resulting schema reliably in test contexts.
         let db_path = tmp.path().join("db.sqlite3");
-
-        // Manually initialize schema with C-backed SqliteConnection before
-        // creating the pool. This matches the pattern used by db crate tests
-        // and avoids async migration issues in test contexts.
-        let init_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("open init conn");
-        init_conn
-            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
-            .expect("apply init PRAGMAs");
-        init_conn
-            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("initialize base schema");
-        drop(init_conn);
-
         let db_url = format!(
             "sqlite:////{}",
             db_path.to_string_lossy().trim_start_matches('/')
@@ -318,7 +350,6 @@ mod tests {
             database_url: db_url,
             min_connections: 1,
             max_connections: 1,
-            run_migrations: false,
             ..Default::default()
         };
         create_pool(&pool_config).expect("create pool")

@@ -28,6 +28,8 @@
 #   SV3_MODE_OVERRIDE         - Force search mode for all queries
 #   SV3_EXPLAIN_ALL           - Enable explain mode for all queries
 #   SV3_GOLDEN_DIR            - Directory for golden ranking files
+#   SV3_STDIO_FIXTURE_RESPONSE - Optional JSONL fixture for stdio response replay
+#   SV3_STDIO_FIXTURE_ELAPSED_MS - Optional elapsed_ms override when using fixture replay
 #
 # Reference: docs/ADR-003-search-v3-architecture.md
 
@@ -311,39 +313,51 @@ print(json.dumps(args))
     local start_time end_time elapsed_ms
     start_time=$(date +%s%3N 2>/dev/null || echo "0")
 
-    local srv_work
-    srv_work="$(mktemp -d "${TMPDIR}/sv3_stdio.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
+    local fixture_response="${SV3_STDIO_FIXTURE_RESPONSE:-}"
+    if [ -n "${fixture_response}" ]; then
+        if [ ! -f "${fixture_response}" ]; then
+            e2e_log "Search V3 stdio fixture missing: ${fixture_response}"
+            _sv3_trace_search "${case_id}" "fail" "${mode}" "0"
+            return 1
+        fi
+        cp "${fixture_response}" "${sv3_case_dir}/response_raw.txt"
+        : > "${sv3_case_dir}/stderr.txt"
+        elapsed_ms="${SV3_STDIO_FIXTURE_ELAPSED_MS:-1}"
+    else
+        local srv_work
+        srv_work="$(mktemp -d "${TMPDIR}/sv3_stdio.XXXXXX")"
+        local fifo="${srv_work}/stdin_fifo"
+        mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        mcp-agent-mail < "$fifo" > "${sv3_case_dir}/response_raw.txt" 2>"${sv3_case_dir}/stderr.txt" &
-    local srv_pid=$!
+        DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
+            mcp-agent-mail < "$fifo" > "${sv3_case_dir}/response_raw.txt" 2>"${sv3_case_dir}/stderr.txt" &
+        local srv_pid=$!
 
-    sleep 0.3
-
-    {
-        echo "$init_req"
-        sleep 0.2
-        echo "$search_req"
         sleep 0.3
-    } > "$fifo" &
-    local write_pid=$!
 
-    local timeout_s=15 elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
+        {
+            echo "$init_req"
+            sleep 0.2
+            echo "$search_req"
+            sleep 0.3
+        } > "$fifo" &
+        local write_pid=$!
 
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-    rm -rf "$srv_work"
+        local timeout_s=15 elapsed=0
+        while [ "$elapsed" -lt "$timeout_s" ]; do
+            if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
+            sleep 0.3
+            elapsed=$((elapsed + 1))
+        done
 
-    end_time=$(date +%s%3N 2>/dev/null || echo "0")
-    elapsed_ms=$(( end_time - start_time ))
+        wait "$write_pid" 2>/dev/null || true
+        kill "$srv_pid" 2>/dev/null || true
+        wait "$srv_pid" 2>/dev/null || true
+        rm -rf "$srv_work"
+
+        end_time=$(date +%s%3N 2>/dev/null || echo "0")
+        elapsed_ms=$(( end_time - start_time ))
+    fi
     echo "${elapsed_ms}" > "${sv3_case_dir}/timing.txt"
 
     # Extract search response from raw output

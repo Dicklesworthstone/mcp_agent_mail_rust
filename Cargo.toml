@@ -97,6 +97,7 @@ walkdir = "2"
 tantivy = "0.25"
 indexmap = "2"
 smallvec = { version = "1", features = ["serde"] }
+atty = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

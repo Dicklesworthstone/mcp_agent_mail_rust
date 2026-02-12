@@ -20,8 +20,14 @@ use crate::search_scope::{
 };
 use crate::tracking::record_query;
 use mcp_agent_mail_core::config::SearchEngine;
+use mcp_agent_mail_core::metrics::global_metrics;
 
 use asupersync::{Cx, Outcome};
+#[cfg(feature = "search-v3")]
+use mcp_agent_mail_search_core::{
+    CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, QueryClass,
+    prepare_candidates,
+};
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
@@ -119,19 +125,137 @@ fn try_tantivy_search(_query: &SearchQuery) -> Option<Vec<SearchResult>> {
     None
 }
 
+/// Try executing semantic candidate retrieval for hybrid mode.
+///
+/// Semantic retrieval is intentionally optional at this stage: if no semantic
+/// backend is initialized yet, we return `None` and the orchestration stage
+/// degrades to lexical-only while preserving deterministic behavior.
+#[cfg(feature = "search-v3")]
+fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
+    None
+}
+
+#[cfg(not(feature = "search-v3"))]
+fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
+    None
+}
+
+#[cfg(feature = "search-v3")]
+fn orchestrate_hybrid_results(
+    query: &SearchQuery,
+    engine: SearchEngine,
+    lexical_results: Vec<SearchResult>,
+    semantic_results: Vec<SearchResult>,
+) -> Vec<SearchResult> {
+    let requested_limit = query.effective_limit();
+    let mode = match engine {
+        SearchEngine::Hybrid => CandidateMode::Hybrid,
+        SearchEngine::Auto => CandidateMode::Auto,
+        _ => CandidateMode::LexicalFallback,
+    };
+    let query_class = QueryClass::classify(&query.text);
+    let budget = CandidateBudget::derive(
+        requested_limit,
+        mode,
+        query_class,
+        CandidateBudgetConfig::default(),
+    );
+
+    let lexical_hits = lexical_results
+        .iter()
+        .map(|result| CandidateHit::new(result.id, result.score.unwrap_or(0.0)))
+        .collect::<Vec<_>>();
+    let semantic_hits = semantic_results
+        .iter()
+        .map(|result| CandidateHit::new(result.id, result.score.unwrap_or(0.0)))
+        .collect::<Vec<_>>();
+    let prepared = prepare_candidates(&lexical_hits, &semantic_hits, budget);
+
+    let lexical_map = lexical_results
+        .into_iter()
+        .map(|result| (result.id, result))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let semantic_map = semantic_results
+        .into_iter()
+        .map(|result| (result.id, result))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let ordered_candidates = prepared
+        .candidates
+        .iter()
+        .take(requested_limit)
+        .collect::<Vec<_>>();
+
+    let merged = ordered_candidates
+        .iter()
+        .filter_map(|candidate| {
+            lexical_map
+                .get(&candidate.doc_id)
+                .cloned()
+                .or_else(|| semantic_map.get(&candidate.doc_id).cloned())
+        })
+        .collect::<Vec<_>>();
+
+    tracing::debug!(
+        target: "search.metrics",
+        query = %query.text,
+        mode = ?mode,
+        query_class = ?query_class,
+        lexical_considered = prepared.counts.lexical_considered,
+        semantic_considered = prepared.counts.semantic_considered,
+        lexical_selected = prepared.counts.lexical_selected,
+        semantic_selected = prepared.counts.semantic_selected,
+        deduped_selected = prepared.counts.deduped_selected,
+        duplicates_removed = prepared.counts.duplicates_removed,
+        "hybrid candidate orchestration completed"
+    );
+
+    merged
+}
+
 /// Log a comparison between FTS5 and Tantivy results in shadow mode.
-fn log_shadow_comparison(fts5: &[SearchResult], tantivy: &[SearchResult], query: &SearchQuery) {
+fn log_shadow_comparison(
+    fts5: &[SearchResult],
+    tantivy: &[SearchResult],
+    query: &SearchQuery,
+    fts5_latency_us: u64,
+    tantivy_latency_us: u64,
+    v3_had_error: bool,
+) {
     let fts5_ids: Vec<i64> = fts5.iter().map(|r| r.id).collect();
     let tantivy_ids: Vec<i64> = tantivy.iter().map(|r| r.id).collect();
     let overlap = fts5_ids
         .iter()
         .filter(|id| tantivy_ids.contains(id))
         .count();
+
+    // Compute overlap percentage (0.0 - 1.0)
+    let max_count = fts5.len().max(tantivy.len()).max(1);
+    #[allow(clippy::cast_precision_loss)]
+    let overlap_pct = overlap as f64 / max_count as f64;
+
+    // Compute latency delta (V3 - legacy) in microseconds
+    #[allow(clippy::cast_possible_wrap)]
+    let latency_delta_us = tantivy_latency_us as i64 - fts5_latency_us as i64;
+
+    // Equivalent if ≥80% overlap and no V3 errors
+    let is_equivalent = overlap_pct >= 0.8 && !v3_had_error;
+
+    // Record to global metrics
+    global_metrics()
+        .search
+        .record_shadow_comparison(is_equivalent, v3_had_error, latency_delta_us);
+
     tracing::info!(
+        target: "search.metrics",
         query = %query.text,
         fts5_count = fts5.len(),
         tantivy_count = tantivy.len(),
         overlap_count = overlap,
+        overlap_pct = %format!("{:.1}%", overlap_pct * 100.0),
+        latency_delta_us = latency_delta_us,
+        is_equivalent = is_equivalent,
+        v3_had_error = v3_had_error,
         "shadow search comparison"
     );
 }
@@ -159,23 +283,50 @@ pub async fn execute_search(
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
         if let Some(raw_results) = try_tantivy_search(query) {
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
             if options.track_telemetry {
-                record_query(
-                    "search_service_tantivy",
-                    u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX),
-                );
+                record_query("search_service_tantivy", latency_us);
             }
+            // Record V3 metrics
+            global_metrics().search.record_v3_query(latency_us, false);
             return finish_scoped_response(raw_results, query, options);
         }
         // Bridge not initialized → fall through to FTS5
     }
 
+    // ── Hybrid candidate orchestration path ─────────────────────────
+    //
+    // Stage order:
+    // 1) lexical candidate retrieval (Tantivy bridge)
+    // 2) semantic candidate retrieval (optional; may be unavailable)
+    // 3) deterministic dedupe + merge prep (mode-aware budgets)
+    // Fusion/rerank stages are implemented by follow-up Search V3 tracks.
+    #[cfg(feature = "search-v3")]
+    if matches!(engine, SearchEngine::Hybrid | SearchEngine::Auto) {
+        if let Some(lexical_results) = try_tantivy_search(query) {
+            let semantic_results =
+                try_semantic_search(query, query.effective_limit()).unwrap_or_default();
+            let raw_results =
+                orchestrate_hybrid_results(query, engine, lexical_results, semantic_results);
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if options.track_telemetry {
+                record_query("search_service_hybrid_candidates", latency_us);
+            }
+            global_metrics().search.record_v3_query(latency_us, false);
+            return finish_scoped_response(raw_results, query, options);
+        }
+        // No lexical bridge available yet → fall through to legacy FTS.
+    }
+
     // ── Shadow: pre-fetch Tantivy results for comparison ────────────
     #[allow(deprecated)]
-    let shadow_tantivy = if engine.is_shadow() {
-        try_tantivy_search(query)
+    let (shadow_tantivy, shadow_tantivy_latency_us) = if engine.is_shadow() {
+        let tantivy_timer = std::time::Instant::now();
+        let results = try_tantivy_search(query);
+        let latency = u64::try_from(tantivy_timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        (results, latency)
     } else {
-        None
+        (None, 0)
     };
 
     // ── FTS5 path (default + Shadow primary) ────────────────────────
@@ -216,19 +367,29 @@ pub async fn execute_search(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let fts5_latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
     if options.track_telemetry {
-        record_query(
-            "search_service",
-            u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX),
-        );
+        record_query("search_service", fts5_latency_us);
     }
+    // Record legacy FTS5 metrics
+    global_metrics()
+        .search
+        .record_legacy_query(fts5_latency_us, false);
 
     // Step 4: Map rows to SearchResult
     let raw_results = map_rows_to_results(&rows, query.doc_kind);
 
     // Shadow comparison logging
     if let Some(ref tantivy_results) = shadow_tantivy {
-        log_shadow_comparison(&raw_results, tantivy_results, query);
+        let v3_had_error = tantivy_results.is_empty() && !raw_results.is_empty();
+        log_shadow_comparison(
+            &raw_results,
+            tantivy_results,
+            query,
+            fts5_latency_us,
+            shadow_tantivy_latency_us,
+            v3_had_error,
+        );
     }
 
     let sql_row_count = raw_results.len();
@@ -357,12 +518,12 @@ pub async fn execute_search_simple(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    record_query(
-        "search_service_simple",
-        u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX),
-    );
-
-    let _ = timer; // prevent unused warning if telemetry is off
+    let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+    record_query("search_service_simple", latency_us);
+    // Record legacy FTS5 metrics (simple search always uses FTS5)
+    global_metrics()
+        .search
+        .record_legacy_query(latency_us, false);
 
     let raw_results = map_rows_to_results(&rows, query.doc_kind);
     let next_cursor = compute_next_cursor(&raw_results, query.effective_limit());
@@ -573,5 +734,61 @@ mod tests {
         assert!(opts.scope_ctx.is_none());
         assert!(opts.redaction_policy.is_none());
         assert!(!opts.track_telemetry);
+    }
+
+    #[cfg(feature = "search-v3")]
+    fn result_with_score(id: i64, score: f64) -> SearchResult {
+        SearchResult {
+            doc_kind: DocKind::Message,
+            id,
+            project_id: Some(1),
+            title: format!("doc-{id}"),
+            body: String::new(),
+            score: Some(score),
+            importance: None,
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            redacted: false,
+            redaction_reason: None,
+        }
+    }
+
+    #[cfg(feature = "search-v3")]
+    #[test]
+    fn hybrid_orchestration_keeps_lexical_ordering_deterministic() {
+        let query = SearchQuery::messages("incident rollback plan", 1);
+        let lexical = vec![
+            result_with_score(10, 0.9),
+            result_with_score(20, 0.8),
+            result_with_score(30, 0.7),
+        ];
+        let semantic = vec![
+            result_with_score(20, 0.99),
+            result_with_score(40, 0.75),
+            result_with_score(30, 0.6),
+        ];
+
+        let merged = orchestrate_hybrid_results(&query, SearchEngine::Hybrid, lexical, semantic);
+        let ids = merged.iter().map(|result| result.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![10, 20, 40, 30]);
+    }
+
+    #[cfg(feature = "search-v3")]
+    #[test]
+    fn hybrid_orchestration_respects_requested_limit() {
+        let mut query = SearchQuery::messages("search", 1);
+        query.limit = Some(2);
+        let lexical = vec![
+            result_with_score(1, 0.9),
+            result_with_score(2, 0.8),
+            result_with_score(3, 0.7),
+        ];
+
+        let merged = orchestrate_hybrid_results(&query, SearchEngine::Hybrid, lexical, Vec::new());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged[1].id, 2);
     }
 }

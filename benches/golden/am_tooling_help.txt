@@ -1,0 +1,13 @@
+Usage: am tooling <COMMAND>
+
+Commands:
+  directory     List all available MCP tools with cluster and capability metadata
+  schemas       Show tool schemas and parameter definitions
+  metrics       Show tool call counts and error rates
+  metrics-core  Show core system metrics (HTTP/DB/Storage/Locks)
+  diagnostics   Show comprehensive diagnostic report with health metrics and recommendations
+  locks         Show active archive locks
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help

@@ -1,0 +1,6 @@
+Error: "guard" is not an MCP server command.
+
+Agent Mail is not a CLI.
+Agent Mail MCP server accepts: serve, config
+For operator CLI commands, use: am guard
+Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail guard ...

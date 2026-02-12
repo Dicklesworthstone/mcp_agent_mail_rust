@@ -1,0 +1,12 @@
+Usage: am agents <COMMAND>
+
+Commands:
+  register  Register or update an agent identity in a project (idempotent)
+  create    Create a new, unique agent identity (never updates existing)
+  list      List agents registered in a project
+  show      Show details for a specific agent
+  detect    Detect installed coding agents on this system
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help

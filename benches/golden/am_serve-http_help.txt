@@ -4,4 +4,5 @@ Options:
       --host <HOST>  
       --port <PORT>  
       --path <PATH>  
+      --no-auth      Disable bearer token authentication for this run (for local development)
   -h, --help         Print help

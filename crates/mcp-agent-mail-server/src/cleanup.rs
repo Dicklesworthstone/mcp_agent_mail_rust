@@ -435,23 +435,11 @@ mod tests {
     }
 
     fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
+        // NOTE: These tests are currently blocked by a FrankenSQLite limitation.
+        // FrankenConnection cannot properly read schemas created by SqliteConnection,
+        // and it doesn't support querying sqlite_master. This is being tracked and
+        // fixed in the sqlmodel_rust/frankensqlite projects.
         let db_path = tmp.path().join("db.sqlite3");
-
-        // Manually initialize schema with C-backed SqliteConnection before
-        // creating the pool. This matches the pattern used by db crate tests
-        // and avoids async migration issues in test contexts.
-        let init_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .expect("open init conn");
-        init_conn
-            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
-            .expect("apply init PRAGMAs");
-        init_conn
-            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("initialize base schema");
-        drop(init_conn);
-
         let db_url = format!(
             "sqlite:////{}",
             db_path.to_string_lossy().trim_start_matches('/')
@@ -460,7 +448,6 @@ mod tests {
             database_url: db_url,
             min_connections: 1,
             max_connections: 1,
-            run_migrations: false,
             ..Default::default()
         };
         create_pool(&pool_config).expect("create pool")

@@ -25,6 +25,7 @@ pub mod results;
 pub mod updater;
 
 pub mod filter_compiler;
+pub mod hybrid_candidates;
 pub mod lexical_parser;
 pub mod lexical_response;
 pub mod rollout;
@@ -34,6 +35,12 @@ pub mod tantivy_schema;
 
 #[cfg(feature = "semantic")]
 pub mod embedder;
+
+#[cfg(feature = "semantic")]
+pub mod embedding_jobs;
+
+#[cfg(feature = "semantic")]
+pub mod vector_index;
 
 // Re-export key types
 pub use canonical::{
@@ -58,9 +65,16 @@ pub use updater::{IncrementalUpdater, UpdaterConfig, UpdaterStats, deduplicate_c
 #[cfg(feature = "tantivy-engine")]
 pub use filter_compiler::{CompiledFilters, compile_filters};
 pub use filter_compiler::{active_filter_count, has_active_filters};
+pub use hybrid_candidates::{
+    CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, CandidatePreparation,
+    CandidateSource, CandidateStageCounts, PreparedCandidate, QueryClass, prepare_candidates,
+};
+pub use lexical_parser::{
+    AppliedFilterHint, DidYouMeanHint, QueryAssistance, SanitizedQuery, extract_terms,
+    parse_query_assistance, sanitize_query,
+};
 #[cfg(feature = "tantivy-engine")]
 pub use lexical_parser::{LexicalParser, LexicalParserConfig, ParseOutcome};
-pub use lexical_parser::{SanitizedQuery, extract_terms, sanitize_query};
 #[cfg(feature = "tantivy-engine")]
 pub use lexical_response::{ResponseConfig, execute_search};
 pub use lexical_response::{find_highlights, generate_snippet};
@@ -70,4 +84,17 @@ pub use rollout::{RolloutController, ShadowComparison, ShadowMetrics, ShadowMetr
 pub use embedder::{
     Embedder, EmbeddingResult, EmbeddingVec, HashEmbedder, ModelInfo, ModelRegistry, ModelTier,
     RegistryConfig, cosine_similarity, embed_document, normalize_l2, well_known,
+};
+
+#[cfg(feature = "semantic")]
+pub use vector_index::{
+    IndexEntry, VectorFilter, VectorHit, VectorIndex, VectorIndexConfig, VectorIndexStats,
+    VectorMetadata,
+};
+
+#[cfg(feature = "semantic")]
+pub use embedding_jobs::{
+    BatchResult, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest,
+    IndexRefreshWorker, JobMetrics, JobMetricsSnapshot, JobResult, NoProgress as JobNoProgress,
+    QueueStats, RebuildProgress, RebuildResult, RefreshWorkerConfig,
 };

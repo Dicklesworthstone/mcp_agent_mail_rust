@@ -198,6 +198,31 @@ workflows to native Rust commands.
 
 ---
 
+## UX Consistency Smoke Suite (T10.7)
+
+To prevent migration regressions in operator-facing UX, run:
+
+```bash
+./scripts/e2e_test.sh migration_ux_smoke
+```
+
+Suite file:
+- `tests/e2e/test_migration_ux_smoke.sh`
+
+Coverage focus:
+- Cross-command consistency for migrated native commands (`--help` content, invalid-flag exit semantics, remediation hint consistency).
+- Onboarding smoke paths (first-run success path + common failure paths with machine-readable diagnostics).
+
+Artifact contract (under `tests/artifacts/migration_ux_smoke/<timestamp>/`):
+- Per-case: `command.txt`, `stdout.txt`, `stderr.txt`, `exit_code.txt`, `timing_ms.txt`, `environment.json`, `result.json`
+- Suite-level: `ux_consistency_report.json` and optional `ux_findings.jsonl`
+
+Governance use:
+- T10.6 closure readiness must reference the latest `ux_consistency_report.json`.
+- Any warning/error in `ux_findings.jsonl` must be resolved via docs/runbook updates or follow-up beads before closure.
+
+---
+
 ## Summary
 
 | Category | Migrated | Partial | Gap | Retained |

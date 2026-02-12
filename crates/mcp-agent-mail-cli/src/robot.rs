@@ -2580,7 +2580,7 @@ fn build_navigate(
     uri: &str,
     project_id: i64,
     project_slug: &str,
-    agent: Option<(i64, String)>,
+    _agent: Option<(i64, String)>,
 ) -> Result<(NavigateResult, Option<String>), CliError> {
     let path = uri.strip_prefix("resource://").ok_or_else(|| {
         CliError::InvalidArgument(format!("invalid URI scheme: {uri} (expected resource://)"))

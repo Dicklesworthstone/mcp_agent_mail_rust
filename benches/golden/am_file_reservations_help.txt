@@ -1,0 +1,14 @@
+Usage: am file_reservations <COMMAND>
+
+Commands:
+  list       List reservations (default: active only)
+  active     Show active reservations with lock type
+  soon       Show reservations expiring soon
+  reserve    Create file reservations for an agent
+  renew      Renew (extend TTL) of existing reservations
+  release    Release file reservations
+  conflicts  Check for conflicts on proposed paths without creating reservations
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help

@@ -11866,4 +11866,351 @@ mod tests {
         );
         assert_forbidden(&resp);
     }
+
+    // =========================================================================
+    // br-3h13.5.2: Additional auth edge case tests
+    // =========================================================================
+
+    #[test]
+    fn jwt_nbf_in_future_is_rejected() {
+        // JWT with nbf (not-before) in the future should be rejected.
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": now + 3600,  // valid expiry
+            "iat": now,
+            "nbf": now + 300,  // not valid for another 5 minutes
+        });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_jwt_artifact(
+            "jwt_nbf_in_future_is_rejected",
+            &serde_json::json!({
+                "claims": claims,
+                "now": now,
+                "nbf": now + 300,
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        // JWT with nbf in future should be rejected
+        assert!(resp.is_some(), "JWT with nbf in future should be rejected");
+        assert_unauthorized(&resp.unwrap());
+    }
+
+    #[test]
+    fn rbac_reader_role_on_write_tool_denied() {
+        // Reader role should be denied access to write tools.
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        // send_message is a write tool
+        let params = serde_json::json!({ "name": "send_message", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("reader role should be denied for write tool");
+        write_rbac_artifact(
+            "rbac_reader_role_on_write_tool_denied",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": "send_message",
+                "expected_status": 403,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_forbidden(&resp);
+    }
+
+    #[test]
+    fn rbac_reader_role_on_read_tool_allowed() {
+        // Reader role should have access to read-only tools.
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        // health_check is a read-only tool
+        let params = serde_json::json!({ "name": "health_check", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_rbac_artifact(
+            "rbac_reader_role_on_read_tool_allowed",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": "health_check",
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        assert!(resp.is_none(), "reader role should access read-only tools");
+    }
+
+    #[test]
+    fn jwt_required_when_bearer_not_configured() {
+        // When only JWT is configured (no bearer token), JWT must be valid.
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: None,
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("jwt-secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let token = hs256_token(b"jwt-secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_jwt_artifact(
+            "jwt_required_when_bearer_not_configured",
+            &serde_json::json!({
+                "bearer_configured": false,
+                "jwt_configured": true,
+                "claims": claims,
+                "result": if resp.is_none() { "allow" } else { "deny" },
+            }),
+        );
+        assert!(
+            resp.is_none(),
+            "valid JWT should succeed when bearer not configured"
+        );
+    }
+
+    #[test]
+    fn invalid_jwt_rejected_when_bearer_not_configured() {
+        // When only JWT is configured, invalid JWT should be rejected.
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: None,
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("jwt-secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // Token signed with wrong secret
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let token = hs256_token(b"wrong-secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_jwt_artifact(
+            "invalid_jwt_rejected_when_bearer_not_configured",
+            &serde_json::json!({
+                "bearer_configured": false,
+                "jwt_configured": true,
+                "signed_with": "wrong-secret",
+                "expected_secret": "jwt-secret",
+                "result": if resp.is_none() { "allow" } else { "deny" },
+            }),
+        );
+        assert!(
+            resp.is_some(),
+            "invalid JWT should be rejected when bearer not configured"
+        );
+        assert_unauthorized(&resp.unwrap());
+    }
+
+    #[test]
+    fn jwt_with_wrong_algorithm_rejected() {
+        // JWT signed with algorithm not in allowed list should be rejected.
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_jwt_algorithms: vec!["RS256".to_string()], // only RS256 allowed
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // Sign with HS256 but config only allows RS256
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_jwt_artifact(
+            "jwt_with_wrong_algorithm_rejected",
+            &serde_json::json!({
+                "configured_algorithms": "RS256",
+                "token_algorithm": "HS256",
+                "result": if resp.is_none() { "allow" } else { "deny" },
+            }),
+        );
+        assert!(
+            resp.is_some(),
+            "JWT with wrong algorithm should be rejected"
+        );
+        assert_unauthorized(&resp.unwrap());
+    }
+
+    #[test]
+    fn rbac_multiple_roles_writer_grants_write_access() {
+        // When token has multiple roles including writer, write access granted.
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        // Multiple roles as array
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "role": ["reader", "writer", "auditor"]
+        });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        // send_message is a write tool
+        let params = serde_json::json!({ "name": "send_message", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_rbac_artifact(
+            "rbac_multiple_roles_writer_grants_write_access",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": "send_message",
+                "result": if resp.is_none() { "allow" } else { "deny" },
+            }),
+        );
+        assert!(
+            resp.is_none(),
+            "multiple roles including writer should grant write access"
+        );
+    }
+
+    #[test]
+    fn auth_bypass_localhost_with_valid_bearer_still_works() {
+        // Even with localhost bypass enabled, valid bearer token should work.
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret-token".to_string()),
+            http_jwt_enabled: false,
+            http_allow_localhost_unauthenticated: true,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let localhost = SocketAddr::from(([127, 0, 0, 1], 1234));
+
+        // Request with valid bearer from localhost
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", "Bearer secret-token")],
+            Some(localhost),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_jwt_artifact(
+            "auth_bypass_localhost_with_valid_bearer_still_works",
+            &serde_json::json!({
+                "config": {
+                    "http_allow_localhost_unauthenticated": true,
+                    "http_bearer_token": "***"
+                },
+                "peer_addr": localhost.to_string(),
+                "authorization": "Bearer ***",
+                "result": if resp.is_none() { "allow" } else { "deny" },
+            }),
+        );
+        assert!(
+            resp.is_none(),
+            "valid bearer token from localhost should succeed"
+        );
+    }
 }

@@ -7,6 +7,12 @@
 #
 # Golden outputs are stored in benches/golden/ with SHA-256 checksums.
 # This ensures no behavioral regressions in stable output surfaces.
+#
+# DEPRECATED: Prefer native `am golden` commands:
+#   am golden capture --dir benches/golden
+#   am golden verify --dir benches/golden
+#   am golden list --dir benches/golden
+# This script remains as a compatibility shim during migration.
 
 set -euo pipefail
 
@@ -25,6 +31,17 @@ _blue='\033[0;34m'
 log() { echo -e "${_blue}[golden]${_reset} $*"; }
 pass() { echo -e "  ${_green}PASS${_reset} $*"; }
 fail() { echo -e "  ${_red}FAIL${_reset} $*"; }
+
+deprecation_notice() {
+    if [ "${AM_GOLDEN_SUPPRESS_DEPRECATION:-0}" = "1" ]; then
+        return
+    fi
+    echo "WARNING: scripts/bench_golden.sh is deprecated." >&2
+    echo "WARNING: Use native commands instead:" >&2
+    echo "WARNING:   am golden capture --dir benches/golden" >&2
+    echo "WARNING:   am golden verify --dir benches/golden" >&2
+    echo "WARNING:   am golden list --dir benches/golden" >&2
+}
 
 # Ensure binary is built
 ensure_binary() {
@@ -200,9 +217,11 @@ validate_golden() {
 # Main
 case "${1:-}" in
     capture)
+        deprecation_notice
         capture_golden
         ;;
     validate)
+        deprecation_notice
         validate_golden
         ;;
     *)

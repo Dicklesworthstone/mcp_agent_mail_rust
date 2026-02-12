@@ -10,6 +10,7 @@ use fastmcp::prelude::*;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 
+use crate::messaging::try_write_message_archive;
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
 };
@@ -237,7 +238,7 @@ pub async fn request_contact(
 
     let to_id = to_row.id.unwrap_or(0);
     let recipients: &[(i64, &str)] = &[(to_id, "to")];
-    db_outcome_to_mcp_result(
+    let message = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::create_message_with_recipients(
             ctx.cx(),
             &pool,
@@ -253,6 +254,37 @@ pub async fn request_contact(
         )
         .await,
     )?;
+
+    // Write message to archive
+    let config = mcp_agent_mail_core::Config::get();
+    let message_id = message.id.unwrap_or(0);
+    let all_recipient_names = vec![target_agent_name.clone()];
+
+    let msg_json = serde_json::json!({
+        "id": message_id,
+        "from": &from_agent,
+        "to": &all_recipient_names,
+        "cc": [],
+        "bcc": [],
+        "subject": &message.subject,
+        "created": micros_to_iso(message.created_ts),
+        "thread_id": &message.thread_id,
+        "project": &project.human_key,
+        "project_slug": &project.slug,
+        "importance": &message.importance,
+        "ack_required": message.ack_required != 0,
+        "attachments": [],
+    });
+
+    try_write_message_archive(
+        &config,
+        &project.slug,
+        &msg_json,
+        &message.body_md,
+        &from_agent,
+        &all_recipient_names,
+        &[],
+    );
 
     let response = ContactLinkState {
         from: from_agent,

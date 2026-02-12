@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 
+use crate::messaging::try_write_message_archive;
 use crate::pattern_overlap::CompiledPattern;
 use crate::reservation_index::{ReservationIndex, ReservationRef};
 use crate::tool_util::{
@@ -731,7 +732,40 @@ pub async fn force_release_file_reservation(
             recipients,
         )
         .await;
-        matches!(result, asupersync::Outcome::Ok(_))
+
+        match result {
+            asupersync::Outcome::Ok(message) => {
+                let message_id = message.id.unwrap_or(0);
+                let all_recipient_names = vec![holder_agent.name.clone()];
+                let msg_json = serde_json::json!({
+                    "id": message_id,
+                    "from": &agent_name,
+                    "to": &all_recipient_names,
+                    "cc": [],
+                    "bcc": [],
+                    "subject": &message.subject,
+                    "created": micros_to_iso(message.created_ts),
+                    "thread_id": &message.thread_id,
+                    "project": &project.human_key,
+                    "project_slug": &project.slug,
+                    "importance": &message.importance,
+                    "ack_required": message.ack_required != 0,
+                    "attachments": [],
+                });
+
+                try_write_message_archive(
+                    &Config::get(),
+                    &project.slug,
+                    &msg_json,
+                    &message.body_md,
+                    &agent_name,
+                    &all_recipient_names,
+                    &[],
+                );
+                true
+            }
+            _ => false,
+        }
     } else {
         false
     };

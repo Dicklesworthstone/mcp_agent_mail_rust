@@ -4,7 +4,7 @@
 //! - Score-sorted hits with deterministic tie-breaking (by ID descending)
 //! - Offset/limit pagination with correct `total_count`
 //! - Context-aware text snippets with term highlighting
-//! - Optional explain report with BM25 score components
+//! - Optional deterministic multi-stage explain report
 
 #[cfg(feature = "tantivy-engine")]
 use std::collections::HashMap;
@@ -28,7 +28,11 @@ use crate::document::DocKind;
 #[cfg(feature = "tantivy-engine")]
 use crate::query::SearchMode;
 #[cfg(feature = "tantivy-engine")]
-use crate::results::{ExplainReport, HitExplanation, SearchHit, SearchResults};
+use crate::results::{
+    ExplainComposerConfig, ExplainReasonCode, ExplainStage, ExplainVerbosity, HitExplanation,
+    ScoreFactor, SearchHit, SearchResults, StageScoreInput, compose_explain_report,
+    compose_hit_explanation,
+};
 #[cfg(feature = "tantivy-engine")]
 use crate::tantivy_schema::FieldHandles;
 
@@ -157,6 +161,10 @@ pub struct ResponseConfig {
     pub generate_snippets: bool,
     /// Whether to generate highlight ranges
     pub generate_highlights: bool,
+    /// Explain payload verbosity.
+    pub explain_verbosity: ExplainVerbosity,
+    /// Maximum factors retained per explain stage.
+    pub explain_max_factors: usize,
 }
 
 #[cfg(feature = "tantivy-engine")]
@@ -166,6 +174,8 @@ impl Default for ResponseConfig {
             snippet_max_chars: SNIPPET_MAX_CHARS,
             generate_snippets: true,
             generate_highlights: true,
+            explain_verbosity: ExplainVerbosity::Standard,
+            explain_max_factors: 4,
         }
     }
 }
@@ -215,6 +225,10 @@ pub fn execute_search(
     // Build hits
     let mut hits = Vec::with_capacity(page_docs.len());
     let mut explanations = Vec::new();
+    let composer_config = ExplainComposerConfig {
+        verbosity: config.explain_verbosity,
+        max_factors_per_stage: config.explain_max_factors,
+    };
 
     for (score, doc_addr) in &page_docs {
         let doc: TantivyDocument = match searcher.doc(*doc_addr) {
@@ -225,7 +239,12 @@ pub fn execute_search(
         let hit = build_hit(&doc, handles, *score, query_terms, config);
 
         if explain {
-            explanations.push(build_explanation(&hit, *score));
+            explanations.push(build_explanation(
+                &hit,
+                *score,
+                query_terms,
+                &composer_config,
+            ));
         }
 
         hits.push(hit);
@@ -248,16 +267,15 @@ pub fn execute_search(
     let elapsed = start.elapsed();
 
     let explain_report = if explain {
-        Some(ExplainReport {
-            hits: explanations,
-            mode_used: SearchMode::Lexical,
-            candidates_evaluated: total_count,
-            phase_timings: {
-                let mut m = HashMap::new();
-                m.insert("search".to_string(), elapsed);
-                m
-            },
-        })
+        let mut phase_timings = HashMap::new();
+        phase_timings.insert("lexical_search".to_string(), elapsed);
+        Some(compose_explain_report(
+            SearchMode::Lexical,
+            total_count,
+            phase_timings,
+            explanations,
+            &composer_config,
+        ))
     } else {
         None
     };
@@ -365,16 +383,28 @@ fn build_hit(
 
 /// Build an explain entry for a hit
 #[cfg(feature = "tantivy-engine")]
-fn build_explanation(hit: &SearchHit, raw_score: f32) -> HitExplanation {
-    HitExplanation {
-        doc_id: hit.doc_id,
-        tf_idf: None,
-        bm25: Some(f64::from(raw_score)),
-        semantic_similarity: None,
-        final_score: hit.score,
-        explanation: format!(
-            "BM25 score={:.4}, doc_kind={}, id={}",
-            raw_score,
+fn build_explanation(
+    hit: &SearchHit,
+    raw_score: f32,
+    query_terms: &[String],
+    config: &ExplainComposerConfig,
+) -> HitExplanation {
+    let raw_bm25 = f64::from(raw_score);
+    let query_term_count = query_terms.len();
+    let highlight_count = hit.highlight_ranges.len();
+    let coverage = if query_term_count == 0 {
+        0.0
+    } else {
+        (highlight_count as f64 / query_term_count as f64).min(1.0)
+    };
+    let coverage_component = raw_bm25 * 0.1 * coverage;
+    let bm25_component = raw_bm25 - coverage_component;
+
+    let lexical_stage = StageScoreInput {
+        stage: ExplainStage::Lexical,
+        reason_code: ExplainReasonCode::LexicalBm25,
+        summary: Some(format!(
+            "Lexical retrieval via BM25 for doc_kind={}, id={}",
             match hit.doc_kind {
                 DocKind::Message => "message",
                 DocKind::Agent => "agent",
@@ -382,8 +412,28 @@ fn build_explanation(hit: &SearchHit, raw_score: f32) -> HitExplanation {
                 DocKind::Thread => "thread",
             },
             hit.doc_id
-        ),
-    }
+        )),
+        stage_score: hit.score,
+        stage_weight: 1.0,
+        score_factors: vec![
+            ScoreFactor {
+                code: ExplainReasonCode::LexicalBm25,
+                key: "bm25".to_string(),
+                contribution: bm25_component,
+                detail: Some(format!("raw_bm25={raw_bm25:.6}")),
+            },
+            ScoreFactor {
+                code: ExplainReasonCode::LexicalTermCoverage,
+                key: "term_coverage".to_string(),
+                contribution: coverage_component,
+                detail: Some(format!(
+                    "highlight_count={highlight_count}, query_term_count={query_term_count}"
+                )),
+            },
+        ],
+    };
+
+    compose_hit_explanation(hit.doc_id, hit.score, vec![lexical_stage], config)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -654,8 +704,63 @@ mod tests {
             let explain = results.explain.unwrap();
             assert_eq!(explain.mode_used, SearchMode::Lexical);
             assert!(!explain.hits.is_empty());
-            assert!(explain.hits[0].bm25.is_some());
-            assert!(explain.hits[0].explanation.contains("BM25"));
+            assert_eq!(explain.taxonomy_version, 1);
+            let hit_explain = &explain.hits[0];
+            assert_eq!(hit_explain.stages[0].stage, ExplainStage::Lexical);
+            assert_eq!(
+                hit_explain.stages[0].reason_code,
+                ExplainReasonCode::LexicalBm25
+            );
+            assert!(!hit_explain.stages[0].score_factors.is_empty());
+        }
+
+        #[test]
+        fn execute_search_with_explain_minimal_verbosity_hides_factors() {
+            let (index, handles) = setup_index();
+            let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
+            let query = parser.parse_query("migration").unwrap();
+            let config = ResponseConfig {
+                explain_verbosity: ExplainVerbosity::Minimal,
+                ..ResponseConfig::default()
+            };
+            let results = execute_search(
+                &index,
+                &*query,
+                &handles,
+                &["migration".to_string()],
+                10,
+                0,
+                true,
+                &config,
+            );
+            let explain = results.explain.unwrap();
+            assert!(explain.hits[0].stages[0].score_factors.is_empty());
+            assert!(explain.hits[0].stages[0].truncated_factor_count >= 1);
+        }
+
+        #[test]
+        fn execute_search_with_explain_truncates_factors_deterministically() {
+            let (index, handles) = setup_index();
+            let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
+            let query = parser.parse_query("migration").unwrap();
+            let config = ResponseConfig {
+                explain_verbosity: ExplainVerbosity::Detailed,
+                explain_max_factors: 1,
+                ..ResponseConfig::default()
+            };
+            let results = execute_search(
+                &index,
+                &*query,
+                &handles,
+                &["migration".to_string()],
+                10,
+                0,
+                true,
+                &config,
+            );
+            let explain = results.explain.unwrap();
+            assert_eq!(explain.hits[0].stages[0].score_factors.len(), 1);
+            assert_eq!(explain.hits[0].stages[0].truncated_factor_count, 1);
         }
 
         #[test]

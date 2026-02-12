@@ -19,6 +19,7 @@ use tantivy::query::{
 use tantivy::schema::Field;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 #[cfg(feature = "tantivy-engine")]
@@ -47,6 +48,23 @@ static HYPHENATED_TOKEN: LazyLock<Regex> =
 static MULTI_SPACE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r" {2,}").expect("multi-space regex"));
 
+/// Canonical supported structured-hint fields.
+const QUERY_HINT_FIELDS: &[&str] = &["from", "thread", "project", "before", "after", "importance"];
+
+/// Structured hint aliases mapped to canonical field names.
+const QUERY_HINT_ALIASES: &[(&str, &str)] = &[
+    ("sender", "from"),
+    ("frm", "from"),
+    ("thread_id", "thread"),
+    ("thr", "thread"),
+    ("proj", "project"),
+    ("since", "after"),
+    ("until", "before"),
+    ("priority", "importance"),
+    ("prio", "importance"),
+    ("imp", "importance"),
+];
+
 /// Result of query sanitization
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SanitizedQuery {
@@ -54,6 +72,194 @@ pub enum SanitizedQuery {
     Empty,
     /// A valid, sanitized query string
     Valid(String),
+}
+
+/// A canonical filter hint extracted from free-text query input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedFilterHint {
+    /// Canonical field name (`from`, `thread`, `project`, `before`, `after`, `importance`).
+    pub field: String,
+    /// Parsed value for this hint.
+    pub value: String,
+}
+
+/// A deterministic typo-tolerant suggestion for malformed hint fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DidYouMeanHint {
+    /// Original token from query input.
+    pub token: String,
+    /// Suggested canonical field name.
+    pub suggested_field: String,
+    /// Parsed value associated with the malformed field.
+    pub value: String,
+}
+
+/// Structured query-assistance metadata extracted from a query string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct QueryAssistance {
+    /// Free-text query with recognized structured hints removed.
+    pub query_text: String,
+    /// Parsed canonical filter hints in deterministic token order.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub applied_filter_hints: Vec<AppliedFilterHint>,
+    /// Typo-tolerant deterministic suggestions for malformed hint fields.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub did_you_mean: Vec<DidYouMeanHint>,
+}
+
+fn split_query_tokens(raw_query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in raw_query.chars() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() && !in_quotes {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn normalize_hint_value(value: &str) -> String {
+    let trimmed = value.trim();
+    let maybe_unquoted = if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    maybe_unquoted.trim().to_string()
+}
+
+fn normalize_hint_field(field: &str) -> Option<&'static str> {
+    let lower = field.to_ascii_lowercase();
+    if QUERY_HINT_FIELDS.contains(&lower.as_str()) {
+        return QUERY_HINT_FIELDS
+            .iter()
+            .find(|candidate| **candidate == lower)
+            .copied();
+    }
+    QUERY_HINT_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == lower)
+        .map(|(_, canonical)| *canonical)
+}
+
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    if a.is_empty() {
+        return b.chars().count();
+    }
+    if b.is_empty() {
+        return a.chars().count();
+    }
+
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev_row: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut cur_row = vec![0; b_chars.len() + 1];
+
+    for (i, a_ch) in a.chars().enumerate() {
+        cur_row[0] = i + 1;
+        for (j, b_ch) in b_chars.iter().enumerate() {
+            let cost = usize::from(a_ch != *b_ch);
+            cur_row[j + 1] = (prev_row[j + 1] + 1)
+                .min(cur_row[j] + 1)
+                .min(prev_row[j] + cost);
+        }
+        prev_row.copy_from_slice(&cur_row);
+    }
+    prev_row[b_chars.len()]
+}
+
+fn suggest_hint_field(field: &str) -> Option<&'static str> {
+    let lower = field.to_ascii_lowercase();
+    let mut best: Option<(&'static str, usize)> = None;
+    for candidate in QUERY_HINT_FIELDS {
+        let distance = levenshtein_distance(&lower, candidate);
+        if distance > 2 {
+            continue;
+        }
+        match best {
+            None => best = Some((*candidate, distance)),
+            Some((best_candidate, best_distance)) => {
+                if distance < best_distance
+                    || (distance == best_distance && *candidate < best_candidate)
+                {
+                    best = Some((*candidate, distance));
+                }
+            }
+        }
+    }
+    best.map(|(candidate, _)| candidate)
+}
+
+/// Parse structured query hints with typo-tolerant suggestions.
+///
+/// Supported canonical fields:
+/// - `from`, `thread`, `project`, `before`, `after`, `importance`
+///
+/// The returned `query_text` preserves plain-text semantics by removing only
+/// recognized canonical/alias hints and keeping unknown `field:value` tokens.
+#[must_use]
+pub fn parse_query_assistance(raw_query: &str) -> QueryAssistance {
+    let mut plain_tokens = Vec::new();
+    let mut applied_filter_hints = Vec::new();
+    let mut did_you_mean = Vec::new();
+
+    for token in split_query_tokens(raw_query) {
+        let Some((field, value_part)) = token.split_once(':') else {
+            plain_tokens.push(token);
+            continue;
+        };
+
+        if field.trim().is_empty() || value_part.trim().is_empty() {
+            plain_tokens.push(token);
+            continue;
+        }
+
+        let value = normalize_hint_value(value_part);
+        if value.is_empty() {
+            plain_tokens.push(token);
+            continue;
+        }
+
+        if let Some(canonical) = normalize_hint_field(field) {
+            applied_filter_hints.push(AppliedFilterHint {
+                field: canonical.to_string(),
+                value,
+            });
+            continue;
+        }
+
+        if let Some(suggested_field) = suggest_hint_field(field) {
+            did_you_mean.push(DidYouMeanHint {
+                token: token.clone(),
+                suggested_field: suggested_field.to_string(),
+                value,
+            });
+        }
+        plain_tokens.push(token);
+    }
+
+    QueryAssistance {
+        query_text: plain_tokens.join(" ").trim().to_string(),
+        applied_filter_hints,
+        did_you_mean,
+    }
 }
 
 impl SanitizedQuery {
@@ -636,6 +842,94 @@ mod tests {
         let valid = SanitizedQuery::Valid("hello".to_string());
         assert!(!valid.is_empty());
         assert_eq!(valid.as_str(), Some("hello"));
+    }
+
+    // ── parse_query_assistance tests ──
+
+    #[test]
+    fn parse_query_assistance_extracts_canonical_hints() {
+        let assistance =
+            parse_query_assistance("from:BlueLake thread:br-123 importance:high migration plan");
+        assert_eq!(assistance.query_text, "migration plan");
+        assert_eq!(
+            assistance.applied_filter_hints,
+            vec![
+                AppliedFilterHint {
+                    field: "from".to_string(),
+                    value: "BlueLake".to_string()
+                },
+                AppliedFilterHint {
+                    field: "thread".to_string(),
+                    value: "br-123".to_string()
+                },
+                AppliedFilterHint {
+                    field: "importance".to_string(),
+                    value: "high".to_string()
+                },
+            ]
+        );
+        assert!(assistance.did_you_mean.is_empty());
+    }
+
+    #[test]
+    fn parse_query_assistance_supports_aliases() {
+        let assistance = parse_query_assistance("sender:RedPeak prio:urgent since:2026-02-01");
+        assert!(assistance.query_text.is_empty());
+        assert_eq!(
+            assistance.applied_filter_hints,
+            vec![
+                AppliedFilterHint {
+                    field: "from".to_string(),
+                    value: "RedPeak".to_string()
+                },
+                AppliedFilterHint {
+                    field: "importance".to_string(),
+                    value: "urgent".to_string()
+                },
+                AppliedFilterHint {
+                    field: "after".to_string(),
+                    value: "2026-02-01".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_assistance_handles_quoted_values() {
+        let assistance = parse_query_assistance(
+            "from:\"Blue Lake\" thread:\"br-42\" project:\"backend-api\" search term",
+        );
+        assert_eq!(assistance.query_text, "search term");
+        assert_eq!(assistance.applied_filter_hints.len(), 3);
+        assert_eq!(assistance.applied_filter_hints[0].value, "Blue Lake");
+        assert_eq!(assistance.applied_filter_hints[1].value, "br-42");
+        assert_eq!(assistance.applied_filter_hints[2].value, "backend-api");
+    }
+
+    #[test]
+    fn parse_query_assistance_preserves_unknown_hint_tokens() {
+        let assistance = parse_query_assistance("form:BlueLake migration");
+        assert_eq!(assistance.query_text, "form:BlueLake migration");
+        assert!(assistance.applied_filter_hints.is_empty());
+        assert_eq!(assistance.did_you_mean.len(), 1);
+        assert_eq!(assistance.did_you_mean[0].suggested_field, "from");
+    }
+
+    #[test]
+    fn parse_query_assistance_suggestion_order_is_deterministic() {
+        let assistance = parse_query_assistance("thred:br-1 imporance:high body");
+        assert_eq!(assistance.did_you_mean.len(), 2);
+        assert_eq!(assistance.did_you_mean[0].suggested_field, "thread");
+        assert_eq!(assistance.did_you_mean[1].suggested_field, "importance");
+        assert_eq!(assistance.query_text, "thred:br-1 imporance:high body");
+    }
+
+    #[test]
+    fn parse_query_assistance_plain_text_compatibility() {
+        let assistance = parse_query_assistance("just regular free text");
+        assert_eq!(assistance.query_text, "just regular free text");
+        assert!(assistance.applied_filter_hints.is_empty());
+        assert!(assistance.did_you_mean.is_empty());
     }
 
     // ── Tantivy integration tests (require tantivy-engine feature) ──

@@ -270,15 +270,7 @@ pub struct AgentsListResponse {
 pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<String> {
     let (project_key, _query) = split_param_and_query(&project_key);
     let pool = get_db_pool()?;
-
-    // Find project by slug
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 

@@ -365,19 +365,16 @@ impl DbPool {
                                     // database files that contain FTS5 shadow table pages
                                     // ("cell has no rowid" error). Search falls back to LIKE
                                     // automatically when FTS5 tables are absent.
-                                    let mig_conn = sqlmodel_sqlite::SqliteConnection::open_file(
-                                        &sqlite_path,
-                                    )
-                                    .map_err(Outcome::<(), SqlError>::Err)?;
+                                    let mig_conn =
+                                        sqlmodel_sqlite::SqliteConnection::open_file(&sqlite_path)
+                                            .map_err(Outcome::<(), SqlError>::Err)?;
 
-                                    if let Err(e) =
-                                        mig_conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
+                                    if let Err(e) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
                                     {
                                         return Err(Outcome::Err(e));
                                     }
                                     if run_migrations {
-                                        match schema::migrate_to_latest_base(&cx2, &mig_conn)
-                                            .await
+                                        match schema::migrate_to_latest_base(&cx2, &mig_conn).await
                                         {
                                             Outcome::Ok(_) => {}
                                             Outcome::Err(e) => return Err(Outcome::Err(e)),

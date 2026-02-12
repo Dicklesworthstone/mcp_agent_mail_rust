@@ -150,6 +150,7 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["beads", "--help"],
     &["file_reservations", "--help"],
     &["setup", "--help"],
+    &["golden", "--help"],
 ];
 
 /// Commands that MCP binary should deny (exit code 2).
@@ -173,6 +174,7 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["file_reservations"],
     &["beads"],
     &["setup"],
+    &["golden"],
 ];
 
 /// Commands that MCP binary should allow (not deny).
@@ -394,6 +396,44 @@ fn save_golden_snapshot(name: &str, content: &str) {
     let _ = std::fs::write(&path, content);
 }
 
+fn should_update_golden_snapshots() -> bool {
+    std::env::var("UPDATE_GOLDEN").ok().is_some_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn maybe_update_golden_snapshot(name: &str, content: &str) {
+    if should_update_golden_snapshots() {
+        save_golden_snapshot(name, content);
+        eprintln!("updated golden snapshot: {name}");
+    }
+}
+
+fn normalize_snapshot_text(text: &str) -> String {
+    let normalized = mcp_agent_mail_cli::golden::normalize_output(text);
+    normalized.trim_end().to_string()
+}
+
+fn assert_snapshot_match(case_label: &str, expected: &str, actual: &str, update_hint: &str) {
+    let comparison = mcp_agent_mail_cli::golden::compare_text(expected, actual);
+    assert!(
+        comparison.matches,
+        "{case_label} snapshot drift.\n\
+         {update_hint}\n\
+         expected_sha256: {}\n\
+         actual_sha256:   {}\n\
+         {}",
+        comparison.expected_sha256,
+        comparison.actual_sha256,
+        comparison
+            .inline_diff
+            .unwrap_or_else(|| "(inline diff unavailable)".to_string())
+    );
+}
+
 #[test]
 fn golden_denial_message_format_contract() {
     let am = am_bin();
@@ -441,20 +481,18 @@ fn golden_denial_message_format_contract() {
             "denial for '{cmd}' must not write to stdout"
         );
 
-        // Save snapshot for diffing
-        save_golden_snapshot(&format!("mcp_deny_{cmd}.txt"), &serr);
+        // Update snapshots only when explicitly requested.
+        maybe_update_golden_snapshot(&format!("mcp_deny_{cmd}.txt"), &serr);
 
         // Check against existing golden snapshot
         if let Some(golden) = load_golden_snapshot(&format!("mcp_deny_{cmd}.txt")) {
-            // Normalize both: strip trailing whitespace/newlines
-            let norm_golden = golden.trim_end();
-            let norm_actual = serr.trim_end();
-            assert_eq!(
-                norm_actual, norm_golden,
-                "denial snapshot drift for '{cmd}'.\n\
-                 Run `cargo test -p mcp-agent-mail-cli golden_denial_message_format_contract -- --nocapture` to update.\n\
-                 Diff:\n  expected: {:?}\n  actual:   {:?}",
-                norm_golden, norm_actual
+            let norm_golden = normalize_snapshot_text(&golden);
+            let norm_actual = normalize_snapshot_text(&serr);
+            assert_snapshot_match(
+                &format!("denial '{cmd}'"),
+                &norm_golden,
+                &norm_actual,
+                "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_denial_message_format_contract -- --nocapture` to update.",
             );
         }
 
@@ -488,22 +526,18 @@ fn golden_cli_help_snapshot_stability() {
             out.status.code()
         );
 
-        // Save current output as golden snapshot
-        save_golden_snapshot(snapshot_name, &sout);
+        // Update snapshots only when explicitly requested.
+        maybe_update_golden_snapshot(snapshot_name, &sout);
 
         // Validate against existing golden if present
         if let Some(golden) = load_golden_snapshot(snapshot_name) {
-            let norm_golden = golden.trim_end();
-            let norm_actual = sout.trim_end();
-            assert_eq!(
-                norm_actual,
-                norm_golden,
-                "help snapshot drift for {:?}.\n\
-                 Run `cargo test -p mcp-agent-mail-cli golden_cli_help_snapshot_stability -- --nocapture` to update.\n\
-                 Old length: {}, New length: {}",
-                args,
-                norm_golden.len(),
-                norm_actual.len()
+            let norm_golden = normalize_snapshot_text(&golden);
+            let norm_actual = normalize_snapshot_text(&sout);
+            assert_snapshot_match(
+                &format!("help {:?}", args),
+                &norm_golden,
+                &norm_actual,
+                "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_cli_help_snapshot_stability -- --nocapture` to update.",
             );
         }
 
