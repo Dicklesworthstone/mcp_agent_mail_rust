@@ -27,7 +27,6 @@ import os
 import sqlite3
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Resolve output directory
@@ -305,7 +304,6 @@ def run_scope_test(db_path: Path, identifiers: list[str]) -> dict:
     """Run project scoping on a copy and return the result."""
     import shutil
     from mcp_agent_mail.share import apply_project_scope
-    from dataclasses import asdict
 
     with tempfile.TemporaryDirectory() as tmp:
         copy_path = Path(tmp) / "scoped.sqlite3"
