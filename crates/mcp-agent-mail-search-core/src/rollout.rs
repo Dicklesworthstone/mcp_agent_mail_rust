@@ -376,6 +376,7 @@ impl Default for RolloutController {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default, clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -504,8 +505,10 @@ mod tests {
 
     #[test]
     fn test_rollout_controller_shadow_mode() {
-        let mut config = SearchRolloutConfig::default();
-        config.shadow_mode = SearchShadowMode::LogOnly;
+        let config = SearchRolloutConfig {
+            shadow_mode: SearchShadowMode::LogOnly,
+            ..Default::default()
+        };
 
         let controller = RolloutController::new(config);
 
@@ -515,8 +518,10 @@ mod tests {
 
     #[test]
     fn test_rollout_controller_shadow_compare_mode() {
-        let mut config = SearchRolloutConfig::default();
-        config.shadow_mode = SearchShadowMode::Compare;
+        let config = SearchRolloutConfig {
+            shadow_mode: SearchShadowMode::Compare,
+            ..Default::default()
+        };
 
         let controller = RolloutController::new(config);
 
