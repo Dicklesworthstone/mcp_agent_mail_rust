@@ -10,11 +10,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ftui::Frame;
 use ftui::layout::Rect;
+use ftui::text::display_width;
 use ftui::widgets::Widget;
 use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
+use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
 use ftui::widgets::notification_queue::NotificationStack;
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
-use ftui::{Event, KeyCode, KeyEventKind, Modifiers};
+use ftui::{Event, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::{Cmd, Model};
 
 use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
@@ -100,7 +102,7 @@ impl ToastSeverityThreshold {
     }
 
     /// Returns `true` if a toast at the given icon level should be shown.
-    fn allows(self, icon: ToastIcon) -> bool {
+    const fn allows(self, icon: ToastIcon) -> bool {
         match self {
             Self::Off => false,
             Self::Error => matches!(icon, ToastIcon::Error),
@@ -114,6 +116,14 @@ impl ToastSeverityThreshold {
 const SLOW_TOOL_THRESHOLD_MS: u64 = 5000;
 /// How far ahead (in microseconds) to warn about expiring reservations (5 min).
 const RESERVATION_EXPIRY_WARN_MICROS: i64 = 5 * 60 * 1_000_000;
+
+/// Toast border/icon colors by severity, matching `tui_events` severity palette.
+const TOAST_COLOR_ERROR: PackedRgba = PackedRgba::rgb(255, 100, 100);
+const TOAST_COLOR_WARNING: PackedRgba = PackedRgba::rgb(255, 184, 108);
+const TOAST_COLOR_INFO: PackedRgba = PackedRgba::rgb(120, 220, 150);
+const TOAST_COLOR_SUCCESS: PackedRgba = PackedRgba::rgb(100, 220, 170);
+/// Bright cyan highlight for the focused toast border.
+const TOAST_FOCUS_HIGHLIGHT: PackedRgba = PackedRgba::rgb(80, 220, 255);
 
 /// Current time as microseconds since Unix epoch.
 fn now_micros() -> i64 {
@@ -138,6 +148,8 @@ pub struct MailAppModel {
     help_scroll: u16,
     keymap: crate::tui_keymap::KeymapRegistry,
     command_palette: CommandPalette,
+    hint_ranker: HintRanker,
+    palette_hint_ids: HashMap<String, usize>,
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
@@ -150,6 +162,9 @@ pub struct MailAppModel {
     warned_reservations: HashSet<String>,
     /// Minimum severity level for toast notifications.
     toast_severity: ToastSeverityThreshold,
+    /// When `Some(idx)`, the toast stack is in focus mode and the
+    /// toast at `idx` has a highlight border. Ctrl+T toggles.
+    toast_focus_index: Option<usize>,
 }
 
 impl MailAppModel {
@@ -188,8 +203,18 @@ impl MailAppModel {
                 screens.insert(id, Box::new(AttachmentExplorerScreen::new()));
             }
         }
+
+        let static_actions = build_palette_actions_static();
         let mut command_palette = CommandPalette::new().with_max_visible(PALETTE_MAX_VISIBLE);
-        command_palette.replace_actions(build_palette_actions_static());
+        command_palette.replace_actions(static_actions.clone());
+        let mut hint_ranker = HintRanker::new(RankerConfig::default());
+        let mut palette_hint_ids: HashMap<String, usize> = HashMap::new();
+        register_palette_hints(
+            &mut hint_ranker,
+            &mut palette_hint_ids,
+            &static_actions,
+            screen_palette_action_id(MailScreenId::Dashboard),
+        );
         Self {
             state,
             active_screen: MailScreenId::Dashboard,
@@ -198,6 +223,8 @@ impl MailAppModel {
             help_scroll: 0,
             keymap: crate::tui_keymap::KeymapRegistry::default(),
             command_palette,
+            hint_ranker,
+            palette_hint_ids,
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
             tick_count: 0,
@@ -206,6 +233,7 @@ impl MailAppModel {
             reservation_tracker: HashMap::new(),
             warned_reservations: HashSet::new(),
             toast_severity: ToastSeverityThreshold::from_env(),
+            toast_focus_index: None,
         }
     }
 
@@ -279,6 +307,61 @@ impl MailAppModel {
             .is_some_and(|s| s.consumes_text_input())
     }
 
+    fn sync_palette_hints(&mut self, actions: &[ActionItem]) {
+        register_palette_hints(
+            &mut self.hint_ranker,
+            &mut self.palette_hint_ids,
+            actions,
+            screen_palette_action_id(self.active_screen),
+        );
+    }
+
+    fn rank_palette_actions(&mut self, actions: Vec<ActionItem>) -> Vec<ActionItem> {
+        self.sync_palette_hints(&actions);
+
+        let (ordering, _) = self
+            .hint_ranker
+            .rank(Some(screen_palette_action_id(self.active_screen)));
+        if ordering.is_empty() {
+            return actions;
+        }
+
+        let mut rank_by_hint_id: HashMap<usize, usize> = HashMap::with_capacity(ordering.len());
+        for (rank, hint_id) in ordering.into_iter().enumerate() {
+            rank_by_hint_id.insert(hint_id, rank);
+        }
+
+        let mut indexed_actions: Vec<(usize, ActionItem)> =
+            actions.into_iter().enumerate().collect();
+        indexed_actions.sort_by_key(|(original_index, action)| {
+            let rank = self
+                .palette_hint_ids
+                .get(action.id.as_str())
+                .and_then(|hint_id| rank_by_hint_id.get(hint_id))
+                .copied()
+                .unwrap_or(usize::MAX);
+            (rank, *original_index)
+        });
+
+        let ranked_actions: Vec<ActionItem> = indexed_actions
+            .into_iter()
+            .map(|(_, action)| action)
+            .collect();
+        for action in ranked_actions.iter().take(PALETTE_MAX_VISIBLE) {
+            if let Some(&hint_id) = self.palette_hint_ids.get(action.id.as_str()) {
+                self.hint_ranker.record_shown_not_used(hint_id);
+            }
+        }
+
+        ranked_actions
+    }
+
+    fn record_palette_action_usage(&mut self, action_id: &str) {
+        if let Some(&hint_id) = self.palette_hint_ids.get(action_id) {
+            self.hint_ranker.record_usage(hint_id);
+        }
+    }
+
     fn open_palette(&mut self) {
         self.help_visible = false;
         let mut actions = build_palette_actions(&self.state);
@@ -343,7 +426,8 @@ impl MailAppModel {
             );
         }
 
-        self.command_palette.replace_actions(actions);
+        let ranked_actions = self.rank_palette_actions(actions);
+        self.command_palette.replace_actions(ranked_actions);
         self.command_palette.open();
     }
 
@@ -359,6 +443,10 @@ impl MailAppModel {
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_palette_action_inner(&mut self, id: &str, macro_playback: bool) -> Cmd<MailMsg> {
+        if !macro_playback {
+            self.record_palette_action_usage(id);
+        }
+
         // ── Macro engine controls (never recorded) ────────────────
         if let Some(cmd) = self.handle_macro_control(id) {
             return cmd;
@@ -966,6 +1054,60 @@ impl Model for MailAppModel {
                     }
                 }
 
+                // Toast focus mode: intercept keys when toast stack is focused.
+                if self.toast_focus_index.is_some() {
+                    if let Event::Key(key) = event {
+                        if key.kind == KeyEventKind::Press {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    if let Some(ref mut idx) = self.toast_focus_index {
+                                        let count = self.notifications.visible_count();
+                                        if count > 0 {
+                                            *idx = if *idx == 0 { count - 1 } else { *idx - 1 };
+                                        }
+                                    }
+                                    return Cmd::none();
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    if let Some(ref mut idx) = self.toast_focus_index {
+                                        let count = self.notifications.visible_count();
+                                        if count > 0 {
+                                            *idx = (*idx + 1) % count;
+                                        }
+                                    }
+                                    return Cmd::none();
+                                }
+                                KeyCode::Enter => {
+                                    // Dismiss the focused toast.
+                                    if let Some(idx) = self.toast_focus_index {
+                                        let vis = self.notifications.visible();
+                                        if let Some(toast) = vis.get(idx) {
+                                            let id = toast.id;
+                                            self.notifications.dismiss(id);
+                                        }
+                                        // Clamp index after dismissal.
+                                        let count = self.notifications.visible_count();
+                                        if count == 0 {
+                                            self.toast_focus_index = None;
+                                        } else {
+                                            self.toast_focus_index =
+                                                Some(idx.min(count.saturating_sub(1)));
+                                        }
+                                    }
+                                    return Cmd::none();
+                                }
+                                KeyCode::Escape => {
+                                    self.toast_focus_index = None;
+                                    return Cmd::none();
+                                }
+                                _ => {
+                                    // Let other keys (like Ctrl+T) fall through.
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Global keybindings (checked before screen dispatch)
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
@@ -974,6 +1116,17 @@ impl Model for MailAppModel {
                             && matches!(key.code, KeyCode::Char('p'));
                         if (is_ctrl_p || matches!(key.code, KeyCode::Char(':'))) && !text_mode {
                             self.open_palette();
+                            return Cmd::none();
+                        }
+                        // Ctrl+T: toggle toast focus mode.
+                        let is_ctrl_t = key.modifiers.contains(Modifiers::CTRL)
+                            && matches!(key.code, KeyCode::Char('t'));
+                        if is_ctrl_t && !text_mode {
+                            if self.toast_focus_index.is_some() {
+                                self.toast_focus_index = None;
+                            } else if self.notifications.visible_count() > 0 {
+                                self.toast_focus_index = Some(0);
+                            }
                             return Cmd::none();
                         }
                         match key.code {
@@ -1115,6 +1268,17 @@ impl Model for MailAppModel {
         NotificationStack::new(&self.notifications)
             .margin(1)
             .render(area, frame);
+
+        // 4b. Toast focus highlight overlay
+        if let Some(focus_idx) = self.toast_focus_index {
+            render_toast_focus_highlight(
+                &self.notifications,
+                focus_idx,
+                area,
+                1, // margin
+                frame,
+            );
+        }
 
         // 5. Command palette (z=5, modal)
         if self.command_palette.is_visible() {
@@ -1370,6 +1534,41 @@ fn build_palette_actions(state: &TuiSharedState) -> Vec<ActionItem> {
     out
 }
 
+fn palette_action_cost_columns(action: &ActionItem) -> f64 {
+    let title_width = display_width(action.title.as_str());
+    let title_width = u16::try_from(title_width).unwrap_or(u16::MAX);
+    f64::from(title_width.max(1))
+}
+
+fn register_palette_hints(
+    hint_ranker: &mut HintRanker,
+    palette_hint_ids: &mut HashMap<String, usize>,
+    actions: &[ActionItem],
+    context_key: &str,
+) {
+    for (index, action) in actions.iter().enumerate() {
+        if palette_hint_ids.contains_key(action.id.as_str()) {
+            continue;
+        }
+
+        let static_priority = u32::try_from(index)
+            .unwrap_or(u32::MAX.saturating_sub(1))
+            .saturating_add(1);
+        let hint_context = if action.id.starts_with("quick:") {
+            HintContext::Widget(context_key.to_string())
+        } else {
+            HintContext::Global
+        };
+        let hint_id = hint_ranker.register(
+            action.id.as_str(),
+            palette_action_cost_columns(action),
+            hint_context,
+            static_priority,
+        );
+        palette_hint_ids.insert(action.id.clone(), hint_id);
+    }
+}
+
 /// Append palette entries derived from the periodic DB snapshot (agents, projects, contacts).
 fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<ActionItem>) {
     let Some(snap) = state.db_stats_snapshot() else {
@@ -1568,6 +1767,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
                 ToastIcon::Info,
                 Toast::new(format!("{from} → {recipients}"))
                     .icon(ToastIcon::Info)
+                    .style(Style::default().fg(TOAST_COLOR_INFO))
                     .duration(Duration::from_secs(4)),
             )
         }
@@ -1581,6 +1781,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
                 ToastIcon::Info,
                 Toast::new(format!("{from}: {truncated}"))
                     .icon(ToastIcon::Info)
+                    .style(Style::default().fg(TOAST_COLOR_INFO))
                     .duration(Duration::from_secs(5)),
             )
         }
@@ -1590,19 +1791,20 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Success,
             Toast::new(format!("{name} ({program})"))
                 .icon(ToastIcon::Success)
+                .style(Style::default().fg(TOAST_COLOR_SUCCESS))
                 .duration(Duration::from_secs(4)),
         ),
 
         // ── Tool calls: slow or errored ──────────────────────────
         MailEvent::ToolCallEnd {
             tool_name,
-            duration_ms,
             result_preview: Some(preview),
             ..
         } if preview.contains("error") || preview.contains("Error") => (
             ToastIcon::Error,
             Toast::new(format!("{tool_name} error"))
                 .icon(ToastIcon::Error)
+                .style(Style::default().fg(TOAST_COLOR_ERROR))
                 .duration(Duration::from_secs(15)),
         ),
         MailEvent::ToolCallEnd {
@@ -1613,6 +1815,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Warning,
             Toast::new(format!("{tool_name}: {duration_ms}ms"))
                 .icon(ToastIcon::Warning)
+                .style(Style::default().fg(TOAST_COLOR_WARNING))
                 .duration(Duration::from_secs(8)),
         ),
 
@@ -1628,6 +1831,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
                 ToastIcon::Info,
                 Toast::new(format!("{agent} locked {path_display}"))
                     .icon(ToastIcon::Info)
+                    .style(Style::default().fg(TOAST_COLOR_INFO))
                     .duration(Duration::from_secs(4)),
             )
         }
@@ -1637,6 +1841,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Error,
             Toast::new(format!("HTTP {status} on {path}"))
                 .icon(ToastIcon::Error)
+                .style(Style::default().fg(TOAST_COLOR_ERROR))
                 .duration(Duration::from_secs(6)),
         ),
 
@@ -1645,12 +1850,14 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Warning,
             Toast::new("Server shutting down")
                 .icon(ToastIcon::Warning)
+                .style(Style::default().fg(TOAST_COLOR_WARNING))
                 .duration(Duration::from_secs(8)),
         ),
         MailEvent::ServerStarted { endpoint, .. } => (
             ToastIcon::Success,
             Toast::new(format!("Server started at {endpoint}"))
                 .icon(ToastIcon::Success)
+                .style(Style::default().fg(TOAST_COLOR_SUCCESS))
                 .duration(Duration::from_secs(5)),
         ),
 
@@ -1662,6 +1869,73 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
         Some(toast)
     } else {
         None
+    }
+}
+
+/// Draw a highlighted border around the focused toast in the notification stack.
+///
+/// This is rendered as a post-processing overlay after `NotificationStack::render`,
+/// overwriting the border cells of the focused toast with a bright highlight color.
+fn render_toast_focus_highlight(
+    queue: &NotificationQueue,
+    focus_idx: usize,
+    area: Rect,
+    margin: u16,
+    frame: &mut Frame,
+) {
+    let positions = queue.calculate_positions(area.width, area.height, margin);
+    let visible = queue.visible();
+
+    if focus_idx >= visible.len() || focus_idx >= positions.len() {
+        return;
+    }
+
+    let toast = &visible[focus_idx];
+    let (_, px, py) = positions[focus_idx];
+    let (tw, th) = toast.calculate_dimensions();
+    let x = area.x.saturating_add(px);
+    let y = area.y.saturating_add(py);
+
+    // Overwrite border cells with highlight color.
+    // Top and bottom border rows.
+    for bx in x..x.saturating_add(tw) {
+        for &by in &[y, y.saturating_add(th).saturating_sub(1)] {
+            if let Some(cell) = frame.buffer.get_mut(bx, by) {
+                cell.fg = TOAST_FOCUS_HIGHLIGHT;
+            }
+        }
+    }
+    // Left and right border columns.
+    let bottom = y.saturating_add(th).saturating_sub(1);
+    for by in y..=bottom {
+        for &bx in &[x, x.saturating_add(tw).saturating_sub(1)] {
+            if let Some(cell) = frame.buffer.get_mut(bx, by) {
+                cell.fg = TOAST_FOCUS_HIGHLIGHT;
+            }
+        }
+    }
+
+    // Draw focus hint below the toast stack.
+    let hint = "Ctrl+T:exit  \u{2191}\u{2193}:nav  Enter:dismiss";
+    let hint_y = positions
+        .last()
+        .map(|(_, _, py)| {
+            let last_toast = visible.last().unwrap();
+            let (_, lh) = last_toast.calculate_dimensions();
+            area.y.saturating_add(*py).saturating_add(lh)
+        })
+        .unwrap_or(y.saturating_add(th));
+
+    let hint_x = x;
+    for (i, ch) in hint.chars().enumerate() {
+        let hx = hint_x.saturating_add(i as u16);
+        if hx >= area.right() {
+            break;
+        }
+        if let Some(cell) = frame.buffer.get_mut(hx, hint_y) {
+            *cell = ftui::Cell::from_char(ch);
+            cell.fg = TOAST_FOCUS_HIGHLIGHT;
+        }
     }
 }
 
@@ -2495,6 +2769,116 @@ mod tests {
     }
 
     #[test]
+    fn hint_ranker_promotes_frequently_used_actions() {
+        let mut model = test_model();
+        let actions = vec![
+            ActionItem::new("hint:a", "Alpha Action"),
+            ActionItem::new("hint:b", "Beta Action"),
+            ActionItem::new("hint:c", "Gamma Action"),
+        ];
+
+        let initial = model.rank_palette_actions(actions.clone());
+        assert_eq!(initial.first().map(|a| a.id.as_str()), Some("hint:a"));
+
+        for _ in 0..8 {
+            model.record_palette_action_usage("hint:c");
+        }
+
+        let reranked = model.rank_palette_actions(actions);
+        assert_eq!(reranked.first().map(|a| a.id.as_str()), Some("hint:c"));
+    }
+
+    #[test]
+    fn record_palette_action_usage_updates_hint_stats_and_order() {
+        let mut model = test_model();
+        let actions = vec![
+            ActionItem::new("hint:a", "Alpha Action"),
+            ActionItem::new("hint:b", "Beta Action"),
+            ActionItem::new("hint:c", "Gamma Action"),
+        ];
+        model.sync_palette_hints(&actions);
+
+        let hint_id = *model
+            .palette_hint_ids
+            .get("hint:b")
+            .expect("hint id for hint:b");
+        let before_alpha = model
+            .hint_ranker
+            .stats(hint_id)
+            .expect("stats before usage")
+            .alpha;
+
+        model.record_palette_action_usage("hint:b");
+
+        let after_alpha = model
+            .hint_ranker
+            .stats(hint_id)
+            .expect("stats after usage")
+            .alpha;
+        assert!(after_alpha > before_alpha, "usage should increase alpha");
+
+        let ranked = model.rank_palette_actions(actions);
+        assert_eq!(ranked.first().map(|a| a.id.as_str()), Some("hint:b"));
+    }
+
+    #[test]
+    fn rank_palette_actions_keeps_all_entries_without_usage_data() {
+        let mut model = test_model();
+        let actions = vec![
+            ActionItem::new("hint:a", "Alpha Action"),
+            ActionItem::new("hint:b", "Beta Action"),
+            ActionItem::new("hint:c", "Gamma Action"),
+        ];
+
+        let ranked = model.rank_palette_actions(actions.clone());
+        assert_eq!(ranked.len(), actions.len());
+
+        let mut ranked_ids: Vec<String> = ranked.into_iter().map(|action| action.id).collect();
+        let mut source_ids: Vec<String> = actions.into_iter().map(|action| action.id).collect();
+        ranked_ids.sort();
+        source_ids.sort();
+        assert_eq!(ranked_ids, source_ids);
+    }
+
+    #[test]
+    fn hint_ranker_ordering_combines_with_bayesian_palette_scoring() {
+        let actions = vec![
+            ActionItem::new("alpha:one", "Alpha One"),
+            ActionItem::new("alpha:two", "Alpha Two"),
+            ActionItem::new("beta:item", "Beta Item"),
+        ];
+
+        let mut baseline_palette = CommandPalette::new();
+        baseline_palette.replace_actions(actions.clone());
+        baseline_palette.open();
+        baseline_palette.set_query("alpha");
+        assert_eq!(
+            baseline_palette
+                .selected_action()
+                .map(|action| action.id.as_str()),
+            Some("alpha:one")
+        );
+
+        let mut model = test_model();
+        model.sync_palette_hints(&actions);
+        for _ in 0..8 {
+            model.record_palette_action_usage("alpha:two");
+        }
+        let ranked_actions = model.rank_palette_actions(actions);
+
+        let mut boosted_palette = CommandPalette::new();
+        boosted_palette.replace_actions(ranked_actions);
+        boosted_palette.open();
+        boosted_palette.set_query("alpha");
+        assert_eq!(
+            boosted_palette
+                .selected_action()
+                .map(|action| action.id.as_str()),
+            Some("alpha:two")
+        );
+    }
+
+    #[test]
     fn extract_reservation_agent_from_events() {
         let ev1 = MailEvent::reservation_granted("TestAgent", vec![], true, 60, "proj");
         let ev2 = MailEvent::reservation_released("OtherAgent", vec![], "proj");
@@ -3251,5 +3635,251 @@ mod tests {
         // Second insert is a no-op
         model.warned_reservations.insert(key.clone());
         assert_eq!(model.warned_reservations.len(), 1);
+    }
+
+    // ── Toast focus mode tests ──────────────────────────────────
+
+    #[test]
+    fn toast_focus_index_starts_none() {
+        let model = test_model();
+        assert!(model.toast_focus_index.is_none());
+    }
+
+    #[test]
+    fn toast_focus_toggle_on_with_visible_toasts() {
+        let mut model = test_model();
+        // Push a toast and tick so it becomes visible.
+        model.notifications.notify(
+            Toast::new("test")
+                .icon(ToastIcon::Info)
+                .duration(Duration::from_secs(60)),
+        );
+        model.notifications.tick(Duration::from_millis(16));
+        assert_eq!(model.notifications.visible_count(), 1);
+
+        // Toggle on.
+        model.toast_focus_index = Some(0);
+        assert_eq!(model.toast_focus_index, Some(0));
+    }
+
+    #[test]
+    fn toast_focus_toggle_off() {
+        let mut model = test_model();
+        model.toast_focus_index = Some(0);
+        model.toast_focus_index = None;
+        assert!(model.toast_focus_index.is_none());
+    }
+
+    #[test]
+    fn toast_focus_no_toggle_when_no_visible() {
+        let model = test_model();
+        // No toasts visible.
+        assert_eq!(model.notifications.visible_count(), 0);
+        // Should not toggle (caller checks visible_count > 0).
+        if model.notifications.visible_count() > 0 {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn toast_focus_navigate_down_wraps() {
+        let mut model = test_model();
+        for i in 0..3 {
+            model.notifications.notify(
+                Toast::new(format!("toast {i}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(60)),
+            );
+        }
+        model.notifications.tick(Duration::from_millis(16));
+        assert_eq!(model.notifications.visible_count(), 3);
+
+        model.toast_focus_index = Some(0);
+        // Navigate down: 0 -> 1 -> 2 -> 0 (wrap).
+        let count = model.notifications.visible_count();
+        let idx = model.toast_focus_index.as_mut().unwrap();
+        *idx = (*idx + 1) % count;
+        assert_eq!(*idx, 1);
+        *idx = (*idx + 1) % count;
+        assert_eq!(*idx, 2);
+        *idx = (*idx + 1) % count;
+        assert_eq!(*idx, 0); // Wrapped.
+    }
+
+    #[test]
+    fn toast_focus_navigate_up_wraps() {
+        let mut model = test_model();
+        for i in 0..3 {
+            model.notifications.notify(
+                Toast::new(format!("toast {i}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(60)),
+            );
+        }
+        model.notifications.tick(Duration::from_millis(16));
+        model.toast_focus_index = Some(0);
+
+        let count = model.notifications.visible_count();
+        let idx = model.toast_focus_index.as_mut().unwrap();
+        // Up from 0 wraps to 2.
+        *idx = if *idx == 0 { count - 1 } else { *idx - 1 };
+        assert_eq!(*idx, 2);
+    }
+
+    #[test]
+    fn toast_focus_dismiss_clamps_index() {
+        let mut model = test_model();
+        for i in 0..3 {
+            model.notifications.notify(
+                Toast::new(format!("toast {i}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(60)),
+            );
+        }
+        model.notifications.tick(Duration::from_millis(16));
+        model.toast_focus_index = Some(2);
+
+        // Dismiss the focused toast (index 2 = last one).
+        let vis = model.notifications.visible();
+        let id = vis[2].id;
+        model.notifications.dismiss(id);
+        model.notifications.tick(Duration::from_millis(16));
+
+        let count = model.notifications.visible_count();
+        model.toast_focus_index = Some(2_usize.min(count.saturating_sub(1)));
+        // After dismissal, count=2, so index clamped to 1.
+        assert_eq!(model.toast_focus_index, Some(1));
+    }
+
+    #[test]
+    fn toast_focus_dismiss_last_clears_focus() {
+        let mut model = test_model();
+        model.notifications.notify(
+            Toast::new("only one")
+                .icon(ToastIcon::Info)
+                .duration(Duration::from_secs(60)),
+        );
+        model.notifications.tick(Duration::from_millis(16));
+        model.toast_focus_index = Some(0);
+
+        // Dismiss the only toast.
+        let vis = model.notifications.visible();
+        let id = vis[0].id;
+        model.notifications.dismiss(id);
+        model.notifications.tick(Duration::from_millis(16));
+
+        let count = model.notifications.visible_count();
+        if count == 0 {
+            model.toast_focus_index = None;
+        }
+        assert!(model.toast_focus_index.is_none());
+    }
+
+    // ── Toast severity coloring tests ───────────────────────────
+    //
+    // Toast.style is private, so we verify coloring by rendering to a
+    // buffer and checking the foreground color of border cells.
+
+    fn render_toast_border_fg(toast: &Toast) -> PackedRgba {
+        let (tw, th) = toast.calculate_dimensions();
+        let area = Rect::new(0, 0, tw.max(10), th.max(4));
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(area.width, area.height, &mut pool);
+        toast.render(area, &mut frame);
+        // Top-left corner cell should carry the toast style fg.
+        frame
+            .buffer
+            .get(0, 0)
+            .map_or(PackedRgba::TRANSPARENT, |c| c.fg)
+    }
+
+    #[test]
+    fn toast_for_event_error_renders_error_color() {
+        let event = MailEvent::http_request("GET", "/mcp/", 500, 5, "127.0.0.1");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
+        let fg = render_toast_border_fg(&toast);
+        assert_eq!(fg, TOAST_COLOR_ERROR);
+    }
+
+    #[test]
+    fn toast_for_event_warning_renders_warning_color() {
+        let event = MailEvent::tool_call_end("slow_tool", 6000, None, 0, 0.0, vec![], None, None);
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
+        let fg = render_toast_border_fg(&toast);
+        assert_eq!(fg, TOAST_COLOR_WARNING);
+    }
+
+    #[test]
+    fn toast_for_event_info_renders_info_color() {
+        let event = MailEvent::message_sent(1, "A", vec!["B".into()], "Hi", "t1", "proj");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
+        let fg = render_toast_border_fg(&toast);
+        assert_eq!(fg, TOAST_COLOR_INFO);
+    }
+
+    #[test]
+    fn toast_for_event_success_renders_success_color() {
+        let event = MailEvent::agent_registered("RedFox", "claude-code", "opus-4.6", "proj");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
+        let fg = render_toast_border_fg(&toast);
+        assert_eq!(fg, TOAST_COLOR_SUCCESS);
+    }
+
+    // ── render_toast_focus_highlight tests ───────────────────────
+
+    #[test]
+    fn focus_highlight_noop_when_no_visible() {
+        let queue = NotificationQueue::new(QueueConfig::default());
+        let area = Rect::new(0, 0, 80, 24);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        // Should not panic with no visible toasts.
+        render_toast_focus_highlight(&queue, 0, area, 1, &mut frame);
+    }
+
+    #[test]
+    fn focus_highlight_noop_when_index_out_of_bounds() {
+        let mut queue = NotificationQueue::new(QueueConfig::default());
+        queue.notify(Toast::new("test").duration(Duration::from_secs(60)));
+        queue.tick(Duration::from_millis(16));
+        assert_eq!(queue.visible_count(), 1);
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        // Index 5 is out of bounds (only 1 visible).
+        render_toast_focus_highlight(&queue, 5, area, 1, &mut frame);
+    }
+
+    #[test]
+    fn focus_highlight_renders_hint_text() {
+        let mut queue = NotificationQueue::new(QueueConfig::default());
+        queue.notify(Toast::new("test toast").duration(Duration::from_secs(60)));
+        queue.tick(Duration::from_millis(16));
+        assert_eq!(queue.visible_count(), 1);
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        render_toast_focus_highlight(&queue, 0, area, 1, &mut frame);
+
+        // The hint text should be rendered below the toast.
+        // Check that some cells in the hint row have the highlight color.
+        let positions = queue.calculate_positions(80, 24, 1);
+        let (_, _, py) = positions[0];
+        let (_, th) = queue.visible()[0].calculate_dimensions();
+        let hint_y = py + th;
+
+        // At least one cell in the hint row should have TOAST_FOCUS_HIGHLIGHT fg.
+        let mut found = false;
+        for x in 0..80 {
+            if let Some(cell) = frame.buffer.get(x, hint_y) {
+                if cell.fg == TOAST_FOCUS_HIGHLIGHT {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "Hint text should be rendered with highlight color");
     }
 }

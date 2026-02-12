@@ -76,7 +76,7 @@ async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Opti
             )));
         }
     };
-    let sql = "SELECT * FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
+    let sql = "SELECT id, product_uid, name, created_at FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
     let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
     let start = mcp_agent_mail_db::query_timer();
     let rows = conn.query_sync(sql, &params);

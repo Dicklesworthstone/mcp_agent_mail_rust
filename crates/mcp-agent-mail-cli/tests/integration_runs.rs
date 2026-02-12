@@ -120,7 +120,7 @@ fn run_am(
 fn init_cli_schema(db_path: &Path) {
     let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
-    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .expect("init schema");
 }
 

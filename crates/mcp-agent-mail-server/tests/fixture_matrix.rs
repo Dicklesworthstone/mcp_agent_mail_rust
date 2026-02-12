@@ -50,7 +50,7 @@ impl FixtureEnv {
     fn conn(&self) -> mcp_agent_mail_db::DbConn {
         let conn = mcp_agent_mail_db::DbConn::open_file(self.db_path.display().to_string())
             .expect("open sqlite db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
         conn
     }

@@ -1,0 +1,3315 @@
+//! Robot output types for agent-optimized CLI commands.
+//!
+//! Provides the `OutputFormat` selector, `RobotEnvelope<T>` response wrapper,
+//! and the `format_output()` dispatcher used by all `am robot *` commands.
+
+#![allow(clippy::module_name_repetitions)]
+
+use chrono::Utc;
+use clap::{Args, Subcommand};
+use serde::Serialize;
+use sqlmodel_core::Value;
+use std::io::IsTerminal;
+
+use crate::CliError;
+
+// ── Output format ────────────────────────────────────────────────────────────
+
+/// Output format for robot commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Token-optimized TOON encoding (default for robot commands).
+    Toon,
+    /// Full JSON — for piping to jq or programmatic access.
+    Json,
+    /// Markdown prose — for thread/message rendering.
+    Markdown,
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Toon => f.write_str("toon"),
+            Self::Json => f.write_str("json"),
+            Self::Markdown => f.write_str("markdown"),
+        }
+    }
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "toon" => Ok(Self::Toon),
+            "json" => Ok(Self::Json),
+            "markdown" | "md" => Ok(Self::Markdown),
+            other => Err(format!(
+                "unknown output format: {other} (expected toon, json, or markdown)"
+            )),
+        }
+    }
+}
+
+impl OutputFormat {
+    /// Auto-detect the best format when the user didn't specify one.
+    ///
+    /// - `prose_hint` true (thread/message) → Markdown
+    /// - stdout is a TTY → Toon (compact, human-friendly)
+    /// - Otherwise (piped) → Json (machine-readable)
+    #[must_use]
+    pub fn auto_detect(prose_hint: bool) -> Self {
+        if prose_hint {
+            Self::Markdown
+        } else if std::io::stdout().is_terminal() {
+            Self::Toon
+        } else {
+            Self::Json
+        }
+    }
+
+    /// Resolve an explicit format or auto-detect.
+    #[must_use]
+    pub fn resolve(explicit: Option<Self>, prose_hint: bool) -> Self {
+        explicit.unwrap_or_else(|| Self::auto_detect(prose_hint))
+    }
+}
+
+// ── Envelope types ───────────────────────────────────────────────────────────
+
+/// Standard response envelope wrapping every robot command's output.
+///
+/// `_meta` is always present. `_alerts` and `_actions` are omitted when empty
+/// to keep output clean. The `data` payload is flattened to top level via
+/// `#[serde(flatten)]`.
+#[derive(Debug, Serialize)]
+pub struct RobotEnvelope<T: Serialize> {
+    pub _meta: RobotMeta,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub _alerts: Vec<RobotAlert>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub _actions: Vec<String>,
+    #[serde(flatten)]
+    pub data: T,
+}
+
+/// Infrastructure metadata attached to every robot response.
+#[derive(Debug, Serialize)]
+pub struct RobotMeta {
+    pub command: String,
+    pub timestamp: String,
+    pub format: String,
+    pub version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// An alert surfacing anomalies detected during data collection.
+#[derive(Debug, Serialize)]
+pub struct RobotAlert {
+    pub severity: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+// ── Envelope builder ─────────────────────────────────────────────────────────
+
+impl<T: Serialize> RobotEnvelope<T> {
+    /// Create a new envelope with the given command name, format, and data payload.
+    pub fn new(command: impl Into<String>, format: OutputFormat, data: T) -> Self {
+        Self {
+            _meta: RobotMeta {
+                command: command.into(),
+                timestamp: Utc::now().to_rfc3339(),
+                format: format.to_string(),
+                version: "1.0",
+                project: None,
+                agent: None,
+            },
+            _alerts: Vec::new(),
+            _actions: Vec::new(),
+            data,
+        }
+    }
+
+    /// Add an alert to the envelope.
+    pub fn with_alert(
+        mut self,
+        severity: impl Into<String>,
+        summary: impl Into<String>,
+        action: Option<String>,
+    ) -> Self {
+        self._alerts.push(RobotAlert {
+            severity: severity.into(),
+            summary: summary.into(),
+            action,
+        });
+        self
+    }
+
+    /// Add a suggested action command.
+    pub fn with_action(mut self, action: impl Into<String>) -> Self {
+        self._actions.push(action.into());
+        self
+    }
+}
+
+// ── Markdown trait ────────────────────────────────────────────────────────────
+
+/// Trait for data types that support custom markdown rendering.
+///
+/// Most robot commands use TOON/JSON. Only a few (thread, message, search)
+/// benefit from markdown. Types implementing this trait get custom markdown
+/// output instead of falling back to TOON.
+pub trait MarkdownRenderable {
+    fn to_markdown(&self, meta: &RobotMeta, alerts: &[RobotAlert], actions: &[String]) -> String;
+}
+
+// ── Format dispatcher ────────────────────────────────────────────────────────
+
+/// Serialize a `RobotEnvelope<T>` into the requested output format.
+pub fn format_output<T: Serialize>(
+    envelope: &RobotEnvelope<T>,
+    format: OutputFormat,
+) -> Result<String, CliError> {
+    match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(envelope).map_err(|e| CliError::Format(e.to_string()))
+        }
+        OutputFormat::Toon => {
+            let json_str =
+                serde_json::to_string(envelope).map_err(|e| CliError::Format(e.to_string()))?;
+            toon::json_to_toon(&json_str).map_err(|e| CliError::Format(e.to_string()))
+        }
+        OutputFormat::Markdown => {
+            // Markdown falls back to TOON for types that don't implement MarkdownRenderable.
+            // Commands that support markdown should call to_markdown() directly before
+            // reaching this generic path.
+            let json_str =
+                serde_json::to_string(envelope).map_err(|e| CliError::Format(e.to_string()))?;
+            toon::json_to_toon(&json_str).map_err(|e| CliError::Format(e.to_string()))
+        }
+    }
+}
+
+/// Format with markdown support for types that implement `MarkdownRenderable`.
+pub fn format_output_md<T: Serialize + MarkdownRenderable>(
+    envelope: &RobotEnvelope<T>,
+    format: OutputFormat,
+) -> Result<String, CliError> {
+    if format == OutputFormat::Markdown {
+        return Ok(envelope.data.to_markdown(
+            &envelope._meta,
+            &envelope._alerts,
+            &envelope._actions,
+        ));
+    }
+    format_output(envelope, format)
+}
+
+// ── Format auto-detection ────────────────────────────────────────────────────
+
+/// Whether a robot subcommand is prose-heavy (thread/message rendering).
+pub fn is_prose_command(subcmd: &str) -> bool {
+    matches!(subcmd, "thread" | "message")
+}
+
+/// Resolve the output format from an explicit flag or auto-detection.
+///
+/// Auto-detection logic:
+/// - Explicit `--format` flag → use that
+/// - Prose-heavy command (thread/message) → Markdown
+/// - stdout is a TTY → TOON (human at terminal)
+/// - stdout is piped → JSON (machine-readable)
+pub fn resolve_format(explicit: Option<OutputFormat>, subcmd: &str) -> OutputFormat {
+    if let Some(fmt) = explicit {
+        return fmt;
+    }
+    if is_prose_command(subcmd) {
+        return OutputFormat::Markdown;
+    }
+    resolve_format_for_terminal()
+}
+
+/// Resolve format based on terminal detection only (no command context).
+pub fn resolve_format_for_terminal() -> OutputFormat {
+    if std::io::stdout().is_terminal() {
+        OutputFormat::Toon
+    } else {
+        OutputFormat::Json
+    }
+}
+
+// ── Domain response types ────────────────────────────────────────────────────
+//
+// Flat, TOON-friendly structs returned by robot commands. Each derives Serialize
+// so it can be used as `RobotEnvelope<T>` data.
+
+/// robot status — dashboard synthesis.
+#[derive(Debug, Serialize)]
+pub struct StatusData {
+    pub health: String,
+    pub unread: usize,
+    pub urgent: usize,
+    pub ack_required: usize,
+    pub ack_overdue: usize,
+    pub active_reservations: usize,
+    pub reservations_expiring_soon: usize,
+    pub active_agents: usize,
+    pub recent_messages: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub my_reservations: Vec<ReservationEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top_threads: Vec<ThreadSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub anomalies: Vec<AnomalyCard>,
+}
+
+/// File reservation entry for status/reservation display.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub path: String,
+    pub exclusive: bool,
+    pub remaining_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<String>,
+}
+
+/// Summary entry for a thread (used in status and overview).
+#[derive(Debug, Serialize)]
+pub struct ThreadSummary {
+    pub id: String,
+    pub subject: String,
+    pub participants: usize,
+    pub messages: usize,
+    pub last_activity: String,
+}
+
+/// robot inbox — actionable inbox entry.
+#[derive(Debug, Serialize)]
+pub struct InboxEntry {
+    pub id: i64,
+    pub priority: String,
+    pub from: String,
+    pub subject: String,
+    pub thread: String,
+    pub age: String,
+    pub ack_status: String,
+    pub importance: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+}
+
+/// robot timeline — chronological event.
+#[derive(Debug, Serialize)]
+pub struct TimelineEvent {
+    pub seq: usize,
+    pub timestamp: String,
+    pub kind: String,
+    pub summary: String,
+    pub source: String,
+}
+
+/// robot overview — per-project summary.
+#[derive(Debug, Serialize)]
+pub struct OverviewProject {
+    pub slug: String,
+    pub unread: usize,
+    pub urgent: usize,
+    pub ack_overdue: usize,
+    pub reservations: usize,
+}
+
+/// robot thread — single message in thread rendering.
+#[derive(Debug, Serialize)]
+pub struct ThreadMessage {
+    pub position: usize,
+    pub from: String,
+    pub to: String,
+    pub age: String,
+    pub importance: String,
+    pub ack: String,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+impl MarkdownRenderable for Vec<ThreadMessage> {
+    fn to_markdown(&self, meta: &RobotMeta, _alerts: &[RobotAlert], _actions: &[String]) -> String {
+        let mut md = format!("# Thread: {}\n\n", meta.command);
+        for msg in self {
+            md.push_str(&format!(
+                "## [{pos}] {from} → {to} ({age})\n**{subject}**\n\n{body}\n\n---\n\n",
+                pos = msg.position,
+                from = msg.from,
+                to = msg.to,
+                age = msg.age,
+                subject = msg.subject,
+                body = msg.body.as_deref().unwrap_or(""),
+            ));
+        }
+        md
+    }
+}
+
+/// robot search — search result entry.
+#[derive(Debug, Serialize)]
+pub struct SearchResult {
+    pub id: i64,
+    pub relevance: f64,
+    pub from: String,
+    pub subject: String,
+    pub thread: String,
+    pub snippet: String,
+    pub age: String,
+}
+
+/// robot message — full message with context.
+#[derive(Debug, Serialize)]
+pub struct MessageContext {
+    pub id: i64,
+    pub from: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_program: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_model: Option<String>,
+    pub to: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub thread: String,
+    pub position: usize,
+    pub total_in_thread: usize,
+    pub importance: String,
+    pub ack_status: String,
+    pub created: String,
+    pub age: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentInfo>,
+}
+
+/// Attachment metadata for message context.
+#[derive(Debug, Serialize)]
+pub struct AttachmentInfo {
+    pub name: String,
+    pub size: String,
+    #[serde(rename = "type")]
+    pub mime_type: String,
+}
+
+impl MarkdownRenderable for MessageContext {
+    fn to_markdown(
+        &self,
+        _meta: &RobotMeta,
+        _alerts: &[RobotAlert],
+        _actions: &[String],
+    ) -> String {
+        let sender_info = match (&self.from_program, &self.from_model) {
+            (Some(p), Some(m)) => format!("{} ({p}, {m})", self.from),
+            _ => self.from.clone(),
+        };
+        let mut md = format!(
+            "## Message #{id} | Thread: {thread} ({pos} of {total})\n\n\
+             **From:** {sender}  \n\
+             **To:** {to}  \n\
+             **Subject:** {subject}  \n\
+             **Importance:** {importance} | **Ack:** {ack}  \n\
+             **Sent:** {created} ({age})\n\n---\n\n{body}\n",
+            id = self.id,
+            thread = self.thread,
+            pos = self.position,
+            total = self.total_in_thread,
+            sender = sender_info,
+            to = self.to.join(", "),
+            subject = self.subject,
+            importance = self.importance,
+            ack = self.ack_status,
+            created = self.created,
+            age = self.age,
+            body = self.body,
+        );
+
+        if !self.attachments.is_empty() {
+            md.push_str(&format!("\n**Attachments:** {}\n", self.attachments.len()));
+            for att in &self.attachments {
+                md.push_str(&format!("- {} ({}, {})\n", att.name, att.size, att.mime_type));
+            }
+        }
+
+        if let Some(prev) = &self.previous {
+            md.push_str(&format!("\n**\u{2190} Previous:** {prev}\n"));
+        }
+        if let Some(next) = &self.next {
+            md.push_str(&format!("**\u{2192} Next:** {next}\n"));
+        }
+        md
+    }
+}
+
+/// robot metrics — tool performance entry.
+#[derive(Debug, Serialize)]
+pub struct MetricEntry {
+    pub name: String,
+    pub calls: u64,
+    pub errors: u64,
+    pub error_pct: f64,
+    pub avg_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+}
+
+/// robot health — system probe entry.
+#[derive(Debug, Serialize)]
+pub struct HealthProbe {
+    pub name: String,
+    pub status: String,
+    pub latency_ms: f64,
+    pub detail: String,
+}
+
+/// robot analytics — anomaly insight.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnomalyCard {
+    pub severity: String,
+    pub confidence: f64,
+    pub category: String,
+    pub headline: String,
+    pub rationale: String,
+    pub remediation: String,
+}
+
+/// robot agents — agent roster entry.
+#[derive(Debug, Serialize)]
+pub struct AgentRow {
+    pub name: String,
+    pub program: String,
+    pub model: String,
+    pub last_active: String,
+    pub msg_count: usize,
+    pub status: String,
+}
+
+/// robot contacts — contact entry.
+#[derive(Debug, Serialize)]
+pub struct ContactRow {
+    pub from: String,
+    pub to: String,
+    pub status: String,
+    pub policy: String,
+    pub reason: String,
+    pub updated: String,
+}
+
+/// robot projects — project entry.
+#[derive(Debug, Serialize)]
+pub struct ProjectRow {
+    pub slug: String,
+    pub path: String,
+    pub agents: usize,
+    pub messages: usize,
+    pub reservations: usize,
+    pub created: String,
+}
+
+/// robot attachments — attachment entry.
+#[derive(Debug, Serialize)]
+pub struct AttachmentRow {
+    pub r#type: String,
+    pub size: usize,
+    pub sender: String,
+    pub subject: String,
+    pub message_id: i64,
+    pub project: String,
+}
+
+// ── Robot subcommand scaffold ────────────────────────────────────────────────
+
+/// Shared arguments for all `am robot` subcommands.
+#[derive(Debug, Args)]
+pub struct RobotArgs {
+    /// Output format: toon (default at TTY), json (default when piped), md (for thread/message).
+    #[arg(long, global = true, value_parser = parse_output_format)]
+    pub format: Option<OutputFormat>,
+
+    /// Project key (absolute path or slug). Auto-detected from CWD if omitted.
+    #[arg(long, global = true)]
+    pub project: Option<String>,
+
+    /// Agent name. Auto-detected from AGENT_NAME env var if omitted.
+    #[arg(long, global = true)]
+    pub agent: Option<String>,
+
+    #[command(subcommand)]
+    pub command: RobotSubcommand,
+}
+
+fn parse_output_format(s: &str) -> Result<OutputFormat, String> {
+    s.parse()
+}
+
+/// All `am robot` subcommands (16 commands across 4 tracks).
+#[derive(Debug, Subcommand)]
+pub enum RobotSubcommand {
+    // ── Track 2: Situational Awareness ──────────────────────────────────
+    /// Dashboard synthesis: health, inbox counts, activity, anomalies, reservations, top threads.
+    Status,
+
+    /// Actionable inbox with priority ordering, urgency/ack synthesis.
+    Inbox {
+        /// Show only urgent messages.
+        #[arg(long)]
+        urgent: bool,
+        /// Show only ack-overdue messages.
+        #[arg(long)]
+        ack_overdue: bool,
+        /// Show only unread messages.
+        #[arg(long)]
+        unread: bool,
+        /// Show all messages (no filtering).
+        #[arg(long)]
+        all: bool,
+        /// Maximum messages to return.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Include message bodies in output.
+        #[arg(long)]
+        include_bodies: bool,
+    },
+
+    /// Events since last check with temporal filters.
+    Timeline {
+        /// ISO-8601 timestamp — show events after this time.
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by event kind (message, reservation, agent).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by event source.
+        #[arg(long)]
+        source: Option<String>,
+    },
+
+    /// Cross-project unified summary (per-project unread/urgent/ack counts).
+    Overview,
+
+    // ── Track 3: Context & Discovery ────────────────────────────────────
+    /// Full conversation rendering for a thread.
+    Thread {
+        /// Thread ID.
+        id: String,
+        /// Maximum messages in thread.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Show messages after this timestamp.
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Full-text search with facets and relevance scores.
+    Search {
+        /// Search query.
+        query: String,
+        /// Filter by message kind.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by importance level.
+        #[arg(long)]
+        importance: Option<String>,
+        /// Limit results to messages after this timestamp.
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Single message with thread position, adjacent messages, sender info.
+    Message {
+        /// Message ID.
+        id: i64,
+    },
+
+    /// Resolve any resource:// URI and return in robot format.
+    Navigate {
+        /// Resource URI (e.g. resource://inbox/AgentName).
+        uri: String,
+    },
+
+    // ── Track 4: Monitoring & Analytics ─────────────────────────────────
+    /// File reservations with TTL warnings, expiring-soon alerts, conflict detection.
+    Reservations {
+        /// Filter by agent name.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Show all reservations (including expired).
+        #[arg(long)]
+        all: bool,
+        /// Show only conflicting reservations.
+        #[arg(long)]
+        conflicts: bool,
+        /// Warn about reservations expiring within N minutes.
+        #[arg(long)]
+        expiring: Option<u32>,
+    },
+
+    /// Tool performance summary (calls, errors, error%, latency percentiles).
+    Metrics,
+
+    /// System diagnostics synthesis (probes, DB pool, disk, anomalies).
+    Health,
+
+    /// Anomaly insights with severity, confidence, remediation commands.
+    Analytics,
+
+    // ── Track 5: Entity Views ───────────────────────────────────────────
+    /// Agent roster with activity status, program, model.
+    Agents {
+        /// Show only active agents.
+        #[arg(long)]
+        active: bool,
+        /// Sort by field (name, last_active, msg_count).
+        #[arg(long)]
+        sort: Option<String>,
+    },
+
+    /// Contact graph with policy surface, pending requests.
+    Contacts,
+
+    /// Project summary with per-project agent/message/reservation counts.
+    Projects,
+
+    /// Attachment inventory with type, size, provenance, storage mode.
+    Attachments,
+}
+
+impl RobotSubcommand {
+    /// Whether this command's output is prose-heavy (prefers Markdown by default).
+    #[must_use]
+    pub const fn is_prose(&self) -> bool {
+        matches!(self, Self::Thread { .. } | Self::Message { .. })
+    }
+
+    /// Name string for the subcommand (used in envelope `_meta.command`).
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Status => "robot status",
+            Self::Inbox { .. } => "robot inbox",
+            Self::Timeline { .. } => "robot timeline",
+            Self::Overview => "robot overview",
+            Self::Thread { .. } => "robot thread",
+            Self::Search { .. } => "robot search",
+            Self::Message { .. } => "robot message",
+            Self::Navigate { .. } => "robot navigate",
+            Self::Reservations { .. } => "robot reservations",
+            Self::Metrics => "robot metrics",
+            Self::Health => "robot health",
+            Self::Analytics => "robot analytics",
+            Self::Agents { .. } => "robot agents",
+            Self::Contacts => "robot contacts",
+            Self::Projects => "robot projects",
+            Self::Attachments => "robot attachments",
+        }
+    }
+}
+
+// ── DB helpers ──────────────────────────────────────────────────────────────
+
+use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
+
+/// Resolve a project by slug or human_key.
+fn resolve_project_sync(conn: &SqliteConnection, key: &str) -> Result<(i64, String), CliError> {
+    // Try slug first
+    let rows = conn
+        .query_sync(
+            "SELECT id, slug FROM projects WHERE slug = ?",
+            &[Value::Text(key.to_string())],
+        )
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+    if let Some(row) = rows.first() {
+        let id: i64 = row.get_named("id").unwrap_or(0);
+        let slug: String = row.get_named("slug").unwrap_or_default();
+        return Ok((id, slug));
+    }
+    // Try human_key
+    let rows = conn
+        .query_sync(
+            "SELECT id, slug FROM projects WHERE human_key = ?",
+            &[Value::Text(key.to_string())],
+        )
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+    if let Some(row) = rows.first() {
+        let id: i64 = row.get_named("id").unwrap_or(0);
+        let slug: String = row.get_named("slug").unwrap_or_default();
+        return Ok((id, slug));
+    }
+    Err(CliError::InvalidArgument(format!(
+        "project not found: {key}"
+    )))
+}
+
+/// Find the project for the current working directory.
+fn find_project_for_cwd(conn: &SqliteConnection) -> Result<(i64, String), CliError> {
+    let cwd =
+        std::env::current_dir().map_err(|e| CliError::Other(format!("cannot get CWD: {e}")))?;
+    let cwd_str = cwd.to_string_lossy().to_string();
+    resolve_project_sync(conn, &cwd_str)
+}
+
+/// Resolve project from --project flag or CWD.
+fn resolve_project(conn: &SqliteConnection, flag: Option<&str>) -> Result<(i64, String), CliError> {
+    if let Some(key) = flag {
+        resolve_project_sync(conn, key)
+    } else {
+        find_project_for_cwd(conn)
+    }
+}
+
+/// Resolve agent ID from --agent flag or AGENT_NAME env.
+fn resolve_agent_id(
+    conn: &SqliteConnection,
+    project_id: i64,
+    flag: Option<&str>,
+) -> Option<(i64, String)> {
+    let name = flag
+        .map(String::from)
+        .or_else(|| std::env::var("AGENT_NAME").ok())?;
+    let rows = conn
+        .query_sync(
+            "SELECT id, name FROM agents WHERE project_id = ? AND name = ?",
+            &[Value::BigInt(project_id), Value::Text(name)],
+        )
+        .ok()?;
+    let row = rows.first()?;
+    let id: i64 = row.get_named("id").unwrap_or(0);
+    let agent_name: String = row.get_named("name").unwrap_or_default();
+    Some((id, agent_name))
+}
+
+/// Format seconds into human-readable relative time.
+fn format_age(seconds: i64) -> String {
+    if seconds < 0 {
+        return "just now".to_string();
+    }
+    if seconds < 60 {
+        return format!("{seconds}s ago");
+    }
+    if seconds < 3600 {
+        return format!("{}m ago", seconds / 60);
+    }
+    if seconds < 86400 {
+        return format!("{}h ago", seconds / 3600);
+    }
+    format!("{}d ago", seconds / 86400)
+}
+
+// ── Status command implementation ───────────────────────────────────────────
+
+fn build_status(
+    conn: &SqliteConnection,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
+) -> Result<(StatusData, Vec<String>), CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let _now_s = now_us / 1_000_000;
+
+    // 1. Inbox counts (agent-specific, if resolved)
+    let (unread, urgent, ack_required, ack_overdue) = if let Some((agent_id, _)) = &agent {
+        let inbox_sql = "
+            SELECT
+                SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread,
+                SUM(CASE WHEN mr.read_ts IS NULL AND m.importance IN ('urgent','high') THEN 1 ELSE 0 END) AS urgent,
+                SUM(CASE WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_required,
+                SUM(CASE WHEN m.ack_required = 1 AND mr.ack_ts IS NULL
+                    AND m.created_ts < ? THEN 1 ELSE 0 END) AS ack_overdue
+            FROM message_recipients mr
+            JOIN messages m ON m.id = mr.message_id
+            WHERE mr.agent_id = ? AND m.project_id = ?
+        ";
+        // ack_overdue threshold: 30 minutes = 30*60*1_000_000 micros
+        let threshold = now_us - 30 * 60 * 1_000_000;
+        let rows = conn
+            .query_sync(
+                inbox_sql,
+                &[
+                    Value::BigInt(threshold),
+                    Value::BigInt(*agent_id),
+                    Value::BigInt(project_id),
+                ],
+            )
+            .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
+        if let Some(row) = rows.first() {
+            (
+                row.get_named::<i64>("unread").unwrap_or(0) as usize,
+                row.get_named::<i64>("urgent").unwrap_or(0) as usize,
+                row.get_named::<i64>("ack_required").unwrap_or(0) as usize,
+                row.get_named::<i64>("ack_overdue").unwrap_or(0) as usize,
+            )
+        } else {
+            (0, 0, 0, 0)
+        }
+    } else {
+        (0, 0, 0, 0)
+    };
+
+    // 2. Active agents (active in last 15 minutes)
+    let active_threshold = now_us - 15 * 60 * 1_000_000;
+    let active_agents = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = ? AND last_active_ts > ?",
+            &[Value::BigInt(project_id), Value::BigInt(active_threshold)],
+        )
+        .ok()
+        .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("cnt").ok()))
+        .unwrap_or(0) as usize;
+
+    // 3. Recent messages (last hour)
+    let hour_ago = now_us - 3600 * 1_000_000;
+    let recent_messages = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ? AND created_ts > ?",
+            &[Value::BigInt(project_id), Value::BigInt(hour_ago)],
+        )
+        .ok()
+        .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("cnt").ok()))
+        .unwrap_or(0) as usize;
+
+    // 4. File reservations (active = not released and not expired)
+    let active_reservations = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM file_reservations
+             WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ?",
+            &[Value::BigInt(project_id), Value::BigInt(now_us)],
+        )
+        .ok()
+        .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("cnt").ok()))
+        .unwrap_or(0) as usize;
+
+    // Reservations expiring soon (within 5 minutes)
+    let expiring_threshold = now_us + 5 * 60 * 1_000_000;
+    let reservations_expiring_soon = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM file_reservations
+             WHERE project_id = ? AND released_ts IS NULL
+             AND expires_ts > ? AND expires_ts < ?",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(now_us),
+                Value::BigInt(expiring_threshold),
+            ],
+        )
+        .ok()
+        .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("cnt").ok()))
+        .unwrap_or(0) as usize;
+
+    // 5. My reservations (agent-specific)
+    let my_reservations = if let Some((agent_id, _)) = &agent {
+        conn.query_sync(
+            "SELECT path_pattern, exclusive, expires_ts FROM file_reservations
+             WHERE project_id = ? AND agent_id = ? AND released_ts IS NULL AND expires_ts > ?
+             ORDER BY expires_ts ASC",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(*agent_id),
+                Value::BigInt(now_us),
+            ],
+        )
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+            ReservationEntry {
+                agent: None,
+                path: r.get_named("path_pattern").unwrap_or_default(),
+                exclusive: r.get_named::<i64>("exclusive").unwrap_or(1) != 0,
+                remaining_seconds: (expires - now_us) / 1_000_000,
+                remaining: None,
+                granted_at: None,
+            }
+        })
+        .collect()
+    } else {
+        vec![]
+    };
+
+    // 6. Top threads (3 most recently active)
+    let top_threads_rows = conn
+        .query_sync(
+            "SELECT thread_id,
+                    COUNT(*) AS msg_count,
+                    MAX(created_ts) AS last_ts,
+                    MIN(subject) AS subject
+             FROM messages
+             WHERE project_id = ? AND thread_id IS NOT NULL
+             GROUP BY thread_id
+             ORDER BY last_ts DESC
+             LIMIT 3",
+            &[Value::BigInt(project_id)],
+        )
+        .unwrap_or_default();
+
+    let top_threads: Vec<ThreadSummary> = top_threads_rows
+        .iter()
+        .map(|r| {
+            let thread_id: String = r.get_named("thread_id").unwrap_or_default();
+            let msg_count: i64 = r.get_named("msg_count").unwrap_or(0);
+            let last_ts: i64 = r.get_named("last_ts").unwrap_or(0);
+            let subject: String = r.get_named("subject").unwrap_or_default();
+            // Count distinct participants for this thread
+            let participants = conn
+                .query_sync(
+                    "SELECT COUNT(DISTINCT sender_id) AS cnt FROM messages
+                     WHERE project_id = ? AND thread_id = ?",
+                    &[Value::BigInt(project_id), Value::Text(thread_id.clone())],
+                )
+                .ok()
+                .and_then(|rows| rows.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+                .unwrap_or(1) as usize;
+            let age_seconds = (now_us - last_ts) / 1_000_000;
+            ThreadSummary {
+                id: thread_id,
+                subject,
+                participants,
+                messages: msg_count as usize,
+                last_activity: format_age(age_seconds),
+            }
+        })
+        .collect();
+
+    // 7. Build anomalies
+    let mut anomalies = Vec::new();
+    if ack_overdue > 0 {
+        anomalies.push(AnomalyCard {
+            severity: "warn".to_string(),
+            confidence: 1.0,
+            category: "ack_sla".to_string(),
+            headline: format!("{ack_overdue} message(s) pending ack > 30 minutes"),
+            rationale: "Messages with ack_required=true have been waiting beyond the 30-minute SLA threshold".to_string(),
+            remediation: "am robot inbox --ack-overdue".to_string(),
+        });
+    }
+    if reservations_expiring_soon > 0 {
+        anomalies.push(AnomalyCard {
+            severity: "warn".to_string(),
+            confidence: 1.0,
+            category: "reservation_expiry".to_string(),
+            headline: format!(
+                "{reservations_expiring_soon} reservation(s) expiring within 5 minutes"
+            ),
+            rationale: "File reservations are about to expire which may cause edit conflicts".to_string(),
+            remediation: "am robot reservations --expiring=5".to_string(),
+        });
+    }
+
+    // 8. Build suggested actions
+    let mut actions = Vec::new();
+    if urgent > 0 {
+        actions.push("am robot inbox --urgent".to_string());
+    }
+    if ack_overdue > 0 {
+        if let Some((_, ref name)) = agent {
+            actions.push(format!(
+                "am mail ack --project {project_slug} --agent {name}"
+            ));
+        }
+    }
+    if let Some(top) = top_threads.first() {
+        actions.push(format!("am robot thread {}", top.id));
+    }
+
+    let health = if anomalies.iter().any(|a| a.severity == "error") {
+        "error"
+    } else if anomalies.is_empty() {
+        "ok"
+    } else {
+        "degraded"
+    }
+    .to_string();
+
+    let data = StatusData {
+        health,
+        unread,
+        urgent,
+        ack_required,
+        ack_overdue,
+        active_reservations,
+        reservations_expiring_soon,
+        active_agents,
+        recent_messages,
+        my_reservations,
+        top_threads,
+        anomalies,
+    };
+
+    Ok((data, actions))
+}
+
+// ── Inbox command implementation ────────────────────────────────────────────
+
+/// Inbox result with entries and generated alerts/actions.
+struct InboxResult {
+    entries: Vec<InboxEntry>,
+    alerts: Vec<(String, String, Option<String>)>,
+    actions: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_inbox(
+    conn: &SqliteConnection,
+    project_id: i64,
+    project_slug: &str,
+    agent_id: i64,
+    agent_name: &str,
+    urgent_only: bool,
+    ack_overdue_only: bool,
+    unread_only: bool,
+    show_all: bool,
+    limit: usize,
+    include_bodies: bool,
+) -> Result<InboxResult, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    // ack_overdue threshold: 30 minutes
+    let ack_threshold = now_us - 30 * 60 * 1_000_000;
+
+    // Build WHERE filter based on flags
+    let bucket_filter = if ack_overdue_only {
+        "AND priority_bucket = 1"
+    } else if urgent_only {
+        "AND priority_bucket <= 2"
+    } else if show_all {
+        "" // no filter
+    } else if unread_only {
+        "AND priority_bucket <= 5"
+    } else {
+        "AND priority_bucket <= 5" // default: unread only
+    };
+
+    let sql = format!(
+        "SELECT sub.*, a_sender.name AS sender_name
+         FROM (
+             SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required,
+                    m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, m.body_md,
+                    CASE
+                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ? THEN 1
+                        WHEN m.importance IN ('urgent','high') AND mr.read_ts IS NULL THEN 2
+                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND mr.read_ts IS NULL THEN 3
+                        WHEN m.importance = 'high' AND mr.read_ts IS NULL THEN 4
+                        WHEN mr.read_ts IS NULL THEN 5
+                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 6
+                        ELSE 7
+                    END AS priority_bucket
+             FROM message_recipients mr
+             JOIN messages m ON m.id = mr.message_id
+             WHERE mr.agent_id = ? AND m.project_id = ?
+         ) sub
+         JOIN agents a_sender ON a_sender.id = sub.sender_id
+         WHERE 1=1 {bucket_filter}
+         ORDER BY sub.priority_bucket ASC, sub.created_ts DESC
+         LIMIT ?"
+    );
+
+    let rows = conn
+        .query_sync(
+            &sql,
+            &[
+                Value::BigInt(ack_threshold),
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+                Value::BigInt(limit as i64),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
+
+    let mut entries = Vec::new();
+    let mut overdue_ids = Vec::new();
+
+    for row in &rows {
+        let id: i64 = row.get_named("id").unwrap_or(0);
+        let bucket: i64 = row.get_named("priority_bucket").unwrap_or(7);
+        let sender: String = row.get_named("sender_name").unwrap_or_default();
+        let subject: String = row.get_named("subject").unwrap_or_default();
+        let thread_id: String = row.get_named("thread_id").unwrap_or_default();
+        let importance: String = row.get_named("importance").unwrap_or_default();
+        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+        let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
+        let ack_ts: Option<i64> = row.get_named("ack_ts").ok();
+        let read_ts: Option<i64> = row.get_named("read_ts").ok();
+
+        let priority_label = match bucket {
+            1 => "ack-overdue",
+            2 => "urgent",
+            3 => "ack-required",
+            4 => "high",
+            5 => "unread",
+            6 => "read-unacked",
+            _ => "read",
+        };
+
+        let ack_status = if ack_required == 0 {
+            "none".to_string()
+        } else if ack_ts.is_some() {
+            "acked".to_string()
+        } else if bucket == 1 {
+            "overdue".to_string()
+        } else if read_ts.is_some() {
+            "pending".to_string()
+        } else {
+            "required".to_string()
+        };
+
+        let age_seconds = (now_us - created_ts) / 1_000_000;
+
+        if bucket == 1 {
+            overdue_ids.push(id);
+        }
+
+        let body_md = if include_bodies {
+            row.get_named::<String>("body_md").ok()
+        } else {
+            None
+        };
+
+        entries.push(InboxEntry {
+            id,
+            priority: priority_label.to_string(),
+            from: sender,
+            subject,
+            thread: thread_id,
+            age: format_age(age_seconds),
+            ack_status,
+            importance,
+            body_md,
+        });
+    }
+
+    // Build alerts
+    let mut alerts = Vec::new();
+    if !overdue_ids.is_empty() {
+        let ids_str: Vec<String> = overdue_ids.iter().map(|id| format!("#{id}")).collect();
+        alerts.push((
+            "warn".to_string(),
+            format!(
+                "{} message(s) ack overdue (>30m): {}",
+                overdue_ids.len(),
+                ids_str.join(", ")
+            ),
+            Some(format!(
+                "am mail ack --project {project_slug} --agent {agent_name} {}",
+                overdue_ids[0]
+            )),
+        ));
+    }
+
+    // Build actions
+    let mut actions = Vec::new();
+    for &id in overdue_ids.iter().take(3) {
+        actions.push(format!(
+            "am mail ack --project {project_slug} --agent {agent_name} {id}"
+        ));
+    }
+    if let Some(entry) = entries.first() {
+        if !entry.thread.is_empty() {
+            actions.push(format!("am robot thread {}", entry.thread));
+        }
+    }
+
+    Ok(InboxResult {
+        entries,
+        alerts,
+        actions,
+    })
+}
+
+// ── Thread command implementation ───────────────────────────────────────────
+
+/// Thread rendering response data.
+#[derive(Debug, Serialize)]
+struct ThreadData {
+    thread_id: String,
+    subject: String,
+    message_count: usize,
+    participants: Vec<String>,
+    last_activity: String,
+    messages: Vec<ThreadMessage>,
+}
+
+impl MarkdownRenderable for ThreadData {
+    fn to_markdown(
+        &self,
+        _meta: &RobotMeta,
+        _alerts: &[RobotAlert],
+        _actions: &[String],
+    ) -> String {
+        let mut md = format!(
+            "## Thread: {} — {}\n**Messages**: {} | **Participants**: {} | **Last activity**: {}\n\n---\n\n",
+            self.thread_id,
+            self.subject,
+            self.message_count,
+            self.participants.join(", "),
+            self.last_activity,
+        );
+        for msg in &self.messages {
+            md.push_str(&format!(
+                "### [{pos}] {from} → {to} | {age} | importance: {imp} | ack: {ack}\n**Subject**: {subj}\n\n{body}\n\n---\n\n",
+                pos = msg.position,
+                from = msg.from,
+                to = msg.to,
+                age = msg.age,
+                imp = msg.importance,
+                ack = msg.ack,
+                subj = msg.subject,
+                body = msg.body.as_deref().unwrap_or("*(no body)*"),
+            ));
+        }
+        md
+    }
+}
+
+fn build_thread(
+    conn: &SqliteConnection,
+    project_id: i64,
+    thread_id: &str,
+    limit: Option<usize>,
+    since: Option<&str>,
+    include_bodies: bool,
+) -> Result<ThreadData, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+
+    let mut conditions = vec![
+        "m.thread_id = ?".to_string(),
+        "m.project_id = ?".to_string(),
+    ];
+    let mut params: Vec<Value> = vec![
+        Value::Text(thread_id.to_string()),
+        Value::BigInt(project_id),
+    ];
+
+    if let Some(since_str) = since {
+        let since_us = mcp_agent_mail_db::iso_to_micros(since_str).unwrap_or(0);
+        conditions.push("m.created_ts > ?".to_string());
+        params.push(Value::BigInt(since_us));
+    }
+
+    let limit_val = limit.unwrap_or(200);
+    params.push(Value::BigInt(limit_val as i64));
+
+    let where_clause = conditions.join(" AND ");
+    let sql = format!(
+        "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                m.sender_id, a_sender.name AS sender_name
+         FROM messages m
+         JOIN agents a_sender ON a_sender.id = m.sender_id
+         WHERE {where_clause}
+         ORDER BY m.created_ts ASC
+         LIMIT ?"
+    );
+
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|e| CliError::Other(format!("thread query failed: {e}")))?;
+
+    let mut messages = Vec::new();
+    let mut participants = Vec::new();
+    let mut last_ts: i64 = 0;
+    let mut thread_subject = String::new();
+
+    for (idx, row) in rows.iter().enumerate() {
+        let msg_id: i64 = row.get_named("id").unwrap_or(0);
+        let subject: String = row.get_named("subject").unwrap_or_default();
+        let body: String = row.get_named("body_md").unwrap_or_default();
+        let importance: String = row.get_named("importance").unwrap_or_default();
+        let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
+        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+        let sender: String = row.get_named("sender_name").unwrap_or_default();
+
+        if idx == 0 {
+            thread_subject.clone_from(&subject);
+        }
+        if created_ts > last_ts {
+            last_ts = created_ts;
+        }
+        if !participants.contains(&sender) {
+            participants.push(sender.clone());
+        }
+
+        // Get recipients for this message
+        let recipients = conn
+            .query_sync(
+                "SELECT a.name FROM message_recipients mr
+                 JOIN agents a ON a.id = mr.agent_id
+                 WHERE mr.message_id = ?",
+                &[Value::BigInt(msg_id)],
+            )
+            .unwrap_or_default();
+        let to_names: Vec<String> = recipients
+            .iter()
+            .filter_map(|r| r.get_named::<String>("name").ok())
+            .collect();
+
+        // Check ack status
+        let ack_status = if ack_required == 0 {
+            "none".to_string()
+        } else {
+            let acked = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS cnt FROM message_recipients
+                     WHERE message_id = ? AND ack_ts IS NOT NULL",
+                    &[Value::BigInt(msg_id)],
+                )
+                .ok()
+                .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+                .unwrap_or(0);
+            if acked > 0 {
+                "done".to_string()
+            } else {
+                "required".to_string()
+            }
+        };
+
+        let age_seconds = (now_us - created_ts) / 1_000_000;
+
+        messages.push(ThreadMessage {
+            position: idx + 1,
+            from: sender,
+            to: to_names.join(", "),
+            age: format_age(age_seconds),
+            importance,
+            ack: ack_status,
+            subject,
+            body: if include_bodies { Some(body) } else { None },
+        });
+    }
+
+    let last_activity = if last_ts > 0 {
+        format_age((now_us - last_ts) / 1_000_000)
+    } else {
+        "unknown".to_string()
+    };
+
+    Ok(ThreadData {
+        thread_id: thread_id.to_string(),
+        subject: thread_subject,
+        message_count: messages.len(),
+        participants,
+        last_activity,
+        messages,
+    })
+}
+
+// ── Message command implementation ──────────────────────────────────────────
+
+/// Truncate a string to `max_len` chars, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.min(s.len())])
+    }
+}
+
+fn build_message(
+    conn: &SqliteConnection,
+    project_id: i64,
+    message_id: i64,
+) -> Result<MessageContext, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+
+    // Fetch the message
+    let rows = conn
+        .query_sync(
+            "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required,
+                    m.created_ts, m.thread_id, m.attachments,
+                    a.name AS sender_name, a.program, a.model
+             FROM messages m
+             JOIN agents a ON a.id = m.sender_id
+             WHERE m.id = ? AND m.project_id = ?",
+            &[Value::BigInt(message_id), Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("message query failed: {e}")))?;
+
+    let row = rows.first().ok_or_else(|| {
+        CliError::InvalidArgument(format!("message #{message_id} not found"))
+    })?;
+
+    let subject: String = row.get_named("subject").unwrap_or_default();
+    let body: String = row.get_named("body_md").unwrap_or_default();
+    let importance: String = row.get_named("importance").unwrap_or_default();
+    let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
+    let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+    let thread_id: String = row.get_named("thread_id").unwrap_or_default();
+    let attachments_json: String = row.get_named("attachments").unwrap_or_default();
+    let sender_name: String = row.get_named("sender_name").unwrap_or_default();
+    let program: String = row.get_named("program").unwrap_or_default();
+    let model: String = row.get_named("model").unwrap_or_default();
+
+    // Recipients
+    let recipient_rows = conn
+        .query_sync(
+            "SELECT a.name FROM message_recipients mr
+             JOIN agents a ON a.id = mr.agent_id
+             WHERE mr.message_id = ?",
+            &[Value::BigInt(message_id)],
+        )
+        .unwrap_or_default();
+    let to: Vec<String> = recipient_rows
+        .iter()
+        .filter_map(|r| r.get_named::<String>("name").ok())
+        .collect();
+
+    // Ack status
+    let ack_status = if ack_required == 0 {
+        "none".to_string()
+    } else {
+        let acked_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM message_recipients
+                 WHERE message_id = ? AND ack_ts IS NOT NULL",
+                &[Value::BigInt(message_id)],
+            )
+            .ok()
+            .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+            .unwrap_or(0);
+        let total_recipients: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM message_recipients WHERE message_id = ?",
+                &[Value::BigInt(message_id)],
+            )
+            .ok()
+            .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+            .unwrap_or(0);
+        if acked_count >= total_recipients && total_recipients > 0 {
+            "done".to_string()
+        } else if acked_count > 0 {
+            format!("partial ({acked_count}/{total_recipients})")
+        } else {
+            "pending".to_string()
+        }
+    };
+
+    // Thread context
+    let (position, total_in_thread) = if !thread_id.is_empty() {
+        let total: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE thread_id = ? AND project_id = ?",
+                &[Value::Text(thread_id.clone()), Value::BigInt(project_id)],
+            )
+            .ok()
+            .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+            .unwrap_or(1);
+        let pos: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM messages
+                 WHERE thread_id = ? AND project_id = ? AND created_ts <= ?",
+                &[
+                    Value::Text(thread_id.clone()),
+                    Value::BigInt(project_id),
+                    Value::BigInt(created_ts),
+                ],
+            )
+            .ok()
+            .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+            .unwrap_or(1);
+        (pos as usize, total as usize)
+    } else {
+        (1, 1)
+    };
+
+    // Adjacent messages
+    let previous = if !thread_id.is_empty() {
+        conn.query_sync(
+            "SELECT m.id, a.name AS sender, m.subject FROM messages m
+             JOIN agents a ON a.id = m.sender_id
+             WHERE m.thread_id = ? AND m.project_id = ? AND m.created_ts < ?
+             ORDER BY m.created_ts DESC LIMIT 1",
+            &[
+                Value::Text(thread_id.clone()),
+                Value::BigInt(project_id),
+                Value::BigInt(created_ts),
+            ],
+        )
+        .ok()
+        .and_then(|r| {
+            r.first().map(|row| {
+                let pid: i64 = row.get_named("id").unwrap_or(0);
+                let pname: String = row.get_named("sender").unwrap_or_default();
+                let psubj: String = row.get_named("subject").unwrap_or_default();
+                format!("#{pid} {pname}: {}", truncate_str(&psubj, 60))
+            })
+        })
+    } else {
+        None
+    };
+
+    let next = if !thread_id.is_empty() {
+        conn.query_sync(
+            "SELECT m.id, a.name AS sender, m.subject FROM messages m
+             JOIN agents a ON a.id = m.sender_id
+             WHERE m.thread_id = ? AND m.project_id = ? AND m.created_ts > ?
+             ORDER BY m.created_ts ASC LIMIT 1",
+            &[
+                Value::Text(thread_id.clone()),
+                Value::BigInt(project_id),
+                Value::BigInt(created_ts),
+            ],
+        )
+        .ok()
+        .and_then(|r| {
+            r.first().map(|row| {
+                let nid: i64 = row.get_named("id").unwrap_or(0);
+                let nname: String = row.get_named("sender").unwrap_or_default();
+                let nsubj: String = row.get_named("subject").unwrap_or_default();
+                format!("#{nid} {nname}: {}", truncate_str(&nsubj, 60))
+            })
+        })
+    } else {
+        None
+    };
+
+    // Parse attachments JSON
+    let attachments: Vec<AttachmentInfo> = serde_json::from_str::<serde_json::Value>(&attachments_json)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    Some(AttachmentInfo {
+                        name: a.get("name")?.as_str()?.to_string(),
+                        size: a
+                            .get("size")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        mime_type: a
+                            .get("type")
+                            .or_else(|| a.get("content_type"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("application/octet-stream")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let age_seconds = (now_us - created_ts) / 1_000_000;
+    let created_iso = mcp_agent_mail_db::micros_to_iso(created_ts);
+
+    Ok(MessageContext {
+        id: message_id,
+        from: sender_name,
+        from_program: if program.is_empty() { None } else { Some(program) },
+        from_model: if model.is_empty() { None } else { Some(model) },
+        to,
+        subject,
+        body,
+        thread: thread_id,
+        position,
+        total_in_thread,
+        importance,
+        ack_status,
+        created: created_iso,
+        age: format_age(age_seconds),
+        previous,
+        next,
+        attachments,
+    })
+}
+
+// ── Search command implementation ───────────────────────────────────────────
+
+/// Facet count entry.
+#[derive(Debug, Serialize)]
+struct FacetEntry {
+    value: String,
+    count: usize,
+}
+
+/// Search result data with facets.
+#[derive(Debug, Serialize)]
+struct SearchData {
+    query: String,
+    total_results: usize,
+    results: Vec<SearchResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    by_thread: Vec<FacetEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    by_agent: Vec<FacetEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    by_importance: Vec<FacetEntry>,
+}
+
+fn build_search(
+    conn: &SqliteConnection,
+    project_id: i64,
+    query: &str,
+    importance_filter: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+) -> Result<SearchData, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+
+    // Sanitize the FTS query
+    let sanitized = match mcp_agent_mail_db::queries::sanitize_fts_query(query) {
+        Some(s) => s,
+        None => {
+            return Ok(SearchData {
+                query: query.to_string(),
+                total_results: 0,
+                results: vec![],
+                by_thread: vec![],
+                by_agent: vec![],
+                by_importance: vec![],
+            });
+        }
+    };
+    if sanitized.is_empty() {
+        return Ok(SearchData {
+            query: query.to_string(),
+            total_results: 0,
+            results: vec![],
+            by_thread: vec![],
+            by_agent: vec![],
+            by_importance: vec![],
+        });
+    }
+
+    // Build additional WHERE conditions
+    let mut extra_where = String::new();
+    let mut params: Vec<Value> = vec![
+        Value::Text(sanitized.clone()),
+        Value::BigInt(project_id),
+    ];
+
+    if let Some(imp) = importance_filter {
+        extra_where.push_str(" AND m.importance = ?");
+        params.push(Value::Text(imp.to_string()));
+    }
+    if let Some(since_str) = since {
+        let since_us = mcp_agent_mail_db::iso_to_micros(since_str).unwrap_or(0);
+        extra_where.push_str(" AND m.created_ts > ?");
+        params.push(Value::BigInt(since_us));
+    }
+    params.push(Value::BigInt(limit as i64));
+
+    let sql = format!(
+        "SELECT m.id, m.subject, m.thread_id, m.importance, m.created_ts,
+                a.name AS sender_name,
+                snippet(fts_messages, 1, '»', '«', '…', 20) AS snippet
+         FROM fts_messages
+         JOIN messages m ON fts_messages.rowid = m.id
+         JOIN agents a ON a.id = m.sender_id
+         WHERE fts_messages MATCH ? AND m.project_id = ?
+         {extra_where}
+         ORDER BY bm25(fts_messages)
+         LIMIT ?"
+    );
+
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|e| CliError::Other(format!("search query failed: {e}")))?;
+
+    // Build results and facets
+    let mut results = Vec::new();
+    let mut thread_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut agent_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut importance_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for row in &rows {
+        let msg_id: i64 = row.get_named("id").unwrap_or(0);
+        let subject: String = row.get_named("subject").unwrap_or_default();
+        let thread_id: String = row.get_named("thread_id").unwrap_or_default();
+        let importance: String = row.get_named("importance").unwrap_or_default();
+        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+        let sender: String = row.get_named("sender_name").unwrap_or_default();
+        let snippet: String = row.get_named("snippet").unwrap_or_default();
+
+        // Aggregate facets
+        if !thread_id.is_empty() {
+            *thread_counts.entry(thread_id.clone()).or_insert(0) += 1;
+        }
+        *agent_counts.entry(sender.clone()).or_insert(0) += 1;
+        *importance_counts.entry(importance.clone()).or_insert(0) += 1;
+
+        let age_seconds = (now_us - created_ts) / 1_000_000;
+        results.push(SearchResult {
+            id: msg_id,
+            relevance: 0.0, // bm25 returns negative scores; normalize later if needed
+            from: sender,
+            subject,
+            thread: thread_id,
+            snippet,
+            age: format_age(age_seconds),
+        });
+    }
+
+    // Sort facets by count descending
+    let mut by_thread: Vec<FacetEntry> = thread_counts
+        .into_iter()
+        .map(|(v, c)| FacetEntry { value: v, count: c })
+        .collect();
+    by_thread.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let mut by_agent: Vec<FacetEntry> = agent_counts
+        .into_iter()
+        .map(|(v, c)| FacetEntry { value: v, count: c })
+        .collect();
+    by_agent.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let mut by_importance: Vec<FacetEntry> = importance_counts
+        .into_iter()
+        .map(|(v, c)| FacetEntry { value: v, count: c })
+        .collect();
+    by_importance.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let total = results.len();
+    Ok(SearchData {
+        query: query.to_string(),
+        total_results: total,
+        results,
+        by_thread,
+        by_agent,
+        by_importance,
+    })
+}
+
+// ── Reservations command implementation ─────────────────────────────────────
+
+/// Conflict between two reservations.
+#[derive(Debug, Serialize)]
+struct ReservationConflict {
+    agent_a: String,
+    path_a: String,
+    agent_b: String,
+    path_b: String,
+}
+
+/// Full reservations response data.
+#[derive(Debug, Serialize)]
+struct ReservationsData {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    my_reservations: Vec<ReservationEntry>,
+    all_active: Vec<ReservationEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<ReservationConflict>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    expiring_soon: Vec<ReservationEntry>,
+}
+
+/// Format remaining seconds with warning markers.
+fn format_remaining(seconds: i64) -> String {
+    let base = format_age(seconds).replace(" ago", "");
+    if seconds < 120 {
+        format!("{base} \u{26a0}\u{26a0}")
+    } else if seconds < 600 {
+        format!("{base} \u{26a0}")
+    } else {
+        base
+    }
+}
+
+fn build_reservations(
+    conn: &SqliteConnection,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
+    show_all: bool,
+    conflicts_only: bool,
+    expiring_minutes: Option<u32>,
+) -> Result<(ReservationsData, Vec<String>), CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let expiring_threshold = now_us + i64::from(expiring_minutes.unwrap_or(10)) * 60 * 1_000_000;
+
+    // Fetch all active reservations
+    let all_rows = conn
+        .query_sync(
+            "SELECT fr.id, fr.path_pattern, fr.exclusive, fr.created_ts, fr.expires_ts,
+                    a.name AS agent_name, a.id AS agent_id
+             FROM file_reservations fr
+             JOIN agents a ON a.id = fr.agent_id
+             WHERE fr.project_id = ? AND fr.released_ts IS NULL AND fr.expires_ts > ?
+             ORDER BY fr.expires_ts ASC",
+            &[Value::BigInt(project_id), Value::BigInt(now_us)],
+        )
+        .map_err(|e| CliError::Other(format!("reservations query failed: {e}")))?;
+
+    let mut all_active = Vec::new();
+    let mut my_reservations = Vec::new();
+    let mut expiring_soon = Vec::new();
+
+    for row in &all_rows {
+        let path: String = row.get_named("path_pattern").unwrap_or_default();
+        let exclusive: bool = row.get_named::<i64>("exclusive").unwrap_or(1) != 0;
+        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+        let expires_ts: i64 = row.get_named("expires_ts").unwrap_or(0);
+        let agent_name: String = row.get_named("agent_name").unwrap_or_default();
+        let agent_id_row: i64 = row.get_named("agent_id").unwrap_or(0);
+
+        let remaining_seconds = (expires_ts - now_us) / 1_000_000;
+        let created_age = (now_us - created_ts) / 1_000_000;
+
+        let entry = ReservationEntry {
+            agent: Some(agent_name.clone()),
+            path: path.clone(),
+            exclusive,
+            remaining_seconds,
+            remaining: Some(format_remaining(remaining_seconds)),
+            granted_at: Some(format_age(created_age)),
+        };
+
+        all_active.push(entry.clone());
+
+        if let Some((my_id, _)) = &agent {
+            if agent_id_row == *my_id {
+                my_reservations.push(entry.clone());
+            }
+        }
+
+        if expires_ts < expiring_threshold {
+            expiring_soon.push(entry);
+        }
+    }
+
+    // Detect conflicts (exclusive reservations with overlapping paths from different agents)
+    let mut conflicts = Vec::new();
+    for (i, a) in all_active.iter().enumerate() {
+        if !a.exclusive {
+            continue;
+        }
+        for b in all_active.iter().skip(i + 1) {
+            if !b.exclusive {
+                continue;
+            }
+            if a.agent == b.agent {
+                continue;
+            }
+            // Check overlap using glob pattern matching
+            if glob_matches(&a.path, &b.path) || glob_matches(&b.path, &a.path) || a.path == b.path
+            {
+                conflicts.push(ReservationConflict {
+                    agent_a: a.agent.clone().unwrap_or_default(),
+                    path_a: a.path.clone(),
+                    agent_b: b.agent.clone().unwrap_or_default(),
+                    path_b: b.path.clone(),
+                });
+            }
+        }
+    }
+
+    // Build actions
+    let mut actions = Vec::new();
+    if let Some((_, ref agent_name)) = agent {
+        for entry in &expiring_soon {
+            if entry.agent.as_deref() == Some(agent_name.as_str()) {
+                actions.push(format!(
+                    "am file_reservations renew {project_slug} {agent_name} --paths {} --extend 3600",
+                    entry.path
+                ));
+            }
+        }
+    }
+
+    // Apply filters
+    if conflicts_only {
+        // Only keep entries involved in conflicts
+        let conflict_paths: std::collections::HashSet<String> = conflicts
+            .iter()
+            .flat_map(|c| vec![c.path_a.clone(), c.path_b.clone()])
+            .collect();
+        let filtered: Vec<_> = all_active
+            .into_iter()
+            .filter(|e| conflict_paths.contains(&e.path))
+            .collect();
+        return Ok((
+            ReservationsData {
+                my_reservations: vec![],
+                all_active: filtered,
+                conflicts,
+                expiring_soon: vec![],
+            },
+            actions,
+        ));
+    }
+
+    if !show_all && agent.is_some() {
+        // When not --all, only show my reservations in all_active
+        return Ok((
+            ReservationsData {
+                my_reservations: my_reservations.clone(),
+                all_active: my_reservations,
+                conflicts,
+                expiring_soon,
+            },
+            actions,
+        ));
+    }
+
+    Ok((
+        ReservationsData {
+            my_reservations,
+            all_active,
+            conflicts,
+            expiring_soon,
+        },
+        actions,
+    ))
+}
+
+/// Simple glob pattern overlap check.
+///
+/// Returns true if `pattern` could match `path` or they share a common prefix.
+/// Uses the same symmetric logic as the guard crate but without the `globset` dependency.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    // Exact match
+    if pattern == path {
+        return true;
+    }
+    // If pattern ends with /** or /*, check prefix containment
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path.starts_with(prefix);
+    }
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        // Must match exactly one level
+        return path.starts_with(prefix)
+            && path.len() > prefix.len()
+            && !path[prefix.len() + 1..].contains('/');
+    }
+    // If path is a pattern with wildcards, check reverse
+    if path.contains('*') {
+        if let Some(prefix) = path.strip_suffix("/**") {
+            return pattern.starts_with(prefix);
+        }
+    }
+    false
+}
+
+// ── Dispatch ────────────────────────────────────────────────────────────────
+
+/// Execute a robot subcommand and print formatted output.
+pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
+    let format = OutputFormat::resolve(args.format, args.command.is_prose());
+    let cmd_name = args.command.name();
+
+    let out = match args.command {
+        RobotSubcommand::Status => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let agent = resolve_agent_id(&conn, project_id, args.agent.as_deref());
+
+            let agent_name = agent.as_ref().map(|(_, n)| n.clone());
+            let (data, actions) = build_status(&conn, project_id, &project_slug, agent)?;
+            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            env._meta.project = Some(project_slug);
+            env._meta.agent = agent_name.clone();
+            if agent_name.is_none() {
+                env = env.with_alert(
+                    "info",
+                    "Agent not detected — inbox/reservation sections omitted. Use --agent to specify.",
+                    Some("am robot status --agent <NAME>".to_string()),
+                );
+            }
+            for a in actions {
+                env = env.with_action(&a);
+            }
+            // Collect alert data before mutating env (avoids borrow conflict)
+            let pending_alerts: Vec<(String, String, Option<String>)> = env
+                .data
+                .anomalies
+                .iter()
+                .filter(|a| a.severity == "warn")
+                .map(|anomaly| {
+                    let action_hint = match anomaly.category.as_str() {
+                        "ack_sla" => Some("am robot inbox --ack-overdue".to_string()),
+                        "reservation_expiry" => {
+                            Some("am robot reservations --expiring=5".to_string())
+                        }
+                        _ => None,
+                    };
+                    (
+                        anomaly.severity.clone(),
+                        anomaly.headline.clone(),
+                        action_hint,
+                    )
+                })
+                .collect();
+            if env._alerts.is_empty() && !pending_alerts.is_empty() {
+                for (severity, headline, action) in pending_alerts {
+                    env = env.with_alert(severity, headline, action);
+                }
+            }
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Inbox {
+            urgent,
+            ack_overdue,
+            unread,
+            all,
+            limit,
+            include_bodies,
+        } => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let (agent_id, agent_name_str) =
+                resolve_agent_id(&conn, project_id, args.agent.as_deref()).ok_or_else(|| {
+                    CliError::InvalidArgument(
+                        "agent required for inbox — use --agent or set AGENT_NAME".to_string(),
+                    )
+                })?;
+
+            let result = build_inbox(
+                &conn,
+                project_id,
+                &project_slug,
+                agent_id,
+                &agent_name_str,
+                urgent,
+                ack_overdue,
+                unread || (!urgent && !ack_overdue && !all),
+                all,
+                limit.unwrap_or(20),
+                include_bodies,
+            )?;
+
+            #[derive(Serialize)]
+            struct InboxData {
+                count: usize,
+                inbox: Vec<InboxEntry>,
+            }
+
+            let count = result.entries.len();
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                InboxData {
+                    count,
+                    inbox: result.entries,
+                },
+            );
+            env._meta.project = Some(project_slug);
+            env._meta.agent = Some(agent_name_str);
+            for (severity, headline, action) in result.alerts {
+                env = env.with_alert(severity, headline, action);
+            }
+            for a in result.actions {
+                env = env.with_action(&a);
+            }
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Thread { id, limit, since } => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+
+            // For thread command, bodies included in md/json, excluded in toon
+            let include_bodies = format != OutputFormat::Toon;
+            let data = build_thread(
+                &conn,
+                project_id,
+                &id,
+                limit,
+                since.as_deref(),
+                include_bodies,
+            )?;
+            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            env._meta.project = Some(project_slug);
+            format_output_md(&env, format)?
+        }
+        RobotSubcommand::Message { id } => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let data = build_message(&conn, project_id, id)?;
+            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            env._meta.project = Some(project_slug);
+            format_output_md(&env, format)?
+        }
+        RobotSubcommand::Search {
+            query,
+            kind: _,
+            importance,
+            since,
+        } => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let data = build_search(
+                &conn,
+                project_id,
+                &query,
+                importance.as_deref(),
+                since.as_deref(),
+                20,
+            )?;
+            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            env._meta.project = Some(project_slug);
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Reservations {
+            agent: agent_override,
+            all,
+            conflicts,
+            expiring,
+        } => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
+            let agent = resolve_agent_id(&conn, project_id, agent_flag);
+            let (data, actions) =
+                build_reservations(&conn, project_id, &project_slug, agent, all, conflicts, expiring)?;
+            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            env._meta.project = Some(project_slug);
+            for a in actions {
+                env = env.with_action(&a);
+            }
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Metrics => {
+            let snapshot = mcp_agent_mail_tools::tool_metrics_snapshot();
+
+            let total_calls: u64 = snapshot.iter().map(|e| e.calls).sum();
+            let total_errors: u64 = snapshot.iter().map(|e| e.errors).sum();
+            let error_rate = if total_calls > 0 {
+                (total_errors as f64 / total_calls as f64) * 100.0
+            } else {
+                0.0
+            };
+            let avg_latency = if !snapshot.is_empty() {
+                let sum: f64 = snapshot
+                    .iter()
+                    .filter_map(|e| e.latency.as_ref().map(|l| l.avg_ms * e.calls as f64))
+                    .sum();
+                if total_calls > 0 { sum / total_calls as f64 } else { 0.0 }
+            } else {
+                0.0
+            };
+
+            let tools: Vec<MetricEntry> = snapshot
+                .iter()
+                .map(|e| {
+                    let error_pct = if e.calls > 0 {
+                        (e.errors as f64 / e.calls as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    MetricEntry {
+                        name: e.name.clone(),
+                        calls: e.calls,
+                        errors: e.errors,
+                        error_pct,
+                        avg_ms: e.latency.as_ref().map_or(0.0, |l| l.avg_ms),
+                        p95_ms: e.latency.as_ref().map_or(0.0, |l| l.p95_ms),
+                        p99_ms: e.latency.as_ref().map_or(0.0, |l| l.p99_ms),
+                    }
+                })
+                .collect();
+
+            #[derive(Serialize)]
+            struct MetricsData {
+                total_calls: u64,
+                total_errors: u64,
+                error_rate_pct: f64,
+                avg_latency_ms: f64,
+                tools: Vec<MetricEntry>,
+            }
+
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                MetricsData {
+                    total_calls,
+                    total_errors,
+                    error_rate_pct: (error_rate * 100.0).round() / 100.0,
+                    avg_latency_ms: (avg_latency * 100.0).round() / 100.0,
+                    tools,
+                },
+            );
+
+            // Generate alerts for problematic tools
+            for e in &snapshot {
+                let error_pct = if e.calls > 0 {
+                    (e.errors as f64 / e.calls as f64) * 100.0
+                } else {
+                    0.0
+                };
+                if error_pct > 50.0 {
+                    env = env.with_alert(
+                        "error",
+                        &format!(
+                            "{} has {:.1}% error rate ({}/{})",
+                            e.name, error_pct, e.errors, e.calls
+                        ),
+                        None,
+                    );
+                } else if error_pct > 10.0 {
+                    env = env.with_alert(
+                        "warn",
+                        &format!(
+                            "{} has {:.1}% error rate ({}/{})",
+                            e.name, error_pct, e.errors, e.calls
+                        ),
+                        None,
+                    );
+                }
+                if let Some(lat) = &e.latency {
+                    if lat.avg_ms > 2000.0 {
+                        env = env.with_alert(
+                            "warn",
+                            &format!("{} avg latency {:.0}ms (>2s)", e.name, lat.avg_ms),
+                            None,
+                        );
+                    }
+                }
+            }
+            if error_rate > 5.0 {
+                env = env.with_alert(
+                    "error",
+                    &format!("Overall error rate {error_rate:.1}% (>{} threshold)", 5),
+                    None,
+                );
+            }
+
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Health => {
+            let mut probes: Vec<HealthProbe> = Vec::new();
+
+            // 1. DB connectivity probe
+            let db_start = std::time::Instant::now();
+            let db_ok = match crate::open_db_sync() {
+                Ok(conn) => {
+                    // Verify with a lightweight query
+                    match conn.query_sync("SELECT 1", &[]) {
+                        Ok(_) => true,
+                        Err(_) => false,
+                    }
+                }
+                Err(_) => false,
+            };
+            let db_ms = db_start.elapsed().as_secs_f64() * 1000.0;
+            probes.push(HealthProbe {
+                name: "db_connectivity".into(),
+                status: if db_ok { "ok" } else { "fail" }.into(),
+                latency_ms: (db_ms * 100.0).round() / 100.0,
+                detail: if db_ok {
+                    "SQLite connection healthy".into()
+                } else {
+                    "Cannot connect to database".into()
+                },
+            });
+
+            // 2. Circuit breaker status
+            let db_health = mcp_agent_mail_db::db_health_status();
+            let circuits_ok = db_health.circuit_state == "closed";
+            let circuit_detail = if circuits_ok {
+                "All circuits closed".to_string()
+            } else {
+                format!(
+                    "Circuit {} ({} failures)",
+                    db_health.circuit_state, db_health.circuit_failures
+                )
+            };
+            probes.push(HealthProbe {
+                name: "circuit_breakers".into(),
+                status: if circuits_ok { "ok" } else { "degraded" }.into(),
+                latency_ms: 0.0,
+                detail: circuit_detail,
+            });
+
+            // Per-subsystem circuit details
+            let mut circuit_entries: Vec<CircuitEntry> = Vec::new();
+            for c in &db_health.circuits {
+                circuit_entries.push(CircuitEntry {
+                    subsystem: c.subsystem.clone(),
+                    state: c.state.clone(),
+                    failures: c.failures,
+                    threshold: c.threshold,
+                });
+            }
+
+            // 3. Health level (backpressure)
+            let (health_level, signals) =
+                mcp_agent_mail_core::backpressure::compute_health_level_with_signals();
+            let health_str = format!("{health_level:?}").to_lowercase();
+            probes.push(HealthProbe {
+                name: "backpressure".into(),
+                status: health_str.clone(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "pool={}% wbq={}% commit={}%",
+                    signals.pool_utilization_pct,
+                    signals.wbq_depth_pct,
+                    signals.commit_depth_pct
+                ),
+            });
+
+            // 4. Integrity metrics
+            let integrity = mcp_agent_mail_db::integrity_metrics();
+            let integrity_ok = integrity.failures_total == 0;
+            let integrity_detail = if integrity.checks_total == 0 {
+                "No checks run yet".to_string()
+            } else if integrity_ok {
+                format!("{} checks, all passed", integrity.checks_total)
+            } else {
+                format!(
+                    "{} failures out of {} checks",
+                    integrity.failures_total, integrity.checks_total
+                )
+            };
+            probes.push(HealthProbe {
+                name: "integrity".into(),
+                status: if integrity_ok { "ok" } else { "warn" }.into(),
+                latency_ms: 0.0,
+                detail: integrity_detail,
+            });
+
+            // 5. Disk space probe
+            let config = mcp_agent_mail_core::Config::from_env();
+            let disk = mcp_agent_mail_core::disk::sample_disk(&config);
+            let disk_status = disk.pressure.label();
+            let free_mb = disk
+                .effective_free_bytes
+                .map(|b| b / (1024 * 1024))
+                .unwrap_or(0);
+            probes.push(HealthProbe {
+                name: "disk".into(),
+                status: disk_status.into(),
+                latency_ms: 0.0,
+                detail: format!("{free_mb} MB free"),
+            });
+
+            // Overall health
+            let overall = if !db_ok {
+                "unhealthy"
+            } else if !circuits_ok || disk.pressure != mcp_agent_mail_core::disk::DiskPressure::Ok {
+                "degraded"
+            } else {
+                "healthy"
+            };
+
+            #[derive(Serialize)]
+            struct HealthData {
+                overall: String,
+                health_level: String,
+                probes: Vec<HealthProbe>,
+                circuits: Vec<CircuitEntry>,
+            }
+
+            #[derive(Serialize)]
+            struct CircuitEntry {
+                subsystem: String,
+                state: String,
+                failures: u32,
+                threshold: u32,
+            }
+
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                HealthData {
+                    overall: overall.into(),
+                    health_level: health_str,
+                    probes,
+                    circuits: circuit_entries,
+                },
+            );
+
+            // Alerts
+            if !db_ok {
+                env = env.with_alert("error", "Database connectivity probe failed", None);
+            }
+            if !circuits_ok {
+                if let Some(rec) = &db_health.recommendation {
+                    env = env.with_alert("error", rec, None);
+                }
+            }
+            if !integrity_ok {
+                env = env.with_alert(
+                    "warn",
+                    &format!(
+                        "{} integrity check failures detected",
+                        integrity.failures_total
+                    ),
+                    None,
+                );
+            }
+            if disk.pressure == mcp_agent_mail_core::disk::DiskPressure::Critical
+                || disk.pressure == mcp_agent_mail_core::disk::DiskPressure::Fatal
+            {
+                env = env.with_alert(
+                    "error",
+                    &format!("Disk pressure: {} ({free_mb} MB free)", disk.pressure.label()),
+                    None,
+                );
+            } else if disk.pressure == mcp_agent_mail_core::disk::DiskPressure::Warning {
+                env = env.with_alert(
+                    "warn",
+                    &format!("Disk pressure: warning ({free_mb} MB free)"),
+                    None,
+                );
+            }
+
+            // Actions
+            if !db_ok {
+                env = env.with_action("Check DATABASE_URL env var and SQLite file accessibility");
+            }
+            if mcp_agent_mail_db::is_full_check_due(24) {
+                env = env.with_action("Run full integrity check (last check >24h ago)");
+            }
+
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Analytics => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let agent = resolve_agent_id(&conn, project_id, args.agent.as_deref());
+
+            let mut anomalies: Vec<AnomalyCard> = Vec::new();
+            let mut actions: Vec<String> = Vec::new();
+
+            // 1. Ack SLA violations
+            let ack_rows = conn
+                .query_sync(
+                    "SELECT m.id, m.subject, m.created_ts,
+                            (? - m.created_ts) / 1000000 AS age_secs
+                     FROM messages m
+                     JOIN message_recipients mr ON mr.message_id = m.id
+                     WHERE m.project_id = ? AND m.ack_required = 1
+                       AND mr.ack_ts IS NULL
+                       AND (? - m.created_ts) > 3600000000
+                     ORDER BY m.created_ts ASC
+                     LIMIT 10",
+                    &[
+                        Value::BigInt(mcp_agent_mail_db::now_micros()),
+                        Value::BigInt(project_id),
+                        Value::BigInt(mcp_agent_mail_db::now_micros()),
+                    ],
+                )
+                .unwrap_or_default();
+            if !ack_rows.is_empty() {
+                let count = ack_rows.len();
+                anomalies.push(AnomalyCard {
+                    severity: if count > 3 { "error" } else { "warn" }.into(),
+                    confidence: 0.95,
+                    category: "ack_sla".into(),
+                    headline: format!("{count} messages overdue for acknowledgement"),
+                    rationale: "Messages with ack_required=true have been pending >1 hour"
+                        .into(),
+                    remediation: "Run `am robot inbox --ack-overdue` to see details, then acknowledge".into(),
+                });
+                actions.push(format!(
+                    "am robot inbox --ack-overdue --project {project_slug}"
+                ));
+            }
+
+            // 2. Reservation expiry warnings
+            let now_us = mcp_agent_mail_db::now_micros();
+            let soon_us = now_us + 900_000_000; // 15 min
+            let expiring_rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) as cnt FROM file_reservations
+                     WHERE project_id = ? AND released_ts IS NULL
+                       AND expires_ts > ? AND expires_ts < ?",
+                    &[
+                        Value::BigInt(project_id),
+                        Value::BigInt(now_us),
+                        Value::BigInt(soon_us),
+                    ],
+                )
+                .unwrap_or_default();
+            let expiring_count: i64 = expiring_rows
+                .first()
+                .and_then(|r| r.get_named("cnt").ok())
+                .unwrap_or(0);
+            if expiring_count > 0 {
+                anomalies.push(AnomalyCard {
+                    severity: "warn".into(),
+                    confidence: 0.90,
+                    category: "reservation_expiry".into(),
+                    headline: format!(
+                        "{expiring_count} file reservation(s) expiring within 15 minutes"
+                    ),
+                    rationale: "Reservations nearing TTL may cause unprotected concurrent edits"
+                        .into(),
+                    remediation: "Renew with `am reservations renew` or release if done".into(),
+                });
+                actions.push(format!(
+                    "am robot reservations --expiring --project {project_slug}"
+                ));
+            }
+
+            // 3. Stale agents (registered but inactive >1 hour)
+            let stale_rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) as cnt FROM agents
+                     WHERE project_id = ? AND (? - last_active_ts) > 3600000000",
+                    &[
+                        Value::BigInt(project_id),
+                        Value::BigInt(now_us),
+                    ],
+                )
+                .unwrap_or_default();
+            let stale_count: i64 = stale_rows
+                .first()
+                .and_then(|r| r.get_named("cnt").ok())
+                .unwrap_or(0);
+            if stale_count > 0 {
+                anomalies.push(AnomalyCard {
+                    severity: "info".into(),
+                    confidence: 0.70,
+                    category: "stale_agents".into(),
+                    headline: format!("{stale_count} agent(s) inactive for >1 hour"),
+                    rationale: "Agents that stop polling may hold stale reservations".into(),
+                    remediation: "Check if agents are still running; force-release their reservations if not".into(),
+                });
+            }
+
+            // 4. High message volume (>100 messages in last hour)
+            let volume_rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) as cnt FROM messages
+                     WHERE project_id = ? AND created_ts > ?",
+                    &[
+                        Value::BigInt(project_id),
+                        Value::BigInt(now_us - 3_600_000_000),
+                    ],
+                )
+                .unwrap_or_default();
+            let volume: i64 = volume_rows
+                .first()
+                .and_then(|r| r.get_named("cnt").ok())
+                .unwrap_or(0);
+            if volume > 100 {
+                anomalies.push(AnomalyCard {
+                    severity: "info".into(),
+                    confidence: 0.80,
+                    category: "high_volume".into(),
+                    headline: format!("{volume} messages in the last hour"),
+                    rationale: "High message volume may indicate coordination overhead or loops"
+                        .into(),
+                    remediation: "Review thread activity for potential message storms".into(),
+                });
+            }
+
+            // 5. Agent-specific: unread count if agent is known
+            if let Some((aid, aname)) = &agent {
+                let unread_rows = conn
+                    .query_sync(
+                        "SELECT COUNT(*) as cnt FROM message_recipients mr
+                         JOIN messages m ON mr.message_id = m.id
+                         WHERE m.project_id = ? AND mr.recipient_agent_id = ?
+                           AND mr.read_ts IS NULL",
+                        &[Value::BigInt(project_id), Value::BigInt(*aid)],
+                    )
+                    .unwrap_or_default();
+                let unread: i64 = unread_rows
+                    .first()
+                    .and_then(|r| r.get_named("cnt").ok())
+                    .unwrap_or(0);
+                if unread > 20 {
+                    anomalies.push(AnomalyCard {
+                        severity: "warn".into(),
+                        confidence: 0.85,
+                        category: "inbox_backlog".into(),
+                        headline: format!("{aname} has {unread} unread messages"),
+                        rationale: "Large unread backlogs can cause missed coordination signals"
+                            .into(),
+                        remediation: format!(
+                            "Run `am robot inbox --unread --project {project_slug} --agent {aname}`"
+                        ),
+                    });
+                }
+            }
+
+            #[derive(Serialize)]
+            struct AnalyticsData {
+                anomaly_count: usize,
+                anomalies: Vec<AnomalyCard>,
+            }
+
+            let count = anomalies.len();
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                AnalyticsData {
+                    anomaly_count: count,
+                    anomalies,
+                },
+            );
+            env._meta.project = Some(project_slug);
+            if let Some((_, aname)) = &agent {
+                env._meta.agent = Some(aname.clone());
+            }
+
+            for a in actions {
+                env = env.with_action(&a);
+            }
+
+            if count == 0 {
+                env = env.with_action("No anomalies detected — system looks healthy");
+            }
+
+            format_output(&env, format)?
+        }
+        _ => {
+            #[derive(Serialize)]
+            struct Stub {
+                status: &'static str,
+                message: String,
+            }
+            let env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                Stub {
+                    status: "stub",
+                    message: format!("{cmd_name} is not yet implemented — see Tracks 2-5 beads"),
+                },
+            );
+            format_output(&env, format)?
+        }
+    };
+
+    println!("{out}");
+    Ok(())
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[derive(Debug, Serialize)]
+    struct TestData {
+        items: Vec<String>,
+        count: usize,
+    }
+
+    #[test]
+    fn test_output_format_display_and_parse() {
+        assert_eq!(OutputFormat::Toon.to_string(), "toon");
+        assert_eq!(OutputFormat::Json.to_string(), "json");
+        assert_eq!(OutputFormat::Markdown.to_string(), "markdown");
+
+        assert_eq!("toon".parse::<OutputFormat>().unwrap(), OutputFormat::Toon);
+        assert_eq!("JSON".parse::<OutputFormat>().unwrap(), OutputFormat::Json);
+        assert_eq!(
+            "md".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Markdown
+        );
+        assert_eq!(
+            "Markdown".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Markdown
+        );
+        assert!("xml".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn test_envelope_serialization_empty_alerts_actions() {
+        let envelope = RobotEnvelope::new(
+            "robot status",
+            OutputFormat::Json,
+            TestData {
+                items: vec!["a".into(), "b".into()],
+                count: 2,
+            },
+        );
+
+        let json_str = serde_json::to_string_pretty(&envelope).unwrap();
+        let v: Value = serde_json::from_str(&json_str).unwrap();
+
+        // _meta must be present
+        assert!(v.get("_meta").is_some());
+        let meta = &v["_meta"];
+        assert_eq!(meta["command"], "robot status");
+        assert_eq!(meta["format"], "json");
+        assert_eq!(meta["version"], "1.0");
+        assert!(meta["timestamp"].as_str().is_some());
+
+        // _alerts and _actions must be absent (empty → skipped)
+        assert!(v.get("_alerts").is_none());
+        assert!(v.get("_actions").is_none());
+
+        // data fields flattened to top level
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_envelope_with_alerts_and_actions() {
+        let envelope = RobotEnvelope::new(
+            "robot inbox",
+            OutputFormat::Toon,
+            TestData {
+                items: vec![],
+                count: 0,
+            },
+        )
+        .with_alert(
+            "warn",
+            "3 ack-overdue messages",
+            Some("am robot inbox --ack-overdue".into()),
+        )
+        .with_action("am acknowledge 42")
+        .with_action("am robot reservations --expiring=30");
+
+        let json_str = serde_json::to_string(&envelope).unwrap();
+        let v: Value = serde_json::from_str(&json_str).unwrap();
+
+        let alerts = v["_alerts"].as_array().unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0]["severity"], "warn");
+        assert_eq!(alerts[0]["summary"], "3 ack-overdue messages");
+        assert!(alerts[0]["action"].as_str().is_some());
+
+        let actions = v["_actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn test_format_output_json() {
+        let envelope = RobotEnvelope::new(
+            "test",
+            OutputFormat::Json,
+            TestData {
+                items: vec!["x".into()],
+                count: 1,
+            },
+        );
+        let out = format_output(&envelope, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["count"], 1);
+    }
+
+    #[test]
+    fn test_format_output_toon() {
+        let envelope = RobotEnvelope::new(
+            "test",
+            OutputFormat::Toon,
+            TestData {
+                items: vec!["hello".into()],
+                count: 1,
+            },
+        );
+        let out = format_output(&envelope, OutputFormat::Toon).unwrap();
+        // TOON output should be non-empty and different from JSON
+        assert!(!out.is_empty());
+        assert!(!out.starts_with('{'));
+    }
+
+    #[test]
+    fn test_format_output_markdown_fallback() {
+        let envelope = RobotEnvelope::new(
+            "test",
+            OutputFormat::Markdown,
+            TestData {
+                items: vec![],
+                count: 0,
+            },
+        );
+        // Without MarkdownRenderable, falls back to TOON
+        let out = format_output(&envelope, OutputFormat::Markdown).unwrap();
+        assert!(!out.is_empty());
+    }
+
+    #[derive(Debug, Serialize)]
+    struct MdData {
+        title: String,
+    }
+
+    impl MarkdownRenderable for MdData {
+        fn to_markdown(
+            &self,
+            meta: &RobotMeta,
+            _alerts: &[RobotAlert],
+            _actions: &[String],
+        ) -> String {
+            format!(
+                "# {}\n\n*Generated by {} at {}*",
+                self.title, meta.command, meta.timestamp
+            )
+        }
+    }
+
+    #[test]
+    fn test_format_output_md_with_trait() {
+        let envelope = RobotEnvelope::new(
+            "robot thread",
+            OutputFormat::Markdown,
+            MdData {
+                title: "Test Thread".into(),
+            },
+        );
+        let out = format_output_md(&envelope, OutputFormat::Markdown).unwrap();
+        assert!(out.starts_with("# Test Thread"));
+        assert!(out.contains("robot thread"));
+
+        // Non-markdown formats should still work through format_output
+        let json_out = format_output_md(&envelope, OutputFormat::Json).unwrap();
+        assert!(json_out.starts_with('{'));
+    }
+
+    #[test]
+    fn test_is_prose_command() {
+        assert!(is_prose_command("thread"));
+        assert!(is_prose_command("message"));
+        assert!(!is_prose_command("status"));
+        assert!(!is_prose_command("inbox"));
+        assert!(!is_prose_command("metrics"));
+    }
+
+    #[test]
+    fn test_resolve_format_explicit_overrides() {
+        assert_eq!(
+            resolve_format(Some(OutputFormat::Json), "thread"),
+            OutputFormat::Json
+        );
+        assert_eq!(
+            resolve_format(Some(OutputFormat::Toon), "message"),
+            OutputFormat::Toon
+        );
+        assert_eq!(
+            resolve_format(Some(OutputFormat::Markdown), "status"),
+            OutputFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn test_resolve_format_prose_default() {
+        // Without explicit format, prose commands default to Markdown
+        assert_eq!(resolve_format(None, "thread"), OutputFormat::Markdown);
+        assert_eq!(resolve_format(None, "message"), OutputFormat::Markdown);
+    }
+
+    #[test]
+    fn test_resolve_format_non_prose_auto() {
+        // Non-prose, non-TTY (test runner pipes stdout) → JSON
+        let fmt = resolve_format(None, "status");
+        // In test context, stdout is not a TTY → JSON
+        assert_eq!(fmt, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_domain_types_serialize_to_toon() {
+        // Verify all domain types can round-trip through JSON → TOON
+        let inbox = vec![InboxEntry {
+            id: 42,
+            priority: "high".into(),
+            from: "RedHarbor".into(),
+            subject: "Test".into(),
+            thread: "br-123".into(),
+            age: "5m".into(),
+            ack_status: "pending".into(),
+            importance: "urgent".into(),
+            body_md: None,
+        }];
+        let json = serde_json::to_string(&inbox).unwrap();
+        let toon_out = toon::json_to_toon(&json).unwrap();
+        assert!(!toon_out.is_empty());
+
+        let agents = vec![AgentRow {
+            name: "BlueLake".into(),
+            program: "claude-code".into(),
+            model: "opus-4.6".into(),
+            last_active: "2m ago".into(),
+            msg_count: 15,
+            status: "active".into(),
+        }];
+        let json = serde_json::to_string(&agents).unwrap();
+        let toon_out = toon::json_to_toon(&json).unwrap();
+        assert!(!toon_out.is_empty());
+
+        let metrics = vec![MetricEntry {
+            name: "send_message".into(),
+            calls: 100,
+            errors: 2,
+            error_pct: 2.0,
+            avg_ms: 12.5,
+            p95_ms: 25.0,
+            p99_ms: 50.0,
+        }];
+        let json = serde_json::to_string(&metrics).unwrap();
+        let toon_out = toon::json_to_toon(&json).unwrap();
+        assert!(!toon_out.is_empty());
+    }
+
+    #[test]
+    fn test_toon_token_savings() {
+        // Verify TOON produces fewer characters than JSON for tabular data
+        let rows: Vec<AgentRow> = (0..5)
+            .map(|i| AgentRow {
+                name: format!("Agent{i}"),
+                program: "claude-code".into(),
+                model: "opus-4.6".into(),
+                last_active: format!("{i}m ago"),
+                msg_count: i * 10,
+                status: "active".into(),
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&rows).unwrap();
+        let json_compact = serde_json::to_string(&rows).unwrap();
+        let toon_out = toon::json_to_toon(&json_compact).unwrap();
+
+        // TOON should be shorter than pretty JSON
+        assert!(
+            toon_out.len() < json.len(),
+            "TOON ({} bytes) should be shorter than JSON ({} bytes)",
+            toon_out.len(),
+            json.len()
+        );
+    }
+
+    #[test]
+    fn test_thread_message_markdown_rendering() {
+        let messages = vec![
+            ThreadMessage {
+                position: 1,
+                from: "RedHarbor".into(),
+                to: "BlueLake".into(),
+                age: "10m".into(),
+                importance: "normal".into(),
+                ack: "read".into(),
+                subject: "Plan review".into(),
+                body: Some("Looks good.".into()),
+            },
+            ThreadMessage {
+                position: 2,
+                from: "BlueLake".into(),
+                to: "RedHarbor".into(),
+                age: "5m".into(),
+                importance: "normal".into(),
+                ack: "pending".into(),
+                subject: "Re: Plan review".into(),
+                body: Some("Thanks!".into()),
+            },
+        ];
+
+        let envelope = RobotEnvelope::new("robot thread TKT-1", OutputFormat::Markdown, messages);
+        let md = format_output_md(&envelope, OutputFormat::Markdown).unwrap();
+        assert!(md.contains("RedHarbor"));
+        assert!(md.contains("BlueLake"));
+        assert!(md.contains("Looks good."));
+        assert!(md.contains("Thanks!"));
+    }
+
+    #[test]
+    fn test_message_context_markdown() {
+        let msg = MessageContext {
+            id: 42,
+            from: "GoldHawk".into(),
+            from_program: Some("claude-code".into()),
+            from_model: Some("opus-4.6".into()),
+            to: vec!["SilverCove".into(), "RedHarbor".into()],
+            subject: "Important update".into(),
+            body: "Here are the details...".into(),
+            thread: "TKT-5".into(),
+            position: 3,
+            total_in_thread: 7,
+            importance: "high".into(),
+            ack_status: "required".into(),
+            created: "2026-02-11T10:00:00Z".into(),
+            age: "2h ago".into(),
+            previous: Some("#41 RedHarbor: Previous message".into()),
+            next: None,
+            attachments: vec![],
+        };
+
+        let envelope = RobotEnvelope::new("robot message 42", OutputFormat::Markdown, msg);
+        let md = format_output_md(&envelope, OutputFormat::Markdown).unwrap();
+        assert!(md.contains("Important update"));
+        assert!(md.contains("GoldHawk"));
+        assert!(md.contains("claude-code"));
+        assert!(md.contains("SilverCove, RedHarbor"));
+        assert!(md.contains("3 of 7"));
+        assert!(md.contains("Here are the details..."));
+        assert!(md.contains("Previous"));
+    }
+
+    #[test]
+    fn test_inbox_entry_serialization_with_body() {
+        let entry = InboxEntry {
+            id: 100,
+            priority: "ack-overdue".into(),
+            from: "RedFox".into(),
+            subject: "Urgent review needed".into(),
+            thread: "AUTH-001".into(),
+            age: "35m ago".into(),
+            ack_status: "overdue".into(),
+            importance: "high".into(),
+            body_md: Some("Please review the auth changes".into()),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["id"], 100);
+        assert_eq!(json["priority"], "ack-overdue");
+        assert_eq!(json["body_md"], "Please review the auth changes");
+    }
+
+    #[test]
+    fn test_inbox_entry_serialization_without_body() {
+        let entry = InboxEntry {
+            id: 200,
+            priority: "unread".into(),
+            from: "BlueLake".into(),
+            subject: "FYI".into(),
+            thread: "".into(),
+            age: "1h ago".into(),
+            ack_status: "none".into(),
+            importance: "normal".into(),
+            body_md: None,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["id"], 200);
+        assert!(json.get("body_md").is_none(), "body_md should be omitted when None");
+    }
+
+    #[test]
+    fn test_inbox_envelope_format_toon() {
+        #[derive(Serialize)]
+        struct InboxData {
+            count: usize,
+            inbox: Vec<InboxEntry>,
+        }
+        let data = InboxData {
+            count: 2,
+            inbox: vec![
+                InboxEntry {
+                    id: 1,
+                    priority: "ack-overdue".into(),
+                    from: "RedFox".into(),
+                    subject: "Review auth".into(),
+                    thread: "AUTH-1".into(),
+                    age: "35m ago".into(),
+                    ack_status: "overdue".into(),
+                    importance: "high".into(),
+                    body_md: None,
+                },
+                InboxEntry {
+                    id: 2,
+                    priority: "urgent".into(),
+                    from: "BlueLake".into(),
+                    subject: "Blocking issue".into(),
+                    thread: "FEAT-1".into(),
+                    age: "10m ago".into(),
+                    ack_status: "required".into(),
+                    importance: "urgent".into(),
+                    body_md: None,
+                },
+            ],
+        };
+        let mut env = RobotEnvelope::new("robot inbox", OutputFormat::Toon, data);
+        env = env.with_alert("warn", "1 message ack overdue", Some("am mail ack 1".into()));
+        env = env.with_action("am mail ack 1");
+
+        // Verify TOON output
+        let toon_out = format_output(&env, OutputFormat::Toon).unwrap();
+        assert!(!toon_out.is_empty());
+
+        // Verify JSON output
+        let json_out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&json_out).unwrap();
+        assert_eq!(v["count"], 2);
+        let inbox_arr = v["inbox"].as_array().unwrap();
+        assert_eq!(inbox_arr.len(), 2);
+        assert_eq!(inbox_arr[0]["priority"], "ack-overdue");
+        assert_eq!(inbox_arr[1]["priority"], "urgent");
+        assert_eq!(v["_alerts"][0]["severity"], "warn");
+        assert_eq!(v["_actions"][0], "am mail ack 1");
+    }
+
+    #[test]
+    fn test_inbox_priority_ordering() {
+        // Verify priority labels map correctly
+        let labels = ["ack-overdue", "urgent", "ack-required", "high", "unread", "read-unacked", "read"];
+        for (i, expected) in labels.iter().enumerate() {
+            let bucket = (i + 1) as i64;
+            let label = match bucket {
+                1 => "ack-overdue",
+                2 => "urgent",
+                3 => "ack-required",
+                4 => "high",
+                5 => "unread",
+                6 => "read-unacked",
+                _ => "read",
+            };
+            assert_eq!(label, *expected, "bucket {bucket} should be {expected}");
+        }
+    }
+
+    #[test]
+    fn test_message_context_with_attachments() {
+        let msg = MessageContext {
+            id: 201,
+            from: "BlueLake".into(),
+            from_program: Some("claude-code".into()),
+            from_model: Some("opus-4.6".into()),
+            to: vec!["RedFox".into(), "GreenCastle".into()],
+            subject: "JWT implementation plan".into(),
+            body: "Planning JWT with JWKS rotation.".into(),
+            thread: "FEAT-123".into(),
+            position: 3,
+            total_in_thread: 8,
+            importance: "high".into(),
+            ack_status: "pending".into(),
+            created: "2026-02-11T08:30:00Z".into(),
+            age: "2h ago".into(),
+            previous: Some("#200 RedFox: I'll handle the middleware setup".into()),
+            next: Some("#202 RedFox: Sounds good, releasing reservations".into()),
+            attachments: vec![AttachmentInfo {
+                name: "api_spec.json".into(),
+                size: "8KB".into(),
+                mime_type: "application/json".into(),
+            }],
+        };
+
+        // Verify JSON serialization
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["id"], 201);
+        assert_eq!(json["from_program"], "claude-code");
+        assert_eq!(json["attachments"][0]["name"], "api_spec.json");
+        assert_eq!(json["previous"], "#200 RedFox: I'll handle the middleware setup");
+        assert_eq!(json["position"], 3);
+        assert_eq!(json["total_in_thread"], 8);
+
+        // Verify markdown rendering
+        let env = RobotEnvelope::new("robot message 201", OutputFormat::Markdown, msg);
+        let md = format_output_md(&env, OutputFormat::Markdown).unwrap();
+        assert!(md.contains("3 of 8"));
+        assert!(md.contains("claude-code"));
+        assert!(md.contains("api_spec.json"));
+        assert!(md.contains("Previous"));
+        assert!(md.contains("Next"));
+    }
+
+    #[test]
+    fn test_search_data_serialization() {
+        let data = SearchData {
+            query: "auth JWT".into(),
+            total_results: 2,
+            results: vec![
+                SearchResult {
+                    id: 201,
+                    relevance: 0.95,
+                    from: "BlueLake".into(),
+                    subject: "JWT plan".into(),
+                    thread: "FEAT-123".into(),
+                    snippet: "...JWT with JWKS rotation...".into(),
+                    age: "2h ago".into(),
+                },
+                SearchResult {
+                    id: 198,
+                    relevance: 0.87,
+                    from: "RedFox".into(),
+                    subject: "Auth review".into(),
+                    thread: "FEAT-123".into(),
+                    snippet: "...middleware chain for auth...".into(),
+                    age: "3h ago".into(),
+                },
+            ],
+            by_thread: vec![FacetEntry {
+                value: "FEAT-123".into(),
+                count: 2,
+            }],
+            by_agent: vec![
+                FacetEntry { value: "BlueLake".into(), count: 1 },
+                FacetEntry { value: "RedFox".into(), count: 1 },
+            ],
+            by_importance: vec![FacetEntry {
+                value: "high".into(),
+                count: 2,
+            }],
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["total_results"], 2);
+        assert_eq!(json["results"].as_array().unwrap().len(), 2);
+        assert_eq!(json["by_thread"][0]["value"], "FEAT-123");
+        assert_eq!(json["by_agent"].as_array().unwrap().len(), 2);
+
+        // TOON output
+        let env = RobotEnvelope::new("robot search", OutputFormat::Toon, data);
+        let toon = format_output(&env, OutputFormat::Toon).unwrap();
+        assert!(!toon.is_empty());
+    }
+
+    #[test]
+    fn test_reservations_data_with_conflicts() {
+        let data = ReservationsData {
+            my_reservations: vec![ReservationEntry {
+                agent: Some("BlueLake".into()),
+                path: "src/auth/**".into(),
+                exclusive: true,
+                remaining_seconds: 2400,
+                remaining: Some("40m".into()),
+                granted_at: Some("2h ago".into()),
+            }],
+            all_active: vec![
+                ReservationEntry {
+                    agent: Some("BlueLake".into()),
+                    path: "src/auth/**".into(),
+                    exclusive: true,
+                    remaining_seconds: 2400,
+                    remaining: Some("40m".into()),
+                    granted_at: Some("2h ago".into()),
+                },
+                ReservationEntry {
+                    agent: Some("RedFox".into()),
+                    path: "src/auth/jwt.rs".into(),
+                    exclusive: true,
+                    remaining_seconds: 300,
+                    remaining: Some("5m \u{26a0}".into()),
+                    granted_at: Some("55m ago".into()),
+                },
+            ],
+            conflicts: vec![ReservationConflict {
+                agent_a: "BlueLake".into(),
+                path_a: "src/auth/**".into(),
+                agent_b: "RedFox".into(),
+                path_b: "src/auth/jwt.rs".into(),
+            }],
+            expiring_soon: vec![ReservationEntry {
+                agent: Some("RedFox".into()),
+                path: "src/auth/jwt.rs".into(),
+                exclusive: true,
+                remaining_seconds: 300,
+                remaining: Some("5m \u{26a0}".into()),
+                granted_at: Some("55m ago".into()),
+            }],
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["all_active"].as_array().unwrap().len(), 2);
+        assert_eq!(json["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(json["conflicts"][0]["agent_a"], "BlueLake");
+        assert_eq!(json["expiring_soon"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_glob_matches() {
+        assert!(glob_matches("src/auth/**", "src/auth/jwt.rs"));
+        assert!(glob_matches("src/auth/**", "src/auth/sub/file.rs"));
+        assert!(!glob_matches("src/auth/**", "src/middleware/foo.rs"));
+        assert!(glob_matches("src/auth/*", "src/auth/jwt.rs"));
+        assert!(!glob_matches("src/auth/*", "src/auth/sub/file.rs"));
+        assert!(glob_matches("src/auth/jwt.rs", "src/auth/jwt.rs"));
+        assert!(!glob_matches("src/auth/jwt.rs", "src/auth/other.rs"));
+    }
+
+    #[test]
+    fn test_format_remaining_warnings() {
+        assert!(!format_remaining(700).contains('\u{26a0}'));
+        assert!(format_remaining(500).contains('\u{26a0}'));
+        assert!(!format_remaining(500).contains("\u{26a0}\u{26a0}"));
+        assert!(format_remaining(60).contains("\u{26a0}\u{26a0}"));
+    }
+
+    #[test]
+    fn test_truncate_str() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world this is long", 10), "hello worl...");
+    }
+}

@@ -4,14 +4,15 @@ use std::collections::HashMap;
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
-use ftui::widgets::StatefulWidget;
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
+use ftui::widgets::StatefulWidget;
+use ftui::widgets::Widget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
+use ftui_widgets::progress::ProgressBar;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
@@ -25,9 +26,6 @@ const COL_PROJECT: usize = 4;
 
 const SORT_LABELS: &[&str] = &["Agent", "Path", "Excl", "TTL", "Project"];
 
-/// TTL bar width in characters.
-const TTL_BAR_WIDTH: usize = 10;
-
 /// Tracked reservation state from events.
 #[derive(Debug, Clone)]
 struct ActiveReservation {
@@ -37,6 +35,14 @@ struct ActiveReservation {
     granted_ts: i64,
     ttl_s: u64,
     project: String,
+    released: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TtlOverlayRow {
+    ratio: f64,
+    label: String,
+    selected: bool,
     released: bool,
 }
 
@@ -51,7 +57,11 @@ impl ActiveReservation {
                 .saturating_mul(1_000_000),
         );
         let remaining = (expires_micros - now) / 1_000_000;
-        if remaining < 0 { 0 } else { remaining as u64 }
+        if remaining < 0 {
+            0
+        } else {
+            remaining as u64
+        }
     }
 
     /// Progress ratio (1.0 = full TTL remaining, 0.0 = expired).
@@ -179,7 +189,11 @@ impl ReservationsScreen {
                 COL_PROJECT => a.project.to_lowercase().cmp(&b.project.to_lowercase()),
                 _ => std::cmp::Ordering::Equal,
             };
-            if self.sort_asc { cmp } else { cmp.reverse() }
+            if self.sort_asc {
+                cmp
+            } else {
+                cmp.reverse()
+            }
         });
 
         self.sorted_keys = entries.iter().map(|(k, _)| (*k).clone()).collect();
@@ -315,6 +329,7 @@ impl MailScreen for ReservationsScreen {
         let header = Row::new(["Agent", "Path Pattern", "Excl", "TTL Remaining", "Project"])
             .style(Style::default().bold());
 
+        let mut ttl_overlay_rows: Vec<TtlOverlayRow> = Vec::new();
         let rows: Vec<Row> = self
             .sorted_keys
             .iter()
@@ -328,9 +343,14 @@ impl MailScreen for ReservationsScreen {
                 };
                 let remaining = res.remaining_secs();
                 let ratio = res.ttl_ratio();
-                let ttl_bar = render_ttl_bar(ratio, TTL_BAR_WIDTH);
                 let ttl_text = format_ttl(remaining);
-                let ttl_display = format!("{ttl_bar} {ttl_text}");
+
+                ttl_overlay_rows.push(TtlOverlayRow {
+                    ratio,
+                    label: ttl_text.clone(),
+                    selected: Some(i) == self.table_state.selected,
+                    released: res.released,
+                });
 
                 let style = if Some(i) == self.table_state.selected {
                     Style::default()
@@ -351,7 +371,7 @@ impl MailScreen for ReservationsScreen {
                         res.agent.clone(),
                         res.path_pattern.clone(),
                         excl_str.to_string(),
-                        ttl_display,
+                        ttl_text,
                         res.project.clone(),
                     ])
                     .style(style),
@@ -382,6 +402,7 @@ impl MailScreen for ReservationsScreen {
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);
+        render_ttl_overlays(frame, table_area, &ttl_overlay_rows);
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -429,27 +450,91 @@ impl MailScreen for ReservationsScreen {
     }
 }
 
-/// Render an inline TTL progress bar using Unicode block characters.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn render_ttl_bar(ratio: f64, width: usize) -> String {
-    if width == 0 {
-        return String::new();
+const fn compute_table_widths(total_width: u16) -> [u16; 5] {
+    let c0 = total_width.saturating_mul(18) / 100;
+    let c1 = total_width.saturating_mul(27) / 100;
+    let c2 = total_width.saturating_mul(8) / 100;
+    let c3 = total_width.saturating_mul(30) / 100;
+    let used = c0.saturating_add(c1).saturating_add(c2).saturating_add(c3);
+    let c4 = total_width.saturating_sub(used);
+    [c0, c1, c2, c3, c4]
+}
+
+fn ttl_fill_color(ratio: f64, released: bool) -> PackedRgba {
+    if released {
+        PackedRgba::rgb(90, 95, 110)
+    } else if ratio < 0.2 {
+        PackedRgba::rgb(255, 100, 100)
+    } else if ratio < 0.5 {
+        PackedRgba::rgb(220, 180, 50)
+    } else {
+        PackedRgba::rgb(80, 200, 80)
     }
-    let filled = (ratio * width as f64).round() as usize;
-    let filled = filled.min(width);
-    let empty = width - filled;
-    let mut out = String::with_capacity(width);
-    for _ in 0..filled {
-        out.push('\u{2588}'); // █
+}
+
+fn render_ttl_overlays(frame: &mut Frame<'_>, table_area: Rect, rows: &[TtlOverlayRow]) {
+    if rows.is_empty() || table_area.width < 8 || table_area.height < 4 {
+        return;
     }
-    for _ in 0..empty {
-        out.push('\u{2591}'); // ░
+
+    let inner = Rect::new(
+        table_area.x.saturating_add(1),
+        table_area.y.saturating_add(1),
+        table_area.width.saturating_sub(2),
+        table_area.height.saturating_sub(2),
+    );
+    if inner.width < 5 || inner.height < 2 {
+        return;
     }
-    out
+
+    let widths = compute_table_widths(inner.width);
+    let ttl_x = inner
+        .x
+        .saturating_add(widths[COL_AGENT])
+        .saturating_add(widths[COL_PATH])
+        .saturating_add(widths[COL_EXCLUSIVE]);
+    let ttl_width = widths[COL_TTL];
+    if ttl_width < 4 {
+        return;
+    }
+
+    let first_row_y = inner.y.saturating_add(1);
+    let max_visible = usize::from(inner.height.saturating_sub(1));
+    for (idx, row) in rows.iter().take(max_visible).enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let y = first_row_y.saturating_add(idx as u16);
+        if y >= inner.bottom() {
+            break;
+        }
+
+        let base_style = if row.selected {
+            Style::default()
+                .fg(PackedRgba::rgb(0, 0, 0))
+                .bg(PackedRgba::rgb(255, 184, 108))
+        } else if row.released {
+            Style::default()
+                .fg(PackedRgba::rgb(120, 124, 140))
+                .bg(PackedRgba::rgb(28, 30, 36))
+        } else {
+            Style::default()
+                .fg(PackedRgba::rgb(220, 220, 220))
+                .bg(PackedRgba::rgb(32, 34, 40))
+        };
+        let gauge_bg = if row.selected {
+            PackedRgba::rgb(255, 140, 60)
+        } else {
+            ttl_fill_color(row.ratio, row.released)
+        };
+
+        let mut gauge = ProgressBar::new()
+            .ratio(row.ratio)
+            .style(base_style)
+            .gauge_style(Style::default().bg(gauge_bg));
+        if ttl_width >= 12 {
+            gauge = gauge.label(&row.label);
+        }
+        gauge.render(Rect::new(ttl_x, y, ttl_width, 1), frame);
+    }
 }
 
 /// Format remaining seconds as a human-readable string.
@@ -610,24 +695,18 @@ mod tests {
     }
 
     #[test]
-    fn render_ttl_bar_values() {
-        let full = render_ttl_bar(1.0, 10);
-        assert_eq!(full.chars().count(), 10);
-        assert_eq!(full.chars().filter(|c| *c == '\u{2588}').count(), 10);
-
-        let empty = render_ttl_bar(0.0, 10);
-        assert_eq!(empty.chars().count(), 10);
-        assert_eq!(empty.chars().filter(|c| *c == '\u{2591}').count(), 10);
-
-        let half = render_ttl_bar(0.5, 10);
-        assert_eq!(half.chars().count(), 10);
-        let filled = half.chars().filter(|c| *c == '\u{2588}').count();
-        assert!((4..=6).contains(&filled));
+    fn table_widths_cover_full_inner_width() {
+        let widths = compute_table_widths(97);
+        assert_eq!(widths.iter().copied().sum::<u16>(), 97);
+        assert_eq!(widths[COL_TTL], 29);
     }
 
     #[test]
-    fn render_ttl_bar_zero_width() {
-        assert!(render_ttl_bar(0.5, 0).is_empty());
+    fn ttl_fill_color_thresholds() {
+        assert_eq!(ttl_fill_color(0.8, false), PackedRgba::rgb(80, 200, 80));
+        assert_eq!(ttl_fill_color(0.3, false), PackedRgba::rgb(220, 180, 50));
+        assert_eq!(ttl_fill_color(0.1, false), PackedRgba::rgb(255, 100, 100));
+        assert_eq!(ttl_fill_color(0.8, true), PackedRgba::rgb(90, 95, 110));
     }
 
     #[test]

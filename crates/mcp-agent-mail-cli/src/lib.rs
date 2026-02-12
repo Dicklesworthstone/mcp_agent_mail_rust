@@ -12,8 +12,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bench;
 pub mod context;
 pub mod output;
+pub mod robot;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::OsString;
@@ -43,6 +45,8 @@ pub enum CliError {
     Guard(#[from] mcp_agent_mail_guard::GuardError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("format error: {0}")]
+    Format(String),
     #[error("{0}")]
     Other(String),
 }
@@ -206,6 +210,15 @@ pub enum Commands {
         #[command(subcommand)]
         action: SetupCommand,
     },
+    /// Flake triage: scan artifacts, reproduce failures, detect flaky tests.
+    #[command(name = "flake-triage")]
+    FlakeTriage {
+        #[command(subcommand)]
+        action: FlakeTriageCommand,
+    },
+    /// Agent-optimized commands with TOON/JSON/Markdown output.
+    #[command(name = "robot")]
+    Robot(robot::RobotArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -384,6 +397,47 @@ pub enum SetupCommand {
         /// Override MCP base path (default: /mcp/).
         #[arg(long, default_value = "/mcp/")]
         path: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FlakeTriageCommand {
+    /// Scan for `failure_context.json` artifacts in a directory tree.
+    Scan {
+        /// Directory to scan (default: tests/artifacts).
+        #[arg(long, short = 'd')]
+        dir: Option<PathBuf>,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Reproduce a failure from its artifact file.
+    Reproduce {
+        /// Path to the `failure_context.json` artifact.
+        artifact: PathBuf,
+        /// Show full subprocess output.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+        /// Timeout in seconds (default: 120).
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// Run a test with multiple seeds to detect flakiness.
+    Detect {
+        /// Test name (passed to cargo test).
+        test_name: String,
+        /// Number of seeds to use (default: 17).
+        #[arg(long, short = 'n', default_value_t = 17)]
+        seeds: usize,
+        /// Packages to test (repeatable, default: core/server/db).
+        #[arg(long, short = 'p')]
+        packages: Vec<String>,
+        /// Timeout per seed in seconds (default: 60).
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -1407,6 +1461,8 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Contacts { action } => handle_contacts(action),
         Commands::Beads { action } => handle_beads(action),
         Commands::Setup { action } => handle_setup(action),
+        Commands::FlakeTriage { action } => handle_flake_triage(action),
+        Commands::Robot(args) => robot::handle_robot(args),
     }
 }
 
@@ -1659,6 +1715,7 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
                             share::deploy::CheckSeverity::Error => "FAIL",
                             share::deploy::CheckSeverity::Warning => "WARN",
                             share::deploy::CheckSeverity::Info => "INFO",
+                            share::deploy::CheckSeverity::Skipped => "SKIP",
                         }
                     };
                     ftui_runtime::ftui_println!("  [{icon}] {}: {}", check.name, check.message);
@@ -1745,6 +1802,7 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
                         share::deploy::CheckSeverity::Error => "REQUIRED",
                         share::deploy::CheckSeverity::Warning => "RECOMMENDED",
                         share::deploy::CheckSeverity::Info => "OPTIONAL",
+                        share::deploy::CheckSeverity::Skipped => "SKIPPED",
                     };
                     ftui_runtime::ftui_println!("  [{severity}] {}: {}", check.name, check.message);
                 }
@@ -2018,7 +2076,7 @@ fn open_db_sync_with_database_url(
     Ok(conn)
 }
 
-fn open_db_sync() -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
+pub(crate) fn open_db_sync() -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     open_db_sync_with_database_url(&cfg.database_url)
 }
@@ -2320,6 +2378,114 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                     }
                 }
                 table.render();
+            }
+            Ok(())
+        }
+    }
+}
+
+fn handle_flake_triage(action: FlakeTriageCommand) -> CliResult<()> {
+    use mcp_agent_mail_core::flake_triage;
+
+    match action {
+        FlakeTriageCommand::Scan { dir, json } => {
+            let scan_dir = dir.unwrap_or_else(|| PathBuf::from("tests/artifacts"));
+            let artifacts = flake_triage::scan_artifacts(&scan_dir);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&artifacts)
+                        .map_err(|e| CliError::Format(e.to_string()))?
+                );
+            } else if artifacts.is_empty() {
+                println!("No failure artifacts found in {}", scan_dir.display());
+            } else {
+                println!(
+                    "Found {} failure artifact(s) in {}:\n",
+                    artifacts.len(),
+                    scan_dir.display()
+                );
+                for (i, a) in artifacts.iter().enumerate() {
+                    println!(
+                        "  [{}] {} {} ({:?})",
+                        i + 1,
+                        &a.context.failure_ts[..19.min(a.context.failure_ts.len())],
+                        a.context.test_name,
+                        a.context.category
+                    );
+                    println!("      {}", a.path.display());
+                }
+            }
+            Ok(())
+        }
+        FlakeTriageCommand::Reproduce {
+            artifact,
+            verbose,
+            timeout,
+        } => {
+            let config = flake_triage::ReproductionConfig {
+                artifact_path: artifact,
+                verbose,
+                timeout: std::time::Duration::from_secs(timeout),
+            };
+            let result = flake_triage::reproduce_failure(&config)?;
+
+            println!("Test:       {}", result.test_name);
+            if let Some(seed) = result.seed {
+                println!("Seed:       {seed}");
+            }
+            println!("Reproduced: {}", result.reproduced);
+            println!("Exit code:  {}", result.exit_code);
+            println!("Elapsed:    {}ms", result.elapsed_ms);
+
+            if !result.stderr.is_empty() {
+                println!("\n--- stderr ---\n{}", result.stderr.trim());
+            }
+            if verbose && !result.stdout.is_empty() {
+                println!("\n--- stdout ---\n{}", result.stdout.trim());
+            }
+            Ok(())
+        }
+        FlakeTriageCommand::Detect {
+            test_name,
+            seeds,
+            packages,
+            timeout,
+            json,
+        } => {
+            let config = flake_triage::MultiSeedConfig {
+                test_name,
+                num_seeds: seeds,
+                packages: if packages.is_empty() {
+                    flake_triage::MultiSeedConfig::default().packages
+                } else {
+                    packages
+                },
+                timeout: std::time::Duration::from_secs(timeout),
+            };
+            let report = flake_triage::run_multi_seed_subprocess(&config);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| CliError::Format(e.to_string()))?
+                );
+            } else {
+                let total = report.runs.len();
+                let passed = report.runs.iter().filter(|r| r.passed).count();
+                let failed = total - passed;
+
+                println!("Results: {passed}/{total} passed, {failed}/{total} failed");
+                println!("Verdict: {:?}", report.verdict);
+
+                if !report.failing_seeds.is_empty() {
+                    println!("Failing seeds: {:?}", report.failing_seeds);
+                }
+                if !report.remediation.is_empty() {
+                    println!("Remediation: {}", report.remediation);
+                }
             }
             Ok(())
         }
@@ -8297,7 +8463,10 @@ sys.exit(7)
             db_path.display().to_string(),
         )
         .expect("open products test sqlite db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        // Use base schema (no FTS5/triggers) because this DB will be opened
+        // by FrankenConnection via the pool. FrankenConnection cannot read
+        // database files containing FTS5 shadow table pages.
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
 
         // Projects
@@ -8514,20 +8683,23 @@ sys.exit(7)
         let root = tempfile::tempdir().unwrap();
         let (db_path, proj_alpha_key, proj_beta_key, created_at_us) = seed_products_cli_db(&root);
 
-        let pool_cfg = mcp_agent_mail_db::DbPoolConfig {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            min_connections: 1,
-            max_connections: 1,
-            acquire_timeout_ms: 5_000,
-            max_lifetime_ms: 60_000,
-            run_migrations: true,
-            warmup_connections: 0,
+        let make_pool = || {
+            mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                acquire_timeout_ms: 5_000,
+                max_lifetime_ms: 60_000,
+                run_migrations: false, // skip migrations to isolate corruption
+                warmup_connections: 0,
+            })
+            .unwrap()
         };
-        let pool = mcp_agent_mail_db::DbPool::new(&pool_cfg).unwrap();
         let cx = asupersync::Cx::for_request();
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
 
         // Ensure (create)
+        let pool = make_pool();
         let (res, out) = run_products_cmd_capture(
             &runtime,
             &cx,
@@ -8544,18 +8716,26 @@ sys.exit(7)
         assert_eq!(ensure_json["name"].as_str(), Some("My Product"));
 
         // Normalize created_at for stable snapshots.
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
-            db_path.display().to_string(),
-        )
-        .unwrap();
-        conn.execute_sync(
-            "UPDATE products SET created_at = ? WHERE product_uid = ?",
-            &[
-                Value::BigInt(created_at_us),
-                Value::Text("abcdef1234".to_string()),
-            ],
-        )
-        .unwrap();
+        // Drop pool (closes FrankenConnection) before opening SqliteConnection:
+        // FrankenConnection and SqliteConnection must not be open simultaneously.
+        drop(pool);
+        {
+            let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+                db_path.display().to_string(),
+            )
+            .unwrap();
+            conn.execute_sync(
+                "UPDATE products SET created_at = ? WHERE product_uid = ?",
+                &[
+                    Value::BigInt(created_at_us),
+                    Value::Text("abcdef1234".to_string()),
+                ],
+            )
+            .unwrap();
+        }
+
+        // Re-create pool after SqliteConnection is dropped.
+        let pool = make_pool();
 
         // Ensure (existing) should now have deterministic created_at
         let (res, out) = run_products_cmd_capture(
@@ -15741,7 +15921,7 @@ async fn get_product_by_key(
         }
     };
 
-    let sql = "SELECT * FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
+    let sql = "SELECT id, product_uid, name, created_at FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
     let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
     let rows = conn
         .query_sync(sql, &params)

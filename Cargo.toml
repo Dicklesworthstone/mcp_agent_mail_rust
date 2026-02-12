@@ -11,6 +11,7 @@ members = [
   "crates/mcp-agent-mail-guard",
   "crates/mcp-agent-mail-share",
   "crates/mcp-agent-mail-conformance",
+  "crates/mcp-agent-mail-search-core",
 ]
 
 [workspace.package]
@@ -47,6 +48,7 @@ ftui-widgets = { path = "../frankentui/crates/ftui-widgets" }
 ftui-harness = { path = "../frankentui/crates/ftui-harness" }
 ftui-render = { path = "../frankentui/crates/ftui-render" }
 beads_rust = { path = "../beads_rust" }
+toon = { path = "../toon_rust" }
 
 # Agent detection (tokio-based upstream; declare optional in crates that use it)
 coding-agent-search = { path = "../coding_agent_session_search" }
@@ -61,6 +63,7 @@ mcp-agent-mail-cli = { path = "crates/mcp-agent-mail-cli" }
 mcp-agent-mail-guard = { path = "crates/mcp-agent-mail-guard" }
 mcp-agent-mail-share = { path = "crates/mcp-agent-mail-share" }
 mcp-agent-mail-conformance = { path = "crates/mcp-agent-mail-conformance" }
+mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 
 # Core ecosystem deps
 serde = { version = "1", features = ["derive"] }
@@ -90,6 +93,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
 fs2 = "0.4"
+tantivy = "0.25"
 indexmap = "2"
 smallvec = { version = "1", features = ["serde"] }
 

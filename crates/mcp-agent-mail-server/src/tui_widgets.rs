@@ -8,7 +8,7 @@
 //! - [`AnomalyCard`]: Compact anomaly alert card with severity/confidence badges
 //! - [`BrailleActivity`]: Braille-resolution activity sparkline chart
 //! - [`MetricTile`]: Compact metric display with inline sparkline
-//! - [`ReservationGauge`]: Reservation pressure gauge bar
+//! - [`ReservationGauge`]: Reservation pressure bar (ProgressBar-backed)
 //! - [`AgentHeatmap`]: Agent-to-agent communication frequency grid
 //!
 //! Cross-cutting concerns (br-3vwi.6.3):
@@ -21,12 +21,14 @@
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::Widget;
 use ftui::{Cell, Frame, PackedRgba, Style};
 use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_extras::charts::heatmap_gradient;
+use ftui_widgets::progress::ProgressBar;
+use ftui_widgets::sparkline::Sparkline;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // WidgetState — loading / empty / error / ready state envelope
@@ -413,7 +415,7 @@ pub struct PercentileSample {
 /// # Fallback
 ///
 /// At `Skeleton` or worse, nothing is rendered.
-/// At `NoStyling`, uses ASCII density chars instead of colored blocks.
+/// Other degradation tiers rely on native `Sparkline` behavior.
 #[derive(Debug, Clone)]
 pub struct PercentileRibbon<'a> {
     /// Time-series samples (left = oldest, right = newest).
@@ -490,9 +492,6 @@ impl<'a> PercentileRibbon<'a> {
 
 impl Widget for PercentileRibbon<'_> {
     fn render(&self, area: Rect, frame: &mut Frame) {
-        // Density chars for no-styling fallback (light to heavy).
-        const DENSITY: &[char] = &[' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2588}'];
-
         if area.is_empty() || self.samples.is_empty() {
             return;
         }
@@ -511,84 +510,84 @@ impl Widget for PercentileRibbon<'_> {
             return;
         }
 
-        // Optional label on the first row.
-        let (data_area, _label_row) = if let Some(lbl) = self.label {
-            if inner.height > 2 {
-                let label_y = inner.y;
-                for (i, ch) in lbl.chars().enumerate() {
+        // Optional title row.
+        let mut data_area = inner;
+        if let Some(lbl) = self.label {
+            for (i, ch) in lbl.chars().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let x = inner.x + i as u16;
+                if x >= inner.right() {
+                    break;
+                }
+                let mut cell = Cell::from_char(ch);
+                cell.fg = PackedRgba::rgb(180, 180, 180);
+                frame.buffer.set_fast(x, inner.y, cell);
+            }
+            if data_area.height > 1 {
+                data_area.y = data_area.y.saturating_add(1);
+                data_area.height = data_area.height.saturating_sub(1);
+            }
+        }
+
+        if data_area.width == 0 || data_area.height == 0 {
+            return;
+        }
+
+        let legend_width: u16 = if data_area.width >= 10 { 3 } else { 0 };
+        let spark_x = data_area.x.saturating_add(legend_width);
+        let spark_width = data_area.width.saturating_sub(legend_width);
+        if spark_width == 0 {
+            return;
+        }
+
+        let max_val = self.auto_max();
+        let trim_to_width = |values: Vec<f64>| -> Vec<f64> {
+            let width = spark_width as usize;
+            if values.len() <= width {
+                values
+            } else {
+                values[values.len() - width..].to_vec()
+            }
+        };
+
+        let p50 = trim_to_width(self.samples.iter().map(|s| s.p50).collect());
+        let p95 = trim_to_width(self.samples.iter().map(|s| s.p95).collect());
+        let p99 = trim_to_width(self.samples.iter().map(|s| s.p99).collect());
+
+        let top_y = data_area.y;
+        let bottom_y = data_area.bottom().saturating_sub(1);
+        let mid_y = data_area.y.saturating_add(data_area.height / 2);
+
+        let bands: [(&[f64], &str, PackedRgba, u16); 3] = [
+            (&p99, "99", self.color_p99, top_y),
+            (&p95, "95", self.color_p95, mid_y),
+            (&p50, "50", self.color_p50, bottom_y),
+        ];
+
+        let mut last_y: Option<u16> = None;
+        for (series, legend, color, y) in bands {
+            if Some(y) == last_y || y >= data_area.bottom() {
+                continue;
+            }
+            last_y = Some(y);
+
+            if legend_width > 0 {
+                for (idx, ch) in legend.chars().enumerate() {
                     #[allow(clippy::cast_possible_truncation)]
-                    let x = inner.x + i as u16;
-                    if x >= inner.right() {
+                    let x = data_area.x + idx as u16;
+                    if x >= spark_x {
                         break;
                     }
                     let mut cell = Cell::from_char(ch);
-                    cell.fg = PackedRgba::rgb(180, 180, 180);
-                    frame.buffer.set_fast(x, label_y, cell);
-                }
-                let r = Rect {
-                    x: inner.x,
-                    y: inner.y + 1,
-                    width: inner.width,
-                    height: inner.height - 1,
-                };
-                (r, true)
-            } else {
-                (inner, false)
-            }
-        } else {
-            (inner, false)
-        };
-
-        let max_val = self.auto_max();
-        let height = f64::from(data_area.height);
-        let no_styling =
-            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
-
-        // Render each column (one per sample, right-aligned to show most recent).
-        let width = data_area.width as usize;
-        let start_idx = self.samples.len().saturating_sub(width);
-
-        for (col_offset, sample) in self.samples[start_idx..].iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            let x = data_area.x + col_offset as u16;
-            if x >= data_area.right() {
-                break;
-            }
-
-            // Compute row thresholds (bottom = 0, top = max).
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let p50_rows = ((sample.p50 / max_val) * height).round() as u16;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let p95_rows = ((sample.p95 / max_val) * height).round() as u16;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let p99_rows = ((sample.p99 / max_val) * height).round() as u16;
-
-            // Render from bottom to top.
-            for row in 0..data_area.height {
-                let y = data_area.bottom().saturating_sub(1).saturating_sub(row);
-                if y < data_area.y {
-                    break;
-                }
-
-                let (color, density_idx) = if row < p50_rows {
-                    (self.color_p50, 4) // full block
-                } else if row < p95_rows {
-                    (self.color_p95, 3)
-                } else if row < p99_rows {
-                    (self.color_p99, 2)
-                } else {
-                    continue; // empty
-                };
-
-                if no_styling {
-                    let ch = DENSITY[density_idx.min(DENSITY.len() - 1)];
-                    frame.buffer.set_fast(x, y, Cell::from_char(ch));
-                } else {
-                    let mut cell = Cell::from_char(' ');
-                    cell.bg = color;
+                    cell.fg = color;
                     frame.buffer.set_fast(x, y, cell);
                 }
             }
+
+            Sparkline::new(series)
+                .bounds(0.0, max_val)
+                .style(Style::new().fg(color))
+                .render(Rect::new(spark_x, y, spark_width, 1), frame);
         }
     }
 }
@@ -1617,9 +1616,6 @@ impl Widget for ReservationGauge<'_> {
             return;
         }
 
-        let no_styling =
-            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
-
         // Line 1: label + count.
         let count_str = format!("{}/{}", self.current, self.capacity);
         let ttl_suffix = self
@@ -1646,27 +1642,19 @@ impl Widget for ReservationGauge<'_> {
             return;
         }
 
-        // Line 2: gauge bar.
-        let bar_width = inner.width as usize;
+        // Line 2: ProgressBar-backed gauge bar.
         let ratio = self.ratio();
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let filled = (ratio * bar_width as f64).round() as usize;
-        let empty = bar_width.saturating_sub(filled);
         let pct_str = format!("{:.0}%", ratio * 100.0);
-
-        if no_styling {
-            let bar = format!(
-                "{}{}  {pct_str}",
-                "\u{2588}".repeat(filled),
-                "\u{2591}".repeat(empty),
-            );
-            let truncated: String = bar.chars().take(bar_width).collect();
-            let line = Line::from_spans([Span::raw(truncated)]);
-            Paragraph::new(line).render(
+        ProgressBar::new()
+            .ratio(ratio)
+            .style(
+                Style::new()
+                    .bg(PackedRgba::rgb(40, 40, 40))
+                    .fg(PackedRgba::rgb(220, 220, 220)),
+            )
+            .gauge_style(Style::new().bg(self.bar_color()))
+            .label(&pct_str)
+            .render(
                 Rect {
                     x: inner.x,
                     y: inner.y + 1,
@@ -1675,34 +1663,6 @@ impl Widget for ReservationGauge<'_> {
                 },
                 frame,
             );
-        } else {
-            let color = self.bar_color();
-            let y = inner.y + 1;
-            for dx in 0..inner.width {
-                let x = inner.x + dx;
-                let bg = if (dx as usize) < filled {
-                    color
-                } else {
-                    PackedRgba::rgb(40, 40, 40)
-                };
-                let mut cell = Cell::from_char(' ');
-                cell.bg = bg;
-                frame.buffer.set_fast(x, y, cell);
-            }
-            // Overlay percentage text centered.
-            let pct_start = (bar_width.saturating_sub(pct_str.len())) / 2;
-            for (i, ch) in pct_str.chars().enumerate() {
-                #[allow(clippy::cast_possible_truncation)]
-                let x = inner.x + (pct_start + i) as u16;
-                if x < inner.right() {
-                    let existing_bg = frame.buffer.get(x, y).unwrap().bg;
-                    let mut cell = Cell::from_char(ch);
-                    cell.bg = existing_bg;
-                    cell.fg = contrast_text(existing_bg);
-                    frame.buffer.set_fast(x, y, cell);
-                }
-            }
-        }
     }
 }
 
@@ -2138,8 +2098,8 @@ impl AnimationBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ftui::GraphemePool;
     use ftui::layout::Rect;
+    use ftui::GraphemePool;
 
     fn render_widget(widget: &impl Widget, width: u16, height: u16) -> String {
         let mut pool = GraphemePool::new();
@@ -2257,12 +2217,11 @@ mod tests {
             p99: 30.0,
         }];
         let widget = PercentileRibbon::new(&samples);
-        let mut pool = GraphemePool::new();
-        let mut frame = Frame::new(20, 10, &mut pool);
-        widget.render(Rect::new(0, 0, 20, 10), &mut frame);
-        // Bottom rows should have colored background (p50 band).
-        let bottom_cell = frame.buffer.get(0, 9).unwrap();
-        assert_ne!(bottom_cell.bg, PackedRgba::TRANSPARENT);
+        let out = render_widget(&widget, 20, 10);
+        assert!(
+            out.chars().any(|ch| "▁▂▃▄▅▆▇█".contains(ch)),
+            "should render native sparkline glyphs"
+        );
     }
 
     #[test]

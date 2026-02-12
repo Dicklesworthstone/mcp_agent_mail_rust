@@ -162,7 +162,7 @@ fn seed_cli_json_db(db_path: &Path, root: &Path) -> (String, String) {
 
     let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
-    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .expect("init schema");
 
     // Projects
@@ -361,7 +361,7 @@ fn seed_cli_json_db_product_only(db_path: &Path) -> String {
 
     let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
-    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .expect("init schema");
 
     conn.execute_sync(
@@ -389,7 +389,7 @@ fn seed_cli_acks_db(db_path: &Path, root: &Path) -> (String, String, i64) {
 
     let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
-    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .expect("init schema");
 
     conn.execute_sync(
