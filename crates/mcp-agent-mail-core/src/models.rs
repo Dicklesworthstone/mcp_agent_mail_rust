@@ -607,4 +607,264 @@ mod tests {
         assert_eq!(sanitize_agent_name("$$$"), None);
         assert_eq!(sanitize_agent_name(""), None);
     }
+
+    // =========================================================================
+    // br-3h13.1.1: Serialize/deserialize roundtrip tests for all model structs
+    // =========================================================================
+
+    #[test]
+    fn test_project_serde_roundtrip() {
+        let p = Project {
+            id: Some(42),
+            slug: "my-project".into(),
+            human_key: "/data/projects/my-project".into(),
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(p.id, p2.id);
+        assert_eq!(p.slug, p2.slug);
+        assert_eq!(p.human_key, p2.human_key);
+        assert_eq!(p.created_at, p2.created_at);
+    }
+
+    #[test]
+    fn test_product_serde_roundtrip() {
+        let p = Product {
+            id: Some(1),
+            product_uid: "prod-abc".into(),
+            name: "My Product".into(),
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: Product = serde_json::from_str(&json).unwrap();
+        assert_eq!(p.id, p2.id);
+        assert_eq!(p.product_uid, p2.product_uid);
+        assert_eq!(p.name, p2.name);
+    }
+
+    #[test]
+    fn test_product_project_link_serde_roundtrip() {
+        let link = ProductProjectLink {
+            id: Some(5),
+            product_id: 1,
+            project_id: 2,
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+        let json = serde_json::to_string(&link).unwrap();
+        let link2: ProductProjectLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(link.product_id, link2.product_id);
+        assert_eq!(link.project_id, link2.project_id);
+    }
+
+    #[test]
+    fn test_agent_serde_roundtrip() {
+        let a = Agent {
+            id: Some(10),
+            project_id: 1,
+            name: "GreenLake".into(),
+            program: "claude-code".into(),
+            model: "opus-4.6".into(),
+            task_description: "Testing serde".into(),
+            attachments_policy: "inline".into(),
+            contact_policy: "contacts_only".into(),
+            ..Agent::default()
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let a2: Agent = serde_json::from_str(&json).unwrap();
+        assert_eq!(a.name, a2.name);
+        assert_eq!(a.program, a2.program);
+        assert_eq!(a.model, a2.model);
+        assert_eq!(a.task_description, a2.task_description);
+        assert_eq!(a.attachments_policy, a2.attachments_policy);
+        assert_eq!(a.contact_policy, a2.contact_policy);
+    }
+
+    #[test]
+    fn test_agent_default_values() {
+        let a = Agent::default();
+        assert_eq!(a.attachments_policy, "auto");
+        assert_eq!(a.contact_policy, "auto");
+        assert!(a.id.is_none());
+        assert_eq!(a.project_id, 0);
+    }
+
+    #[test]
+    fn test_message_serde_roundtrip() {
+        let m = Message {
+            id: Some(100),
+            project_id: 1,
+            sender_id: 2,
+            thread_id: Some("FEAT-42".into()),
+            subject: "Hello world".into(),
+            body_md: "## Title\n\nBody text.".into(),
+            importance: "high".into(),
+            ack_required: true,
+            attachments: "[{\"name\":\"file.txt\"}]".into(),
+            ..Message::default()
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let m2: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(m.id, m2.id);
+        assert_eq!(m.thread_id, m2.thread_id);
+        assert_eq!(m.subject, m2.subject);
+        assert_eq!(m.body_md, m2.body_md);
+        assert_eq!(m.importance, m2.importance);
+        assert_eq!(m.ack_required, m2.ack_required);
+        assert_eq!(m.attachments, m2.attachments);
+    }
+
+    #[test]
+    fn test_message_default_values() {
+        let m = Message::default();
+        assert!(m.id.is_none());
+        assert_eq!(m.importance, "normal");
+        assert!(!m.ack_required);
+        assert!(m.thread_id.is_none());
+        assert_eq!(m.attachments, "[]");
+    }
+
+    #[test]
+    fn test_message_recipient_serde_roundtrip() {
+        let r = MessageRecipient {
+            message_id: 1,
+            agent_id: 2,
+            kind: "cc".into(),
+            read_ts: Some(chrono::Utc::now().naive_utc()),
+            ack_ts: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let r2: MessageRecipient = serde_json::from_str(&json).unwrap();
+        assert_eq!(r.kind, r2.kind);
+        assert!(r2.read_ts.is_some());
+        assert!(r2.ack_ts.is_none());
+    }
+
+    #[test]
+    fn test_message_recipient_default_values() {
+        let r = MessageRecipient::default();
+        assert_eq!(r.kind, "to");
+        assert!(r.read_ts.is_none());
+        assert!(r.ack_ts.is_none());
+    }
+
+    #[test]
+    fn test_file_reservation_serde_roundtrip() {
+        let f = FileReservation {
+            id: Some(7),
+            project_id: 1,
+            agent_id: 3,
+            path_pattern: "src/**/*.rs".into(),
+            exclusive: true,
+            reason: "editing source".into(),
+            released_ts: None,
+            ..FileReservation::default()
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let f2: FileReservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(f.path_pattern, f2.path_pattern);
+        assert_eq!(f.exclusive, f2.exclusive);
+        assert_eq!(f.reason, f2.reason);
+        assert!(f2.released_ts.is_none());
+    }
+
+    #[test]
+    fn test_file_reservation_default_values() {
+        let f = FileReservation::default();
+        assert!(f.exclusive);
+        assert!(f.released_ts.is_none());
+    }
+
+    #[test]
+    fn test_agent_link_serde_roundtrip() {
+        let link = AgentLink {
+            id: Some(3),
+            a_project_id: 1,
+            a_agent_id: 10,
+            b_project_id: 2,
+            b_agent_id: 20,
+            status: "approved".into(),
+            reason: "collaboration".into(),
+            expires_ts: Some(chrono::Utc::now().naive_utc()),
+            ..AgentLink::default()
+        };
+        let json = serde_json::to_string(&link).unwrap();
+        let link2: AgentLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(link.status, link2.status);
+        assert_eq!(link.reason, link2.reason);
+        assert!(link2.expires_ts.is_some());
+    }
+
+    #[test]
+    fn test_agent_link_default_values() {
+        let link = AgentLink::default();
+        assert_eq!(link.status, "pending");
+        assert!(link.expires_ts.is_none());
+    }
+
+    #[test]
+    fn test_consistency_report_serde_roundtrip() {
+        let r = ConsistencyReport {
+            sampled: 50,
+            found: 48,
+            missing: 2,
+            missing_ids: vec![101, 203],
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let r2: ConsistencyReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(r.sampled, r2.sampled);
+        assert_eq!(r.found, r2.found);
+        assert_eq!(r.missing, r2.missing);
+        assert_eq!(r.missing_ids, r2.missing_ids);
+    }
+
+    #[test]
+    fn test_consistency_message_ref_serde_roundtrip() {
+        let mr = ConsistencyMessageRef {
+            project_slug: "my-proj".into(),
+            message_id: 42,
+            sender_name: "RedFox".into(),
+            subject: "Test subject".into(),
+            created_ts_iso: "2026-01-15T10:30:00Z".into(),
+        };
+        let json = serde_json::to_string(&mr).unwrap();
+        let mr2: ConsistencyMessageRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(mr.project_slug, mr2.project_slug);
+        assert_eq!(mr.message_id, mr2.message_id);
+        assert_eq!(mr.sender_name, mr2.sender_name);
+    }
+
+    #[test]
+    fn test_message_with_none_thread_id_serde() {
+        let m = Message {
+            thread_id: None,
+            ..Message::default()
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"thread_id\":null"));
+        let m2: Message = serde_json::from_str(&json).unwrap();
+        assert!(m2.thread_id.is_none());
+    }
+
+    #[test]
+    fn test_sanitize_agent_name_long_input() {
+        let long = "A".repeat(200);
+        let result = sanitize_agent_name(&long);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 128);
+    }
+
+    #[test]
+    fn test_sanitize_agent_name_special_chars_only() {
+        assert_eq!(sanitize_agent_name("!@#$%^&*()"), None);
+        assert_eq!(sanitize_agent_name("   "), None);
+    }
+
+    #[test]
+    fn test_valid_name_count() {
+        // 62 adjectives x 69 nouns = 4,278 valid names
+        assert_eq!(VALID_ADJECTIVES.len(), 62);
+        assert_eq!(VALID_NOUNS.len(), 69);
+        assert_eq!(valid_names_set().len(), 62 * 69);
+    }
 }
