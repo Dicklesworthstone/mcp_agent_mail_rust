@@ -660,6 +660,7 @@ mod tests {
                 memory_last_sample_us: 0,
                 memory_sample_errors_total: 0,
             },
+            search: SearchMetricsSnapshot::default(),
         };
 
         let signals = HealthSignals::from_snapshot(&snap, 1_000_000_000);

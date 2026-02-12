@@ -137,7 +137,7 @@ pub struct Log2Histogram {
     max: AtomicU64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct HistogramSnapshot {
     pub count: u64,
     pub sum: u64,
@@ -288,7 +288,7 @@ pub struct HttpMetrics {
     pub latency_us: Log2Histogram,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct HttpMetricsSnapshot {
     pub requests_total: u64,
     pub requests_inflight: i64,
@@ -348,7 +348,7 @@ pub struct ToolsMetrics {
     pub contact_enforcement_bypass_total: Counter,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ToolsMetricsSnapshot {
     pub tool_calls_total: u64,
     pub tool_errors_total: u64,
@@ -401,7 +401,7 @@ pub struct DbMetrics {
     pub pool_over_80_since_us: GaugeU64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DbMetricsSnapshot {
     pub pool_acquires_total: u64,
     pub pool_acquire_errors_total: u64,
@@ -507,7 +507,7 @@ pub struct StorageMetrics {
     pub lockfree_commit_fallbacks_total: Counter,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StorageMetricsSnapshot {
     pub wbq_enqueued_total: u64,
     pub wbq_drained_total: u64,
@@ -559,7 +559,7 @@ pub struct SystemMetrics {
     pub memory_sample_errors_total: Counter,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SystemMetricsSnapshot {
     pub disk_storage_free_bytes: u64,
     pub disk_db_free_bytes: u64,
@@ -607,6 +607,263 @@ impl SystemMetrics {
             memory_pressure_level: self.memory_pressure_level.load(),
             memory_last_sample_us: self.memory_last_sample_us.load(),
             memory_sample_errors_total: self.memory_sample_errors_total.load(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search V3 Metrics
+// ---------------------------------------------------------------------------
+
+/// Search V3 telemetry and operational metrics.
+///
+/// Tracks query volumes, latencies, engine selection, shadow comparison results,
+/// and fallback behavior for safe rollout validation.
+#[derive(Debug)]
+pub struct SearchMetrics {
+    // -- Query volume counters --
+    /// Total search queries executed (all engines).
+    pub queries_total: Counter,
+    /// Queries routed to V3 (Tantivy lexical or hybrid).
+    pub queries_v3_total: Counter,
+    /// Queries routed to legacy `SQLite` FTS5.
+    pub queries_legacy_total: Counter,
+    /// Shadow mode comparisons executed (both engines run).
+    pub shadow_comparisons_total: Counter,
+    /// Queries that encountered errors (any engine).
+    pub queries_errors_total: Counter,
+
+    // -- Latency histograms --
+    /// All query latencies (microseconds).
+    pub query_latency_us: Log2Histogram,
+    /// V3-specific query latencies (microseconds).
+    pub v3_latency_us: Log2Histogram,
+    /// Legacy FTS query latencies (microseconds).
+    pub legacy_latency_us: Log2Histogram,
+
+    // -- Shadow mode metrics --
+    /// Shadow comparisons where results were equivalent (≥80% overlap).
+    pub shadow_equivalent_total: Counter,
+    /// Shadow comparisons where V3 had errors.
+    pub shadow_v3_errors_total: Counter,
+    /// Shadow comparisons with significant result divergence.
+    pub shadow_divergent_total: Counter,
+    /// Cumulative latency delta (V3 - legacy) in shadow mode (for averaging).
+    /// Stored with +1M offset to handle negative deltas in atomic u64.
+    shadow_latency_delta_sum_us: AtomicU64,
+    /// Count for shadow latency delta averaging.
+    shadow_latency_delta_count: AtomicU64,
+
+    // -- Fallback and degradation --
+    /// V3 errors that triggered fallback to legacy FTS.
+    pub fallback_to_legacy_total: Counter,
+    /// Semantic tier disabled via kill switch during query.
+    pub semantic_killswitch_hits: Counter,
+    /// Rerank tier disabled via kill switch during query.
+    pub rerank_killswitch_hits: Counter,
+
+    // -- Index health gauges --
+    /// Estimated Tantivy index size in bytes (updated periodically).
+    pub tantivy_index_size_bytes: GaugeU64,
+    /// Documents in Tantivy index (updated periodically).
+    pub tantivy_doc_count: GaugeU64,
+    /// Last index update timestamp (micros since epoch).
+    pub tantivy_last_update_us: GaugeU64,
+}
+
+/// Point-in-time snapshot of search metrics.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SearchMetricsSnapshot {
+    // Query volumes
+    pub queries_total: u64,
+    pub queries_v3_total: u64,
+    pub queries_legacy_total: u64,
+    pub shadow_comparisons_total: u64,
+    pub queries_errors_total: u64,
+
+    // Latencies
+    pub query_latency_us: HistogramSnapshot,
+    pub v3_latency_us: HistogramSnapshot,
+    pub legacy_latency_us: HistogramSnapshot,
+
+    // Shadow mode
+    pub shadow_equivalent_total: u64,
+    pub shadow_equivalent_pct: f64,
+    pub shadow_v3_errors_total: u64,
+    pub shadow_divergent_total: u64,
+    pub shadow_avg_latency_delta_us: i64,
+
+    // Fallback/degradation
+    pub fallback_to_legacy_total: u64,
+    pub semantic_killswitch_hits: u64,
+    pub rerank_killswitch_hits: u64,
+
+    // Index health
+    pub tantivy_index_size_bytes: u64,
+    pub tantivy_doc_count: u64,
+    pub tantivy_last_update_us: u64,
+}
+
+impl Default for SearchMetrics {
+    fn default() -> Self {
+        Self {
+            queries_total: Counter::new(),
+            queries_v3_total: Counter::new(),
+            queries_legacy_total: Counter::new(),
+            shadow_comparisons_total: Counter::new(),
+            queries_errors_total: Counter::new(),
+
+            query_latency_us: Log2Histogram::new(),
+            v3_latency_us: Log2Histogram::new(),
+            legacy_latency_us: Log2Histogram::new(),
+
+            shadow_equivalent_total: Counter::new(),
+            shadow_v3_errors_total: Counter::new(),
+            shadow_divergent_total: Counter::new(),
+            shadow_latency_delta_sum_us: AtomicU64::new(0),
+            shadow_latency_delta_count: AtomicU64::new(0),
+
+            fallback_to_legacy_total: Counter::new(),
+            semantic_killswitch_hits: Counter::new(),
+            rerank_killswitch_hits: Counter::new(),
+
+            tantivy_index_size_bytes: GaugeU64::new(),
+            tantivy_doc_count: GaugeU64::new(),
+            tantivy_last_update_us: GaugeU64::new(),
+        }
+    }
+}
+
+/// Offset for storing signed latency deltas in unsigned atomics.
+const LATENCY_DELTA_OFFSET: i64 = 1_000_000;
+
+impl SearchMetrics {
+    /// Record a V3 query execution.
+    #[inline]
+    pub fn record_v3_query(&self, latency_us: u64, is_error: bool) {
+        self.queries_total.inc();
+        self.queries_v3_total.inc();
+        self.query_latency_us.record(latency_us);
+        self.v3_latency_us.record(latency_us);
+        if is_error {
+            self.queries_errors_total.inc();
+        }
+    }
+
+    /// Record a legacy FTS query execution.
+    #[inline]
+    pub fn record_legacy_query(&self, latency_us: u64, is_error: bool) {
+        self.queries_total.inc();
+        self.queries_legacy_total.inc();
+        self.query_latency_us.record(latency_us);
+        self.legacy_latency_us.record(latency_us);
+        if is_error {
+            self.queries_errors_total.inc();
+        }
+    }
+
+    /// Record a shadow mode comparison result.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn record_shadow_comparison(
+        &self,
+        is_equivalent: bool,
+        v3_had_error: bool,
+        latency_delta_us: i64,
+    ) {
+        self.shadow_comparisons_total.inc();
+
+        if is_equivalent {
+            self.shadow_equivalent_total.inc();
+        } else {
+            self.shadow_divergent_total.inc();
+        }
+
+        if v3_had_error {
+            self.shadow_v3_errors_total.inc();
+        }
+
+        // Store latency delta with offset to handle negatives
+        let delta_offset = (latency_delta_us + LATENCY_DELTA_OFFSET) as u64;
+        self.shadow_latency_delta_sum_us
+            .fetch_add(delta_offset, Ordering::Relaxed);
+        self.shadow_latency_delta_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a fallback from V3 to legacy due to error.
+    #[inline]
+    pub fn record_fallback(&self) {
+        self.fallback_to_legacy_total.inc();
+    }
+
+    /// Record semantic kill switch activation.
+    #[inline]
+    pub fn record_semantic_killswitch(&self) {
+        self.semantic_killswitch_hits.inc();
+    }
+
+    /// Record rerank kill switch activation.
+    #[inline]
+    pub fn record_rerank_killswitch(&self) {
+        self.rerank_killswitch_hits.inc();
+    }
+
+    /// Update Tantivy index health gauges.
+    #[allow(clippy::cast_possible_truncation)] // u128 micros won't overflow u64 for millennia
+    pub fn update_index_health(&self, size_bytes: u64, doc_count: u64) {
+        self.tantivy_index_size_bytes.set(size_bytes);
+        self.tantivy_doc_count.set(doc_count);
+        self.tantivy_last_update_us.set(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros() as u64),
+        );
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_possible_wrap)]
+    #[must_use]
+    pub fn snapshot(&self) -> SearchMetricsSnapshot {
+        let shadow_total = self.shadow_comparisons_total.load();
+        let shadow_equiv = self.shadow_equivalent_total.load();
+        let shadow_equiv_pct = if shadow_total > 0 {
+            shadow_equiv as f64 / shadow_total as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        let delta_count = self.shadow_latency_delta_count.load(Ordering::Relaxed);
+        let delta_sum = self.shadow_latency_delta_sum_us.load(Ordering::Relaxed);
+        let avg_delta = if delta_count > 0 {
+            (delta_sum as i64 / delta_count as i64) - LATENCY_DELTA_OFFSET
+        } else {
+            0
+        };
+
+        SearchMetricsSnapshot {
+            queries_total: self.queries_total.load(),
+            queries_v3_total: self.queries_v3_total.load(),
+            queries_legacy_total: self.queries_legacy_total.load(),
+            shadow_comparisons_total: shadow_total,
+            queries_errors_total: self.queries_errors_total.load(),
+
+            query_latency_us: self.query_latency_us.snapshot(),
+            v3_latency_us: self.v3_latency_us.snapshot(),
+            legacy_latency_us: self.legacy_latency_us.snapshot(),
+
+            shadow_equivalent_total: shadow_equiv,
+            shadow_equivalent_pct: shadow_equiv_pct,
+            shadow_v3_errors_total: self.shadow_v3_errors_total.load(),
+            shadow_divergent_total: self.shadow_divergent_total.load(),
+            shadow_avg_latency_delta_us: avg_delta,
+
+            fallback_to_legacy_total: self.fallback_to_legacy_total.load(),
+            semantic_killswitch_hits: self.semantic_killswitch_hits.load(),
+            rerank_killswitch_hits: self.rerank_killswitch_hits.load(),
+
+            tantivy_index_size_bytes: self.tantivy_index_size_bytes.load(),
+            tantivy_doc_count: self.tantivy_doc_count.load(),
+            tantivy_last_update_us: self.tantivy_last_update_us.load(),
         }
     }
 }
@@ -697,15 +954,17 @@ pub struct GlobalMetrics {
     pub db: DbMetrics,
     pub storage: StorageMetrics,
     pub system: SystemMetrics,
+    pub search: SearchMetrics,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct GlobalMetricsSnapshot {
     pub http: HttpMetricsSnapshot,
     pub tools: ToolsMetricsSnapshot,
     pub db: DbMetricsSnapshot,
     pub storage: StorageMetricsSnapshot,
     pub system: SystemMetricsSnapshot,
+    pub search: SearchMetricsSnapshot,
 }
 
 impl GlobalMetrics {
@@ -717,6 +976,7 @@ impl GlobalMetrics {
             db: self.db.snapshot(),
             storage: self.storage.snapshot(),
             system: self.system.snapshot(),
+            search: self.search.snapshot(),
         }
     }
 }
@@ -1037,5 +1297,129 @@ mod tests {
             "p99={} should reflect high-latency tail (≥1000)",
             snap.p99
         );
+    }
+
+    // ── Search metrics tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn search_metrics_record_v3_query() {
+        let m = SearchMetrics::default();
+
+        m.record_v3_query(1000, false);
+        m.record_v3_query(2000, false);
+        m.record_v3_query(5000, true); // error
+
+        let snap = m.snapshot();
+        assert_eq!(snap.queries_total, 3);
+        assert_eq!(snap.queries_v3_total, 3);
+        assert_eq!(snap.queries_legacy_total, 0);
+        assert_eq!(snap.queries_errors_total, 1);
+        assert_eq!(snap.v3_latency_us.count, 3);
+    }
+
+    #[test]
+    fn search_metrics_record_legacy_query() {
+        let m = SearchMetrics::default();
+
+        m.record_legacy_query(500, false);
+        m.record_legacy_query(1500, false);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.queries_total, 2);
+        assert_eq!(snap.queries_v3_total, 0);
+        assert_eq!(snap.queries_legacy_total, 2);
+        assert_eq!(snap.legacy_latency_us.count, 2);
+    }
+
+    #[test]
+    fn search_metrics_shadow_comparison() {
+        let m = SearchMetrics::default();
+
+        // Equivalent result, V3 faster by 100µs
+        m.record_shadow_comparison(true, false, -100);
+        // Divergent result, V3 slower by 500µs
+        m.record_shadow_comparison(false, false, 500);
+        // V3 error
+        m.record_shadow_comparison(false, true, 1000);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.shadow_comparisons_total, 3);
+        assert_eq!(snap.shadow_equivalent_total, 1);
+        assert_eq!(snap.shadow_divergent_total, 2);
+        assert_eq!(snap.shadow_v3_errors_total, 1);
+        // Average delta: (-100 + 500 + 1000) / 3 = 466
+        assert!(
+            (snap.shadow_avg_latency_delta_us - 466).abs() <= 1,
+            "avg_delta={} expected ~466",
+            snap.shadow_avg_latency_delta_us
+        );
+        // Equivalent percentage: 1/3 * 100 = 33.33...
+        assert!(
+            (snap.shadow_equivalent_pct - 33.33).abs() < 1.0,
+            "equiv_pct={} expected ~33.33",
+            snap.shadow_equivalent_pct
+        );
+    }
+
+    #[test]
+    fn search_metrics_fallback_and_killswitch() {
+        let m = SearchMetrics::default();
+
+        m.record_fallback();
+        m.record_fallback();
+        m.record_semantic_killswitch();
+        m.record_rerank_killswitch();
+        m.record_rerank_killswitch();
+        m.record_rerank_killswitch();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.fallback_to_legacy_total, 2);
+        assert_eq!(snap.semantic_killswitch_hits, 1);
+        assert_eq!(snap.rerank_killswitch_hits, 3);
+    }
+
+    #[test]
+    fn search_metrics_index_health() {
+        let m = SearchMetrics::default();
+
+        m.update_index_health(1024 * 1024 * 50, 10_000);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.tantivy_index_size_bytes, 50 * 1024 * 1024);
+        assert_eq!(snap.tantivy_doc_count, 10_000);
+        assert!(snap.tantivy_last_update_us > 0);
+    }
+
+    #[test]
+    fn search_metrics_snapshot_serialization() {
+        let m = SearchMetrics::default();
+        m.record_v3_query(1000, false);
+        m.record_shadow_comparison(true, false, 50);
+
+        let snap = m.snapshot();
+        let json = serde_json::to_value(&snap).expect("should serialize");
+
+        // Verify key fields present
+        assert!(json.get("queries_total").is_some());
+        assert!(json.get("queries_v3_total").is_some());
+        assert!(json.get("shadow_comparisons_total").is_some());
+        assert!(json.get("shadow_equivalent_pct").is_some());
+        assert!(json.get("shadow_avg_latency_delta_us").is_some());
+        assert!(json.get("v3_latency_us").is_some());
+        assert!(json.get("tantivy_index_size_bytes").is_some());
+    }
+
+    #[test]
+    fn global_metrics_includes_search() {
+        let gm = GlobalMetrics::default();
+        gm.search.record_v3_query(500, false);
+
+        let snap = gm.snapshot();
+        assert_eq!(snap.search.queries_total, 1);
+        assert_eq!(snap.search.queries_v3_total, 1);
+
+        // Verify JSON includes search section
+        let json = serde_json::to_value(&snap).expect("should serialize");
+        assert!(json.get("search").is_some());
     }
 }

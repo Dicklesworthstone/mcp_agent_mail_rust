@@ -1624,7 +1624,7 @@ mod tests {
     use super::*;
     use crate::metrics::{
         DbMetricsSnapshot, GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
-        StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot,
+        SearchMetricsSnapshot, StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot,
     };
     use std::sync::Mutex;
     use std::thread;
@@ -1739,6 +1739,7 @@ mod tests {
                 memory_last_sample_us: 0,
                 memory_sample_errors_total: 0,
             },
+            search: SearchMetricsSnapshot::default(),
         }
     }
 
