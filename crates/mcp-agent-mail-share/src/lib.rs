@@ -4,9 +4,12 @@ pub mod bundle;
 pub mod crypto;
 pub mod deploy;
 pub mod detection;
+pub mod executor;
 pub mod finalize;
 pub mod hosting;
+pub mod planner;
 pub mod probe;
+pub mod prompt;
 pub mod scope;
 pub mod scrub;
 pub mod snapshot;
@@ -29,15 +32,18 @@ pub use deploy::{
     generate_gh_pages_workflow, generate_netlify_config, generate_validation_script,
     run_verify_live, validate_bundle, write_deploy_tooling,
 };
+pub use detection::{
+    detect_cloudflare_pages, detect_environment, detect_github_pages, detect_netlify, detect_s3,
+    extract_github_repo,
+};
+pub use executor::{ExecutorConfig, execute_plan};
 pub use finalize::{
     FinalizeResult, build_materialized_views, build_search_indexes, create_performance_indexes,
     finalize_export_db, finalize_snapshot_for_export,
 };
 pub use hosting::{HostingHint, detect_hosting_hints, generate_headers_file};
-pub use detection::{
-    detect_cloudflare_pages, detect_environment, detect_github_pages, detect_netlify, detect_s3,
-    extract_github_repo,
-};
+pub use planner::{PlanResult, format_plan_human, generate_plan, validate_inputs};
+pub use prompt::{WizardConfig, WizardOutcome, format_json_output, run_interactive_wizard};
 pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
 pub use scrub::{ScrubSummary, scan_for_secrets, scrub_snapshot};
 pub use snapshot::{SnapshotContext, create_snapshot_context, create_sqlite_snapshot};
@@ -46,8 +52,8 @@ pub use static_render::{
 };
 pub use wizard::{
     DeploymentPlan, DetectedEnvironment, DetectedSignal, DetectionConfidence, HostingProvider,
-    PlanStep, StepOutcome, WizardError, WizardErrorCode, WizardInputs, WizardJsonOutput,
-    WizardMetadata, WizardMode, WizardResult, WIZARD_VERSION, exit_codes,
+    PlanStep, StepOutcome, WIZARD_VERSION, WizardError, WizardErrorCode, WizardInputs,
+    WizardJsonOutput, WizardMetadata, WizardMode, WizardResult, exit_codes,
 };
 
 use serde::{Deserialize, Serialize};
