@@ -203,7 +203,6 @@ impl ShadowMetrics {
     }
 
     /// Get snapshot of current metrics.
-    /// Get snapshot of current metrics.
     ///
     /// Precision loss in u64→f64 casts is acceptable for percentage calculations.
     #[must_use]
