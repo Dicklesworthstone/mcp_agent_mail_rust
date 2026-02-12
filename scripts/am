@@ -190,4 +190,10 @@ fi
 cd "$repo_root"
 echo "am: host=${host} port=${port} path=${resolved_path} tui=$([[ "$no_tui" -eq 0 ]] && echo on || echo off) rich=${LOG_RICH_ENABLED}" >&2
 
-exec cargo run -p mcp-agent-mail -- serve --host "$host" --port "$port" --path "$resolved_path" "${tui_flag[@]}" "${extra_args[@]}"
+# Use release binary if available, fall back to cargo run
+binary="${CARGO_TARGET_DIR:-${repo_root}/target}/release/mcp-agent-mail"
+if [[ -x "$binary" ]]; then
+  exec "$binary" serve --host "$host" --port "$port" --path "$resolved_path" "${tui_flag[@]}" "${extra_args[@]}"
+else
+  exec cargo run --release -p mcp-agent-mail -- serve --host "$host" --port "$port" --path "$resolved_path" "${tui_flag[@]}" "${extra_args[@]}"
+fi
