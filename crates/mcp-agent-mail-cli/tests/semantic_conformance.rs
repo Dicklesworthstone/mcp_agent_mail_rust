@@ -77,8 +77,7 @@ impl TestEnv {
     }
 
     fn open_conn(&self) -> mcp_agent_mail_db::DbConn {
-        mcp_agent_mail_db::DbConn::open_file(self.db_path.display().to_string())
-            .expect("open db")
+        mcp_agent_mail_db::DbConn::open_file(self.db_path.display().to_string()).expect("open db")
     }
 }
 
@@ -95,8 +94,8 @@ fn run_am(env: &[(String, String)], args: &[&str]) -> Output {
 }
 
 fn init_schema(db_path: &Path) -> mcp_agent_mail_db::DbConn {
-    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-        .expect("open db");
+    let conn =
+        mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
         .expect("init schema");
     conn

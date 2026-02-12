@@ -353,9 +353,7 @@ pub fn merge_mcp_server(
     };
 
     let obj = doc.as_object_mut().ok_or(SetupError::NotJsonObject)?;
-    let servers = obj
-        .entry(servers_key)
-        .or_insert_with(|| json!({}));
+    let servers = obj.entry(servers_key).or_insert_with(|| json!({}));
     let servers_obj = servers.as_object_mut().ok_or(SetupError::NotJsonObject)?;
 
     servers_obj.insert(server_name.to_string(), server_value);
@@ -450,9 +448,7 @@ fn build_post_tool_use_hooks(project_slug: &str, agent_name: &str) -> Vec<Value>
 }
 
 fn merge_hook_array(hooks: &mut Map<String, Value>, key: &str, new_entries: Vec<Value>) {
-    let arr = hooks
-        .entry(key)
-        .or_insert_with(|| json!([]));
+    let arr = hooks.entry(key).or_insert_with(|| json!([]));
     if let Some(arr) = arr.as_array_mut() {
         arr.retain(|entry| !hook_is_ours(entry));
         arr.extend(new_entries);
@@ -475,9 +471,7 @@ pub fn merge_claude_hooks(
     };
 
     let obj = doc.as_object_mut().ok_or(SetupError::NotJsonObject)?;
-    let hooks = obj
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks_obj = hooks.as_object_mut().ok_or(SetupError::NotJsonObject)?;
 
     merge_hook_array(
@@ -505,7 +499,10 @@ pub fn merge_claude_hooks(
 
 /// Ensure the given entries are present in the .gitignore file.
 /// Does not duplicate existing entries.
-pub fn ensure_gitignore_entries(gitignore_path: &Path, entries: &[&str]) -> Result<bool, SetupError> {
+pub fn ensure_gitignore_entries(
+    gitignore_path: &Path,
+    entries: &[&str],
+) -> Result<bool, SetupError> {
     let existing = std::fs::read_to_string(gitignore_path).unwrap_or_default();
     let existing_lines: Vec<&str> = existing.lines().collect();
 
@@ -588,23 +585,35 @@ impl AgentPlatform {
             Self::Claude => self.claude_actions(params, &url, token, pdir, &home),
             Self::Cursor => self.cursor_actions(params, &url, token, pdir, &home),
             Self::Cline => vec![project_local_action(
-                self, pdir, "cline.mcp.json", "mcpServers",
+                self,
+                pdir,
+                "cline.mcp.json",
+                "mcpServers",
                 standard_http_server_value(&url, token),
                 "Cline project-local MCP config",
             )],
             Self::Windsurf => vec![project_local_action(
-                self, pdir, "windsurf.mcp.json", "mcpServers",
+                self,
+                pdir,
+                "windsurf.mcp.json",
+                "mcpServers",
                 standard_http_server_value(&url, token),
                 "Windsurf project-local MCP config",
             )],
             Self::Codex => vec![project_local_action(
-                self, pdir, "codex.mcp.json", "mcpServers",
+                self,
+                pdir,
+                "codex.mcp.json",
+                "mcpServers",
                 standard_http_server_value(&url, token),
                 "Codex CLI project-local MCP config",
             )],
             Self::Gemini => self.gemini_actions(params, &url, token, pdir, &home),
             Self::OpenCode => vec![project_local_action(
-                self, pdir, "opencode.json", "mcp",
+                self,
+                pdir,
+                "opencode.json",
+                "mcp",
                 json!({
                     "type": "remote",
                     "url": url,
@@ -630,7 +639,12 @@ impl AgentPlatform {
     }
 
     fn claude_actions(
-        self, params: &SetupParams, url: &str, token: &str, pdir: &Path, home: &Path,
+        self,
+        params: &SetupParams,
+        url: &str,
+        token: &str,
+        pdir: &Path,
+        home: &Path,
     ) -> Vec<ConfigAction> {
         let mut actions = vec![ConfigAction {
             platform: self,
@@ -678,10 +692,18 @@ impl AgentPlatform {
     }
 
     fn cursor_actions(
-        self, params: &SetupParams, url: &str, token: &str, pdir: &Path, home: &Path,
+        self,
+        params: &SetupParams,
+        url: &str,
+        token: &str,
+        pdir: &Path,
+        home: &Path,
     ) -> Vec<ConfigAction> {
         let mut actions = vec![project_local_action(
-            self, pdir, "cursor.mcp.json", "mcpServers",
+            self,
+            pdir,
+            "cursor.mcp.json",
+            "mcpServers",
             standard_http_server_value(url, token),
             "Cursor project-local MCP config",
         )];
@@ -703,10 +725,18 @@ impl AgentPlatform {
     }
 
     fn gemini_actions(
-        self, params: &SetupParams, url: &str, token: &str, pdir: &Path, home: &Path,
+        self,
+        params: &SetupParams,
+        url: &str,
+        token: &str,
+        pdir: &Path,
+        home: &Path,
     ) -> Vec<ConfigAction> {
         let mut actions = vec![project_local_action(
-            self, pdir, "gemini.mcp.json", "mcpServers",
+            self,
+            pdir,
+            "gemini.mcp.json",
+            "mcpServers",
             json!({
                 "httpUrl": url,
                 "headers": { "Authorization": format!("Bearer {token}") }
@@ -731,10 +761,18 @@ impl AgentPlatform {
     }
 
     fn factory_actions(
-        self, params: &SetupParams, url: &str, token: &str, pdir: &Path, home: &Path,
+        self,
+        params: &SetupParams,
+        url: &str,
+        token: &str,
+        pdir: &Path,
+        home: &Path,
     ) -> Vec<ConfigAction> {
         let mut actions = vec![project_local_action(
-            self, pdir, "factory.mcp.json", "mcpServers",
+            self,
+            pdir,
+            "factory.mcp.json",
+            "mcpServers",
             json!({
                 "url": url,
                 "headers": { "Authorization": format!("Bearer {token}") }
@@ -833,7 +871,10 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
 /// Run the full setup flow.
 #[must_use]
 pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
-    let platforms = params.agents.clone().unwrap_or_else(|| AgentPlatform::ALL.to_vec());
+    let platforms = params
+        .agents
+        .clone()
+        .unwrap_or_else(|| AgentPlatform::ALL.to_vec());
 
     let mut results = Vec::new();
 
@@ -904,7 +945,10 @@ pub struct ConfigFileStatus {
 /// Check config status for detected agents.
 #[must_use]
 pub fn check_status(params: &SetupParams) -> Vec<AgentConfigStatus> {
-    let platforms = params.agents.clone().unwrap_or_else(|| AgentPlatform::ALL.to_vec());
+    let platforms = params
+        .agents
+        .clone()
+        .unwrap_or_else(|| AgentPlatform::ALL.to_vec());
     let url = params.server_url();
 
     let mut statuses = Vec::new();
@@ -1011,7 +1055,11 @@ mod tests {
     #[test]
     fn resolve_token_reads_env_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "FOO=bar\nHTTP_BEARER_TOKEN=from-file\nBAZ=qux\n").unwrap();
+        std::fs::write(
+            tmp.path(),
+            "FOO=bar\nHTTP_BEARER_TOKEN=from-file\nBAZ=qux\n",
+        )
+        .unwrap();
         let t = resolve_token(None, tmp.path());
         assert_eq!(t, "from-file");
     }
@@ -1019,8 +1067,12 @@ mod tests {
     #[test]
     fn merge_mcp_server_empty() {
         let result = merge_mcp_server(
-            None, "mcpServers", "test-server", json!({"url": "http://localhost"}),
-        ).unwrap();
+            None,
+            "mcpServers",
+            "test-server",
+            json!({"url": "http://localhost"}),
+        )
+        .unwrap();
         let doc: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(doc["mcpServers"]["test-server"]["url"], "http://localhost");
     }
@@ -1029,8 +1081,12 @@ mod tests {
     fn merge_mcp_server_existing_preserves_others() {
         let existing = r#"{"mcpServers": {"other-server": {"url": "http://other"}}}"#;
         let result = merge_mcp_server(
-            Some(existing), "mcpServers", "mcp-agent-mail", json!({"url": "http://new"}),
-        ).unwrap();
+            Some(existing),
+            "mcpServers",
+            "mcp-agent-mail",
+            json!({"url": "http://new"}),
+        )
+        .unwrap();
         let doc: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(doc["mcpServers"]["other-server"]["url"], "http://other");
         assert_eq!(doc["mcpServers"]["mcp-agent-mail"]["url"], "http://new");
@@ -1040,8 +1096,12 @@ mod tests {
     fn merge_mcp_server_updates_stale_entry() {
         let existing = r#"{"mcpServers": {"mcp-agent-mail": {"url": "http://old"}}}"#;
         let result = merge_mcp_server(
-            Some(existing), "mcpServers", "mcp-agent-mail", json!({"url": "http://new"}),
-        ).unwrap();
+            Some(existing),
+            "mcpServers",
+            "mcp-agent-mail",
+            json!({"url": "http://new"}),
+        )
+        .unwrap();
         let doc: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(doc["mcpServers"]["mcp-agent-mail"]["url"], "http://new");
     }
@@ -1050,8 +1110,12 @@ mod tests {
     fn merge_mcp_server_preserves_other_keys() {
         let existing = r#"{"someOtherSetting": true, "mcpServers": {}}"#;
         let result = merge_mcp_server(
-            Some(existing), "mcpServers", "mcp-agent-mail", json!({"url": "http://localhost"}),
-        ).unwrap();
+            Some(existing),
+            "mcpServers",
+            "mcp-agent-mail",
+            json!({"url": "http://localhost"}),
+        )
+        .unwrap();
         let doc: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(doc["someOtherSetting"], json!(true));
     }
@@ -1071,7 +1135,11 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(actions[0].file_path.ends_with("cursor.mcp.json"));
         match &actions[0].content {
-            ConfigContent::JsonMerge { servers_key, server_value, .. } => {
+            ConfigContent::JsonMerge {
+                servers_key,
+                server_value,
+                ..
+            } => {
                 assert_eq!(*servers_key, "mcpServers");
                 assert_eq!(server_value["type"], "http");
                 assert!(server_value["url"].as_str().unwrap().contains("8765"));
@@ -1093,7 +1161,10 @@ mod tests {
         match &actions[0].content {
             ConfigContent::JsonMerge { server_value, .. } => {
                 assert!(server_value.get("httpUrl").is_some(), "Gemini uses httpUrl");
-                assert!(server_value.get("type").is_none(), "Gemini has no type field");
+                assert!(
+                    server_value.get("type").is_none(),
+                    "Gemini has no type field"
+                );
             }
             _ => panic!("expected JsonMerge"),
         }
@@ -1109,7 +1180,11 @@ mod tests {
         let actions = AgentPlatform::OpenCode.config_actions(&params);
         assert_eq!(actions.len(), 1);
         match &actions[0].content {
-            ConfigContent::JsonMerge { servers_key, server_value, .. } => {
+            ConfigContent::JsonMerge {
+                servers_key,
+                server_value,
+                ..
+            } => {
                 assert_eq!(*servers_key, "mcp");
                 assert_eq!(server_value["type"], "remote");
                 assert_eq!(server_value["enabled"], true);
@@ -1148,7 +1223,10 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0].content {
             ConfigContent::JsonMerge { server_value, .. } => {
-                assert!(server_value.get("type").is_none(), "Factory has no type field");
+                assert!(
+                    server_value.get("type").is_none(),
+                    "Factory has no type field"
+                );
                 assert!(server_value.get("url").is_some());
             }
             _ => panic!("expected JsonMerge"),
@@ -1170,9 +1248,8 @@ mod tests {
         let outcome = write_config_atomic(&action).unwrap();
         assert_eq!(outcome, ActionOutcome::Created);
         assert!(deep.exists());
-        let content: Value = serde_json::from_str(
-            &std::fs::read_to_string(&deep).unwrap(),
-        ).unwrap();
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&deep).unwrap()).unwrap();
         assert_eq!(content["hello"], "world");
     }
 
@@ -1208,9 +1285,8 @@ mod tests {
         let path = tmp.path().join("config.json");
 
         // Write initial via merge
-        let initial = merge_mcp_server(
-            None, "mcpServers", "test", json!({"url": "http://a"}),
-        ).unwrap();
+        let initial =
+            merge_mcp_server(None, "mcpServers", "test", json!({"url": "http://a"})).unwrap();
         std::fs::write(&path, &initial).unwrap();
 
         let action = ConfigAction {
@@ -1248,9 +1324,17 @@ mod tests {
         // User's custom hook preserved
         assert_eq!(doc["permissions"]["allow"][0], "Bash");
         let session_start = doc["hooks"]["SessionStart"].as_array().unwrap();
-        assert!(session_start.iter().any(|e| e.to_string().contains("custom")));
+        assert!(
+            session_start
+                .iter()
+                .any(|e| e.to_string().contains("custom"))
+        );
         // Our hooks added
-        assert!(session_start.iter().any(|e| e.to_string().contains("am file_reservations")));
+        assert!(
+            session_start
+                .iter()
+                .any(|e| e.to_string().contains("am file_reservations"))
+        );
     }
 
     #[test]
@@ -1266,7 +1350,11 @@ mod tests {
         let result2 = merge_claude_hooks(Some(&result1), "proj", "NewAgent").unwrap();
         let doc: Value = serde_json::from_str(&result2).unwrap();
         let post_hooks = doc["hooks"]["PostToolUse"].as_array().unwrap();
-        let all_text = post_hooks.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+        let all_text = post_hooks
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(all_text.contains("NewAgent"));
         assert!(!all_text.contains("OldAgent"));
     }
@@ -1350,9 +1438,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.json");
         let content = merge_mcp_server(
-            None, "mcpServers", "mcp-agent-mail",
+            None,
+            "mcpServers",
+            "mcp-agent-mail",
             json!({"url": "http://127.0.0.1:8765/mcp/"}),
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(&path, &content).unwrap();
 
         let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");

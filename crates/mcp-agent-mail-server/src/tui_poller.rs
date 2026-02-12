@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::timestamps::now_micros;
 
 use crate::tui_bridge::TuiSharedState;

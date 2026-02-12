@@ -10,9 +10,9 @@ use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_bridge::TuiSharedState;

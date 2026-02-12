@@ -14,10 +14,10 @@ use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
 
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::mail_explorer::{AckFilter, Direction, ExplorerStats, GroupMode, SortMode};
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::{Row, Value};
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 
 use crate::tui_bridge::TuiSharedState;
@@ -413,10 +413,7 @@ impl MailExplorerScreen {
         self.db_conn = Some(conn);
     }
 
-    fn query_overdue_acks(
-        conn: &DbConn,
-        now: i64,
-    ) -> Result<Vec<AckPressureCard>, String> {
+    fn query_overdue_acks(conn: &DbConn, now: i64) -> Result<Vec<AckPressureCard>, String> {
         let threshold = now - ACK_SLA_THRESHOLD_MICROS;
 
         let sql = "SELECT a.name AS agent_name, p.slug AS project_slug, \
@@ -526,11 +523,7 @@ impl MailExplorerScreen {
             })
     }
 
-    fn fetch_inbound(
-        &self,
-        conn: &DbConn,
-        text_filter: &str,
-    ) -> Result<Vec<DisplayEntry>, String> {
+    fn fetch_inbound(&self, conn: &DbConn, text_filter: &str) -> Result<Vec<DisplayEntry>, String> {
         let mut conditions = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 

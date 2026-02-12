@@ -862,8 +862,8 @@ pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asupersync::runtime::RuntimeBuilder;
     use crate::DbConn;
+    use asupersync::runtime::RuntimeBuilder;
 
     fn block_on<F, Fut, T>(f: F) -> T
     where
@@ -881,8 +881,8 @@ mod tests {
     fn migrations_apply_and_are_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_apply.db");
-        let conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // First run applies all schema migrations.
         let applied = block_on({
@@ -911,8 +911,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_preserve.db");
-        let conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Simulate an older DB with only `projects` table.
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -954,8 +954,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v3_text_ts.db");
-        let conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
             .expect("apply PRAGMAs");
@@ -1132,8 +1132,8 @@ mod tests {
     fn v4_migration_creates_composite_indexes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_indexes.db");
-        let conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Apply all migrations.
         block_on({
@@ -1183,8 +1183,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v4_existing.db");
-        let conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
             .expect("apply PRAGMAs");
@@ -1285,8 +1285,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v5_fts.db");
-        let conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Apply all migrations (creates schema + FTS with porter tokenizer).
         block_on({
@@ -1385,8 +1385,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("v7_fts_identity.db");
-        let conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Simulate a pre-v7 DB: identity tables exist, but there are no fts_agents/fts_projects.
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -1511,8 +1511,8 @@ mod tests {
     fn corrupted_migrations_table_yields_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("migrations_corrupt.db");
-        let conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open sqlite connection");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
 
         // Create a tracking table with the right name but wrong schema.
         conn.execute_sync(

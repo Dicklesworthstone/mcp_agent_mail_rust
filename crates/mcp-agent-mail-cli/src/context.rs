@@ -254,7 +254,9 @@ pub fn resolve_bool(primary: bool, negated: bool, default: bool) -> bool {
 
 // ── Internal helpers ────────────────────────────────────────────────────
 
-fn open_conn(cfg: &DbPoolConfig) -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
+fn open_conn(
+    cfg: &DbPoolConfig,
+) -> CliResult<mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection> {
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;

@@ -155,6 +155,17 @@ pub fn is_lock_error(msg: &str) -> bool {
         || lower.contains("locked")
         || lower.contains("unable to open database")
         || lower.contains("disk i/o error")
+        || is_mvcc_conflict(msg)
+}
+
+/// Check whether an error message indicates an MVCC write conflict
+/// (frankensqlite `BEGIN CONCURRENT` page-level collision).
+#[must_use]
+pub fn is_mvcc_conflict(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("write conflict on page")
+        || lower.contains("serialization failure")
+        || lower.contains("snapshot too old")
 }
 
 /// Check whether an error message indicates pool exhaustion.
@@ -378,6 +389,37 @@ mod tests {
         assert!(!is_lock_error("syntax error"));
         assert!(!is_lock_error("table not found"));
         assert!(!is_lock_error(""));
+    }
+
+    // ── is_mvcc_conflict ────────────────────────────────────────────
+
+    #[test]
+    fn mvcc_conflict_patterns() {
+        assert!(is_mvcc_conflict(
+            "write conflict on page 42: held by transaction 7"
+        ));
+        assert!(is_mvcc_conflict(
+            "serialization failure: page 5 was modified after snapshot"
+        ));
+        assert!(is_mvcc_conflict(
+            "snapshot too old: transaction 3 is below GC horizon"
+        ));
+    }
+
+    #[test]
+    fn mvcc_conflict_is_retryable() {
+        let e = DbError::Sqlite("write conflict on page 42: held by transaction 7".into());
+        assert!(e.is_retryable());
+        let e2 =
+            DbError::Sqlite("serialization failure: page 5 was modified after snapshot".into());
+        assert!(e2.is_retryable());
+    }
+
+    #[test]
+    fn not_mvcc_conflict() {
+        assert!(!is_mvcc_conflict("syntax error"));
+        assert!(!is_mvcc_conflict("unique constraint violated"));
+        assert!(!is_mvcc_conflict(""));
     }
 
     // ── is_pool_exhausted_error ─────────────────────────────────────

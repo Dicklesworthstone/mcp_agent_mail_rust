@@ -181,8 +181,9 @@ else
     e2e_pass "send_message succeeded"
 fi
 
-MSG_ID="$(parse_json_field "$SEND_TEXT" "id")"
-if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "" ]; then
+# send_message returns {deliveries: [{payload: {id, ...}}], count}
+MSG_ID="$(parse_json_field "$SEND_TEXT" "deliveries.0.payload.id")"
+if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "" ] && [ "$MSG_ID" != "None" ]; then
     e2e_pass "send_message returned message id: $MSG_ID"
 else
     e2e_fail "send_message missing id"
@@ -235,9 +236,9 @@ e2e_assert_contains "ack_required=True" "$INBOX_CHECK" "ack_required=True"
 e2e_assert_contains "thread_id=PR-42" "$INBOX_CHECK" "thread_id=PR-42"
 
 # ===========================================================================
-# Case 3: fetch_inbox with limit=0
+# Case 3: fetch_inbox with limit=0 returns validation error
 # ===========================================================================
-e2e_case_banner "fetch_inbox with limit=0 returns empty"
+e2e_case_banner "fetch_inbox with limit=0 returns validation error"
 
 EMPTY_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "$INIT_REQ" \
@@ -245,16 +246,12 @@ EMPTY_RESP="$(send_jsonrpc_session "$MSG_DB" \
 )"
 e2e_save_artifact "case3_empty.txt" "$EMPTY_RESP"
 
-EMPTY_TEXT="$(extract_result "$EMPTY_RESP" 31)"
-EMPTY_COUNT="$(echo "$EMPTY_TEXT" | python3 -c "
-import sys, json
-try:
-    messages = json.loads(sys.stdin.read())
-    print(len(messages) if isinstance(messages, list) else 'not_list')
-except: print('error')
-" 2>/dev/null)"
-
-e2e_assert_eq "limit=0 returns 0 messages" "0" "$EMPTY_COUNT"
+EMPTY_ERROR="$(is_error_result "$EMPTY_RESP" 31)"
+if [ "$EMPTY_ERROR" = "true" ]; then
+    e2e_pass "limit=0 returns validation error as expected"
+else
+    e2e_fail "limit=0 should return an error but did not"
+fi
 
 # ===========================================================================
 # Case 4: acknowledge_message
@@ -296,14 +293,15 @@ else
     e2e_pass "reply_message succeeded"
 fi
 
-REPLY_SUBJ="$(parse_json_field "$REPLY_TEXT" "subject")"
-REPLY_THREAD="$(parse_json_field "$REPLY_TEXT" "thread_id")"
-REPLY_ID="$(parse_json_field "$REPLY_TEXT" "id")"
+# reply_message returns {deliveries: [{payload: {subject, thread_id, id, ...}}], count}
+REPLY_SUBJ="$(parse_json_field "$REPLY_TEXT" "deliveries.0.payload.subject")"
+REPLY_THREAD="$(parse_json_field "$REPLY_TEXT" "deliveries.0.payload.thread_id")"
+REPLY_ID="$(parse_json_field "$REPLY_TEXT" "deliveries.0.payload.id")"
 
 e2e_assert_contains "reply has Re: prefix" "$REPLY_SUBJ" "Re:"
 e2e_assert_eq "reply preserves thread_id" "PR-42" "$REPLY_THREAD"
 
-if [ -n "$REPLY_ID" ] && [ "$REPLY_ID" != "" ]; then
+if [ -n "$REPLY_ID" ] && [ "$REPLY_ID" != "" ] && [ "$REPLY_ID" != "None" ]; then
     e2e_pass "reply returned new message id: $REPLY_ID"
 else
     e2e_fail "reply missing id"

@@ -416,4 +416,229 @@ mod tests {
             );
         }
     }
+
+    // =========================================================================
+    // br-3h13.1.2: Display impl tests for every error variant
+    // =========================================================================
+
+    #[test]
+    fn test_display_not_found_variants() {
+        assert_eq!(
+            Error::ProjectNotFound("proj-a".into()).to_string(),
+            "Project not found: proj-a"
+        );
+        assert_eq!(
+            Error::AgentNotFound("BlueLake".into()).to_string(),
+            "Agent not found: BlueLake"
+        );
+        assert_eq!(
+            Error::MessageNotFound(42).to_string(),
+            "Message not found: 42"
+        );
+        assert_eq!(
+            Error::ThreadNotFound("TKT-1".into()).to_string(),
+            "Thread not found: TKT-1"
+        );
+        assert_eq!(
+            Error::ReservationNotFound(7).to_string(),
+            "File reservation not found: 7"
+        );
+        assert_eq!(
+            Error::ProductNotFound("p1".into()).to_string(),
+            "Product not found: p1"
+        );
+    }
+
+    #[test]
+    fn test_display_validation_variants() {
+        assert_eq!(
+            Error::InvalidArgument("bad arg".into()).to_string(),
+            "Invalid argument: bad arg"
+        );
+        assert_eq!(
+            Error::InvalidAgentName("Xyz".into()).to_string(),
+            "Invalid agent name: Xyz. Must be adjective+noun format (e.g., GreenLake)"
+        );
+        assert_eq!(
+            Error::InvalidThreadId("../evil".into()).to_string(),
+            "Invalid thread ID: ../evil. Must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        );
+        assert_eq!(
+            Error::InvalidProjectKey("relative".into()).to_string(),
+            "Invalid project key: relative. Must be absolute path"
+        );
+        assert_eq!(
+            Error::MissingField("sender_name".into()).to_string(),
+            "Missing required field: sender_name"
+        );
+        assert_eq!(
+            Error::TypeError("expected int".into()).to_string(),
+            "Type error: expected int"
+        );
+    }
+
+    #[test]
+    fn test_display_contact_auth_variants() {
+        assert_eq!(
+            Error::ContactRequired {
+                from: "A".into(),
+                to: "B".into(),
+            }
+            .to_string(),
+            "Contact required: A -> B"
+        );
+        assert_eq!(
+            Error::ContactBlocked {
+                from: "A".into(),
+                to: "B".into(),
+            }
+            .to_string(),
+            "Contact blocked: A -> B"
+        );
+        assert_eq!(
+            Error::CapabilityDenied("admin only".into()).to_string(),
+            "Capability denied: admin only"
+        );
+        assert_eq!(
+            Error::PermissionDenied("read-only".into()).to_string(),
+            "Permission denied: read-only"
+        );
+    }
+
+    #[test]
+    fn test_display_conflict_variants() {
+        assert_eq!(
+            Error::ReservationConflict {
+                pattern: "src/*.rs".into(),
+                holders: vec!["BlueLake".into(), "RedFox".into()],
+            }
+            .to_string(),
+            "File reservation conflict on pattern 'src/*.rs'. Held by: [\"BlueLake\", \"RedFox\"]"
+        );
+        assert_eq!(
+            Error::ResourceBusy("slot-1".into()).to_string(),
+            "Resource busy: slot-1"
+        );
+        assert_eq!(
+            Error::ResourceExhausted("connections".into()).to_string(),
+            "Resource exhausted: connections"
+        );
+    }
+
+    #[test]
+    fn test_display_database_variants() {
+        assert_eq!(
+            Error::Database("table locked".into()).to_string(),
+            "Database error: table locked"
+        );
+        assert_eq!(
+            Error::DatabasePoolExhausted.to_string(),
+            "Database pool exhausted"
+        );
+        assert_eq!(
+            Error::DatabaseLockTimeout.to_string(),
+            "Database lock timeout"
+        );
+    }
+
+    #[test]
+    fn test_display_git_archive_variants() {
+        assert_eq!(
+            Error::Git("merge conflict".into()).to_string(),
+            "Git error: merge conflict"
+        );
+        assert_eq!(
+            Error::GitIndexLock.to_string(),
+            "Git index lock held by another process"
+        );
+        assert_eq!(
+            Error::ArchiveLockTimeout("proj-x".into()).to_string(),
+            "Archive lock timeout for project: proj-x"
+        );
+    }
+
+    #[test]
+    fn test_display_io_variants() {
+        let io_err = Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        assert!(io_err.to_string().contains("gone"));
+
+        let json_err: serde_json::Error = serde_json::from_str::<i32>("nope").unwrap_err();
+        let ser_err = Error::Serialization(json_err);
+        assert!(ser_err.to_string().starts_with("Serialization error:"));
+    }
+
+    #[test]
+    fn test_display_timeout_variants() {
+        assert_eq!(
+            Error::Timeout("5s elapsed".into()).to_string(),
+            "Operation timed out: 5s elapsed"
+        );
+        assert_eq!(Error::Cancelled.to_string(), "Operation cancelled");
+    }
+
+    #[test]
+    fn test_display_connection_internal_variants() {
+        assert_eq!(
+            Error::Connection("refused".into()).to_string(),
+            "Connection error: refused"
+        );
+        assert_eq!(
+            Error::Internal("unexpected state".into()).to_string(),
+            "Internal error: unexpected state"
+        );
+    }
+
+    /// Verify that every error variant's Display output is non-empty.
+    #[test]
+    fn test_display_all_non_empty() {
+        let all_errors: Vec<Error> = vec![
+            Error::ProjectNotFound(String::new()),
+            Error::AgentNotFound(String::new()),
+            Error::MessageNotFound(0),
+            Error::ThreadNotFound(String::new()),
+            Error::ReservationNotFound(0),
+            Error::ProductNotFound(String::new()),
+            Error::InvalidArgument(String::new()),
+            Error::InvalidAgentName(String::new()),
+            Error::InvalidThreadId(String::new()),
+            Error::InvalidProjectKey(String::new()),
+            Error::MissingField(String::new()),
+            Error::TypeError(String::new()),
+            Error::ContactRequired {
+                from: String::new(),
+                to: String::new(),
+            },
+            Error::ContactBlocked {
+                from: String::new(),
+                to: String::new(),
+            },
+            Error::CapabilityDenied(String::new()),
+            Error::PermissionDenied(String::new()),
+            Error::ReservationConflict {
+                pattern: String::new(),
+                holders: vec![],
+            },
+            Error::ResourceBusy(String::new()),
+            Error::ResourceExhausted(String::new()),
+            Error::Database(String::new()),
+            Error::DatabasePoolExhausted,
+            Error::DatabaseLockTimeout,
+            Error::Git(String::new()),
+            Error::GitIndexLock,
+            Error::ArchiveLockTimeout(String::new()),
+            Error::Io(std::io::Error::other("")),
+            Error::Serialization(serde_json::from_str::<i32>("x").unwrap_err()),
+            Error::Timeout(String::new()),
+            Error::Cancelled,
+            Error::Connection(String::new()),
+            Error::Internal(String::new()),
+        ];
+        for err in &all_errors {
+            let display = err.to_string();
+            assert!(
+                !display.is_empty(),
+                "Error {err:?} should have non-empty Display"
+            );
+        }
+    }
 }

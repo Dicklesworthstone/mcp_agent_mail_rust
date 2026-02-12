@@ -60,10 +60,8 @@ pub fn apply_project_scope(
     identifiers: &[String],
 ) -> Result<ProjectScopeResult, ShareError> {
     let path_str = snapshot_path.display().to_string();
-    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| {
-        ShareError::Sqlite {
-            message: format!("cannot open snapshot {path_str}: {e}"),
-        }
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot {path_str}: {e}"),
     })?;
 
     // Enable foreign keys
@@ -164,7 +162,7 @@ pub fn apply_project_scope(
     let placeholders = build_placeholders(matched_ids.len());
     let id_values: Vec<Value> = matched_ids.iter().map(|&id| Value::BigInt(id)).collect();
 
-    conn.execute_sync("BEGIN CONCURRENT", &[])
+    conn.execute_sync("BEGIN IMMEDIATE", &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("BEGIN transaction failed: {e}"),
         })?;
@@ -310,11 +308,7 @@ fn table_exists(conn: &mcp_agent_mail_db::DbConn, name: &str) -> Result<bool, Sh
 }
 
 /// Execute a statement with parameters, mapping errors to [`ShareError`].
-fn exec(
-    conn: &mcp_agent_mail_db::DbConn,
-    sql: &str,
-    params: &[Value],
-) -> Result<u64, ShareError> {
+fn exec(conn: &mcp_agent_mail_db::DbConn, sql: &str, params: &[Value]) -> Result<u64, ShareError> {
     conn.execute_sync(sql, params)
         .map_err(|e| ShareError::Sqlite {
             message: format!("SQL exec failed: {e}"),
@@ -322,9 +316,7 @@ fn exec(
 }
 
 /// Count remaining rows in all relevant tables.
-fn count_remaining(
-    conn: &mcp_agent_mail_db::DbConn,
-) -> Result<RemainingCounts, ShareError> {
+fn count_remaining(conn: &mcp_agent_mail_db::DbConn) -> Result<RemainingCounts, ShareError> {
     Ok(RemainingCounts {
         projects: count_table(conn, "projects")?,
         agents: count_table(conn, "agents")?,
@@ -362,10 +354,7 @@ fn count_table(conn: &mcp_agent_mail_db::DbConn, table: &str) -> Result<i64, Sha
         .unwrap_or(0))
 }
 
-fn count_if_exists(
-    conn: &mcp_agent_mail_db::DbConn,
-    table: &str,
-) -> Result<i64, ShareError> {
+fn count_if_exists(conn: &mcp_agent_mail_db::DbConn, table: &str) -> Result<i64, ShareError> {
     if table_exists(conn, table)? {
         count_table(conn, table)
     } else {
@@ -380,8 +369,7 @@ mod tests {
 
     fn create_test_db(dir: &Path) -> PathBuf {
         let db_path = dir.join("test.sqlite3");
-        let conn =
-            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

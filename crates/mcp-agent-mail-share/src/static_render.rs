@@ -17,9 +17,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value as SqlValue;
-use mcp_agent_mail_db::DbConn;
 
 use crate::{ExportRedactionPolicy, RedactionAuditLog, RedactionReason, ShareError, ShareResult};
 
@@ -487,10 +487,7 @@ fn discover_projects(conn: &DbConn) -> ShareResult<Vec<ProjectInfo>> {
     Ok(projects)
 }
 
-fn discover_messages(
-    conn: &DbConn,
-    config: &StaticRenderConfig,
-) -> ShareResult<Vec<MessageInfo>> {
+fn discover_messages(conn: &DbConn, config: &StaticRenderConfig) -> ShareResult<Vec<MessageInfo>> {
     // Fetch messages joined with sender agent and project
     let rows = conn
         .query_sync(

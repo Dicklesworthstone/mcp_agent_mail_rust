@@ -2084,8 +2084,7 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
             no_user_config,
             no_hooks,
         } => {
-            let pdir = project_dir
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let pdir = project_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let env_file = pdir.join(".env");
 
             // Resolve token
@@ -2093,7 +2092,9 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
 
             // Parse agent filter
             let agents = match agent {
-                Some(a) => Some(setup::parse_agent_list(&a).map_err(|e| CliError::Other(e.to_string()))?),
+                Some(a) => {
+                    Some(setup::parse_agent_list(&a).map_err(|e| CliError::Other(e.to_string()))?)
+                }
                 None => None,
             };
 
@@ -2103,15 +2104,16 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 include_undetected: false,
                 root_overrides: Vec::new(),
             };
-            let detected_slugs: Vec<String> = match mcp_agent_mail_core::detect_installed_agents(&detect_opts) {
-                Ok(report) => report
-                    .installed_agents
-                    .iter()
-                    .filter(|e| e.detected)
-                    .map(|e| e.slug.clone())
-                    .collect(),
-                Err(_) => Vec::new(),
-            };
+            let detected_slugs: Vec<String> =
+                match mcp_agent_mail_core::detect_installed_agents(&detect_opts) {
+                    Ok(report) => report
+                        .installed_agents
+                        .iter()
+                        .filter(|e| e.detected)
+                        .map(|e| e.slug.clone())
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
 
             // Resolve project identity for hooks
             let pdir_str = pdir.display().to_string();
@@ -2126,7 +2128,7 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 if !json {
                     output::warn(
                         "AGENT_MAIL_AGENT not set — skipping Claude Code hook installation. \
-                         Set the env var or use --no-hooks to suppress this warning."
+                         Set the env var or use --no-hooks to suppress this warning.",
                     );
                 }
                 true
@@ -2154,7 +2156,9 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 if json {
                     ftui_runtime::ftui_println!("[]");
                 } else {
-                    output::warn("No coding agents detected. Use --agent to specify agents manually.");
+                    output::warn(
+                        "No coding agents detected. Use --agent to specify agents manually.",
+                    );
                 }
                 return Ok(());
             }
@@ -2274,7 +2278,11 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 ftui_runtime::ftui_println!("");
 
                 let mut table = output::CliTable::new(vec![
-                    "AGENT", "DETECTED", "CONFIG", "SERVER ENTRY", "URL OK",
+                    "AGENT",
+                    "DETECTED",
+                    "CONFIG",
+                    "SERVER ENTRY",
+                    "URL OK",
                 ]);
                 for status in &statuses {
                     let detected_str = if status.detected { "yes" } else { "no" };
@@ -3759,7 +3767,7 @@ fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
 
-    let conn = DbConn::open_file(&path)
+    let conn = SqliteConnection::open_file(&path)
         .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
     conn.execute_raw(schema::PRAGMA_SETTINGS_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply PRAGMAs: {e}")))?;
@@ -7624,8 +7632,10 @@ sys.exit(7)
 
         handle_migrate_with_database_url(&url).unwrap();
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
-            .expect("reopen");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("reopen");
         let tables = conn
             .query_sync(
                 "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
@@ -7676,8 +7686,10 @@ sys.exit(7)
 
         handle_migrate_with_database_url(&url).unwrap();
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
-            .expect("reopen");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("reopen");
         let tables = conn
             .query_sync(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%' ORDER BY name",
@@ -7799,8 +7811,10 @@ sys.exit(7)
     }
 
     fn seed_mailbox_db(db_path: &Path) {
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
-            .expect("open test sqlite db");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open test sqlite db");
         conn.execute_raw(
             "CREATE TABLE projects (\
                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -8083,8 +8097,10 @@ sys.exit(7)
         );
 
         // Restored DB should contain only the scoped project.
-        let restored_conn =
-            mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(restore_db.display().to_string()).unwrap();
+        let restored_conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            restore_db.display().to_string(),
+        )
+        .unwrap();
         let rows = restored_conn
             .query_sync("SELECT slug FROM projects ORDER BY id", &[])
             .unwrap();
@@ -8277,8 +8293,10 @@ sys.exit(7)
         let proj_beta_key = proj_beta_dir.canonicalize().unwrap().display().to_string();
 
         let db_path = root.path().join("mailbox.sqlite3");
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
-            .expect("open products test sqlite db");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open products test sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
 
@@ -8526,8 +8544,10 @@ sys.exit(7)
         assert_eq!(ensure_json["name"].as_str(), Some("My Product"));
 
         // Normalize created_at for stable snapshots.
-        let conn =
-            mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .unwrap();
         conn.execute_sync(
             "UPDATE products SET created_at = ? WHERE product_uid = ?",
             &[
@@ -11041,11 +11061,15 @@ sys.exit(7)
     }
 
     /// Helper: seed a DB with projects, agents, messages, and file_reservations for CLI tests.
-    fn seed_acks_and_reservations_db(db_path: &Path) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
+    fn seed_acks_and_reservations_db(
+        db_path: &Path,
+    ) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
 
@@ -11642,8 +11666,10 @@ sys.exit(7)
     ) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
 
@@ -11826,8 +11852,10 @@ sys.exit(7)
     ) -> mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 
-        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
-            .expect("open sqlite db");
+        let conn = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(
+            db_path.display().to_string(),
+        )
+        .expect("open sqlite db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
             .expect("init schema");
 

@@ -16,8 +16,8 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers};
 use ftui_runtime::program::Cmd;
 
-use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_bridge::TuiSharedState;
@@ -793,11 +793,7 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
 }
 
 /// Fetch all messages in a thread, sorted chronologically.
-fn fetch_thread_messages(
-    conn: &DbConn,
-    thread_id: &str,
-    limit: usize,
-) -> Vec<ThreadMessage> {
+fn fetch_thread_messages(conn: &DbConn, thread_id: &str, limit: usize) -> Vec<ThreadMessage> {
     let escaped = thread_id.replace('\'', "''");
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.importance, m.created_ts, \
@@ -1801,7 +1797,11 @@ mod tests {
         let s = "ab→cd🔥éf";
         for max in 1..=s.chars().count() + 2 {
             let r = truncate_str(s, max);
-            assert!(r.chars().count() <= max, "max={max} got {}", r.chars().count());
+            assert!(
+                r.chars().count() <= max,
+                "max={max} got {}",
+                r.chars().count()
+            );
         }
     }
 }

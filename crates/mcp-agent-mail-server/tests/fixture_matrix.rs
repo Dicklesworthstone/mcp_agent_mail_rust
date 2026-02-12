@@ -141,12 +141,7 @@ fn insert_message(
     .expect("insert message");
 }
 
-fn insert_recipient(
-    conn: &mcp_agent_mail_db::DbConn,
-    message_id: i64,
-    agent_id: i64,
-    kind: &str,
-) {
+fn insert_recipient(conn: &mcp_agent_mail_db::DbConn, message_id: i64, agent_id: i64, kind: &str) {
     conn.execute_sync(
         "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
         &[
@@ -699,11 +694,7 @@ fn fixture_seed_performance() {
     // Verify all scenarios seed within reasonable time budgets.
     let env = FixtureEnv::new();
 
-    let scenarios: Vec<(
-        &str,
-        Box<dyn FnOnce(&mcp_agent_mail_db::DbConn)>,
-        u64,
-    )> = vec![
+    let scenarios: Vec<(&str, Box<dyn FnOnce(&mcp_agent_mail_db::DbConn)>, u64)> = vec![
         ("baseline", Box::new(seed_baseline), 100),
         ("multi_project", Box::new(seed_multi_project), 200),
         ("contention", Box::new(seed_contention), 200),

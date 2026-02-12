@@ -477,8 +477,7 @@ mod tests {
     /// Create a test DB with the standard schema.
     fn create_test_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test_finalize.sqlite3");
-        let conn =
-            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
 
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
@@ -818,8 +817,7 @@ mod tests {
         assert!(fts_ok);
 
         // Verify the virtual table schema matches
-        let conn =
-            mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT sql FROM sqlite_master WHERE name = 'fts_messages'",
@@ -855,8 +853,7 @@ mod tests {
         assert!(views.contains(&"attachments_by_message_mv".to_string()));
 
         // Verify overview has expected columns
-        let conn =
-            mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
         let rows = conn
             .query_sync("PRAGMA table_info(message_overview_mv)", &[])
             .unwrap();

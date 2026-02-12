@@ -1626,8 +1626,13 @@ mod tests {
         DbMetricsSnapshot, GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
         StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot,
     };
+    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
+
+    /// Tests that use global `SAMPLE_BUFFER` (`reset_samples` / `record_sample` / `sample_count`)
+    /// must hold this lock to prevent races with parallel test threads.
+    static GLOBAL_SAMPLE_LOCK: Mutex<()> = Mutex::new(());
 
     fn zero_histogram() -> HistogramSnapshot {
         HistogramSnapshot {
@@ -2109,6 +2114,10 @@ mod tests {
 
     #[test]
     fn record_and_snapshot_integration() {
+        let _lock = GLOBAL_SAMPLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         // Use the global sample buffer.
         reset_samples();
         assert_eq!(sample_count(), 0);
@@ -2171,6 +2180,10 @@ mod tests {
 
     #[test]
     fn latest_raw_returns_metrics() {
+        let _lock = GLOBAL_SAMPLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         reset_samples();
         assert!(latest_raw().is_none());
 

@@ -124,10 +124,8 @@ pub fn scrub_snapshot(
 ) -> Result<ScrubSummary, ShareError> {
     let cfg = preset_config(preset);
     let path_str = snapshot_path.display().to_string();
-    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| {
-        ShareError::Sqlite {
-            message: format!("cannot open snapshot {path_str}: {e}"),
-        }
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot {path_str}: {e}"),
     })?;
 
     conn.execute_raw("PRAGMA foreign_keys = ON")
@@ -135,7 +133,7 @@ pub fn scrub_snapshot(
             message: format!("PRAGMA foreign_keys failed: {e}"),
         })?;
 
-    conn.execute_raw("BEGIN CONCURRENT")
+    conn.execute_raw("BEGIN IMMEDIATE")
         .map_err(|e| ShareError::Sqlite {
             message: format!("BEGIN transaction failed: {e}"),
         })?;
@@ -581,8 +579,7 @@ mod tests {
         }
 
         // Verify message content
-        let conn =
-            mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_file(snapshot.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT id, subject, body_md, ack_required, attachments FROM messages ORDER BY id",
@@ -633,8 +630,7 @@ mod tests {
 
     fn create_fixture_db(dir: &std::path::Path) -> std::path::PathBuf {
         let db_path = dir.join("test.sqlite3");
-        let conn =
-            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
         )

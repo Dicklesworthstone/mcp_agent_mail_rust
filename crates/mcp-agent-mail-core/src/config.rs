@@ -56,6 +56,14 @@ pub struct Config {
     /// Hours between periodic full `PRAGMA integrity_check` runs (default: 24, 0 = disabled).
     pub integrity_check_interval_hours: u64,
 
+    // FrankenSQLite MVCC / RaptorQ
+    /// Auto-promote bare `BEGIN` to `BEGIN CONCURRENT` (default: true).
+    pub fsqlite_concurrent_mode: bool,
+    /// Enable `RaptorQ` erasure-coded self-healing on WAL + DB files (default: true).
+    pub fsqlite_raptorq_enabled: bool,
+    /// Max retries on MVCC page-level conflict at COMMIT (default: 5).
+    pub fsqlite_concurrent_retries: u64,
+
     // Storage
     pub storage_root: PathBuf,
     pub git_author_name: String,
@@ -380,6 +388,10 @@ impl Default for Config {
             integrity_check_on_startup: true,
             integrity_check_interval_hours: 24,
 
+            fsqlite_concurrent_mode: true,
+            fsqlite_raptorq_enabled: true,
+            fsqlite_concurrent_retries: 5,
+
             // Storage
             storage_root: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -685,6 +697,16 @@ impl Config {
         config.integrity_check_interval_hours = env_u64(
             "INTEGRITY_CHECK_INTERVAL_HOURS",
             config.integrity_check_interval_hours,
+        );
+
+        // FrankenSQLite MVCC / RaptorQ
+        config.fsqlite_concurrent_mode =
+            env_bool("FSQLITE_CONCURRENT_MODE", config.fsqlite_concurrent_mode);
+        config.fsqlite_raptorq_enabled =
+            env_bool("FSQLITE_RAPTORQ_ENABLED", config.fsqlite_raptorq_enabled);
+        config.fsqlite_concurrent_retries = env_u64(
+            "FSQLITE_CONCURRENT_RETRIES",
+            config.fsqlite_concurrent_retries,
         );
 
         // Storage

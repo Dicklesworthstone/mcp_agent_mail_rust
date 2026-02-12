@@ -14,6 +14,7 @@ use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
 
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
     DocKind, Importance, RankingMode, SearchQuery, plan_search,
@@ -23,7 +24,6 @@ use mcp_agent_mail_db::search_recipes::{
     list_recent_history, list_recipes, touch_recipe,
 };
 use mcp_agent_mail_db::sqlmodel::Value;
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 
 use crate::tui_bridge::TuiSharedState;
@@ -741,12 +741,7 @@ impl SearchCockpitScreen {
     }
 
     /// Run a search for a single doc kind using sync queries.
-    fn run_kind_search(
-        &mut self,
-        conn: &DbConn,
-        kind: DocKind,
-        raw: &str,
-    ) -> Vec<ResultEntry> {
+    fn run_kind_search(&mut self, conn: &DbConn, kind: DocKind, raw: &str) -> Vec<ResultEntry> {
         match kind {
             DocKind::Message => self.search_messages(conn, raw),
             DocKind::Agent => Self::search_agents(conn, raw),
@@ -3056,7 +3051,11 @@ mod tests {
         let s = "hello→world🔥test";
         for max in 1..=s.chars().count() {
             let r = truncate_str(s, max);
-            assert!(r.chars().count() <= max, "max={max} got {}", r.chars().count());
+            assert!(
+                r.chars().count() <= max,
+                "max={max} got {}",
+                r.chars().count()
+            );
         }
     }
 

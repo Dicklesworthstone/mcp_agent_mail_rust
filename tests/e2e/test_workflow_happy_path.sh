@@ -251,8 +251,9 @@ else
     e2e_pass "send_message succeeded"
 fi
 
-MSG_ID="$(parse_json_field "$SEND_TEXT" "id")"
-if [ -n "$MSG_ID" ]; then
+# send_message returns {deliveries: [{project, payload: {id, ...}}], count}
+MSG_ID="$(parse_json_field "$SEND_TEXT" "deliveries.0.payload.id")"
+if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "None" ]; then
     e2e_pass "send_message returned message id: $MSG_ID"
 else
     e2e_fail "send_message missing id in response"
@@ -275,7 +276,7 @@ try:
     if isinstance(messages, list):
         count = len(messages)
         subjects = [m.get('subject', '') for m in messages]
-        senders = [m.get('from_agent', '') for m in messages]
+        senders = [m.get('from', '') for m in messages]
         bodies = [m.get('body_md', '') for m in messages]
         has_target = any('Implementation update' in s for s in subjects)
         has_sender = 'RedFox' in senders
@@ -337,13 +338,14 @@ else
     e2e_pass "reply_message succeeded"
 fi
 
-REPLY_SUBJ="$(parse_json_field "$REPLY_TEXT" "subject")"
-REPLY_THREAD="$(parse_json_field "$REPLY_TEXT" "thread_id")"
+# reply_message returns {deliveries: [{payload: {subject, thread_id, id, ...}}], count}
+REPLY_SUBJ="$(parse_json_field "$REPLY_TEXT" "deliveries.0.payload.subject")"
+REPLY_THREAD="$(parse_json_field "$REPLY_TEXT" "deliveries.0.payload.thread_id")"
 e2e_assert_contains "reply has Re: prefix" "$REPLY_SUBJ" "Re:"
 e2e_assert_eq "reply preserves thread_id" "FEAT-42" "$REPLY_THREAD"
 
-REPLY_ID="$(parse_json_field "$REPLY_TEXT" "id")"
-if [ -n "$REPLY_ID" ]; then
+REPLY_ID="$(parse_json_field "$REPLY_TEXT" "deliveries.0.payload.id")"
+if [ -n "$REPLY_ID" ] && [ "$REPLY_ID" != "None" ]; then
     e2e_pass "reply returned message id: $REPLY_ID"
 else
     e2e_fail "reply missing id"
@@ -416,7 +418,7 @@ try:
     msgs = d if isinstance(d, list) else d.get('messages', d.get('thread', []))
     if isinstance(msgs, list):
         count = len(msgs)
-        senders = [m.get('from_agent', '') for m in msgs if isinstance(m, dict)]
+        senders = [m.get('from', m.get('from_agent', '')) for m in msgs if isinstance(m, dict)]
         print(f'count={count}|senders={\",\".join(senders)}')
     else:
         print(f'unexpected_type={type(msgs).__name__}')

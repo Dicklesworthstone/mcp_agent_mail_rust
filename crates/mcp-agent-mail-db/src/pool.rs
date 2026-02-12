@@ -2,6 +2,7 @@
 //!
 //! Uses `sqlmodel_pool` for efficient connection management.
 
+use crate::DbConn;
 use crate::error::{DbError, DbResult};
 use crate::integrity;
 use crate::schema;
@@ -14,7 +15,6 @@ use mcp_agent_mail_core::{
 };
 use sqlmodel_core::Error as SqlError;
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
-use crate::DbConn;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

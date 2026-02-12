@@ -8,10 +8,10 @@
 //! Both tables use microsecond `i64` timestamps consistent with the rest of
 //! the crate.
 
+use crate::DbConn;
 use serde::{Deserialize, Serialize};
 use sqlmodel::Row;
 use sqlmodel_schema::Migration;
-use crate::DbConn;
 
 use crate::timestamps::now_micros;
 
@@ -453,10 +453,7 @@ pub fn insert_history(conn: &DbConn, entry: &QueryHistoryEntry) -> Result<i64, S
 }
 
 /// List recent query history, newest first.
-pub fn list_recent_history(
-    conn: &DbConn,
-    limit: usize,
-) -> Result<Vec<QueryHistoryEntry>, String> {
+pub fn list_recent_history(conn: &DbConn, limit: usize) -> Result<Vec<QueryHistoryEntry>, String> {
     let sql = "SELECT id, query_text, doc_kind, scope_mode, scope_id, \
         result_count, executed_ts \
         FROM query_history \

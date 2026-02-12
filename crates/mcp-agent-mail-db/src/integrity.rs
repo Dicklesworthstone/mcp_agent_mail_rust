@@ -16,9 +16,9 @@
 //! - Returns an `IntegrityCorruption` error so callers can set health to Red.
 //! - Optionally attempts recovery via `VACUUM INTO` to create a clean copy.
 
+use crate::DbConn;
 use crate::error::{DbError, DbResult};
 use sqlmodel_core::{Row, Value};
-use crate::DbConn;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -131,11 +131,7 @@ pub fn full_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
     run_check(conn, "PRAGMA integrity_check", CheckKind::Full)
 }
 
-fn run_check(
-    conn: &DbConn,
-    pragma: &str,
-    kind: CheckKind,
-) -> DbResult<IntegrityCheckResult> {
+fn run_check(conn: &DbConn, pragma: &str, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
     let start = std::time::Instant::now();
 
     let rows: Vec<Row> = conn
