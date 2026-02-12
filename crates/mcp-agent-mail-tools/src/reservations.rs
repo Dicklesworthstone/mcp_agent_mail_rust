@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::messaging::try_write_message_archive;
+use crate::messaging::{enqueue_message_semantic_index, try_write_message_archive};
 use crate::pattern_overlap::CompiledPattern;
 use crate::reservation_index::{ReservationIndex, ReservationRef};
 use crate::tool_util::{
@@ -736,6 +736,12 @@ pub async fn force_release_file_reservation(
         match result {
             asupersync::Outcome::Ok(message) => {
                 let message_id = message.id.unwrap_or(0);
+                enqueue_message_semantic_index(
+                    project_id,
+                    message_id,
+                    &message.subject,
+                    &message.body_md,
+                );
                 let all_recipient_names = vec![holder_agent.name.clone()];
                 let msg_json = serde_json::json!({
                     "id": message_id,

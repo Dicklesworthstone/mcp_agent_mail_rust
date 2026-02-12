@@ -57,6 +57,30 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
     }
 }
 
+fn enqueue_project_semantic_index(project: &mcp_agent_mail_db::ProjectRow) {
+    let project_id = project.id.unwrap_or(0);
+    let _ = mcp_agent_mail_db::search_service::enqueue_semantic_document(
+        mcp_agent_mail_db::search_planner::DocKind::Project,
+        project_id,
+        Some(project_id),
+        &project.slug,
+        &project.human_key,
+    );
+}
+
+fn enqueue_agent_semantic_index(agent: &mcp_agent_mail_db::AgentRow) {
+    let _ = mcp_agent_mail_db::search_service::enqueue_semantic_document(
+        mcp_agent_mail_db::search_planner::DocKind::Agent,
+        agent.id.unwrap_or(0),
+        Some(agent.project_id),
+        &agent.name,
+        &format!(
+            "{}\n{}\n{}",
+            agent.program, agent.model, agent.task_description
+        ),
+    );
+}
+
 /// Health check response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckResponse {
@@ -406,6 +430,7 @@ Check that all parameters have valid values."
     let row = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::ensure_project(ctx.cx(), &pool, &human_key).await,
     )?;
+    enqueue_project_semantic_index(&row);
 
     // Ensure the git archive directory exists for this project
     if let Err(e) = mcp_agent_mail_storage::ensure_archive(config, &row.slug) {
@@ -533,6 +558,7 @@ Check that all parameters have valid values."
     .await;
 
     let row = db_outcome_to_mcp_result(agent_out)?;
+    enqueue_agent_semantic_index(&row);
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);
@@ -703,6 +729,7 @@ Choose a different name (or omit the name to auto-generate one)."
             )));
         }
     };
+    enqueue_agent_semantic_index(&row);
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);

@@ -10,7 +10,9 @@ use fastmcp::prelude::*;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 
-use crate::messaging::try_write_message_archive;
+use crate::messaging::{
+    enqueue_agent_semantic_index, enqueue_message_semantic_index, try_write_message_archive,
+};
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
 };
@@ -144,7 +146,9 @@ async fn resolve_or_register_sender(
                 Some("auto"),
             )
             .await;
-            Ok(db_outcome_to_mcp_result(out)?)
+            let row = db_outcome_to_mcp_result(out)?;
+            enqueue_agent_semantic_index(&row);
+            Ok(row)
         }
     }
 }
@@ -254,6 +258,12 @@ pub async fn request_contact(
         )
         .await,
     )?;
+    enqueue_message_semantic_index(
+        project_id,
+        message.id.unwrap_or(0),
+        &message.subject,
+        &message.body_md,
+    );
 
     // Write message to archive
     let config = mcp_agent_mail_core::Config::get();

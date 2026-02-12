@@ -60,6 +60,34 @@ pub fn try_write_message_archive(
     }
 }
 
+pub(crate) fn enqueue_message_semantic_index(
+    project_id: i64,
+    message_id: i64,
+    subject: &str,
+    body_md: &str,
+) {
+    let _ = mcp_agent_mail_db::search_service::enqueue_semantic_document(
+        mcp_agent_mail_db::search_planner::DocKind::Message,
+        message_id,
+        Some(project_id),
+        subject,
+        body_md,
+    );
+}
+
+pub(crate) fn enqueue_agent_semantic_index(agent: &mcp_agent_mail_db::AgentRow) {
+    let _ = mcp_agent_mail_db::search_service::enqueue_semantic_document(
+        mcp_agent_mail_db::search_planner::DocKind::Agent,
+        agent.id.unwrap_or(0),
+        Some(agent.project_id),
+        &agent.name,
+        &format!(
+            "{}\n{}\n{}",
+            agent.program, agent.model, agent.task_description
+        ),
+    );
+}
+
 async fn resolve_or_register_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -68,7 +96,9 @@ async fn resolve_or_register_agent(
     sender: &mcp_agent_mail_db::AgentRow,
     config: &Config,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
-    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await {
+    let agent = match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name)
+        .await
+    {
         Outcome::Ok(agent) => Ok(agent),
         Outcome::Err(DbError::NotFound { .. }) if config.messaging_auto_register_recipients => {
             let _ = db_outcome_to_mcp_result(
@@ -94,7 +124,9 @@ async fn resolve_or_register_agent(
             "Internal panic: {}",
             p.message()
         ))),
-    }
+    }?;
+    enqueue_agent_semantic_index(&agent);
+    Ok(agent)
 }
 
 /// Validate `thread_id` format: must start with alphanumeric and contain only
@@ -992,6 +1024,7 @@ effective_free_bytes={free}"
     )?;
 
     let message_id = message.id.unwrap_or(0);
+    enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
 
     // Emit notification signals for to/cc recipients only (never bcc).
     //
@@ -1290,6 +1323,7 @@ effective_free_bytes={free}"
     )?;
 
     let reply_id = reply.id.unwrap_or(0);
+    enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
 
     // Emit notification signals for to/cc recipients only (never bcc).
     // Mirrors the send_message notification logic for parity with Python.
