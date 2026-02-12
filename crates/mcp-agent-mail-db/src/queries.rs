@@ -814,7 +814,7 @@ pub async fn list_projects(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, D
 // =============================================================================
 
 /// Register or update an agent
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn register_agent(
     cx: &Cx,
     pool: &DbPool,
@@ -1200,14 +1200,14 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
 
     // Batch all updates in a single transaction.
     match begin_concurrent_tx(cx, &tracked).await {
-        Outcome::Ok(_) => {}
+        Outcome::Ok(()) => {}
         other => {
             re_enqueue_touches(&pending);
             return match other {
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
-                Outcome::Ok(_) => unreachable!(),
+                Outcome::Ok(()) => unreachable!(),
             };
         }
     }

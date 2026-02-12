@@ -681,6 +681,7 @@ fn is_corruption_error_message(message: &str) -> bool {
         || lower.contains("file is not a database")
 }
 
+#[allow(clippy::result_large_err)]
 fn sqlite_quick_check_is_ok(conn: &sqlmodel_sqlite::SqliteConnection) -> Result<bool, SqlError> {
     let rows = conn.query_sync("PRAGMA quick_check", &[])?;
     let mut details: Vec<String> = Vec::with_capacity(rows.len());
@@ -700,6 +701,7 @@ fn sqlite_quick_check_is_ok(conn: &sqlmodel_sqlite::SqliteConnection) -> Result<
     Ok(details.len() == 1 && details[0] == "ok")
 }
 
+#[allow(clippy::result_large_err)]
 fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     if !path.exists() {
         return Ok(true);
@@ -792,6 +794,7 @@ fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
     None
 }
 
+#[allow(clippy::result_large_err)]
 fn quarantine_sidecar(primary_path: &Path, suffix: &str, timestamp: &str) -> Result<(), SqlError> {
     let mut source_os = primary_path.as_os_str().to_os_string();
     source_os.push(suffix);
@@ -812,6 +815,7 @@ fn quarantine_sidecar(primary_path: &Path, suffix: &str, timestamp: &str) -> Res
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), SqlError> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let base_name = primary_path
@@ -860,6 +864,7 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     if sqlite_file_is_healthy(primary_path)? {
         return Ok(());

@@ -956,6 +956,7 @@ fn base_trigger_cleanup_migrations() -> Vec<Migration> {
 /// This is intentionally separate from migration history so servers can recover
 /// from DB files that were later touched by full/CLI migrations and reintroduced
 /// incompatible FTS identity objects.
+#[allow(clippy::result_large_err)]
 pub fn enforce_base_mode_cleanup(conn: &SqliteConnection) -> std::result::Result<(), SqlError> {
     for migration in base_trigger_cleanup_migrations() {
         conn.execute_raw(&migration.up)?;
@@ -1272,6 +1273,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn enforce_base_mode_cleanup_drops_identity_fts_objects() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("base_cleanup_identity_fts.db");
