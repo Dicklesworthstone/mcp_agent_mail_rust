@@ -1990,6 +1990,657 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
     false
 }
 
+// ── Timeline command implementation ─────────────────────────────────────────
+
+fn build_timeline(
+    conn: &SqliteConnection,
+    project_id: i64,
+    since: Option<&str>,
+    kind_filter: Option<&str>,
+    source_filter: Option<&str>,
+) -> Result<Vec<TimelineEvent>, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+
+    // Default "since" to 24h ago
+    let since_us = if let Some(s) = since {
+        mcp_agent_mail_db::iso_to_micros(s)
+            .map_err(|e| CliError::InvalidArgument(format!("invalid --since timestamp: {e}")))?
+    } else {
+        now_us - 24 * 3600 * 1_000_000
+    };
+
+    let mut events: Vec<TimelineEvent> = Vec::new();
+
+    // Message events
+    if kind_filter.is_none() || kind_filter == Some("message") {
+        let msg_rows = conn
+            .query_sync(
+                "SELECT m.id, m.subject, m.created_ts, m.importance, a.name AS sender
+                 FROM messages m
+                 JOIN agents a ON a.id = m.sender_id
+                 WHERE m.project_id = ? AND m.created_ts > ?
+                 ORDER BY m.created_ts ASC",
+                &[Value::BigInt(project_id), Value::BigInt(since_us)],
+            )
+            .map_err(|e| CliError::Other(format!("timeline messages query: {e}")))?;
+
+        for row in &msg_rows {
+            let id: i64 = row.get_named("id").unwrap_or(0);
+            let subject: String = row.get_named("subject").unwrap_or_default();
+            let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+            let importance: String = row.get_named("importance").unwrap_or_default();
+            let sender: String = row.get_named("sender").unwrap_or_default();
+
+            if source_filter.is_some() && source_filter != Some(sender.as_str()) {
+                continue;
+            }
+
+            events.push(TimelineEvent {
+                seq: 0,
+                timestamp: mcp_agent_mail_db::micros_to_iso(created_ts),
+                kind: "message".to_string(),
+                summary: format!("#{id} [{importance}] {sender}: {}", truncate_str(&subject, 60)),
+                source: sender,
+            });
+        }
+    }
+
+    // Reservation events
+    if kind_filter.is_none() || kind_filter == Some("reservation") {
+        let res_rows = conn
+            .query_sync(
+                "SELECT fr.id, fr.path_pattern, fr.created_ts, fr.released_ts, a.name AS agent
+                 FROM file_reservations fr
+                 JOIN agents a ON a.id = fr.agent_id
+                 WHERE fr.project_id = ? AND (fr.created_ts > ? OR (fr.released_ts IS NOT NULL AND fr.released_ts > ?))
+                 ORDER BY fr.created_ts ASC",
+                &[
+                    Value::BigInt(project_id),
+                    Value::BigInt(since_us),
+                    Value::BigInt(since_us),
+                ],
+            )
+            .map_err(|e| CliError::Other(format!("timeline reservations query: {e}")))?;
+
+        for row in &res_rows {
+            let path: String = row.get_named("path_pattern").unwrap_or_default();
+            let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+            let released_ts: Option<i64> = row.get_named("released_ts").ok();
+            let agent: String = row.get_named("agent").unwrap_or_default();
+
+            if source_filter.is_some() && source_filter != Some(agent.as_str()) {
+                continue;
+            }
+
+            if created_ts > since_us {
+                events.push(TimelineEvent {
+                    seq: 0,
+                    timestamp: mcp_agent_mail_db::micros_to_iso(created_ts),
+                    kind: "reservation".to_string(),
+                    summary: format!("{agent} reserved {path}"),
+                    source: agent.clone(),
+                });
+            }
+            if let Some(rel_ts) = released_ts {
+                if rel_ts > since_us {
+                    events.push(TimelineEvent {
+                        seq: 0,
+                        timestamp: mcp_agent_mail_db::micros_to_iso(rel_ts),
+                        kind: "reservation".to_string(),
+                        summary: format!("{agent} released {path}"),
+                        source: agent.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Agent events (registration)
+    if kind_filter.is_none() || kind_filter == Some("agent") {
+        let agent_rows = conn
+            .query_sync(
+                "SELECT name, inception_ts, program
+                 FROM agents
+                 WHERE project_id = ? AND inception_ts > ?
+                 ORDER BY inception_ts ASC",
+                &[Value::BigInt(project_id), Value::BigInt(since_us)],
+            )
+            .map_err(|e| CliError::Other(format!("timeline agents query: {e}")))?;
+
+        for row in &agent_rows {
+            let name: String = row.get_named("name").unwrap_or_default();
+            let inception_ts: i64 = row.get_named("inception_ts").unwrap_or(0);
+            let program: String = row.get_named("program").unwrap_or_default();
+
+            if source_filter.is_some() && source_filter != Some(name.as_str()) {
+                continue;
+            }
+
+            events.push(TimelineEvent {
+                seq: 0,
+                timestamp: mcp_agent_mail_db::micros_to_iso(inception_ts),
+                kind: "agent".to_string(),
+                summary: format!("{name} registered ({program})"),
+                source: name,
+            });
+        }
+    }
+
+    // Sort by timestamp and assign sequence numbers
+    events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    for (i, ev) in events.iter_mut().enumerate() {
+        ev.seq = i + 1;
+    }
+
+    Ok(events)
+}
+
+// ── Overview command implementation ─────────────────────────────────────────
+
+fn build_overview(conn: &SqliteConnection) -> Result<Vec<OverviewProject>, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+
+    let rows = conn
+        .query_sync("SELECT id, slug FROM projects ORDER BY slug ASC", &[])
+        .map_err(|e| CliError::Other(format!("overview projects query: {e}")))?;
+
+    let mut projects = Vec::new();
+    for row in &rows {
+        let pid: i64 = row.get_named("id").unwrap_or(0);
+        let slug: String = row.get_named("slug").unwrap_or_default();
+
+        // Count unread messages across all agents in project
+        let unread: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM message_recipients mr
+                 JOIN messages m ON m.id = mr.message_id
+                 WHERE m.project_id = ? AND mr.read_ts IS NULL",
+                &[Value::BigInt(pid)],
+            )
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+
+        // Count urgent messages
+        let urgent: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM messages
+                 WHERE project_id = ? AND importance IN ('urgent', 'high')",
+                &[Value::BigInt(pid)],
+            )
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+
+        // Count ack-overdue
+        let ack_overdue: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM message_recipients mr
+                 JOIN messages m ON m.id = mr.message_id
+                 WHERE m.project_id = ? AND m.ack_required = 1 AND mr.ack_ts IS NULL",
+                &[Value::BigInt(pid)],
+            )
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+
+        // Count active reservations
+        let reservations: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM file_reservations
+                 WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ?",
+                &[Value::BigInt(pid), Value::BigInt(now_us)],
+            )
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+
+        projects.push(OverviewProject {
+            slug,
+            unread: unread as usize,
+            urgent: urgent as usize,
+            ack_overdue: ack_overdue as usize,
+            reservations: reservations as usize,
+        });
+    }
+
+    Ok(projects)
+}
+
+// ── Health command implementation ────────────────────────────────────────────
+
+fn build_health(conn: &SqliteConnection) -> Result<(Vec<HealthProbe>, Vec<AnomalyCard>), CliError> {
+    let mut probes = Vec::new();
+    let mut anomalies = Vec::new();
+
+    // DB connectivity probe
+    let start = std::time::Instant::now();
+    let db_ok = conn
+        .query_sync("SELECT 1 AS ok", &[])
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false);
+    let db_latency = start.elapsed().as_secs_f64() * 1000.0;
+    probes.push(HealthProbe {
+        name: "database".to_string(),
+        status: if db_ok { "ok" } else { "error" }.to_string(),
+        latency_ms: (db_latency * 100.0).round() / 100.0,
+        detail: if db_ok {
+            "SQLite responsive".to_string()
+        } else {
+            "Database query failed".to_string()
+        },
+    });
+    if !db_ok {
+        anomalies.push(AnomalyCard {
+            severity: "error".to_string(),
+            confidence: 1.0,
+            category: "database".to_string(),
+            headline: "Database not responding".to_string(),
+            rationale: "SELECT 1 probe failed".to_string(),
+            remediation: "Check database file permissions and disk space".to_string(),
+        });
+    }
+
+    // WAL mode probe
+    let wal_rows = conn
+        .query_sync("PRAGMA journal_mode", &[])
+        .unwrap_or_default();
+    let journal_mode: String = wal_rows
+        .first()
+        .and_then(|r| r.get_named("journal_mode").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    probes.push(HealthProbe {
+        name: "wal_mode".to_string(),
+        status: if journal_mode == "wal" { "ok" } else { "warn" }.to_string(),
+        latency_ms: 0.0,
+        detail: format!("journal_mode={journal_mode}"),
+    });
+    if journal_mode != "wal" {
+        anomalies.push(AnomalyCard {
+            severity: "warn".to_string(),
+            confidence: 0.9,
+            category: "database".to_string(),
+            headline: format!("Database not in WAL mode (journal_mode={journal_mode})"),
+            rationale: "WAL provides better concurrent read/write performance".to_string(),
+            remediation: "PRAGMA journal_mode=WAL".to_string(),
+        });
+    }
+
+    // Table counts probe
+    let tables = ["projects", "agents", "messages", "file_reservations", "agent_links"];
+    for table in tables {
+        let count: i64 = conn
+            .query_sync(&format!("SELECT COUNT(*) AS cnt FROM {table}"), &[])
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        probes.push(HealthProbe {
+            name: format!("table_{table}"),
+            status: "ok".to_string(),
+            latency_ms: 0.0,
+            detail: format!("{count} rows"),
+        });
+    }
+
+    // Metrics probe
+    let snapshot = mcp_agent_mail_tools::tool_metrics_snapshot();
+    let total_errors: u64 = snapshot.iter().map(|e| e.errors).sum();
+    let total_calls: u64 = snapshot.iter().map(|e| e.calls).sum();
+    let error_rate = if total_calls > 0 {
+        (total_errors as f64 / total_calls as f64) * 100.0
+    } else {
+        0.0
+    };
+    probes.push(HealthProbe {
+        name: "tool_errors".to_string(),
+        status: if error_rate > 10.0 { "warn" } else { "ok" }.to_string(),
+        latency_ms: 0.0,
+        detail: format!("{total_errors}/{total_calls} errors ({error_rate:.1}%)"),
+    });
+    if error_rate > 10.0 {
+        anomalies.push(AnomalyCard {
+            severity: "warn".to_string(),
+            confidence: 0.8,
+            category: "tools".to_string(),
+            headline: format!("Tool error rate {error_rate:.1}%"),
+            rationale: format!("{total_errors} errors in {total_calls} calls"),
+            remediation: "am robot metrics".to_string(),
+        });
+    }
+
+    Ok((probes, anomalies))
+}
+
+// ── Analytics command implementation ────────────────────────────────────────
+
+fn build_analytics(
+    conn: &SqliteConnection,
+    project_id: i64,
+    agent: Option<(i64, String)>,
+) -> Result<Vec<AnomalyCard>, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let mut anomalies = Vec::new();
+
+    // Check for ack SLA violations (>1h old unacked)
+    let ack_overdue: i64 = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM message_recipients mr
+             JOIN messages m ON m.id = mr.message_id
+             WHERE m.project_id = ? AND m.ack_required = 1 AND mr.ack_ts IS NULL
+               AND m.created_ts < ?",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(now_us - 3600 * 1_000_000),
+            ],
+        )
+        .unwrap_or_default()
+        .first()
+        .and_then(|r| r.get_named("cnt").ok())
+        .unwrap_or(0);
+    if ack_overdue > 0 {
+        anomalies.push(AnomalyCard {
+            severity: "warn".to_string(),
+            confidence: 0.9,
+            category: "ack_sla".to_string(),
+            headline: format!("{ack_overdue} messages ack-overdue (>1h)"),
+            rationale: "Messages requiring acknowledgement have been pending over 1 hour"
+                .to_string(),
+            remediation: "am robot inbox --ack-overdue".to_string(),
+        });
+    }
+
+    // Check for reservation conflicts
+    let conflict_rows = conn
+        .query_sync(
+            "SELECT fr1.path_pattern AS p1, fr2.path_pattern AS p2,
+                    a1.name AS agent1, a2.name AS agent2
+             FROM file_reservations fr1
+             JOIN file_reservations fr2 ON fr1.id < fr2.id
+               AND fr1.project_id = fr2.project_id
+               AND fr1.agent_id != fr2.agent_id
+             JOIN agents a1 ON a1.id = fr1.agent_id
+             JOIN agents a2 ON a2.id = fr2.agent_id
+             WHERE fr1.project_id = ? AND fr1.exclusive = 1 AND fr2.exclusive = 1
+               AND fr1.released_ts IS NULL AND fr2.released_ts IS NULL
+               AND fr1.expires_ts > ? AND fr2.expires_ts > ?",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(now_us),
+                Value::BigInt(now_us),
+            ],
+        )
+        .unwrap_or_default();
+    let mut conflict_count = 0;
+    for row in &conflict_rows {
+        let p1: String = row.get_named("p1").unwrap_or_default();
+        let p2: String = row.get_named("p2").unwrap_or_default();
+        if glob_matches(&p1, &p2) || glob_matches(&p2, &p1) || p1 == p2 {
+            conflict_count += 1;
+        }
+    }
+    if conflict_count > 0 {
+        anomalies.push(AnomalyCard {
+            severity: "error".to_string(),
+            confidence: 1.0,
+            category: "reservation_conflict".to_string(),
+            headline: format!("{conflict_count} reservation conflict(s) detected"),
+            rationale: "Multiple agents hold exclusive reservations on overlapping paths"
+                .to_string(),
+            remediation: "am robot reservations --conflicts".to_string(),
+        });
+    }
+
+    // Check for expiring-soon reservations
+    let expiring_threshold = now_us + 10 * 60 * 1_000_000;
+    let expiring_count: i64 = if let Some((agent_id, _)) = &agent {
+        conn.query_sync(
+            "SELECT COUNT(*) AS cnt FROM file_reservations
+             WHERE project_id = ? AND agent_id = ? AND released_ts IS NULL
+               AND expires_ts > ? AND expires_ts < ?",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(*agent_id),
+                Value::BigInt(now_us),
+                Value::BigInt(expiring_threshold),
+            ],
+        )
+    } else {
+        conn.query_sync(
+            "SELECT COUNT(*) AS cnt FROM file_reservations
+             WHERE project_id = ? AND released_ts IS NULL
+               AND expires_ts > ? AND expires_ts < ?",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(now_us),
+                Value::BigInt(expiring_threshold),
+            ],
+        )
+    }
+    .unwrap_or_default()
+    .first()
+    .and_then(|r| r.get_named("cnt").ok())
+    .unwrap_or(0);
+    if expiring_count > 0 {
+        anomalies.push(AnomalyCard {
+            severity: "warn".to_string(),
+            confidence: 0.95,
+            category: "reservation_expiry".to_string(),
+            headline: format!("{expiring_count} reservation(s) expiring within 10 minutes"),
+            rationale: "Reservations nearing expiry may cause unprotected concurrent edits"
+                .to_string(),
+            remediation: "am robot reservations --expiring=10".to_string(),
+        });
+    }
+
+    // Check for idle agents (registered but no activity in 24h)
+    let idle_rows = conn
+        .query_sync(
+            "SELECT a.name FROM agents a
+             WHERE a.project_id = ? AND a.last_active_ts < ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM messages m WHERE m.sender_id = a.id AND m.created_ts > ?
+               )",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(now_us - 24 * 3600 * 1_000_000),
+                Value::BigInt(now_us - 24 * 3600 * 1_000_000),
+            ],
+        )
+        .unwrap_or_default();
+    if !idle_rows.is_empty() {
+        let idle_names: Vec<String> = idle_rows
+            .iter()
+            .filter_map(|r| r.get_named("name").ok())
+            .collect();
+        anomalies.push(AnomalyCard {
+            severity: "info".to_string(),
+            confidence: 0.7,
+            category: "agent_idle".to_string(),
+            headline: format!("{} agent(s) idle >24h", idle_names.len()),
+            rationale: format!("Agents inactive: {}", idle_names.join(", ")),
+            remediation: "am robot agents".to_string(),
+        });
+    }
+
+    // Tool error rate anomaly
+    let snapshot = mcp_agent_mail_tools::tool_metrics_snapshot();
+    for entry in &snapshot {
+        if entry.calls >= 10 {
+            let error_pct = (entry.errors as f64 / entry.calls as f64) * 100.0;
+            if error_pct > 25.0 {
+                anomalies.push(AnomalyCard {
+                    severity: "warn".to_string(),
+                    confidence: 0.85,
+                    category: "tool_errors".to_string(),
+                    headline: format!("{} error rate {error_pct:.1}%", entry.name),
+                    rationale: format!(
+                        "{}/{} calls failed for {}",
+                        entry.errors, entry.calls, entry.name
+                    ),
+                    remediation: "am robot metrics".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(anomalies)
+}
+
+// ── Agents command implementation ───────────────────────────────────────────
+
+fn build_agents(
+    conn: &SqliteConnection,
+    project_id: i64,
+    active_only: bool,
+    sort_field: Option<&str>,
+) -> Result<Vec<AgentRow>, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let active_threshold = now_us - 15 * 60 * 1_000_000; // 15 min
+    let idle_threshold = now_us - 4 * 3600 * 1_000_000; // 4 hours
+
+    let rows = conn
+        .query_sync(
+            "SELECT a.id, a.name, a.program, a.model, a.last_active_ts,
+                    (SELECT COUNT(*) FROM messages m WHERE m.sender_id = a.id) AS msg_count
+             FROM agents a
+             WHERE a.project_id = ?
+             ORDER BY a.last_active_ts DESC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("agents query: {e}")))?;
+
+    let mut agents: Vec<AgentRow> = Vec::new();
+    for row in &rows {
+        let name: String = row.get_named("name").unwrap_or_default();
+        let program: String = row.get_named("program").unwrap_or_default();
+        let model: String = row.get_named("model").unwrap_or_default();
+        let last_active_ts: i64 = row.get_named("last_active_ts").unwrap_or(0);
+        let msg_count: i64 = row.get_named("msg_count").unwrap_or(0);
+
+        let status = if last_active_ts >= active_threshold {
+            "active"
+        } else if last_active_ts >= idle_threshold {
+            "idle"
+        } else {
+            "inactive"
+        };
+
+        if active_only && status != "active" {
+            continue;
+        }
+
+        let age_seconds = (now_us - last_active_ts) / 1_000_000;
+
+        agents.push(AgentRow {
+            name,
+            program,
+            model,
+            last_active: format_age(age_seconds),
+            msg_count: msg_count as usize,
+            status: status.to_string(),
+        });
+    }
+
+    // Sort
+    match sort_field {
+        Some("name") => agents.sort_by(|a, b| a.name.cmp(&b.name)),
+        Some("msg_count") => agents.sort_by(|a, b| b.msg_count.cmp(&a.msg_count)),
+        _ => {} // Default: already sorted by last_active (DESC from SQL)
+    }
+
+    Ok(agents)
+}
+
+// ── Contacts command implementation ─────────────────────────────────────────
+
+fn build_contacts(conn: &SqliteConnection, project_id: i64) -> Result<Vec<ContactRow>, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+
+    let rows = conn
+        .query_sync(
+            "SELECT al.status, al.reason, al.updated_ts,
+                    a1.name AS from_agent, a1.contact_policy AS from_policy,
+                    a2.name AS to_agent
+             FROM agent_links al
+             JOIN agents a1 ON a1.id = al.a_agent_id
+             JOIN agents a2 ON a2.id = al.b_agent_id
+             WHERE al.a_project_id = ?
+             ORDER BY al.updated_ts DESC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("contacts query: {e}")))?;
+
+    let mut contacts = Vec::new();
+    for row in &rows {
+        let from: String = row.get_named("from_agent").unwrap_or_default();
+        let to: String = row.get_named("to_agent").unwrap_or_default();
+        let status: String = row.get_named("status").unwrap_or_default();
+        let from_policy: String = row.get_named("from_policy").unwrap_or_default();
+        let reason: String = row.get_named("reason").unwrap_or_default();
+        let updated_ts: i64 = row.get_named("updated_ts").unwrap_or(0);
+
+        let age = (now_us - updated_ts) / 1_000_000;
+
+        contacts.push(ContactRow {
+            from,
+            to,
+            status,
+            policy: from_policy,
+            reason,
+            updated: format_age(age),
+        });
+    }
+
+    Ok(contacts)
+}
+
+// ── Projects command implementation ─────────────────────────────────────────
+
+fn build_projects(conn: &SqliteConnection) -> Result<Vec<ProjectRow>, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+
+    let rows = conn
+        .query_sync(
+            "SELECT p.id, p.slug, p.human_key, p.created_at,
+                    (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id) AS agent_count,
+                    (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id) AS msg_count,
+                    (SELECT COUNT(*) FROM file_reservations fr
+                     WHERE fr.project_id = p.id AND fr.released_ts IS NULL AND fr.expires_ts > ?) AS res_count
+             FROM projects p
+             ORDER BY p.slug ASC",
+            &[Value::BigInt(now_us)],
+        )
+        .map_err(|e| CliError::Other(format!("projects query: {e}")))?;
+
+    let mut projects = Vec::new();
+    for row in &rows {
+        let slug: String = row.get_named("slug").unwrap_or_default();
+        let path: String = row.get_named("human_key").unwrap_or_default();
+        let agent_count: i64 = row.get_named("agent_count").unwrap_or(0);
+        let msg_count: i64 = row.get_named("msg_count").unwrap_or(0);
+        let res_count: i64 = row.get_named("res_count").unwrap_or(0);
+        let created_at: i64 = row.get_named("created_at").unwrap_or(0);
+
+        let age = (now_us - created_at) / 1_000_000;
+
+        projects.push(ProjectRow {
+            slug,
+            path,
+            agents: agent_count as usize,
+            messages: msg_count as usize,
+            reservations: res_count as usize,
+            created: format_age(age),
+        });
+    }
+
+    Ok(projects)
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
 /// Execute a robot subcommand and print formatted output.
@@ -2654,7 +3305,176 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             format_output(&env, format)?
         }
-        _ => {
+        RobotSubcommand::Timeline {
+            since,
+            kind,
+            source,
+        } => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let events = build_timeline(
+                &conn,
+                project_id,
+                since.as_deref(),
+                kind.as_deref(),
+                source.as_deref(),
+            )?;
+
+            #[derive(Serialize)]
+            struct TimelineData {
+                count: usize,
+                events: Vec<TimelineEvent>,
+            }
+
+            let count = events.len();
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                TimelineData { count, events },
+            );
+            env._meta.project = Some(project_slug);
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Overview => {
+            let conn = crate::open_db_sync()?;
+            let projects = build_overview(&conn)?;
+
+            #[derive(Serialize)]
+            struct OverviewData {
+                project_count: usize,
+                projects: Vec<OverviewProject>,
+            }
+
+            let project_count = projects.len();
+            let env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                OverviewData {
+                    project_count,
+                    projects,
+                },
+            );
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Health => {
+            let conn = crate::open_db_sync()?;
+            let (probes, anomalies) = build_health(&conn)?;
+
+            let overall = if anomalies.iter().any(|a| a.severity == "error") {
+                "error"
+            } else if anomalies.iter().any(|a| a.severity == "warn") {
+                "degraded"
+            } else {
+                "healthy"
+            };
+
+            #[derive(Serialize)]
+            struct HealthData {
+                overall: String,
+                probes: Vec<HealthProbe>,
+                anomalies: Vec<AnomalyCard>,
+            }
+
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                HealthData {
+                    overall: overall.to_string(),
+                    probes,
+                    anomalies: anomalies.clone(),
+                },
+            );
+            for a in &anomalies {
+                env = env.with_alert(&a.severity, &a.headline, Some(a.remediation.clone()));
+            }
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Analytics => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let agent = resolve_agent_id(&conn, project_id, args.agent.as_deref());
+            let anomalies = build_analytics(&conn, project_id, agent)?;
+
+            #[derive(Serialize)]
+            struct AnalyticsData {
+                anomaly_count: usize,
+                anomalies: Vec<AnomalyCard>,
+            }
+
+            let anomaly_count = anomalies.len();
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                AnalyticsData {
+                    anomaly_count,
+                    anomalies: anomalies.clone(),
+                },
+            );
+            env._meta.project = Some(project_slug);
+            for a in &anomalies {
+                env = env.with_alert(&a.severity, &a.headline, Some(a.remediation.clone()));
+            }
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Agents { active, sort } => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let agents = build_agents(&conn, project_id, active, sort.as_deref())?;
+
+            #[derive(Serialize)]
+            struct AgentsData {
+                count: usize,
+                agents: Vec<AgentRow>,
+            }
+
+            let count = agents.len();
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                AgentsData { count, agents },
+            );
+            env._meta.project = Some(project_slug);
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Contacts => {
+            let conn = crate::open_db_sync()?;
+            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let contacts = build_contacts(&conn, project_id)?;
+
+            #[derive(Serialize)]
+            struct ContactsData {
+                count: usize,
+                contacts: Vec<ContactRow>,
+            }
+
+            let count = contacts.len();
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                ContactsData { count, contacts },
+            );
+            env._meta.project = Some(project_slug);
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Projects => {
+            let conn = crate::open_db_sync()?;
+            let projects = build_projects(&conn)?;
+
+            #[derive(Serialize)]
+            struct ProjectsData {
+                count: usize,
+                projects: Vec<ProjectRow>,
+            }
+
+            let count = projects.len();
+            let env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                ProjectsData { count, projects },
+            );
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Navigate { .. } | RobotSubcommand::Attachments => {
             #[derive(Serialize)]
             struct Stub {
                 status: &'static str,
@@ -2665,7 +3485,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 format,
                 Stub {
                     status: "stub",
-                    message: format!("{cmd_name} is not yet implemented — see Tracks 2-5 beads"),
+                    message: format!("{cmd_name} is not yet implemented"),
                 },
             );
             format_output(&env, format)?

@@ -2885,7 +2885,7 @@ mod tests {
 
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(160, 48, &mut pool);
-        model.view(Rect::from_size(160, 48), &mut frame);
+        model.view(&mut frame);
         let text = ftui_harness::buffer_to_text(&frame.buffer);
 
         assert!(text.contains("Command Palette"));
@@ -2899,7 +2899,7 @@ mod tests {
 
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        model.view(Rect::from_size(80, 24), &mut frame);
+        model.view(&mut frame);
         let text = ftui_harness::buffer_to_text(&frame.buffer);
 
         assert!(text.contains("Command Palette"));

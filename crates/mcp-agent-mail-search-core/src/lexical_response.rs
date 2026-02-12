@@ -182,6 +182,7 @@ impl Default for ResponseConfig {
 /// * `explain` — Whether to include an explain report
 /// * `config` — Response assembly configuration
 #[cfg(feature = "tantivy-engine")]
+#[allow(clippy::too_many_arguments)]
 pub fn execute_search(
     index: &Index,
     query: &dyn Query,
@@ -194,17 +195,15 @@ pub fn execute_search(
 ) -> SearchResults {
     let start = Instant::now();
 
-    let reader = match index.reader() {
-        Ok(r) => r,
-        Err(_) => return SearchResults::empty(SearchMode::Lexical, start.elapsed()),
+    let Ok(reader) = index.reader() else {
+        return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
     let searcher = reader.searcher();
 
     // Fetch more results than needed to handle offset + count total
     let fetch_limit = offset.saturating_add(limit).max(1);
-    let top_docs = match searcher.search(query, &TopDocs::with_limit(fetch_limit)) {
-        Ok(docs) => docs,
-        Err(_) => return SearchResults::empty(SearchMode::Lexical, start.elapsed()),
+    let Ok(top_docs) = searcher.search(query, &TopDocs::with_limit(fetch_limit)) else {
+        return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
 
     let total_count = top_docs.len();
@@ -280,10 +279,11 @@ fn build_hit(
     query_terms: &[String],
     config: &ResponseConfig,
 ) -> SearchHit {
+    #[allow(clippy::cast_possible_wrap)]
     let id = doc
         .get_first(handles.id)
         .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+        .unwrap_or(0) as i64;
 
     let doc_kind_str = doc
         .get_first(handles.doc_kind)
