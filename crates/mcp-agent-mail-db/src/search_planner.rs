@@ -10,6 +10,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use mcp_agent_mail_search_core::QueryAssistance;
 use serde::{Deserialize, Serialize};
 
 // ────────────────────────────────────────────────────────────────────
@@ -24,6 +25,7 @@ pub enum DocKind {
     Message,
     Agent,
     Project,
+    Thread,
 }
 
 impl DocKind {
@@ -33,6 +35,7 @@ impl DocKind {
             Self::Message => "message",
             Self::Agent => "agent",
             Self::Project => "project",
+            Self::Thread => "thread",
         }
     }
 }
@@ -422,6 +425,8 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     pub next_cursor: Option<String>,
     pub explain: Option<QueryExplain>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistance: Option<QueryAssistance>,
 
     /// Audit log of denied/redacted results (empty when scope is unrestricted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -532,7 +537,7 @@ use crate::queries::{extract_like_terms, sanitize_fts_query};
 #[must_use]
 pub fn plan_search(query: &SearchQuery) -> SearchPlan {
     let mut plan = match query.doc_kind {
-        DocKind::Message => plan_message_search(query),
+        DocKind::Message | DocKind::Thread => plan_message_search(query),
         DocKind::Agent => plan_agent_search(query),
         DocKind::Project => plan_project_search(query),
     };
@@ -549,7 +554,7 @@ pub fn plan_search(query: &SearchQuery) -> SearchPlan {
 
 const fn empty_plan_sql(kind: DocKind) -> &'static str {
     match kind {
-        DocKind::Message => {
+        DocKind::Message | DocKind::Thread => {
             "SELECT \
                 0 AS id, \
                 '' AS subject, \
@@ -1873,6 +1878,7 @@ mod tests {
             results: vec![],
             next_cursor: None,
             explain: None,
+            assistance: None,
             audit: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -1885,6 +1891,7 @@ mod tests {
             results: vec![],
             next_cursor: None,
             explain: None,
+            assistance: None,
             audit: vec![SearchAuditEntry {
                 action: AuditAction::Redacted,
                 doc_kind: DocKind::Message,

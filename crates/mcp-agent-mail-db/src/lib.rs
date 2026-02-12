@@ -63,13 +63,13 @@ pub static QUERY_TRACKER: std::sync::LazyLock<QueryTracker> =
     std::sync::LazyLock::new(QueryTracker::new);
 
 // Re-export sqlmodel for convenience
+pub use mcp_agent_mail_search_core::{QueryAssistance, parse_query_assistance};
 pub use sqlmodel;
 pub use sqlmodel_frankensqlite;
 pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
-/// Backed by `FrankenConnection` (pure-Rust `SQLite`).
-/// The share crate's snapshot module uses `SqliteConnection` directly
-/// for `backup_to_path()` which `FrankenConnection` does not expose.
-pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
+/// We use `SqliteConnection` for runtime durability and parity with CLI/share
+/// tooling that also operates through the C-backed SQLite driver.
+pub type DbConn = sqlmodel_sqlite::SqliteConnection;

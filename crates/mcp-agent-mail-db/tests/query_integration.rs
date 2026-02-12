@@ -15,16 +15,67 @@
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
+use mcp_agent_mail_core::config::SearchEngine;
+use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::search_planner::{DocKind, SearchQuery};
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
+use mcp_agent_mail_db::search_v3::{get_bridge, init_bridge};
 use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, Once};
+use tantivy::doc;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_suffix() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn tantivy_test_lock() -> &'static Mutex<()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    &LOCK
+}
+
+fn ensure_tantivy_bridge_initialized() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let index_dir = std::env::temp_dir().join("mcp_agent_mail_search_v3_test_index");
+        std::fs::create_dir_all(&index_dir).expect("create tantivy test index dir");
+        init_bridge(&index_dir).expect("initialize Tantivy bridge");
+    });
+}
+
+fn insert_tantivy_message_doc(
+    doc_id: i64,
+    project_id: i64,
+    token: &str,
+    sender: &str,
+    thread_id: &str,
+    importance: &str,
+) {
+    ensure_tantivy_bridge_initialized();
+    let bridge = get_bridge().expect("tantivy bridge should be initialized");
+    let handles = bridge.handles();
+    let mut writer = bridge
+        .index()
+        .writer(15_000_000)
+        .expect("create tantivy writer");
+    writer
+        .add_document(doc!(
+            handles.id => u64::try_from(doc_id).expect("doc_id must be positive"),
+            handles.doc_kind => "message",
+            handles.subject => format!("tantivy-{token}-subject"),
+            handles.body => format!("tantivy-{token}-body"),
+            handles.sender => sender.to_string(),
+            handles.project_slug => format!("project-{project_id}"),
+            handles.project_id => u64::try_from(project_id).expect("project_id must be positive"),
+            handles.thread_id => thread_id.to_string(),
+            handles.importance => importance.to_string(),
+            handles.created_ts => 1_700_000_000_000i64,
+        ))
+        .expect("add tantivy test doc");
+    writer.commit().expect("commit tantivy test doc");
 }
 
 fn block_on<F, Fut, T>(f: F) -> T
@@ -601,6 +652,150 @@ fn search_pagination_cursor() {
             }
         }
         other => panic!("search failed: {other:?}"),
+    }
+}
+
+#[test]
+fn search_engine_lexical_routes_to_tantivy_bridge() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+
+    let token = format!("v3lex{}", unique_suffix());
+    let tantivy_doc_id = 9_000_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+    insert_tantivy_message_doc(
+        tantivy_doc_id,
+        pid,
+        &token,
+        "BlueLake",
+        "br-v3-lexical",
+        "high",
+    );
+
+    let before = global_metrics().snapshot();
+    let query_token = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: query_token,
+            doc_kind: DocKind::Message,
+            project_id: Some(pid),
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            track_telemetry: true,
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            let found = resp.results.iter().any(|r| r.result.id == tantivy_doc_id);
+            assert!(
+                found,
+                "expected Tantivy lexical result id={tantivy_doc_id}, got ids={:?}",
+                resp.results.iter().map(|r| r.result.id).collect::<Vec<_>>()
+            );
+        }
+        other => panic!("lexical routing search failed: {other:?}"),
+    }
+
+    let after = global_metrics().snapshot();
+    assert!(
+        after.search.queries_v3_total > before.search.queries_v3_total,
+        "expected V3 query counter to increase (before={}, after={})",
+        before.search.queries_v3_total,
+        after.search.queries_v3_total
+    );
+}
+
+#[test]
+fn search_engine_legacy_routes_to_fts_even_with_bridge_available() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+
+    ensure_tantivy_bridge_initialized();
+
+    let pool2 = pool.clone();
+    let token_for_query = format!("legacyfts{}", unique_suffix());
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_for_query.clone(),
+            doc_kind: DocKind::Message,
+            project_id: Some(pid),
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Legacy),
+            track_telemetry: true,
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Err(DbError::Sqlite(msg)) => {
+            assert!(
+                msg.contains("fts_messages"),
+                "expected legacy path to touch FTS layer, got: {msg}"
+            );
+        }
+        other => panic!("expected legacy FTS-layer error, got: {other:?}"),
+    }
+}
+
+#[test]
+#[allow(deprecated)]
+fn search_engine_shadow_records_parity_comparison_metrics() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+
+    let token = format!("shadowcmp{}", unique_suffix());
+    let tantivy_doc_id = 9_500_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+    insert_tantivy_message_doc(
+        tantivy_doc_id,
+        pid,
+        &token,
+        "GoldFox",
+        "br-v3-shadow",
+        "normal",
+    );
+
+    let pool2 = pool.clone();
+    let token_for_query = token.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_for_query.clone(),
+            doc_kind: DocKind::Message,
+            project_id: Some(pid),
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Shadow),
+            track_telemetry: true,
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Err(DbError::Sqlite(msg)) => {
+            assert!(
+                msg.contains("fts_messages"),
+                "expected shadow primary path to hit legacy FTS layer, got: {msg}"
+            );
+        }
+        other => panic!("expected shadow legacy-path error, got: {other:?}"),
     }
 }
 

@@ -10,8 +10,8 @@ description = "Database layer for MCP Agent Mail"
 
 [dependencies]
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
-mcp-agent-mail-search-core = { path = "../mcp-agent-mail-search-core", optional = true, features = ["tantivy-engine"] }
-tantivy = { workspace = true, optional = true }
+mcp-agent-mail-search-core = { path = "../mcp-agent-mail-search-core" }
+tantivy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -36,16 +36,15 @@ indexmap.workspace = true
 asupersync.workspace = true
 
 [features]
+default = ["hybrid"]
+# Enable hybrid search (lexical + semantic)
+hybrid = ["mcp-agent-mail-search-core/hybrid"]
 # Enable loom model-checking tests (run with `cargo test --features loom-tests`)
 loom-tests = []
-# Enable Tantivy-based Search V3 engine
-search-v3 = ["dep:mcp-agent-mail-search-core", "dep:tantivy"]
 
 [dev-dependencies]
 loom.workspace = true
 tempfile.workspace = true
-tantivy.workspace = true
-mcp-agent-mail-search-core = { path = "../mcp-agent-mail-search-core", features = ["tantivy-engine"] }
 
 [lints]
 workspace = true

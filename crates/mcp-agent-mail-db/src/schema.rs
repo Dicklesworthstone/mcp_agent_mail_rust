@@ -5,6 +5,7 @@
 use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection, Error as SqlError};
 use sqlmodel_schema::{Migration, MigrationRunner, MigrationStatus};
+use sqlmodel_sqlite::SqliteConnection;
 
 // Schema creation SQL - no runtime dependencies needed
 
@@ -209,6 +210,14 @@ pub const PRAGMA_DB_INIT_SQL: &str = r"
 PRAGMA journal_mode = WAL;
 ";
 
+/// Base-mode DB init PRAGMAs for files later opened by `FrankenConnection`.
+///
+/// WAL mode is intentionally avoided here to prevent mixed-runtime corruption
+/// and malformed-image scenarios when the server process is terminated abruptly.
+pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
+PRAGMA journal_mode = DELETE;
+";
+
 /// Per-connection PRAGMAs (safe to run on every new connection).
 ///
 /// IMPORTANT: `busy_timeout` must be first so lock waits apply to any
@@ -275,7 +284,8 @@ pub fn init_schema_sql() -> String {
 /// PRAGMAs are intentionally excluded because:
 /// - `PRAGMA journal_mode = WAL` creates WAL files that `FrankenConnection` cannot handle
 /// - The pool applies per-connection PRAGMAs separately via [`build_conn_pragmas`]
-/// - The pool's init gate applies WAL mode via [`PRAGMA_DB_INIT_SQL`] through `SqliteConnection`
+/// - The pool's init gate applies base-safe DB init pragmas via
+///   [`PRAGMA_DB_INIT_BASE_SQL`] through `SqliteConnection`
 ///
 /// Search queries automatically fall back to LIKE-based search when FTS5 tables are absent.
 #[must_use]
@@ -848,6 +858,111 @@ fn is_fts_or_trigger_migration(id: &str) -> bool {
     id_lower.contains("fts") || id_lower.contains("trigger") || id_lower.contains("trg")
 }
 
+/// Base-only trigger cleanup migrations.
+///
+/// Base mode runs under `SqliteConnection` during startup to make DB files safe
+/// for later `FrankenConnection` access. Any pre-existing message->FTS triggers
+/// can break message inserts in that mode, so base startup drops both legacy
+/// Python trigger names and current Rust trigger names.
+fn base_trigger_cleanup_migrations() -> Vec<Migration> {
+    let cleanup_steps = vec![
+        (
+            "base_v1_drop_legacy_fts_messages_ai",
+            "drop legacy python fts insert trigger for base mode",
+            "DROP TRIGGER IF EXISTS fts_messages_ai",
+        ),
+        (
+            "base_v1_drop_legacy_fts_messages_ad",
+            "drop legacy python fts delete trigger for base mode",
+            "DROP TRIGGER IF EXISTS fts_messages_ad",
+        ),
+        (
+            "base_v1_drop_legacy_fts_messages_au",
+            "drop legacy python fts update trigger for base mode",
+            "DROP TRIGGER IF EXISTS fts_messages_au",
+        ),
+        (
+            "base_v1_drop_rust_messages_ai",
+            "drop rust fts insert trigger for base mode",
+            "DROP TRIGGER IF EXISTS messages_ai",
+        ),
+        (
+            "base_v1_drop_rust_messages_ad",
+            "drop rust fts delete trigger for base mode",
+            "DROP TRIGGER IF EXISTS messages_ad",
+        ),
+        (
+            "base_v1_drop_rust_messages_au",
+            "drop rust fts update trigger for base mode",
+            "DROP TRIGGER IF EXISTS messages_au",
+        ),
+        (
+            "base_v2_drop_fts_agents_insert_trigger",
+            "drop identity fts agent insert trigger for base mode",
+            "DROP TRIGGER IF EXISTS agents_ai",
+        ),
+        (
+            "base_v2_drop_fts_agents_delete_trigger",
+            "drop identity fts agent delete trigger for base mode",
+            "DROP TRIGGER IF EXISTS agents_ad",
+        ),
+        (
+            "base_v2_drop_fts_agents_update_trigger",
+            "drop identity fts agent update trigger for base mode",
+            "DROP TRIGGER IF EXISTS agents_au",
+        ),
+        (
+            "base_v2_drop_fts_projects_insert_trigger",
+            "drop identity fts project insert trigger for base mode",
+            "DROP TRIGGER IF EXISTS projects_ai",
+        ),
+        (
+            "base_v2_drop_fts_projects_delete_trigger",
+            "drop identity fts project delete trigger for base mode",
+            "DROP TRIGGER IF EXISTS projects_ad",
+        ),
+        (
+            "base_v2_drop_fts_projects_update_trigger",
+            "drop identity fts project update trigger for base mode",
+            "DROP TRIGGER IF EXISTS projects_au",
+        ),
+        (
+            "base_v2_drop_fts_agents_table",
+            "drop identity fts agent table for base mode",
+            "DROP TABLE IF EXISTS fts_agents",
+        ),
+        (
+            "base_v2_drop_fts_projects_table",
+            "drop identity fts project table for base mode",
+            "DROP TABLE IF EXISTS fts_projects",
+        ),
+    ];
+
+    cleanup_steps
+        .into_iter()
+        .map(|(id, desc, up)| {
+            Migration::new(
+                id.to_string(),
+                desc.to_string(),
+                up.to_string(),
+                String::new(),
+            )
+        })
+        .collect()
+}
+
+/// Re-apply base-mode cleanup statements at startup.
+///
+/// This is intentionally separate from migration history so servers can recover
+/// from DB files that were later touched by full/CLI migrations and reintroduced
+/// incompatible FTS identity objects.
+pub fn enforce_base_mode_cleanup(conn: &SqliteConnection) -> std::result::Result<(), SqlError> {
+    for migration in base_trigger_cleanup_migrations() {
+        conn.execute_raw(&migration.up)?;
+    }
+    Ok(())
+}
+
 /// Migrations excluding FTS5 virtual tables, triggers, and FTS backfill inserts.
 ///
 /// Safe for databases that will be opened by `FrankenConnection`. The migration
@@ -856,10 +971,12 @@ fn is_fts_or_trigger_migration(id: &str) -> bool {
 /// doesn't re-run them.
 #[must_use]
 pub fn schema_migrations_base() -> Vec<Migration> {
-    schema_migrations()
+    let mut migrations: Vec<Migration> = schema_migrations()
         .into_iter()
         .filter(|m| !is_fts_or_trigger_migration(&m.id))
-        .collect()
+        .collect();
+    migrations.extend(base_trigger_cleanup_migrations());
+    migrations
 }
 
 #[must_use]
@@ -1016,6 +1133,271 @@ mod tests {
         assert_eq!(
             rows[0].get_named::<String>("slug").unwrap_or_default(),
             "proj"
+        );
+    }
+
+    #[test]
+    fn base_migrations_include_message_fts_trigger_cleanup() {
+        use std::collections::HashSet;
+
+        let ids: HashSet<String> = schema_migrations_base().into_iter().map(|m| m.id).collect();
+        assert!(ids.contains("base_v1_drop_legacy_fts_messages_ai"));
+        assert!(ids.contains("base_v1_drop_legacy_fts_messages_ad"));
+        assert!(ids.contains("base_v1_drop_legacy_fts_messages_au"));
+        assert!(ids.contains("base_v1_drop_rust_messages_ai"));
+        assert!(ids.contains("base_v1_drop_rust_messages_ad"));
+        assert!(ids.contains("base_v1_drop_rust_messages_au"));
+        assert!(ids.contains("base_v2_drop_fts_agents_insert_trigger"));
+        assert!(ids.contains("base_v2_drop_fts_agents_delete_trigger"));
+        assert!(ids.contains("base_v2_drop_fts_agents_update_trigger"));
+        assert!(ids.contains("base_v2_drop_fts_projects_insert_trigger"));
+        assert!(ids.contains("base_v2_drop_fts_projects_delete_trigger"));
+        assert!(ids.contains("base_v2_drop_fts_projects_update_trigger"));
+        assert!(ids.contains("base_v2_drop_fts_agents_table"));
+        assert!(ids.contains("base_v2_drop_fts_projects_table"));
+
+        // FTS table creation must still be excluded from base migrations.
+        assert!(!ids.contains("v5_create_fts_with_porter"));
+        assert!(!ids.contains("v7_create_fts_agents"));
+        assert!(!ids.contains("v7_create_fts_projects"));
+    }
+
+    #[test]
+    fn base_migrations_drop_existing_message_fts_triggers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("base_drop_fts_triggers.db");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
+
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                sender_id INTEGER NOT NULL,\
+                thread_id TEXT,\
+                subject TEXT NOT NULL,\
+                body_md TEXT NOT NULL,\
+                importance TEXT NOT NULL DEFAULT 'normal',\
+                ack_required INTEGER NOT NULL DEFAULT 0,\
+                created_ts INTEGER NOT NULL,\
+                attachments_json TEXT NOT NULL DEFAULT ''\
+            )",
+            &[],
+        )
+        .expect("create messages table");
+        conn.execute_sync(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(message_id UNINDEXED, subject, body)",
+            &[],
+        )
+        .expect("create fts_messages table");
+
+        // Legacy Python trigger names.
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS fts_messages_ai AFTER INSERT ON messages BEGIN \
+                 INSERT INTO fts_messages(rowid, message_id, subject, body) \
+                 VALUES (NEW.id, NEW.id, NEW.subject, NEW.body_md); \
+             END",
+            &[],
+        )
+        .expect("create legacy ai trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS fts_messages_ad AFTER DELETE ON messages BEGIN \
+                 DELETE FROM fts_messages WHERE rowid = OLD.id; \
+             END",
+            &[],
+        )
+        .expect("create legacy ad trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS fts_messages_au AFTER UPDATE ON messages BEGIN \
+                 DELETE FROM fts_messages WHERE rowid = OLD.id; \
+                 INSERT INTO fts_messages(rowid, message_id, subject, body) \
+                 VALUES (NEW.id, NEW.id, NEW.subject, NEW.body_md); \
+             END",
+            &[],
+        )
+        .expect("create legacy au trigger");
+
+        // Current Rust trigger names.
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN \
+                 INSERT INTO fts_messages(message_id, subject, body) \
+                 VALUES (NEW.id, NEW.subject, NEW.body_md); \
+             END",
+            &[],
+        )
+        .expect("create rust ai trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN \
+                 DELETE FROM fts_messages WHERE message_id = OLD.id; \
+             END",
+            &[],
+        )
+        .expect("create rust ad trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN \
+                 DELETE FROM fts_messages WHERE message_id = OLD.id; \
+                 INSERT INTO fts_messages(message_id, subject, body) \
+                 VALUES (NEW.id, NEW.subject, NEW.body_md); \
+             END",
+            &[],
+        )
+        .expect("create rust au trigger");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='trigger' AND name IN (\
+                     'fts_messages_ai', 'fts_messages_ad', 'fts_messages_au', \
+                     'messages_ai', 'messages_ad', 'messages_au'\
+                 )",
+                &[],
+            )
+            .expect("query remaining trigger names");
+        assert!(
+            rows.is_empty(),
+            "base migrations should remove all message->fts triggers"
+        );
+    }
+
+    #[test]
+    fn enforce_base_mode_cleanup_drops_identity_fts_objects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("base_cleanup_identity_fts.db");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
+
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                slug TEXT NOT NULL UNIQUE,\
+                human_key TEXT NOT NULL,\
+                created_at INTEGER NOT NULL\
+            )",
+            &[],
+        )
+        .expect("create projects table");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                name TEXT NOT NULL,\
+                program TEXT NOT NULL,\
+                model TEXT NOT NULL,\
+                task_description TEXT NOT NULL DEFAULT '',\
+                inception_ts INTEGER NOT NULL,\
+                last_active_ts INTEGER NOT NULL,\
+                attachments_policy TEXT NOT NULL DEFAULT 'auto',\
+                contact_policy TEXT NOT NULL DEFAULT 'auto',\
+                UNIQUE(project_id, name)\
+            )",
+            &[],
+        )
+        .expect("create agents table");
+        conn.execute_sync(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_agents USING fts5(\
+                agent_id UNINDEXED, project_id UNINDEXED, name, task_description, program, model\
+            )",
+            &[],
+        )
+        .expect("create fts_agents table");
+        conn.execute_sync(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_projects USING fts5(\
+                project_id UNINDEXED, slug, human_key\
+            )",
+            &[],
+        )
+        .expect("create fts_projects table");
+
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS agents_ai AFTER INSERT ON agents BEGIN \
+                 INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+                 VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
+             END",
+            &[],
+        )
+        .expect("create agents_ai trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS agents_ad AFTER DELETE ON agents BEGIN \
+                 DELETE FROM fts_agents WHERE rowid = OLD.id; \
+             END",
+            &[],
+        )
+        .expect("create agents_ad trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS agents_au AFTER UPDATE ON agents BEGIN \
+                 DELETE FROM fts_agents WHERE rowid = OLD.id; \
+                 INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+                 VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
+             END",
+            &[],
+        )
+        .expect("create agents_au trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS projects_ai AFTER INSERT ON projects BEGIN \
+                 INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
+                 VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
+             END",
+            &[],
+        )
+        .expect("create projects_ai trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS projects_ad AFTER DELETE ON projects BEGIN \
+                 DELETE FROM fts_projects WHERE rowid = OLD.id; \
+             END",
+            &[],
+        )
+        .expect("create projects_ad trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS projects_au AFTER UPDATE ON projects BEGIN \
+                 DELETE FROM fts_projects WHERE rowid = OLD.id; \
+                 INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
+                 VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
+             END",
+            &[],
+        )
+        .expect("create projects_au trigger");
+
+        enforce_base_mode_cleanup(&conn).expect("base cleanup");
+
+        let trigger_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='trigger' AND name IN (\
+                     'agents_ai', 'agents_ad', 'agents_au',\
+                     'projects_ai', 'projects_ad', 'projects_au'\
+                 )",
+                &[],
+            )
+            .expect("query trigger names");
+        assert!(
+            trigger_rows.is_empty(),
+            "base cleanup should remove identity FTS triggers"
+        );
+
+        let fts_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='table' AND name IN ('fts_agents', 'fts_projects')",
+                &[],
+            )
+            .expect("query fts table names");
+        assert!(
+            fts_rows.is_empty(),
+            "base cleanup should remove identity FTS tables"
         );
     }
 

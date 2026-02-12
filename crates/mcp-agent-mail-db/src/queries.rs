@@ -317,8 +317,20 @@ fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> 
     ProjectRow::from_row(row).map_err(|e| map_sql_error(&e))
 }
 
+fn decode_file_reservation_row(row: &SqlRow) -> std::result::Result<FileReservationRow, DbError> {
+    FileReservationRow::from_row(row).map_err(|e| map_sql_error(&e))
+}
+
+fn decode_agent_link_row(row: &SqlRow) -> std::result::Result<AgentLinkRow, DbError> {
+    AgentLinkRow::from_row(row).map_err(|e| map_sql_error(&e))
+}
+
 const PROJECT_SELECT_ALL_SQL: &str =
     "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
+const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts \
+     FROM file_reservations";
+const AGENT_LINK_SELECT_COLUMNS_SQL: &str = "SELECT id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts \
+     FROM agent_links";
 
 fn find_project_by_slug(
     rows: &[SqlRow],
@@ -496,7 +508,25 @@ async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcom
 
 /// Commit the current transaction (single fsync in WAL mode).
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
-    map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await).map(|_| ())
+    match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
+        Outcome::Ok(_) => rebuild_indexes(cx, tracked).await,
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Rebuild indexes to keep C-backed tooling and integrity checks in sync with
+/// pure-Rust runtime writes.
+async fn rebuild_indexes(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    map_sql_outcome(traw_execute(cx, tracked, "REINDEX", &[]).await).map(|_| ())
+}
+
+/// Begin an immediate write transaction (single-writer semantics).
+///
+/// Used for write paths that are sensitive to `BEGIN CONCURRENT` backend quirks.
+async fn begin_immediate_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    map_sql_outcome(tracked.execute(cx, "BEGIN IMMEDIATE", &[]).await).map(|_| ())
 }
 
 /// Rollback the current transaction (best-effort, errors ignored).
@@ -578,6 +608,12 @@ pub async fn ensure_project(
             let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(_) => {
+                    match rebuild_indexes(cx, &tracked).await {
+                        Outcome::Ok(()) => {}
+                        Outcome::Err(e) => return Outcome::Err(e),
+                        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => return Outcome::Panicked(p),
+                    }
                     match map_sql_outcome(
                         traw_query(cx, &tracked, PROJECT_SELECT_ALL_SQL, &[]).await,
                     ) {
@@ -818,6 +854,12 @@ pub async fn register_agent(
                 row.attachments_policy = attach_pol.to_string();
                 match map_sql_outcome(update!(&row).execute(cx, &tracked).await) {
                     Outcome::Ok(_) => {
+                        match rebuild_indexes(cx, &tracked).await {
+                            Outcome::Ok(()) => {}
+                            Outcome::Err(e) => return Outcome::Err(e),
+                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                            Outcome::Panicked(p) => return Outcome::Panicked(p),
+                        }
                         crate::cache::read_cache().put_agent(&row);
                         Outcome::Ok(row)
                     }
@@ -841,6 +883,12 @@ pub async fn register_agent(
                 };
                 match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
                     Outcome::Ok(_) => {
+                        match rebuild_indexes(cx, &tracked).await {
+                            Outcome::Ok(()) => {}
+                            Outcome::Err(e) => return Outcome::Err(e),
+                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                            Outcome::Panicked(p) => return Outcome::Panicked(p),
+                        }
                         // Read-back by project and filter in Rust. This avoids
                         // fragile multi-parameter string matching paths.
                         let fetch_sql = "SELECT id, project_id, name, program, model, \
@@ -958,6 +1006,12 @@ pub async fn create_agent(
     };
     match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
         Outcome::Ok(_) => {
+            match rebuild_indexes(cx, &tracked).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
             // Read back the inserted row so callers never see a synthetic id=0.
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                              inception_ts, last_active_ts, attachments_policy, contact_policy \
@@ -1190,7 +1244,12 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
     }
 
     match map_sql_outcome(traw_execute(cx, &tracked, "COMMIT", &[]).await) {
-        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Ok(_) => match rebuild_indexes(cx, &tracked).await {
+            Outcome::Ok(()) => Outcome::Ok(()),
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        },
         Outcome::Err(e) => {
             let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
             re_enqueue_touches(&pending);
@@ -1244,6 +1303,12 @@ pub async fn set_agent_contact_policy(
 
     match out {
         Outcome::Ok(_) => {
+            match rebuild_indexes(cx, &tracked).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
             // Fetch updated agent using raw SQL with explicit column order
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                              inception_ts, last_active_ts, attachments_policy, contact_policy \
@@ -1312,6 +1377,13 @@ pub async fn set_agent_contact_policy_by_name(
                     "Agent",
                     format!("{project_id}:{normalized_name}"),
                 ));
+            }
+
+            match rebuild_indexes(cx, &tracked).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
 
             // Invalidate stale entry and then re-read the full record from DB.
@@ -1468,7 +1540,9 @@ pub async fn create_message_with_recipients(
 
     let tracked = tracked(&*conn);
 
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    // `BEGIN CONCURRENT` has produced backend-specific `OpenWrite` failures for
+    // message inserts on some persistent DBs; use immediate transaction here.
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
     // Insert message
     let mut row = MessageRow {
@@ -2375,12 +2449,16 @@ pub async fn search_messages_for_product(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let from: String = match row.get_named("from_name") {
+                // Use positional access for aliased columns where ORM column name inference
+                // incorrectly parses "a.name as from_name" as "name as" instead of "from_name".
+                // Column order: id(0), subject(1), importance(2), ack_required(3),
+                // created_ts(4), thread_id(5), from_name(6), body_md(7), project_id(8)
+                let from: String = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = row.get_named("body_md").unwrap_or_default();
-                let project_id: i64 = match row.get_named("project_id") {
+                let body_md: String = row.get_as(7).unwrap_or_default();
+                let project_id: i64 = match row.get_as(8) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -2865,23 +2943,27 @@ pub async fn acknowledge_message(
     ];
     let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
     match out {
-        Outcome::Ok(rows) => {
-            if rows == 0 {
-                return Outcome::Err(DbError::not_found(
-                    "MessageRecipient",
-                    format!("{agent_id}:{message_id}"),
-                ));
-            }
+        Outcome::Ok(_rows) => {
             // Invalidate cached inbox stats (ack_pending_count may have changed).
             crate::cache::read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
 
             // Read back the actual stored timestamps (may differ from `now` on
             // idempotent calls where COALESCE preserved the original values).
+            //
+            // We intentionally do not trust `rows_affected` from the UPDATE above:
+            // under some backend/runtime combinations, updates that clearly match
+            // a row can report 0. Existence is determined by this read-back query.
             let read_sql = "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
             let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
             let ts_out = map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await);
             match ts_out {
                 Outcome::Ok(rows) => {
+                    if rows.is_empty() {
+                        return Outcome::Err(DbError::not_found(
+                            "MessageRecipient",
+                            format!("{agent_id}:{message_id}"),
+                        ));
+                    }
                     let row = rows.first();
                     let read_ts = row
                         .and_then(|r| r.get(0))
@@ -3077,14 +3159,27 @@ pub async fn get_active_reservations(
 
     let tracked = tracked(&*conn);
 
-    map_sql_outcome(
-        select!(FileReservationRow)
-            .filter(Expr::col("project_id").eq(project_id))
-            .filter(Expr::col("released_ts").is_null())
-            .filter(Expr::col("expires_ts").gt(now))
-            .all(cx, &tracked)
-            .await,
-    )
+    let sql = format!(
+        "{FILE_RESERVATION_SELECT_COLUMNS_SQL} \
+         WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ?"
+    );
+    let params = [Value::BigInt(project_id), Value::BigInt(now)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                match decode_file_reservation_row(&row) {
+                    Ok(decoded) => out.push(decoded),
+                    Err(e) => return Outcome::Err(e),
+                }
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// Release file reservations
@@ -3525,16 +3620,31 @@ pub async fn request_contact(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
 
-    // Fetch the upserted row.
-    let fetch = map_sql_outcome(
-        select!(AgentLinkRow)
-            .filter(Expr::col("a_project_id").eq(from_project_id))
-            .filter(Expr::col("a_agent_id").eq(from_agent_id))
-            .filter(Expr::col("b_project_id").eq(to_project_id))
-            .filter(Expr::col("b_agent_id").eq(to_agent_id))
-            .first(cx, &tracked)
-            .await,
+    // Fetch the upserted row using explicit columns to avoid SELECT * decoding issues.
+    let fetch_sql = format!(
+        "{AGENT_LINK_SELECT_COLUMNS_SQL} \
+         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
+         LIMIT 1"
     );
+    let fetch_params = [
+        Value::BigInt(from_project_id),
+        Value::BigInt(from_agent_id),
+        Value::BigInt(to_project_id),
+        Value::BigInt(to_agent_id),
+    ];
+
+    let fetch = match map_sql_outcome(traw_query(cx, &tracked, &fetch_sql, &fetch_params).await) {
+        Outcome::Ok(rows) => {
+            rows.first()
+                .map_or(Outcome::Ok(None), |row| match decode_agent_link_row(row) {
+                    Ok(link) => Outcome::Ok(Some(link)),
+                    Err(e) => Outcome::Err(e),
+                })
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    };
 
     match fetch {
         Outcome::Ok(Some(row)) => Outcome::Ok(row),
@@ -3574,15 +3684,31 @@ pub async fn respond_contact(
 
     let tracked = tracked(&*conn);
 
-    let existing = map_sql_outcome(
-        select!(AgentLinkRow)
-            .filter(Expr::col("a_project_id").eq(from_project_id))
-            .filter(Expr::col("a_agent_id").eq(from_agent_id))
-            .filter(Expr::col("b_project_id").eq(to_project_id))
-            .filter(Expr::col("b_agent_id").eq(to_agent_id))
-            .first(cx, &tracked)
-            .await,
+    let existing_sql = format!(
+        "{AGENT_LINK_SELECT_COLUMNS_SQL} \
+         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
+         LIMIT 1"
     );
+    let existing_params = [
+        Value::BigInt(from_project_id),
+        Value::BigInt(from_agent_id),
+        Value::BigInt(to_project_id),
+        Value::BigInt(to_agent_id),
+    ];
+
+    let existing =
+        match map_sql_outcome(traw_query(cx, &tracked, &existing_sql, &existing_params).await) {
+            Outcome::Ok(rows) => {
+                rows.first()
+                    .map_or(Outcome::Ok(None), |row| match decode_agent_link_row(row) {
+                        Ok(link) => Outcome::Ok(Some(link)),
+                        Err(e) => Outcome::Err(e),
+                    })
+            }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        };
 
     match existing {
         Outcome::Ok(Some(mut row)) => {
@@ -3634,13 +3760,25 @@ pub async fn list_contacts(
     let tracked = tracked(&*conn);
 
     // Outgoing: links where this agent is "a" side
-    let outgoing = map_sql_outcome(
-        select!(AgentLinkRow)
-            .filter(Expr::col("a_project_id").eq(project_id))
-            .filter(Expr::col("a_agent_id").eq(agent_id))
-            .all(cx, &tracked)
-            .await,
-    );
+    let outgoing_sql =
+        format!("{AGENT_LINK_SELECT_COLUMNS_SQL} WHERE a_project_id = ? AND a_agent_id = ?");
+    let outgoing_params = [Value::BigInt(project_id), Value::BigInt(agent_id)];
+    let outgoing =
+        match map_sql_outcome(traw_query(cx, &tracked, &outgoing_sql, &outgoing_params).await) {
+            Outcome::Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match decode_agent_link_row(&row) {
+                        Ok(link) => out.push(link),
+                        Err(e) => return Outcome::Err(e),
+                    }
+                }
+                Outcome::Ok(out)
+            }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        };
 
     let outgoing_rows = match outgoing {
         Outcome::Ok(rows) => rows,
@@ -3650,13 +3788,25 @@ pub async fn list_contacts(
     };
 
     // Incoming: links where this agent is "b" side
-    let incoming = map_sql_outcome(
-        select!(AgentLinkRow)
-            .filter(Expr::col("b_project_id").eq(project_id))
-            .filter(Expr::col("b_agent_id").eq(agent_id))
-            .all(cx, &tracked)
-            .await,
-    );
+    let incoming_sql =
+        format!("{AGENT_LINK_SELECT_COLUMNS_SQL} WHERE b_project_id = ? AND b_agent_id = ?");
+    let incoming_params = [Value::BigInt(project_id), Value::BigInt(agent_id)];
+    let incoming =
+        match map_sql_outcome(traw_query(cx, &tracked, &incoming_sql, &incoming_params).await) {
+            Outcome::Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match decode_agent_link_row(&row) {
+                        Ok(link) => out.push(link),
+                        Err(e) => return Outcome::Err(e),
+                    }
+                }
+                Outcome::Ok(out)
+            }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        };
 
     match incoming {
         Outcome::Ok(incoming_rows) => Outcome::Ok((outgoing_rows, incoming_rows)),
@@ -3832,17 +3982,31 @@ pub async fn is_contact_allowed(
     // Helper: check if an approved link is still valid (not expired).
     let link_is_valid = |link: &AgentLinkRow| -> bool { link.expires_ts.is_none_or(|ts| ts > now) };
 
-    // Check if there's an approved link in either direction
-    let link = map_sql_outcome(
-        select!(AgentLinkRow)
-            .filter(Expr::col("a_project_id").eq(from_project_id))
-            .filter(Expr::col("a_agent_id").eq(from_agent_id))
-            .filter(Expr::col("b_project_id").eq(to_project_id))
-            .filter(Expr::col("b_agent_id").eq(to_agent_id))
-            .filter(Expr::col("status").eq("approved"))
-            .first(cx, &tracked)
-            .await,
+    // Check if there's an approved link in either direction.
+    let link_sql = format!(
+        "{AGENT_LINK_SELECT_COLUMNS_SQL} \
+         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
+           AND status = 'approved' \
+         LIMIT 1"
     );
+    let link_params = [
+        Value::BigInt(from_project_id),
+        Value::BigInt(from_agent_id),
+        Value::BigInt(to_project_id),
+        Value::BigInt(to_agent_id),
+    ];
+    let link = match map_sql_outcome(traw_query(cx, &tracked, &link_sql, &link_params).await) {
+        Outcome::Ok(rows) => {
+            rows.first()
+                .map_or(Outcome::Ok(None), |row| match decode_agent_link_row(row) {
+                    Ok(link) => Outcome::Ok(Some(link)),
+                    Err(e) => Outcome::Err(e),
+                })
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    };
 
     match link {
         Outcome::Ok(Some(ref row)) if link_is_valid(row) => return Outcome::Ok(true),
@@ -3853,16 +4017,25 @@ pub async fn is_contact_allowed(
     }
 
     // Check reverse direction
-    let reverse_link = map_sql_outcome(
-        select!(AgentLinkRow)
-            .filter(Expr::col("a_project_id").eq(to_project_id))
-            .filter(Expr::col("a_agent_id").eq(to_agent_id))
-            .filter(Expr::col("b_project_id").eq(from_project_id))
-            .filter(Expr::col("b_agent_id").eq(from_agent_id))
-            .filter(Expr::col("status").eq("approved"))
-            .first(cx, &tracked)
-            .await,
-    );
+    let reverse_params = [
+        Value::BigInt(to_project_id),
+        Value::BigInt(to_agent_id),
+        Value::BigInt(from_project_id),
+        Value::BigInt(from_agent_id),
+    ];
+    let reverse_link =
+        match map_sql_outcome(traw_query(cx, &tracked, &link_sql, &reverse_params).await) {
+            Outcome::Ok(rows) => {
+                rows.first()
+                    .map_or(Outcome::Ok(None), |row| match decode_agent_link_row(row) {
+                        Ok(link) => Outcome::Ok(Some(link)),
+                        Err(e) => Outcome::Err(e),
+                    })
+            }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        };
 
     match reverse_link {
         Outcome::Ok(Some(ref row)) if link_is_valid(row) => return Outcome::Ok(true),

@@ -23,14 +23,20 @@ use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
 
 use asupersync::{Cx, Outcome};
-#[cfg(feature = "search-v3")]
 use mcp_agent_mail_search_core::{
-    CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, QueryClass,
-    prepare_candidates,
+    CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, QueryAssistance,
+    QueryClass, parse_query_assistance, prepare_candidates,
+};
+#[cfg(feature = "hybrid")]
+use mcp_agent_mail_search_core::{
+    DocKind as SearchDocKind, ModelRegistry, ModelTier, RegistryConfig, VectorFilter, VectorIndex,
+    VectorIndexConfig,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
+#[cfg(feature = "hybrid")]
+use std::sync::{Arc, OnceLock, RwLock};
 // ────────────────────────────────────────────────────────────────────
 // Search service options
 // ────────────────────────────────────────────────────────────────────
@@ -67,6 +73,9 @@ pub struct ScopedSearchResponse {
     pub audit_summary: Option<ScopeAuditSummary>,
     /// Total rows returned from SQL before scope filtering.
     pub sql_row_count: usize,
+    /// Query-assistance metadata (`did_you_mean`, parsed hint tokens, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistance: Option<QueryAssistance>,
 }
 
 /// Lightweight response for simple (unscoped) searches.
@@ -101,6 +110,15 @@ fn map_sql_outcome<T>(out: Outcome<T, sqlmodel_core::Error>) -> Outcome<T, DbErr
     }
 }
 
+fn query_assistance_payload(query: &SearchQuery) -> Option<QueryAssistance> {
+    let assistance = parse_query_assistance(&query.text);
+    if assistance.applied_filter_hints.is_empty() && assistance.did_you_mean.is_empty() {
+        None
+    } else {
+        Some(assistance)
+    }
+}
+
 async fn acquire_conn(
     cx: &Cx,
     pool: &DbPool,
@@ -109,20 +127,199 @@ async fn acquire_conn(
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Tantivy routing helpers (feature-gated)
+// Tantivy routing helpers
 // ────────────────────────────────────────────────────────────────────
 
 /// Try executing a search via the Tantivy bridge. Returns `None` if the
-/// bridge is not initialized (feature disabled or `init_bridge` not called).
-#[cfg(feature = "search-v3")]
+/// bridge is not initialized (`init_bridge` not called).
 fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
     let bridge = crate::search_v3::get_bridge()?;
     Some(bridge.search(query))
 }
 
-#[cfg(not(feature = "search-v3"))]
-const fn try_tantivy_search(_query: &SearchQuery) -> Option<Vec<SearchResult>> {
-    None
+// ────────────────────────────────────────────────────────────────────
+// Semantic search bridge (vector index + embedder)
+// ────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "hybrid")]
+static SEMANTIC_BRIDGE: OnceLock<Option<Arc<SemanticBridge>>> = OnceLock::new();
+
+/// Bridge to the semantic search infrastructure (vector index + embedder).
+#[cfg(feature = "hybrid")]
+pub struct SemanticBridge {
+    /// The vector index holding document embeddings.
+    index: RwLock<VectorIndex>,
+    /// The model registry for obtaining embedders.
+    registry: RwLock<ModelRegistry>,
+}
+
+#[cfg(feature = "hybrid")]
+impl SemanticBridge {
+    /// Create a new semantic bridge with the given configuration.
+    #[must_use]
+    pub fn new(config: VectorIndexConfig) -> Self {
+        Self {
+            index: RwLock::new(VectorIndex::new(config)),
+            registry: RwLock::new(ModelRegistry::new(RegistryConfig::default())),
+        }
+    }
+
+    /// Create a semantic bridge with default configuration (384-dim for `MiniLM`).
+    #[must_use]
+    pub fn default_config() -> Self {
+        Self::new(VectorIndexConfig::default())
+    }
+
+    /// Get a reference to the vector index (for reads).
+    pub fn index(&self) -> std::sync::RwLockReadGuard<'_, VectorIndex> {
+        self.index.read().expect("vector index lock poisoned")
+    }
+
+    /// Get a mutable reference to the vector index (for writes).
+    pub fn index_mut(&self) -> std::sync::RwLockWriteGuard<'_, VectorIndex> {
+        self.index.write().expect("vector index lock poisoned")
+    }
+
+    /// Get a reference to the model registry.
+    pub fn registry(&self) -> std::sync::RwLockReadGuard<'_, ModelRegistry> {
+        self.registry.read().expect("model registry lock poisoned")
+    }
+
+    /// Get a mutable reference to the model registry (for registering embedders).
+    pub fn registry_mut(&self) -> std::sync::RwLockWriteGuard<'_, ModelRegistry> {
+        self.registry.write().expect("model registry lock poisoned")
+    }
+
+    /// Check if the bridge has any real embedder (beyond hash fallback).
+    #[must_use]
+    pub fn has_real_embedder(&self) -> bool {
+        self.registry().has_real_embedder()
+    }
+
+    /// Search for semantically similar documents.
+    ///
+    /// Embeds the query text and performs vector similarity search.
+    pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
+        let registry = self.registry();
+
+        // Get the best available embedder (will fallback to hash if no real model)
+        let Ok(embedder) = registry.get_embedder(ModelTier::Fast) else {
+            return Vec::new();
+        };
+
+        // If only hash embedder is available, semantic search won't produce
+        // meaningful similarity scores, so return empty to degrade gracefully
+        if embedder.model_info().tier == ModelTier::Hash {
+            tracing::debug!(
+                target: "search.semantic",
+                "no real embedder available, skipping semantic search"
+            );
+            return Vec::new();
+        }
+
+        // Embed the query text
+        let embedding = match embedder.embed(&query.text) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(
+                    target: "search.semantic",
+                    error = %e,
+                    "failed to embed query"
+                );
+                return Vec::new();
+            }
+        };
+        drop(registry);
+
+        // Build filter from query
+        let filter = build_vector_filter(query);
+
+        // Search the index
+        let index = self.index();
+        let hits = match index.search(&embedding.vector, limit, Some(&filter)) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(
+                    target: "search.semantic",
+                    error = %e,
+                    "vector search failed"
+                );
+                return Vec::new();
+            }
+        };
+        drop(index);
+
+        // Convert to SearchResult
+        hits.into_iter()
+            .map(|hit| SearchResult {
+                doc_kind: convert_doc_kind(hit.doc_kind),
+                id: hit.doc_id,
+                project_id: hit.project_id,
+                title: String::new(), // Vector index doesn't store full docs
+                body: String::new(),
+                score: Some(f64::from(hit.score)),
+                importance: None,
+                ack_required: None,
+                created_ts: None,
+                thread_id: None,
+                from_agent: None,
+                redacted: false,
+                redaction_reason: None,
+            })
+            .collect()
+    }
+}
+
+/// Build a `VectorFilter` from a `SearchQuery`.
+#[cfg(feature = "hybrid")]
+fn build_vector_filter(query: &SearchQuery) -> VectorFilter {
+    let mut filter = VectorFilter::new();
+
+    if let Some(pid) = query.project_id {
+        filter = filter.with_project(pid);
+    }
+
+    let doc_kinds = vec![match query.doc_kind {
+        DocKind::Message => SearchDocKind::Message,
+        DocKind::Agent => SearchDocKind::Agent,
+        DocKind::Project => SearchDocKind::Project,
+        DocKind::Thread => SearchDocKind::Thread,
+    }];
+    filter = filter.with_doc_kinds(doc_kinds);
+    filter
+}
+
+/// Convert search-core `DocKind` to planner `DocKind`.
+#[cfg(feature = "hybrid")]
+const fn convert_doc_kind(kind: SearchDocKind) -> DocKind {
+    match kind {
+        SearchDocKind::Message => DocKind::Message,
+        SearchDocKind::Agent => DocKind::Agent,
+        SearchDocKind::Project => DocKind::Project,
+        SearchDocKind::Thread => DocKind::Thread,
+    }
+}
+
+/// Initialize the global semantic search bridge.
+///
+/// Should be called once at startup when hybrid search is enabled.
+#[cfg(feature = "hybrid")]
+pub fn init_semantic_bridge(config: VectorIndexConfig) -> Result<(), String> {
+    let bridge = SemanticBridge::new(config);
+    let _ = SEMANTIC_BRIDGE.set(Some(Arc::new(bridge)));
+    Ok(())
+}
+
+/// Initialize the global semantic bridge with default configuration.
+#[cfg(feature = "hybrid")]
+pub fn init_semantic_bridge_default() -> Result<(), String> {
+    init_semantic_bridge(VectorIndexConfig::default())
+}
+
+/// Get the global semantic bridge, if initialized.
+#[cfg(feature = "hybrid")]
+pub fn get_semantic_bridge() -> Option<Arc<SemanticBridge>> {
+    SEMANTIC_BRIDGE.get().and_then(std::clone::Clone::clone)
 }
 
 /// Try executing semantic candidate retrieval for hybrid mode.
@@ -130,18 +327,23 @@ const fn try_tantivy_search(_query: &SearchQuery) -> Option<Vec<SearchResult>> {
 /// Semantic retrieval is intentionally optional at this stage: if no semantic
 /// backend is initialized yet, we return `None` and the orchestration stage
 /// degrades to lexical-only while preserving deterministic behavior.
-#[cfg(feature = "search-v3")]
+#[cfg(feature = "hybrid")]
+fn try_semantic_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
+    let bridge = get_semantic_bridge()?;
+    let results = bridge.search(query, limit);
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
+}
+
+/// Fallback for when hybrid feature is not enabled.
+#[cfg(not(feature = "hybrid"))]
 const fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
     None
 }
 
-#[cfg(not(feature = "search-v3"))]
-#[allow(dead_code)] // Stub for when search-v3 feature is disabled
-const fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
-    None
-}
-
-#[cfg(feature = "search-v3")]
 fn orchestrate_hybrid_results(
     query: &SearchQuery,
     engine: SearchEngine,
@@ -281,6 +483,7 @@ pub async fn execute_search(
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
     let engine = options.search_engine.unwrap_or_default();
+    let assistance = query_assistance_payload(query);
 
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
@@ -291,7 +494,7 @@ pub async fn execute_search(
             }
             // Record V3 metrics
             global_metrics().search.record_v3_query(latency_us, false);
-            return finish_scoped_response(raw_results, query, options);
+            return finish_scoped_response(raw_results, query, options, assistance.clone());
         }
         // Bridge not initialized → fall through to FTS5
     }
@@ -303,7 +506,6 @@ pub async fn execute_search(
     // 2) semantic candidate retrieval (optional; may be unavailable)
     // 3) deterministic dedupe + merge prep (mode-aware budgets)
     // Fusion/rerank stages are implemented by follow-up Search V3 tracks.
-    #[cfg(feature = "search-v3")]
     if matches!(engine, SearchEngine::Hybrid | SearchEngine::Auto) {
         if let Some(lexical_results) = try_tantivy_search(query) {
             let semantic_results =
@@ -315,7 +517,7 @@ pub async fn execute_search(
                 record_query("search_service_hybrid_candidates", latency_us);
             }
             global_metrics().search.record_v3_query(latency_us, false);
-            return finish_scoped_response(raw_results, query, options);
+            return finish_scoped_response(raw_results, query, options, assistance.clone());
         }
         // No lexical bridge available yet → fall through to legacy FTS.
     }
@@ -348,6 +550,7 @@ pub async fn execute_search(
             explain,
             audit_summary: None,
             sql_row_count: 0,
+            assistance,
         });
     }
 
@@ -434,6 +637,7 @@ pub async fn execute_search(
         explain,
         audit_summary: audit,
         sql_row_count,
+        assistance,
     })
 }
 
@@ -444,6 +648,7 @@ fn finish_scoped_response(
     raw_results: Vec<SearchResult>,
     query: &SearchQuery,
     options: &SearchOptions,
+    assistance: Option<QueryAssistance>,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let sql_row_count = raw_results.len();
     let next_cursor = compute_next_cursor(&raw_results, query.effective_limit());
@@ -467,6 +672,7 @@ fn finish_scoped_response(
         explain: None,
         audit_summary: audit,
         sql_row_count,
+        assistance,
     })
 }
 
@@ -486,6 +692,7 @@ pub async fn execute_search_simple(
     query: &SearchQuery,
 ) -> Outcome<SimpleSearchResponse, DbError> {
     let timer = std::time::Instant::now();
+    let assistance = query_assistance_payload(query);
 
     let plan = plan_search(query);
 
@@ -499,6 +706,7 @@ pub async fn execute_search_simple(
             results: Vec::new(),
             next_cursor: None,
             explain,
+            assistance,
             audit: Vec::new(),
         });
     }
@@ -540,6 +748,7 @@ pub async fn execute_search_simple(
         results: raw_results,
         next_cursor,
         explain,
+        assistance,
         audit: Vec::new(),
     })
 }
@@ -552,7 +761,7 @@ pub async fn execute_search_simple(
 fn map_rows_to_results(rows: &[SqlRow], doc_kind: DocKind) -> Vec<SearchResult> {
     rows.iter()
         .filter_map(|row| match doc_kind {
-            DocKind::Message => map_message_row(row),
+            DocKind::Message | DocKind::Thread => map_message_row(row),
             DocKind::Agent => map_agent_row(row),
             DocKind::Project => map_project_row(row),
         })
@@ -662,6 +871,7 @@ fn compute_next_cursor(results: &[SearchResult], limit: usize) -> Option<String>
 mod tests {
     use super::*;
     use crate::search_planner::SearchCursor;
+    use mcp_agent_mail_core::metrics::global_metrics;
 
     #[test]
     fn plan_param_conversion() {
@@ -738,7 +948,6 @@ mod tests {
         assert!(!opts.track_telemetry);
     }
 
-    #[cfg(feature = "search-v3")]
     fn result_with_score(id: i64, score: f64) -> SearchResult {
         SearchResult {
             doc_kind: DocKind::Message,
@@ -757,7 +966,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "search-v3")]
     #[test]
     fn hybrid_orchestration_keeps_lexical_ordering_deterministic() {
         let query = SearchQuery::messages("incident rollback plan", 1);
@@ -777,7 +985,6 @@ mod tests {
         assert_eq!(ids, vec![10, 20, 40, 30]);
     }
 
-    #[cfg(feature = "search-v3")]
     #[test]
     fn hybrid_orchestration_respects_requested_limit() {
         let mut query = SearchQuery::messages("search", 1);
@@ -792,5 +999,48 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, 1);
         assert_eq!(merged[1].id, 2);
+    }
+
+    #[test]
+    fn shadow_comparison_logging_updates_metrics_hook() {
+        let before = global_metrics().snapshot();
+        let query = SearchQuery::messages("shadow-hook", 1);
+        let fts5 = vec![
+            result_with_score(1, 0.9),
+            result_with_score(2, 0.8),
+            result_with_score(3, 0.7),
+        ];
+        let tantivy = vec![
+            result_with_score(1, 0.88),
+            result_with_score(2, 0.77),
+            result_with_score(9, 0.66),
+        ];
+
+        log_shadow_comparison(&fts5, &tantivy, &query, 1500, 1100, false);
+
+        let after = global_metrics().snapshot();
+        assert!(
+            after.search.shadow_comparisons_total > before.search.shadow_comparisons_total,
+            "expected shadow comparison counter to increase (before={}, after={})",
+            before.search.shadow_comparisons_total,
+            after.search.shadow_comparisons_total
+        );
+    }
+
+    #[test]
+    fn query_assistance_payload_empty_for_plain_text() {
+        let query = SearchQuery::messages("plain text query", 1);
+        assert!(query_assistance_payload(&query).is_none());
+    }
+
+    #[test]
+    fn query_assistance_payload_contains_hints_and_suggestions() {
+        let query = SearchQuery::messages("form:BlueLake thread:br-123 migration", 1);
+        let assistance = query_assistance_payload(&query).expect("assistance should be populated");
+        assert_eq!(assistance.applied_filter_hints.len(), 1);
+        assert_eq!(assistance.applied_filter_hints[0].field, "thread");
+        assert_eq!(assistance.applied_filter_hints[0].value, "br-123");
+        assert_eq!(assistance.did_you_mean.len(), 1);
+        assert_eq!(assistance.did_you_mean[0].suggested_field, "from");
     }
 }

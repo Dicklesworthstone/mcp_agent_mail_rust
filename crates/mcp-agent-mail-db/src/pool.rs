@@ -13,13 +13,13 @@ use mcp_agent_mail_core::{
     config::env_value,
     disk::{is_sqlite_memory_database_url, sqlite_file_path_from_database_url},
 };
-use sqlmodel_core::Error as SqlError;
+use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 /// Default pool configuration values — sized for 1000+ concurrent agents.
 ///
@@ -345,7 +345,7 @@ impl DbPool {
                         }
                     }
 
-                    // For file-backed DBs, run DB-wide init (WAL mode, migrations) with
+                    // For file-backed DBs, run DB-wide init (journal mode, migrations) with
                     // C-backed SqliteConnection BEFORE opening FrankenConnection.
                     // FrankenConnection and SqliteConnection must never be open on the
                     // same file simultaneously — concurrent access corrupts the database.
@@ -360,16 +360,23 @@ impl DbPool {
                                 async move {
                                     // Use C-backed SqliteConnection for DB-wide init.
                                     //
-                                    // IMPORTANT: Only run *base* migrations (no FTS5 virtual
+                                    // IMPORTANT: Use base-safe DB init pragmas (no WAL mode)
+                                    // and only run *base* migrations (no FTS5 virtual
                                     // tables, no triggers). FrankenConnection cannot open
                                     // database files that contain FTS5 shadow table pages
                                     // ("cell has no rowid" error). Search falls back to LIKE
                                     // automatically when FTS5 tables are absent.
+                                    if let Err(e) =
+                                        ensure_sqlite_file_healthy(Path::new(&sqlite_path))
+                                    {
+                                        return Err(Outcome::Err(e));
+                                    }
                                     let mig_conn =
                                         sqlmodel_sqlite::SqliteConnection::open_file(&sqlite_path)
                                             .map_err(Outcome::<(), SqlError>::Err)?;
 
-                                    if let Err(e) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
+                                    if let Err(e) =
+                                        mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
                                     {
                                         return Err(Outcome::Err(e));
                                     }
@@ -385,6 +392,9 @@ impl DbPool {
                                                 return Err(Outcome::Panicked(p));
                                             }
                                         }
+                                    }
+                                    if let Err(e) = schema::enforce_base_mode_cleanup(&mig_conn) {
+                                        return Err(Outcome::Err(e));
                                     }
                                     // Drop SqliteConnection before FrankenConnection opens.
                                     drop(mig_conn);
@@ -662,6 +672,213 @@ fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
     let gate = Arc::new(OnceCell::new());
     guard.insert(sqlite_path.to_string(), Arc::clone(&gate));
     gate
+}
+
+fn is_corruption_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("database disk image is malformed")
+        || lower.contains("malformed database schema")
+        || lower.contains("file is not a database")
+}
+
+fn sqlite_quick_check_is_ok(conn: &sqlmodel_sqlite::SqliteConnection) -> Result<bool, SqlError> {
+    let rows = conn.query_sync("PRAGMA quick_check", &[])?;
+    let mut details: Vec<String> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(v) = row.get_named::<String>("quick_check") {
+            details.push(v);
+        } else if let Ok(v) = row.get_named::<String>("integrity_check") {
+            details.push(v);
+        } else if let Some(Value::Text(v)) = row.values().next() {
+            details.push(v.clone());
+        }
+    }
+    if details.is_empty() {
+        // Some backends may return an empty rowset for success.
+        return Ok(true);
+    }
+    Ok(details.len() == 1 && details[0] == "ok")
+}
+
+fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    let path_str = path.to_string_lossy();
+    let conn = match sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            if is_corruption_error_message(&e.to_string()) {
+                return Ok(false);
+            }
+            return Err(e);
+        }
+    };
+
+    match sqlite_quick_check_is_ok(&conn) {
+        Ok(ok) => Ok(ok),
+        Err(e) => {
+            if is_corruption_error_message(&e.to_string()) {
+                return Ok(false);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
+    let mut candidates: Vec<(u8, SystemTime, PathBuf)> = Vec::new();
+    let Some(file_name) = primary_path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Some(parent) = primary_path.parent() else {
+        return Vec::new();
+    };
+
+    let bak = primary_path.with_file_name(format!("{file_name}.bak"));
+    if bak.is_file() {
+        let modified = bak
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((0, modified, bak));
+    }
+
+    let backup_prefix = format!("{file_name}.backup-");
+    let recovery_prefix = format!("{file_name}.recovery");
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let priority = if name.starts_with(&backup_prefix) {
+                1
+            } else if name.starts_with(&recovery_prefix) {
+                2
+            } else {
+                continue;
+            };
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            candidates.push((priority, modified, path));
+        }
+    }
+
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    candidates.into_iter().map(|(_, _, p)| p).collect()
+}
+
+fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
+    for candidate in sqlite_backup_candidates(primary_path) {
+        match sqlite_file_is_healthy(&candidate) {
+            Ok(true) => return Some(candidate),
+            Ok(false) => tracing::warn!(
+                candidate = %candidate.display(),
+                "sqlite backup candidate failed quick_check; skipping"
+            ),
+            Err(e) => tracing::warn!(
+                candidate = %candidate.display(),
+                error = %e,
+                "sqlite backup candidate unreadable; skipping"
+            ),
+        }
+    }
+    None
+}
+
+fn quarantine_sidecar(primary_path: &Path, suffix: &str, timestamp: &str) -> Result<(), SqlError> {
+    let mut source_os = primary_path.as_os_str().to_os_string();
+    source_os.push(suffix);
+    let source = PathBuf::from(source_os);
+    if !source.exists() {
+        return Ok(());
+    }
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    let target = primary_path.with_file_name(format!("{base_name}{suffix}.corrupt-{timestamp}"));
+    std::fs::rename(&source, &target).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to quarantine sidecar {}: {e}",
+            source.display()
+        ))
+    })
+}
+
+fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), SqlError> {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    let quarantined_db = primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
+
+    std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to quarantine corrupted database {}: {e}",
+            primary_path.display()
+        ))
+    })?;
+
+    if let Err(e) = quarantine_sidecar(primary_path, "-wal", &timestamp) {
+        tracing::warn!(
+            sidecar = %format!("{}-wal", primary_path.display()),
+            error = %e,
+            "failed to quarantine WAL sidecar; continuing"
+        );
+    }
+    if let Err(e) = quarantine_sidecar(primary_path, "-shm", &timestamp) {
+        tracing::warn!(
+            sidecar = %format!("{}-shm", primary_path.display()),
+            error = %e,
+            "failed to quarantine SHM sidecar; continuing"
+        );
+    }
+
+    if let Err(e) = std::fs::copy(backup_path, primary_path) {
+        let _ = std::fs::rename(&quarantined_db, primary_path);
+        return Err(SqlError::Custom(format!(
+            "failed to restore backup {} into {}: {e}",
+            backup_path.display(),
+            primary_path.display()
+        )));
+    }
+
+    tracing::warn!(
+        primary = %primary_path.display(),
+        backup = %backup_path.display(),
+        quarantined = %quarantined_db.display(),
+        "auto-restored sqlite database from backup after corruption detection"
+    );
+    Ok(())
+}
+
+fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
+    if sqlite_file_is_healthy(primary_path)? {
+        return Ok(());
+    }
+    let Some(backup_path) = find_healthy_backup(primary_path) else {
+        return Err(SqlError::Custom(format!(
+            "database file {} is malformed and no healthy backup was found",
+            primary_path.display()
+        )));
+    };
+    restore_from_backup(primary_path, &backup_path)?;
+    if sqlite_file_is_healthy(primary_path)? {
+        return Ok(());
+    }
+    Err(SqlError::Custom(format!(
+        "database file {} was restored from {}, but quick_check still failed",
+        primary_path.display(),
+        backup_path.display()
+    )))
 }
 
 /// Get (or create) a cached pool for the given config.
@@ -1029,5 +1246,84 @@ mod tests {
             .wal_checkpoint()
             .expect("memory checkpoint should succeed");
         assert_eq!(frames, 0, "memory DB checkpoint should return 0");
+    }
+
+    fn sqlite_marker_value(path: &Path) -> Option<String> {
+        let path_str = path.to_string_lossy();
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref()).ok()?;
+        conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT NOT NULL)")
+            .ok()?;
+        let rows = conn
+            .query_sync("SELECT value FROM marker ORDER BY rowid DESC LIMIT 1", &[])
+            .ok()?;
+        rows.first()?.get_named::<String>("value").ok()
+    }
+
+    #[test]
+    fn sqlite_backup_candidates_prioritize_dot_bak() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let dot_bak = dir.path().join("storage.sqlite3.bak");
+        let backup_series = dir.path().join("storage.sqlite3.backup-20260212_000000");
+        std::fs::write(&primary, b"primary").expect("write primary");
+        std::fs::write(&dot_bak, b"bak").expect("write .bak");
+        std::fs::write(&backup_series, b"series").expect("write backup-");
+
+        let candidates = sqlite_backup_candidates(&primary);
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(dot_bak.as_path()),
+            ".bak should be first-priority backup candidate"
+        );
+    }
+
+    #[test]
+    fn ensure_sqlite_file_healthy_restores_from_bak() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let primary_str = primary.to_string_lossy();
+        let conn =
+            sqlmodel_sqlite::SqliteConnection::open_file(primary_str.as_ref()).expect("open db");
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
+            .expect("create marker table");
+        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
+            .expect("seed marker");
+        drop(conn);
+        std::fs::copy(&primary, &backup).expect("copy backup");
+        std::fs::write(&primary, b"not-a-sqlite-file").expect("corrupt primary");
+
+        ensure_sqlite_file_healthy(&primary).expect("auto-recovery should succeed");
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("from-backup"),
+            "restored DB should preserve backup data"
+        );
+
+        let mut corrupt_artifacts = 0usize;
+        for entry in std::fs::read_dir(dir.path()).expect("read dir").flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().contains(".corrupt-") {
+                corrupt_artifacts += 1;
+            }
+        }
+        assert!(
+            corrupt_artifacts >= 1,
+            "expected quarantined corrupt artifact(s) after recovery"
+        );
+    }
+
+    #[test]
+    fn ensure_sqlite_file_healthy_errors_without_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        std::fs::write(&primary, b"broken").expect("write broken db");
+
+        let err = ensure_sqlite_file_healthy(&primary).expect_err("should fail without backup");
+        let message = err.to_string();
+        assert!(
+            message.contains("no healthy backup"),
+            "expected clear no-backup error, got: {message}"
+        );
     }
 }
