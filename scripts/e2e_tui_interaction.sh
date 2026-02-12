@@ -238,25 +238,19 @@ setup_server_env() {
 seed_test_data() {
     local port="$1"
     local url="http://127.0.0.1:${port}/mcp/"
-    local headers='-H "content-type: application/json"'
 
-    # ensure_project
-    curl -sS -X POST "${url}" \
-        -H "content-type: application/json" \
-        --data '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"ensure_project","arguments":{"human_key":"/tmp/e2e-test-project"}}}' \
-        >/dev/null 2>&1
+    SEED_CALL_SEQ="${SEED_CALL_SEQ:-0}"
+    SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
+    local seed_prefix="seed_tui_interaction_${SEED_CALL_SEQ}"
 
-    # register_agent
-    curl -sS -X POST "${url}" \
-        -H "content-type: application/json" \
-        --data '{"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e-test-project","program":"e2e-test","model":"test-model","name":"RedFox","task_description":"E2E testing"}}}' \
-        >/dev/null 2>&1
+    e2e_mark_case_start "${seed_prefix}_ensure_project"
+    e2e_rpc_call "${seed_prefix}_ensure_project" "${url}" "ensure_project" '{"human_key":"/tmp/e2e-test-project"}' >/dev/null 2>&1 || true
 
-    # send_message
-    curl -sS -X POST "${url}" \
-        -H "content-type: application/json" \
-        --data '{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e-test-project","sender_name":"RedFox","to":["RedFox"],"subject":"E2E test message","body_md":"Hello from E2E test"}}}' \
-        >/dev/null 2>&1
+    e2e_mark_case_start "${seed_prefix}_register_agent"
+    e2e_rpc_call "${seed_prefix}_register_agent" "${url}" "register_agent" '{"project_key":"/tmp/e2e-test-project","program":"e2e-test","model":"test-model","name":"RedFox","task_description":"E2E testing"}' >/dev/null 2>&1 || true
+
+    e2e_mark_case_start "${seed_prefix}_send_message"
+    e2e_rpc_call "${seed_prefix}_send_message" "${url}" "send_message" '{"project_key":"/tmp/e2e-test-project","sender_name":"RedFox","to":["RedFox"],"subject":"E2E test message","body_md":"Hello from E2E test"}' >/dev/null 2>&1 || true
 }
 
 
