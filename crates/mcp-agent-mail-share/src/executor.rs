@@ -340,7 +340,6 @@ fn prompt_step_confirm(step: &PlanStep) -> Result<bool, WizardError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn headers_content_github_includes_coop_coep() {

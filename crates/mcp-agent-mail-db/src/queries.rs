@@ -317,34 +317,44 @@ fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> 
     ProjectRow::from_row(row).map_err(|e| map_sql_error(&e))
 }
 
-fn decode_agent_row(row: &SqlRow) -> std::result::Result<AgentRow, DbError> {
-    // Use named column access for reliability. Positional access can fail when
-    // row metadata doesn't match expected column order.
-    Ok(AgentRow {
-        id: Some(row.get_named("id").unwrap_or(0)),
-        project_id: row.get_named("project_id").unwrap_or(0),
-        name: row.get_named("name").unwrap_or_default(),
-        program: row.get_named("program").unwrap_or_default(),
-        model: row.get_named("model").unwrap_or_default(),
-        task_description: row.get_named("task_description").unwrap_or_default(),
-        inception_ts: row.get_named("inception_ts").unwrap_or(0),
-        last_active_ts: row.get_named("last_active_ts").unwrap_or(0),
-        attachments_policy: row.get_named("attachments_policy").unwrap_or_else(|| "auto".to_string()),
-        contact_policy: row.get_named("contact_policy").unwrap_or_else(|| "auto".to_string()),
-    })
+fn decode_agent_row(row: &SqlRow) -> AgentRow {
+    // Extract all fields manually - the ORM's from_row has issues with raw query results
+    // where column metadata is missing or id returns 0
+
+    // Try positional extraction first (more reliable for traw_query results)
+    let id = row.get_as::<i64>(0).ok();
+    let project_id = row.get_as::<i64>(1).unwrap_or(0);
+    let name = row.get_as::<String>(2).unwrap_or_default();
+    let program = row.get_as::<String>(3).unwrap_or_default();
+    let model = row.get_as::<String>(4).unwrap_or_default();
+    let task_description = row.get_as::<String>(5).unwrap_or_default();
+    let inception_ts = row.get_as::<i64>(6).unwrap_or(0);
+    let last_active_ts = row.get_as::<i64>(7).unwrap_or(0);
+    let attachments_policy = row.get_as::<String>(8).unwrap_or_else(|_| "auto".to_string());
+    let contact_policy = row.get_as::<String>(9).unwrap_or_else(|_| "auto".to_string());
+
+    AgentRow {
+        id,
+        project_id,
+        name,
+        program,
+        model,
+        task_description,
+        inception_ts,
+        last_active_ts,
+        attachments_policy,
+        contact_policy,
+    }
 }
 
-fn find_agent_by_name(
-    rows: &[SqlRow],
-    name: &str,
-) -> std::result::Result<Option<AgentRow>, DbError> {
+fn find_agent_by_name(rows: &[SqlRow], name: &str) -> Option<AgentRow> {
     for r in rows {
-        let row = decode_agent_row(r)?;
+        let row = decode_agent_row(r);
         if row.name == name {
-            return Ok(Some(row));
+            return Some(row);
         }
     }
-    Ok(None)
+    None
 }
 
 /// `SQLite` default `SQLITE_MAX_VARIABLE_NUMBER` is 999 (32766 in newer builds).
@@ -510,19 +520,15 @@ pub async fn ensure_project(
                     match map_sql_outcome(
                         traw_query(cx, &tracked, select_sql, &select_params).await,
                     ) {
-                        Outcome::Ok(rows) => {
-                            if let Some(r) = rows.first() {
-                                match decode_project_row(r) {
-                                    Ok(row) => {
-                                        crate::cache::read_cache().put_project(&row);
-                                        Outcome::Ok(row)
-                                    }
-                                    Err(err) => Outcome::Err(err),
+                        Outcome::Ok(rows) => rows.first().map_or(Outcome::Err(e), |r| {
+                            match decode_project_row(r) {
+                                Ok(row) => {
+                                    crate::cache::read_cache().put_project(&row);
+                                    Outcome::Ok(row)
                                 }
-                            } else {
-                                Outcome::Err(e)
+                                Err(err) => Outcome::Err(err),
                             }
-                        }
+                        }),
                         Outcome::Err(select_err) => Outcome::Err(select_err),
                         Outcome::Cancelled(r) => Outcome::Cancelled(r),
                         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -560,19 +566,16 @@ pub async fn get_project_by_slug(
     let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
     let params = [Value::Text(slug.to_string())];
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => {
-            if let Some(r) = rows.first() {
-                match decode_project_row(r) {
-                    Ok(row) => {
-                        crate::cache::read_cache().put_project(&row);
-                        Outcome::Ok(row)
-                    }
-                    Err(e) => Outcome::Err(e),
+        Outcome::Ok(rows) => rows.first().map_or_else(
+            || Outcome::Err(DbError::not_found("Project", slug)),
+            |r| match decode_project_row(r) {
+                Ok(row) => {
+                    crate::cache::read_cache().put_project(&row);
+                    Outcome::Ok(row)
                 }
-            } else {
-                Outcome::Err(DbError::not_found("Project", slug))
-            }
-        }
+                Err(e) => Outcome::Err(e),
+            },
+        ),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -601,19 +604,16 @@ pub async fn get_project_by_human_key(
     let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE human_key = ? LIMIT 1";
     let params = [Value::Text(human_key.to_string())];
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => {
-            if let Some(r) = rows.first() {
-                match decode_project_row(r) {
-                    Ok(row) => {
-                        crate::cache::read_cache().put_project(&row);
-                        Outcome::Ok(row)
-                    }
-                    Err(e) => Outcome::Err(e),
+        Outcome::Ok(rows) => rows.first().map_or_else(
+            || Outcome::Err(DbError::not_found("Project", human_key)),
+            |r| match decode_project_row(r) {
+                Ok(row) => {
+                    crate::cache::read_cache().put_project(&row);
+                    Outcome::Ok(row)
                 }
-            } else {
-                Outcome::Err(DbError::not_found("Project", human_key))
-            }
-        }
+                Err(e) => Outcome::Err(e),
+            },
+        ),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -638,16 +638,13 @@ pub async fn get_project_by_id(
     let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(project_id)];
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => {
-            if let Some(r) = rows.first() {
-                match decode_project_row(r) {
-                    Ok(row) => Outcome::Ok(row),
-                    Err(e) => Outcome::Err(e),
-                }
-            } else {
-                Outcome::Err(DbError::not_found("Project", project_id.to_string()))
-            }
-        }
+        Outcome::Ok(rows) => rows.first().map_or_else(
+            || Outcome::Err(DbError::not_found("Project", project_id.to_string())),
+            |r| match decode_project_row(r) {
+                Ok(row) => Outcome::Ok(row),
+                Err(e) => Outcome::Err(e),
+            },
+        ),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -727,11 +724,7 @@ pub async fn register_agent(
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(raw_rows) => {
             // Decode rows using the fallback decoder
-            let found = match find_agent_by_name(&raw_rows, name) {
-                Ok(r) => r,
-                Err(e) => return Outcome::Err(e),
-            };
-            if let Some(mut row) = found {
+            if let Some(mut row) = find_agent_by_name(&raw_rows, name) {
                 row.program = program.to_string();
                 row.model = model.to_string();
                 row.task_description = task_desc.to_string();
@@ -761,30 +754,17 @@ pub async fn register_agent(
                 };
                 match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
                     Outcome::Ok(_) => {
-                        // Re-read by name to get actual ID (insert! returns 0 instead of rowid)
-                        let reread_sql = "SELECT id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy FROM agents WHERE project_id = ? AND name = ? LIMIT 1";
-                        let reread_params =
-                            [Value::BigInt(project_id), Value::Text(name.to_string())];
-                        match map_sql_outcome(
-                            traw_query(cx, &tracked, reread_sql, &reread_params).await,
-                        ) {
-                            Outcome::Ok(rows) => {
-                                if let Some(r) = rows.first() {
-                                    match decode_agent_row(r) {
-                                        Ok(fresh) => {
-                                            crate::cache::read_cache().put_agent(&fresh);
-                                            Outcome::Ok(fresh)
-                                        }
-                                        Err(e) => Outcome::Err(e),
-                                    }
-                                } else {
-                                    Outcome::Err(DbError::not_found("Agent", name))
-                                }
-                            }
-                            Outcome::Err(e) => Outcome::Err(e),
-                            Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                            Outcome::Panicked(p) => Outcome::Panicked(p),
-                        }
+                        // Use synchronous query on inner connection to get last_insert_rowid
+                        // This works reliably unlike async traw_query which has row format issues
+                        let rowid = tracked.inner
+                            .query_sync("SELECT last_insert_rowid() AS id", &[])
+                            .ok()
+                            .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("id").ok()))
+                            .unwrap_or(0);
+                        let mut fresh = row;
+                        fresh.id = Some(rowid);
+                        crate::cache::read_cache().put_agent(&fresh);
+                        Outcome::Ok(fresh)
                     }
                     Outcome::Err(e) => Outcome::Err(e),
                     Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -907,14 +887,13 @@ pub async fn get_agent(
             .all(cx, &tracked)
             .await,
     ) {
-        Outcome::Ok(rows) => {
-            if let Some(row) = rows.into_iter().find(|r| r.name == name) {
+        Outcome::Ok(rows) => rows.into_iter().find(|r| r.name == name).map_or_else(
+            || Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}"))),
+            |row| {
                 crate::cache::read_cache().put_agent(&row);
                 Outcome::Ok(row)
-            } else {
-                Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")))
-            }
-        }
+            },
+        ),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -1144,6 +1123,68 @@ pub async fn set_agent_contact_policy(
                 }
                 Outcome::Ok(None) => {
                     Outcome::Err(DbError::not_found("Agent", agent_id.to_string()))
+                }
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            }
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Update agent's `contact_policy` by project and name (avoids ID lookup issues)
+pub async fn set_agent_contact_policy_by_name(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+    policy: &str,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let now = now_micros();
+    let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE project_id = ? AND name = ?";
+    let params = [
+        Value::Text(policy.to_string()),
+        Value::BigInt(now),
+        Value::BigInt(project_id),
+        Value::Text(name.to_string()),
+    ];
+    let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
+
+    match out {
+        Outcome::Ok(affected) => {
+            if affected == 0 {
+                return Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")));
+            }
+            // Invalidate cache
+            crate::cache::read_cache().invalidate_agent(project_id, name);
+
+            // Fetch updated agent directly with raw query (bypasses ORM decoding issues)
+            let select_sql = "SELECT id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy FROM agents WHERE project_id = ? AND name = ? LIMIT 1";
+            let select_params = [
+                Value::BigInt(project_id),
+                Value::Text(name.to_string()),
+            ];
+            match map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await) {
+                Outcome::Ok(rows) => {
+                    if let Some(r) = rows.first() {
+                        let row = decode_agent_row(r);
+                        crate::cache::read_cache().put_agent(&row);
+                        Outcome::Ok(row)
+                    } else {
+                        Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")))
+                    }
                 }
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),

@@ -1103,10 +1103,6 @@ mod tests {
 
         // macro_contact_handshake default TTL
         assert_eq!(604_800_i64, 7 * 24 * 60 * 60); // 7 days
-
-        // Both should be >= 60
-        assert!(3600 >= 60);
-        assert!(604_800 >= 60);
     }
 
     // -----------------------------------------------------------------------

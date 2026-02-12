@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn worktrees_required_error_contains_feature_disabled() {
         let err = worktrees_required();
-        let msg = format!("{:?}", err);
+        let msg = format!("{err:?}");
         assert!(
             msg.contains("FEATURE_DISABLED") || msg.contains("disabled"),
             "error should mention FEATURE_DISABLED: {msg}"
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn worktrees_required_error_mentions_env_var() {
         let err = worktrees_required();
-        let msg = format!("{:?}", err);
+        let msg = format!("{err:?}");
         assert!(
             msg.contains("WORKTREES_ENABLED"),
             "error should mention WORKTREES_ENABLED env var: {msg}"

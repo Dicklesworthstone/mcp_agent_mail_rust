@@ -697,7 +697,7 @@ mod tests {
     #[test]
     fn worktrees_required_mentions_env_var() {
         let err = worktrees_required();
-        let msg = format!("{:?}", err);
+        let msg = format!("{err:?}");
         assert!(
             msg.contains("WORKTREES_ENABLED"),
             "error should mention WORKTREES_ENABLED: {msg}"
@@ -707,7 +707,7 @@ mod tests {
     #[test]
     fn worktrees_required_mentions_product_bus() {
         let err = worktrees_required();
-        let msg = format!("{:?}", err);
+        let msg = format!("{err:?}");
         assert!(
             msg.contains("Product Bus"),
             "error should mention Product Bus: {msg}"

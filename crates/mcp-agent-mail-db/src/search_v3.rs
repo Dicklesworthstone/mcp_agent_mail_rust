@@ -61,6 +61,7 @@ mod inner {
 
         /// Create an in-memory index (for testing).
         #[cfg(test)]
+        #[must_use]
         pub fn in_memory() -> Self {
             let (schema, handles) = build_schema();
             let index = Index::create_in_ram(schema);
@@ -73,16 +74,19 @@ mod inner {
         }
 
         /// Get a reference to the underlying Tantivy `Index`.
-        pub fn index(&self) -> &Index {
+        #[must_use]
+        pub const fn index(&self) -> &Index {
             &self.index
         }
 
         /// Get the field handles.
-        pub fn handles(&self) -> &FieldHandles {
+        #[must_use]
+        pub const fn handles(&self) -> &FieldHandles {
             &self.handles
         }
 
         /// Get the index directory path.
+        #[must_use]
         pub fn index_dir(&self) -> &Path {
             &self.index_dir
         }
@@ -91,6 +95,7 @@ mod inner {
         ///
         /// Converts the planner `SearchQuery` to Tantivy-native queries,
         /// executes the search, and converts results back to `SearchResult`.
+        #[must_use]
         pub fn search(&self, query: &PlannerQuery) -> Vec<PlannerResult> {
             // Build text query
             let parser = LexicalParser::with_defaults(self.handles.subject, self.handles.body);
@@ -208,7 +213,7 @@ mod inner {
                     .get("sender")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let created_ts = hit.metadata.get("created_ts").and_then(|v| v.as_i64());
+                let created_ts = hit.metadata.get("created_ts").and_then(serde_json::Value::as_i64);
                 let subject = hit
                     .metadata
                     .get("subject")
@@ -216,11 +221,10 @@ mod inner {
                     .unwrap_or("")
                     .to_string();
 
-                #[allow(clippy::cast_possible_wrap)]
                 PlannerResult {
                     doc_kind,
-                    id: hit.doc_id as i64,
-                    project_id: hit.metadata.get("project_id").and_then(|v| v.as_i64()),
+                    id: hit.doc_id,
+                    project_id: hit.metadata.get("project_id").and_then(serde_json::Value::as_i64),
                     title: subject,
                     body: hit.snippet.clone().unwrap_or_default(),
                     score: Some(hit.score),
@@ -252,7 +256,7 @@ mod inner {
 
     /// Get the global Tantivy bridge, if initialized.
     pub fn get_bridge() -> Option<Arc<TantivyBridge>> {
-        BRIDGE.get().and_then(|opt| opt.clone())
+        BRIDGE.get().and_then(std::clone::Clone::clone)
     }
 }
 
@@ -347,7 +351,7 @@ mod tests {
     #[test]
     fn search_empty_query() {
         let bridge = setup_bridge_with_docs();
-        let mut query = PlannerQuery::messages("", 1);
+        let query = PlannerQuery::messages("", 1);
         let results = bridge.search(&query);
         assert!(results.is_empty());
     }
@@ -365,9 +369,11 @@ mod tests {
     #[test]
     fn search_no_project_scope() {
         let bridge = setup_bridge_with_docs();
-        let mut query = PlannerQuery::default();
-        query.text = "search".to_string();
-        query.doc_kind = DocKind::Message;
+        let query = PlannerQuery {
+            text: "search".to_string(),
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
         // No project_id filter
         let results = bridge.search(&query);
         // "search" only appears in doc 2
@@ -378,10 +384,12 @@ mod tests {
     #[test]
     fn search_with_sender_filter() {
         let bridge = setup_bridge_with_docs();
-        let mut query = PlannerQuery::default();
-        query.text = "plan fix".to_string();
-        query.doc_kind = DocKind::Message;
-        query.agent_name = Some("BlueLake".to_string());
+        let query = PlannerQuery {
+            text: "plan fix".to_string(),
+            doc_kind: DocKind::Message,
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
         // Should match docs from BlueLake only
         let results = bridge.search(&query);
         for r in &results {
@@ -415,10 +423,12 @@ mod tests {
     #[test]
     fn search_with_thread_filter() {
         let bridge = setup_bridge_with_docs();
-        let mut query = PlannerQuery::default();
-        query.text = "plan deploy fix".to_string();
-        query.doc_kind = DocKind::Message;
-        query.thread_id = Some("br-100".to_string());
+        let query = PlannerQuery {
+            text: "plan deploy fix".to_string(),
+            doc_kind: DocKind::Message,
+            thread_id: Some("br-100".to_string()),
+            ..Default::default()
+        };
         let results = bridge.search(&query);
         for r in &results {
             assert_eq!(r.thread_id.as_deref(), Some("br-100"));

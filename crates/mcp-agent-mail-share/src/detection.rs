@@ -60,7 +60,7 @@ pub fn detect_environment(bundle_path: Option<&Path>, cwd: &Path) -> DetectedEnv
 
     // Sort signals by confidence (high to low)
     env.signals
-        .sort_by(|a, b| confidence_order(a.confidence).cmp(&confidence_order(b.confidence)));
+        .sort_by_key(|a| confidence_order(a.confidence));
 
     env
 }
@@ -577,24 +577,30 @@ mod tests {
 
     #[test]
     fn determine_provider_github_from_repo() {
-        let mut env = DetectedEnvironment::default();
-        env.github_repo = Some("owner/repo".to_string());
+        let env = DetectedEnvironment {
+            github_repo: Some("owner/repo".to_string()),
+            ..Default::default()
+        };
         let provider = determine_recommended_provider(&env);
         assert_eq!(provider, Some(HostingProvider::GithubPages));
     }
 
     #[test]
     fn determine_provider_cloudflare_from_env() {
-        let mut env = DetectedEnvironment::default();
-        env.cloudflare_env = true;
+        let env = DetectedEnvironment {
+            cloudflare_env: true,
+            ..Default::default()
+        };
         let provider = determine_recommended_provider(&env);
         assert_eq!(provider, Some(HostingProvider::CloudflarePages));
     }
 
     #[test]
     fn determine_provider_netlify_from_env() {
-        let mut env = DetectedEnvironment::default();
-        env.netlify_env = true;
+        let env = DetectedEnvironment {
+            netlify_env: true,
+            ..Default::default()
+        };
         let provider = determine_recommended_provider(&env);
         assert_eq!(provider, Some(HostingProvider::Netlify));
     }

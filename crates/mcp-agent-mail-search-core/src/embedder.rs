@@ -885,7 +885,7 @@ mod tests {
     fn registry_register_model() {
         let mut registry = ModelRegistry::default();
         let info = well_known::minilm_l6_v2();
-        registry.register_model(info.clone());
+        registry.register_model(info);
         assert!(registry.get_model_info("all-minilm-l6-v2").is_some());
         // Not available until activated
         assert!(
@@ -901,7 +901,7 @@ mod tests {
         let mut registry = ModelRegistry::default();
         let embedder = Arc::new(HashEmbedder::new());
         registry.activate_embedder(embedder);
-        assert!(registry.has_real_embedder() || registry.list_available().len() > 0);
+        assert!(registry.has_real_embedder() || !registry.list_available().is_empty());
     }
 
     #[test]
@@ -946,20 +946,20 @@ mod tests {
     fn cosine_mismatched_length() {
         let a = vec![1.0, 2.0];
         let b = vec![1.0, 2.0, 3.0];
-        assert_eq!(cosine_similarity(&a, &b), 0.0);
+        assert!(cosine_similarity(&a, &b).abs() < f32::EPSILON);
     }
 
     #[test]
     fn cosine_empty() {
         let empty: Vec<f32> = Vec::new();
-        assert_eq!(cosine_similarity(&empty, &empty), 0.0);
+        assert!(cosine_similarity(&empty, &empty).abs() < f32::EPSILON);
     }
 
     #[test]
     fn cosine_zero_vector() {
         let zero = vec![0.0, 0.0, 0.0];
         let v = vec![1.0, 2.0, 3.0];
-        assert_eq!(cosine_similarity(&zero, &v), 0.0);
+        assert!(cosine_similarity(&zero, &v).abs() < f32::EPSILON);
     }
 
     // ── L2 normalization ──

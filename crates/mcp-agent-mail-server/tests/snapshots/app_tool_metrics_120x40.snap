@@ -1,19 +1,6 @@
-Search across messages, agents, projects... (/ to focus)                                                                
-Route: /search                                                                                                          
-                                                                                                                        
-                                                                                                                        
-  Scope               No results found.                            Select a result to view details.                     
-  [global]                                                                                                              
-  Type                                                                                                                  
-  [Messages]                                                                                                            
-  Imp.                                                                                                                  
-  [Any]                                                                                                                 
-  Ack                                                                                                                   
-  [Any]                                                                                                                 
-  Sort                                                                                                                  
-  [Newest]                                                                                                              
-  Field                                                                                                                 
-  [Both]                                                                                                                
+ 1:Dashboard  2:Messages  3:Threads  4:Agents  5:Search  6:Reservations  7:Tool Metrics  8:System Health  9:Timeline    
+ 0 tools | 0 calls | 0 errors | avg 0ms | Sort: Calls▼ | v=dashboard                                                    
+Tool Name                    │Calls         │Errors        │Err%        │Avg(ms)       │Trend                           
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -37,4 +24,17 @@ Route: /search
                                                                                                                         
                                                                                                                         
                                                                                                                         
-f:facets                                                                                                                
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+ Tool Metrics | mode:api up:0m00s     req:0 ok:0 err:0 avg:0ms | [j/k] Navigate tools [s] Cycle sort column     ? help  

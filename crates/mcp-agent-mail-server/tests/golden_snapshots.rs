@@ -240,3 +240,113 @@ fn buffer_to_text_is_not_blank() {
         "Dashboard should render visible content, got {non_space_count} non-space chars"
     );
 }
+
+// ===========================================================================
+// TUI V2 Widget Snapshot Tests (br-2bbt.11.1)
+// ===========================================================================
+//
+// These tests cover the new TUI V2 widgets introduced in the
+// TUI V2 Showcase-Grade Upgrade epic (br-2bbt) via full-app rendering:
+// - Command Palette (br-2bbt.1)
+// - Toast Notifications (br-2bbt.2)
+// - Modal Dialogs (br-2bbt.5)
+// - Native Charts (br-2bbt.4)
+
+use ftui::{Event, KeyCode, Modifiers};
+
+// ---------------------------------------------------------------------------
+// Command Palette - Full App Snapshots (br-2bbt.1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn app_with_palette_open_80x24() {
+    use ftui_runtime::Model;
+    use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
+
+    let config = Config::default();
+    let state = TuiSharedState::new(&config);
+    let mut model = MailAppModel::new(Arc::clone(&state));
+
+    // Open command palette via Ctrl+P key event
+    let ctrl_p =
+        Event::Key(ftui::KeyEvent::new(KeyCode::Char('p')).with_modifiers(Modifiers::CTRL));
+    model.update(MailMsg::Terminal(ctrl_p));
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(80, 24, &mut pool);
+    model.view(&mut frame);
+    assert_snapshot!("app_with_palette_open_80x24", &frame.buffer);
+}
+
+#[test]
+fn app_with_palette_open_160x48() {
+    use ftui_runtime::Model;
+    use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
+
+    let config = Config::default();
+    let state = TuiSharedState::new(&config);
+    let mut model = MailAppModel::new(Arc::clone(&state));
+
+    // Open command palette via Ctrl+P key event
+    let ctrl_p =
+        Event::Key(ftui::KeyEvent::new(KeyCode::Char('p')).with_modifiers(Modifiers::CTRL));
+    model.update(MailMsg::Terminal(ctrl_p));
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(160, 48, &mut pool);
+    model.view(&mut frame);
+    assert_snapshot!("app_with_palette_open_160x48", &frame.buffer);
+}
+
+// ---------------------------------------------------------------------------
+// More terminal size variants for comprehensive coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn app_reservations_80x24() {
+    snapshot_app(80, 24, MailScreenId::Reservations, "app_reservations_80x24");
+}
+
+#[test]
+fn app_reservations_120x40() {
+    snapshot_app(
+        120,
+        40,
+        MailScreenId::Reservations,
+        "app_reservations_120x40",
+    );
+}
+
+#[test]
+fn app_tool_metrics_80x24() {
+    snapshot_app(80, 24, MailScreenId::ToolMetrics, "app_tool_metrics_80x24");
+}
+
+#[test]
+fn app_tool_metrics_120x40() {
+    snapshot_app(
+        120,
+        40,
+        MailScreenId::ToolMetrics,
+        "app_tool_metrics_120x40",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Large terminal variants for dashboard layouts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn app_dashboard_160x48() {
+    snapshot_app(160, 48, MailScreenId::Dashboard, "app_dashboard_160x48");
+}
+
+#[test]
+fn app_messages_160x48() {
+    snapshot_app(160, 48, MailScreenId::Messages, "app_messages_160x48");
+}
+
+#[test]
+fn app_search_160x48() {
+    snapshot_app(160, 48, MailScreenId::Search, "app_search_160x48");
+}

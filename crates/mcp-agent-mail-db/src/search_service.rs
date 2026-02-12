@@ -131,11 +131,12 @@ const fn try_tantivy_search(_query: &SearchQuery) -> Option<Vec<SearchResult>> {
 /// backend is initialized yet, we return `None` and the orchestration stage
 /// degrades to lexical-only while preserving deterministic behavior.
 #[cfg(feature = "search-v3")]
-fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
+const fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
     None
 }
 
 #[cfg(not(feature = "search-v3"))]
+#[allow(dead_code)] // Stub for when search-v3 feature is disabled
 const fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
     None
 }

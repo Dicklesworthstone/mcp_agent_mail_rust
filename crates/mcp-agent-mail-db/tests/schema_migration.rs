@@ -1529,8 +1529,8 @@ fn data_survives_complete_migration_roundtrip() {
     );
 }
 
-/// Test whether FrankenConnection corrupts a DB created by SqliteConnection.
-/// Reproduces the "malformed database schema (agent_links) - duplicate column name" error.
+/// Test whether `FrankenConnection` corrupts a DB created by `SqliteConnection`.
+/// Reproduces the "malformed database schema (`agent_links`) - duplicate column name" error.
 #[test]
 fn frankenconnection_does_not_corrupt_schema() {
     use mcp_agent_mail_db::DbConn;
@@ -1617,7 +1617,7 @@ fn frankenconnection_does_not_corrupt_schema() {
         .expect("update after franken should work");
 }
 
-/// Does FrankenConnection corrupt even without writing (just open + close)?
+/// Does `FrankenConnection` corrupt even without writing (just open + close)?
 #[test]
 fn frankenconnection_open_close_no_write() {
     use mcp_agent_mail_db::DbConn;
@@ -1741,7 +1741,7 @@ fn frankenconnection_autoincrement_write() {
     }
 }
 
-/// Does FrankenConnection corrupt with a read-only query?
+/// Does `FrankenConnection` corrupt with a read-only query?
 #[test]
 fn frankenconnection_read_only_no_corruption() {
     use mcp_agent_mail_db::DbConn;
@@ -1775,7 +1775,7 @@ fn frankenconnection_read_only_no_corruption() {
     }
 }
 
-/// Minimal reproduction: does FrankenConnection corrupt even a tiny schema?
+/// Minimal reproduction: does `FrankenConnection` corrupt even a tiny schema?
 #[test]
 fn frankenconnection_tiny_schema_no_corruption() {
     use mcp_agent_mail_db::DbConn;

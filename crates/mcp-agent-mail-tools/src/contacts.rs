@@ -445,14 +445,13 @@ pub async fn set_contact_policy(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
-    let agent_id = agent.id.unwrap_or(0);
-
+    // Use name-based lookup to avoid ID issues with ORM row decoding
     let updated_agent = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::set_agent_contact_policy(
+        mcp_agent_mail_db::queries::set_agent_contact_policy_by_name(
             ctx.cx(),
             &pool,
-            agent_id,
+            project_id,
+            &agent_name,
             &policy_norm,
         )
         .await,
