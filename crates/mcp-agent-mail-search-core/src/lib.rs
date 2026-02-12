@@ -26,6 +26,7 @@ pub mod updater;
 
 pub mod filter_compiler;
 pub mod lexical_parser;
+pub mod lexical_response;
 
 #[cfg(feature = "tantivy-engine")]
 pub mod tantivy_schema;
@@ -54,5 +55,8 @@ pub use filter_compiler::{active_filter_count, has_active_filters};
 #[cfg(feature = "tantivy-engine")]
 pub use filter_compiler::{CompiledFilters, compile_filters};
 pub use lexical_parser::{SanitizedQuery, extract_terms, sanitize_query};
+pub use lexical_response::{find_highlights, generate_snippet};
+#[cfg(feature = "tantivy-engine")]
+pub use lexical_response::{ResponseConfig, execute_search};
 #[cfg(feature = "tantivy-engine")]
 pub use lexical_parser::{LexicalParser, LexicalParserConfig, ParseOutcome};

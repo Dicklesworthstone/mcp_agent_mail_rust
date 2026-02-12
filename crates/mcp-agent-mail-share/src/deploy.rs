@@ -304,6 +304,308 @@ impl VerifyLiveReport {
     }
 }
 
+// ── Verify-live orchestration ────────────────────────────────────────────
+
+/// Options for a verify-live run.
+#[derive(Debug, Clone)]
+pub struct VerifyLiveOptions {
+    /// URL to verify.
+    pub url: String,
+    /// Local bundle directory (Stage 1). If None, Stage 1 is skipped.
+    pub bundle_path: Option<std::path::PathBuf>,
+    /// Run security header audit (Stage 3).
+    pub security_audit: bool,
+    /// Promote warnings to errors for exit code.
+    pub strict: bool,
+    /// Stop after first error-severity failure.
+    pub fail_fast: bool,
+    /// Probe configuration (timeout, retries, etc.).
+    pub probe_config: crate::probe::ProbeConfig,
+}
+
+impl Default for VerifyLiveOptions {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            bundle_path: None,
+            security_audit: false,
+            strict: false,
+            fail_fast: false,
+            probe_config: crate::probe::ProbeConfig::default(),
+        }
+    }
+}
+
+/// Map a `DeployCheck` from `validate_bundle()` into a `VerifyLiveCheck`.
+fn map_bundle_check(check: &DeployCheck, elapsed_ms: u64) -> VerifyLiveCheck {
+    VerifyLiveCheck {
+        id: format!("bundle.{}", check.name),
+        description: check.message.clone(),
+        severity: check.severity,
+        passed: check.passed,
+        message: if check.passed {
+            check.message.clone()
+        } else {
+            format!("FAIL: {}", check.message)
+        },
+        elapsed_ms,
+        http_status: None,
+        headers_captured: None,
+    }
+}
+
+/// Map a `ProbeCheckResult` into a `VerifyLiveCheck`.
+fn map_probe_result(result: &crate::probe::ProbeCheckResult) -> VerifyLiveCheck {
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_ms = result.elapsed.as_millis() as u64;
+    VerifyLiveCheck {
+        id: result.id.clone(),
+        description: result.description.clone(),
+        severity: result.severity,
+        passed: result.passed,
+        message: result.message.clone(),
+        elapsed_ms,
+        http_status: result.http_status,
+        headers_captured: if result.headers_captured.is_empty() {
+            None
+        } else {
+            Some(result.headers_captured.clone())
+        },
+    }
+}
+
+/// Build the standard remote probe checks per `SPEC-verify-live-contract.md`.
+fn build_remote_checks() -> Vec<crate::probe::ProbeCheck> {
+    vec![
+        crate::probe::ProbeCheck {
+            id: "remote.root".to_string(),
+            description: "Root page accessible".to_string(),
+            path: "/".to_string(),
+            expected_status: Some(200),
+            required_headers: vec![],
+            severity: CheckSeverity::Error,
+        },
+        crate::probe::ProbeCheck {
+            id: "remote.viewer".to_string(),
+            description: "Viewer page accessible".to_string(),
+            path: "/viewer/".to_string(),
+            expected_status: Some(200),
+            required_headers: vec![],
+            severity: CheckSeverity::Warning,
+        },
+        crate::probe::ProbeCheck {
+            id: "remote.manifest".to_string(),
+            description: "Manifest accessible".to_string(),
+            path: "/manifest.json".to_string(),
+            expected_status: Some(200),
+            required_headers: vec![],
+            severity: CheckSeverity::Error,
+        },
+        crate::probe::ProbeCheck {
+            id: "remote.coop".to_string(),
+            description: "Cross-Origin-Opener-Policy header present".to_string(),
+            path: "/".to_string(),
+            expected_status: None,
+            required_headers: vec!["Cross-Origin-Opener-Policy".to_string()],
+            severity: CheckSeverity::Warning,
+        },
+        crate::probe::ProbeCheck {
+            id: "remote.coep".to_string(),
+            description: "Cross-Origin-Embedder-Policy header present".to_string(),
+            path: "/".to_string(),
+            expected_status: None,
+            required_headers: vec!["Cross-Origin-Embedder-Policy".to_string()],
+            severity: CheckSeverity::Warning,
+        },
+        crate::probe::ProbeCheck {
+            id: "remote.database".to_string(),
+            description: "Database accessible".to_string(),
+            path: "/mailbox.sqlite3".to_string(),
+            expected_status: Some(200),
+            required_headers: vec![],
+            severity: CheckSeverity::Info,
+        },
+    ]
+}
+
+/// Build the security audit checks per `SPEC-verify-live-contract.md`.
+fn build_security_checks() -> Vec<crate::probe::ProbeCheck> {
+    vec![
+        crate::probe::ProbeCheck {
+            id: "security.hsts".to_string(),
+            description: "Strict-Transport-Security header".to_string(),
+            path: "/".to_string(),
+            expected_status: None,
+            required_headers: vec!["Strict-Transport-Security".to_string()],
+            severity: CheckSeverity::Info,
+        },
+        crate::probe::ProbeCheck {
+            id: "security.x_content_type".to_string(),
+            description: "X-Content-Type-Options header".to_string(),
+            path: "/".to_string(),
+            expected_status: None,
+            required_headers: vec!["X-Content-Type-Options".to_string()],
+            severity: CheckSeverity::Info,
+        },
+        crate::probe::ProbeCheck {
+            id: "security.x_frame".to_string(),
+            description: "X-Frame-Options header".to_string(),
+            path: "/".to_string(),
+            expected_status: None,
+            required_headers: vec!["X-Frame-Options".to_string()],
+            severity: CheckSeverity::Info,
+        },
+        crate::probe::ProbeCheck {
+            id: "security.corp".to_string(),
+            description: "Cross-Origin-Resource-Policy header".to_string(),
+            path: "/".to_string(),
+            expected_status: None,
+            required_headers: vec!["Cross-Origin-Resource-Policy".to_string()],
+            severity: CheckSeverity::Info,
+        },
+    ]
+}
+
+/// Run the full verify-live pipeline (Stage 1 + Stage 2 + optional Stage 3).
+///
+/// Returns a complete `VerifyLiveReport` conforming to the JSON schema
+/// defined in `SPEC-verify-live-contract.md`.
+pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
+    let start = std::time::Instant::now();
+
+    // ── Stage 1: Local bundle validation ────────────────────────────
+    let local_stage = if let Some(ref bundle_dir) = opts.bundle_path {
+        let bundle_start = std::time::Instant::now();
+        match validate_bundle(bundle_dir) {
+            Ok(report) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed = bundle_start.elapsed().as_millis() as u64;
+                let checks: Vec<VerifyLiveCheck> = report
+                    .checks
+                    .iter()
+                    .map(|c| map_bundle_check(c, elapsed))
+                    .collect();
+
+                // Check for fail-fast short-circuit
+                let has_error = opts.fail_fast
+                    && checks
+                        .iter()
+                        .any(|c| !c.passed && c.severity == CheckSeverity::Error);
+
+                if has_error {
+                    // Return early with only local stage
+                    let stages = VerifyStages {
+                        local: VerifyStage { ran: true, checks },
+                        remote: VerifyStage {
+                            ran: false,
+                            checks: vec![],
+                        },
+                        security: VerifyStage {
+                            ran: false,
+                            checks: vec![],
+                        },
+                    };
+                    let verdict = VerifyLiveReport::compute_verdict(&stages);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let total_elapsed = start.elapsed().as_millis() as u64;
+                    let summary = VerifyLiveReport::compute_summary(&stages, total_elapsed);
+                    return VerifyLiveReport {
+                        schema_version: "1.0.0".to_string(),
+                        generated_at: Utc::now().to_rfc3339(),
+                        url: opts.url.clone(),
+                        bundle_path: Some(bundle_dir.display().to_string()),
+                        verdict,
+                        stages,
+                        summary,
+                        config: VerifyConfig {
+                            strict: opts.strict,
+                            fail_fast: opts.fail_fast,
+                            timeout_ms: opts.probe_config.timeout.as_millis() as u64,
+                            retries: opts.probe_config.retries,
+                            security_audit: opts.security_audit,
+                        },
+                    };
+                }
+
+                VerifyStage { ran: true, checks }
+            }
+            Err(e) => VerifyStage {
+                ran: true,
+                checks: vec![VerifyLiveCheck {
+                    id: "bundle.error".to_string(),
+                    description: "Bundle validation failed".to_string(),
+                    severity: CheckSeverity::Error,
+                    passed: false,
+                    message: e.to_string(),
+                    elapsed_ms: 0,
+                    http_status: None,
+                    headers_captured: None,
+                }],
+            },
+        }
+    } else {
+        VerifyStage {
+            ran: false,
+            checks: vec![],
+        }
+    };
+
+    // ── Stage 2: Remote endpoint probes ─────────────────────────────
+    let remote_checks = build_remote_checks();
+    let remote_results =
+        crate::probe::run_probe_checks(&opts.url, &remote_checks, &opts.probe_config);
+    let remote_stage = VerifyStage {
+        ran: true,
+        checks: remote_results.iter().map(map_probe_result).collect(),
+    };
+
+    // ── Stage 3: Security header audit ──────────────────────────────
+    let security_stage = if opts.security_audit {
+        let security_checks = build_security_checks();
+        let security_results =
+            crate::probe::run_probe_checks(&opts.url, &security_checks, &opts.probe_config);
+        VerifyStage {
+            ran: true,
+            checks: security_results.iter().map(map_probe_result).collect(),
+        }
+    } else {
+        VerifyStage {
+            ran: false,
+            checks: vec![],
+        }
+    };
+
+    // ── Assemble report ─────────────────────────────────────────────
+    let stages = VerifyStages {
+        local: local_stage,
+        remote: remote_stage,
+        security: security_stage,
+    };
+
+    let verdict = VerifyLiveReport::compute_verdict(&stages);
+    #[allow(clippy::cast_possible_truncation)]
+    let total_elapsed = start.elapsed().as_millis() as u64;
+    let summary = VerifyLiveReport::compute_summary(&stages, total_elapsed);
+
+    VerifyLiveReport {
+        schema_version: "1.0.0".to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        url: opts.url.clone(),
+        bundle_path: opts.bundle_path.as_ref().map(|p| p.display().to_string()),
+        verdict,
+        stages,
+        summary,
+        config: VerifyConfig {
+            strict: opts.strict,
+            fail_fast: opts.fail_fast,
+            #[allow(clippy::cast_possible_truncation)]
+            timeout_ms: opts.probe_config.timeout.as_millis() as u64,
+            retries: opts.probe_config.retries,
+            security_audit: opts.security_audit,
+        },
+    }
+}
+
 /// Deployment history entry for tracking deployments over time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployHistoryEntry {

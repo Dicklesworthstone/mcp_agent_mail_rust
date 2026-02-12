@@ -129,7 +129,7 @@ const TOAST_FOCUS_HIGHLIGHT: PackedRgba = PackedRgba::rgb(80, 220, 255);
 fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as i64)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2876,6 +2876,34 @@ mod tests {
                 .map(|action| action.id.as_str()),
             Some("alpha:two")
         );
+    }
+
+    #[test]
+    fn palette_renders_ranked_overlay_large_layout() {
+        let mut model = test_model();
+        model.open_palette();
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(160, 48, &mut pool);
+        model.view(Rect::from_size(160, 48), &mut frame);
+        let text = ftui_harness::buffer_to_text(&frame.buffer);
+
+        assert!(text.contains("Command Palette"));
+        assert!(text.contains("Navigate to Messages"));
+    }
+
+    #[test]
+    fn palette_renders_ranked_overlay_compact_layout() {
+        let mut model = test_model();
+        model.open_palette();
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        model.view(Rect::from_size(80, 24), &mut frame);
+        let text = ftui_harness::buffer_to_text(&frame.buffer);
+
+        assert!(text.contains("Command Palette"));
+        assert!(text.contains("Navigate to Messages"));
     }
 
     #[test]
