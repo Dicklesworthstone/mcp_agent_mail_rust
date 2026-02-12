@@ -502,6 +502,272 @@ pub fn read_uptime_secs() -> f64 {
     start.elapsed().as_secs_f64()
 }
 
+// ── Artifact Scanning (br-36xx) ─────────────────────────────────────
+
+/// A scanned failure artifact with file location and parsed context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScannedArtifact {
+    /// Absolute path to the artifact file.
+    pub path: std::path::PathBuf,
+    /// Parsed failure context (or None if the file was malformed).
+    pub context: FailureContext,
+}
+
+/// Read a single failure context from a JSON artifact file.
+///
+/// # Errors
+/// Returns `Err` on I/O or deserialization failure.
+pub fn read_artifact(path: &Path) -> std::io::Result<FailureContext> {
+    let content = std::fs::read_to_string(path)?;
+    serde_json::from_str(&content).map_err(std::io::Error::other)
+}
+
+/// Scan a directory tree for `failure_context.json` artifacts.
+///
+/// Walks `dir` recursively, finding files named `failure_context.json`.
+/// Malformed files are silently skipped (logged to stderr).
+/// Results are sorted by failure timestamp (most recent first).
+#[must_use]
+pub fn scan_artifacts(dir: &Path) -> Vec<ScannedArtifact> {
+    let mut results = Vec::new();
+    scan_dir_recursive(dir, &mut results);
+    // Sort by timestamp (most recent first)
+    results.sort_by(|a, b| b.context.failure_ts.cmp(&a.context.failure_ts));
+    results
+}
+
+fn scan_dir_recursive(dir: &Path, results: &mut Vec<ScannedArtifact>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_recursive(&path, results);
+        } else if path
+            .file_name()
+            .is_some_and(|n| n == "failure_context.json")
+        {
+            match read_artifact(&path) {
+                Ok(ctx) => results.push(ScannedArtifact {
+                    path: path.clone(),
+                    context: ctx,
+                }),
+                Err(e) => {
+                    eprintln!(
+                        "flake-triage: skipping malformed artifact {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ── Failure Reproduction (br-1kk7) ─────────────────────────────────
+
+/// Configuration for reproducing a failure from an artifact.
+#[derive(Debug, Clone)]
+pub struct ReproductionConfig {
+    /// Path to the `failure_context.json` artifact.
+    pub artifact_path: std::path::PathBuf,
+    /// Pass `--nocapture` to cargo test for verbose output.
+    pub verbose: bool,
+    /// Timeout per test run.
+    pub timeout: std::time::Duration,
+}
+
+/// Result of a reproduction attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReproductionResult {
+    /// Test name reproduced.
+    pub test_name: String,
+    /// Seed used (if any).
+    pub seed: Option<u64>,
+    /// Whether the failure was reproduced (test failed again).
+    pub reproduced: bool,
+    /// Process exit code.
+    pub exit_code: i32,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
+    /// Elapsed wall-clock time.
+    pub elapsed_ms: u64,
+}
+
+/// Reproduce a failure from an artifact file.
+///
+/// Reads the artifact, reconstructs the repro command, and executes it
+/// as a subprocess. Returns the result including whether the failure
+/// was successfully reproduced.
+///
+/// # Errors
+/// Returns `Err` on I/O failure or if the artifact is malformed.
+pub fn reproduce_failure(config: &ReproductionConfig) -> std::io::Result<ReproductionResult> {
+    let ctx = read_artifact(&config.artifact_path)?;
+
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("test");
+
+    // Add package flags for the standard test packages
+    for pkg in &[
+        "mcp-agent-mail-core",
+        "mcp-agent-mail-server",
+        "mcp-agent-mail-db",
+    ] {
+        cmd.arg("-p").arg(pkg);
+    }
+
+    cmd.arg(&ctx.test_name).arg("--");
+    if config.verbose {
+        cmd.arg("--nocapture");
+    }
+
+    // Set seed environment variables
+    if let Some(seed) = ctx.harness_seed {
+        cmd.env("HARNESS_SEED", seed.to_string());
+    }
+    if let Some(ref e2e_seed) = ctx.e2e_seed {
+        cmd.env("E2E_SEED", e2e_seed);
+    }
+
+    // Replay captured environment (minus secrets)
+    for (key, value) in &ctx.env_snapshot {
+        if value != "[REDACTED]" {
+            cmd.env(key, value);
+        }
+    }
+
+    let start = std::time::Instant::now();
+    let output = cmd.output()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok(ReproductionResult {
+        test_name: ctx.test_name,
+        seed: ctx.harness_seed,
+        reproduced: !output.status.success(),
+        exit_code,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        elapsed_ms,
+    })
+}
+
+// ── Multi-Seed Subprocess Runner (br-154k) ─────────────────────────
+
+/// Configuration for subprocess-based multi-seed flake detection.
+#[derive(Debug, Clone)]
+pub struct MultiSeedConfig {
+    /// Test name to run.
+    pub test_name: String,
+    /// Number of seeds to test.
+    pub num_seeds: usize,
+    /// Extra cargo packages to include (default: core, server, db).
+    pub packages: Vec<String>,
+    /// Timeout per individual test run.
+    pub timeout: std::time::Duration,
+}
+
+impl Default for MultiSeedConfig {
+    fn default() -> Self {
+        Self {
+            test_name: String::new(),
+            num_seeds: DEFAULT_FLAKE_SEEDS.len(),
+            packages: vec![
+                "mcp-agent-mail-core".to_string(),
+                "mcp-agent-mail-server".to_string(),
+                "mcp-agent-mail-db".to_string(),
+            ],
+            timeout: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+/// Extend a seed corpus with pseudo-random values to reach `target_count`.
+///
+/// Uses a simple deterministic PRNG (splitmix64) seeded from the corpus
+/// to generate additional seeds reproducibly.
+#[must_use]
+pub fn extend_seeds(base: &[u64], target_count: usize) -> Vec<u64> {
+    let mut seeds: Vec<u64> = base.to_vec();
+    if seeds.len() >= target_count {
+        seeds.truncate(target_count);
+        return seeds;
+    }
+
+    // Simple splitmix64 for deterministic extension
+    let mut state: u64 = base
+        .iter()
+        .copied()
+        .fold(0x9E37_79B9_7F4A_7C15, u64::wrapping_add);
+    while seeds.len() < target_count {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        if !seeds.contains(&z) {
+            seeds.push(z);
+        }
+    }
+    seeds
+}
+
+/// Run a test as a subprocess with multiple seeds, collecting outcomes.
+///
+/// Unlike [`run_with_seeds`] which uses closures (in-process), this spawns
+/// `cargo test` as a subprocess for each seed. Suitable for CLI integration
+/// where full binary startup and process isolation is needed.
+#[must_use]
+pub fn run_multi_seed_subprocess(config: &MultiSeedConfig) -> FlakeReport {
+    let seeds = extend_seeds(DEFAULT_FLAKE_SEEDS, config.num_seeds);
+    let mut runs = Vec::with_capacity(seeds.len());
+
+    for (i, &seed) in seeds.iter().enumerate() {
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.arg("test");
+
+        for pkg in &config.packages {
+            cmd.arg("-p").arg(pkg);
+        }
+
+        cmd.arg(&config.test_name)
+            .arg("--")
+            .arg("--nocapture")
+            .env("HARNESS_SEED", seed.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let start = std::time::Instant::now();
+        let status = cmd.status();
+        #[allow(clippy::cast_possible_truncation)]
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let (passed, exit_code) = status
+            .as_ref()
+            .map_or((false, -1), |s| (s.success(), s.code().unwrap_or(-1)));
+
+        runs.push(RunOutcome {
+            #[allow(clippy::cast_possible_truncation)]
+            run: (i + 1) as u32,
+            passed,
+            duration_ms,
+            failure_message: if passed {
+                None
+            } else {
+                Some(format!("exit {exit_code}"))
+            },
+            seed: Some(seed),
+        });
+    }
+
+    FlakeReport::from_runs(&config.test_name, runs)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -963,5 +1229,193 @@ mod tests {
             ],
         );
         assert!(det_fail.remediation.contains("Fix the test"));
+    }
+
+    // ── Artifact Scanning Tests (br-36xx) ───────────────────────────
+
+    #[test]
+    fn read_artifact_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = FailureContext::capture("test_roundtrip", Some(42), "assertion failed");
+        ctx.write_artifact(dir.path()).unwrap();
+
+        let restored = read_artifact(&dir.path().join("failure_context.json")).unwrap();
+        assert_eq!(restored.test_name, "test_roundtrip");
+        assert_eq!(restored.harness_seed, Some(42));
+        assert_eq!(restored.category, FailureCategory::Assertion);
+    }
+
+    #[test]
+    fn read_artifact_missing_file() {
+        let result = read_artifact(Path::new("/nonexistent/path/failure_context.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_artifact_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failure_context.json");
+        std::fs::write(&path, "{ not valid json }").unwrap();
+        let result = read_artifact(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scan_artifacts_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let results = scan_artifacts(dir.path());
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn scan_artifacts_finds_nested() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create nested directories with artifacts
+        let sub1 = dir.path().join("run1");
+        let sub2 = dir.path().join("run2");
+        std::fs::create_dir_all(&sub1).unwrap();
+        std::fs::create_dir_all(&sub2).unwrap();
+
+        let ctx1 = FailureContext::capture("test_a", Some(1), "timeout");
+        ctx1.write_artifact(&sub1).unwrap();
+
+        let ctx2 = FailureContext::capture("test_b", Some(2), "database is locked");
+        ctx2.write_artifact(&sub2).unwrap();
+
+        let results = scan_artifacts(dir.path());
+        assert_eq!(results.len(), 2);
+
+        let names: Vec<&str> = results
+            .iter()
+            .map(|r| r.context.test_name.as_str())
+            .collect();
+        assert!(names.contains(&"test_a"));
+        assert!(names.contains(&"test_b"));
+    }
+
+    #[test]
+    fn scan_artifacts_skips_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Valid artifact
+        let sub1 = dir.path().join("valid");
+        std::fs::create_dir_all(&sub1).unwrap();
+        let ctx = FailureContext::capture("good_test", Some(1), "fail");
+        ctx.write_artifact(&sub1).unwrap();
+
+        // Malformed artifact
+        let sub2 = dir.path().join("bad");
+        std::fs::create_dir_all(&sub2).unwrap();
+        std::fs::write(sub2.join("failure_context.json"), "not json").unwrap();
+
+        let results = scan_artifacts(dir.path());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].context.test_name, "good_test");
+    }
+
+    #[test]
+    fn scan_artifacts_nonexistent_dir() {
+        let results = scan_artifacts(Path::new("/nonexistent/dir"));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn scanned_artifact_has_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = FailureContext::capture("path_test", None, "fail");
+        ctx.write_artifact(dir.path()).unwrap();
+
+        let results = scan_artifacts(dir.path());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].path.ends_with("failure_context.json"));
+    }
+
+    // ── Seed Extension Tests (br-154k) ──────────────────────────────
+
+    #[test]
+    fn extend_seeds_noop_when_enough() {
+        let base = &[1, 2, 3, 4, 5];
+        let extended = extend_seeds(base, 3);
+        assert_eq!(extended.len(), 3);
+        assert_eq!(extended, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn extend_seeds_adds_values() {
+        let base = &[1, 2, 3];
+        let extended = extend_seeds(base, 10);
+        assert_eq!(extended.len(), 10);
+        // Original seeds preserved
+        assert_eq!(&extended[..3], &[1, 2, 3]);
+        // No duplicates
+        let mut uniq = extended.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), extended.len());
+    }
+
+    #[test]
+    fn extend_seeds_deterministic() {
+        let base = &[42, 100, 255];
+        let run1 = extend_seeds(base, 20);
+        let run2 = extend_seeds(base, 20);
+        assert_eq!(run1, run2);
+    }
+
+    #[test]
+    fn extend_seeds_from_default_corpus() {
+        let extended = extend_seeds(DEFAULT_FLAKE_SEEDS, 30);
+        assert_eq!(extended.len(), 30);
+        assert_eq!(&extended[..DEFAULT_FLAKE_SEEDS.len()], DEFAULT_FLAKE_SEEDS);
+    }
+
+    #[test]
+    fn extend_seeds_exact_count() {
+        let extended = extend_seeds(DEFAULT_FLAKE_SEEDS, DEFAULT_FLAKE_SEEDS.len());
+        assert_eq!(extended.len(), DEFAULT_FLAKE_SEEDS.len());
+        assert_eq!(extended, DEFAULT_FLAKE_SEEDS);
+    }
+
+    // ── Reproduction Config Tests (br-1kk7) ────────────────────────
+
+    #[test]
+    fn reproduction_result_serialization() {
+        let result = ReproductionResult {
+            test_name: "repro_test".to_string(),
+            seed: Some(42),
+            reproduced: true,
+            exit_code: 101,
+            stdout: "test output".to_string(),
+            stderr: "error output".to_string(),
+            elapsed_ms: 1234,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: ReproductionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.test_name, "repro_test");
+        assert_eq!(restored.seed, Some(42));
+        assert!(restored.reproduced);
+        assert_eq!(restored.exit_code, 101);
+    }
+
+    #[test]
+    fn multi_seed_config_default() {
+        let config = MultiSeedConfig::default();
+        assert_eq!(config.num_seeds, DEFAULT_FLAKE_SEEDS.len());
+        assert_eq!(config.packages.len(), 3);
+        assert_eq!(config.timeout, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn scanned_artifact_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = FailureContext::capture("serde_scan", Some(99), "panic");
+        ctx.write_artifact(dir.path()).unwrap();
+
+        let results = scan_artifacts(dir.path());
+        assert_eq!(results.len(), 1);
+        let json = serde_json::to_string_pretty(&results[0]).unwrap();
+        let restored: ScannedArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.context.test_name, "serde_scan");
     }
 }

@@ -12,7 +12,7 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::metrics::{GlobalMetricsSnapshot, global_metrics};
+use crate::metrics::{global_metrics, GlobalMetricsSnapshot};
 use crate::slo;
 
 // ---------------------------------------------------------------------------
@@ -301,7 +301,11 @@ const fn pct(value: u64, total: u64) -> u64 {
         return 0;
     }
     let p = value.saturating_mul(100).saturating_div(total);
-    if p > 100 { 100 } else { p }
+    if p > 100 {
+        100
+    } else {
+        p
+    }
 }
 
 /// Current time in microseconds (Unix epoch). Infallible.
@@ -517,6 +521,13 @@ mod tests {
     }
 
     #[test]
+    fn duration_since_future_timestamp_is_zero() {
+        let now_us = 1_000_000_000;
+        let future_since = now_us + 60_000_000;
+        assert_eq!(duration_since_s(future_since, now_us), 0);
+    }
+
+    #[test]
     #[expect(clippy::too_many_lines)]
     fn from_snapshot_with_zero_metrics() {
         let snap = GlobalMetricsSnapshot {
@@ -663,6 +674,85 @@ mod tests {
     }
 
     #[test]
+    fn health_signals_from_snapshot_captures_every_metric() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.db.pool_acquire_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: 120_000,
+            min: 120_000,
+            max: 120_000,
+            p50: 120_000,
+            p95: 120_000,
+            p99: 120_000,
+        };
+        snap.db.pool_utilization_pct = 77;
+        snap.db.pool_over_80_since_us = now_us - 42_000_000;
+        snap.storage.wbq_depth = 75;
+        snap.storage.wbq_capacity = 100;
+        snap.storage.wbq_over_80_since_us = now_us - 5_000_000;
+        snap.storage.commit_pending_requests = 45;
+        snap.storage.commit_soft_cap = 90;
+        snap.storage.commit_over_80_since_us = now_us - 8_000_000;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+
+        assert_eq!(signals.pool_acquire_p95_us, 120_000);
+        assert_eq!(signals.pool_utilization_pct, 77);
+        assert_eq!(signals.pool_over_80_for_s, 42);
+        assert_eq!(signals.wbq_depth_pct, 75);
+        assert_eq!(signals.wbq_over_80_for_s, 5);
+        assert_eq!(signals.commit_depth_pct, 50);
+        assert_eq!(signals.commit_over_80_for_s, 8);
+        assert_eq!(signals.classify(), HealthLevel::Yellow);
+    }
+
+    #[test]
+    fn health_signals_pct_clamps_to_hundred() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.storage.wbq_depth = 1000;
+        snap.storage.wbq_capacity = 1;
+        snap.storage.commit_pending_requests = 500;
+        snap.storage.commit_soft_cap = 1;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.wbq_depth_pct, 100);
+        assert_eq!(signals.commit_depth_pct, 100);
+        assert_eq!(signals.classify(), HealthLevel::Red);
+    }
+
+    #[test]
+    fn health_signals_zero_capacities_do_not_divide_by_zero() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.storage.wbq_depth = 42;
+        snap.storage.wbq_capacity = 0;
+        snap.storage.commit_pending_requests = 99;
+        snap.storage.commit_soft_cap = 0;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.wbq_depth_pct, 0);
+        assert_eq!(signals.commit_depth_pct, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+    }
+
+    #[test]
+    fn stale_over_80_timestamps_do_not_trigger_red() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.db.pool_over_80_since_us = now_us + 10_000_000;
+        snap.storage.wbq_over_80_since_us = now_us + 20_000_000;
+        snap.storage.commit_over_80_since_us = now_us + 30_000_000;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.pool_over_80_for_s, 0);
+        assert_eq!(signals.wbq_over_80_for_s, 0);
+        assert_eq!(signals.commit_over_80_for_s, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+    }
+
+    #[test]
     fn cached_level_starts_green() {
         // Note: tests run in parallel, so the global may have been modified.
         // We can at least verify the API is callable.
@@ -691,6 +781,94 @@ mod tests {
         s.pool_acquire_p95_us = yellow::POOL_ACQUIRE_P95_US + 1;
         s.wbq_depth_pct = 80;
         assert_eq!(s.classify(), HealthLevel::Red);
+    }
+
+    #[test]
+    fn single_yellow_among_green_is_yellow() {
+        let mut s = default_signals();
+        s.commit_depth_pct = yellow::COMMIT_DEPTH_PCT;
+        assert_eq!(s.classify(), HealthLevel::Yellow);
+    }
+
+    #[test]
+    fn all_critical_signals_red_is_red() {
+        let s = HealthSignals {
+            pool_acquire_p95_us: red::POOL_ACQUIRE_P95_US + 1,
+            pool_utilization_pct: red::POOL_UTIL_PCT,
+            pool_over_80_for_s: red::OVER_80_DURATION_S,
+            wbq_depth_pct: red::WBQ_DEPTH_PCT,
+            wbq_over_80_for_s: red::OVER_80_DURATION_S,
+            commit_depth_pct: red::COMMIT_DEPTH_PCT,
+            commit_over_80_for_s: red::OVER_80_DURATION_S,
+        };
+        assert_eq!(s.classify(), HealthLevel::Red);
+    }
+
+    #[test]
+    fn rapid_oscillation_green_red_green_is_deterministic() {
+        let mut s = default_signals();
+        assert_eq!(s.classify(), HealthLevel::Green);
+
+        s.wbq_depth_pct = red::WBQ_DEPTH_PCT;
+        assert_eq!(s.classify(), HealthLevel::Red);
+
+        s.wbq_depth_pct = 0;
+        assert_eq!(s.classify(), HealthLevel::Green);
+    }
+
+    #[test]
+    fn duration_since_extreme_values_stays_bounded() {
+        let now_us = u64::MAX;
+        let since_us = 1;
+        let elapsed = duration_since_s(since_us, now_us);
+        assert_eq!(elapsed, (u64::MAX - 1).saturating_div(1_000_000));
+    }
+
+    #[test]
+    fn unknown_tools_are_not_shedable() {
+        let unknown = ["", "search_message", "HEALTH_CHECK", "macro_start_session"];
+        for tool in unknown {
+            assert!(!is_shedable_tool(tool), "unexpected shedable tool: {tool}");
+            assert!(
+                !HealthLevel::Red.should_shed(is_shedable_tool(tool)),
+                "red should not shed unknown non-shedable tool: {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn shed_decision_matches_tool_categories() {
+        let cases = [
+            ("health_check", true),
+            ("whois", true),
+            ("search_messages", true),
+            ("summarize_thread", true),
+            ("install_precommit_guard", true),
+            ("uninstall_precommit_guard", true),
+            ("send_message", false),
+            ("fetch_inbox", false),
+            ("register_agent", false),
+            ("ensure_project", false),
+            ("file_reservation_paths", false),
+            ("acknowledge_message", false),
+        ];
+
+        for (tool, expected_shedable) in cases {
+            assert_eq!(
+                is_shedable_tool(tool),
+                expected_shedable,
+                "unexpected shedability for tool {tool}"
+            );
+            assert_eq!(
+                HealthLevel::Red.should_shed(is_shedable_tool(tool)),
+                expected_shedable,
+                "unexpected red shed decision for tool {tool}"
+            );
+            assert!(
+                !HealthLevel::Yellow.should_shed(is_shedable_tool(tool)),
+                "yellow should not shed tool {tool}"
+            );
+        }
     }
 
     #[test]

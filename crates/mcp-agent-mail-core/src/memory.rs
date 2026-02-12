@@ -259,4 +259,31 @@ mod tests {
             assert!(sample.error.is_none());
         }
     }
+
+    #[test]
+    fn sample_and_record_updates_memory_metrics() {
+        let config = Config::default();
+        let metrics = crate::global_metrics();
+        metrics.system.memory_rss_bytes.set(0);
+        metrics.system.memory_pressure_level.set(0);
+        metrics.system.memory_last_sample_us.set(0);
+        metrics.system.memory_sample_errors_total.store(0);
+
+        let sample = sample_and_record(&config);
+
+        assert_eq!(
+            metrics.system.memory_pressure_level.load(),
+            sample.pressure.as_u64()
+        );
+        assert!(metrics.system.memory_last_sample_us.load() > 0);
+
+        if let Some(rss) = sample.rss_bytes {
+            assert_eq!(metrics.system.memory_rss_bytes.load(), rss);
+            assert_eq!(metrics.system.memory_sample_errors_total.load(), 0);
+        } else {
+            assert_eq!(metrics.system.memory_rss_bytes.load(), 0);
+            assert_eq!(metrics.system.memory_sample_errors_total.load(), 1);
+            assert!(sample.error.is_some());
+        }
+    }
 }

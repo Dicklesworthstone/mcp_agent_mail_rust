@@ -282,6 +282,7 @@ pub fn sample_and_record(config: &Config) -> DiskSample {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn sqlite_url_parsing_variants() {
@@ -349,6 +350,142 @@ mod tests {
         assert_eq!(
             classify_pressure(5 * MIB, 500, 100, 10),
             DiskPressure::Fatal
+        );
+    }
+
+    #[test]
+    fn min_opt_combinations() {
+        assert_eq!(min_opt(Some(3), Some(9)), Some(3));
+        assert_eq!(min_opt(Some(9), Some(3)), Some(3));
+        assert_eq!(min_opt(Some(7), None), Some(7));
+        assert_eq!(min_opt(None, Some(7)), Some(7));
+        assert_eq!(min_opt(None, None), None);
+    }
+
+    #[test]
+    fn normalize_probe_path_prefers_existing_parent_and_dot_fallback() {
+        let tmp = tempdir().expect("tempdir should be created");
+        let missing_leaf = tmp.path().join("missing").join("nested").join("db.sqlite3");
+        assert_eq!(
+            normalize_probe_path(&missing_leaf),
+            tmp.path().to_path_buf()
+        );
+
+        let unique = PathBuf::from(format!(
+            "definitely_missing_probe_path_{}",
+            now_unix_micros_u64()
+        ));
+        assert!(
+            !unique.exists(),
+            "unique missing probe path unexpectedly exists: {}",
+            unique.display()
+        );
+        assert_eq!(normalize_probe_path(&unique), PathBuf::from("."));
+    }
+
+    #[test]
+    fn sample_disk_uses_effective_min_and_applies_thresholds() {
+        let tmp = tempdir().expect("tempdir should be created");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root should be created");
+
+        let db_file = tmp.path().join("db").join("storage.sqlite3");
+        std::fs::create_dir_all(
+            db_file
+                .parent()
+                .expect("db file parent should exist after create_dir_all"),
+        )
+        .expect("db parent should be created");
+
+        // Force warning classification for any realistic free-byte value.
+        let config = Config {
+            storage_root: storage_root.clone(),
+            database_url: format!(
+                "sqlite:////{}",
+                db_file.to_string_lossy().trim_start_matches('/')
+            ),
+            disk_space_warning_mb: u64::MAX,
+            disk_space_critical_mb: 0,
+            disk_space_fatal_mb: 0,
+            ..Config::default()
+        };
+
+        let sample = sample_disk(&config);
+        assert_eq!(sample.storage_probe_path, storage_root);
+        assert_eq!(
+            sample.db_probe_path,
+            db_file.parent().map(std::path::Path::to_path_buf)
+        );
+        assert!(sample.storage_free_bytes.is_some());
+        assert!(sample.db_free_bytes.is_some());
+
+        let storage_free = sample
+            .storage_free_bytes
+            .expect("storage free bytes expected");
+        let db_free = sample.db_free_bytes.expect("db free bytes expected");
+        assert_eq!(
+            sample.effective_free_bytes,
+            Some(std::cmp::min(storage_free, db_free))
+        );
+        assert_eq!(sample.pressure, DiskPressure::Warning);
+        assert!(sample.errors.is_empty());
+    }
+
+    #[test]
+    fn sample_and_record_updates_disk_metrics() {
+        let tmp = tempdir().expect("tempdir should be created");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root should be created");
+
+        let db_file = tmp.path().join("db").join("storage.sqlite3");
+        std::fs::create_dir_all(
+            db_file
+                .parent()
+                .expect("db file parent should exist after create_dir_all"),
+        )
+        .expect("db parent should be created");
+
+        let config = Config {
+            storage_root,
+            database_url: format!(
+                "sqlite:////{}",
+                db_file.to_string_lossy().trim_start_matches('/')
+            ),
+            disk_space_warning_mb: 0,
+            disk_space_critical_mb: 0,
+            disk_space_fatal_mb: 0,
+            ..Config::default()
+        };
+
+        let metrics = crate::global_metrics();
+        metrics.system.disk_storage_free_bytes.set(0);
+        metrics.system.disk_db_free_bytes.set(0);
+        metrics.system.disk_effective_free_bytes.set(0);
+        metrics.system.disk_pressure_level.set(0);
+        metrics.system.disk_last_sample_us.set(0);
+        metrics.system.disk_sample_errors_total.store(0);
+
+        let sample = sample_and_record(&config);
+        assert_eq!(sample.pressure, DiskPressure::Ok);
+
+        if let Some(storage_free) = sample.storage_free_bytes {
+            assert_eq!(metrics.system.disk_storage_free_bytes.load(), storage_free);
+        }
+        if let Some(db_free) = sample.db_free_bytes {
+            assert_eq!(metrics.system.disk_db_free_bytes.load(), db_free);
+        }
+        assert_eq!(
+            metrics.system.disk_effective_free_bytes.load(),
+            sample.effective_free_bytes.unwrap_or(0)
+        );
+        assert_eq!(
+            metrics.system.disk_pressure_level.load(),
+            sample.pressure.as_u64()
+        );
+        assert!(metrics.system.disk_last_sample_us.load() > 0);
+        assert_eq!(
+            metrics.system.disk_sample_errors_total.load(),
+            u64::try_from(sample.errors.len()).expect("error count should fit u64")
         );
     }
 }

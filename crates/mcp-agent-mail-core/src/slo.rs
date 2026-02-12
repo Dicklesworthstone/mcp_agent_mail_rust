@@ -235,4 +235,44 @@ mod tests {
             (SEND_ATTACH_P95_US, SEND_ATTACH_P99_US)
         );
     }
+
+    #[test]
+    fn pool_health_large_values_stay_red() {
+        assert_eq!(
+            PoolHealth::classify(POOL_ACQUIRE_YELLOW_US + 10_000),
+            PoolHealth::Red
+        );
+        assert_eq!(PoolHealth::classify(u64::MAX), PoolHealth::Red);
+    }
+
+    #[test]
+    fn op_class_budget_ordering_invariants() {
+        let ordered = [
+            (OpClass::Read, "read"),
+            (OpClass::Tool, "tool"),
+            (OpClass::Send, "send"),
+            (OpClass::SendAttach, "send+attach"),
+        ];
+
+        let mut prev_p95 = 0;
+        let mut prev_p99 = 0;
+
+        for (class, label) in ordered {
+            let (p95, p99) = class.budget_us();
+            assert!(
+                p95 < p99,
+                "{label} budget should have p95 < p99, got p95={p95} p99={p99}"
+            );
+            assert!(
+                p95 > prev_p95,
+                "{label} p95 should be strictly increasing across operation classes"
+            );
+            assert!(
+                p99 > prev_p99,
+                "{label} p99 should be strictly increasing across operation classes"
+            );
+            prev_p95 = p95;
+            prev_p99 = p99;
+        }
+    }
 }

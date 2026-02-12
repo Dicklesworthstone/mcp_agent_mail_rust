@@ -92,7 +92,11 @@ fn git_cmd(repo: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn parse_remote_url(url: &str) -> Option<(String, String)> {
@@ -570,6 +574,32 @@ mod tests {
         assert_eq!(slugify("v1.2.3-rc4"), "v1-2-3-rc4");
     }
 
+    #[test]
+    fn slugify_windows_style_separators() {
+        assert_eq!(slugify(r"C:\Users\Alice\Repo"), "c-users-alice-repo");
+    }
+
+    #[test]
+    fn slugify_relative_components() {
+        assert_eq!(slugify("../repo/./module"), "repo-module");
+    }
+
+    #[test]
+    fn slugify_trailing_slashes() {
+        assert_eq!(
+            slugify("/data/projects/backend///"),
+            "data-projects-backend"
+        );
+    }
+
+    #[test]
+    fn slugify_very_long_path_is_stable_and_non_empty() {
+        let long = format!("/{}", "a".repeat(5000));
+        let slug = slugify(&long);
+        assert_eq!(slug, "a".repeat(5000));
+        assert!(!slug.is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // sha1_hex / short_sha1
     // -----------------------------------------------------------------------
@@ -600,6 +630,13 @@ mod tests {
     fn short_sha1_zero_length() {
         let short = short_sha1("hello", 0);
         assert!(short.is_empty());
+    }
+
+    #[test]
+    fn short_sha1_distinguishes_different_inputs() {
+        let a = short_sha1("/tmp/project-a", 20);
+        let b = short_sha1("/tmp/project-b", 20);
+        assert_ne!(a, b);
     }
 
     // -----------------------------------------------------------------------
@@ -644,6 +681,18 @@ mod tests {
         assert!(parse_remote_url("   ").is_none());
     }
 
+    #[test]
+    fn parse_remote_scp_without_user() {
+        let (host, path) = parse_remote_url("github.com:user/repo.git").unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(path, "user/repo.git");
+    }
+
+    #[test]
+    fn parse_remote_invalid_without_separator_returns_none() {
+        assert!(parse_remote_url("just-a-random-string").is_none());
+    }
+
     // -----------------------------------------------------------------------
     // normalize_remote_first_two
     // -----------------------------------------------------------------------
@@ -681,6 +730,12 @@ mod tests {
         assert_eq!(result, "gitlab.com/org/sub");
     }
 
+    #[test]
+    fn normalize_remote_first_two_collapses_duplicate_slashes() {
+        let result = normalize_remote_first_two("https://github.com//org///repo.git").unwrap();
+        assert_eq!(result, "github.com/org/repo");
+    }
+
     // -----------------------------------------------------------------------
     // normalize_remote_last_two
     // -----------------------------------------------------------------------
@@ -696,6 +751,13 @@ mod tests {
         // Takes last two segments
         let result = normalize_remote_last_two("https://gitlab.com/org/sub/deep/repo.git").unwrap();
         assert_eq!(result, "gitlab.com/deep/repo");
+    }
+
+    #[test]
+    fn normalize_remote_last_two_collapses_duplicate_slashes() {
+        let result =
+            normalize_remote_last_two("https://gitlab.com///team//service///api.git").unwrap();
+        assert_eq!(result, "gitlab.com/service/api");
     }
 
     // -----------------------------------------------------------------------
@@ -764,5 +826,24 @@ mod tests {
             mode_to_str(ProjectIdentityMode::GitToplevel),
             "git-toplevel"
         );
+    }
+
+    #[test]
+    fn resolve_project_identity_returns_core_fields_for_existing_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let identity = resolve_project_identity(&tmp.path().display().to_string());
+
+        assert!(!identity.slug.is_empty());
+        assert!(!identity.canonical_path.is_empty());
+        assert!(!identity.human_key.is_empty());
+        assert!(!identity.project_uid.is_empty());
+        assert!(!identity.identity_mode_used.is_empty());
+    }
+
+    #[test]
+    fn compute_project_slug_returns_non_empty_for_existing_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let slug = compute_project_slug(&tmp.path().display().to_string());
+        assert!(!slug.is_empty());
     }
 }
