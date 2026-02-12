@@ -147,45 +147,26 @@ rpc_call() {
     local tool_name="$2"
     local args_json="$3"
 
-    local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
-    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
-    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
-    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
-
-    local payload
-    payload="$(python3 - <<'PY' "$tool_name" "$args_json"
-import json, sys
-tool = sys.argv[1]
-args = json.loads(sys.argv[2])
-print(json.dumps({
-  "jsonrpc": "2.0",
-  "method": "tools/call",
-  "id": 1,
-  "params": { "name": tool, "arguments": args }
-}))
-PY
-)"
-
-    e2e_save_artifact "${case_id}_request.json" "$payload"
-
-    set +e
-    local status
-    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
-        -X POST "${API_URL}" \
-        -H "content-type: application/json" \
-        -H "authorization: Bearer ${TOKEN}" \
-        --data "${payload}" \
-        2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-
-    echo "${status}" > "${status_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fatal "${case_id}: curl failed rc=${rc}"
-    fi
-    if [ "${status}" != "200" ]; then
+    # Use the shared capture helper (request/response/headers/timing/status).
+    e2e_mark_case_start "${case_id}"
+    if ! e2e_rpc_call "${case_id}" "${API_URL}" "${tool_name}" "${args_json}" \
+        "authorization: Bearer ${TOKEN}"; then
+        local status_file_new="${E2E_ARTIFACT_DIR}/${case_id}/status.txt"
+        local status="unknown"
+        if [ -f "${status_file_new}" ]; then
+            status="$(cat "${status_file_new}")"
+        fi
         e2e_fatal "${case_id}: unexpected HTTP status ${status}"
     fi
+
+    # Backward-compatible flat artifact paths used by existing assertions.
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    cp "${case_dir}/request.json" "${E2E_ARTIFACT_DIR}/${case_id}_request.json"
+    cp "${case_dir}/response.json" "${E2E_ARTIFACT_DIR}/${case_id}_body.json"
+    cp "${case_dir}/headers.txt" "${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
+    cp "${case_dir}/status.txt" "${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    cp "${case_dir}/timing.txt" "${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
+    cp "${case_dir}/curl_stderr.txt" "${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
 }
 
 parse_frontmatter_json() {
@@ -285,6 +266,14 @@ rpc_call "register_sender_file" "register_agent" "$(python3 -c "import json,sys;
 rpc_call "register_to" "register_agent" "$(python3 -c "import json,sys; print(json.dumps({'project_key': sys.argv[1], 'program': 'e2e', 'model': 'test', 'name': 'BlueBear', 'task_description': 'e2e'}))" "${PROJECT_DIR}")"
 rpc_call "register_cc" "register_agent" "$(python3 -c "import json,sys; print(json.dumps({'project_key': sys.argv[1], 'program': 'e2e', 'model': 'test', 'name': 'OrangeFox', 'task_description': 'e2e'}))" "${PROJECT_DIR}")"
 rpc_call "register_bcc" "register_agent" "$(python3 -c "import json,sys; print(json.dumps({'project_key': sys.argv[1], 'program': 'e2e', 'model': 'test', 'name': 'SilverCove', 'task_description': 'e2e'}))" "${PROJECT_DIR}")"
+rpc_call "set_policy_redfox_open" "set_contact_policy" "$(python3 -c "import json,sys; print(json.dumps({'project_key': sys.argv[1], 'agent_name': 'RedFox', 'policy': 'open'}))" "${PROJECT_DIR}")"
+if rpc_has_error "${E2E_ARTIFACT_DIR}/set_policy_redfox_open_body.json"; then
+    e2e_fatal "set_contact_policy(open) failed for RedFox"
+fi
+rpc_call "set_policy_greencastle_open" "set_contact_policy" "$(python3 -c "import json,sys; print(json.dumps({'project_key': sys.argv[1], 'agent_name': 'GreenCastle', 'policy': 'open'}))" "${PROJECT_DIR}")"
+if rpc_has_error "${E2E_ARTIFACT_DIR}/set_policy_greencastle_open_body.json"; then
+    e2e_fatal "set_contact_policy(open) failed for GreenCastle"
+fi
 
 e2e_pass "seeded project_slug=${PROJECT_SLUG}"
 

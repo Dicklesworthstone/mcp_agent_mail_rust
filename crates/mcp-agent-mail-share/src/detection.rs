@@ -59,8 +59,7 @@ pub fn detect_environment(bundle_path: Option<&Path>, cwd: &Path) -> DetectedEnv
     env.recommended_provider = determine_recommended_provider(&env);
 
     // Sort signals by confidence (high to low)
-    env.signals
-        .sort_by_key(|a| confidence_order(a.confidence));
+    env.signals.sort_by_key(|a| confidence_order(a.confidence));
 
     env
 }

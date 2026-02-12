@@ -728,30 +728,37 @@ impl RobotSubcommand {
 use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 
 /// Resolve a project by slug or human_key.
+///
+/// Note: Uses LIKE instead of = for string comparison due to a bug in sqlmodel_sqlite
+/// where parameterized = queries don't match strings correctly.
 fn resolve_project_sync(conn: &SqliteConnection, key: &str) -> Result<(i64, String), CliError> {
-    // Try slug first
+    // Try slug first (using LIKE for workaround)
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE slug = ?",
+            "SELECT id, slug FROM projects WHERE slug LIKE ?",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
     if let Some(row) = rows.first() {
-        let id: i64 = row.get_named("id").unwrap_or(0);
-        let slug: String = row.get_named("slug").unwrap_or_default();
-        return Ok((id, slug));
+        let id: i64 = row.get_as(0).unwrap_or(0);
+        let slug: String = row.get_as(1).unwrap_or_default();
+        if id > 0 && !slug.is_empty() {
+            return Ok((id, slug));
+        }
     }
-    // Try human_key
+    // Try human_key (using LIKE for workaround)
     let rows = conn
         .query_sync(
-            "SELECT id, slug FROM projects WHERE human_key = ?",
+            "SELECT id, slug FROM projects WHERE human_key LIKE ?",
             &[Value::Text(key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
     if let Some(row) = rows.first() {
-        let id: i64 = row.get_named("id").unwrap_or(0);
-        let slug: String = row.get_named("slug").unwrap_or_default();
-        return Ok((id, slug));
+        let id: i64 = row.get_as(0).unwrap_or(0);
+        let slug: String = row.get_as(1).unwrap_or_default();
+        if id > 0 && !slug.is_empty() {
+            return Ok((id, slug));
+        }
     }
     Err(CliError::InvalidArgument(format!(
         "project not found: {key}"
@@ -776,6 +783,9 @@ fn resolve_project(conn: &SqliteConnection, flag: Option<&str>) -> Result<(i64, 
 }
 
 /// Resolve agent ID from --agent flag or AGENT_NAME env.
+///
+/// Note: Uses LIKE instead of = for string comparison due to a bug in sqlmodel_sqlite
+/// where parameterized = queries don't match strings correctly.
 fn resolve_agent_id(
     conn: &SqliteConnection,
     project_id: i64,
@@ -786,14 +796,14 @@ fn resolve_agent_id(
         .or_else(|| std::env::var("AGENT_NAME").ok())?;
     let rows = conn
         .query_sync(
-            "SELECT id, name FROM agents WHERE project_id = ? AND name = ?",
+            "SELECT id, name FROM agents WHERE project_id = ? AND name LIKE ?",
             &[Value::BigInt(project_id), Value::Text(name)],
         )
         .ok()?;
     let row = rows.first()?;
-    let id: i64 = row.get_named("id").unwrap_or(0);
-    let agent_name: String = row.get_named("name").unwrap_or_default();
-    Some((id, agent_name))
+    let id: i64 = row.get_as(0).ok()?;
+    let agent_name: String = row.get_as(1).ok()?;
+    if id > 0 { Some((id, agent_name)) } else { None }
 }
 
 /// Format seconds into human-readable relative time.

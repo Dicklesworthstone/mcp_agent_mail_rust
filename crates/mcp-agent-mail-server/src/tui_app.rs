@@ -2840,6 +2840,7 @@ mod tests {
     use crate::tui_macro::{MacroDef, MacroStep};
     use crate::tui_screens::MailScreenMsg;
     use ftui::KeyEvent;
+    use ftui_widgets::NotificationPriority;
     use mcp_agent_mail_core::Config;
     use serde::Serialize;
     use std::path::{Path, PathBuf};
@@ -4999,5 +5000,268 @@ mod tests {
             }
         }
         assert!(found, "Hint text should be rendered with highlight color");
+    }
+
+    // ── Performance benchmarks (br-2bbt.11.4) ─────────────────────────────────
+
+    /// Benchmark: render toast overlay with 3 stacked toasts.
+    ///
+    /// Measures the frame render overhead added by toast overlay rendering.
+    /// Budget: overlay should add < 1ms to frame time.
+    #[test]
+    fn perf_toast_overlay_render() {
+        use std::time::Instant;
+
+        let area = Rect::new(0, 0, 160, 48);
+        let mut pool = ftui::GraphemePool::new();
+
+        // Create a queue with 3 visible toasts of different severities.
+        let mut queue = NotificationQueue::new(QueueConfig {
+            max_visible: 3,
+            ..QueueConfig::default()
+        });
+
+        // Add 3 toasts
+        queue.push(
+            Toast::new("Info: New message from BlueLake")
+                .icon(ToastIcon::Info)
+                .duration(std::time::Duration::from_secs(10)),
+            NotificationPriority::Normal,
+        );
+        queue.push(
+            Toast::new("Warning: Reservation expiring soon")
+                .icon(ToastIcon::Warning)
+                .duration(std::time::Duration::from_secs(10)),
+            NotificationPriority::Normal,
+        );
+        queue.push(
+            Toast::new("Error: Connection lost to remote server")
+                .icon(ToastIcon::Error)
+                .duration(std::time::Duration::from_secs(10)),
+            NotificationPriority::Urgent,
+        );
+
+        // Promote toasts from queue to visible
+        queue.tick(std::time::Duration::from_millis(16));
+
+        // Benchmark: render 100 frames with toast overlay
+        let mut timings_ns: Vec<u128> = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let mut frame = Frame::new(area.width, area.height, &mut pool);
+            let start = Instant::now();
+            NotificationStack::new(&queue).render(area, &mut frame);
+            let elapsed = start.elapsed();
+            timings_ns.push(elapsed.as_nanos());
+        }
+
+        // Sort for percentile calculation
+        timings_ns.sort_unstable();
+        let p50_us = timings_ns[timings_ns.len() / 2] / 1000;
+        let p95_us = timings_ns[timings_ns.len() * 95 / 100] / 1000;
+        let p99_us = timings_ns[timings_ns.len() * 99 / 100] / 1000;
+
+        // Toast overlay should add < 1ms (1000µs) to frame time at p95
+        assert!(
+            p95_us < 1000,
+            "Toast overlay p95 exceeds 1ms: p50={}µs, p95={}µs, p99={}µs",
+            p50_us,
+            p95_us,
+            p99_us
+        );
+
+        eprintln!(
+            "[perf] Toast overlay render (3 toasts, 160x48): \
+             p50={}µs p95={}µs p99={}µs",
+            p50_us, p95_us, p99_us
+        );
+    }
+
+    /// Benchmark: render sparkline with 100 data points.
+    ///
+    /// Budget: sparkline render should complete in < 500µs.
+    #[test]
+    fn perf_sparkline_100points() {
+        use ftui_widgets::sparkline::Sparkline;
+        use std::time::Instant;
+
+        let area = Rect::new(0, 0, 80, 1);
+        let mut pool = ftui::GraphemePool::new();
+
+        // Generate 100 data points with variation
+        let data: Vec<f64> = (0..100)
+            .map(|i| {
+                let base = 50.0;
+                let wave = (i as f64 * 0.2).sin() * 30.0;
+                let noise = ((i * 7) % 13) as f64 - 6.0;
+                (base + wave + noise).max(0.0)
+            })
+            .collect();
+
+        // Benchmark: render 100 times
+        let mut timings_ns: Vec<u128> = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let mut frame = Frame::new(area.width, area.height, &mut pool);
+            let sparkline = Sparkline::new(&data).min(0.0).max(100.0);
+
+            let start = Instant::now();
+            sparkline.render(area, &mut frame);
+            let elapsed = start.elapsed();
+            timings_ns.push(elapsed.as_nanos());
+        }
+
+        // Sort for percentile calculation
+        timings_ns.sort_unstable();
+        let p50_us = timings_ns[timings_ns.len() / 2] / 1000;
+        let p95_us = timings_ns[timings_ns.len() * 95 / 100] / 1000;
+        let p99_us = timings_ns[timings_ns.len() * 99 / 100] / 1000;
+
+        // Sparkline should render in < 500µs at p95
+        assert!(
+            p95_us < 500,
+            "Sparkline p95 exceeds 500µs: p50={}µs, p95={}µs, p99={}µs",
+            p50_us,
+            p95_us,
+            p99_us
+        );
+
+        eprintln!(
+            "[perf] Sparkline render (100 points, 80 cols): \
+             p50={}µs p95={}µs p99={}µs",
+            p50_us, p95_us, p99_us
+        );
+    }
+
+    /// Benchmark: render modal dialog overlay.
+    ///
+    /// Budget: modal overlay should add < 1ms to frame time.
+    #[test]
+    fn perf_modal_overlay_render() {
+        use std::time::Instant;
+
+        let area = Rect::new(0, 0, 160, 48);
+        let mut pool = ftui::GraphemePool::new();
+
+        // Create a modal dialog with typical confirmation content
+        let dialog = Dialog::confirm(
+            "Confirm Force Release",
+            "Are you sure you want to force-release this file reservation?\n\n\
+             This will immediately terminate the current reservation holder's lock.\n\
+             Any unsaved work may be lost.",
+        );
+
+        // Benchmark: render 100 frames with modal overlay
+        // Use DialogState::new() to start with open=true so dialog renders
+        let mut state = DialogState::new();
+        let mut timings_ns: Vec<u128> = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let mut frame = Frame::new(area.width, area.height, &mut pool);
+
+            let start = Instant::now();
+            dialog.render(area, &mut frame, &mut state);
+            let elapsed = start.elapsed();
+            timings_ns.push(elapsed.as_nanos());
+        }
+
+        // Sort for percentile calculation
+        timings_ns.sort_unstable();
+        let p50_us = timings_ns[timings_ns.len() / 2] / 1000;
+        let p95_us = timings_ns[timings_ns.len() * 95 / 100] / 1000;
+        let p99_us = timings_ns[timings_ns.len() * 99 / 100] / 1000;
+
+        // Modal overlay should add < 1ms (1000µs) at p95
+        assert!(
+            p95_us < 1000,
+            "Modal overlay p95 exceeds 1ms: p50={}µs, p95={}µs, p99={}µs",
+            p50_us,
+            p95_us,
+            p99_us
+        );
+
+        eprintln!(
+            "[perf] Modal overlay render (160x48): \
+             p50={}µs p95={}µs p99={}µs",
+            p50_us, p95_us, p99_us
+        );
+    }
+
+    /// Benchmark: command palette fuzzy search with 100 entries.
+    ///
+    /// Tests the fuzzy matching performance of the command palette.
+    /// Budget: fuzzy search should complete in < 2ms per query at p95.
+    #[test]
+    fn perf_command_palette_fuzzy_100() {
+        use ftui::widgets::command_palette::{ActionItem, CommandPalette};
+        use std::time::Instant;
+
+        // Create a command palette and populate with 100 action items
+        let mut palette = CommandPalette::new();
+
+        for i in 0..100 {
+            let category = match i % 5 {
+                0 => "Layout",
+                1 => "Theme",
+                2 => "Navigation",
+                3 => "Actions",
+                _ => "Help",
+            };
+            palette.register_action(
+                ActionItem::new(
+                    format!("action:{}", i),
+                    format!("Action Item Number {} Description", i),
+                )
+                .with_description(format!(
+                    "This is action {} which does something useful in category {}",
+                    i, category
+                ))
+                .with_category(category)
+                .with_tags(&[&format!("tag{}", i % 10), category.to_lowercase().as_str()]),
+            );
+        }
+
+        // Test queries of varying lengths and match difficulty
+        let queries = [
+            "act",     // Short prefix
+            "action",  // Common word
+            "number",  // Middle match
+            "layout",  // Category match
+            "des",     // Description match
+            "tag5",    // Tag match
+            "xyz",     // No match
+            "a i n d", // Sparse chars
+            "item 50", // Specific number
+            "useful",  // Description word
+        ];
+
+        // Benchmark: run each query 10 times
+        let mut timings_ns: Vec<u128> = Vec::with_capacity(100);
+        for query in &queries {
+            for _ in 0..10 {
+                let start = Instant::now();
+                palette.set_query(*query);
+                let elapsed = start.elapsed();
+                timings_ns.push(elapsed.as_nanos());
+            }
+        }
+
+        // Sort for percentile calculation
+        timings_ns.sort_unstable();
+        let p50_us = timings_ns[timings_ns.len() / 2] / 1000;
+        let p95_us = timings_ns[timings_ns.len() * 95 / 100] / 1000;
+        let p99_us = timings_ns[timings_ns.len() * 99 / 100] / 1000;
+
+        // Fuzzy search should complete in < 2ms (2000µs) at p95
+        assert!(
+            p95_us < 2000,
+            "Command palette fuzzy search p95 exceeds 2ms: p50={}µs, p95={}µs, p99={}µs",
+            p50_us,
+            p95_us,
+            p99_us
+        );
+
+        eprintln!(
+            "[perf] Command palette fuzzy search (100 entries): \
+             p50={}µs p95={}µs p99={}µs",
+            p50_us, p95_us, p99_us
+        );
     }
 }

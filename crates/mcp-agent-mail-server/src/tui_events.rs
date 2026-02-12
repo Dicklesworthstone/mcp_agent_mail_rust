@@ -3489,9 +3489,9 @@ mod tests {
     #[test]
     fn timeline_data_provider_total_count_matches_ring() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(sample_tool_start("a"));
-        ring.push(sample_tool_start("b"));
-        ring.push(sample_tool_start("c"));
+        let _ = ring.push(sample_tool_start("a"));
+        let _ = ring.push(sample_tool_start("b"));
+        let _ = ring.push(sample_tool_start("c"));
 
         let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
         provider.refresh();
@@ -3503,7 +3503,7 @@ mod tests {
     fn timeline_data_provider_window_returns_slice() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         for i in 0..10 {
-            ring.push(sample_http(&format!("/{i}"), 200));
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
         }
 
         let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
@@ -3521,7 +3521,7 @@ mod tests {
     fn timeline_data_provider_window_clamps_to_bounds() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         for i in 0..5 {
-            ring.push(sample_http(&format!("/{i}"), 200));
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
         }
 
         let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
@@ -3539,15 +3539,15 @@ mod tests {
     #[test]
     fn timeline_data_provider_prefetch_refreshes() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(sample_tool_start("initial"));
+        let _ = ring.push(sample_tool_start("initial"));
 
         let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
         provider.refresh();
         assert_eq!(provider.total_count(), 1);
 
         // Add more events
-        ring.push(sample_tool_start("second"));
-        ring.push(sample_tool_start("third"));
+        let _ = ring.push(sample_tool_start("second"));
+        let _ = ring.push(sample_tool_start("third"));
 
         // Prefetch should pick up new events
         provider.prefetch(0);
@@ -3558,7 +3558,7 @@ mod tests {
     fn timeline_data_provider_invalidate_forces_rebuild() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         for i in 0..5 {
-            ring.push(sample_http(&format!("/{i}"), 200));
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
         }
 
         let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
@@ -3633,6 +3633,7 @@ mod tests {
     /// is handled by ftui_widgets::VirtualizedList which has O(1) complexity
     /// for visible rows only.
     #[test]
+    #[allow(clippy::similar_names)]
     fn perf_virtualized_timeline_10k_events() {
         use std::time::Instant;
 

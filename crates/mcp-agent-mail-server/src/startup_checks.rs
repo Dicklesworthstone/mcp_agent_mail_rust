@@ -42,13 +42,13 @@ pub enum PortStatus {
 impl PortStatus {
     /// Returns true if the port can be used (either free or Agent Mail server reuse).
     #[must_use]
-    pub fn is_usable(&self) -> bool {
+    pub const fn is_usable(&self) -> bool {
         matches!(self, Self::Free | Self::AgentMailServer)
     }
 
     /// Returns true if an Agent Mail server is already running.
     #[must_use]
-    pub fn is_agent_mail_server(&self) -> bool {
+    pub const fn is_agent_mail_server(&self) -> bool {
         matches!(self, Self::AgentMailServer)
     }
 }

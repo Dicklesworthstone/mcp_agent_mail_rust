@@ -69,19 +69,26 @@ jsonrpc_call() {
     local port="$1"
     local tool="$2"
     local args_json="$3"
-    local payload
-    payload="$(python3 -c "
-import json, sys
-print(json.dumps({
-  'jsonrpc':'2.0',
-  'id': 1,
-  'method':'tools/call',
-  'params': {'name': sys.argv[1], 'arguments': json.loads(sys.argv[2])}
-}, separators=(',',':')))
-" "$tool" "$args_json")"
-    curl -sS -X POST "http://127.0.0.1:${port}/mcp/" \
-        -H "content-type: application/json" \
-        --data "${payload}" 2>/dev/null || true
+    : "${args_json:="{}"}"
+
+    JSONRPC_CALL_SEQ="${JSONRPC_CALL_SEQ:-0}"
+    JSONRPC_CALL_SEQ=$((JSONRPC_CALL_SEQ + 1))
+
+    local case_id="jsonrpc_${JSONRPC_CALL_SEQ}_${tool}"
+    local url="http://127.0.0.1:${port}/mcp/"
+
+    e2e_mark_case_start "${case_id}"
+    if ! e2e_rpc_call "${case_id}" "${url}" "${tool}" "${args_json}"; then
+        :
+    fi
+
+    local status
+    status="$(e2e_rpc_read_status "${case_id}")"
+    if [ -z "${status}" ] || [ "${status}" = "000" ]; then
+        return 1
+    fi
+
+    e2e_rpc_read_response "${case_id}"
 }
 
 start_server_headless() {

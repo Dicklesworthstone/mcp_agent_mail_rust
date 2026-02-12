@@ -152,12 +152,37 @@ rpc_call() {
     local args="${3}"
     : "${args:="{}"}"
     local id="${4:-1}"
-    local pfile
-    pfile="$(build_payload "$tool" "$args" "$id")"
-    curl -sS -X POST "${url}" \
-        -H "content-type: application/json" \
-        --data-binary "@${pfile}" 2>/dev/null
-    rm -f "$pfile"
+
+    RPC_CALL_SEQ="${RPC_CALL_SEQ:-0}"
+    RPC_CALL_SEQ=$((RPC_CALL_SEQ + 1))
+
+    local case_id="rpc_${RPC_CALL_SEQ}_${tool}"
+    local payload
+    payload="$(python3 -c "
+import json, sys
+tool = sys.argv[1]
+args = json.loads(sys.argv[2])
+rid = int(sys.argv[3])
+print(json.dumps({
+  'jsonrpc': '2.0',
+  'method': 'tools/call',
+  'id': rid,
+  'params': { 'name': tool, 'arguments': args }
+}, separators=(',', ':')))
+" "$tool" "$args" "$id")"
+
+    e2e_mark_case_start "${case_id}"
+    if ! e2e_rpc_call_raw "${case_id}" "${url}" "${payload}"; then
+        :
+    fi
+
+    local status
+    status="$(e2e_rpc_read_status "${case_id}")"
+    if [ -z "${status}" ] || [ "${status}" = "000" ]; then
+        return 1
+    fi
+
+    e2e_rpc_read_response "${case_id}"
 }
 
 # Send a tool call in the background (fire-and-forget, log response)

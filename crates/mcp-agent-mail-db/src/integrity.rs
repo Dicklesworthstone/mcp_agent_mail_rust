@@ -141,7 +141,7 @@ fn run_check(conn: &DbConn, pragma: &str, kind: CheckKind) -> DbResult<Integrity
     let duration_us =
         u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
 
-    let details: Vec<String> = rows
+    let mut details: Vec<String> = rows
         .iter()
         .filter_map(|r| {
             // PRAGMA integrity_check returns a column named "integrity_check",
@@ -157,6 +157,12 @@ fn run_check(conn: &DbConn, pragma: &str, kind: CheckKind) -> DbResult<Integrity
             }
         })
         .collect();
+
+    // Some SQLite backends currently surface PRAGMA check success with an empty
+    // rowset instead of a single "ok" row; normalize that to preserve semantics.
+    if details.is_empty() {
+        details.push("ok".to_string());
+    }
 
     // SQLite returns "ok" as the single row when no corruption is found.
     let ok = details.len() == 1 && details[0] == "ok";

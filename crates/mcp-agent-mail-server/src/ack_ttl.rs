@@ -502,6 +502,25 @@ mod tests {
     }
 
     #[test]
+    fn escalation_mode_unknown_is_noop() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "unknown".to_string();
+
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("escalate");
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert!(reservations.is_empty());
+    }
+
+    #[test]
     fn ack_ttl_cycle_zero_when_no_messages() {
         let tmp = tempfile::tempdir().unwrap();
         let pool = make_test_pool(&tmp);
@@ -566,6 +585,26 @@ mod tests {
             other => panic!("get_agent_by_id failed: {other:?}"),
         };
         assert_eq!(holder.name, "OpsEscalation");
+    }
+
+    #[test]
+    fn escalation_mode_is_case_insensitive() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "FILE_RESERVATION".to_string();
+        config.ack_escalation_claim_holder_name.clear();
+
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("escalate");
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 1);
     }
 
     #[test]

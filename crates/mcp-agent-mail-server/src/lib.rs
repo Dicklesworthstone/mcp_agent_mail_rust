@@ -6993,6 +6993,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn rate_limit_tools_with_different_names_use_separate_buckets() {
         let config = mcp_agent_mail_core::Config {
             http_rate_limit_enabled: true,

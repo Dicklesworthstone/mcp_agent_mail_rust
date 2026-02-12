@@ -213,7 +213,10 @@ mod inner {
                     .get("sender")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let created_ts = hit.metadata.get("created_ts").and_then(serde_json::Value::as_i64);
+                let created_ts = hit
+                    .metadata
+                    .get("created_ts")
+                    .and_then(serde_json::Value::as_i64);
                 let subject = hit
                     .metadata
                     .get("subject")
@@ -224,7 +227,10 @@ mod inner {
                 PlannerResult {
                     doc_kind,
                     id: hit.doc_id,
-                    project_id: hit.metadata.get("project_id").and_then(serde_json::Value::as_i64),
+                    project_id: hit
+                        .metadata
+                        .get("project_id")
+                        .and_then(serde_json::Value::as_i64),
                     title: subject,
                     body: hit.snippet.clone().unwrap_or_default(),
                     score: Some(hit.score),

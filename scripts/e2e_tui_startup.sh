@@ -544,6 +544,18 @@ done
 
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
+TOOLS_LIST_PAYLOAD='{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}'
+
+tools_list_call() {
+    local case_id="$1"
+    local url="$2"
+    shift 2
+    e2e_mark_case_start "${case_id}"
+    if ! e2e_rpc_call_raw "${case_id}" "${url}" "${TOOLS_LIST_PAYLOAD}" "$@"; then
+        :
+    fi
+}
+
 # ────────────────────────────────────────────────────────────────────
 # Case 1: Default startup shows bootstrap banner (headless for easy capture)
 # ────────────────────────────────────────────────────────────────────
@@ -592,12 +604,13 @@ if ! e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
 fi
 
 # Verify the server responds to MCP tools/list
-set +e
-TOOLS_LIST="$(curl -sS -X POST "http://127.0.0.1:${PORT2}/mcp/" \
-    -H "content-type: application/json" \
-    --data '{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}' 2>/dev/null)"
-CURL_RC=$?
-set -e
+tools_list_call "case2_tools_list" "http://127.0.0.1:${PORT2}/mcp/"
+TOOLS_LIST="$(e2e_rpc_read_response "case2_tools_list")"
+TOOLS_LIST_STATUS="$(e2e_rpc_read_status "case2_tools_list")"
+CURL_RC=1
+if [ "${TOOLS_LIST_STATUS}" = "200" ]; then
+    CURL_RC=0
+fi
 e2e_save_artifact "tui_ready_tools_list.json" "${TOOLS_LIST:-<empty>}"
 
 if [ "$CURL_RC" -eq 0 ] && echo "${TOOLS_LIST}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'result' in d" 2>/dev/null; then
@@ -630,12 +643,13 @@ if ! e2e_wait_port 127.0.0.1 "${PORT3}" 10; then
 fi
 
 # Verify API path responds
-set +e
-API_RESP="$(curl -sS -X POST "http://127.0.0.1:${PORT3}/api/" \
-    -H "content-type: application/json" \
-    --data '{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}' 2>/dev/null)"
-API_RC=$?
-set -e
+tools_list_call "case3_api_tools_list" "http://127.0.0.1:${PORT3}/api/"
+API_RESP="$(e2e_rpc_read_response "case3_api_tools_list")"
+API_STATUS="$(e2e_rpc_read_status "case3_api_tools_list")"
+API_RC=1
+if [ "${API_STATUS}" = "200" ]; then
+    API_RC=0
+fi
 e2e_save_artifact "api_mode_tools_list.json" "${API_RESP:-<empty>}"
 
 if [ "$API_RC" -eq 0 ] && echo "${API_RESP}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'result' in d" 2>/dev/null; then
@@ -673,11 +687,8 @@ if ! e2e_wait_port 127.0.0.1 "${PORT4}" 10; then
 fi
 
 # Verify unauthenticated request is rejected
-set +e
-UNAUTH_RESP="$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${PORT4}/mcp/" \
-    -H "content-type: application/json" \
-    --data '{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}' 2>/dev/null)"
-set -e
+tools_list_call "case4_unauth_tools_list" "http://127.0.0.1:${PORT4}/mcp/"
+UNAUTH_RESP="$(e2e_rpc_read_status "case4_unauth_tools_list")"
 if [ "${UNAUTH_RESP}" = "401" ] || [ "${UNAUTH_RESP}" = "403" ]; then
     e2e_pass "unauthenticated request rejected (${UNAUTH_RESP})"
 else
@@ -685,13 +696,14 @@ else
 fi
 
 # Verify authenticated request succeeds
-set +e
-AUTH_RESP="$(curl -sS -X POST "http://127.0.0.1:${PORT4}/mcp/" \
-    -H "content-type: application/json" \
-    -H "Authorization: Bearer test-secret-token-e2e-12345" \
-    --data '{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}' 2>/dev/null)"
-AUTH_RC=$?
-set -e
+tools_list_call "case4_auth_tools_list" "http://127.0.0.1:${PORT4}/mcp/" \
+    "Authorization: Bearer test-secret-token-e2e-12345"
+AUTH_RESP="$(e2e_rpc_read_response "case4_auth_tools_list")"
+AUTH_STATUS="$(e2e_rpc_read_status "case4_auth_tools_list")"
+AUTH_RC=1
+if [ "${AUTH_STATUS}" = "200" ]; then
+    AUTH_RC=0
+fi
 e2e_save_artifact "token_auth_tools_list.json" "${AUTH_RESP:-<empty>}"
 
 if [ "$AUTH_RC" -eq 0 ] && echo "${AUTH_RESP}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'result' in d" 2>/dev/null; then

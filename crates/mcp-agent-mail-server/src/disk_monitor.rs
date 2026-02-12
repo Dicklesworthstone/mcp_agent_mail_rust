@@ -126,6 +126,11 @@ mod tests {
     }
 
     #[test]
+    fn startup_warning_zero_free_space_triggers() {
+        assert!(should_emit_startup_warning(Some(0)));
+    }
+
+    #[test]
     fn pressure_change_alert_only_when_level_changes() {
         assert!(!should_emit_pressure_change_alert(
             DiskPressure::Ok,

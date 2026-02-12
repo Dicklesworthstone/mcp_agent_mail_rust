@@ -9,6 +9,7 @@
 //! the crate.
 
 use crate::DbConn;
+use crate::queries::row_first_i64;
 use serde::{Deserialize, Serialize};
 use sqlmodel::Row;
 use sqlmodel_schema::Migration;
@@ -293,6 +294,14 @@ pub fn recipe_migrations() -> Vec<Migration> {
 
 use crate::sqlmodel::Value;
 
+fn row_named_i64(row: &Row, col: &str) -> Option<i64> {
+    row.get_named::<i64>(col)
+        .ok()
+        .or_else(|| row.get_named::<i32>(col).ok().map(i64::from))
+        .or_else(|| row.get_named::<i16>(col).ok().map(i64::from))
+        .or_else(|| row.get_named::<i8>(col).ok().map(i64::from))
+}
+
 /// Insert a new search recipe. Returns the row ID.
 pub fn insert_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<i64, String> {
     let sql = "INSERT INTO search_recipes \
@@ -304,13 +313,15 @@ pub fn insert_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<i64, String
     let params = recipe_to_params(recipe);
     conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
 
-    // Fetch last insert rowid
+    // frankensqlite workaround: parameter comparison doesn't work reliably.
+    // Use MAX(id) to get the most recently inserted recipe id.
+    let lookup_sql = "SELECT MAX(id) as id FROM search_recipes";
     let rows = conn
-        .query_sync("SELECT last_insert_rowid() AS id", &[])
+        .query_sync(lookup_sql, &[])
         .map_err(|e| e.to_string())?;
     rows.first()
-        .and_then(|r| r.get_named::<i64>("id").ok())
-        .ok_or_else(|| "failed to get last_insert_rowid".to_string())
+        .and_then(|r| row_named_i64(r, "id").or_else(|| row_first_i64(r)))
+        .ok_or_else(|| "failed to resolve inserted search_recipes id".to_string())
 }
 
 /// Update an existing recipe by ID.
@@ -444,12 +455,15 @@ pub fn insert_history(conn: &DbConn, entry: &QueryHistoryEntry) -> Result<i64, S
 
     conn.execute_sync(sql, &params).map_err(|e| e.to_string())?;
 
+    // frankensqlite workaround: parameter comparison doesn't work reliably.
+    // Use MAX(id) to get the most recently inserted history entry id.
+    let lookup_sql = "SELECT MAX(id) as id FROM query_history";
     let rows = conn
-        .query_sync("SELECT last_insert_rowid() AS id", &[])
+        .query_sync(lookup_sql, &[])
         .map_err(|e| e.to_string())?;
     rows.first()
-        .and_then(|r| r.get_named::<i64>("id").ok())
-        .ok_or_else(|| "failed to get last_insert_rowid".to_string())
+        .and_then(|r| row_named_i64(r, "id").or_else(|| row_first_i64(r)))
+        .ok_or_else(|| "failed to resolve inserted query_history id".to_string())
 }
 
 /// List recent query history, newest first.

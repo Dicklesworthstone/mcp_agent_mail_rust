@@ -317,44 +317,146 @@ fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> 
     ProjectRow::from_row(row).map_err(|e| map_sql_error(&e))
 }
 
-fn decode_agent_row(row: &SqlRow) -> AgentRow {
-    // Extract all fields manually - the ORM's from_row has issues with raw query results
-    // where column metadata is missing or id returns 0
+const PROJECT_SELECT_ALL_SQL: &str =
+    "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
 
-    // Try positional extraction first (more reliable for traw_query results)
-    let id = row.get_as::<i64>(0).ok();
-    let project_id = row.get_as::<i64>(1).unwrap_or(0);
-    let name = row.get_as::<String>(2).unwrap_or_default();
-    let program = row.get_as::<String>(3).unwrap_or_default();
-    let model = row.get_as::<String>(4).unwrap_or_default();
-    let task_description = row.get_as::<String>(5).unwrap_or_default();
-    let inception_ts = row.get_as::<i64>(6).unwrap_or(0);
-    let last_active_ts = row.get_as::<i64>(7).unwrap_or(0);
-    let attachments_policy = row.get_as::<String>(8).unwrap_or_else(|_| "auto".to_string());
-    let contact_policy = row.get_as::<String>(9).unwrap_or_else(|_| "auto".to_string());
+fn find_project_by_slug(
+    rows: &[SqlRow],
+    slug: &str,
+) -> std::result::Result<Option<ProjectRow>, DbError> {
+    for r in rows {
+        let row = decode_project_row(r)?;
+        if row.slug == slug {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+fn find_project_by_human_key(
+    rows: &[SqlRow],
+    human_key: &str,
+) -> std::result::Result<Option<ProjectRow>, DbError> {
+    for r in rows {
+        let row = decode_project_row(r)?;
+        if row.human_key == human_key {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+/// Decode `ProductRow` from raw SQL query result using positional (indexed) column access.
+/// Expected column order: `id`, `product_uid`, `name`, `created_at`.
+fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, DbError> {
+    let id = row.get(0).and_then(|v| match v {
+        Value::BigInt(n) => Some(*n),
+        Value::Int(n) => Some(i64::from(*n)),
+        _ => None,
+    });
+    let product_uid = row
+        .get(1)
+        .and_then(|v| match v {
+            Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| DbError::Internal("missing product_uid in product row".to_string()))?;
+    let name = row
+        .get(2)
+        .and_then(|v| match v {
+            Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| DbError::Internal("missing name in product row".to_string()))?;
+    let created_at = row
+        .get(3)
+        .and_then(|v| match v {
+            Value::BigInt(n) => Some(*n),
+            Value::Int(n) => Some(i64::from(*n)),
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    Ok(ProductRow {
+        id,
+        product_uid,
+        name,
+        created_at,
+    })
+}
+
+/// Decode `AgentRow` from raw SQL query result using positional (indexed) column access.
+/// Expected column order: `id`, `project_id`, `name`, `program`, `model`, `task_description`,
+/// `inception_ts`, `last_active_ts`, `attachments_policy`, `contact_policy`.
+fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
+    fn get_i64(row: &SqlRow, idx: usize) -> i64 {
+        row.get(idx)
+            .and_then(|v| match v {
+                Value::BigInt(n) => Some(*n),
+                Value::Int(n) => Some(i64::from(*n)),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+    fn get_string(row: &SqlRow, idx: usize) -> String {
+        row.get(idx)
+            .and_then(|v| match v {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+    fn get_opt_i64(row: &SqlRow, idx: usize) -> Option<i64> {
+        row.get(idx).and_then(|v| match v {
+            Value::BigInt(n) => Some(*n),
+            Value::Int(n) => Some(i64::from(*n)),
+            _ => None,
+        })
+    }
 
     AgentRow {
-        id,
-        project_id,
-        name,
-        program,
-        model,
-        task_description,
-        inception_ts,
-        last_active_ts,
-        attachments_policy,
-        contact_policy,
+        id: get_opt_i64(row, 0),
+        project_id: get_i64(row, 1),
+        name: get_string(row, 2),
+        program: get_string(row, 3),
+        model: get_string(row, 4),
+        task_description: get_string(row, 5),
+        inception_ts: get_i64(row, 6),
+        last_active_ts: get_i64(row, 7),
+        attachments_policy: {
+            let s = get_string(row, 8);
+            if s.is_empty() { "auto".to_string() } else { s }
+        },
+        contact_policy: {
+            let s = get_string(row, 9);
+            if s.is_empty() { "auto".to_string() } else { s }
+        },
     }
 }
 
 fn find_agent_by_name(rows: &[SqlRow], name: &str) -> Option<AgentRow> {
     for r in rows {
-        let row = decode_agent_row(r);
+        // Use indexed access since raw SQL has explicit column order
+        let row = decode_agent_row_indexed(r);
         if row.name == name {
             return Some(row);
         }
     }
     None
+}
+
+fn value_as_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::BigInt(n) => Some(*n),
+        Value::Int(n) => Some(i64::from(*n)),
+        Value::SmallInt(n) => Some(i64::from(*n)),
+        Value::TinyInt(n) => Some(i64::from(*n)),
+        _ => None,
+    }
+}
+
+pub(crate) fn row_first_i64(row: &SqlRow) -> Option<i64> {
+    row.get(0).and_then(value_as_i64)
 }
 
 /// `SQLite` default `SQLITE_MAX_VARIABLE_NUMBER` is 999 (32766 in newer builds).
@@ -459,42 +561,36 @@ pub async fn ensure_project(
     let tracked = tracked(&*conn);
 
     // Match legacy semantics: slug is the stable identity; `human_key` is informative.
-    let select_sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
-    let select_params = [Value::Text(slug.clone())];
-    match map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await) {
+    // Work around fragile text-parameter/index cursor paths by loading project rows
+    // and filtering in Rust.
+    match map_sql_outcome(traw_query(cx, &tracked, PROJECT_SELECT_ALL_SQL, &[]).await) {
         Outcome::Ok(rows) => {
-            if let Some(r) = rows.first() {
-                match decode_project_row(r) {
-                    Ok(row) => {
-                        crate::cache::read_cache().put_project(&row);
-                        return Outcome::Ok(row);
-                    }
-                    Err(e) => return Outcome::Err(e),
+            match find_project_by_slug(&rows, &slug) {
+                Ok(Some(row)) => {
+                    crate::cache::read_cache().put_project(&row);
+                    return Outcome::Ok(row);
                 }
+                Ok(None) => {}
+                Err(e) => return Outcome::Err(e),
             }
 
-            let mut row = ProjectRow::new(slug.clone(), human_key.to_string());
+            let row = ProjectRow::new(slug.clone(), human_key.to_string());
             let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(_) => {
                     match map_sql_outcome(
-                        traw_query(cx, &tracked, select_sql, &select_params).await,
+                        traw_query(cx, &tracked, PROJECT_SELECT_ALL_SQL, &[]).await,
                     ) {
-                        Outcome::Ok(rows) => {
-                            if let Some(r) = rows.first() {
-                                match decode_project_row(r) {
-                                    Ok(fresh) => {
-                                        crate::cache::read_cache().put_project(&fresh);
-                                        Outcome::Ok(fresh)
-                                    }
-                                    Err(err) => Outcome::Err(err),
-                                }
-                            } else {
-                                row.id = Some(0);
-                                crate::cache::read_cache().put_project(&row);
-                                Outcome::Ok(row)
+                        Outcome::Ok(rows) => match find_project_by_slug(&rows, &slug) {
+                            Ok(Some(fresh)) => {
+                                crate::cache::read_cache().put_project(&fresh);
+                                Outcome::Ok(fresh)
                             }
-                        }
+                            Ok(None) => Outcome::Err(DbError::Internal(format!(
+                                "project insert succeeded but re-select failed for slug={slug}"
+                            ))),
+                            Err(err) => Outcome::Err(err),
+                        },
                         Outcome::Err(err) => Outcome::Err(err),
                         Outcome::Cancelled(r) => Outcome::Cancelled(r),
                         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -518,17 +614,16 @@ pub async fn ensure_project(
                     }
 
                     match map_sql_outcome(
-                        traw_query(cx, &tracked, select_sql, &select_params).await,
+                        traw_query(cx, &tracked, PROJECT_SELECT_ALL_SQL, &[]).await,
                     ) {
-                        Outcome::Ok(rows) => rows.first().map_or(Outcome::Err(e), |r| {
-                            match decode_project_row(r) {
-                                Ok(row) => {
-                                    crate::cache::read_cache().put_project(&row);
-                                    Outcome::Ok(row)
-                                }
-                                Err(err) => Outcome::Err(err),
+                        Outcome::Ok(rows) => match find_project_by_slug(&rows, &slug) {
+                            Ok(Some(row)) => {
+                                crate::cache::read_cache().put_project(&row);
+                                Outcome::Ok(row)
                             }
-                        }),
+                            Ok(None) => Outcome::Err(e),
+                            Err(err) => Outcome::Err(err),
+                        },
                         Outcome::Err(select_err) => Outcome::Err(select_err),
                         Outcome::Cancelled(r) => Outcome::Cancelled(r),
                         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -563,19 +658,15 @@ pub async fn get_project_by_slug(
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
-    let params = [Value::Text(slug.to_string())];
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || Outcome::Err(DbError::not_found("Project", slug)),
-            |r| match decode_project_row(r) {
-                Ok(row) => {
-                    crate::cache::read_cache().put_project(&row);
-                    Outcome::Ok(row)
-                }
-                Err(e) => Outcome::Err(e),
-            },
-        ),
+    match map_sql_outcome(traw_query(cx, &tracked, PROJECT_SELECT_ALL_SQL, &[]).await) {
+        Outcome::Ok(rows) => match find_project_by_slug(&rows, slug) {
+            Ok(Some(row)) => {
+                crate::cache::read_cache().put_project(&row);
+                Outcome::Ok(row)
+            }
+            Ok(None) => Outcome::Err(DbError::not_found("Project", slug)),
+            Err(e) => Outcome::Err(e),
+        },
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -601,19 +692,15 @@ pub async fn get_project_by_human_key(
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE human_key = ? LIMIT 1";
-    let params = [Value::Text(human_key.to_string())];
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || Outcome::Err(DbError::not_found("Project", human_key)),
-            |r| match decode_project_row(r) {
-                Ok(row) => {
-                    crate::cache::read_cache().put_project(&row);
-                    Outcome::Ok(row)
-                }
-                Err(e) => Outcome::Err(e),
-            },
-        ),
+    match map_sql_outcome(traw_query(cx, &tracked, PROJECT_SELECT_ALL_SQL, &[]).await) {
+        Outcome::Ok(rows) => match find_project_by_human_key(&rows, human_key) {
+            Ok(Some(row)) => {
+                crate::cache::read_cache().put_project(&row);
+                Outcome::Ok(row)
+            }
+            Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
+            Err(e) => Outcome::Err(e),
+        },
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -662,8 +749,7 @@ pub async fn list_projects(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, D
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
+    match map_sql_outcome(traw_query(cx, &tracked, PROJECT_SELECT_ALL_SQL, &[]).await) {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for r in &rows {
@@ -740,6 +826,7 @@ pub async fn register_agent(
                     Outcome::Panicked(p) => Outcome::Panicked(p),
                 }
             } else {
+                // Use ORM insert, then fetch the actual ID via last_insert_rowid
                 let row = AgentRow {
                     id: None,
                     project_id,
@@ -754,15 +841,33 @@ pub async fn register_agent(
                 };
                 match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
                     Outcome::Ok(_) => {
-                        // Use synchronous query on inner connection to get last_insert_rowid
-                        // This works reliably unlike async traw_query which has row format issues
-                        let rowid = tracked.inner
-                            .query_sync("SELECT last_insert_rowid() AS id", &[])
-                            .ok()
-                            .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("id").ok()))
-                            .unwrap_or(0);
-                        let mut fresh = row;
-                        fresh.id = Some(rowid);
+                        // Read-back by project and filter in Rust. This avoids
+                        // fragile multi-parameter string matching paths.
+                        let fetch_sql = "SELECT id, project_id, name, program, model, \
+                                         task_description, inception_ts, last_active_ts, \
+                                         attachments_policy, contact_policy \
+                                         FROM agents WHERE project_id = ?";
+                        let params = [Value::BigInt(project_id)];
+                        let mut fresh = match map_sql_outcome(
+                            traw_query(cx, &tracked, fetch_sql, &params).await,
+                        ) {
+                            Outcome::Ok(rows) => {
+                                let Some(found) = find_agent_by_name(&rows, name) else {
+                                    return Outcome::Err(DbError::Internal(format!(
+                                        "agent insert succeeded but re-select failed for {project_id}:{name}"
+                                    )));
+                                };
+                                found
+                            }
+                            Outcome::Err(e) => return Outcome::Err(e),
+                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                            Outcome::Panicked(p) => return Outcome::Panicked(p),
+                        };
+                        fresh.program = program.to_string();
+                        fresh.model = model.to_string();
+                        fresh.task_description = task_desc.to_string();
+                        fresh.last_active_ts = now;
+                        fresh.attachments_policy = attach_pol.to_string();
                         crate::cache::read_cache().put_agent(&fresh);
                         Outcome::Ok(fresh)
                     }
@@ -819,36 +924,55 @@ pub async fn create_agent(
     let task_desc = task_description.unwrap_or_default();
     let attach_pol = attachments_policy.unwrap_or("auto");
 
-    match map_sql_outcome(
-        select!(AgentRow)
-            .filter(Expr::col("project_id").eq(project_id))
-            .all(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(rows) => {
-            if rows.iter().any(|r| r.name == name) {
-                return Outcome::Err(DbError::duplicate(
-                    "agent",
-                    format!("{name} (project {project_id})"),
-                ));
-            }
-            let mut row = AgentRow {
-                id: None,
-                project_id,
-                name: name.to_string(),
-                program: program.to_string(),
-                model: model.to_string(),
-                task_description: task_desc.to_string(),
-                inception_ts: now,
-                last_active_ts: now,
-                attachments_policy: attach_pol.to_string(),
-                contact_policy: "auto".to_string(),
-            };
-            match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
-                Outcome::Ok(id) => {
-                    row.id = Some(id);
-                    crate::cache::read_cache().put_agent(&row);
-                    Outcome::Ok(row)
+    // Use a project-scoped fetch and filter in Rust for robust name matching.
+    let check_sql = "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy \
+                     FROM agents WHERE project_id = ?";
+    let check_params = [Value::BigInt(project_id)];
+
+    let exists = match map_sql_outcome(traw_query(cx, &tracked, check_sql, &check_params).await) {
+        Outcome::Ok(rows) => find_agent_by_name(&rows, name).is_some(),
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    if exists {
+        return Outcome::Err(DbError::duplicate(
+            "agent",
+            format!("{name} (project {project_id})"),
+        ));
+    }
+
+    let row = AgentRow {
+        id: None,
+        project_id,
+        name: name.to_string(),
+        program: program.to_string(),
+        model: model.to_string(),
+        task_description: task_desc.to_string(),
+        inception_ts: now,
+        last_active_ts: now,
+        attachments_policy: attach_pol.to_string(),
+        contact_policy: "auto".to_string(),
+    };
+    match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
+        Outcome::Ok(_) => {
+            // Read back the inserted row so callers never see a synthetic id=0.
+            let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                             inception_ts, last_active_ts, attachments_policy, contact_policy \
+                             FROM agents WHERE project_id = ?";
+            let fetch_params = [Value::BigInt(project_id)];
+            match map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await) {
+                Outcome::Ok(rows) => {
+                    let Some(found) = find_agent_by_name(&rows, name) else {
+                        return Outcome::Err(DbError::Internal(format!(
+                            "agent insert succeeded but re-select failed for {project_id}:{name}"
+                        )));
+                    };
+                    let fresh = found;
+                    crate::cache::read_cache().put_agent(&fresh);
+                    Outcome::Ok(fresh)
                 }
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -881,19 +1005,21 @@ pub async fn get_agent(
 
     let tracked = tracked(&*conn);
 
-    match map_sql_outcome(
-        select!(AgentRow)
-            .filter(Expr::col("project_id").eq(project_id))
-            .all(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(rows) => rows.into_iter().find(|r| r.name == name).map_or_else(
-            || Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}"))),
-            |row| {
-                crate::cache::read_cache().put_agent(&row);
-                Outcome::Ok(row)
-            },
-        ),
+    // Load all project agents and filter in Rust to avoid fragile
+    // multi-parameter string matching in lower SQL layers.
+    let sql = "SELECT id, project_id, name, program, model, task_description, \
+               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               FROM agents WHERE project_id = ?";
+    let params = [Value::BigInt(project_id)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let Some(agent) = find_agent_by_name(&rows, name) else {
+                return Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")));
+            };
+            crate::cache::read_cache().put_agent(&agent);
+            Outcome::Ok(agent)
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -915,17 +1041,21 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
 
     let tracked = tracked(&*conn);
 
-    match map_sql_outcome(
-        select!(AgentRow)
-            .filter(Expr::col("id").eq(agent_id))
-            .first(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(Some(row)) => {
-            crate::cache::read_cache().put_agent(&row);
-            Outcome::Ok(row)
-        }
-        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Agent", agent_id.to_string())),
+    // Use raw SQL with explicit column order to avoid ORM decoding issues
+    let sql = "SELECT id, project_id, name, program, model, task_description, \
+               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               FROM agents WHERE id = ? LIMIT 1";
+    let params = [Value::BigInt(agent_id)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => rows.first().map_or_else(
+            || Outcome::Err(DbError::not_found("Agent", agent_id.to_string())),
+            |row| {
+                let agent = decode_agent_row_indexed(row);
+                crate::cache::read_cache().put_agent(&agent);
+                Outcome::Ok(agent)
+            },
+        ),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -947,13 +1077,17 @@ pub async fn list_agents(
 
     let tracked = tracked(&*conn);
 
-    match map_sql_outcome(
-        select!(AgentRow)
-            .filter(Expr::col("project_id").eq(project_id))
-            .all(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(rows) => Outcome::Ok(rows),
+    // Use raw SQL with explicit column order to avoid ORM decoding issues
+    let sql = "SELECT id, project_id, name, program, model, task_description, \
+               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               FROM agents WHERE project_id = ?";
+    let params = [Value::BigInt(project_id)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let agents: Vec<AgentRow> = rows.iter().map(decode_agent_row_indexed).collect();
+            Outcome::Ok(agents)
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -1110,20 +1244,20 @@ pub async fn set_agent_contact_policy(
 
     match out {
         Outcome::Ok(_) => {
-            // Fetch updated agent
-            match map_sql_outcome(
-                select!(AgentRow)
-                    .filter(Expr::col("id").eq(agent_id))
-                    .first(cx, &tracked)
-                    .await,
-            ) {
-                Outcome::Ok(Some(row)) => {
-                    crate::cache::read_cache().put_agent(&row);
-                    Outcome::Ok(row)
-                }
-                Outcome::Ok(None) => {
-                    Outcome::Err(DbError::not_found("Agent", agent_id.to_string()))
-                }
+            // Fetch updated agent using raw SQL with explicit column order
+            let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                             inception_ts, last_active_ts, attachments_policy, contact_policy \
+                             FROM agents WHERE id = ? LIMIT 1";
+            let fetch_params = [Value::BigInt(agent_id)];
+            match map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await) {
+                Outcome::Ok(rows) => rows.first().map_or_else(
+                    || Outcome::Err(DbError::not_found("Agent", agent_id.to_string())),
+                    |row| {
+                        let agent = decode_agent_row_indexed(row);
+                        crate::cache::read_cache().put_agent(&agent);
+                        Outcome::Ok(agent)
+                    },
+                ),
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -1143,6 +1277,14 @@ pub async fn set_agent_contact_policy_by_name(
     name: &str,
     policy: &str,
 ) -> Outcome<AgentRow, DbError> {
+    let normalized_name = name.trim();
+    if normalized_name.is_empty() {
+        return Outcome::Err(DbError::invalid(
+            "name",
+            "agent name cannot be empty".to_string(),
+        ));
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -1151,49 +1293,50 @@ pub async fn set_agent_contact_policy_by_name(
     };
 
     let tracked = tracked(&*conn);
-
     let now = now_micros();
-    let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE project_id = ? AND name = ?";
-    let params = [
-        Value::Text(policy.to_string()),
-        Value::BigInt(now),
-        Value::BigInt(project_id),
-        Value::Text(name.to_string()),
-    ];
-    let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
 
-    match out {
-        Outcome::Ok(affected) => {
+    // Use numbered placeholders for sync SQL UPDATE.
+    let sql = "UPDATE agents SET contact_policy = ?1, last_active_ts = ?2 WHERE project_id = ?3 AND name = ?4";
+    match tracked.inner.execute_sync(
+        sql,
+        &[
+            Value::Text(policy.to_string()),
+            Value::BigInt(now),
+            Value::BigInt(project_id),
+            Value::Text(normalized_name.to_string()),
+        ],
+    ) {
+        Ok(affected) => {
             if affected == 0 {
-                return Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")));
+                return Outcome::Err(DbError::not_found(
+                    "Agent",
+                    format!("{project_id}:{normalized_name}"),
+                ));
             }
-            // Invalidate cache
-            crate::cache::read_cache().invalidate_agent(project_id, name);
 
-            // Fetch updated agent directly with raw query (bypasses ORM decoding issues)
-            let select_sql = "SELECT id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy FROM agents WHERE project_id = ? AND name = ? LIMIT 1";
-            let select_params = [
-                Value::BigInt(project_id),
-                Value::Text(name.to_string()),
-            ];
-            match map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await) {
+            // Invalidate stale entry and then re-read the full record from DB.
+            crate::cache::read_cache().invalidate_agent(project_id, normalized_name);
+
+            let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                             inception_ts, last_active_ts, attachments_policy, contact_policy \
+                             FROM agents WHERE project_id = ?";
+            let fetch_params = [Value::BigInt(project_id)];
+            match map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await) {
                 Outcome::Ok(rows) => {
-                    if let Some(r) = rows.first() {
-                        let row = decode_agent_row(r);
-                        crate::cache::read_cache().put_agent(&row);
-                        Outcome::Ok(row)
-                    } else {
-                        Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")))
-                    }
+                    let Some(agent) = find_agent_by_name(&rows, normalized_name) else {
+                        return Outcome::Err(DbError::Internal(format!(
+                            "policy update succeeded but re-select failed for {project_id}:{normalized_name}"
+                        )));
+                    };
+                    crate::cache::read_cache().put_agent(&agent);
+                    Outcome::Ok(agent)
                 }
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
             }
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+        Err(e) => Outcome::Err(map_sql_error(&e)),
     }
 }
 
@@ -1215,6 +1358,30 @@ pub struct ThreadMessageRow {
     pub created_ts: i64,
     pub attachments: String,
     pub from: String,
+}
+
+async fn reload_inserted_message_id(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    _row: &MessageRow,
+) -> Outcome<i64, DbError> {
+    // frankensqlite workaround: parameter comparison doesn't work reliably.
+    // Use MAX(id) to get the most recently inserted message id.
+    // This is safe because we're inside a transaction and just did the INSERT.
+    let sql = "SELECT MAX(id) FROM messages";
+    match map_sql_outcome(traw_query(cx, tracked, sql, &[]).await) {
+        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).map_or_else(
+            || {
+                Outcome::Err(DbError::Internal(
+                    "message insert succeeded but MAX(id) returned NULL".to_string(),
+                ))
+            },
+            Outcome::Ok,
+        ),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// Create a new message
@@ -1255,9 +1422,14 @@ pub async fn create_message(
         attachments: attachments.to_string(),
     };
 
-    let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
-    match id_out {
-        Outcome::Ok(id) => {
+    match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
+        Outcome::Ok(_) => {
+            let id = match reload_inserted_message_id(cx, &tracked, &row).await {
+                Outcome::Ok(id) => id,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
             row.id = Some(id);
             Outcome::Ok(row)
         }
@@ -1312,10 +1484,15 @@ pub async fn create_message_with_recipients(
         attachments: attachments.to_string(),
     };
 
-    let message_id = try_in_tx!(
+    try_in_tx!(
         cx,
         &tracked,
         map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
+    );
+    let message_id = try_in_tx!(
+        cx,
+        &tracked,
+        reload_inserted_message_id(cx, &tracked, &row).await
     );
     row.id = Some(message_id);
 
@@ -2852,11 +3029,29 @@ pub async fn create_file_reservations(
             released_ts: None,
         };
 
-        let id = try_in_tx!(
+        // Insert the row (execute returns rows_affected, not ID)
+        try_in_tx!(
             cx,
             &tracked,
             map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
         );
+
+        // frankensqlite workaround: parameter comparison doesn't work reliably
+        // in concurrent transactions. Use MAX(id) to get the most recently
+        // inserted reservation id. This is safe because we're inside a
+        // transaction and just did the INSERT.
+        let lookup_sql = "SELECT MAX(id) FROM file_reservations";
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, lookup_sql, &[]).await)
+        );
+        let Some(id) = rows.first().and_then(row_first_i64) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "file reservation insert succeeded but MAX(id) returned NULL for project_id={project_id} agent_id={agent_id} path={path}"
+            )));
+        };
         row.id = Some(id);
         out.push(row);
     }
@@ -3678,17 +3873,21 @@ pub async fn is_contact_allowed(
     }
 
     // Check if target agent has "open" or "auto" contact policy (allows all contacts)
-    match map_sql_outcome(
-        select!(AgentRow)
-            .filter(Expr::col("project_id").eq(to_project_id))
-            .filter(Expr::col("id").eq(to_agent_id))
-            .first(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(Some(agent)) => {
-            Outcome::Ok(matches!(agent.contact_policy.as_str(), "auto" | "open"))
+    // Use raw SQL to avoid ORM decoding issues
+    let sql = "SELECT contact_policy FROM agents WHERE project_id = ? AND id = ? LIMIT 1";
+    let params = [Value::BigInt(to_project_id), Value::BigInt(to_agent_id)];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let policy = rows
+                .first()
+                .and_then(|r| r.get(0))
+                .and_then(|v| match v {
+                    Value::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            Outcome::Ok(matches!(policy, "auto" | "open"))
         }
-        Outcome::Ok(None) => Outcome::Ok(false),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -3700,6 +3899,9 @@ pub async fn is_contact_allowed(
 // =============================================================================
 
 /// Ensure product exists, creating if necessary.
+///
+/// Note: Uses raw SQL with explicit columns instead of select!() macro due to
+/// frankensqlite ORM limitation with SELECT * column name inference.
 pub async fn ensure_product(
     cx: &Cx,
     pool: &DbPool,
@@ -3719,29 +3921,52 @@ pub async fn ensure_product(
 
     let tracked = tracked(&*conn);
 
-    // Check if product already exists
-    let existing = map_sql_outcome(
-        select!(ProductRow)
-            .filter(Expr::col("product_uid").eq(uid.as_str()))
-            .first(cx, &tracked)
-            .await,
-    );
+    // Use explicit column listing to work around frankensqlite SELECT * issue
+    let select_sql =
+        "SELECT id, product_uid, name, created_at FROM products WHERE product_uid = ? LIMIT 1";
+    let select_params = [Value::Text(uid.clone())];
 
-    match existing {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
-        Outcome::Ok(None) => {
-            let mut row = ProductRow {
+    // Check if product already exists
+    match map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await) {
+        Outcome::Ok(rows) => {
+            if let Some(r) = rows.first() {
+                match decode_product_row_indexed(r) {
+                    Ok(row) => return Outcome::Ok(row),
+                    Err(e) => return Outcome::Err(e),
+                }
+            }
+
+            // Product doesn't exist, create it
+            let row = ProductRow {
                 id: None,
                 product_uid: uid,
                 name: prod_name,
                 created_at: now,
             };
 
-            let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
-            match id_out {
-                Outcome::Ok(id) => {
-                    row.id = Some(id);
-                    Outcome::Ok(row)
+            match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
+                Outcome::Ok(_) => {
+                    // Re-select by stable uid so callers get the real row id.
+                    let reselect_params = [Value::Text(row.product_uid.clone())];
+                    match map_sql_outcome(
+                        traw_query(cx, &tracked, select_sql, &reselect_params).await,
+                    ) {
+                        Outcome::Ok(rows) => rows.first().map_or_else(
+                            || {
+                                Outcome::Err(DbError::Internal(format!(
+                                    "product insert succeeded but re-select failed for uid={}",
+                                    row.product_uid
+                                )))
+                            },
+                            |r| match decode_product_row_indexed(r) {
+                                Ok(fresh) => Outcome::Ok(fresh),
+                                Err(err) => Outcome::Err(err),
+                            },
+                        ),
+                        Outcome::Err(e) => Outcome::Err(e),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
+                    }
                 }
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -3798,6 +4023,9 @@ pub async fn link_product_to_projects(
 }
 
 /// Get product by UID.
+///
+/// Note: Uses raw SQL with explicit columns instead of select!() macro due to
+/// frankensqlite ORM limitation with SELECT * column name inference.
 pub async fn get_product_by_uid(
     cx: &Cx,
     pool: &DbPool,
@@ -3812,14 +4040,18 @@ pub async fn get_product_by_uid(
 
     let tracked = tracked(&*conn);
 
-    match map_sql_outcome(
-        select!(ProductRow)
-            .filter(Expr::col("product_uid").eq(product_uid))
-            .first(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
-        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Product", product_uid)),
+    let select_sql =
+        "SELECT id, product_uid, name, created_at FROM products WHERE product_uid = ? LIMIT 1";
+    let select_params = [Value::Text(product_uid.to_string())];
+
+    match map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await) {
+        Outcome::Ok(rows) => rows.first().map_or_else(
+            || Outcome::Err(DbError::not_found("Product", product_uid)),
+            |r| match decode_product_row_indexed(r) {
+                Ok(row) => Outcome::Ok(row),
+                Err(e) => Outcome::Err(e),
+            },
+        ),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -4367,16 +4599,16 @@ pub async fn insert_system_agent(
 
     let tracked = tracked(&*conn);
 
-    // Check if already exists.
-    match map_sql_outcome(
-        select!(AgentRow)
-            .filter(Expr::col("project_id").eq(project_id))
-            .all(cx, &tracked)
-            .await,
-    ) {
+    // Check if already exists by project, then filter by name in Rust.
+    let check_sql = "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy \
+                     FROM agents WHERE project_id = ?";
+    let check_params = [Value::BigInt(project_id)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, check_sql, &check_params).await) {
         Outcome::Ok(rows) => {
-            if let Some(row) = rows.into_iter().find(|r| r.name == name) {
-                return Outcome::Ok(row);
+            if let Some(found) = find_agent_by_name(&rows, name) {
+                return Outcome::Ok(found);
             }
         }
         Outcome::Err(e) => return Outcome::Err(e),
@@ -4384,7 +4616,7 @@ pub async fn insert_system_agent(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
 
-    let mut row = AgentRow {
+    let row = AgentRow {
         id: None,
         project_id,
         name: name.to_string(),
@@ -4398,9 +4630,20 @@ pub async fn insert_system_agent(
     };
 
     match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
-        Outcome::Ok(id) => {
-            row.id = Some(id);
-            Outcome::Ok(row)
+        Outcome::Ok(_) => {
+            match map_sql_outcome(traw_query(cx, &tracked, check_sql, &check_params).await) {
+                Outcome::Ok(rows) => {
+                    let Some(found) = find_agent_by_name(&rows, name) else {
+                        return Outcome::Err(DbError::Internal(format!(
+                            "system agent insert succeeded but re-select failed for {project_id}:{name}"
+                        )));
+                    };
+                    Outcome::Ok(found)
+                }
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            }
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -4625,6 +4868,225 @@ mod tests {
     }
 
     #[test]
+    fn register_agent_then_get_agent_by_name_succeeds() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_then_get_agent.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-agent-repro-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let registered = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("first registration"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            assert!(registered.id.is_some(), "register should assign id");
+
+            let fetched = get_agent(&cx, &pool, project_id, "BlueLake")
+                .await
+                .into_result()
+                .expect("get_agent should find newly registered agent");
+            assert_eq!(fetched.name, "BlueLake");
+            assert_eq!(fetched.program, "codex-cli");
+            assert_eq!(fetched.model, "gpt-5");
+            assert_eq!(fetched.id, registered.id);
+        });
+    }
+
+    #[test]
+    fn ensure_project_and_project_lookups_succeed() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("ensure_project_and_lookups.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let human_key = format!("/tmp/am-project-lookups-{base}");
+
+            let ensured = ensure_project(&cx, &pool, &human_key)
+                .await
+                .into_result()
+                .expect("ensure project");
+            let by_slug = get_project_by_slug(&cx, &pool, &ensured.slug)
+                .await
+                .into_result()
+                .expect("lookup by slug");
+            let by_human_key = get_project_by_human_key(&cx, &pool, &human_key)
+                .await
+                .into_result()
+                .expect("lookup by human_key");
+
+            assert_eq!(ensured.id, by_slug.id);
+            assert_eq!(ensured.id, by_human_key.id);
+            assert_eq!(ensured.slug, by_slug.slug);
+            assert_eq!(human_key, by_human_key.human_key);
+        });
+    }
+
+    #[test]
+    fn set_contact_policy_by_name_preserves_lookup_and_cache() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("set_policy_by_name_lookup.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-policy-repro-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let registered = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("policy update test"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            assert_eq!(registered.contact_policy, "auto");
+
+            let updated =
+                set_agent_contact_policy_by_name(&cx, &pool, project_id, "BlueLake", "open")
+                    .await
+                    .into_result()
+                    .expect("set policy by exact name");
+            assert!(updated.id.is_some(), "updated row should include id");
+            assert_eq!(updated.name, "BlueLake");
+            assert_eq!(updated.program, "codex-cli");
+            assert_eq!(updated.contact_policy, "open");
+
+            // Whitespace around input name should not break lookup/update.
+            let updated2 = set_agent_contact_policy_by_name(
+                &cx,
+                &pool,
+                project_id,
+                "  BlueLake \t",
+                "contacts_only",
+            )
+            .await
+            .into_result()
+            .expect("set policy by trimmed name");
+            assert_eq!(updated2.contact_policy, "contacts_only");
+
+            let fetched = get_agent(&cx, &pool, project_id, "BlueLake")
+                .await
+                .into_result()
+                .expect("get_agent should work after policy updates");
+            assert_eq!(fetched.contact_policy, "contacts_only");
+
+            let cached = crate::read_cache()
+                .get_agent(project_id, "BlueLake")
+                .expect("cache entry should be refreshed");
+            assert_eq!(cached.contact_policy, "contacts_only");
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn run_like_fallback_handles_over_100_terms() {
         use asupersync::runtime::RuntimeBuilder;
@@ -4660,41 +5122,25 @@ mod tests {
 
         rt.block_on(async {
             let base = now_micros();
-            let conn = acquire_conn(&cx, &pool)
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-like-fallback-{base}"))
                 .await
                 .into_result()
-                .expect("acquire conn");
-            let setup_tracked = tracked(&*conn);
-
-            let project_row = crate::models::ProjectRow {
-                id: None,
-                slug: format!("like-fallback-{base}"),
-                human_key: format!("/tmp/am-like-fallback-{base}"),
-                created_at: now_micros(),
-            };
-            let project_id =
-                map_sql_outcome(insert!(&project_row).execute(&cx, &setup_tracked).await)
-                    .into_result()
-                    .expect("insert project");
-
-            let sender_row = crate::models::AgentRow {
-                id: None,
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = create_agent(
+                &cx,
+                &pool,
                 project_id,
-                name: "BlueLake".to_string(),
-                program: "e2e-test".to_string(),
-                model: "test-model".to_string(),
-                task_description: "like fallback test".to_string(),
-                inception_ts: now_micros(),
-                last_active_ts: now_micros(),
-                attachments_policy: "auto".to_string(),
-                contact_policy: "auto".to_string(),
-            };
-            let sender_id =
-                map_sql_outcome(insert!(&sender_row).execute(&cx, &setup_tracked).await)
-                    .into_result()
-                    .expect("insert sender");
-
-            drop(conn);
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("like fallback test"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
 
             create_message(
                 &cx,
@@ -4885,117 +5331,64 @@ mod tests {
 
         rt.block_on(async {
             let base = now_micros();
-            let conn = acquire_conn(&cx, &pool)
+            let project_a = ensure_project(&cx, &pool, &format!("/tmp/am-prod-search-a-{base}"))
                 .await
                 .into_result()
-                .expect("acquire conn");
-            let tracked = tracked(&*conn);
+                .expect("ensure project A");
+            let project_a_id = project_a.id.expect("project A id");
 
-            let project_a_id = map_sql_outcome(
-                insert!(&crate::models::ProjectRow {
-                    id: None,
-                    slug: format!("prod-search-a-{base}"),
-                    human_key: format!("/tmp/am-prod-search-a-{base}"),
-                    created_at: now_micros(),
-                })
-                .execute(&cx, &tracked)
-                .await,
-            )
-            .into_result()
-            .expect("insert project A");
-
-            let project_b_id = map_sql_outcome(
-                insert!(&crate::models::ProjectRow {
-                    id: None,
-                    slug: format!("prod-search-b-{base}"),
-                    human_key: format!("/tmp/am-prod-search-b-{base}"),
-                    created_at: now_micros(),
-                })
-                .execute(&cx, &tracked)
-                .await,
-            )
-            .into_result()
-            .expect("insert project B");
+            let project_b = ensure_project(&cx, &pool, &format!("/tmp/am-prod-search-b-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project B");
+            let project_b_id = project_b.id.expect("project B id");
 
             let product_uid = format!("prod_search_rank_{base}");
-            let product_id = map_sql_outcome(
-                insert!(&crate::models::ProductRow {
-                    id: None,
-                    product_uid: product_uid.clone(),
-                    name: product_uid,
-                    created_at: now_micros(),
-                })
-                .execute(&cx, &tracked)
-                .await,
+            let product = ensure_product(
+                &cx,
+                &pool,
+                Some(product_uid.as_str()),
+                Some(product_uid.as_str()),
             )
+            .await
             .into_result()
-            .expect("insert product");
+            .expect("ensure product");
+            let product_id = product.id.expect("product id");
 
-            let _ = map_sql_outcome(
-                insert!(&crate::models::ProductProjectLinkRow {
-                    id: None,
-                    product_id,
-                    project_id: project_a_id,
-                    created_at: now_micros(),
-                })
-                .execute(&cx, &tracked)
-                .await,
+            link_product_to_projects(&cx, &pool, product_id, &[project_a_id, project_b_id])
+                .await
+                .into_result()
+                .expect("link product to projects");
+
+            let sender_a = create_agent(
+                &cx,
+                &pool,
+                project_a_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("product search project A"),
+                Some("auto"),
             )
+            .await
             .into_result()
-            .expect("link product to project A");
+            .expect("create sender A");
+            let sender_a_id = sender_a.id.expect("sender A id");
 
-            let _ = map_sql_outcome(
-                insert!(&crate::models::ProductProjectLinkRow {
-                    id: None,
-                    product_id,
-                    project_id: project_b_id,
-                    created_at: now_micros(),
-                })
-                .execute(&cx, &tracked)
-                .await,
+            let sender_b = create_agent(
+                &cx,
+                &pool,
+                project_b_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("product search project B"),
+                Some("auto"),
             )
+            .await
             .into_result()
-            .expect("link product to project B");
-
-            let sender_a_id = map_sql_outcome(
-                insert!(&crate::models::AgentRow {
-                    id: None,
-                    project_id: project_a_id,
-                    name: "BlueLake".to_string(),
-                    program: "e2e-test".to_string(),
-                    model: "test-model".to_string(),
-                    task_description: "product search project A".to_string(),
-                    inception_ts: now_micros(),
-                    last_active_ts: now_micros(),
-                    attachments_policy: "auto".to_string(),
-                    contact_policy: "auto".to_string(),
-                })
-                .execute(&cx, &tracked)
-                .await,
-            )
-            .into_result()
-            .expect("insert sender A");
-
-            let sender_b_id = map_sql_outcome(
-                insert!(&crate::models::AgentRow {
-                    id: None,
-                    project_id: project_b_id,
-                    name: "BlueLake".to_string(),
-                    program: "e2e-test".to_string(),
-                    model: "test-model".to_string(),
-                    task_description: "product search project B".to_string(),
-                    inception_ts: now_micros(),
-                    last_active_ts: now_micros(),
-                    attachments_policy: "auto".to_string(),
-                    contact_policy: "auto".to_string(),
-                })
-                .execute(&cx, &tracked)
-                .await,
-            )
-            .into_result()
-            .expect("insert sender B");
-
-            drop(conn);
+            .expect("create sender B");
+            let sender_b_id = sender_b.id.expect("sender B id");
 
             create_message(
                 &cx,

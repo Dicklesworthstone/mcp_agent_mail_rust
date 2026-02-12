@@ -5,15 +5,16 @@
 //! and a conversation detail panel on the right showing chronological messages
 //! within the selected thread.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use ftui::layout::Rect;
-use ftui::text::{Line, Text};
+use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 
 use mcp_agent_mail_db::DbConn;
@@ -30,25 +31,70 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 /// Max threads to fetch.
 const MAX_THREADS: usize = 500;
 
-/// Max messages to show within a single thread detail.
-const MAX_THREAD_MESSAGES: usize = 200;
-
 /// Periodic refresh interval in seconds.
 const REFRESH_INTERVAL_SECS: u64 = 5;
 
 /// Default page size for thread pagination.
-/// Override via AM_TUI_THREAD_PAGE_SIZE environment variable.
+/// Override via `AM_TUI_THREAD_PAGE_SIZE` environment variable.
 const DEFAULT_THREAD_PAGE_SIZE: usize = 20;
 
 /// Number of older messages to load when clicking "Load older".
 const LOAD_OLDER_BATCH_SIZE: usize = 15;
 
+/// Color palette for deterministic per-agent coloring in thread cards.
+const AGENT_COLOR_PALETTE: [PackedRgba; 8] = [
+    PackedRgba::rgb(92, 201, 255),
+    PackedRgba::rgb(123, 214, 153),
+    PackedRgba::rgb(255, 184, 108),
+    PackedRgba::rgb(255, 122, 162),
+    PackedRgba::rgb(180, 166, 255),
+    PackedRgba::rgb(141, 222, 255),
+    PackedRgba::rgb(255, 219, 109),
+    PackedRgba::rgb(163, 229, 124),
+];
+
+fn parse_thread_page_size(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_THREAD_PAGE_SIZE)
+}
+
 /// Get the configured thread page size from environment or default.
 fn get_thread_page_size() -> usize {
-    std::env::var("AM_TUI_THREAD_PAGE_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_THREAD_PAGE_SIZE)
+    parse_thread_page_size(std::env::var("AM_TUI_THREAD_PAGE_SIZE").ok().as_deref())
+}
+
+/// Deterministically map an agent name to one of eight theme-safe colors.
+fn agent_color(name: &str) -> PackedRgba {
+    // FNV-1a 64-bit hash; deterministic and fast for tiny identifiers.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let palette_len_u64 = u64::try_from(AGENT_COLOR_PALETTE.len()).unwrap_or(1);
+    let idx_u64 = hash % palette_len_u64;
+    let idx = usize::try_from(idx_u64).unwrap_or(0);
+    AGENT_COLOR_PALETTE[idx]
+}
+
+fn iso_compact_time(iso: &str) -> &str {
+    if iso.len() >= 19 { &iso[11..19] } else { iso }
+}
+
+fn body_preview(body_md: &str, max_len: usize) -> String {
+    let mut compact = String::new();
+    for line in body_md.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !compact.is_empty() {
+            compact.push(' ');
+        }
+        compact.push_str(line);
+    }
+    if compact.is_empty() {
+        "(empty)".to_string()
+    } else {
+        truncate_str(&compact, max_len)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -72,8 +118,6 @@ struct ThreadSummary {
     velocity_msg_per_hr: f64,
     /// Participant names (comma-separated).
     participant_names: String,
-    /// First message timestamp (for velocity calculation).
-    first_timestamp_micros: i64,
     /// First message timestamp in ISO format (for time span display).
     first_timestamp_iso: String,
     /// Number of unread messages in this thread (if tracking is available).
@@ -179,6 +223,7 @@ enum Focus {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Thread Explorer screen: browse message threads with conversation view.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ThreadExplorerScreen {
     /// All threads sorted by last activity.
     threads: Vec<ThreadSummary>,
@@ -214,6 +259,10 @@ pub struct ThreadExplorerScreen {
     total_thread_messages: usize,
     /// How many messages are currently loaded (pagination offset).
     loaded_message_count: usize,
+    /// Selected message card in the detail pane.
+    detail_cursor: usize,
+    /// Expanded message card IDs.
+    expanded_message_ids: HashSet<i64>,
     /// Page size for pagination.
     page_size: usize,
     /// Whether "Load older" button is selected (when at scroll 0).
@@ -241,6 +290,8 @@ impl ThreadExplorerScreen {
             focused_synthetic: None,
             total_thread_messages: 0,
             loaded_message_count: 0,
+            detail_cursor: 0,
+            expanded_message_ids: HashSet::new(),
             page_size: get_thread_page_size(),
             load_older_selected: false,
         }
@@ -344,6 +395,8 @@ impl ThreadExplorerScreen {
             self.detail_scroll = 0;
             self.total_thread_messages = 0;
             self.loaded_message_count = 0;
+            self.detail_cursor = 0;
+            self.expanded_message_ids.clear();
             self.load_older_selected = false;
             return;
         }
@@ -361,7 +414,12 @@ impl ThreadExplorerScreen {
         self.detail_messages = messages;
         self.loaded_message_count = self.detail_messages.len();
         self.loaded_thread_id = current_thread_id.to_string();
-        self.detail_scroll = 0;
+        self.detail_cursor = self.detail_messages.len().saturating_sub(1);
+        self.detail_scroll = self.detail_cursor.saturating_sub(3);
+        self.expanded_message_ids.clear();
+        if let Some(last) = self.detail_messages.last() {
+            self.expanded_message_ids.insert(last.id);
+        }
         self.load_older_selected = false;
         // If there are older messages to load, note the offset
         let _ = offset; // offset is 0 for initial load
@@ -392,6 +450,7 @@ impl ThreadExplorerScreen {
         let (older_messages, _) =
             fetch_thread_messages_paginated(conn, &self.loaded_thread_id, batch, new_offset);
 
+        let added = older_messages.len();
         if older_messages.is_empty() {
             return;
         }
@@ -400,23 +459,46 @@ impl ThreadExplorerScreen {
         let mut new_messages = older_messages;
         new_messages.append(&mut self.detail_messages);
         self.detail_messages = new_messages;
-        self.loaded_message_count += batch;
+        self.loaded_message_count += added;
 
-        // Adjust scroll to keep the same content visible
-        // (the new messages were prepended, so add their line count to scroll)
-        self.detail_scroll += batch * 4; // rough estimate: ~4 lines per message
+        // Maintain selection on the same logical message after prepending.
+        if !self.load_older_selected {
+            self.detail_cursor = self.detail_cursor.saturating_add(added);
+            self.detail_scroll = self.detail_scroll.saturating_add(added);
+        }
         self.load_older_selected = false;
     }
 
     /// Check if there are more older messages to load.
-    fn has_older_messages(&self) -> bool {
+    const fn has_older_messages(&self) -> bool {
         self.loaded_message_count < self.total_thread_messages
     }
 
     /// Get the count of remaining older messages.
-    fn remaining_older_count(&self) -> usize {
+    const fn remaining_older_count(&self) -> usize {
         self.total_thread_messages
             .saturating_sub(self.loaded_message_count)
+    }
+
+    const fn sync_scroll_to_cursor(&mut self) {
+        self.detail_scroll = self.detail_cursor.saturating_sub(3);
+    }
+
+    fn toggle_selected_expansion(&mut self) {
+        let Some(msg) = self.detail_messages.get(self.detail_cursor) else {
+            return;
+        };
+        if !self.expanded_message_ids.remove(&msg.id) {
+            self.expanded_message_ids.insert(msg.id);
+        }
+    }
+
+    fn expand_all(&mut self) {
+        self.expanded_message_ids = self.detail_messages.iter().map(|m| m.id).collect();
+    }
+
+    fn collapse_all(&mut self) {
+        self.expanded_message_ids.clear();
     }
 }
 
@@ -538,66 +620,83 @@ impl MailScreen for ThreadExplorerScreen {
                                 self.focus = Focus::ThreadList;
                                 self.load_older_selected = false;
                             }
-                            // Scroll detail / navigate load-older button
+                            // Navigate message cards / load-older button
                             KeyCode::Char('j') | KeyCode::Down => {
                                 if self.load_older_selected {
                                     // Move from load-older button into message list
                                     self.load_older_selected = false;
+                                } else if self.detail_cursor + 1 < self.detail_messages.len() {
+                                    self.detail_cursor += 1;
+                                    self.sync_scroll_to_cursor();
                                 } else {
-                                    self.detail_scroll += 1;
+                                    self.sync_scroll_to_cursor();
                                 }
                             }
                             KeyCode::Char('k') | KeyCode::Up => {
-                                if self.detail_scroll == 0 && self.has_older_messages() {
+                                if self.detail_cursor == 0 && self.has_older_messages() {
                                     // At top and there are older messages, select the load button
                                     self.load_older_selected = true;
                                 } else if !self.load_older_selected {
-                                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                                    self.detail_cursor = self.detail_cursor.saturating_sub(1);
+                                    self.sync_scroll_to_cursor();
                                 }
                             }
                             KeyCode::Char('d') | KeyCode::PageDown => {
                                 self.load_older_selected = false;
-                                self.detail_scroll += 20;
+                                if !self.detail_messages.is_empty() {
+                                    let step = 10usize;
+                                    self.detail_cursor = (self.detail_cursor + step)
+                                        .min(self.detail_messages.len().saturating_sub(1));
+                                    self.sync_scroll_to_cursor();
+                                }
                             }
                             KeyCode::Char('u') | KeyCode::PageUp => {
                                 self.load_older_selected = false;
-                                if self.detail_scroll < 20 && self.has_older_messages() {
+                                if self.detail_cursor < 10 && self.has_older_messages() {
                                     // Near top with older messages available
+                                    self.detail_cursor = 0;
                                     self.detail_scroll = 0;
                                     self.load_older_selected = true;
                                 } else {
-                                    self.detail_scroll = self.detail_scroll.saturating_sub(20);
+                                    self.detail_cursor = self.detail_cursor.saturating_sub(10);
+                                    self.sync_scroll_to_cursor();
                                 }
                             }
                             KeyCode::Char('G') | KeyCode::End => {
-                                // Jump to bottom of detail
+                                // Jump to newest message card.
                                 self.load_older_selected = false;
-                                self.detail_scroll = self.detail_messages.len().saturating_mul(10); // generous upper bound
+                                self.detail_cursor = self.detail_messages.len().saturating_sub(1);
+                                self.sync_scroll_to_cursor();
                             }
                             KeyCode::Char('g') | KeyCode::Home => {
-                                // Jump to top; if there are older messages, select load button
+                                // Jump to oldest loaded card; if there are older messages,
+                                // focus the load button instead.
+                                self.detail_cursor = 0;
                                 self.detail_scroll = 0;
                                 if self.has_older_messages() {
                                     self.load_older_selected = true;
                                 }
                             }
-                            // Enter: load older messages if button selected, else deep-link
-                            KeyCode::Enter => {
+                            // Enter/Space: load older if selected, otherwise toggle card expansion.
+                            KeyCode::Enter | KeyCode::Char(' ') => {
                                 if self.load_older_selected && self.has_older_messages() {
                                     self.load_older_messages();
                                     return Cmd::None;
                                 }
-                                if let Some(msg) = self.detail_messages.first() {
-                                    return Cmd::msg(MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::MessageById(msg.id),
-                                    ));
-                                }
+                                self.toggle_selected_expansion();
                             }
                             // 'o' key: quick load older messages
                             KeyCode::Char('o') => {
                                 if self.has_older_messages() {
                                     self.load_older_messages();
                                 }
+                            }
+                            // Expand/collapse all loaded message cards.
+                            KeyCode::Char('e') => {
+                                self.expand_all();
+                            }
+                            KeyCode::Char('c') => {
+                                self.collapse_all();
                             }
                             // Deep-link: jump to timeline at thread last activity.
                             KeyCode::Char('t') => {
@@ -716,6 +815,13 @@ impl MailScreen for ThreadExplorerScreen {
                 &self.detail_messages,
                 self.threads.get(self.cursor),
                 self.detail_scroll,
+                self.detail_cursor,
+                &self.expanded_message_ids,
+                self.has_older_messages(),
+                self.remaining_older_count(),
+                self.loaded_message_count,
+                self.total_thread_messages,
+                self.load_older_selected,
                 matches!(self.focus, Focus::DetailPanel),
             );
         } else {
@@ -739,6 +845,13 @@ impl MailScreen for ThreadExplorerScreen {
                         &self.detail_messages,
                         self.threads.get(self.cursor),
                         self.detail_scroll,
+                        self.detail_cursor,
+                        &self.expanded_message_ids,
+                        self.has_older_messages(),
+                        self.remaining_older_count(),
+                        self.loaded_message_count,
+                        self.total_thread_messages,
+                        self.load_older_selected,
                         true,
                     );
                 }
@@ -763,6 +876,18 @@ impl MailScreen for ThreadExplorerScreen {
             HelpEntry {
                 key: "Enter/l",
                 action: "Open thread detail",
+            },
+            HelpEntry {
+                key: "Enter/Space",
+                action: "Toggle message expansion",
+            },
+            HelpEntry {
+                key: "e / c",
+                action: "Expand all / collapse all",
+            },
+            HelpEntry {
+                key: "o",
+                action: "Load older messages",
             },
             HelpEntry {
                 key: "t",
@@ -889,7 +1014,6 @@ fn fetch_threads(conn: &DbConn, filter: &str, limit: usize) -> Vec<ThreadSummary
                     .get_named::<String>("participant_names")
                     .ok()
                     .unwrap_or_default(),
-                first_timestamp_micros: first_ts,
                 first_timestamp_iso: micros_to_iso(first_ts),
                 unread_count: 0, // Will be updated if read tracking is available
             })
@@ -936,8 +1060,9 @@ fn fetch_thread_message_count(conn: &DbConn, thread_id: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Fetch messages in a thread with pagination, returning most recent first for offset calculation.
-/// Returns (messages_in_chronological_order, offset_used).
+/// Fetch messages in a thread with pagination, returning most recent first for
+/// offset calculation.
+/// Returns (`messages_in_chronological_order`, `offset_used`).
 fn fetch_thread_messages_paginated(
     conn: &DbConn,
     thread_id: &str,
@@ -1141,12 +1266,20 @@ fn render_thread_list(
 }
 
 /// Render the thread detail/conversation panel.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_thread_detail(
     frame: &mut Frame<'_>,
     area: Rect,
     messages: &[ThreadMessage],
     thread: Option<&ThreadSummary>,
     scroll: usize,
+    selected_idx: usize,
+    expanded_message_ids: &HashSet<i64>,
+    has_older_messages: bool,
+    remaining_older_count: usize,
+    loaded_message_count: usize,
+    total_thread_messages: usize,
+    load_older_selected: bool,
     focused: bool,
 ) {
     let title = thread.map_or_else(
@@ -1181,59 +1314,116 @@ fn render_thread_detail(
         return;
     }
 
-    // Build conversation view: each message as a "chat bubble"
     let body_width = inner.width as usize;
     let md_theme = ftui_extras::markdown::MarkdownTheme::default();
     let mut styled_lines: Vec<Line> = Vec::new();
 
+    // Metadata header.
+    if let Some(t) = thread {
+        styled_lines.push(Line::raw(format!(
+            "Thread: {}  |  Loaded: {}/{}  |  Unread: {}",
+            truncate_str(&t.thread_id, body_width.saturating_sub(34)),
+            loaded_message_count,
+            total_thread_messages,
+            t.unread_count,
+        )));
+        styled_lines.push(Line::raw(format!(
+            "Participants ({})  |  {} -> {}",
+            t.participant_count,
+            iso_compact_time(&t.first_timestamp_iso),
+            iso_compact_time(&t.last_timestamp_iso),
+        )));
+        if !t.participant_names.is_empty() {
+            let mut spans: Vec<Span<'static>> = vec![Span::raw("Agents: ".to_string())];
+            for (idx, name) in t
+                .participant_names
+                .split(", ")
+                .filter(|n| !n.is_empty())
+                .enumerate()
+            {
+                if idx > 0 {
+                    spans.push(Span::raw(", ".to_string()));
+                }
+                spans.push(Span::styled(
+                    name.to_string(),
+                    Style::default().fg(agent_color(name)).bold(),
+                ));
+            }
+            styled_lines.push(Line::from_spans(spans));
+        }
+        styled_lines.push(Line::raw(String::new()));
+    }
+
+    if has_older_messages {
+        let marker = if load_older_selected && focused {
+            ">"
+        } else {
+            " "
+        };
+        styled_lines.push(Line::raw(format!(
+            "{marker} [Load {remaining_older_count} older messages] (Enter/o)"
+        )));
+        styled_lines.push(Line::raw(String::new()));
+    }
+
+    // Build conversation cards.
     for (i, msg) in messages.iter().enumerate() {
         if i > 0 {
-            styled_lines.push(Line::raw("")); // Separator between messages
+            styled_lines.push(Line::raw(String::new()));
         }
 
-        // Header line: sender → recipients, timestamp
-        let importance_badge = match msg.importance.as_str() {
-            "high" => " [!]",
-            "urgent" => " [!!]",
-            _ => "",
-        };
+        let selected = focused && !load_older_selected && i == selected_idx;
+        let marker = if selected { ">" } else { " " };
+        let expanded = expanded_message_ids.contains(&msg.id);
+        let toggle = if expanded { "[-]" } else { "[+]" };
+        let border = "─".repeat(body_width.saturating_sub(2).max(1));
 
-        // Compact timestamp
-        let time_short = if msg.timestamp_iso.len() >= 19 {
-            &msg.timestamp_iso[11..19]
-        } else {
-            &msg.timestamp_iso
-        };
+        styled_lines.push(Line::raw(format!("{marker}┌{border}")));
 
-        let to_display = if msg.to_agents.is_empty() {
-            String::new()
-        } else {
-            format!(" -> {}", msg.to_agents)
-        };
+        let sender_style = Style::default().fg(agent_color(&msg.from_agent)).bold();
+        let mut header_spans: Vec<Span<'static>> = vec![
+            Span::raw(format!("{marker}│ {toggle} #{} ", msg.id)),
+            Span::styled(msg.from_agent.clone(), sender_style),
+        ];
 
-        let header = format!(
-            "[#{id}] {sender}{to}{badge} ({time})",
-            id = msg.id,
-            sender = msg.from_agent,
-            to = to_display,
-            badge = importance_badge,
-            time = time_short,
-        );
-        styled_lines.push(Line::raw(truncate_str(&header, body_width)));
+        if !msg.to_agents.is_empty() {
+            header_spans.push(Span::raw(format!(
+                " -> {}",
+                truncate_str(&msg.to_agents, 26)
+            )));
+        }
+        if msg.importance == "high" || msg.importance == "urgent" {
+            header_spans.push(Span::raw(format!(
+                " [{}]",
+                msg.importance.to_ascii_uppercase()
+            )));
+        }
+        header_spans.push(Span::raw(format!(
+            " @ {}",
+            iso_compact_time(&msg.timestamp_iso)
+        )));
+        styled_lines.push(Line::from_spans(header_spans));
 
-        // Subject (if different from thread_id)
         if !msg.subject.is_empty() {
             styled_lines.push(Line::raw(format!(
-                "  Subj: {}",
+                "{marker}│ Subj: {}",
                 truncate_str(&msg.subject, body_width.saturating_sub(8))
             )));
         }
 
-        // Body (rendered with GFM markdown support)
-        let body_text = crate::tui_markdown::render_body(&msg.body_md, &md_theme);
-        for line in body_text.lines() {
-            styled_lines.push(line.clone());
+        if expanded {
+            let body_text = crate::tui_markdown::render_body(&msg.body_md, &md_theme);
+            for line in body_text.lines() {
+                styled_lines.push(line.clone());
+            }
+        } else {
+            styled_lines.push(Line::raw(format!(
+                "{marker}│ {}",
+                body_preview(&msg.body_md, body_width.saturating_sub(4))
+            )));
         }
+
+        styled_lines.push(Line::raw(format!("{marker}└{border}")));
     }
 
     // Apply scroll offset
@@ -1284,6 +1474,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftui_harness::buffer_to_text;
 
     // ── Construction ────────────────────────────────────────────────
 
@@ -1432,26 +1623,68 @@ mod tests {
         assert_eq!(screen.cursor, 0);
     }
 
-    // ── Detail scroll ───────────────────────────────────────────────
+    // ── Detail card navigation + expansion ─────────────────────────
 
     #[test]
-    fn detail_scroll_in_detail_pane() {
+    fn detail_cursor_moves_in_detail_pane() {
         let mut screen = ThreadExplorerScreen::new();
         screen.focus = Focus::DetailPanel;
         screen.detail_messages.push(make_message(1));
+        screen.detail_messages.push(make_message(2));
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
         let j = Event::Key(ftui::KeyEvent::new(KeyCode::Char('j')));
         screen.update(&j, &state);
-        assert_eq!(screen.detail_scroll, 1);
+        assert_eq!(screen.detail_cursor, 1);
 
         let k = Event::Key(ftui::KeyEvent::new(KeyCode::Char('k')));
         screen.update(&k, &state);
-        assert_eq!(screen.detail_scroll, 0);
+        assert_eq!(screen.detail_cursor, 0);
 
         // Can't go below 0
         screen.update(&k, &state);
-        assert_eq!(screen.detail_scroll, 0);
+        assert_eq!(screen.detail_cursor, 0);
+    }
+
+    #[test]
+    fn enter_and_space_toggle_selected_message_expansion() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.focus = Focus::DetailPanel;
+        screen.detail_messages.push(make_message(1));
+        screen.detail_messages.push(make_message(2));
+        screen.detail_cursor = 1;
+        screen.expanded_message_ids.insert(2);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        // Enter collapses selected card.
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        screen.update(&enter, &state);
+        assert!(!screen.expanded_message_ids.contains(&2));
+
+        // Space expands it again.
+        let space = Event::Key(ftui::KeyEvent::new(KeyCode::Char(' ')));
+        screen.update(&space, &state);
+        assert!(screen.expanded_message_ids.contains(&2));
+    }
+
+    #[test]
+    fn e_and_c_expand_and_collapse_all_cards() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.focus = Focus::DetailPanel;
+        for id in 1..=4 {
+            screen.detail_messages.push(make_message(id));
+        }
+        // Start with a partial expansion set.
+        screen.expanded_message_ids.insert(4);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let expand_all = Event::Key(ftui::KeyEvent::new(KeyCode::Char('e')));
+        screen.update(&expand_all, &state);
+        assert_eq!(screen.expanded_message_ids.len(), 4);
+
+        let collapse_all = Event::Key(ftui::KeyEvent::new(KeyCode::Char('c')));
+        screen.update(&collapse_all, &state);
+        assert!(screen.expanded_message_ids.is_empty());
     }
 
     // ── Filter editing ──────────────────────────────────────────────
@@ -1614,6 +1847,46 @@ mod tests {
     }
 
     #[test]
+    fn metadata_header_shows_participant_count_and_names() {
+        let mut thread = make_thread("thread-meta", 12, 3);
+        thread.participant_names = "Alpha, Beta, Gamma".to_string();
+        thread.unread_count = 3;
+
+        let messages = vec![make_message(1)];
+        let expanded: HashSet<i64> = HashSet::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 24, &mut pool);
+
+        render_thread_detail(
+            &mut frame,
+            Rect::new(0, 0, 120, 24),
+            &messages,
+            Some(&thread),
+            0,
+            0,
+            &expanded,
+            false,
+            0,
+            12,
+            12,
+            false,
+            true,
+        );
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Participants (3)"),
+            "missing participant count: {text}"
+        );
+        assert!(
+            text.contains("Agents: Alpha"),
+            "missing first participant: {text}"
+        );
+        assert!(text.contains("Beta"), "missing second participant: {text}");
+        assert!(text.contains("Gamma"), "missing third participant: {text}");
+    }
+
+    #[test]
     fn render_narrow_screen_no_panic() {
         let screen = ThreadExplorerScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
@@ -1719,7 +1992,85 @@ mod tests {
         assert_eq!(screen.cursor, 0);
     }
 
+    #[test]
+    fn paginated_fetch_respects_offset_for_older_messages() {
+        let conn = make_thread_messages_db("thread-paged", 25);
+
+        let (recent, recent_offset) = fetch_thread_messages_paginated(&conn, "thread-paged", 20, 0);
+        assert_eq!(recent_offset, 0);
+        assert_eq!(recent.len(), 20);
+        assert_eq!(recent.first().map(|m| m.id), Some(6));
+        assert_eq!(recent.last().map(|m| m.id), Some(25));
+
+        let (older, older_offset) = fetch_thread_messages_paginated(&conn, "thread-paged", 15, 20);
+        assert_eq!(older_offset, 20);
+        assert_eq!(older.len(), 5);
+        assert_eq!(older.first().map(|m| m.id), Some(1));
+        assert_eq!(older.last().map(|m| m.id), Some(5));
+    }
+
+    #[test]
+    fn parse_thread_page_size_honors_valid_override() {
+        assert_eq!(parse_thread_page_size(Some("7")), 7);
+        assert_eq!(parse_thread_page_size(Some(" 42 ")), 42);
+    }
+
+    #[test]
+    fn parse_thread_page_size_falls_back_to_default() {
+        assert_eq!(parse_thread_page_size(None), DEFAULT_THREAD_PAGE_SIZE);
+        assert_eq!(
+            parse_thread_page_size(Some("not-a-number")),
+            DEFAULT_THREAD_PAGE_SIZE
+        );
+        assert_eq!(parse_thread_page_size(Some("0")), DEFAULT_THREAD_PAGE_SIZE);
+    }
+
     // ── Test helpers ────────────────────────────────────────────────
+
+    fn make_thread_messages_db(thread_id: &str, count: usize) -> DbConn {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create agents table");
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+               id INTEGER PRIMARY KEY, \
+               subject TEXT NOT NULL, \
+               body_md TEXT NOT NULL, \
+               importance TEXT NOT NULL, \
+               created_ts INTEGER NOT NULL, \
+               sender_id INTEGER NOT NULL, \
+               thread_id TEXT NOT NULL\
+             )",
+        )
+        .expect("create messages table");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (\
+               message_id INTEGER NOT NULL, \
+               agent_id INTEGER NOT NULL\
+             )",
+        )
+        .expect("create recipients table");
+        conn.execute_raw("INSERT INTO agents (id, name) VALUES (1, 'Sender'), (2, 'Receiver')")
+            .expect("seed agents");
+
+        for idx in 1..=count {
+            let id = i64::try_from(idx).expect("idx fits i64");
+            let created_ts = 1_700_000_000_000_000_i64 + (id * 1_000_000_i64);
+            let insert_message = format!(
+                "INSERT INTO messages (id, subject, body_md, importance, created_ts, sender_id, thread_id) \
+                 VALUES ({id}, 'Subject {id}', 'Body {id}', 'normal', {created_ts}, 1, '{}')",
+                thread_id.replace('\'', "''")
+            );
+            conn.execute_raw(&insert_message)
+                .expect("insert thread message");
+            let insert_recipient =
+                format!("INSERT INTO message_recipients (message_id, agent_id) VALUES ({id}, 2)");
+            conn.execute_raw(&insert_recipient)
+                .expect("insert message recipient");
+        }
+
+        conn
+    }
 
     fn make_thread(id: &str, msg_count: usize, participant_count: usize) -> ThreadSummary {
         ThreadSummary {
@@ -1735,7 +2086,6 @@ mod tests {
             #[allow(clippy::cast_precision_loss)]
             velocity_msg_per_hr: msg_count as f64 / 2.0,
             participant_names: "GoldFox,SilverWolf".to_string(),
-            first_timestamp_micros: 1_699_993_600_000_000,
             first_timestamp_iso: "2026-02-06T10:00:00Z".to_string(),
             unread_count: 0,
         }
@@ -1898,6 +2248,17 @@ mod tests {
         assert!(bindings.iter().any(|b| b.key == "s"));
         assert!(bindings.iter().any(|b| b.key == "v"));
         assert!(bindings.iter().any(|b| b.key == "t"));
+        assert!(bindings.iter().any(|b| b.key == "Enter/Space"));
+        assert!(bindings.iter().any(|b| b.key == "e / c"));
+    }
+
+    #[test]
+    fn agent_color_is_deterministic() {
+        let a = agent_color("CopperCastle");
+        let b = agent_color("CopperCastle");
+        let c = agent_color("FrostyCompass");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     fn make_message(id: i64) -> ThreadMessage {

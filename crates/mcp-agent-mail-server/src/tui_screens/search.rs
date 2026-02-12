@@ -8,7 +8,7 @@ use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
-use ftui::widgets::borders::BorderType;
+use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
@@ -50,12 +50,16 @@ const MAX_SNIPPET_CHARS: usize = 180;
 const MAX_HIGHLIGHT_TERMS: usize = 8;
 
 /// Minimum title width required before we show a snippet in the results list.
+#[allow(dead_code)]
 const RESULTS_MIN_TITLE_CHARS: usize = 18;
 /// Minimum snippet width required before we show it in the results list.
+#[allow(dead_code)]
 const RESULTS_MIN_SNIPPET_CHARS: usize = 18;
 /// Max chars allocated to the snippet column in the results list.
+#[allow(dead_code)]
 const RESULTS_MAX_SNIPPET_CHARS_IN_LIST: usize = 60;
 /// Separator between title and snippet in the results list.
+#[allow(dead_code)]
 const RESULTS_SNIPPET_SEP: &str = " | ";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1589,9 +1593,6 @@ impl MailScreen for SearchCockpitScreen {
 
         // Render query bar
         render_query_bar(frame, query_area, &self.query_input, self);
-        if self.query_help_visible {
-            render_query_help_popup(frame, area, query_area);
-        }
 
         // Body: facet rail (left) + results + detail (right)
         let facet_w: u16 = if area.width >= 100 { 20 } else { 16 };
@@ -1651,6 +1652,11 @@ impl MailScreen for SearchCockpitScreen {
                 &self.highlight_terms,
                 self.sort_direction,
             );
+        }
+
+        // Render query help popup LAST so it appears on top of body content
+        if self.query_help_visible {
+            render_query_help_popup(frame, area, query_area);
         }
     }
 
@@ -2015,12 +2021,14 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
     }
 
     let x = area.x + 1;
-    let desired_y = query_area.y + query_area.height.saturating_sub(1);
+    // Position popup just below the query area (not overlapping)
+    let desired_y = query_area.y + query_area.height;
     let max_y = area.y + area.height.saturating_sub(height);
     let y = desired_y.min(max_y);
     let popup_area = Rect::new(x, y, width, height);
 
     let block = Block::default()
+        .borders(Borders::ALL)
         .title("Query Syntax Help")
         .border_type(BorderType::Rounded)
         .style(Style::default().fg(FACET_LABEL_FG).bg(QUERY_HELP_BG));
@@ -2137,6 +2145,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
     }
 }
 
+#[allow(dead_code)]
 fn created_time_hms(created_ts: Option<i64>) -> String {
     created_ts
         .map(|ts| {
@@ -2150,6 +2159,7 @@ fn created_time_hms(created_ts: Option<i64>) -> String {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct ResultListRenderCfg<'a> {
     width: usize,
@@ -2161,6 +2171,7 @@ struct ResultListRenderCfg<'a> {
     highlight_style: Style,
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_lines)]
 fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRenderCfg<'_>) -> Line {
     let marker = if is_cursor { '>' } else { ' ' };
@@ -2450,6 +2461,7 @@ fn render_action_bar(frame: &mut Frame<'_>, area: Rect, entry: &ResultEntry) {
 }
 
 /// Compute a centered viewport range for scrolling.
+#[allow(dead_code)]
 fn viewport_range(total: usize, visible: usize, cursor: usize) -> (usize, usize) {
     if total <= visible {
         return (0, total);

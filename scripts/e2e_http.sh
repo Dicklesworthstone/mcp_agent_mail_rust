@@ -61,6 +61,8 @@ http_request() {
     local url="$3"
     shift 3
 
+    e2e_mark_case_start "${case_id}"
+
     local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
@@ -99,36 +101,33 @@ http_post_json() {
     local payload="$3"
     shift 3
 
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local request_file="${E2E_ARTIFACT_DIR}/${case_id}_request.json"
     local headers_file="${E2E_ARTIFACT_DIR}/${case_id}_headers.txt"
     local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.json"
     local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local timing_file="${E2E_ARTIFACT_DIR}/${case_id}_timing.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
 
-    e2e_save_artifact "${case_id}_request.json" "${payload}"
+    e2e_mark_case_start "${case_id}"
 
-    local args=(
-        -sS
-        -D "${headers_file}"
-        -o "${body_file}"
-        -w "%{http_code}"
-        -X POST
-        "${url}"
-        -H "content-type: application/json"
-        --data "${payload}"
-    )
-    for h in "$@"; do
-        args+=(-H "$h")
-    done
+    # Use shared RPC capture helper, then mirror legacy flat filenames for
+    # existing assertions in this suite.
+    if ! e2e_rpc_call_raw "${case_id}" "${url}" "${payload}" "$@"; then
+        :
+    fi
 
-    set +e
+    cp "${case_dir}/request.json" "${request_file}" 2>/dev/null || e2e_save_artifact "${case_id}_request.json" "${payload}"
+    cp "${case_dir}/headers.txt" "${headers_file}" 2>/dev/null || true
+    cp "${case_dir}/response.json" "${body_file}" 2>/dev/null || true
+    cp "${case_dir}/status.txt" "${status_file}" 2>/dev/null || true
+    cp "${case_dir}/timing.txt" "${timing_file}" 2>/dev/null || true
+    cp "${case_dir}/curl_stderr.txt" "${curl_stderr_file}" 2>/dev/null || true
+
     local status
-    status="$(curl "${args[@]}" 2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-
-    echo "${status}" > "${status_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fatal "${case_id}: curl failed rc=${rc}"
+    status="$(cat "${status_file}" 2>/dev/null || echo "")"
+    if [ -z "${status}" ] || [ "${status}" = "000" ]; then
+        e2e_fatal "${case_id}: curl failed (status=${status:-missing})"
     fi
 }
 

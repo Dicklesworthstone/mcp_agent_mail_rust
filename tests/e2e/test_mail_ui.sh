@@ -201,49 +201,39 @@ rpc_call() {
     local tool_name="$2"
     local args_json="$3"
 
+    local helper_case="seed_${case_id}"
+    local case_dir="${E2E_ARTIFACT_DIR}/${helper_case}"
+    local request_file="${E2E_ARTIFACT_DIR}/seed_${case_id}_request.json"
     local headers_file="${E2E_ARTIFACT_DIR}/seed_${case_id}_headers.txt"
     local body_file="${E2E_ARTIFACT_DIR}/seed_${case_id}_body.json"
     local status_file="${E2E_ARTIFACT_DIR}/seed_${case_id}_status.txt"
+    local timing_file="${E2E_ARTIFACT_DIR}/seed_${case_id}_timing.txt"
     local curl_stderr_file="${E2E_ARTIFACT_DIR}/seed_${case_id}_curl_stderr.txt"
 
-    local payload
-    payload="$(python3 -c "
-import json, sys
-tool = sys.argv[1]
-args = json.loads(sys.argv[2])
-print(json.dumps({
-  'jsonrpc': '2.0',
-  'method': 'tools/call',
-  'id': 1,
-  'params': { 'name': tool, 'arguments': args }
-}))
-" "$tool_name" "$args_json")"
+    e2e_mark_case_start "${helper_case}"
+    if ! e2e_rpc_call "${helper_case}" "${API_URL}" "${tool_name}" "${args_json}" "authorization: Bearer ${TOKEN}"; then
+        :
+    fi
 
-    e2e_save_artifact "seed_${case_id}_request.json" "$payload"
+    cp "${case_dir}/request.json" "${request_file}" 2>/dev/null || true
+    cp "${case_dir}/headers.txt" "${headers_file}" 2>/dev/null || true
+    cp "${case_dir}/response.json" "${body_file}" 2>/dev/null || true
+    cp "${case_dir}/status.txt" "${status_file}" 2>/dev/null || true
+    cp "${case_dir}/timing.txt" "${timing_file}" 2>/dev/null || true
+    cp "${case_dir}/curl_stderr.txt" "${curl_stderr_file}" 2>/dev/null || true
 
-    local start_ns end_ns elapsed_ms
-    start_ns="$(date +%s%N)"
-    set +e
-    local status
-    status="$(curl -sS -D "${headers_file}" -o "${body_file}" -w "%{http_code}" \
-        -X POST "${API_URL}" \
-        -H "content-type: application/json" \
-        -H "authorization: Bearer ${TOKEN}" \
-        --data "${payload}" \
-        2>"${curl_stderr_file}")"
-    local rc=$?
-    set -e
-    end_ns="$(date +%s%N)"
-    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+    local status rc elapsed_ms
+    status="$(cat "${status_file}" 2>/dev/null || echo "000")"
+    elapsed_ms="$(cat "${timing_file}" 2>/dev/null || echo "0")"
+    rc=0
+    if [ "${status}" = "000" ]; then
+        rc=1
+    fi
 
-    echo "${status}" > "${status_file}"
     append_network_trace \
         "${case_id}" "mcp_rpc" "POST" "${API_URL}" "${status}" "200" "bearer_valid" "${rc}" "${elapsed_ms}" \
         "${headers_file}" "${body_file}" "${curl_stderr_file}"
-    if [ "$rc" -ne 0 ]; then
-        e2e_fail "seed_${case_id}: curl failed rc=${rc}"
-        return 1
-    fi
+
     if [ "${status}" != "200" ]; then
         e2e_fail "seed_${case_id}: unexpected HTTP status ${status}"
         return 1

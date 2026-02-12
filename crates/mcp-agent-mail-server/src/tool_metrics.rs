@@ -128,6 +128,7 @@ mod tests {
     use super::*;
     use mcp_agent_mail_tools::{
         record_call, record_error, record_latency, reset_tool_latencies, reset_tool_metrics,
+        slow_tools,
     };
 
     static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -228,9 +229,35 @@ mod tests {
             .iter()
             .find(|e| e.name == "send_message")
             .expect("send_message present after reset");
+        assert_eq!(
+            after_entry.calls, 1,
+            "call counters should remain after latency reset"
+        );
         assert!(
             after_entry.latency.is_none(),
             "latency histogram should be cleared while call count remains"
+        );
+    }
+
+    #[test]
+    fn slow_tools_only_reports_tools_above_threshold() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_tool_metrics();
+
+        record_call("health_check");
+        record_latency("health_check", 200_000); // 200ms
+
+        record_call("send_message");
+        record_latency("send_message", 800_000); // 800ms
+
+        let slow = slow_tools();
+        assert!(
+            slow.iter().any(|e| e.name == "send_message"),
+            "send_message should be flagged as slow"
+        );
+        assert!(
+            !slow.iter().any(|e| e.name == "health_check"),
+            "health_check should not be flagged as slow"
         );
     }
 

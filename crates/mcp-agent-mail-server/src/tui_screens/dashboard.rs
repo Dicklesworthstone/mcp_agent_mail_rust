@@ -835,7 +835,11 @@ fn summarize_recipients(recipients: &[String]) -> String {
 /// Render the summary band using `MetricTile` widgets.
 ///
 /// Adapts tile count to terminal density: 3 tiles at Minimal/Compact, up to 6 at Detailed.
-#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    clippy::too_many_lines
+)]
 fn render_summary_band(
     frame: &mut Frame<'_>,
     area: Rect,

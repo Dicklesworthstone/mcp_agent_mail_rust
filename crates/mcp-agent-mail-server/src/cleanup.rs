@@ -434,6 +434,12 @@ mod tests {
         assert!(collect_matching_paths(fake, "*.rs").is_empty());
     }
 
+    #[test]
+    fn collect_matching_invalid_glob_pattern_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(collect_matching_paths(tmp.path(), "[unterminated").is_empty());
+    }
+
     fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
         // NOTE: These tests are currently blocked by a FrankenSQLite limitation.
         // FrankenConnection cannot properly read schemas created by SqliteConnection,
@@ -476,7 +482,7 @@ mod tests {
                 &cx,
                 &pool,
                 project_id,
-                "GreenDuck",
+                "GreenLake",
                 "test",
                 "test",
                 None,
@@ -626,6 +632,64 @@ mod tests {
 
         let now = now_micros();
         assert!(!check_git_activity(tmp.path(), "file.rs", now, 1_000_000));
+    }
+
+    #[test]
+    fn check_git_activity_detects_recent_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let file = repo.join("tracked.rs");
+        std::fs::write(&file, "fn tracked() {}\n").unwrap();
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("init")
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.email", "cleanup-test@example.com"])
+            .status()
+            .expect("git config user.email should run");
+        assert!(status.success(), "git config user.email should succeed");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.name", "Cleanup Test"])
+            .status()
+            .expect("git config user.name should run");
+        assert!(status.success(), "git config user.name should succeed");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "tracked.rs"])
+            .status()
+            .expect("git add should run");
+        assert!(status.success(), "git add should succeed");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["commit", "-m", "seed commit"])
+            .status()
+            .expect("git commit should run");
+        assert!(status.success(), "git commit should succeed");
+
+        let now = now_micros();
+        assert!(
+            check_git_activity(repo, "tracked.rs", now, 120_000_000),
+            "recently committed file should be treated as recently active"
+        );
+        assert!(
+            !check_git_activity(repo, "tracked.rs", now + 10_000_000_000, 1_000_000),
+            "old commit should fall outside a short grace window"
+        );
     }
 
     #[test]
