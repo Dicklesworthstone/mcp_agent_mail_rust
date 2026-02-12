@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bench;
+pub mod ci;
 pub mod context;
 pub mod output;
 pub mod robot;
@@ -73,6 +74,19 @@ pub enum Commands {
     },
     #[command(name = "serve-stdio")]
     ServeStdio,
+    /// Run CI quality gates (format, lint, build, test).
+    #[command(name = "ci")]
+    Ci {
+        /// Quick mode: skip long-running E2E gates.
+        #[arg(long, short = 'q')]
+        quick: bool,
+        /// Write JSON report to this path.
+        #[arg(long, short = 'r')]
+        report: Option<std::path::PathBuf>,
+        /// Output JSON to stdout instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
     Lint,
     Typecheck,
     #[command(name = "share")]
@@ -466,6 +480,9 @@ pub enum DeployCommand {
     /// Build a verification plan for a deployed URL.
     #[command(name = "verify")]
     VerifyUrl(DeployVerifyArgs),
+    /// Verify a live deployment (HTTP probes, content match, security audit).
+    #[command(name = "verify-live")]
+    VerifyLive(DeployVerifyLiveArgs),
 }
 
 #[derive(Args, Debug)]
@@ -490,6 +507,36 @@ pub struct DeployVerifyArgs {
     /// Output as JSON instead of human-readable table.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DeployVerifyLiveArgs {
+    /// Deployed URL to verify (e.g., `https://example.github.io/agent-mail`).
+    pub url: String,
+    /// Local bundle directory for content-match checks.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
+    /// Output JSON report instead of human-readable summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Promote warnings to errors for exit code.
+    #[arg(long)]
+    pub strict: bool,
+    /// Stop after first error-severity failure.
+    #[arg(long)]
+    pub fail_fast: bool,
+    /// Run security header audit (Stage 3).
+    #[arg(long)]
+    pub security: bool,
+    /// Per-request timeout in milliseconds.
+    #[arg(long, default_value_t = 10000)]
+    pub timeout: u64,
+    /// Retry count for failed HTTP requests.
+    #[arg(long, default_value_t = 2)]
+    pub retries: u32,
+    /// Delay between retries in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    pub retry_delay: u64,
 }
 
 #[derive(Args, Debug)]
@@ -1436,6 +1483,7 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::Archive { action } => handle_archive(action),
         Commands::ServeHttp { host, port, path } => handle_serve_http(host, port, path),
         Commands::ServeStdio => handle_serve_stdio(),
+        Commands::Ci { quick, report, json } => handle_ci(quick, report, json),
         Commands::Lint => handle_lint(),
         Commands::Typecheck => handle_typecheck(),
         Commands::Migrate => handle_migrate(),
@@ -1807,9 +1855,13 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
                     ftui_runtime::ftui_println!("  [{severity}] {}: {}", check.name, check.message);
                 }
                 ftui_runtime::ftui_println!("");
+                ftui_runtime::ftui_println!("Authoritative validation path (native):");
                 ftui_runtime::ftui_println!(
-                    "Run the validation script against the deployed URL for live HTTP checks:"
+                    "  am share deploy verify-live {} --bundle <bundle_dir>",
+                    plan.url
                 );
+                ftui_runtime::ftui_println!("");
+                ftui_runtime::ftui_println!("Compatibility-only wrapper (generated in bundle):");
                 ftui_runtime::ftui_println!(
                     "  ./scripts/validate_deploy.sh <bundle_dir> {}",
                     plan.url
@@ -1817,7 +1869,86 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
             }
             Ok(())
         }
+        DeployCommand::VerifyLive(args) => handle_deploy_verify_live(args),
     }
+}
+
+fn build_verify_live_options(args: &DeployVerifyLiveArgs) -> share::deploy::VerifyLiveOptions {
+    let probe_config = share::probe::ProbeConfig {
+        timeout: std::time::Duration::from_millis(args.timeout),
+        retries: args.retries,
+        retry_delay: std::time::Duration::from_millis(args.retry_delay),
+        ..share::probe::ProbeConfig::default()
+    };
+    share::deploy::VerifyLiveOptions {
+        url: args.url.clone(),
+        bundle_path: args.bundle.clone(),
+        security_audit: args.security,
+        strict: args.strict,
+        fail_fast: args.fail_fast,
+        probe_config,
+    }
+}
+
+fn handle_deploy_verify_live(args: DeployVerifyLiveArgs) -> CliResult<()> {
+    let opts = build_verify_live_options(&args);
+    let report = share::deploy::run_verify_live(&opts);
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+        ftui_runtime::ftui_println!("{json}");
+    } else {
+        ftui_runtime::ftui_println!("verify-live: {}", args.url);
+        ftui_runtime::ftui_println!("");
+
+        // Render local stage
+        if report.stages.local.ran {
+            for check in &report.stages.local.checks {
+                print_verify_check(check);
+            }
+        }
+
+        // Render remote stage
+        if report.stages.remote.ran {
+            for check in &report.stages.remote.checks {
+                print_verify_check(check);
+            }
+        }
+
+        // Render security stage
+        if report.stages.security.ran {
+            for check in &report.stages.security.checks {
+                print_verify_check(check);
+            }
+        }
+
+        ftui_runtime::ftui_println!("");
+        ftui_runtime::ftui_println!(
+            "Result: {}/{} passed, {} warnings ({}ms)",
+            report.summary.passed,
+            report.summary.total,
+            report.summary.warnings,
+            report.summary.elapsed_ms
+        );
+    }
+
+    // Exit code per SPEC
+    let code = report.exit_code();
+    if code != 0 {
+        return Err(CliError::ExitCode(code));
+    }
+    Ok(())
+}
+
+fn print_verify_check(check: &share::deploy::VerifyLiveCheck) {
+    let tag = match (check.passed, check.severity) {
+        (true, _) => "PASS",
+        (false, share::deploy::CheckSeverity::Error) => "FAIL",
+        (false, share::deploy::CheckSeverity::Warning) => "WARN",
+        (false, share::deploy::CheckSeverity::Skipped) => "SKIP",
+        (false, share::deploy::CheckSeverity::Info) => "INFO",
+    };
+    ftui_runtime::ftui_println!("  [{tag}] {:<20} {}", check.id, check.message);
 }
 
 fn handle_serve_http(
@@ -4170,6 +4301,72 @@ fn clear_and_reset_everything(
         deleted_db_files,
         deleted_storage_entries,
     })
+}
+
+/// Handle the `am ci` command: run quality gates with optional flags.
+fn handle_ci(
+    quick: bool,
+    report_path: Option<std::path::PathBuf>,
+    json_output: bool,
+) -> CliResult<()> {
+    use ci::{
+        default_gates, print_gate_summary, run_gates, Decision, GateRunnerConfig, RunMode,
+    };
+
+    let mode = if quick { RunMode::Quick } else { RunMode::Full };
+
+    // Build runner config
+    let working_dir =
+        std::env::current_dir().map_err(|e| CliError::Other(format!("cwd error: {e}")))?;
+    let runner_config = GateRunnerConfig::new(working_dir)
+        .mode(mode)
+        .timeout_secs(600);
+
+    // Progress callback
+    let on_start: fn(&str, usize, usize) = |name, idx, total| {
+        ftui_runtime::ftui_println!("━━━ GATE [{}/{}]: {} ━━━", idx + 1, total, name);
+    };
+
+    let runner_config = GateRunnerConfig {
+        on_gate_start: Some(on_start),
+        ..runner_config
+    };
+
+    // Run all gates
+    let gates = default_gates();
+    let report = run_gates(&gates, &runner_config);
+
+    // Write report to file if requested
+    if let Some(ref path) = report_path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CliError::Other(format!("failed to create report directory: {e}"))
+            })?;
+        }
+        report
+            .write_to_file(path)
+            .map_err(|e| CliError::Other(format!("failed to write report: {e}")))?;
+        ftui_runtime::ftui_println!("Report written to: {}", path.display());
+    }
+
+    // Output results
+    if json_output {
+        let json = report
+            .to_json()
+            .map_err(|e| CliError::Other(format!("JSON serialization failed: {e}")))?;
+        println!("{json}");
+    } else {
+        print_gate_summary(&report);
+    }
+
+    // Exit with appropriate code
+    match report.decision {
+        Decision::Go => Ok(()),
+        Decision::NoGo => {
+            ftui_runtime::ftui_eprintln!("CI failed: {}", report.decision_reason);
+            Err(CliError::ExitCode(1))
+        }
+    }
 }
 
 fn handle_lint() -> CliResult<()> {
@@ -7144,6 +7341,169 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_share_deploy_verify_live_defaults() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "share",
+            "deploy",
+            "verify-live",
+            "https://example.test/agent-mail",
+        ])
+        .expect("failed to parse deploy verify-live defaults");
+
+        match cli.command {
+            Commands::Share {
+                action:
+                    ShareCommand::Deploy {
+                        action: DeployCommand::VerifyLive(args),
+                    },
+            } => {
+                assert_eq!(args.url, "https://example.test/agent-mail");
+                assert_eq!(args.bundle, None);
+                assert!(!args.json);
+                assert!(!args.strict);
+                assert!(!args.fail_fast);
+                assert!(!args.security);
+                assert_eq!(args.timeout, 10_000);
+                assert_eq!(args.retries, 2);
+                assert_eq!(args.retry_delay, 1_000);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_share_deploy_verify_live_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "share",
+            "deploy",
+            "verify-live",
+            "https://example.test/agent-mail",
+            "--bundle",
+            "/tmp/live_bundle",
+            "--json",
+            "--strict",
+            "--fail-fast",
+            "--security",
+            "--timeout",
+            "2500",
+            "--retries",
+            "5",
+            "--retry-delay",
+            "250",
+        ])
+        .expect("failed to parse deploy verify-live with all flags");
+
+        match cli.command {
+            Commands::Share {
+                action:
+                    ShareCommand::Deploy {
+                        action: DeployCommand::VerifyLive(args),
+                    },
+            } => {
+                assert_eq!(args.url, "https://example.test/agent-mail");
+                assert_eq!(args.bundle, Some(PathBuf::from("/tmp/live_bundle")));
+                assert!(args.json);
+                assert!(args.strict);
+                assert!(args.fail_fast);
+                assert!(args.security);
+                assert_eq!(args.timeout, 2_500);
+                assert_eq!(args.retries, 5);
+                assert_eq!(args.retry_delay, 250);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_verify_live_options_maps_cli_fields() {
+        let args = DeployVerifyLiveArgs {
+            url: "https://example.test/agent-mail".to_string(),
+            bundle: Some(PathBuf::from("/tmp/live_bundle")),
+            json: true,
+            strict: true,
+            fail_fast: true,
+            security: true,
+            timeout: 12_345,
+            retries: 4,
+            retry_delay: 321,
+        };
+
+        let opts = build_verify_live_options(&args);
+        assert_eq!(opts.url, "https://example.test/agent-mail");
+        assert_eq!(opts.bundle_path, Some(PathBuf::from("/tmp/live_bundle")));
+        assert!(opts.security_audit);
+        assert!(opts.strict);
+        assert!(opts.fail_fast);
+        assert_eq!(
+            opts.probe_config.timeout,
+            std::time::Duration::from_millis(12_345)
+        );
+        assert_eq!(opts.probe_config.retries, 4);
+        assert_eq!(
+            opts.probe_config.retry_delay,
+            std::time::Duration::from_millis(321)
+        );
+    }
+
+    #[test]
+    fn print_verify_check_renders_severity_tags() {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let capture = StdioCapture::install().unwrap();
+
+        let checks = [
+            share::deploy::VerifyLiveCheck {
+                id: "remote.root".to_string(),
+                description: "root".to_string(),
+                severity: share::deploy::CheckSeverity::Error,
+                passed: true,
+                message: "ok".to_string(),
+                elapsed_ms: 1,
+                http_status: Some(200),
+                headers_captured: None,
+            },
+            share::deploy::VerifyLiveCheck {
+                id: "remote.coop".to_string(),
+                description: "coop".to_string(),
+                severity: share::deploy::CheckSeverity::Warning,
+                passed: false,
+                message: "missing".to_string(),
+                elapsed_ms: 1,
+                http_status: None,
+                headers_captured: None,
+            },
+            share::deploy::VerifyLiveCheck {
+                id: "remote.content_match".to_string(),
+                description: "content match".to_string(),
+                severity: share::deploy::CheckSeverity::Skipped,
+                passed: false,
+                message: "skipped".to_string(),
+                elapsed_ms: 0,
+                http_status: None,
+                headers_captured: None,
+            },
+        ];
+
+        for check in &checks {
+            print_verify_check(check);
+        }
+
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        let out = String::from_utf8_lossy(&sink);
+        assert!(out.contains("[PASS] remote.root"));
+        assert!(out.contains("[WARN] remote.coop"));
+        assert!(out.contains("[SKIP] remote.content_match"));
     }
 
     #[test]
