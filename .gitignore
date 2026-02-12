@@ -44,3 +44,17 @@ crates/mcp-agent-mail-conformance/tests/conformance/python_reference/_scratch/
 
 # Legacy Python reference code (local-only, not part of Rust workspace)
 legacy_python_mcp_agent_mail_code/
+legacy/
+
+# FastEmbed model caches (downloaded at runtime)
+.fastembed_cache/
+**/.fastembed_cache/
+
+# Database backup and recovery files
+*.sqlite3.bak
+*.sqlite3-wal.bak
+*.sqlite3.corrupt-*
+
+# Temporary directories
+tmp/
+test_logs/
