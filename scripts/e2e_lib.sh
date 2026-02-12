@@ -1804,10 +1804,351 @@ e2e_ensure_binary() {
 }
 
 # ---------------------------------------------------------------------------
+# Server Log Capture (br-3h13.12.2)
+# ---------------------------------------------------------------------------
+#
+# Provides server lifecycle management with automatic log capture for E2E tests.
+# Server logs are captured to artifacts/logs/server.log, with per-case markers
+# for easy extraction of relevant log segments when tests fail.
+#
+# Usage:
+#   e2e_start_server_with_logs "/path/to/db" "/path/to/storage" "label" [extra_env...]
+#   e2e_mark_case_start "test_case_name"
+#   # ... run test case ...
+#   e2e_mark_case_end "test_case_name"
+#   e2e_stop_server
+#
+# On test failure, call e2e_extract_case_logs to get relevant server output.
+
+# Server state tracking
+_E2E_SERVER_PID=""
+_E2E_SERVER_LOG=""
+_E2E_SERVER_LABEL=""
+_E2E_CASE_MARKERS=()
+_E2E_CASE_LOG_LINE_COUNTS=()
+
+# e2e_start_server_with_logs: Start mcp-agent-mail server with debug logging
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: storage_root - Path to storage root directory
+#   $3: label - Server label for log file naming
+#   $4+: Extra env vars as KEY=VALUE pairs
+#
+# Example:
+#   e2e_start_server_with_logs "/tmp/db.sqlite3" "/tmp/storage" "main" "HTTP_PORT=8765"
+
+e2e_start_server_with_logs() {
+    local db_path="$1"
+    local storage_root="$2"
+    local label="${3:-server}"
+    shift 3 2>/dev/null || shift 2 2>/dev/null || true
+
+    # Determine server binary
+    local bin
+    bin="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+
+    # Pick a random port if not specified
+    local port="${HTTP_PORT:-}"
+    if [ -z "$port" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+        else
+            port="$((8000 + RANDOM % 1000))"
+        fi
+    fi
+
+    # Server log file
+    _E2E_SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_${label}.log"
+    _E2E_SERVER_LABEL="$label"
+    mkdir -p "$(dirname "$_E2E_SERVER_LOG")"
+
+    e2e_log "Starting server (${label}): 127.0.0.1:${port}"
+    e2e_log "  log: $_E2E_SERVER_LOG"
+
+    # Start server in background with debug logging
+    (
+        export DATABASE_URL="sqlite:////${db_path}"
+        export STORAGE_ROOT="${storage_root}"
+        export HTTP_HOST="127.0.0.1"
+        export HTTP_PORT="${port}"
+        export LOG_LEVEL="debug"
+        export RUST_LOG="debug"
+
+        # Apply extra env vars
+        while [ $# -gt 0 ]; do
+            export "$1"
+            shift
+        done
+
+        "${bin}" serve --host 127.0.0.1 --port "${port}"
+    ) >"$_E2E_SERVER_LOG" 2>&1 &
+    _E2E_SERVER_PID=$!
+
+    # Wait for server to be ready
+    if ! e2e_wait_port "127.0.0.1" "${port}" 15; then
+        e2e_log "Server failed to start within 15s"
+        _e2e_server_startup_diagnostics
+        return 1
+    fi
+
+    # Write server startup marker
+    _e2e_server_log_marker "SERVER_STARTED" "pid=${_E2E_SERVER_PID} port=${port} label=${label}"
+
+    # Export server URL for tests
+    export E2E_SERVER_URL="http://127.0.0.1:${port}/mcp/"
+    export E2E_SERVER_PID="${_E2E_SERVER_PID}"
+
+    e2e_log "Server started: pid=${_E2E_SERVER_PID}"
+    return 0
+}
+
+# e2e_stop_server: Stop the running server and finalize logs
+e2e_stop_server() {
+    if [ -z "${_E2E_SERVER_PID}" ]; then
+        return 0
+    fi
+
+    _e2e_server_log_marker "SERVER_STOPPING" "pid=${_E2E_SERVER_PID}"
+
+    if kill -0 "${_E2E_SERVER_PID}" 2>/dev/null; then
+        # Graceful shutdown
+        kill "${_E2E_SERVER_PID}" 2>/dev/null || true
+        sleep 0.5
+
+        # Force kill if still running
+        if kill -0 "${_E2E_SERVER_PID}" 2>/dev/null; then
+            kill -9 "${_E2E_SERVER_PID}" 2>/dev/null || true
+        fi
+    fi
+
+    _e2e_server_log_marker "SERVER_STOPPED" "pid=${_E2E_SERVER_PID}"
+
+    # Write server log stats
+    if [ -f "$_E2E_SERVER_LOG" ]; then
+        local line_count
+        line_count="$(wc -l < "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
+        e2e_log "Server log: ${line_count} lines"
+    fi
+
+    _E2E_SERVER_PID=""
+    unset E2E_SERVER_URL E2E_SERVER_PID
+}
+
+# e2e_mark_case_start: Write marker to server log at case start
+#
+# Usage:
+#   e2e_mark_case_start "test_case_name"
+
+e2e_mark_case_start() {
+    local case_name="$1"
+    local marker="E2E_CASE_START:${case_name}:$(_e2e_now_rfc3339)"
+
+    _E2E_CASE_MARKERS+=("${marker}")
+
+    if [ -n "${_E2E_SERVER_LOG}" ] && [ -f "${_E2E_SERVER_LOG}" ]; then
+        local line_num
+        line_num="$(wc -l < "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
+        _E2E_CASE_LOG_LINE_COUNTS+=("${case_name}:${line_num}")
+    fi
+
+    _e2e_server_log_marker "CASE_START" "$case_name"
+}
+
+# e2e_mark_case_end: Write marker to server log at case end
+#
+# Usage:
+#   e2e_mark_case_end "test_case_name"
+
+e2e_mark_case_end() {
+    local case_name="$1"
+    _e2e_server_log_marker "CASE_END" "$case_name"
+}
+
+# e2e_extract_case_logs: Extract server logs for a specific test case
+#
+# Usage:
+#   e2e_extract_case_logs "test_case_name"
+#
+# Output:
+#   Saves logs to ${E2E_ARTIFACT_DIR}/${case_name}/server_logs.txt
+#   Returns the extracted log content
+
+e2e_extract_case_logs() {
+    local case_name="$1"
+    local out_file="${E2E_ARTIFACT_DIR}/${case_name}/server_logs.txt"
+
+    if [ -z "${_E2E_SERVER_LOG}" ] || [ ! -f "${_E2E_SERVER_LOG}" ]; then
+        echo "(no server log available)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$out_file")"
+
+    # Find start and end line numbers for this case
+    local start_line=0 end_line
+    local entry
+    for entry in "${_E2E_CASE_LOG_LINE_COUNTS[@]}"; do
+        local entry_case="${entry%%:*}"
+        local entry_line="${entry##*:}"
+        if [ "$entry_case" = "$case_name" ]; then
+            start_line="$entry_line"
+            break
+        fi
+    done
+
+    # Get current line count as end
+    end_line="$(wc -l < "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
+
+    # Extract lines between markers
+    if [ "$start_line" -gt 0 ]; then
+        sed -n "${start_line},${end_line}p" "$_E2E_SERVER_LOG" > "$out_file"
+    else
+        # Fallback: grep for case name in logs
+        grep -i "$case_name" "$_E2E_SERVER_LOG" > "$out_file" 2>/dev/null || true
+    fi
+
+    cat "$out_file"
+}
+
+# e2e_get_server_logs_tail: Get the last N lines of server log
+#
+# Usage:
+#   e2e_get_server_logs_tail 50
+
+e2e_get_server_logs_tail() {
+    local n="${1:-50}"
+    if [ -n "${_E2E_SERVER_LOG}" ] && [ -f "${_E2E_SERVER_LOG}" ]; then
+        tail -n "$n" "$_E2E_SERVER_LOG"
+    fi
+}
+
+# Internal: Write marker to server log (via echo to log file)
+_e2e_server_log_marker() {
+    local kind="$1"
+    local msg="${2:-}"
+    local ts
+    ts="$(_e2e_now_rfc3339)"
+
+    if [ -n "${_E2E_SERVER_LOG}" ]; then
+        echo "[E2E_MARKER] ${ts} ${kind}: ${msg}" >> "$_E2E_SERVER_LOG" 2>/dev/null || true
+    fi
+}
+
+# Internal: Diagnostics on server startup failure
+_e2e_server_startup_diagnostics() {
+    local diag_file="${E2E_ARTIFACT_DIR}/diagnostics/server_startup_failure.txt"
+    mkdir -p "$(dirname "$diag_file")"
+
+    {
+        echo "Server startup failure diagnostics"
+        echo "=================================="
+        echo "Timestamp: $(_e2e_now_rfc3339)"
+        echo "Label: ${_E2E_SERVER_LABEL}"
+        echo "PID: ${_E2E_SERVER_PID}"
+        echo ""
+        echo "=== Server log (last 100 lines) ==="
+        if [ -n "${_E2E_SERVER_LOG}" ] && [ -f "${_E2E_SERVER_LOG}" ]; then
+            tail -n 100 "$_E2E_SERVER_LOG"
+        else
+            echo "(no log file)"
+        fi
+        echo ""
+        echo "=== Process status ==="
+        ps aux | grep -E "mcp-agent-mail|$_E2E_SERVER_PID" | grep -v grep || echo "(no matching processes)"
+        echo ""
+        echo "=== Port status ==="
+        ss -tlnp 2>/dev/null | head -20 || netstat -tlnp 2>/dev/null | head -20 || echo "(unable to check ports)"
+    } > "$diag_file"
+
+    e2e_log "Startup diagnostics saved to: $diag_file"
+}
+
+# e2e_write_server_log_stats: Include server log stats in summary JSON
+#
+# Called automatically by e2e_summary if server was started
+e2e_write_server_log_stats() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    local stats_file="${artifact_dir}/logs/server_stats.json"
+
+    if [ -z "${_E2E_SERVER_LOG}" ]; then
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$stats_file")"
+
+    local line_count=0 error_count=0 warn_count=0
+    if [ -f "${_E2E_SERVER_LOG}" ]; then
+        line_count="$(wc -l < "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
+        error_count="$(grep -ci 'error\|ERROR' "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
+        warn_count="$(grep -ci 'warn\|WARN' "$_E2E_SERVER_LOG" 2>/dev/null || echo "0")"
+    fi
+
+    # Build per-case line counts JSON
+    local case_counts_json="["
+    local first=1
+    local entry
+    for entry in "${_E2E_CASE_LOG_LINE_COUNTS[@]}"; do
+        local case_name="${entry%%:*}"
+        local start_line="${entry##*:}"
+        if [ "$first" -eq 1 ]; then
+            first=0
+        else
+            case_counts_json="${case_counts_json},"
+        fi
+        case_counts_json="${case_counts_json}{\"case\":\"$(_e2e_json_escape "$case_name")\",\"start_line\":${start_line}}"
+    done
+    case_counts_json="${case_counts_json}]"
+
+    cat > "$stats_file" <<EOJSON
+{
+  "schema_version": 1,
+  "suite": "$(_e2e_json_escape "$E2E_SUITE")",
+  "timestamp": "$(_e2e_json_escape "$E2E_TIMESTAMP")",
+  "server_label": "$(_e2e_json_escape "${_E2E_SERVER_LABEL:-}")",
+  "log_file": "$(_e2e_json_escape "${_E2E_SERVER_LOG:-}")",
+  "stats": {
+    "total_lines": ${line_count},
+    "error_lines": ${error_count},
+    "warn_lines": ${warn_count}
+  },
+  "case_markers": ${case_counts_json}
+}
+EOJSON
+}
+
+# Enhanced e2e_fail to auto-extract server logs on failure
+_e2e_original_fail() {
+    local msg="${1:-}"
+    (( _E2E_FAIL++ )) || true
+    _e2e_trace_event "assert_fail" "$msg"
+    echo -e "  ${_e2e_color_red}FAIL${_e2e_color_reset} ${msg}"
+}
+
+# Override e2e_fail to capture server logs on failure (if server is running)
+e2e_fail() {
+    local msg="${1:-}"
+    _e2e_original_fail "$msg"
+
+    # Auto-extract server logs for current case on failure
+    if [ -n "${_E2E_CURRENT_CASE}" ] && [ -n "${_E2E_SERVER_LOG}" ]; then
+        local case_logs
+        case_logs="$(e2e_extract_case_logs "${_E2E_CURRENT_CASE}" 2>/dev/null)"
+        if [ -n "$case_logs" ]; then
+            echo -e "    ${_e2e_color_dim}=== Server logs (last 20 lines) ===${_e2e_color_reset}" >&2
+            echo "$case_logs" | tail -20 | sed 's/^/    /' >&2
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
 e2e_summary() {
+    # Stop server before generating summary (ensures logs are complete)
+    e2e_stop_server 2>/dev/null || true
+
     echo ""
     echo -e "${_e2e_color_blue}════════════════════════════════════════════════════════════${_e2e_color_reset}"
     echo -e "  Suite: ${E2E_SUITE}"
@@ -1833,6 +2174,9 @@ e2e_summary() {
         e2e_write_transcript_summary
         e2e_write_repro_files
         e2e_write_forensic_indexes
+
+        # Write server log stats if server was used (br-3h13.12.2)
+        e2e_write_server_log_stats
 
         # Emit a versioned bundle manifest and validate it. This provides
         # artifact-contract enforcement for CI regression triage (br-3vwi.10.18).
