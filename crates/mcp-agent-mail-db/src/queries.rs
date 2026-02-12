@@ -36,7 +36,7 @@ impl<'conn> TrackedConnection<'conn> {
 }
 
 struct TrackedTransaction<'conn> {
-    inner: <&'conn crate::DbConn as Connection>::Tx<'conn>,
+    inner: <crate::DbConn as Connection>::Tx<'conn>,
 }
 
 impl TransactionOps for TrackedTransaction<'_> {
