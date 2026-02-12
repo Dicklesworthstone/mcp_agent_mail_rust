@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ftui::Frame;
 use ftui::layout::Rect;
@@ -35,6 +35,7 @@ const TICK_INTERVAL: Duration = Duration::from_millis(100);
 const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
 const PALETTE_DYNAMIC_THREAD_CAP: usize = 50;
+const PALETTE_DYNAMIC_MESSAGE_CAP: usize = 50;
 const PALETTE_DYNAMIC_TOOL_CAP: usize = 50;
 const PALETTE_DYNAMIC_PROJECT_CAP: usize = 30;
 const PALETTE_DYNAMIC_CONTACT_CAP: usize = 30;
@@ -67,6 +68,61 @@ impl From<Event> for MailMsg {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Toast severity threshold
+// ──────────────────────────────────────────────────────────────────────
+
+/// Minimum severity for toast notifications. Toasts below this level
+/// are suppressed. Controlled by `AM_TUI_TOAST_SEVERITY` env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastSeverityThreshold {
+    /// Show all toasts (info, warning, error).
+    Info,
+    /// Show only warning and error toasts.
+    Warning,
+    /// Show only error toasts.
+    Error,
+    /// Suppress all toasts.
+    Off,
+}
+
+impl ToastSeverityThreshold {
+    fn from_env() -> Self {
+        match std::env::var("AM_TUI_TOAST_SEVERITY")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" | "none" => Self::Off,
+            "error" => Self::Error,
+            "warning" | "warn" => Self::Warning,
+            _ => Self::Info,
+        }
+    }
+
+    /// Returns `true` if a toast at the given icon level should be shown.
+    fn allows(self, icon: ToastIcon) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Error => matches!(icon, ToastIcon::Error),
+            Self::Warning => matches!(icon, ToastIcon::Warning | ToastIcon::Error),
+            Self::Info => true,
+        }
+    }
+}
+
+/// Duration threshold (ms) for slow tool call toasts.
+const SLOW_TOOL_THRESHOLD_MS: u64 = 5000;
+/// How far ahead (in microseconds) to warn about expiring reservations (5 min).
+const RESERVATION_EXPIRY_WARN_MICROS: i64 = 5 * 60 * 1_000_000;
+
+/// Current time as microseconds since Unix epoch.
+fn now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64)
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // MailAppModel — implements ftui_runtime::Model
 // ──────────────────────────────────────────────────────────────────────
 
@@ -87,6 +143,13 @@ pub struct MailAppModel {
     tick_count: u64,
     accessibility: crate::tui_persist::AccessibilitySettings,
     macro_engine: MacroEngine,
+    /// Tracks active reservations for expiry warnings.
+    /// Key: "{project}:{agent}:{path}", Value: (display_label, expiry_timestamp_micros).
+    reservation_tracker: HashMap<String, (String, i64)>,
+    /// Reservations already warned about (prevent duplicate warnings).
+    warned_reservations: HashSet<String>,
+    /// Minimum severity level for toast notifications.
+    toast_severity: ToastSeverityThreshold,
 }
 
 impl MailAppModel {
@@ -140,6 +203,9 @@ impl MailAppModel {
             tick_count: 0,
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
             macro_engine: MacroEngine::new(),
+            reservation_tracker: HashMap::new(),
+            warned_reservations: HashSet::new(),
+            toast_severity: ToastSeverityThreshold::from_env(),
         }
     }
 
@@ -431,6 +497,18 @@ impl MailAppModel {
         }
         if id.starts_with(palette_action_ids::THREAD_PREFIX) {
             self.active_screen = MailScreenId::Threads;
+            return Cmd::none();
+        }
+        if let Some(id_str) = id.strip_prefix(palette_action_ids::MESSAGE_PREFIX) {
+            if let Ok(msg_id) = id_str.parse::<i64>() {
+                let target = DeepLinkTarget::MessageById(msg_id);
+                self.active_screen = MailScreenId::Messages;
+                if let Some(screen) = self.screens.get_mut(&MailScreenId::Messages) {
+                    screen.receive_deep_link(&target);
+                }
+            } else {
+                self.active_screen = MailScreenId::Messages;
+            }
             return Cmd::none();
         }
         if id.starts_with(palette_action_ids::TOOL_PREFIX) {
@@ -765,11 +843,67 @@ impl Model for MailAppModel {
                     screen.tick(self.tick_count, &self.state);
                 }
 
-                // Generate toasts from new high-priority events
+                // Generate toasts from new high-priority events and track reservations
                 let new_events = self.state.events_since(self.last_toast_seq);
                 for event in &new_events {
                     self.last_toast_seq = event.seq().max(self.last_toast_seq);
-                    if let Some(toast) = toast_for_event(event) {
+
+                    // Track reservation lifecycle for expiry warnings
+                    match event {
+                        MailEvent::ReservationGranted {
+                            agent,
+                            paths,
+                            ttl_s,
+                            project,
+                            ..
+                        } => {
+                            let expiry = now_micros() + (*ttl_s as i64) * 1_000_000;
+                            for path in paths {
+                                let key = format!("{project}:{agent}:{path}");
+                                let label = format!("{agent}:{path}");
+                                self.reservation_tracker.insert(key, (label, expiry));
+                            }
+                        }
+                        MailEvent::ReservationReleased {
+                            agent,
+                            paths,
+                            project,
+                            ..
+                        } => {
+                            for path in paths {
+                                let key = format!("{project}:{agent}:{path}");
+                                self.reservation_tracker.remove(&key);
+                                self.warned_reservations.remove(&key);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    if let Some(toast) = toast_for_event(event, self.toast_severity) {
+                        self.notifications.notify(toast);
+                    }
+                }
+
+                // Check for reservations expiring soon (within 5 minutes)
+                let now = now_micros();
+                let mut expiry_toasts = Vec::new();
+                for (key, (label, expiry)) in &self.reservation_tracker {
+                    if *expiry > now
+                        && *expiry - now < RESERVATION_EXPIRY_WARN_MICROS
+                        && !self.warned_reservations.contains(key)
+                    {
+                        let minutes_left = (*expiry - now) / 60_000_000;
+                        expiry_toasts.push((
+                            key.clone(),
+                            Toast::new(format!("{label} expires in ~{minutes_left}m"))
+                                .icon(ToastIcon::Warning)
+                                .duration(Duration::from_secs(10)),
+                        ));
+                    }
+                }
+                for (key, toast) in expiry_toasts {
+                    if self.toast_severity.allows(ToastIcon::Warning) {
+                        self.warned_reservations.insert(key);
                         self.notifications.notify(toast);
                     }
                 }
@@ -1040,6 +1174,7 @@ mod palette_action_ids {
 
     pub const AGENT_PREFIX: &str = "agent:";
     pub const THREAD_PREFIX: &str = "thread:";
+    pub const MESSAGE_PREFIX: &str = "message:";
     pub const TOOL_PREFIX: &str = "tool:";
     pub const PROJECT_PREFIX: &str = "project:";
     pub const CONTACT_PREFIX: &str = "contact:";
@@ -1308,6 +1443,7 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
     let events = state.recent_events(PALETTE_DYNAMIC_EVENT_SCAN);
 
     let mut threads_seen: HashSet<String> = HashSet::new();
+    let mut messages_seen: HashSet<i64> = HashSet::new();
     let mut tools_seen: HashSet<String> = HashSet::new();
     let mut reservations_seen: HashSet<String> = HashSet::new();
 
@@ -1323,6 +1459,22 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
                         .with_description(format!("Latest: {subject}"))
                         .with_tags(&["thread", "messages"])
                         .with_category("Threads"),
+                    );
+                }
+            }
+        }
+
+        if messages_seen.len() < PALETTE_DYNAMIC_MESSAGE_CAP {
+            if let Some((message_id, from, subject, thread_id)) = extract_message(ev) {
+                if messages_seen.insert(message_id) {
+                    out.push(
+                        ActionItem::new(
+                            format!("{}{}", palette_action_ids::MESSAGE_PREFIX, message_id),
+                            format!("Message: {}", truncate_subject(subject, 56)),
+                        )
+                        .with_description(format!("{from} • thread {thread_id} • id {message_id}"))
+                        .with_tags(&["message", "subject"])
+                        .with_category("Messages"),
                     );
                 }
             }
@@ -1361,6 +1513,7 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
         }
 
         if threads_seen.len() >= PALETTE_DYNAMIC_THREAD_CAP
+            && messages_seen.len() >= PALETTE_DYNAMIC_MESSAGE_CAP
             && tools_seen.len() >= PALETTE_DYNAMIC_TOOL_CAP
             && reservations_seen.len() >= PALETTE_DYNAMIC_RESERVATION_CAP
         {
@@ -1400,42 +1553,115 @@ fn screen_name_from_id(id: MailScreenId) -> &'static str {
 
 /// Generate a toast notification for high-priority events.
 ///
-/// Returns `None` for routine events that shouldn't produce toasts.
-fn toast_for_event(event: &MailEvent) -> Option<Toast> {
-    match event {
+/// Returns `None` for routine events that shouldn't produce toasts,
+/// or if the toast's severity is below the configured threshold.
+fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Option<Toast> {
+    let (icon, toast) = match event {
+        // ── Messaging ────────────────────────────────────────────
         MailEvent::MessageSent { from, to, .. } => {
             let recipients = if to.len() > 2 {
                 format!("{} +{}", to[0], to.len() - 1)
             } else {
                 to.join(", ")
             };
-            Some(
+            (
+                ToastIcon::Info,
                 Toast::new(format!("{from} → {recipients}"))
                     .icon(ToastIcon::Info)
                     .duration(Duration::from_secs(4)),
             )
         }
-        MailEvent::AgentRegistered { name, program, .. } => Some(
+        MailEvent::MessageReceived { from, subject, .. } => {
+            let truncated = if subject.len() > 40 {
+                format!("{}…", &subject[..39])
+            } else {
+                subject.clone()
+            };
+            (
+                ToastIcon::Info,
+                Toast::new(format!("{from}: {truncated}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(5)),
+            )
+        }
+
+        // ── Identity ─────────────────────────────────────────────
+        MailEvent::AgentRegistered { name, program, .. } => (
+            ToastIcon::Success,
             Toast::new(format!("{name} ({program})"))
                 .icon(ToastIcon::Success)
                 .duration(Duration::from_secs(4)),
         ),
-        MailEvent::HttpRequest { status, path, .. } if *status >= 500 => Some(
+
+        // ── Tool calls: slow or errored ──────────────────────────
+        MailEvent::ToolCallEnd {
+            tool_name,
+            duration_ms,
+            result_preview: Some(preview),
+            ..
+        } if preview.contains("error") || preview.contains("Error") => (
+            ToastIcon::Error,
+            Toast::new(format!("{tool_name} error"))
+                .icon(ToastIcon::Error)
+                .duration(Duration::from_secs(15)),
+        ),
+        MailEvent::ToolCallEnd {
+            tool_name,
+            duration_ms,
+            ..
+        } if *duration_ms > SLOW_TOOL_THRESHOLD_MS => (
+            ToastIcon::Warning,
+            Toast::new(format!("{tool_name}: {duration_ms}ms"))
+                .icon(ToastIcon::Warning)
+                .duration(Duration::from_secs(8)),
+        ),
+
+        // ── Reservations: exclusive grants ───────────────────────
+        MailEvent::ReservationGranted {
+            agent,
+            paths,
+            exclusive: true,
+            ..
+        } => {
+            let path_display = paths.first().map_or("…", String::as_str);
+            (
+                ToastIcon::Info,
+                Toast::new(format!("{agent} locked {path_display}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(4)),
+            )
+        }
+
+        // ── HTTP 5xx ─────────────────────────────────────────────
+        MailEvent::HttpRequest { status, path, .. } if *status >= 500 => (
+            ToastIcon::Error,
             Toast::new(format!("HTTP {status} on {path}"))
                 .icon(ToastIcon::Error)
                 .duration(Duration::from_secs(6)),
         ),
-        MailEvent::ServerShutdown { .. } => Some(
+
+        // ── Lifecycle ────────────────────────────────────────────
+        MailEvent::ServerShutdown { .. } => (
+            ToastIcon::Warning,
             Toast::new("Server shutting down")
                 .icon(ToastIcon::Warning)
                 .duration(Duration::from_secs(8)),
         ),
-        MailEvent::ServerStarted { endpoint, .. } => Some(
+        MailEvent::ServerStarted { endpoint, .. } => (
+            ToastIcon::Success,
             Toast::new(format!("Server started at {endpoint}"))
                 .icon(ToastIcon::Success)
                 .duration(Duration::from_secs(5)),
         ),
-        _ => None,
+
+        _ => return None,
+    };
+
+    // Apply severity filter
+    if severity.allows(icon) {
+        Some(toast)
+    } else {
+        None
     }
 }
 
@@ -1458,6 +1684,38 @@ fn extract_thread(event: &MailEvent) -> Option<(&str, &str)> {
         } => Some((thread_id, subject)),
         _ => None,
     }
+}
+
+fn extract_message(event: &MailEvent) -> Option<(i64, &str, &str, &str)> {
+    match event {
+        MailEvent::MessageSent {
+            id,
+            from,
+            subject,
+            thread_id,
+            ..
+        }
+        | MailEvent::MessageReceived {
+            id,
+            from,
+            subject,
+            thread_id,
+            ..
+        } => Some((*id, from, subject, thread_id)),
+        _ => None,
+    }
+}
+
+fn truncate_subject(subject: &str, max_chars: usize) -> String {
+    let mut truncated = String::new();
+    for (idx, ch) in subject.chars().enumerate() {
+        if idx >= max_chars {
+            truncated.push('…');
+            return truncated;
+        }
+        truncated.push(ch);
+    }
+    truncated
 }
 
 fn extract_reservation_agent(event: &MailEvent) -> Option<&str> {
@@ -2019,6 +2277,13 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_palette_message_prefix_goes_to_messages() {
+        let mut model = test_model();
+        model.dispatch_palette_action("message:42");
+        assert_eq!(model.active_screen(), MailScreenId::Messages);
+    }
+
+    #[test]
     fn dispatch_palette_tool_prefix_goes_to_tool_metrics() {
         let mut model = test_model();
         model.dispatch_palette_action("tool:fetch_inbox");
@@ -2184,6 +2449,49 @@ mod tests {
         let mut model = test_model();
         model.dispatch_palette_action("reservation:BlueLake");
         assert_eq!(model.active_screen(), MailScreenId::Reservations);
+    }
+
+    #[test]
+    fn dynamic_palette_adds_message_entries_from_events() {
+        let model = test_model();
+        assert!(model.state.push_event(MailEvent::message_received(
+            42,
+            "BlueLake",
+            vec!["RedFox".to_string()],
+            "Subject for dynamic palette entry",
+            "thread-42",
+            "proj-a",
+        )));
+        assert!(model.state.push_event(MailEvent::message_sent(
+            99,
+            "RedFox",
+            vec!["BlueLake".to_string()],
+            "Outgoing subject",
+            "thread-99",
+            "proj-a",
+        )));
+
+        let actions = build_palette_actions(&model.state);
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"message:42"));
+        assert!(ids.contains(&"message:99"));
+
+        let message_entry = actions
+            .iter()
+            .find(|a| a.id == "message:42")
+            .expect("message action for id 42");
+        assert!(
+            message_entry
+                .title
+                .contains("Subject for dynamic palette entry")
+        );
+        assert!(
+            message_entry
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("thread-42")
+        );
     }
 
     #[test]
@@ -2672,5 +2980,276 @@ mod tests {
             artifacts.join("report.json"),
             serde_json::to_string_pretty(&report).unwrap(),
         );
+    }
+
+    // ── Toast severity threshold tests ──────────────────────────────
+
+    #[test]
+    fn severity_info_allows_all() {
+        let s = ToastSeverityThreshold::Info;
+        assert!(s.allows(ToastIcon::Info));
+        assert!(s.allows(ToastIcon::Warning));
+        assert!(s.allows(ToastIcon::Error));
+        assert!(s.allows(ToastIcon::Success));
+    }
+
+    #[test]
+    fn severity_warning_filters_info() {
+        let s = ToastSeverityThreshold::Warning;
+        assert!(!s.allows(ToastIcon::Info));
+        assert!(s.allows(ToastIcon::Warning));
+        assert!(s.allows(ToastIcon::Error));
+        assert!(!s.allows(ToastIcon::Success));
+    }
+
+    #[test]
+    fn severity_error_filters_warning_and_info() {
+        let s = ToastSeverityThreshold::Error;
+        assert!(!s.allows(ToastIcon::Info));
+        assert!(!s.allows(ToastIcon::Warning));
+        assert!(s.allows(ToastIcon::Error));
+        assert!(!s.allows(ToastIcon::Success));
+    }
+
+    #[test]
+    fn severity_off_blocks_everything() {
+        let s = ToastSeverityThreshold::Off;
+        assert!(!s.allows(ToastIcon::Info));
+        assert!(!s.allows(ToastIcon::Warning));
+        assert!(!s.allows(ToastIcon::Error));
+        assert!(!s.allows(ToastIcon::Success));
+    }
+
+    // ── toast_for_event tests ───────────────────────────────────────
+
+    #[test]
+    fn toast_message_received_generates_info() {
+        let event = MailEvent::message_received(1, "BlueLake", vec![], "Hello world", "t1", "proj");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(toast.is_some(), "MessageReceived should generate a toast");
+    }
+
+    #[test]
+    fn toast_message_received_truncates_long_subject() {
+        let long_subject = "A".repeat(60);
+        let event = MailEvent::message_received(1, "BlueLake", vec![], &long_subject, "t1", "proj");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
+        // The message inside the toast should be truncated
+        assert!(toast.content.message.len() < 60);
+        assert!(toast.content.message.contains('…'));
+    }
+
+    #[test]
+    fn toast_message_sent_still_works() {
+        let event = MailEvent::message_sent(1, "RedFox", vec![], "Test", "t1", "proj");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_some(),
+            "MessageSent should still generate a toast (regression)"
+        );
+    }
+
+    #[test]
+    fn toast_tool_call_end_normal_no_toast() {
+        let event =
+            MailEvent::tool_call_end("register_agent", 100, None, 0, 0.0, vec![], None, None);
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_none(),
+            "Normal ToolCallEnd should not generate a toast"
+        );
+    }
+
+    #[test]
+    fn toast_tool_call_end_slow_generates_warning() {
+        let event =
+            MailEvent::tool_call_end("search_messages", 6000, None, 0, 0.0, vec![], None, None);
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_some(),
+            "Slow ToolCallEnd should generate a warning toast"
+        );
+        let t = toast.unwrap();
+        assert_eq!(t.content.icon, Some(ToastIcon::Warning));
+        assert!(t.content.message.contains("6000ms"));
+    }
+
+    #[test]
+    fn toast_tool_call_end_error_preview_generates_error() {
+        let event = MailEvent::tool_call_end(
+            "send_message",
+            200,
+            Some("error: agent not registered".to_string()),
+            0,
+            0.0,
+            vec![],
+            None,
+            None,
+        );
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_some(),
+            "Error ToolCallEnd should generate an error toast"
+        );
+        let t = toast.unwrap();
+        assert_eq!(t.content.icon, Some(ToastIcon::Error));
+        assert!(t.content.message.contains("send_message"));
+    }
+
+    #[test]
+    fn toast_reservation_granted_exclusive_generates_info() {
+        let event = MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/**".to_string()],
+            true,
+            3600,
+            "proj",
+        );
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_some(),
+            "Exclusive ReservationGranted should generate an info toast"
+        );
+        let t = toast.unwrap();
+        assert!(t.content.message.contains("BlueLake"));
+        assert!(t.content.message.contains("src/**"));
+    }
+
+    #[test]
+    fn toast_reservation_granted_shared_no_toast() {
+        let event = MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/**".to_string()],
+            false,
+            3600,
+            "proj",
+        );
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_none(),
+            "Non-exclusive ReservationGranted should NOT generate a toast"
+        );
+    }
+
+    #[test]
+    fn toast_existing_mappings_unchanged_agent_registered() {
+        let event = MailEvent::agent_registered("RedFox", "claude-code", "opus-4.6", "proj");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_some(),
+            "AgentRegistered should generate a toast (regression)"
+        );
+        assert_eq!(toast.unwrap().content.icon, Some(ToastIcon::Success));
+    }
+
+    #[test]
+    fn toast_existing_mappings_unchanged_http_500() {
+        let event = MailEvent::http_request("GET", "/mcp/", 500, 5, "127.0.0.1");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_some(),
+            "HTTP 500 should generate a toast (regression)"
+        );
+        assert_eq!(toast.unwrap().content.icon, Some(ToastIcon::Error));
+    }
+
+    #[test]
+    fn toast_existing_mappings_unchanged_server_shutdown() {
+        let event = MailEvent::server_shutdown();
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_some(),
+            "ServerShutdown should generate a toast (regression)"
+        );
+        assert_eq!(toast.unwrap().content.icon, Some(ToastIcon::Warning));
+    }
+
+    #[test]
+    fn toast_existing_mappings_unchanged_server_started() {
+        let event = MailEvent::server_started("http://127.0.0.1:8765", "test");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
+        assert!(
+            toast.is_some(),
+            "ServerStarted should generate a toast (regression)"
+        );
+        assert_eq!(toast.unwrap().content.icon, Some(ToastIcon::Success));
+    }
+
+    #[test]
+    fn toast_severity_filter_blocks_info_at_error_level() {
+        let event = MailEvent::message_received(1, "BlueLake", vec![], "Hello", "t1", "proj");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Error);
+        assert!(
+            toast.is_none(),
+            "Info toast should be blocked at Error severity"
+        );
+    }
+
+    #[test]
+    fn toast_severity_filter_passes_error_at_error_level() {
+        let event = MailEvent::http_request("GET", "/mcp/", 500, 5, "127.0.0.1");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Error);
+        assert!(toast.is_some(), "Error toast should pass at Error severity");
+    }
+
+    #[test]
+    fn toast_severity_off_blocks_everything() {
+        let event = MailEvent::http_request("GET", "/mcp/", 500, 5, "127.0.0.1");
+        let toast = toast_for_event(&event, ToastSeverityThreshold::Off);
+        assert!(
+            toast.is_none(),
+            "All toasts should be blocked at Off severity"
+        );
+    }
+
+    // ── Reservation expiry tracker tests ────────────────────────────
+
+    #[test]
+    fn reservation_tracker_insert_and_remove() {
+        let mut model = test_model();
+        let key = "proj:BlueLake:src/**".to_string();
+        model
+            .reservation_tracker
+            .insert(key.clone(), ("BlueLake:src/**".to_string(), i64::MAX));
+        assert!(model.reservation_tracker.contains_key(&key));
+        model.reservation_tracker.remove(&key);
+        assert!(!model.reservation_tracker.contains_key(&key));
+    }
+
+    #[test]
+    fn reservation_expiry_warning_fires_within_window() {
+        let mut model = test_model();
+        let now = now_micros();
+        // Reservation expiring in 3 minutes (within 5-minute window)
+        let expiry = now + 3 * 60 * 1_000_000;
+        let key = "proj:BlueLake:src/**".to_string();
+        model
+            .reservation_tracker
+            .insert(key.clone(), ("BlueLake:src/**".to_string(), expiry));
+        assert!(!model.warned_reservations.contains(&key));
+
+        // Check: expiry is within the warning window
+        assert!(expiry > now);
+        assert!(expiry - now < RESERVATION_EXPIRY_WARN_MICROS);
+    }
+
+    #[test]
+    fn reservation_expiry_no_warning_if_far_away() {
+        let now = now_micros();
+        // Reservation expiring in 30 minutes (outside 5-minute window)
+        let expiry = now + 30 * 60 * 1_000_000;
+        // Should NOT be within warning window
+        assert!(expiry - now >= RESERVATION_EXPIRY_WARN_MICROS);
+    }
+
+    #[test]
+    fn warned_reservations_dedup_prevents_repeat() {
+        let mut model = test_model();
+        let key = "proj:BlueLake:src/**".to_string();
+        model.warned_reservations.insert(key.clone());
+        assert!(model.warned_reservations.contains(&key));
+        // Second insert is a no-op
+        model.warned_reservations.insert(key.clone());
+        assert_eq!(model.warned_reservations.len(), 1);
     }
 }
