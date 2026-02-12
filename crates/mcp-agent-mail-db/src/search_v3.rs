@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_search_core::filter_compiler::compile_filters;
 use mcp_agent_mail_search_core::lexical_parser::{LexicalParser, ParseOutcome, extract_terms};
 use mcp_agent_mail_search_core::lexical_response::{self, ResponseConfig};
@@ -45,6 +46,13 @@ impl TantivyBridge {
         };
 
         register_tokenizer(&index);
+        let doc_count = index
+            .reader()
+            .map_or(0, |reader| reader.searcher().num_docs());
+        let index_size_bytes = measure_index_dir_bytes(index_dir);
+        global_metrics()
+            .search
+            .update_index_health(index_size_bytes, doc_count);
 
         Ok(Self {
             index,
@@ -125,6 +133,31 @@ impl TantivyBridge {
         // Convert to planner results
         convert_results(&results, query.doc_kind)
     }
+}
+
+fn measure_index_dir_bytes(index_dir: &Path) -> u64 {
+    if !index_dir.is_dir() {
+        return 0;
+    }
+
+    let mut stack = vec![index_dir.to_path_buf()];
+    let mut total = 0_u64;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
 }
 
 /// Convert a planner `SearchQuery` to search-core `SearchFilter`.
@@ -414,5 +447,21 @@ mod tests {
         for r in &results {
             assert_eq!(r.thread_id.as_deref(), Some("br-100"));
         }
+    }
+
+    #[test]
+    fn measure_index_dir_bytes_counts_nested_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        std::fs::write(temp.path().join("a.bin"), [1_u8; 4]).expect("write file a");
+        std::fs::write(nested.join("b.bin"), [2_u8; 6]).expect("write file b");
+
+        let size = measure_index_dir_bytes(temp.path());
+        assert!(
+            size >= 10,
+            "expected at least 10 bytes, got {size} for {}",
+            temp.path().display()
+        );
     }
 }

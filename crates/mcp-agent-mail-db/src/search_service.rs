@@ -23,23 +23,24 @@ use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
 
 use asupersync::{Cx, Outcome};
+#[cfg(feature = "hybrid")]
+use half::f16;
 use mcp_agent_mail_search_core::{
     CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, QueryAssistance,
     QueryClass, parse_query_assistance, prepare_candidates,
 };
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
-    DocKind as SearchDocKind, ModelRegistry, ModelTier, RegistryConfig, TwoTierAvailability,
-    TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex, VectorIndexConfig,
-    get_two_tier_context,
+    DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
+    EmbeddingRequest, EmbeddingResult, HashEmbedder, JobMetricsSnapshot, ModelInfo, ModelRegistry,
+    ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, TwoTierAvailability, TwoTierConfig,
+    TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex, VectorIndexConfig, get_two_tier_context,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
 #[cfg(feature = "hybrid")]
-use std::sync::{Arc, OnceLock, RwLock};
-#[cfg(feature = "hybrid")]
-use half::f16;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 // ────────────────────────────────────────────────────────────────────
 // Search service options
 // ────────────────────────────────────────────────────────────────────
@@ -147,13 +148,80 @@ fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
 #[cfg(feature = "hybrid")]
 static SEMANTIC_BRIDGE: OnceLock<Option<Arc<SemanticBridge>>> = OnceLock::new();
 
+#[cfg(feature = "hybrid")]
+#[derive(Debug)]
+struct AutoInitSemanticEmbedder {
+    info: ModelInfo,
+    hash_fallback: HashEmbedder,
+}
+
+#[cfg(feature = "hybrid")]
+impl AutoInitSemanticEmbedder {
+    fn new() -> Self {
+        let dimension = get_two_tier_context().config().fast_dimension;
+        Self {
+            info: ModelInfo::new(
+                "auto-init-semantic-fast",
+                "Auto-Init Semantic Fast",
+                ModelTier::Fast,
+                dimension,
+                4096,
+            )
+            .with_available(true),
+            hash_fallback: HashEmbedder::new(),
+        }
+    }
+}
+
+#[cfg(feature = "hybrid")]
+impl Embedder for AutoInitSemanticEmbedder {
+    fn embed(
+        &self,
+        text: &str,
+    ) -> mcp_agent_mail_search_core::error::SearchResult<EmbeddingResult> {
+        let ctx = get_two_tier_context();
+        let start = std::time::Instant::now();
+        if let Ok(vector) = ctx.embed_fast(text) {
+            return Ok(EmbeddingResult::new(
+                vector,
+                self.info.id.clone(),
+                ModelTier::Fast,
+                start.elapsed(),
+                mcp_agent_mail_search_core::canonical::content_hash(text),
+            ));
+        }
+        if let Ok(vector) = ctx.embed_quality(text) {
+            return Ok(EmbeddingResult::new(
+                vector,
+                "auto-init-semantic-quality".to_string(),
+                ModelTier::Quality,
+                start.elapsed(),
+                mcp_agent_mail_search_core::canonical::content_hash(text),
+            ));
+        }
+        self.hash_fallback.embed(text)
+    }
+
+    fn model_info(&self) -> &ModelInfo {
+        &self.info
+    }
+}
+
 /// Bridge to the semantic search infrastructure (vector index + embedder).
 #[cfg(feature = "hybrid")]
 pub struct SemanticBridge {
     /// The vector index holding document embeddings.
-    index: RwLock<VectorIndex>,
+    index: Arc<RwLock<VectorIndex>>,
     /// The model registry for obtaining embedders.
-    registry: RwLock<ModelRegistry>,
+    registry: Arc<RwLock<ModelRegistry>>,
+    /// Queue of pending embedding work.
+    queue: Arc<EmbeddingQueue>,
+    /// Batch runner for embedding/index updates.
+    runner: Arc<EmbeddingJobRunner>,
+    /// Background refresh worker.
+    refresh_worker: Arc<mcp_agent_mail_search_core::IndexRefreshWorker>,
+    /// Background refresh worker handle.
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[cfg(feature = "hybrid")]
@@ -161,9 +229,41 @@ impl SemanticBridge {
     /// Create a new semantic bridge with the given configuration.
     #[must_use]
     pub fn new(config: VectorIndexConfig) -> Self {
+        let index = Arc::new(RwLock::new(VectorIndex::new(config)));
+        let registry = Arc::new(RwLock::new(ModelRegistry::new(RegistryConfig::default())));
+        let job_config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(job_config.clone()));
+        let embedder: Arc<dyn Embedder> = Arc::new(AutoInitSemanticEmbedder::new());
+        let runner = Arc::new(EmbeddingJobRunner::new(
+            job_config,
+            queue.clone(),
+            embedder,
+            index.clone(),
+        ));
+        let worker_cfg = RefreshWorkerConfig {
+            refresh_interval_ms: 250,
+            rebuild_on_startup: false,
+            max_docs_per_cycle: 256,
+        };
+        let refresh_worker = Arc::new(mcp_agent_mail_search_core::IndexRefreshWorker::new(
+            worker_cfg,
+            runner.clone(),
+        ));
+        let worker = {
+            let worker = refresh_worker.clone();
+            std::thread::Builder::new()
+                .name("semantic-index-refresh".to_string())
+                .spawn(move || worker.run())
+                .ok()
+        };
+
         Self {
-            index: RwLock::new(VectorIndex::new(config)),
-            registry: RwLock::new(ModelRegistry::new(RegistryConfig::default())),
+            index,
+            registry,
+            queue,
+            runner,
+            refresh_worker,
+            worker: Mutex::new(worker),
         }
     }
 
@@ -196,31 +296,14 @@ impl SemanticBridge {
     /// Check if the bridge has any real embedder (beyond hash fallback).
     #[must_use]
     pub fn has_real_embedder(&self) -> bool {
-        self.registry().has_real_embedder()
+        self.registry().has_real_embedder() || get_two_tier_context().is_available()
     }
 
     /// Search for semantically similar documents.
     ///
     /// Embeds the query text and performs vector similarity search.
     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
-        let registry = self.registry();
-
-        // Get the best available embedder (will fallback to hash if no real model)
-        let Ok(embedder) = registry.get_embedder(ModelTier::Fast) else {
-            return Vec::new();
-        };
-
-        // If only hash embedder is available, semantic search won't produce
-        // meaningful similarity scores, so return empty to degrade gracefully
-        if embedder.model_info().tier == ModelTier::Hash {
-            tracing::debug!(
-                target: "search.semantic",
-                "no real embedder available, skipping semantic search"
-            );
-            return Vec::new();
-        }
-
-        // Embed the query text
+        let embedder = AutoInitSemanticEmbedder::new();
         let embedding = match embedder.embed(&query.text) {
             Ok(result) => result,
             Err(e) => {
@@ -232,7 +315,13 @@ impl SemanticBridge {
                 return Vec::new();
             }
         };
-        drop(registry);
+        if embedding.is_hash_only() {
+            tracing::debug!(
+                target: "search.semantic",
+                "no real embedder available, skipping semantic search"
+            );
+            return Vec::new();
+        }
 
         // Build filter from query
         let filter = build_vector_filter(query);
@@ -271,6 +360,61 @@ impl SemanticBridge {
             })
             .collect()
     }
+
+    /// Enqueue a document for background semantic indexing.
+    pub fn enqueue_document(
+        &self,
+        doc_id: i64,
+        doc_kind: SearchDocKind,
+        project_id: Option<i64>,
+        title: &str,
+        body: &str,
+    ) -> bool {
+        self.queue.enqueue(EmbeddingRequest::new(
+            doc_id,
+            doc_kind,
+            project_id,
+            title,
+            body,
+            ModelTier::Fast,
+        ))
+    }
+
+    #[must_use]
+    pub fn queue_stats(&self) -> QueueStats {
+        self.queue.stats()
+    }
+
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> JobMetricsSnapshot {
+        self.runner.metrics().snapshot()
+    }
+}
+
+#[cfg(feature = "hybrid")]
+impl Drop for SemanticBridge {
+    fn drop(&mut self) {
+        self.refresh_worker.shutdown();
+        let join = self.worker.lock().expect("worker lock poisoned").take();
+        if let Some(join) = join {
+            let _ = join.join();
+        }
+    }
+}
+
+#[cfg(feature = "hybrid")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticIndexingSnapshot {
+    pub queue: QueueStats,
+    pub metrics: JobMetricsSnapshot,
+}
+
+#[cfg(feature = "hybrid")]
+fn get_or_init_semantic_bridge() -> Option<Arc<SemanticBridge>> {
+    if get_semantic_bridge().is_none() {
+        let _ = init_semantic_bridge_default();
+    }
+    get_semantic_bridge()
 }
 
 /// Build a `VectorFilter` from a `SearchQuery`.
@@ -303,6 +447,16 @@ const fn convert_doc_kind(kind: SearchDocKind) -> DocKind {
     }
 }
 
+#[cfg(feature = "hybrid")]
+const fn convert_planner_doc_kind(kind: DocKind) -> SearchDocKind {
+    match kind {
+        DocKind::Message => SearchDocKind::Message,
+        DocKind::Agent => SearchDocKind::Agent,
+        DocKind::Project => SearchDocKind::Project,
+        DocKind::Thread => SearchDocKind::Thread,
+    }
+}
+
 /// Initialize the global semantic search bridge.
 ///
 /// Should be called once at startup when hybrid search is enabled.
@@ -332,7 +486,7 @@ pub fn get_semantic_bridge() -> Option<Arc<SemanticBridge>> {
 /// degrades to lexical-only while preserving deterministic behavior.
 #[cfg(feature = "hybrid")]
 fn try_semantic_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
-    let bridge = get_semantic_bridge()?;
+    let bridge = get_or_init_semantic_bridge()?;
     let results = bridge.search(query, limit);
     if results.is_empty() {
         None
@@ -347,6 +501,57 @@ const fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<
     None
 }
 
+/// Enqueue a document for background semantic indexing.
+#[cfg(feature = "hybrid")]
+#[must_use]
+pub fn enqueue_semantic_document(
+    doc_kind: DocKind,
+    doc_id: i64,
+    project_id: Option<i64>,
+    title: &str,
+    body: &str,
+) -> bool {
+    let Some(bridge) = get_or_init_semantic_bridge() else {
+        return false;
+    };
+    bridge.enqueue_document(
+        doc_id,
+        convert_planner_doc_kind(doc_kind),
+        project_id,
+        title,
+        body,
+    )
+}
+
+#[cfg(not(feature = "hybrid"))]
+#[must_use]
+pub fn enqueue_semantic_document(
+    _doc_kind: DocKind,
+    _doc_id: i64,
+    _project_id: Option<i64>,
+    _title: &str,
+    _body: &str,
+) -> bool {
+    false
+}
+
+/// Snapshot current semantic indexing queue + metrics.
+#[cfg(feature = "hybrid")]
+#[must_use]
+pub fn semantic_indexing_snapshot() -> Option<SemanticIndexingSnapshot> {
+    let bridge = get_or_init_semantic_bridge()?;
+    Some(SemanticIndexingSnapshot {
+        queue: bridge.queue_stats(),
+        metrics: bridge.metrics_snapshot(),
+    })
+}
+
+#[cfg(not(feature = "hybrid"))]
+#[must_use]
+pub const fn semantic_indexing_snapshot() -> Option<()> {
+    None
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Two-Tier Semantic Bridge (auto-initialized, no manual setup)
 // ────────────────────────────────────────────────────────────────────
@@ -357,8 +562,8 @@ static TWO_TIER_BRIDGE: OnceLock<Option<Arc<TwoTierBridge>>> = OnceLock::new();
 /// Bridge to the two-tier progressive semantic search system.
 ///
 /// Uses automatic embedder detection and initialization:
-/// - Fast tier: potion-128M (sub-ms, from HuggingFace cache)
-/// - Quality tier: MiniLM-L6-v2 (128ms, via FastEmbed)
+/// - Fast tier: potion-128M (sub-ms, from `HuggingFace` cache)
+/// - Quality tier: `MiniLM-L6-v2` (128ms, via `FastEmbed`)
 ///
 /// No manual setup required - embedders are auto-detected on first use.
 #[cfg(feature = "hybrid")]
@@ -450,12 +655,10 @@ impl TwoTierBridge {
             }
         };
 
-        // Search the index
-        let index = self.index();
-
+        // Search the index (drop lock before converting results)
         // For now, use simple similarity search on the fast tier
         // Full progressive refinement will be added in a follow-up
-        let hits = index.search_fast(&embedding, limit);
+        let hits = self.index().search_fast(&embedding, limit);
 
         // Convert to SearchResult using metadata from the index
         hits.into_iter()
@@ -537,6 +740,7 @@ impl TwoTierBridge {
         index
             .add_entry(entry)
             .map_err(|e| format!("two-tier index add_entry failed: {e}"))?;
+        drop(index);
 
         Ok(())
     }
@@ -567,11 +771,15 @@ pub fn get_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
 
 /// Try executing semantic candidate retrieval using two-tier system.
 ///
-/// Prefers the two-tier bridge if available, falls back to legacy SemanticBridge.
+/// Prefers the two-tier bridge if available, falls back to legacy `SemanticBridge`.
 #[cfg(feature = "hybrid")]
 fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
     // Try two-tier bridge first (auto-initialized, no manual setup)
-    if let Some(bridge) = get_two_tier_bridge() {
+    let bridge = get_two_tier_bridge().or_else(|| {
+        let _ = init_two_tier_bridge();
+        get_two_tier_bridge()
+    });
+    if let Some(bridge) = bridge {
         if bridge.is_available() {
             let results = bridge.search(query, limit);
             if !results.is_empty() {
@@ -703,6 +911,30 @@ fn log_shadow_comparison(
     );
 }
 
+fn record_legacy_error_metrics(metric_key: &str, latency_us: u64, track_telemetry: bool) {
+    if track_telemetry {
+        record_query(metric_key, latency_us);
+    }
+    global_metrics()
+        .search
+        .record_legacy_query(latency_us, true);
+}
+
+fn maybe_record_v3_fallback(engine: SearchEngine, query: &SearchQuery) {
+    if matches!(
+        engine,
+        SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
+    ) {
+        global_metrics().search.record_fallback();
+        tracing::warn!(
+            target: "search.metrics",
+            engine = ?engine,
+            query = %query.text,
+            "v3 search unavailable; falling back to legacy FTS5"
+        );
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Core execution
 // ────────────────────────────────────────────────────────────────────
@@ -736,7 +968,8 @@ pub async fn execute_search(
             global_metrics().search.record_v3_query(latency_us, false);
             return finish_scoped_response(raw_results, query, options, assistance.clone());
         }
-        // Bridge not initialized → fall through to FTS5
+        maybe_record_v3_fallback(engine, query);
+        // Bridge not initialized → fall through to FTS5.
     }
 
     // ── Hybrid candidate orchestration path ─────────────────────────
@@ -764,6 +997,7 @@ pub async fn execute_search(
             global_metrics().search.record_v3_query(latency_us, false);
             return finish_scoped_response(raw_results, query, options, assistance.clone());
         }
+        maybe_record_v3_fallback(engine, query);
         // No lexical bridge available yet → fall through to legacy FTS.
     }
 
@@ -802,7 +1036,11 @@ pub async fn execute_search(
     // Step 2: Acquire connection
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Err(e) => {
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+            record_legacy_error_metrics("search_service", latency_us, options.track_telemetry);
+            return Outcome::Err(e);
+        }
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
@@ -812,7 +1050,11 @@ pub async fn execute_search(
 
     let rows = match rows_out {
         Outcome::Ok(r) => r,
-        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Err(e) => {
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+            record_legacy_error_metrics("search_service", latency_us, options.track_telemetry);
+            return Outcome::Err(e);
+        }
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
@@ -959,7 +1201,11 @@ pub async fn execute_search_simple(
     // Acquire connection
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Err(e) => {
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+            record_legacy_error_metrics("search_service_simple", latency_us, true);
+            return Outcome::Err(e);
+        }
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
@@ -968,7 +1214,11 @@ pub async fn execute_search_simple(
 
     let rows = match rows_out {
         Outcome::Ok(r) => r,
-        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Err(e) => {
+            let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+            record_legacy_error_metrics("search_service_simple", latency_us, true);
+            return Outcome::Err(e);
+        }
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
@@ -1273,6 +1523,37 @@ mod tests {
     }
 
     #[test]
+    fn v3_fallback_records_metric() {
+        let before = global_metrics().snapshot();
+        let query = SearchQuery::messages("fallback-check", 1);
+
+        maybe_record_v3_fallback(SearchEngine::Lexical, &query);
+
+        let after = global_metrics().snapshot();
+        assert!(
+            after.search.fallback_to_legacy_total > before.search.fallback_to_legacy_total,
+            "expected fallback counter to increase (before={}, after={})",
+            before.search.fallback_to_legacy_total,
+            after.search.fallback_to_legacy_total
+        );
+    }
+
+    #[test]
+    fn legacy_error_metrics_record_error_counter() {
+        let before = global_metrics().snapshot();
+
+        record_legacy_error_metrics("search_service_test_error", 321, false);
+
+        let after = global_metrics().snapshot();
+        assert!(
+            after.search.queries_errors_total > before.search.queries_errors_total,
+            "expected error counter to increase (before={}, after={})",
+            before.search.queries_errors_total,
+            after.search.queries_errors_total
+        );
+    }
+
+    #[test]
     fn query_assistance_payload_empty_for_plain_text() {
         let query = SearchQuery::messages("plain text query", 1);
         assert!(query_assistance_payload(&query).is_none());
@@ -1287,5 +1568,62 @@ mod tests {
         assert_eq!(assistance.applied_filter_hints[0].value, "br-123");
         assert_eq!(assistance.did_you_mean.len(), 1);
         assert_eq!(assistance.did_you_mean[0].suggested_field, "from");
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn two_tier_entry_contract() {
+        let config = TwoTierConfig::default();
+        let mut index = TwoTierIndex::new(&config);
+
+        let entry = TwoTierEntry {
+            doc_id: 9,
+            doc_kind: SearchDocKind::Message,
+            project_id: Some(42),
+            fast_embedding: vec![half::f16::from_f32(0.01); config.fast_dimension],
+            quality_embedding: vec![half::f16::from_f32(0.02); config.quality_dimension],
+        };
+
+        index
+            .add_entry(entry)
+            .expect("two-tier entry should be accepted with matching dimensions");
+
+        let hits = index.search_fast(&vec![0.01_f32; config.fast_dimension], 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, 9);
+        assert_eq!(hits[0].doc_kind, SearchDocKind::Message);
+        assert_eq!(hits[0].project_id, Some(42));
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_enqueue_auto_initializes_bridge_and_tracks_dedup() {
+        assert!(enqueue_semantic_document(
+            DocKind::Message,
+            4242,
+            Some(7),
+            "Initial subject",
+            "Initial body"
+        ));
+        assert!(enqueue_semantic_document(
+            DocKind::Message,
+            4242,
+            Some(7),
+            "Updated subject",
+            "Updated body"
+        ));
+
+        let snapshot =
+            semantic_indexing_snapshot().expect("semantic indexing bridge should be initialized");
+        assert!(snapshot.queue.total_enqueued >= 1);
+        assert!(snapshot.queue.total_deduped >= 1);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn try_two_tier_search_lazy_initializes_bridge() {
+        let query = SearchQuery::messages("auto-init semantic bridge", 1);
+        let _ = try_two_tier_search(&query, query.effective_limit());
+        assert!(get_two_tier_bridge().is_some());
     }
 }
