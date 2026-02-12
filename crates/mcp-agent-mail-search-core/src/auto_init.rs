@@ -161,13 +161,13 @@ impl TwoTierContext {
 
     /// Get fast embedder info (if available).
     #[must_use]
-    pub fn fast_info(&self) -> Option<&EmbedderInfo> {
+    pub const fn fast_info(&self) -> Option<&EmbedderInfo> {
         self.fast_info.as_ref()
     }
 
     /// Get quality embedder info (if available).
     #[must_use]
-    pub fn quality_info(&self) -> Option<&EmbedderInfo> {
+    pub const fn quality_info(&self) -> Option<&EmbedderInfo> {
         self.quality_info.as_ref()
     }
 

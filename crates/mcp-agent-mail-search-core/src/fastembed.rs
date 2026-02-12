@@ -90,6 +90,7 @@ impl FastEmbedEmbedder {
         let embeddings = model
             .embed(vec![text], None)
             .map_err(|e| SearchError::Internal(format!("fastembed embed failed: {e}")))?;
+        drop(model);
 
         let mut embedding = embeddings.into_iter().next().ok_or_else(|| {
             SearchError::Internal("fastembed returned no embedding".to_string())

@@ -10,7 +10,7 @@
 //!
 //! # File Format
 //!
-//! - `tokenizer.json` - HuggingFace tokenizer
+//! - `tokenizer.json` - `HuggingFace` tokenizer
 //! - `model.safetensors` - Static embedding weights
 //! - `config.json` - Model configuration (optional)
 

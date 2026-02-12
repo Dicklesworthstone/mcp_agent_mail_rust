@@ -330,13 +330,13 @@ impl TwoTierIndex {
 
     /// Get the number of documents in the index.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.metadata.doc_count
     }
 
     /// Check if the index is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.metadata.doc_count == 0
     }
 
@@ -459,8 +459,7 @@ impl TwoTierIndex {
             .iter()
             .map(|&idx| {
                 self.quality_embedding(idx)
-                    .map(|emb| dot_product_f16_simd(emb, query_vec))
-                    .unwrap_or(0.0)
+                    .map_or(0.0, |emb| dot_product_f16_simd(emb, query_vec))
             })
             .collect()
     }
@@ -618,7 +617,7 @@ pub fn blend_scores(fast: &[f32], quality: &[f32], quality_weight: f32) -> Vec<f
     fast_norm
         .iter()
         .zip(quality_norm.iter())
-        .map(|(&f, &q)| (1.0 - quality_weight) * f + quality_weight * q)
+        .map(|(&f, &q)| (1.0 - quality_weight).mul_add(f, quality_weight * q))
         .collect()
 }
 
@@ -720,6 +719,7 @@ struct TwoTierSearchIter<'a> {
 }
 
 impl<'a> TwoTierSearchIter<'a> {
+    #[allow(clippy::missing_const_for_fn)]
     fn new(searcher: &'a TwoTierSearcher<'a>, query: String, k: usize) -> Self {
         Self {
             searcher,
@@ -744,6 +744,7 @@ impl Iterator for TwoTierSearchIter<'_> {
                 match self.searcher.fast_embedder.embed(&self.query) {
                     Ok(query_vec) => {
                         let results = self.searcher.index.search_fast(&query_vec, self.k);
+                        #[allow(clippy::cast_possible_truncation)]
                         let latency_ms = start.elapsed().as_millis() as u64;
                         self.fast_results = Some(results.clone());
 
@@ -789,7 +790,9 @@ impl Iterator for TwoTierSearchIter<'_> {
                             .unwrap_or_default();
 
                         // If we have fast results, blend scores; otherwise full quality search
-                        let results = if !candidates.is_empty() {
+                        let results = if candidates.is_empty() {
+                            self.searcher.index.search_quality(&query_vec, self.k)
+                        } else {
                             let fast_results = self.fast_results.as_ref().unwrap();
                             let quality_scores = self
                                 .searcher
@@ -806,7 +809,7 @@ impl Iterator for TwoTierSearchIter<'_> {
                                     doc_id: fast.doc_id,
                                     doc_kind: fast.doc_kind,
                                     project_id: fast.project_id,
-                                    score: (1.0 - weight) * fast.score + weight * quality,
+                                    score: (1.0 - weight).mul_add(fast.score, weight * quality),
                                 })
                                 .collect();
 
@@ -816,10 +819,9 @@ impl Iterator for TwoTierSearchIter<'_> {
                             });
                             blended.truncate(self.k);
                             blended
-                        } else {
-                            self.searcher.index.search_quality(&query_vec, self.k)
                         };
 
+                        #[allow(clippy::cast_possible_truncation)]
                         let latency_ms = start.elapsed().as_millis() as u64;
                         Some(SearchPhase::Refined {
                             results,

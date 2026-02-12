@@ -659,6 +659,15 @@ pub fn format_plan_human(plan: &DeploymentPlan) -> String {
 mod tests {
     use super::*;
 
+    fn normalize_snapshot_text(text: &str) -> String {
+        let mut out = String::new();
+        for line in text.replace("\r\n", "\n").lines() {
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn validate_inputs_empty_ok() {
         let inputs = WizardInputs::default();
@@ -796,5 +805,52 @@ mod tests {
         assert!(output.contains("Test step"));
         assert!(output.contains("echo test"));
         assert!(output.contains("https://example.github.io/repo"));
+    }
+
+    #[test]
+    fn format_plan_human_matches_snapshot() {
+        let plan = DeploymentPlan {
+            provider: HostingProvider::GithubPages,
+            bundle_path: PathBuf::from("/tmp/bundle"),
+            steps: vec![
+                PlanStep {
+                    index: 1,
+                    id: "prepare".to_string(),
+                    description: "Prepare workflow".to_string(),
+                    command: Some("echo prepare".to_string()),
+                    optional: true,
+                    requires_confirm: true,
+                },
+                PlanStep {
+                    index: 2,
+                    id: "deploy".to_string(),
+                    description: "Deploy bundle".to_string(),
+                    command: Some("gh workflow run deploy.yml".to_string()),
+                    optional: false,
+                    requires_confirm: false,
+                },
+            ],
+            expected_url: Some("https://example.github.io/repo".to_string()),
+            generated_files: vec![
+                PathBuf::from("/tmp/bundle/.nojekyll"),
+                PathBuf::from("/tmp/bundle/_headers"),
+            ],
+            warnings: vec![
+                "Ensure Pages source is set to GitHub Actions".to_string(),
+                "First deployment may take a few minutes".to_string(),
+            ],
+        };
+
+        let expected = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/plan_human_github_snapshot.txt"
+        ));
+        let actual = format_plan_human(&plan);
+
+        assert_eq!(
+            normalize_snapshot_text(expected),
+            normalize_snapshot_text(&actual),
+            "format_plan_human snapshot drift"
+        );
     }
 }
