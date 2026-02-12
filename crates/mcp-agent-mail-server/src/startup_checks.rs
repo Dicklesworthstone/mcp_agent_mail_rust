@@ -960,6 +960,48 @@ mod tests {
     }
 
     #[test]
+    fn check_port_status_detects_agent_mail_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).expect("read request line");
+                if bytes == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+
+            let body = r#"{"status":"healthy"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Server: mcp-agent-mail-test\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write health response");
+            stream.flush().expect("flush health response");
+        });
+
+        let status = check_port_status("127.0.0.1", port);
+        assert!(
+            matches!(status, PortStatus::AgentMailServer),
+            "expected AgentMailServer, got {status:?}"
+        );
+
+        server_thread.join().expect("join test server");
+    }
+
+    #[test]
     fn probe_port_passes_when_free() {
         // Find an available port
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");

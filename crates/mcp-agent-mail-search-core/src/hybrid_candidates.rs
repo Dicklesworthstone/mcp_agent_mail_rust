@@ -86,16 +86,16 @@ impl QueryClass {
 /// Tunables for candidate budget derivation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CandidateBudgetConfig {
-    /// Base lexical multiplier in explicit hybrid mode.
-    pub hybrid_lexical_multiplier: f64,
-    /// Base semantic multiplier in explicit hybrid mode.
-    pub hybrid_semantic_multiplier: f64,
-    /// Base lexical multiplier in auto mode.
-    pub auto_lexical_multiplier: f64,
-    /// Base semantic multiplier in auto mode.
-    pub auto_semantic_multiplier: f64,
-    /// Base lexical multiplier in lexical fallback mode.
-    pub lexical_fallback_multiplier: f64,
+    /// Base lexical multiplier in explicit hybrid mode, scaled by 100.
+    pub hybrid_lexical_bps: u32,
+    /// Base semantic multiplier in explicit hybrid mode, scaled by 100.
+    pub hybrid_semantic_bps: u32,
+    /// Base lexical multiplier in auto mode, scaled by 100.
+    pub auto_lexical_bps: u32,
+    /// Base semantic multiplier in auto mode, scaled by 100.
+    pub auto_semantic_bps: u32,
+    /// Base lexical multiplier in lexical fallback mode, scaled by 100.
+    pub lexical_fallback_bps: u32,
     /// Minimum lexical candidates to request.
     pub min_lexical: usize,
     /// Minimum semantic candidates to request when semantic tier is active.
@@ -112,11 +112,11 @@ impl Default for CandidateBudgetConfig {
     fn default() -> Self {
         Self {
             // Mirrors existing design docs and keeps headroom for downstream RRF/rerank stages.
-            hybrid_lexical_multiplier: 3.0,
-            hybrid_semantic_multiplier: 4.0,
-            auto_lexical_multiplier: 3.0,
-            auto_semantic_multiplier: 3.0,
-            lexical_fallback_multiplier: 4.0,
+            hybrid_lexical_bps: 300,
+            hybrid_semantic_bps: 400,
+            auto_lexical_bps: 300,
+            auto_semantic_bps: 300,
+            lexical_fallback_bps: 400,
             min_lexical: 20,
             min_semantic: 20,
             max_lexical: 1_000,
@@ -146,34 +146,34 @@ impl CandidateBudget {
         query_class: QueryClass,
         config: CandidateBudgetConfig,
     ) -> Self {
+        const SCALE: u64 = 100;
         let requested_limit = requested_limit.clamp(1, 1_000);
 
-        let (base_lexical, base_semantic) = match mode {
-            CandidateMode::Hybrid => (
-                config.hybrid_lexical_multiplier,
-                config.hybrid_semantic_multiplier,
-            ),
-            CandidateMode::Auto => (
-                config.auto_lexical_multiplier,
-                config.auto_semantic_multiplier,
-            ),
-            CandidateMode::LexicalFallback => (config.lexical_fallback_multiplier, 0.0),
+        let (base_lexical_bps, base_semantic_bps) = match mode {
+            CandidateMode::Hybrid => (config.hybrid_lexical_bps, config.hybrid_semantic_bps),
+            CandidateMode::Auto => (config.auto_lexical_bps, config.auto_semantic_bps),
+            CandidateMode::LexicalFallback => (config.lexical_fallback_bps, 0),
         };
 
-        let (class_lexical, class_semantic) = match query_class {
-            QueryClass::Identifier => (1.5, 0.5),
-            QueryClass::ShortKeyword => (1.25, 0.75),
-            QueryClass::NaturalLanguage => (0.9, 1.35),
-            QueryClass::Empty => (1.0, 0.0),
+        let (class_lexical_bps, class_semantic_bps) = match query_class {
+            QueryClass::Identifier => (150_u32, 50_u32),
+            QueryClass::ShortKeyword => (125_u32, 75_u32),
+            QueryClass::NaturalLanguage => (90_u32, 135_u32),
+            QueryClass::Empty => (100_u32, 0_u32),
         };
 
-        let lexical_raw = ((requested_limit as f64) * base_lexical * class_lexical).ceil() as usize;
-        let semantic_raw =
-            ((requested_limit as f64) * base_semantic * class_semantic).ceil() as usize;
+        let lexical_raw =
+            scaled_ceil_limit(requested_limit, base_lexical_bps, class_lexical_bps, SCALE);
+        let semantic_raw = scaled_ceil_limit(
+            requested_limit,
+            base_semantic_bps,
+            class_semantic_bps,
+            SCALE,
+        );
 
         let lexical_limit = lexical_raw.clamp(config.min_lexical, config.max_lexical);
 
-        let semantic_limit = if base_semantic == 0.0 {
+        let semantic_limit = if base_semantic_bps == 0 || class_semantic_bps == 0 {
             0
         } else {
             semantic_raw.clamp(config.min_semantic, config.max_semantic)
@@ -189,6 +189,23 @@ impl CandidateBudget {
             combined_limit,
         }
     }
+}
+
+fn scaled_ceil_limit(
+    requested_limit: usize,
+    base_multiplier: u32,
+    class_multiplier: u32,
+    scale: u64,
+) -> usize {
+    let requested = u64::try_from(requested_limit).unwrap_or(u64::MAX);
+    let numerator = requested
+        .saturating_mul(u64::from(base_multiplier))
+        .saturating_mul(u64::from(class_multiplier));
+    let denominator = scale.saturating_mul(scale).max(1);
+    let rounded_up = numerator
+        .saturating_add(denominator.saturating_sub(1))
+        .saturating_div(denominator);
+    usize::try_from(rounded_up).unwrap_or(usize::MAX)
 }
 
 /// A candidate hit produced by a retrieval stage.

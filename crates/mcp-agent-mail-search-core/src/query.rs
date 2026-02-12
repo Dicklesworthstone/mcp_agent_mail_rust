@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::document::DocKind;
 
 /// Which search algorithm to use
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
     /// Full-text lexical search (FTS5 or Tantivy)

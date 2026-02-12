@@ -121,7 +121,7 @@ fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
 }
 
 #[cfg(not(feature = "search-v3"))]
-fn try_tantivy_search(_query: &SearchQuery) -> Option<Vec<SearchResult>> {
+const fn try_tantivy_search(_query: &SearchQuery) -> Option<Vec<SearchResult>> {
     None
 }
 
@@ -136,7 +136,7 @@ fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<Search
 }
 
 #[cfg(not(feature = "search-v3"))]
-fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
+const fn try_semantic_search(_query: &SearchQuery, _limit: usize) -> Option<Vec<SearchResult>> {
     None
 }
 
@@ -271,6 +271,7 @@ fn log_shadow_comparison(
 /// # Errors
 ///
 /// Returns `DbError` on database or pool errors.
+#[allow(clippy::too_many_lines)]
 pub async fn execute_search(
     cx: &Cx,
     pool: &DbPool,

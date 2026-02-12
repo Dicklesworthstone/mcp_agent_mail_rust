@@ -136,6 +136,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 - [x] Recovery runbook: SQLite corruption, archive rebuild
 - [x] ADR-001: dual-mode invariants documented
 - [x] Migration guide: before/after command mappings
+- [x] Legacy script shim deprecation/rollback policy documented (`docs/SPEC-script-migration-matrix.md`, T10.5)
 - [x] Rollout playbook: phased plan + kill-switch procedure
 - [x] AGENTS.md: dual-mode reminder for agents
 - [x] Verify-live contract + compatibility strategy documented (`docs/SPEC-verify-live-contract.md`)
@@ -161,6 +162,10 @@ ls tests/artifacts/dual_mode/*/steps/step_*.json | wc -l
 # 4. Golden snapshot checksums are current
 bash scripts/bench_golden.sh validate
 # All checksums must match
+
+# 4b. Legacy shim emits deprecation and forwards to native command
+PATH="/data/tmp/cargo-target/release:$PATH" legacy/hooks/check_inbox.sh --help
+# Must print deprecation guidance, then native `am check-inbox` help output
 
 # 5. Verify-live E2E artifacts exist (native path authoritative)
 bash tests/e2e/test_share_verify_live.sh

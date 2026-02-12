@@ -24,7 +24,9 @@ pub mod query;
 pub mod results;
 pub mod updater;
 
+pub mod cache;
 pub mod filter_compiler;
+pub mod fusion;
 pub mod hybrid_candidates;
 pub mod lexical_parser;
 pub mod lexical_response;
@@ -62,9 +64,19 @@ pub use query::{DateRange, ImportanceFilter, SearchFilter, SearchMode, SearchQue
 pub use results::{ExplainReport, HighlightRange, SearchHit, SearchResults};
 pub use updater::{IncrementalUpdater, UpdaterConfig, UpdaterStats, deduplicate_changes};
 
+pub use cache::{
+    CACHE_MAX_ENTRIES_ENV, CACHE_TTL_SECONDS_ENV, CacheConfig, CacheEntry, CacheInvalidator,
+    CacheMetrics, DEFAULT_CACHE_MAX_ENTRIES, DEFAULT_CACHE_TTL_SECONDS, InvalidationEvent,
+    InvalidationTrigger, QueryCache, QueryCacheKey, WarmResource, WarmState, WarmStatus,
+    WarmWorker, WarmWorkerConfig,
+};
 #[cfg(feature = "tantivy-engine")]
 pub use filter_compiler::{CompiledFilters, compile_filters};
 pub use filter_compiler::{active_filter_count, has_active_filters};
+pub use fusion::{
+    DEFAULT_RRF_K, FusedHit, FusionExplain, FusionResult, RRF_K_ENV_VAR, RrfConfig,
+    SourceContribution, fuse_rrf, fuse_rrf_default,
+};
 pub use hybrid_candidates::{
     CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, CandidatePreparation,
     CandidateSource, CandidateStageCounts, PreparedCandidate, QueryClass, prepare_candidates,

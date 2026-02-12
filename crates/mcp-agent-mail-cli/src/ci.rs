@@ -2019,6 +2019,88 @@ mod tests {
     }
 
     #[test]
+    fn test_gate_report_with_timestamp_is_deterministic() {
+        let timestamp = DateTime::parse_from_rfc3339("2026-02-12T08:00:00Z")
+            .expect("timestamp parse should succeed")
+            .with_timezone(&Utc);
+
+        let report = GateReport::with_timestamp(
+            RunMode::Full,
+            vec![GateResult {
+                name: "Deterministic timestamp gate".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Pass,
+                elapsed_seconds: 1,
+                command: "true".to_string(),
+                stderr_tail: None,
+                error: None,
+            }],
+            timestamp,
+        );
+
+        assert_eq!(report.generated_at, "2026-02-12T08:00:00Z");
+    }
+
+    #[test]
+    fn test_gate_report_compact_json_has_no_newlines() {
+        let report = GateReport::new(
+            RunMode::Full,
+            vec![GateResult {
+                name: "Compact JSON gate".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Pass,
+                elapsed_seconds: 1,
+                command: "true".to_string(),
+                stderr_tail: None,
+                error: None,
+            }],
+        );
+
+        let compact = report
+            .to_json_compact()
+            .expect("compact JSON serialization should work");
+        assert!(!compact.contains('\n'));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&compact).expect("compact JSON must be valid");
+        assert_eq!(parsed["schema_version"], GATE_REPORT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_gate_report_from_json_invalid_payload_errors() {
+        let err = GateReport::from_json("{not valid json").expect_err("must fail");
+        assert!(err.is_syntax() || err.is_data() || err.is_eof());
+    }
+
+    #[test]
+    fn test_gate_report_from_file_invalid_data_kind() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file should create");
+        std::fs::write(tmp.path(), b"not-json").expect("write should succeed");
+
+        let err = GateReport::from_file(tmp.path()).expect_err("must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_gate_report_failure_summary_uses_first_stderr_line_only() {
+        let report = GateReport::new(
+            RunMode::Full,
+            vec![GateResult {
+                name: "Failing gate".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Fail,
+                elapsed_seconds: 1,
+                command: "false".to_string(),
+                stderr_tail: Some("first line\nsecond line\nthird line".to_string()),
+                error: Some(GateError::simple("first line")),
+            }],
+        );
+
+        let summary = report.failure_summary();
+        assert!(summary.contains("first line"));
+        assert!(!summary.contains("second line"));
+    }
+
+    #[test]
     fn test_gate_report_write_and_read_file() {
         use std::fs;
 

@@ -114,6 +114,29 @@ am guard install "$PROJ"
 am doctor check --json
 ```
 
+### Legacy shim policy (compatibility-only)
+
+Legacy script paths are transitional shims only; native `am` paths are authoritative.
+
+Example mapping:
+
+```bash
+# Legacy compatibility shim (deprecated):
+legacy/hooks/check_inbox.sh --agent "$AGENT_NAME" --rate-limit 120
+
+# Native authoritative path:
+am check-inbox --agent "$AGENT_NAME" --rate-limit 120
+```
+
+Deprecation flow:
+
+1. Announce with before/after mapping and runtime warning.
+2. Shift all CI/runbook examples to native `am`.
+3. Keep shim for a bounded fallback window, then remove after migration audit.
+
+Rollback trigger (shim-first guidance temporarily reinstated) is allowed only for
+confirmed native-path regressions with reproducible artifacts (`stdout/stderr/exit/timing`).
+
 ### CI pipelines
 
 Update your CI to build and test both binaries:

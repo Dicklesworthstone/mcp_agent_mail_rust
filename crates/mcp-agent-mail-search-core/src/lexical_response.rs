@@ -392,6 +392,7 @@ fn build_explanation(
     let raw_bm25 = f64::from(raw_score);
     let query_term_count = query_terms.len();
     let highlight_count = hit.highlight_ranges.len();
+    #[allow(clippy::cast_precision_loss)] // highlight/query counts always small
     let coverage = if query_term_count == 0 {
         0.0
     } else {

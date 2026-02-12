@@ -317,6 +317,36 @@ fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> 
     ProjectRow::from_row(row).map_err(|e| map_sql_error(&e))
 }
 
+fn decode_agent_row(row: &SqlRow) -> std::result::Result<AgentRow, DbError> {
+    // Use named column access for reliability. Positional access can fail when
+    // row metadata doesn't match expected column order.
+    Ok(AgentRow {
+        id: Some(row.get_named("id").unwrap_or(0)),
+        project_id: row.get_named("project_id").unwrap_or(0),
+        name: row.get_named("name").unwrap_or_default(),
+        program: row.get_named("program").unwrap_or_default(),
+        model: row.get_named("model").unwrap_or_default(),
+        task_description: row.get_named("task_description").unwrap_or_default(),
+        inception_ts: row.get_named("inception_ts").unwrap_or(0),
+        last_active_ts: row.get_named("last_active_ts").unwrap_or(0),
+        attachments_policy: row.get_named("attachments_policy").unwrap_or_else(|| "auto".to_string()),
+        contact_policy: row.get_named("contact_policy").unwrap_or_else(|| "auto".to_string()),
+    })
+}
+
+fn find_agent_by_name(
+    rows: &[SqlRow],
+    name: &str,
+) -> std::result::Result<Option<AgentRow>, DbError> {
+    for r in rows {
+        let row = decode_agent_row(r)?;
+        if row.name == name {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
 /// `SQLite` default `SQLITE_MAX_VARIABLE_NUMBER` is 999 (32766 in newer builds).
 /// We cap IN-clause item counts well below that to prevent excessively large
 /// SQL strings and parameter arrays from untrusted input.
@@ -690,14 +720,18 @@ pub async fn register_agent(
 
     let task_desc = task_description.unwrap_or_default();
     let attach_pol = attachments_policy.unwrap_or("auto");
-    match map_sql_outcome(
-        select!(AgentRow)
-            .filter(Expr::col("project_id").eq(project_id))
-            .all(cx, &tracked)
-            .await,
-    ) {
-        Outcome::Ok(rows) => {
-            if let Some(mut row) = rows.into_iter().find(|r| r.name == name) {
+
+    // Use raw SQL with explicit column names to avoid ORM row decoding issues
+    let sql = "SELECT id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy FROM agents WHERE project_id = ?";
+    let params = [Value::BigInt(project_id)];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(raw_rows) => {
+            // Decode rows using the fallback decoder
+            let found = match find_agent_by_name(&raw_rows, name) {
+                Ok(r) => r,
+                Err(e) => return Outcome::Err(e),
+            };
+            if let Some(mut row) = found {
                 row.program = program.to_string();
                 row.model = model.to_string();
                 row.task_description = task_desc.to_string();
@@ -713,7 +747,7 @@ pub async fn register_agent(
                     Outcome::Panicked(p) => Outcome::Panicked(p),
                 }
             } else {
-                let mut row = AgentRow {
+                let row = AgentRow {
                     id: None,
                     project_id,
                     name: name.to_string(),
@@ -726,10 +760,31 @@ pub async fn register_agent(
                     contact_policy: "auto".to_string(),
                 };
                 match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
-                    Outcome::Ok(id) => {
-                        row.id = Some(id);
-                        crate::cache::read_cache().put_agent(&row);
-                        Outcome::Ok(row)
+                    Outcome::Ok(_) => {
+                        // Re-read by name to get actual ID (insert! returns 0 instead of rowid)
+                        let reread_sql = "SELECT id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy FROM agents WHERE project_id = ? AND name = ? LIMIT 1";
+                        let reread_params =
+                            [Value::BigInt(project_id), Value::Text(name.to_string())];
+                        match map_sql_outcome(
+                            traw_query(cx, &tracked, reread_sql, &reread_params).await,
+                        ) {
+                            Outcome::Ok(rows) => {
+                                if let Some(r) = rows.first() {
+                                    match decode_agent_row(r) {
+                                        Ok(fresh) => {
+                                            crate::cache::read_cache().put_agent(&fresh);
+                                            Outcome::Ok(fresh)
+                                        }
+                                        Err(e) => Outcome::Err(e),
+                                    }
+                                } else {
+                                    Outcome::Err(DbError::not_found("Agent", name))
+                                }
+                            }
+                            Outcome::Err(e) => Outcome::Err(e),
+                            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                            Outcome::Panicked(p) => Outcome::Panicked(p),
+                        }
                     }
                     Outcome::Err(e) => Outcome::Err(e),
                     Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -1087,7 +1142,9 @@ pub async fn set_agent_contact_policy(
                     crate::cache::read_cache().put_agent(&row);
                     Outcome::Ok(row)
                 }
-                Outcome::Ok(None) => Outcome::Err(DbError::not_found("Agent", agent_id.to_string())),
+                Outcome::Ok(None) => {
+                    Outcome::Err(DbError::not_found("Agent", agent_id.to_string()))
+                }
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -2254,7 +2311,7 @@ pub struct ProjectUnreadCount {
 
 /// Count unread messages per project for a given agent name.
 ///
-/// Returns a list of (project_id, project_slug, unread_count) for all projects
+/// Returns a list of (`project_id`, `project_slug`, `unread_count`) for all projects
 /// where the agent has unread messages.
 pub async fn count_unread_global(
     cx: &Cx,

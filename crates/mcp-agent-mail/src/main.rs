@@ -5,11 +5,14 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::fs;
 use std::io::IsTerminal;
+use std::path::Path;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, env_value};
+use mcp_agent_mail_server::startup_checks::{self, PortStatus};
 use tracing_subscriber::EnvFilter;
 
 /// Runtime interface mode selector for the `mcp-agent-mail` binary.
@@ -81,6 +84,20 @@ enum Commands {
         /// Disable the interactive TUI (headless/CI mode).
         #[arg(long)]
         no_tui: bool,
+
+        /// Read `HTTP_BEARER_TOKEN` fallback from this env file for `serve`.
+        ///
+        /// Process env and regular config loading still take precedence.
+        #[arg(long)]
+        env_file: Option<String>,
+
+        /// Reuse a compatible already-running Agent Mail server on the same host/port.
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_reuse_running")]
+        reuse_running: bool,
+
+        /// Disable reuse checks and always attempt a fresh server start.
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "reuse_running")]
+        no_reuse_running: bool,
     },
 
     /// Show configuration
@@ -197,6 +214,103 @@ fn resolve_serve_http_path(
     }
 }
 
+fn parse_reuse_running_env(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" => true,
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => true,
+    }
+}
+
+fn unquote_env_value(raw: &str) -> &str {
+    if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    }
+}
+
+fn load_env_file_value(path: &Path, key: &str) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut matched: Option<Option<String>> = None;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let normalized = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let (lhs, rhs) = normalized.split_once('=')?;
+        if lhs.trim() != key {
+            continue;
+        }
+        let value = unquote_env_value(rhs.trim()).trim().to_string();
+        if value.is_empty() {
+            matched = Some(None);
+            continue;
+        }
+        matched = Some(Some(value));
+    }
+    matched.flatten()
+}
+
+fn resolve_http_bearer_token_for_serve(
+    current_token: Option<&str>,
+    env_file: Option<&str>,
+) -> Option<String> {
+    if current_token.is_some_and(|token| !token.trim().is_empty()) {
+        return None;
+    }
+    let path = env_file?;
+    load_env_file_value(Path::new(path), "HTTP_BEARER_TOKEN")
+}
+
+fn resolve_reuse_running_setting(
+    reuse_running_flag: bool,
+    no_reuse_running_flag: bool,
+    env_override: Option<&str>,
+) -> bool {
+    if reuse_running_flag {
+        return true;
+    }
+    if no_reuse_running_flag {
+        return false;
+    }
+    parse_reuse_running_env(env_override)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReusePreflightDecision {
+    Proceed,
+    ReusedExistingServer,
+    PortOccupiedByOtherProcess { description: String },
+}
+
+fn decide_reuse_preflight(
+    reuse_running_enabled: bool,
+    port_status: PortStatus,
+) -> ReusePreflightDecision {
+    if !reuse_running_enabled {
+        return ReusePreflightDecision::Proceed;
+    }
+
+    match port_status {
+        PortStatus::Free => ReusePreflightDecision::Proceed,
+        PortStatus::AgentMailServer => ReusePreflightDecision::ReusedExistingServer,
+        PortStatus::OtherProcess { description } => {
+            ReusePreflightDecision::PortOccupiedByOtherProcess { description }
+        }
+        PortStatus::Error { .. } => ReusePreflightDecision::Proceed,
+    }
+}
+
 fn main() {
     // Decide runtime mode before setting up logging or parsing the MCP CLI.
     // This ensures `--help` renders the correct surface and avoids polluting CLI-mode output.
@@ -255,6 +369,9 @@ fn main() {
             path,
             transport,
             no_tui,
+            env_file,
+            reuse_running,
+            no_reuse_running,
         }) => {
             let mut config = config;
             let host_cli = host.is_some();
@@ -271,6 +388,43 @@ fn main() {
             let resolved_path =
                 resolve_serve_http_path(path.as_deref(), transport, env_value("HTTP_PATH"));
             config.http_path = resolved_path.path;
+            if let Some(token) = resolve_http_bearer_token_for_serve(
+                config.http_bearer_token.as_deref(),
+                env_file.as_deref(),
+            ) {
+                config.http_bearer_token = Some(token);
+            }
+            let reuse_running_enabled = resolve_reuse_running_setting(
+                reuse_running,
+                no_reuse_running,
+                env_value("AM_REUSE_RUNNING").as_deref(),
+            );
+
+            let preflight_decision = decide_reuse_preflight(
+                reuse_running_enabled,
+                startup_checks::check_port_status(&config.http_host, config.http_port),
+            );
+            match preflight_decision {
+                ReusePreflightDecision::Proceed => {}
+                ReusePreflightDecision::ReusedExistingServer => {
+                    eprintln!(
+                        "am: reusing existing Agent Mail server on {}:{}.",
+                        config.http_host, config.http_port
+                    );
+                    return;
+                }
+                ReusePreflightDecision::PortOccupiedByOtherProcess { description } => {
+                    eprintln!(
+                        "am: port {} is in use by a non-Agent-Mail process on {}.",
+                        config.http_port, config.http_host
+                    );
+                    if !description.trim().is_empty() {
+                        eprintln!("am: {description}");
+                    }
+                    eprintln!("am: free the port or choose a different one with --port.");
+                    std::process::exit(2);
+                }
+            }
 
             // Build and display startup diagnostics
             let mut summary = config.bootstrap_summary();
@@ -438,6 +592,189 @@ mod tests {
         assert_eq!(ServeTransport::Auto.explicit_path(), None);
         assert_eq!(ServeTransport::Mcp.explicit_path(), Some("/mcp/"));
         assert_eq!(ServeTransport::Api.explicit_path(), Some("/api/"));
+    }
+
+    #[test]
+    fn serve_command_reuse_flags_parse_and_conflict() {
+        let cli = Cli::try_parse_from([
+            "mcp-agent-mail",
+            "serve",
+            "--env-file",
+            "/tmp/custom-agent-mail.env",
+        ])
+        .expect("should parse env-file");
+        match cli.command {
+            Some(Commands::Serve { env_file, .. }) => {
+                assert_eq!(env_file.as_deref(), Some("/tmp/custom-agent-mail.env"));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["mcp-agent-mail", "serve", "--no-reuse-running"])
+            .expect("should parse");
+        match cli.command {
+            Some(Commands::Serve {
+                reuse_running,
+                no_reuse_running,
+                ..
+            }) => {
+                assert!(!reuse_running);
+                assert!(no_reuse_running);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+
+        let err = match Cli::try_parse_from([
+            "mcp-agent-mail",
+            "serve",
+            "--reuse-running",
+            "--no-reuse-running",
+        ]) {
+            Ok(_) => panic!("conflicting flags should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parse_reuse_running_env_defaults_to_true() {
+        assert!(parse_reuse_running_env(None));
+        assert!(parse_reuse_running_env(Some("")));
+        assert!(parse_reuse_running_env(Some("1")));
+        assert!(parse_reuse_running_env(Some("true")));
+        assert!(parse_reuse_running_env(Some("yes")));
+        assert!(parse_reuse_running_env(Some("on")));
+    }
+
+    #[test]
+    fn parse_reuse_running_env_handles_falsey_values() {
+        assert!(!parse_reuse_running_env(Some("0")));
+        assert!(!parse_reuse_running_env(Some("false")));
+        assert!(!parse_reuse_running_env(Some("no")));
+        assert!(!parse_reuse_running_env(Some("off")));
+    }
+
+    #[test]
+    fn resolve_reuse_running_setting_prioritizes_cli_flags() {
+        assert!(resolve_reuse_running_setting(true, false, Some("0")));
+        assert!(!resolve_reuse_running_setting(false, true, Some("1")));
+        assert!(resolve_reuse_running_setting(false, false, Some("1")));
+        assert!(!resolve_reuse_running_setting(false, false, Some("0")));
+    }
+
+    #[test]
+    fn decide_reuse_preflight_maps_port_status() {
+        assert_eq!(
+            decide_reuse_preflight(
+                false,
+                PortStatus::OtherProcess {
+                    description: "x".to_string()
+                }
+            ),
+            ReusePreflightDecision::Proceed
+        );
+
+        assert_eq!(
+            decide_reuse_preflight(true, PortStatus::Free),
+            ReusePreflightDecision::Proceed
+        );
+        assert_eq!(
+            decide_reuse_preflight(true, PortStatus::AgentMailServer),
+            ReusePreflightDecision::ReusedExistingServer
+        );
+        assert_eq!(
+            decide_reuse_preflight(
+                true,
+                PortStatus::OtherProcess {
+                    description: "other".to_string(),
+                },
+            ),
+            ReusePreflightDecision::PortOccupiedByOtherProcess {
+                description: "other".to_string(),
+            }
+        );
+        assert_eq!(
+            decide_reuse_preflight(
+                true,
+                PortStatus::Error {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    message: "denied".to_string(),
+                },
+            ),
+            ReusePreflightDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn resolve_http_bearer_token_for_serve_loads_from_custom_env_file() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        fs::write(
+            tmp.path(),
+            "export HTTP_BEARER_TOKEN='token-from-custom-env'\n",
+        )
+        .expect("write env file");
+        let resolved = resolve_http_bearer_token_for_serve(None, tmp.path().to_str());
+        assert_eq!(resolved.as_deref(), Some("token-from-custom-env"));
+    }
+
+    #[test]
+    fn resolve_http_bearer_token_for_serve_does_not_override_existing_token() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        fs::write(tmp.path(), "HTTP_BEARER_TOKEN=token-from-file\n").expect("write env file");
+        let resolved =
+            resolve_http_bearer_token_for_serve(Some("from-process-env"), tmp.path().to_str());
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn load_env_file_value_handles_double_quoted_values() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        fs::write(tmp.path(), "HTTP_BEARER_TOKEN=\"quoted-token\"\n").expect("write env file");
+        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN");
+        assert_eq!(token.as_deref(), Some("quoted-token"));
+    }
+
+    #[test]
+    fn load_env_file_value_last_match_wins() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        fs::write(
+            tmp.path(),
+            "HTTP_BEARER_TOKEN=first-token\nHTTP_BEARER_TOKEN=second-token\n",
+        )
+        .expect("write env file");
+        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN");
+        assert_eq!(token.as_deref(), Some("second-token"));
+    }
+
+    #[test]
+    fn load_env_file_value_handles_export_and_whitespace() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        fs::write(
+            tmp.path(),
+            "  export HTTP_BEARER_TOKEN =   'trimmed-token'   \n",
+        )
+        .expect("write env file");
+        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN");
+        assert_eq!(token.as_deref(), Some("trimmed-token"));
+    }
+
+    #[test]
+    fn load_env_file_value_treats_empty_last_value_as_absent() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        fs::write(
+            tmp.path(),
+            "HTTP_BEARER_TOKEN=present\nHTTP_BEARER_TOKEN=\n",
+        )
+        .expect("write env file");
+        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN");
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn resolve_http_bearer_token_for_serve_handles_missing_file() {
+        let missing = "/tmp/this-file-should-not-exist-agent-mail.env";
+        let resolved = resolve_http_bearer_token_for_serve(None, Some(missing));
+        assert!(resolved.is_none());
     }
 
     #[test]

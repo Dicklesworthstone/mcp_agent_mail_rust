@@ -1350,7 +1350,7 @@ mod tests {
         assert_eq!(&extended[..3], &[1, 2, 3]);
         // No duplicates
         let mut uniq = extended.clone();
-        uniq.sort();
+        uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), extended.len());
     }

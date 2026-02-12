@@ -99,12 +99,15 @@ seed_data() {
         echo "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${project}\",\"program\":\"claude-code\",\"model\":\"opus-4.6\",\"name\":\"BlueLake\",\"task_description\":\"E2E testing\"}}}"
         sleep 0.2
         echo "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${project}\",\"program\":\"codex-cli\",\"model\":\"gpt-5.2\",\"name\":\"RedFox\",\"task_description\":\"E2E testing\"}}}"
-        sleep 0.2
-        # Send a message
-        echo "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message\",\"body_md\":\"This is a test message for robot E2E validation.\",\"importance\":\"high\"}}}"
-        sleep 0.2
+        sleep 0.3
+        # Set RedFox's contact policy to "open" so anyone can message them
+        echo "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"RedFox\",\"policy\":\"open\"}}}"
+        sleep 0.3
+        # Send a message (now allowed since RedFox accepts all contacts)
+        echo "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message\",\"body_md\":\"This is a test message for robot E2E validation.\",\"importance\":\"high\"}}}"
+        sleep 0.3
         # Create a file reservation
-        echo "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"paths\":[\"src/test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"E2E test\"}}}"
+        echo "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"paths\":[\"src/test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"E2E test\"}}}"
         sleep 0.2
     } > "$fifo" &
     local write_pid=$!

@@ -79,6 +79,12 @@ workflows to native Rust commands.
 | `toon_stub_encoder.sh` | -- | **Retained** | Test stub; not operational |
 | `toon_stub_encoder_fail.sh` | -- | **Retained** | Test stub; not operational |
 
+### Legacy Compatibility Hooks
+
+| Script | Native Equivalent | Status | Notes |
+|--------|-------------------|--------|-------|
+| `legacy/hooks/check_inbox.sh` | `am check-inbox` | **Migrated** | Compatibility shim only; emits deprecation warning and forwards all args to native command |
+
 ---
 
 ## Tests Directory (`tests/e2e/`)
@@ -223,6 +229,61 @@ Governance use:
 
 ---
 
+## Deprecation and Rollback Policy (T10.5)
+
+This policy governs every legacy script shim that remains after native command migration.
+
+### Authoritative Path
+
+- Native `am` commands are authoritative.
+- Legacy script shims are compatibility-only and must emit explicit deprecation guidance.
+- Any discrepancy between shim behavior and native output is treated as a migration bug.
+
+### Deprecation Stages
+
+| Stage | Operator expectation | Minimum window |
+|-------|----------------------|----------------|
+| **Stage A: Announce** | Before/after command mapping published, shim warns at runtime | 1 release cycle |
+| **Stage B: Default Shift** | CI/runbook examples use native path only; shim remains as fallback | 30 days |
+| **Stage C: Removal Eligible** | Shim callers audited/migrated; rollback plan validated | 1 release cycle after Stage B |
+
+### Fallback and Rollback Conditions
+
+Rollback to shim-first guidance is allowed only when a native-path regression is confirmed:
+
+- P0/P1 operational breakage in native command path.
+- Deterministic correctness mismatch versus prior shim contract.
+- Security/privacy regression requiring immediate mitigation.
+
+If rollback is triggered:
+
+1. Open incident bead linked to failing command/thread.
+2. Re-enable compatibility guidance in runbook + release checklist.
+3. Capture reproduction artifacts (command/stdout/stderr/exit/timing) in `tests/artifacts/`.
+4. Publish recovery ETA and owner; re-run migration gates before returning to native-first.
+
+### Operator Troubleshooting Baseline
+
+- Prefer native reproduction first:
+  - `am <command> --help`
+  - `RUST_LOG=debug am <command> ...`
+- For shim behavior:
+  - run shim once with current args
+  - compare output/exit code against native invocation
+- Debug artifact locations:
+  - `tests/artifacts/` (suite-level machine-readable traces)
+  - command-specific E2E suites under `tests/e2e/`
+
+### Verification Checklist (Re-audit Ready)
+
+- [ ] Every retained shim prints deprecation + native replacement mapping.
+- [ ] Migration guide examples are native-first and do not require script-first paths.
+- [ ] Release checklist references rollback trigger/steps and artifact evidence requirements.
+- [ ] CI/gate commands remain native-first with no contradictory script-only workflow.
+- [ ] At least one deterministic reproduction path exists per shim.
+
+---
+
 ## Summary
 
 | Category | Migrated | Partial | Gap | Retained |
@@ -230,11 +291,12 @@ Governance use:
 | Server/Wrappers | 0 | 0 | 0 | 1 |
 | CI/Quality | 0 | 0 | 3 | 0 |
 | Flake Triage | 1 | 0 | 0 | 0 |
+| Legacy Hooks | 1 | 0 | 0 | 0 |
 | E2E Harnesses | 0 | 0 | 0 | 15 |
 | TUI Tests | 0 | 0 | 0 | 5 |
 | Utility | 0 | 0 | 0 | 2 |
 | tests/e2e/ | 0 | 0 | 0 | 30 |
-| **Total** | **1** | **0** | **3** | **53** |
+| **Total** | **2** | **0** | **3** | **53** |
 
 ### Key Insights
 
@@ -251,6 +313,9 @@ Governance use:
 
 4. **`flake_triage.sh` is fully migrated** to `am flake-triage` with subcommands
    `scan`, `reproduce`, and `detect`.
+
+5. **Legacy `check_inbox` hook path is compatibility-only** and now delegates to
+   native `am check-inbox` with explicit deprecation messaging.
 
 ---
 

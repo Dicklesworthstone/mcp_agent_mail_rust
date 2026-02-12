@@ -659,7 +659,8 @@ mod tests {
         .expect("result");
 
         assert!((result.mean_ms - 4.25).abs() < 0.001);
-        assert!((result.median_ms - 3.0).abs() < 0.001);
+        // Nearest-rank interpolation: idx = round(0.5 * 3) = 2 → sorted_values[2] = 4.0
+        assert!((result.median_ms - 4.0).abs() < 0.001);
         assert!((result.p95_ms - 10.0).abs() < 0.001);
         assert!(result.baseline.regression);
         assert_eq!(result.baseline.delta_p95_ms, Some(3.0));

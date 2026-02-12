@@ -3617,4 +3617,166 @@ mod tests {
 
         assert_eq!(row.height(), 1);
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Performance benchmarks for virtualized rendering (br-2bbt.3)
+    // ────────────────────────────────────────────────────────────────
+
+    /// Benchmark: TimelineDataProvider with 10,000 events.
+    ///
+    /// Acceptance criteria from br-2bbt.3:
+    /// - Frame render at p95: <16ms with 10,000 items in data source
+    /// - Scroll latency: <1 frame
+    ///
+    /// This test measures the DataProvider.window() operation which is the
+    /// critical path for VirtualizedList frame rendering. The actual rendering
+    /// is handled by ftui_widgets::VirtualizedList which has O(1) complexity
+    /// for visible rows only.
+    #[test]
+    fn perf_virtualized_timeline_10k_events() {
+        use std::time::Instant;
+
+        // Create ring buffer with 10,000 events (mixed types)
+        let ring = Arc::new(EventRingBuffer::with_capacity(10_000));
+        for i in 0..10_000u64 {
+            match i % 5 {
+                0 => {
+                    let _ = ring.push(MailEvent::tool_call_start(
+                        &format!("tool_{}", i % 50),
+                        serde_json::json!({"iter": i}),
+                        Some("proj".to_string()),
+                        Some(format!("Agent{}", i % 10)),
+                    ));
+                }
+                1 => {
+                    let _ = ring.push(MailEvent::tool_call_end(
+                        &format!("tool_{}", i % 50),
+                        i,
+                        None,
+                        5,
+                        0.95,
+                        vec![],
+                        Some("proj".to_string()),
+                        Some(format!("Agent{}", i % 10)),
+                    ));
+                }
+                2 => {
+                    let _ = ring.push(MailEvent::message_sent(
+                        i as i64,
+                        &format!("Agent{}", i % 10),
+                        vec![format!("Agent{}", (i + 1) % 10)],
+                        &format!("Subject {}", i),
+                        &format!("thread-{}", i % 100),
+                        "proj",
+                    ));
+                }
+                3 => {
+                    let _ = ring.push(MailEvent::http_request(
+                        "GET",
+                        &format!("/api/messages/{}", i),
+                        200,
+                        5,
+                        "127.0.0.1",
+                    ));
+                }
+                _ => {
+                    let _ = ring.push(MailEvent::health_pulse(DbStatSnapshot::default()));
+                }
+            }
+        }
+
+        // Create DataProvider and measure initial refresh
+        let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
+        let refresh_start = Instant::now();
+        provider.refresh();
+        let refresh_elapsed = refresh_start.elapsed();
+
+        assert_eq!(provider.total_count(), 10_000);
+        // Initial refresh converts all events - budget 50ms for 10K items
+        assert!(
+            refresh_elapsed.as_millis() < 50,
+            "Initial refresh took too long: {:?} (budget: 50ms)",
+            refresh_elapsed
+        );
+
+        // Benchmark: measure 100 window() calls at different positions
+        // This simulates scrolling through the timeline
+        let mut timings_ns: Vec<u128> = Vec::with_capacity(100);
+        for offset in (0..10_000).step_by(100) {
+            let start = Instant::now();
+            let window = provider.window(offset, 50);
+            let elapsed = start.elapsed();
+            timings_ns.push(elapsed.as_nanos());
+
+            // Window should return up to 50 items (or fewer at end)
+            assert!(window.len() <= 50);
+        }
+
+        // Sort for percentile calculation
+        timings_ns.sort_unstable();
+        let p50_ns = timings_ns[timings_ns.len() / 2];
+        let p95_ns = timings_ns[timings_ns.len() * 95 / 100];
+        let p99_ns = timings_ns[timings_ns.len() * 99 / 100];
+
+        // Convert to microseconds for readable output
+        let p50_us = p50_ns / 1000;
+        let p95_us = p95_ns / 1000;
+        let p99_us = p99_ns / 1000;
+
+        // Acceptance criteria: window() must be sub-millisecond
+        // This ensures the total frame budget of 16ms is achievable
+        // (window() is just one component of the render pipeline)
+        assert!(
+            p95_us < 1000,
+            "window() p95 exceeds 1ms: p50={}µs, p95={}µs, p99={}µs",
+            p50_us,
+            p95_us,
+            p99_us
+        );
+
+        // Log percentiles for CI trend analysis (ignored by default, shown with --nocapture)
+        eprintln!(
+            "[perf] TimelineDataProvider.window() (10K events, 50 visible): \
+             p50={}µs p95={}µs p99={}µs",
+            p50_us, p95_us, p99_us
+        );
+    }
+
+    /// Benchmark: rapid scrolling through 10K events.
+    ///
+    /// Simulates user holding down Page-Down key, which triggers
+    /// rapid window() calls at increasing offsets.
+    #[test]
+    fn perf_rapid_scroll_timeline_10k() {
+        use std::time::Instant;
+
+        // Setup ring buffer with 10,000 events
+        let ring = Arc::new(EventRingBuffer::with_capacity(10_000));
+        for i in 0..10_000u64 {
+            let _ = ring.push(sample_http(&format!("/scroll/{i}"), 200));
+        }
+
+        let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
+        provider.refresh();
+
+        // Simulate rapid scrolling: 200 consecutive window calls
+        let total_start = Instant::now();
+        for page in 0..200 {
+            let offset = (page * 50) % 10_000;
+            let _ = provider.window(offset, 50);
+        }
+        let total_elapsed = total_start.elapsed();
+
+        // 200 scrolls should complete in under 20ms (100µs per scroll average)
+        assert!(
+            total_elapsed.as_millis() < 20,
+            "Rapid scroll (200 pages) took {:?}, budget: 20ms",
+            total_elapsed
+        );
+
+        eprintln!(
+            "[perf] Rapid scroll (200 page transitions): {}ms",
+            total_elapsed.as_millis()
+        );
+    }
 }

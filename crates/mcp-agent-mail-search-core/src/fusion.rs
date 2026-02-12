@@ -182,11 +182,7 @@ pub fn fuse_rrf(
     let total_fused = fused.len();
 
     // Apply pagination after fusion
-    let paginated: Vec<FusedHit> = fused
-        .into_iter()
-        .skip(offset)
-        .take(limit.max(1))
-        .collect();
+    let paginated: Vec<FusedHit> = fused.into_iter().skip(offset).take(limit.max(1)).collect();
 
     FusionResult {
         config,
@@ -247,7 +243,7 @@ pub fn fuse_rrf_default(candidates: &[PreparedCandidate]) -> FusionResult {
 )]
 mod tests {
     use super::*;
-    use crate::hybrid_candidates::{CandidateHit, CandidateBudget, prepare_candidates};
+    use crate::hybrid_candidates::{CandidateBudget, CandidateHit, prepare_candidates};
 
     fn make_candidate(
         doc_id: i64,
@@ -284,8 +280,12 @@ mod tests {
     #[test]
     fn test_overlapping_pools_dedup() {
         // Two pools of 10 docs each, 3 overlapping (docs 5, 6, 7)
-        let lexical: Vec<_> = (1..=10).map(|i| CandidateHit::new(i, 1.0 - i as f64 * 0.1)).collect();
-        let semantic: Vec<_> = (5..=14).map(|i| CandidateHit::new(i, 0.9 - (i - 5) as f64 * 0.1)).collect();
+        let lexical: Vec<_> = (1..=10)
+            .map(|i| CandidateHit::new(i, 1.0 - i as f64 * 0.1))
+            .collect();
+        let semantic: Vec<_> = (5..=14)
+            .map(|i| CandidateHit::new(i, 0.9 - (i - 5) as f64 * 0.1))
+            .collect();
 
         let budget = CandidateBudget {
             lexical_limit: 10,
@@ -302,11 +302,15 @@ mod tests {
         // Overlapping docs (5, 6, 7) should have contributions from both sources
         for hit in &result.hits {
             if hit.doc_id >= 5 && hit.doc_id <= 7 {
-                let lexical_contrib = hit.explain.source_contributions
+                let lexical_contrib = hit
+                    .explain
+                    .source_contributions
                     .iter()
                     .find(|c| c.source == "lexical")
                     .unwrap();
-                let semantic_contrib = hit.explain.source_contributions
+                let semantic_contrib = hit
+                    .explain
+                    .source_contributions
                     .iter()
                     .find(|c| c.source == "semantic")
                     .unwrap();
@@ -349,10 +353,7 @@ mod tests {
 
     #[test]
     fn test_empty_pool_passthrough() {
-        let lexical: Vec<CandidateHit> = vec![
-            CandidateHit::new(1, 0.9),
-            CandidateHit::new(2, 0.8),
-        ];
+        let lexical: Vec<CandidateHit> = vec![CandidateHit::new(1, 0.9), CandidateHit::new(2, 0.8)];
         let semantic: Vec<CandidateHit> = vec![];
 
         let budget = CandidateBudget {
@@ -366,7 +367,12 @@ mod tests {
 
         // All lexical docs should pass through
         assert_eq!(result.total_fused, 2);
-        assert!(result.hits.iter().all(|h| h.explain.semantic_rank.is_none()));
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|h| h.explain.semantic_rank.is_none())
+        );
     }
 
     #[test]
@@ -381,7 +387,8 @@ mod tests {
         assert_eq!(explain.semantic_rank, Some(2));
         assert_eq!(explain.source_contributions.len(), 2);
 
-        let lexical_contrib = explain.source_contributions
+        let lexical_contrib = explain
+            .source_contributions
             .iter()
             .find(|c| c.source == "lexical")
             .unwrap();
@@ -416,10 +423,26 @@ mod tests {
             .map(|i| {
                 make_candidate(
                     i,
-                    if i % 2 == 0 { Some((i / 2) as usize) } else { None },
-                    if i % 3 == 0 { Some((i / 3) as usize) } else { None },
-                    if i % 2 == 0 { Some(1.0 / i as f64) } else { None },
-                    if i % 3 == 0 { Some(0.5 / i as f64) } else { None },
+                    if i % 2 == 0 {
+                        Some((i / 2) as usize)
+                    } else {
+                        None
+                    },
+                    if i % 3 == 0 {
+                        Some((i / 3) as usize)
+                    } else {
+                        None
+                    },
+                    if i % 2 == 0 {
+                        Some(1.0 / i as f64)
+                    } else {
+                        None
+                    },
+                    if i % 3 == 0 {
+                        Some(0.5 / i as f64)
+                    } else {
+                        None
+                    },
                 )
             })
             .collect();
@@ -430,7 +453,10 @@ mod tests {
         for _ in 0..100 {
             let result = fuse_rrf_default(&candidates);
             let order: Vec<i64> = result.hits.iter().map(|h| h.doc_id).collect();
-            assert_eq!(order, first_order, "Ordering should be deterministic across runs");
+            assert_eq!(
+                order, first_order,
+                "Ordering should be deterministic across runs"
+            );
         }
     }
 
@@ -443,16 +469,17 @@ mod tests {
 
     #[test]
     fn test_custom_k_affects_scores() {
-        let candidates = vec![
-            make_candidate(1, Some(1), Some(2), Some(0.9), Some(0.8)),
-        ];
+        let candidates = vec![make_candidate(1, Some(1), Some(2), Some(0.9), Some(0.8))];
 
         // With default k=60
         let default_result = fuse_rrf(&candidates, RrfConfig::default(), 0, 100);
         let default_score = default_result.hits[0].rrf_score;
 
         // With smaller k=10 (higher scores for top ranks)
-        let small_k_config = RrfConfig { k: 10.0, epsilon: 1e-9 };
+        let small_k_config = RrfConfig {
+            k: 10.0,
+            epsilon: 1e-9,
+        };
         let small_k_result = fuse_rrf(&candidates, small_k_config, 0, 100);
         let small_k_score = small_k_result.hits[0].rrf_score;
 
