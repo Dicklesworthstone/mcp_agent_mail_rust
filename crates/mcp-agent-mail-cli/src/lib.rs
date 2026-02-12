@@ -16,6 +16,8 @@ pub mod bench;
 pub mod ci;
 pub mod context;
 pub mod e2e_artifacts;
+pub mod e2e_runner;
+pub mod golden;
 pub mod output;
 pub mod robot;
 
@@ -121,6 +123,12 @@ pub enum Commands {
     },
     Lint,
     Typecheck,
+    /// Run E2E test suites.
+    #[command(name = "e2e")]
+    E2e {
+        #[command(subcommand)]
+        action: E2eCommand,
+    },
     #[command(name = "share")]
     Share {
         #[command(subcommand)]
@@ -484,6 +492,57 @@ pub enum FlakeTriageCommand {
         /// Output as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+
+/// E2E test runner commands (br-8zmc).
+#[derive(Subcommand, Debug)]
+pub enum E2eCommand {
+    /// List available E2E test suites.
+    #[command(name = "list")]
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Show suite details (descriptions, tags).
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+    /// Run E2E test suites.
+    #[command(name = "run")]
+    Run {
+        /// Specific suites to run (runs all if not specified).
+        suites: Vec<String>,
+        /// Include suites matching pattern (repeatable).
+        #[arg(long, short = 'i')]
+        include: Vec<String>,
+        /// Exclude suites matching pattern (repeatable).
+        #[arg(long, short = 'e')]
+        exclude: Vec<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Keep temporary directories.
+        #[arg(long)]
+        keep_tmp: bool,
+        /// Force rebuild before running.
+        #[arg(long)]
+        force_build: bool,
+        /// Project root directory (default: current directory).
+        #[arg(long, short = 'p')]
+        project: Option<PathBuf>,
+        /// Artifact output directory.
+        #[arg(long, short = 'o')]
+        artifacts: Option<PathBuf>,
+        /// Timeout per suite in seconds (default: 600).
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+    /// Show suite details.
+    #[command(name = "show")]
+    Show {
+        /// Suite name to show.
+        suite: String,
     },
 }
 
@@ -1537,6 +1596,7 @@ fn execute(cli: Cli) -> CliResult<()> {
         } => handle_ci(quick, report, json, parallel),
         Commands::Lint => handle_lint(),
         Commands::Typecheck => handle_typecheck(),
+        Commands::E2e { action } => handle_e2e(action),
         Commands::Migrate => handle_migrate(),
         Commands::ListProjects {
             include_agents,
@@ -2760,12 +2820,23 @@ fn handle_flake_triage(action: FlakeTriageCommand) -> CliResult<()> {
             verbose,
             timeout,
         } => {
+            if !artifact.is_file() {
+                return Err(CliError::InvalidArgument(
+                    flake_triage_missing_artifact_hint(&artifact),
+                ));
+            }
             let config = flake_triage::ReproductionConfig {
-                artifact_path: artifact,
+                artifact_path: artifact.clone(),
                 verbose,
                 timeout: std::time::Duration::from_secs(timeout),
             };
-            let result = flake_triage::reproduce_failure(&config)?;
+            let result = flake_triage::reproduce_failure(&config).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    CliError::InvalidArgument(flake_triage_missing_artifact_hint(&artifact))
+                } else {
+                    CliError::Io(err)
+                }
+            })?;
 
             println!("Test:       {}", result.test_name);
             if let Some(seed) = result.seed {
@@ -2826,6 +2897,16 @@ fn handle_flake_triage(action: FlakeTriageCommand) -> CliResult<()> {
             Ok(())
         }
     }
+}
+
+fn flake_triage_missing_artifact_hint(path: &Path) -> String {
+    format!(
+        "artifact not found: {}\n\
+         - Verify the path points to an existing flake artifact file.\n\
+         - Expected artifact filename: failure_context.json\n\
+         - For more information, try '--help'.",
+        path.display()
+    )
 }
 
 fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
@@ -4601,6 +4682,118 @@ fn handle_typecheck() -> CliResult<()> {
         Ok(())
     } else {
         Err(CliError::ExitCode(status.code().unwrap_or(1)))
+    }
+}
+
+/// Handle E2E test runner commands (br-8zmc).
+fn handle_e2e(action: E2eCommand) -> CliResult<()> {
+    use e2e_runner::{RunConfig, Runner, SuiteRegistry};
+
+    let cwd = std::env::current_dir()?;
+
+    match action {
+        E2eCommand::List { json, verbose } => {
+            let registry = SuiteRegistry::new(&cwd)?;
+
+            if json {
+                let suites: Vec<_> = registry.suites().iter().map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "script": s.script_path,
+                        "description": s.description,
+                        "tags": s.tags,
+                        "duration_class": s.duration_class.as_str(),
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&suites).unwrap_or_default());
+            } else {
+                ftui_runtime::ftui_println!("Available E2E test suites ({}):", registry.len());
+                ftui_runtime::ftui_println!("");
+                for suite in registry.suites() {
+                    if verbose {
+                        ftui_runtime::ftui_println!(
+                            "  {} [{}]",
+                            suite.name,
+                            suite.duration_class.as_str()
+                        );
+                        if let Some(desc) = &suite.description {
+                            ftui_runtime::ftui_println!("    {}", desc);
+                        }
+                        if !suite.tags.is_empty() {
+                            ftui_runtime::ftui_println!("    tags: {}", suite.tags.join(", "));
+                        }
+                    } else {
+                        ftui_runtime::ftui_println!("  {}", suite.name);
+                    }
+                }
+            }
+            Ok(())
+        }
+        E2eCommand::Run {
+            suites,
+            include,
+            exclude,
+            json,
+            keep_tmp,
+            force_build,
+            project,
+            artifacts,
+            timeout,
+        } => {
+            let project_root = project.unwrap_or(cwd);
+
+            let config = RunConfig {
+                project_root: project_root.clone(),
+                artifact_dir: artifacts,
+                keep_tmp,
+                force_build,
+                timeout: Some(std::time::Duration::from_secs(timeout)),
+                ..Default::default()
+            };
+
+            let runner = Runner::new(&project_root, config)?;
+
+            // Determine which suites to run
+            let report = if !suites.is_empty() {
+                runner.run(&suites)
+            } else if !include.is_empty() || !exclude.is_empty() {
+                let inc = if include.is_empty() { None } else { Some(include.as_slice()) };
+                let exc = if exclude.is_empty() { None } else { Some(exclude.as_slice()) };
+                runner.run_filtered(inc, exc)
+            } else {
+                runner.run(&[]) // Run all
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            } else {
+                print!("{}", report.format_summary());
+            }
+
+            if report.success() {
+                Ok(())
+            } else {
+                Err(CliError::ExitCode(report.exit_code()))
+            }
+        }
+        E2eCommand::Show { suite } => {
+            let registry = SuiteRegistry::new(&cwd)?;
+
+            if let Some(s) = registry.get(&suite) {
+                ftui_runtime::ftui_println!("Suite: {}", s.name);
+                ftui_runtime::ftui_println!("Script: {}", s.script_path.display());
+                ftui_runtime::ftui_println!("Duration: {}", s.duration_class.as_str());
+                if let Some(desc) = &s.description {
+                    ftui_runtime::ftui_println!("Description: {}", desc);
+                }
+                if !s.tags.is_empty() {
+                    ftui_runtime::ftui_println!("Tags: {}", s.tags.join(", "));
+                }
+                Ok(())
+            } else {
+                Err(CliError::InvalidArgument(format!("Suite not found: {}", suite)))
+            }
+        }
     }
 }
 
@@ -7113,6 +7306,60 @@ mod tests {
     fn rate_limiter_custom_interval() {
         let limiter = CheckInboxRateLimiter::new("TestAgent", Some(60));
         assert_eq!(limiter.interval_secs, 60);
+    }
+
+    #[test]
+    fn rate_limiter_first_check_always_allowed() {
+        // Use unique agent name to avoid interference with other tests
+        let limiter = CheckInboxRateLimiter::new("TestFirstCheck", Some(1));
+        limiter.reset(); // Clean start
+        assert!(
+            limiter.should_check(),
+            "first check should always be allowed"
+        );
+        limiter.reset(); // Clean up
+    }
+
+    #[test]
+    fn rate_limiter_blocks_rapid_checks() {
+        let limiter = CheckInboxRateLimiter::new("TestRapidCheck", Some(60));
+        limiter.reset(); // Clean start
+        assert!(limiter.should_check(), "first check should be allowed");
+        assert!(
+            !limiter.should_check(),
+            "second immediate check should be blocked"
+        );
+        limiter.reset(); // Clean up
+    }
+
+    #[test]
+    fn rate_limiter_disabled_with_zero_interval() {
+        let limiter = CheckInboxRateLimiter::new("TestZeroInterval", Some(0));
+        limiter.reset(); // Clean start
+        assert!(limiter.should_check(), "zero interval: first check allowed");
+        // With interval=0, next check should also be allowed immediately
+        // The condition is elapsed < interval, and 0 < 0 is false, so it proceeds
+        assert!(
+            limiter.should_check(),
+            "zero interval: second check also allowed"
+        );
+        limiter.reset(); // Clean up
+    }
+
+    #[test]
+    fn rate_limiter_reset_clears_state() {
+        let limiter = CheckInboxRateLimiter::new("TestReset", Some(60));
+        limiter.reset(); // Clean start
+        let _ = limiter.should_check(); // Set the lockfile
+        assert!(
+            limiter.lockfile_path().exists(),
+            "lockfile should exist after check"
+        );
+        limiter.reset();
+        assert!(
+            !limiter.lockfile_path().exists(),
+            "lockfile should be removed after reset"
+        );
     }
 
     #[test]
