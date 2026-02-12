@@ -389,18 +389,16 @@ impl DbPool {
                                             }
                                         }
                                     }
+                                    // Always enforce startup cleanup for legacy identity FTS
+                                    // artifacts. These can be reintroduced by historical/full
+                                    // migration paths and have caused post-crash rowid/index
+                                    // mismatch failures (e.g. fts_projects corruption paths).
+                                    if let Err(e) = schema::enforce_base_mode_cleanup(&mig_conn) {
+                                        return Err(Outcome::Err(e));
+                                    }
                                     // Close migration connection first. Some paths can leave
                                     // implicit transaction state when no migrations are applied.
                                     drop(mig_conn);
-
-                                    let cleanup_conn =
-                                        sqlmodel_sqlite::SqliteConnection::open_file(&sqlite_path)
-                                            .map_err(Outcome::<(), SqlError>::Err)?;
-                                    if let Err(e) = schema::enforce_base_mode_cleanup(&cleanup_conn)
-                                    {
-                                        return Err(Outcome::Err(e));
-                                    }
-                                    drop(cleanup_conn);
                                     Ok(())
                                 }
                             })
@@ -1383,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_startup_preserves_identity_fts_artifacts() {
+    fn pool_startup_strips_identity_fts_artifacts() {
         use asupersync::runtime::RuntimeBuilder;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1413,22 +1411,26 @@ mod tests {
         });
         drop(pool);
 
-        // Verify FTS artifacts are present after pool startup
+        // Verify identity FTS artifacts are removed after pool startup.
         let conn = sqlmodel_sqlite::SqliteConnection::open_file(parsed_path).expect("reopen db");
-        let fts_rows = conn
+        let identity_fts_rows = conn
             .query_sync(
                 "SELECT COUNT(*) AS n FROM sqlite_master \
-                 WHERE type='table' AND name IN ('fts_messages', 'fts_agents', 'fts_projects')",
+                 WHERE (type='table' AND name IN ('fts_agents', 'fts_projects')) \
+                    OR (type='trigger' AND name IN (\
+                        'agents_ai', 'agents_ad', 'agents_au', \
+                        'projects_ai', 'projects_ad', 'projects_au'\
+                    ))",
                 &[],
             )
-            .expect("query FTS tables");
-        let fts_count = fts_rows
+            .expect("query identity FTS artifacts");
+        let identity_fts_count = identity_fts_rows
             .first()
             .and_then(|row| row.get_named::<i64>("n").ok())
             .unwrap_or_default();
-        assert!(
-            fts_count >= 1,
-            "pool startup should preserve FTS tables for search functionality, found {fts_count}"
+        assert_eq!(
+            identity_fts_count, 0,
+            "pool startup must remove legacy identity FTS artifacts to avoid rowid corruption regressions"
         );
     }
 }
