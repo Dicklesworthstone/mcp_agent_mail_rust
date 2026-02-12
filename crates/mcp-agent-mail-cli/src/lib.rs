@@ -92,7 +92,10 @@ pub enum Commands {
         /// Query DB directly instead of HTTP (faster for co-located setups).
         #[arg(long)]
         direct: bool,
-        /// Output JSON instead of human-readable format.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
         /// Server host for HTTP mode (default: 127.0.0.1).
@@ -114,7 +117,10 @@ pub enum Commands {
         /// Write JSON report to this path.
         #[arg(long, short = 'r')]
         report: Option<std::path::PathBuf>,
-        /// Output JSON to stdout instead of human-readable format.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
         /// Run independent gates in parallel (faster execution).
@@ -169,6 +175,10 @@ pub enum Commands {
     ListProjects {
         #[arg(long, default_value_t = false)]
         include_agents: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1092,7 +1102,10 @@ pub enum MailCommand {
         /// Thread ID to associate with.
         #[arg(long)]
         thread_id: Option<String>,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1113,7 +1126,10 @@ pub enum MailCommand {
         /// Override recipients (comma-separated; defaults to original sender).
         #[arg(long)]
         to: Option<String>,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1137,7 +1153,10 @@ pub enum MailCommand {
         /// Include message bodies.
         #[arg(long, default_value_t = false)]
         include_bodies: bool,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1173,7 +1192,10 @@ pub enum MailCommand {
         /// Max results.
         #[arg(long, short = 'l', default_value_t = 20)]
         limit: i64,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1681,25 +1703,28 @@ fn execute(cli: Cli) -> CliResult<()> {
             agent,
             rate_limit,
             direct,
+            format,
             json,
             host,
             port,
             project,
-        } => handle_check_inbox(agent, rate_limit, direct, json, host, port, project),
+        } => handle_check_inbox(agent, rate_limit, direct, format, json, host, port, project),
         Commands::Ci {
             quick,
             report,
+            format,
             json,
             parallel,
-        } => handle_ci(quick, report, json, parallel),
+        } => handle_ci(quick, report, format, json, parallel),
         Commands::Lint => handle_lint(),
         Commands::Typecheck => handle_typecheck(),
         Commands::E2e { action } => handle_e2e(action),
         Commands::Migrate => handle_migrate(),
         Commands::ListProjects {
             include_agents,
+            format,
             json,
-        } => handle_list_projects(include_agents, json),
+        } => handle_list_projects(include_agents, format, json),
         Commands::ClearAndResetEverything {
             force,
             archive,
@@ -2182,11 +2207,14 @@ fn handle_check_inbox(
     agent: Option<String>,
     rate_limit: u64,
     direct: bool,
+    format: Option<output::CliOutputFormat>,
     json: bool,
     host: String,
     port: u16,
     project: Option<String>,
 ) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+
     // Resolve agent name from flag or environment variables
     let agent_name = agent
         .or_else(|| std::env::var("AGENT_NAME").ok())
@@ -2269,28 +2297,23 @@ fn handle_check_inbox(
         return Ok(());
     }
 
-    // Format and print output
-    if json {
-        // JSON output mode
-        let output = serde_json::json!({
-            "agent": agent_name,
-            "unread_count": result.unread_count,
-            "urgent_or_high_count": result.urgent_or_high_count,
-            "messages": result.messages.iter().map(|m| {
-                serde_json::json!({
-                    "id": m.id,
-                    "subject": m.subject,
-                    "from": m.from,
-                    "importance": m.importance,
-                    "created_ts": m.created_ts,
-                })
-            }).collect::<Vec<_>>(),
-        });
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
-    } else {
+    // Build output data for JSON/TOON
+    let output_data = serde_json::json!({
+        "agent": agent_name,
+        "unread_count": result.unread_count,
+        "urgent_or_high_count": result.urgent_or_high_count,
+        "messages": result.messages.iter().map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "subject": m.subject,
+                "from": m.from,
+                "importance": m.importance,
+                "created_ts": m.created_ts,
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    output::emit_output(&output_data, fmt, || {
         // Human-readable output with emoji
         ftui_runtime::ftui_println!();
         ftui_runtime::ftui_println!("📬 === INBOX REMINDER ===");
@@ -2312,7 +2335,7 @@ fn handle_check_inbox(
         }
         ftui_runtime::ftui_println!("=========================");
         ftui_runtime::ftui_println!();
-    }
+    });
 
     Ok(())
 }
@@ -2447,16 +2470,22 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
     }
 }
 
-fn handle_list_projects(include_agents: bool, json_output: bool) -> CliResult<()> {
+fn handle_list_projects(
+    include_agents: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    handle_list_projects_with_database_url(&cfg.database_url, include_agents, json_output)
+    handle_list_projects_with_database_url(&cfg.database_url, include_agents, format, json)
 }
 
 fn handle_list_projects_with_database_url(
     database_url: &str,
     include_agents: bool,
-    json_output: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
 ) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
     let conn = open_db_sync_with_database_url(database_url)?;
 
     let projects = conn
@@ -2466,53 +2495,73 @@ fn handle_list_projects_with_database_url(
         )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
-    if json_output {
-        let mut output: Vec<serde_json::Value> = Vec::new();
-        for row in &projects {
-            let id: i64 = row.get_named("id").unwrap_or(0);
-            let slug: String = row.get_named("slug").unwrap_or_default();
-            let human_key: String = row.get_named("human_key").unwrap_or_default();
-            let created_at: i64 = row.get_named("created_at").unwrap_or(0);
+    if projects.is_empty() {
+        output::emit_empty(fmt, "No projects found.");
+        return Ok(());
+    }
 
-            let mut entry = serde_json::json!({
-                "id": id,
-                "slug": slug,
-                "human_key": human_key,
-                "created_at": mcp_agent_mail_db::timestamps::micros_to_iso(created_at),
-            });
-
-            if include_agents {
+    // Pre-fetch agents once if needed (avoids duplicate queries)
+    let agents_by_project: std::collections::HashMap<i64, Vec<(String, String, String)>> =
+        if include_agents {
+            let mut map = std::collections::HashMap::new();
+            for row in &projects {
+                let id: i64 = row.get_named("id").unwrap_or(0);
                 let agents = conn
                     .query_sync(
                         "SELECT name, program, model FROM agents WHERE project_id = ?",
                         &[sqlmodel_core::Value::BigInt(id)],
                     )
                     .unwrap_or_default();
-                let agent_list: Vec<serde_json::Value> = agents
+                let agent_list: Vec<(String, String, String)> = agents
                     .iter()
                     .map(|a| {
                         let name: String = a.get_named("name").unwrap_or_default();
                         let program: String = a.get_named("program").unwrap_or_default();
                         let model: String = a.get_named("model").unwrap_or_default();
+                        (name, program, model)
+                    })
+                    .collect();
+                map.insert(id, agent_list);
+            }
+            map
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    // Build serializable data structure for JSON/TOON output
+    let mut output_data: Vec<serde_json::Value> = Vec::new();
+    for row in &projects {
+        let id: i64 = row.get_named("id").unwrap_or(0);
+        let slug: String = row.get_named("slug").unwrap_or_default();
+        let human_key: String = row.get_named("human_key").unwrap_or_default();
+        let created_at: i64 = row.get_named("created_at").unwrap_or(0);
+
+        let mut entry = serde_json::json!({
+            "id": id,
+            "slug": slug,
+            "human_key": human_key,
+            "created_at": mcp_agent_mail_db::timestamps::micros_to_iso(created_at),
+        });
+
+        if include_agents {
+            if let Some(agent_list) = agents_by_project.get(&id) {
+                let agents_json: Vec<serde_json::Value> = agent_list
+                    .iter()
+                    .map(|(name, program, model)| {
                         serde_json::json!({ "name": name, "program": program, "model": model })
                     })
                     .collect();
                 entry
                     .as_object_mut()
                     .unwrap()
-                    .insert("agents".to_string(), serde_json::json!(agent_list));
+                    .insert("agents".to_string(), serde_json::json!(agents_json));
             }
-            output.push(entry);
         }
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
-    } else {
-        if projects.is_empty() {
-            output::empty_result(false, "No projects found.");
-            return Ok(());
-        }
+        output_data.push(entry);
+    }
+
+    output::emit_output(&output_data, fmt, || {
+        // Table rendering
         let mut table = output::CliTable::new(vec!["ID", "SLUG", "HUMAN_KEY"]);
         for row in &projects {
             let id: i64 = row.get_named("id").unwrap_or(0);
@@ -2526,24 +2575,17 @@ fn handle_list_projects_with_database_url(
             for row in &projects {
                 let id: i64 = row.get_named("id").unwrap_or(0);
                 let slug: String = row.get_named("slug").unwrap_or_default();
-                let agents = conn
-                    .query_sync(
-                        "SELECT name, program, model FROM agents WHERE project_id = ?",
-                        &[sqlmodel_core::Value::BigInt(id)],
-                    )
-                    .unwrap_or_default();
-                if !agents.is_empty() {
-                    output::section(&format!("Agents for {slug}:"));
-                    for a in &agents {
-                        let name: String = a.get_named("name").unwrap_or_default();
-                        let program: String = a.get_named("program").unwrap_or_default();
-                        let model: String = a.get_named("model").unwrap_or_default();
-                        ftui_runtime::ftui_println!("  {name} ({program}/{model})");
+                if let Some(agent_list) = agents_by_project.get(&id) {
+                    if !agent_list.is_empty() {
+                        output::section(&format!("Agents for {slug}:"));
+                        for (name, program, model) in agent_list {
+                            ftui_runtime::ftui_println!("  {name} ({program}/{model})");
+                        }
                     }
                 }
             }
         }
-    }
+    });
     Ok(())
 }
 
@@ -5289,10 +5331,15 @@ fn clear_and_reset_everything(
 }
 
 /// Handle the `am ci` command: run quality gates with optional flags.
+const fn ci_should_emit_progress(fmt: output::CliOutputFormat) -> bool {
+    matches!(fmt, output::CliOutputFormat::Table)
+}
+
 fn handle_ci(
     quick: bool,
     report_path: Option<std::path::PathBuf>,
-    json_output: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
     parallel: bool,
 ) -> CliResult<()> {
     use ci::{
@@ -5300,6 +5347,8 @@ fn handle_ci(
         run_gates_parallel,
     };
 
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let show_progress = ci_should_emit_progress(fmt);
     let mode = if quick { RunMode::Quick } else { RunMode::Full };
 
     // Build runner config
@@ -5314,15 +5363,21 @@ fn handle_ci(
         ftui_runtime::ftui_println!("━━━ GATE [{}/{}]: {} ━━━", idx + 1, total, name);
     };
 
-    let runner_config = GateRunnerConfig {
-        on_gate_start: Some(on_start),
-        ..runner_config
+    let runner_config = if show_progress {
+        GateRunnerConfig {
+            on_gate_start: Some(on_start),
+            ..runner_config
+        }
+    } else {
+        runner_config
     };
 
     // Run all gates (parallel or sequential)
     let gates = default_gates();
     let report = if parallel {
-        ftui_runtime::ftui_println!("Running gates in parallel mode...");
+        if show_progress {
+            ftui_runtime::ftui_println!("Running gates in parallel mode...");
+        }
         run_gates_parallel(&gates, &runner_config)
     } else {
         run_gates(&gates, &runner_config)
@@ -5337,18 +5392,24 @@ fn handle_ci(
         report
             .write_to_file(path)
             .map_err(|e| CliError::Other(format!("failed to write report: {e}")))?;
-        ftui_runtime::ftui_println!("Report written to: {}", path.display());
+        if show_progress {
+            ftui_runtime::ftui_println!("Report written to: {}", path.display());
+        } else {
+            ftui_runtime::ftui_eprintln!("Report written to: {}", path.display());
+        }
     }
 
     // Output results
-    if json_output {
-        let json = report
-            .to_json()
-            .map_err(|e| CliError::Other(format!("JSON serialization failed: {e}")))?;
-        println!("{json}");
-    } else {
+    // Convert report to JSON value for emit_output
+    let json_str = report
+        .to_json()
+        .map_err(|e| CliError::Other(format!("JSON serialization failed: {e}")))?;
+    let data: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| CliError::Other(format!("JSON parse failed: {e}")))?;
+
+    output::emit_output(&data, fmt, || {
         print_gate_summary(&report);
-    }
+    });
 
     // Exit with appropriate code
     match report.decision {
@@ -6439,8 +6500,10 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             importance,
             ack_required,
             thread_id,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
@@ -6486,19 +6549,14 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 .await,
             )?;
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&message_row_to_json(&msg, &sender))
-                        .unwrap_or_default()
-                );
-            } else {
+            let data = message_row_to_json(&msg, &sender);
+            output::emit_output(&data, fmt, || {
                 output::success(&format!(
                     "Message sent (id={}) to {}",
                     msg.id.unwrap_or(0),
                     to
                 ));
-            }
+            });
             Ok(())
         }
 
@@ -6508,8 +6566,10 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             message_id,
             body,
             to,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
@@ -6567,19 +6627,14 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 .await,
             )?;
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&message_row_to_json(&msg, &sender))
-                        .unwrap_or_default()
-                );
-            } else {
+            let data = message_row_to_json(&msg, &sender);
+            output::emit_output(&data, fmt, || {
                 output::success(&format!(
                     "Reply sent (id={}, thread={})",
                     msg.id.unwrap_or(0),
                     thread_id
                 ));
-            }
+            });
             Ok(())
         }
 
@@ -6590,8 +6645,10 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             since,
             limit,
             include_bodies,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
@@ -6616,46 +6673,42 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 .await,
             )?;
 
-            if json {
-                let data: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|r| inbox_row_to_json(r, include_bodies))
-                    .collect();
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&data).unwrap_or_default()
-                );
-                return Ok(());
-            }
-
             if rows.is_empty() {
-                output::empty_result(false, "No messages.");
+                output::emit_empty(fmt, "No messages.");
                 return Ok(());
             }
 
-            let mut table =
-                output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
-            for r in &rows {
-                table.add_row(vec![
-                    r.message.id.unwrap_or(0).to_string(),
-                    r.sender_name.clone(),
-                    truncate_str(&r.message.subject, 50),
-                    r.message.importance.clone(),
-                    context::format_ts_short(r.message.created_ts),
-                ]);
-            }
-            table.render();
+            // Build serializable data for JSON/TOON
+            let data: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| inbox_row_to_json(r, include_bodies))
+                .collect();
 
-            if include_bodies {
+            output::emit_output(&data, fmt, || {
+                let mut table =
+                    output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
                 for r in &rows {
-                    ftui_runtime::ftui_println!(
-                        "\n--- #{} {} ---",
-                        r.message.id.unwrap_or(0),
-                        r.message.subject
-                    );
-                    ftui_runtime::ftui_println!("{}", r.message.body_md);
+                    table.add_row(vec![
+                        r.message.id.unwrap_or(0).to_string(),
+                        r.sender_name.clone(),
+                        truncate_str(&r.message.subject, 50),
+                        r.message.importance.clone(),
+                        context::format_ts_short(r.message.created_ts),
+                    ]);
                 }
-            }
+                table.render();
+
+                if include_bodies {
+                    for r in &rows {
+                        ftui_runtime::ftui_println!(
+                            "\n--- #{} {} ---",
+                            r.message.id.unwrap_or(0),
+                            r.message.subject
+                        );
+                        ftui_runtime::ftui_println!("{}", r.message.body_md);
+                    }
+                }
+            });
             Ok(())
         }
 
@@ -6796,8 +6849,10 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             project_key,
             query,
             limit,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
@@ -6812,45 +6867,41 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 .await,
             )?;
 
-            if json {
-                let data: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "id": r.id,
-                            "subject": r.subject,
-                            "importance": r.importance,
-                            "ack_required": r.ack_required != 0,
-                            "created_ts": mcp_agent_mail_db::micros_to_iso(r.created_ts),
-                            "thread_id": r.thread_id,
-                            "from": r.from,
-                        })
-                    })
-                    .collect();
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&data).unwrap_or_default()
-                );
-                return Ok(());
-            }
-
             if rows.is_empty() {
-                output::empty_result(false, "No results.");
+                output::emit_empty(fmt, "No results.");
                 return Ok(());
             }
 
-            let mut table =
-                output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
-            for r in &rows {
-                table.add_row(vec![
-                    r.id.to_string(),
-                    r.from.clone(),
-                    truncate_str(&r.subject, 50),
-                    r.importance.clone(),
-                    context::format_ts_short(r.created_ts),
-                ]);
-            }
-            table.render();
+            // Build serializable data for JSON/TOON
+            let data: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "subject": r.subject,
+                        "importance": r.importance,
+                        "ack_required": r.ack_required != 0,
+                        "created_ts": mcp_agent_mail_db::micros_to_iso(r.created_ts),
+                        "thread_id": r.thread_id,
+                        "from": r.from,
+                    })
+                })
+                .collect();
+
+            output::emit_output(&data, fmt, || {
+                let mut table =
+                    output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
+                for r in &rows {
+                    table.add_row(vec![
+                        r.id.to_string(),
+                        r.from.clone(),
+                        truncate_str(&r.subject, 50),
+                        r.importance.clone(),
+                        context::format_ts_short(r.created_ts),
+                    ]);
+                }
+                table.render();
+            });
             Ok(())
         }
     }
@@ -8157,6 +8208,7 @@ mod tests {
                 agent,
                 rate_limit,
                 direct,
+                format,
                 json,
                 host,
                 port,
@@ -8165,6 +8217,7 @@ mod tests {
                 assert!(agent.is_none());
                 assert_eq!(rate_limit, 120);
                 assert!(!direct);
+                assert!(format.is_none());
                 assert!(!json);
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 8765);
@@ -8198,6 +8251,7 @@ mod tests {
                 agent,
                 rate_limit,
                 direct,
+                format,
                 json,
                 host,
                 port,
@@ -8206,6 +8260,7 @@ mod tests {
                 assert_eq!(agent.as_deref(), Some("BlueLake"));
                 assert_eq!(rate_limit, 60);
                 assert!(direct);
+                assert!(format.is_none());
                 assert!(json);
                 assert_eq!(host, "0.0.0.0");
                 assert_eq!(port, 9999);
@@ -8213,6 +8268,48 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_check_inbox_format_toon() {
+        let cli = Cli::try_parse_from(["am", "check-inbox", "--format", "toon"])
+            .expect("failed to parse check-inbox with format");
+        match cli.command {
+            Commands::CheckInbox { format, json, .. } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_ci_format_toon() {
+        let cli = Cli::try_parse_from(["am", "ci", "--format", "toon"])
+            .expect("failed to parse ci with format");
+        match cli.command {
+            Commands::Ci {
+                format,
+                json,
+                quick,
+                report,
+                parallel,
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+                assert!(!quick);
+                assert!(report.is_none());
+                assert!(!parallel);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ci_progress_is_table_only() {
+        assert!(ci_should_emit_progress(output::CliOutputFormat::Table));
+        assert!(!ci_should_emit_progress(output::CliOutputFormat::Json));
+        assert!(!ci_should_emit_progress(output::CliOutputFormat::Toon));
     }
 
     #[test]
@@ -11421,9 +11518,11 @@ mod tests {
         match cli.command {
             Commands::ListProjects {
                 include_agents,
+                format,
                 json,
             } => {
                 assert!(!include_agents);
+                assert!(format.is_none());
                 assert!(!json);
             }
             other => panic!("expected ListProjects, got {other:?}"),
@@ -11437,10 +11536,29 @@ mod tests {
         match cli.command {
             Commands::ListProjects {
                 include_agents,
+                format,
                 json,
             } => {
                 assert!(include_agents);
+                assert!(format.is_none());
                 assert!(json);
+            }
+            other => panic!("expected ListProjects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_list_projects_format_toon() {
+        let cli = Cli::try_parse_from(["am", "list-projects", "--format", "toon"]).unwrap();
+        match cli.command {
+            Commands::ListProjects {
+                include_agents,
+                format,
+                json,
+            } => {
+                assert!(!include_agents);
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
             }
             other => panic!("expected ListProjects, got {other:?}"),
         }
@@ -12909,7 +13027,7 @@ mod tests {
 
         // list-projects should succeed with empty output
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_list_projects_with_database_url(&db_url, false, true);
+        let result = handle_list_projects_with_database_url(&db_url, false, None, true);
         let output = capture.drain_to_string();
         assert!(result.is_ok(), "list-projects --json failed: {result:?}");
 
@@ -20248,12 +20366,28 @@ fn handle_tooling_diagnostics(json_mode: bool) -> CliResult<()> {
             &report.search.fallback_to_legacy_total.to_string(),
         );
         output::kv(
+            "    Query errors",
+            &report.search.queries_errors_total.to_string(),
+        );
+        output::kv(
             "    Shadow comparisons",
             &report.search.shadow_comparisons_total.to_string(),
         );
         output::kv(
             "    Shadow equivalence",
             &format!("{:.1}%", report.search.shadow_equivalent_pct),
+        );
+        output::kv(
+            "    Shadow V3 errors",
+            &report.search.shadow_v3_errors_total.to_string(),
+        );
+        output::kv(
+            "    Semantic kill-switch hits",
+            &report.search.semantic_killswitch_hits.to_string(),
+        );
+        output::kv(
+            "    Rerank kill-switch hits",
+            &report.search.rerank_killswitch_hits.to_string(),
         );
         output::kv(
             "    Tantivy docs",
@@ -20263,6 +20397,10 @@ fn handle_tooling_diagnostics(json_mode: bool) -> CliResult<()> {
             "    Tantivy size",
             &format!("{} bytes", report.search.tantivy_index_size_bytes),
         );
+        let tantivy_last_update = i64::try_from(report.search.tantivy_last_update_us)
+            .ok()
+            .map_or_else(|| "(invalid)".to_string(), format_micros_as_iso);
+        output::kv("    Tantivy last update", &tantivy_last_update);
 
         if !report.tools_detail.is_empty() {
             ftui_runtime::ftui_println!("");

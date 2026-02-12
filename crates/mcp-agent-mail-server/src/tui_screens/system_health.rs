@@ -328,7 +328,7 @@ impl SystemHealthScreen {
         state: &TuiSharedState,
         snap: &DiagnosticsSnapshot,
     ) {
-        if area.width < 10 || area.height < 1 {
+        if area.is_empty() {
             return;
         }
 
@@ -340,6 +340,18 @@ impl SystemHealthScreen {
         let counters = state.request_counters();
         let requests_str = format!("{}", counters.total);
         let avg_latency_str = format!("{}ms", state.avg_latency_ms());
+
+        const METRIC_TILE_COUNT: u16 = 4;
+        const MIN_TILE_WIDTH: u16 = 8;
+
+        // On narrow panes, render a compact summary instead of silently drawing nothing.
+        if area.width < METRIC_TILE_COUNT * MIN_TILE_WIDTH {
+            let summary = format!(
+                "Up {uptime_str} | TCP {tcp_latency_str} | Req {requests_str} | Avg {avg_latency_str}"
+            );
+            Paragraph::new(summary).render(area, frame);
+            return;
+        }
 
         // Split area into 4 tiles
         let tile_w = area.width / 4;
@@ -404,7 +416,42 @@ impl SystemHealthScreen {
     /// Render diagnostic findings as anomaly cards.
     #[allow(clippy::unused_self)]
     fn render_anomaly_cards(&self, frame: &mut Frame<'_>, area: Rect, snap: &DiagnosticsSnapshot) {
-        if snap.lines.is_empty() && snap.tcp_error.is_none() {
+        if area.is_empty() {
+            return;
+        }
+
+        #[derive(Debug)]
+        struct FindingCard {
+            severity: AnomalySeverity,
+            confidence: f64,
+            title: String,
+            rationale: Option<String>,
+        }
+
+        let mut findings: Vec<FindingCard> = Vec::new();
+        if let Some(err) = &snap.tcp_error {
+            findings.push(FindingCard {
+                severity: AnomalySeverity::Critical,
+                confidence: 0.95,
+                title: "TCP connection failed".to_string(),
+                rationale: Some(err.clone()),
+            });
+        }
+        for line in &snap.lines {
+            let severity = match line.level {
+                Level::Ok => AnomalySeverity::Low,
+                Level::Warn => AnomalySeverity::Medium,
+                Level::Fail => AnomalySeverity::High,
+            };
+            findings.push(FindingCard {
+                severity,
+                confidence: 0.8,
+                title: line.detail.clone(),
+                rationale: line.remediation.clone(),
+            });
+        }
+
+        if findings.is_empty() {
             // All healthy — render a single OK card
             let card = AnomalyCard::new(AnomalySeverity::Low, 1.0, "All diagnostics passed")
                 .rationale("TCP reachable, HTTP probes healthy, auth configuration valid.");
@@ -413,49 +460,61 @@ impl SystemHealthScreen {
         }
 
         // Compute per-card height (minimum 4 lines each)
-        let total_findings = snap.lines.len() + usize::from(snap.tcp_error.is_some());
-        if total_findings == 0 {
-            return;
-        }
+        let total_findings = findings.len();
         #[allow(clippy::cast_possible_truncation)]
         let card_h = (area.height / (total_findings as u16).max(1))
             .max(4)
             .min(area.height);
-        let mut y_offset = area.y;
+        let max_cards = usize::from((area.height / card_h).max(1));
 
-        // TCP error card
-        if let Some(err) = &snap.tcp_error {
-            let remaining_h = area.height.saturating_sub(y_offset - area.y);
-            if remaining_h >= 3 {
-                let card_area = Rect::new(area.x, y_offset, area.width, card_h.min(remaining_h));
-                AnomalyCard::new(AnomalySeverity::Critical, 0.95, "TCP connection failed")
-                    .rationale(err)
-                    .render(card_area, frame);
-                y_offset += card_h.min(remaining_h);
+        let render_cards: Vec<FindingCard> = if total_findings > max_cards {
+            if max_cards == 1 {
+                let mut first = findings.remove(0);
+                let hidden = total_findings.saturating_sub(1);
+                if hidden > 0 {
+                    let mut rationale = first.rationale.unwrap_or_default();
+                    if !rationale.is_empty() {
+                        rationale.push(' ');
+                    }
+                    rationale.push_str(&format!(
+                        "{hidden} more findings hidden; enlarge the panel."
+                    ));
+                    first.rationale = Some(rationale);
+                }
+                vec![first]
+            } else {
+                let visible = max_cards - 1;
+                let hidden = total_findings.saturating_sub(visible);
+                let mut cards: Vec<FindingCard> = findings.into_iter().take(visible).collect();
+                cards.push(FindingCard {
+                    severity: AnomalySeverity::Medium,
+                    confidence: 0.6,
+                    title: format!("{hidden} more findings"),
+                    rationale: Some("Enlarge this pane to view all diagnostics.".to_string()),
+                });
+                cards
             }
-        }
+        } else {
+            findings
+        };
 
-        // Finding cards
-        for line in &snap.lines {
-            let remaining_h = area.height.saturating_sub(y_offset - area.y);
+        let mut y_offset = area.y;
+        for card_data in render_cards {
+            let consumed_h = y_offset.saturating_sub(area.y);
+            let remaining_h = area.height.saturating_sub(consumed_h);
             if remaining_h < 3 {
                 break;
             }
 
-            let severity = match line.level {
-                Level::Ok => AnomalySeverity::Low,
-                Level::Warn => AnomalySeverity::Medium,
-                Level::Fail => AnomalySeverity::High,
-            };
-
-            let mut card = AnomalyCard::new(severity, 0.8, &line.detail);
-            if let Some(fix) = &line.remediation {
-                card = card.rationale(fix);
+            let current_h = card_h.min(remaining_h);
+            let card_area = Rect::new(area.x, y_offset, area.width, current_h);
+            let mut card =
+                AnomalyCard::new(card_data.severity, card_data.confidence, &card_data.title);
+            if let Some(rationale) = card_data.rationale.as_deref() {
+                card = card.rationale(rationale);
             }
-
-            let card_area = Rect::new(area.x, y_offset, area.width, card_h.min(remaining_h));
             card.render(card_area, frame);
-            y_offset += card_h.min(remaining_h);
+            y_offset = y_offset.saturating_add(current_h);
         }
     }
 }
@@ -960,6 +1019,22 @@ fn parse_authority_host_port(authority: &str) -> Result<(String, u16), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftui_harness::buffer_to_text;
+    use mcp_agent_mail_core::Config;
+
+    fn test_state() -> Arc<TuiSharedState> {
+        TuiSharedState::new(&Config::default())
+    }
+
+    fn test_screen(snapshot: DiagnosticsSnapshot) -> SystemHealthScreen {
+        SystemHealthScreen {
+            snapshot: Arc::new(Mutex::new(snapshot)),
+            refresh_requested: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            view_mode: ViewMode::Dashboard,
+        }
+    }
 
     #[test]
     fn parse_http_endpoint_ipv4() {
@@ -1693,10 +1768,83 @@ mod tests {
 
     #[test]
     fn keybindings_includes_view_toggle() {
-        // We need a way to check the keybindings. Since we can't construct
-        // SystemHealthScreen easily, we check the constant expected behavior:
-        // the implementation now includes "v" for view toggle alongside "r" for refresh.
-        // This is a structural test of the expected keybinding count.
-        assert_eq!(2, 2); // 2 keybindings: r, v
+        let screen = test_screen(DiagnosticsSnapshot::default());
+        let bindings = screen.keybindings();
+        assert!(bindings.iter().any(|b| b.key == "r"));
+        assert!(bindings.iter().any(|b| b.key == "v"));
+    }
+
+    #[test]
+    fn metric_tiles_narrow_width_renders_compact_summary() {
+        let state = test_state();
+        let screen = test_screen(DiagnosticsSnapshot {
+            tcp_latency_ms: Some(42),
+            ..Default::default()
+        });
+        let snap = screen.snapshot();
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(24, 3, &mut pool);
+        screen.render_metric_tiles(&mut frame, Rect::new(0, 0, 24, 3), &state, &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Up "),
+            "expected compact metric summary in narrow layout, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn anomaly_cards_overflow_shows_overflow_indicator() {
+        let mut snap = DiagnosticsSnapshot {
+            tcp_error: Some("connection refused".to_string()),
+            ..Default::default()
+        };
+        for idx in 0..6 {
+            snap.lines.push(ProbeLine {
+                level: Level::Warn,
+                name: "overflow-test",
+                detail: format!("Issue {idx}"),
+                remediation: Some("Inspect logs".to_string()),
+            });
+        }
+        let screen = test_screen(DiagnosticsSnapshot::default());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 8, &mut pool);
+        screen.render_anomaly_cards(&mut frame, Rect::new(0, 0, 80, 8), &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("more findings"),
+            "expected overflow indicator card when findings exceed view, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn anomaly_cards_single_slot_mentions_hidden_findings() {
+        let mut snap = DiagnosticsSnapshot {
+            tcp_error: Some("connection refused".to_string()),
+            ..Default::default()
+        };
+        for idx in 0..2 {
+            snap.lines.push(ProbeLine {
+                level: Level::Warn,
+                name: "single-slot-overflow",
+                detail: format!("Issue {idx}"),
+                remediation: Some("Inspect logs".to_string()),
+            });
+        }
+        let screen = test_screen(DiagnosticsSnapshot::default());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 4, &mut pool);
+        screen.render_anomaly_cards(&mut frame, Rect::new(0, 0, 80, 4), &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("hidden"),
+            "expected single-slot overflow annotation, got:\n{text}"
+        );
     }
 }

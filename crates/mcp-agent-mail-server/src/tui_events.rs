@@ -3,10 +3,12 @@
 use ftui::layout::Rect;
 use ftui::text::{Line, Span};
 use ftui::{Frame, PackedRgba, Style};
+use ftui_widgets::fenwick::FenwickTree;
 use ftui_widgets::virtualized::RenderItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -1149,6 +1151,100 @@ pub trait DataProvider {
     fn invalidate(&mut self);
 }
 
+/// Fenwick-backed viewport index for virtualized row ranges.
+///
+/// `VirtualizedList` scroll state is item-index based, but large data sources
+/// often need fast offset→index mapping for variable row heights. This index
+/// keeps that mapping O(log n) via a Fenwick tree.
+#[derive(Debug, Clone)]
+struct FenwickViewportIndex {
+    heights: Vec<u32>,
+    tree: FenwickTree,
+}
+
+impl Default for FenwickViewportIndex {
+    fn default() -> Self {
+        Self {
+            heights: Vec::new(),
+            tree: FenwickTree::new(0),
+        }
+    }
+}
+
+impl FenwickViewportIndex {
+    fn rebuild_from_rows<T: RenderItem>(&mut self, rows: &[T]) {
+        self.heights.clear();
+        self.heights.reserve(rows.len());
+        for row in rows {
+            self.heights.push(u32::from(row.height().max(1)));
+        }
+        self.tree = if self.heights.is_empty() {
+            FenwickTree::new(0)
+        } else {
+            FenwickTree::from_values(&self.heights)
+        };
+    }
+
+    #[cfg(test)]
+    fn rebuild_from_heights(&mut self, heights: &[u16]) {
+        self.heights.clear();
+        self.heights.reserve(heights.len());
+        for &height in heights {
+            self.heights.push(u32::from(height.max(1)));
+        }
+        self.tree = if self.heights.is_empty() {
+            FenwickTree::new(0)
+        } else {
+            FenwickTree::from_values(&self.heights)
+        };
+    }
+
+    fn total_height(&self) -> u32 {
+        self.tree.total()
+    }
+
+    fn index_for_offset(&self, offset: u32) -> usize {
+        if self.heights.is_empty() {
+            return 0;
+        }
+        if offset >= self.total_height() {
+            return self.heights.len();
+        }
+        self.tree
+            .find_prefix(offset)
+            .map_or(0, |idx| idx.saturating_add(1))
+            .min(self.heights.len())
+    }
+
+    fn visible_count_from_index(&self, start: usize, viewport_height: u16) -> usize {
+        if start >= self.heights.len() || viewport_height == 0 {
+            return 0;
+        }
+        let mut consumed = 0u32;
+        let max_height = u32::from(viewport_height);
+        let mut count = 0usize;
+        for &height in &self.heights[start..] {
+            let next = consumed.saturating_add(height.max(1));
+            if next > max_height {
+                break;
+            }
+            consumed = next;
+            count += 1;
+        }
+        count.max(1)
+    }
+
+    fn range_for_offset(&self, offset: u32, viewport_height: u16) -> Range<usize> {
+        let start = self.index_for_offset(offset);
+        if start >= self.heights.len() {
+            return start..start;
+        }
+        let visible = self.visible_count_from_index(start, viewport_height);
+        let end = start.saturating_add(visible).min(self.heights.len());
+        start..end
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // TimelineRow — RenderItem for timeline events
 // ──────────────────────────────────────────────────────────────────────
@@ -1352,6 +1448,8 @@ pub struct TimelineDataProvider {
     last_seq: u64,
     /// Whether the cache is invalidated.
     dirty: bool,
+    /// Fenwick-backed index for viewport calculations.
+    height_index: FenwickViewportIndex,
 }
 
 impl TimelineDataProvider {
@@ -1363,6 +1461,7 @@ impl TimelineDataProvider {
             rows: Vec::new(),
             last_seq: 0,
             dirty: true,
+            height_index: FenwickViewportIndex::default(),
         }
     }
 
@@ -1395,6 +1494,29 @@ impl TimelineDataProvider {
                 self.rows.drain(..excess);
             }
         }
+        self.height_index.rebuild_from_rows(&self.rows);
+    }
+
+    /// Compute the item range visible at a row-offset and viewport height.
+    #[must_use]
+    pub fn viewport_range_for_offset(
+        &self,
+        row_offset: usize,
+        viewport_height: u16,
+    ) -> Range<usize> {
+        let offset = u32::try_from(row_offset).unwrap_or(u32::MAX);
+        self.height_index.range_for_offset(offset, viewport_height)
+    }
+
+    /// Return the visible window for a row-offset and viewport height.
+    #[must_use]
+    pub fn window_for_viewport_offset(
+        &self,
+        row_offset: usize,
+        viewport_height: u16,
+    ) -> &[TimelineRow] {
+        let range = self.viewport_range_for_offset(row_offset, viewport_height);
+        &self.rows[range]
     }
 }
 
@@ -3534,6 +3656,38 @@ mod tests {
         // Window starting beyond end
         let window = provider.window(100, 10);
         assert_eq!(window.len(), 0);
+    }
+
+    #[test]
+    fn fenwick_viewport_index_handles_variable_heights() {
+        let mut index = FenwickViewportIndex::default();
+        index.rebuild_from_heights(&[2, 1, 3, 1]);
+
+        assert_eq!(index.range_for_offset(0, 2), 0..1);
+        assert_eq!(index.range_for_offset(2, 2), 1..2);
+        assert_eq!(index.range_for_offset(3, 3), 2..3);
+        assert_eq!(index.range_for_offset(6, 3), 3..4);
+        assert_eq!(index.range_for_offset(7, 3), 4..4);
+    }
+
+    #[test]
+    fn timeline_data_provider_window_for_viewport_offset_uses_index() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        for i in 0..10 {
+            let _ = ring.push(sample_http(&format!("/{i}"), 200));
+        }
+
+        let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
+        provider.refresh();
+
+        // With 1-row heights, viewport range should map directly to row indices.
+        assert_eq!(provider.viewport_range_for_offset(3, 4), 3..7);
+        assert_eq!(provider.viewport_range_for_offset(9, 4), 9..10);
+        assert_eq!(provider.viewport_range_for_offset(20, 4), 10..10);
+
+        assert_eq!(provider.window_for_viewport_offset(3, 4).len(), 4);
+        assert_eq!(provider.window_for_viewport_offset(9, 4).len(), 1);
+        assert_eq!(provider.window_for_viewport_offset(20, 4).len(), 0);
     }
 
     #[test]

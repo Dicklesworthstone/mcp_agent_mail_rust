@@ -353,14 +353,117 @@ impl ModalManager {
 // MailAppModel — implements ftui_runtime::Model
 // ──────────────────────────────────────────────────────────────────────
 
+/// Encapsulates screen instances and active-screen routing.
+struct ScreenManager {
+    state: Arc<TuiSharedState>,
+    active_screen: MailScreenId,
+    screens: HashMap<MailScreenId, Box<dyn MailScreen>>,
+}
+
+impl ScreenManager {
+    fn new(state: &Arc<TuiSharedState>) -> Self {
+        let mut manager = Self {
+            state: Arc::clone(state),
+            active_screen: MailScreenId::Dashboard,
+            screens: HashMap::new(),
+        };
+        // Eager-load only the default landing surface.
+        manager.ensure_screen(MailScreenId::Dashboard);
+        manager
+    }
+
+    fn create_screen(id: MailScreenId, state: &Arc<TuiSharedState>) -> Box<dyn MailScreen> {
+        match id {
+            MailScreenId::Dashboard => Box::new(DashboardScreen::new()),
+            MailScreenId::Messages => Box::new(MessageBrowserScreen::new()),
+            MailScreenId::Threads => Box::new(ThreadExplorerScreen::new()),
+            MailScreenId::Timeline => Box::new(TimelineScreen::new()),
+            MailScreenId::SystemHealth => Box::new(SystemHealthScreen::new(Arc::clone(state))),
+            MailScreenId::Agents => Box::new(AgentsScreen::new()),
+            MailScreenId::Search => Box::new(SearchCockpitScreen::new()),
+            MailScreenId::ToolMetrics => Box::new(ToolMetricsScreen::new()),
+            MailScreenId::Reservations => Box::new(ReservationsScreen::new()),
+            MailScreenId::Projects => Box::new(ProjectsScreen::new()),
+            MailScreenId::Contacts => Box::new(ContactsScreen::new()),
+            MailScreenId::Explorer => Box::new(MailExplorerScreen::new()),
+            MailScreenId::Analytics => Box::new(AnalyticsScreen::new()),
+            MailScreenId::Attachments => Box::new(AttachmentExplorerScreen::new()),
+        }
+    }
+
+    fn ensure_screen(&mut self, id: MailScreenId) {
+        let state = Arc::clone(&self.state);
+        self.screens
+            .entry(id)
+            .or_insert_with(|| Self::create_screen(id, &state));
+    }
+
+    fn set_screen(&mut self, id: MailScreenId, screen: Box<dyn MailScreen>) {
+        self.screens.insert(id, screen);
+    }
+
+    const fn active_screen(&self) -> MailScreenId {
+        self.active_screen
+    }
+
+    fn set_active_screen(&mut self, id: MailScreenId) {
+        self.active_screen = id;
+        self.ensure_screen(id);
+    }
+
+    fn active_next(&mut self) {
+        self.set_active_screen(self.active_screen.next());
+    }
+
+    fn active_prev(&mut self) {
+        self.set_active_screen(self.active_screen.prev());
+    }
+
+    fn get(&self, id: MailScreenId) -> Option<&dyn MailScreen> {
+        self.screens.get(&id).map(Box::as_ref)
+    }
+
+    fn get_mut(&mut self, id: MailScreenId) -> Option<&mut (dyn MailScreen + '_)> {
+        self.ensure_screen(id);
+        match self.screens.get_mut(&id) {
+            Some(screen) => Some(screen.as_mut()),
+            None => None,
+        }
+    }
+
+    fn active_screen_ref(&self) -> Option<&dyn MailScreen> {
+        self.get(self.active_screen)
+    }
+
+    fn active_screen_mut(&mut self) -> Option<&mut (dyn MailScreen + '_)> {
+        self.get_mut(self.active_screen)
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut Box<dyn MailScreen>> {
+        self.screens.values_mut()
+    }
+
+    fn apply_deep_link(&mut self, target: &DeepLinkTarget) {
+        let target_screen = target.target_screen();
+        self.set_active_screen(target_screen);
+        if let Some(screen) = self.get_mut(target_screen) {
+            screen.receive_deep_link(target);
+        }
+    }
+
+    #[cfg(test)]
+    fn has_screen(&self, id: MailScreenId) -> bool {
+        self.screens.contains_key(&id)
+    }
+}
+
 /// The top-level TUI application model.
 ///
 /// Owns all screen instances and dispatches events to the active screen
 /// after processing global keybindings.
 pub struct MailAppModel {
     state: Arc<TuiSharedState>,
-    active_screen: MailScreenId,
-    screens: HashMap<MailScreenId, Box<dyn MailScreen>>,
+    screen_manager: ScreenManager,
     help_visible: bool,
     help_scroll: u16,
     keymap: crate::tui_keymap::KeymapRegistry,
@@ -401,38 +504,7 @@ impl MailAppModel {
     /// Create a new application model with placeholder screens (no persistence).
     #[must_use]
     pub fn new(state: Arc<TuiSharedState>) -> Self {
-        let mut screens: HashMap<MailScreenId, Box<dyn MailScreen>> = HashMap::new();
-        for &id in ALL_SCREEN_IDS {
-            if id == MailScreenId::Dashboard {
-                screens.insert(id, Box::new(DashboardScreen::new()));
-            } else if id == MailScreenId::Messages {
-                screens.insert(id, Box::new(MessageBrowserScreen::new()));
-            } else if id == MailScreenId::Threads {
-                screens.insert(id, Box::new(ThreadExplorerScreen::new()));
-            } else if id == MailScreenId::Timeline {
-                screens.insert(id, Box::new(TimelineScreen::new()));
-            } else if id == MailScreenId::SystemHealth {
-                screens.insert(id, Box::new(SystemHealthScreen::new(Arc::clone(&state))));
-            } else if id == MailScreenId::Agents {
-                screens.insert(id, Box::new(AgentsScreen::new()));
-            } else if id == MailScreenId::Search {
-                screens.insert(id, Box::new(SearchCockpitScreen::new()));
-            } else if id == MailScreenId::ToolMetrics {
-                screens.insert(id, Box::new(ToolMetricsScreen::new()));
-            } else if id == MailScreenId::Reservations {
-                screens.insert(id, Box::new(ReservationsScreen::new()));
-            } else if id == MailScreenId::Projects {
-                screens.insert(id, Box::new(ProjectsScreen::new()));
-            } else if id == MailScreenId::Contacts {
-                screens.insert(id, Box::new(ContactsScreen::new()));
-            } else if id == MailScreenId::Explorer {
-                screens.insert(id, Box::new(MailExplorerScreen::new()));
-            } else if id == MailScreenId::Analytics {
-                screens.insert(id, Box::new(AnalyticsScreen::new()));
-            } else if id == MailScreenId::Attachments {
-                screens.insert(id, Box::new(AttachmentExplorerScreen::new()));
-            }
-        }
+        let screen_manager = ScreenManager::new(&state);
 
         let static_actions = build_palette_actions_static();
         let mut command_palette = CommandPalette::new().with_max_visible(PALETTE_MAX_VISIBLE);
@@ -447,8 +519,7 @@ impl MailAppModel {
         );
         Self {
             state,
-            active_screen: MailScreenId::Dashboard,
-            screens,
+            screen_manager,
             help_visible: false,
             help_scroll: 0,
             keymap: crate::tui_keymap::KeymapRegistry::default(),
@@ -517,13 +588,13 @@ impl MailAppModel {
 
     /// Replace a screen implementation (used when real screens are ready).
     pub fn set_screen(&mut self, id: MailScreenId, screen: Box<dyn MailScreen>) {
-        self.screens.insert(id, screen);
+        self.screen_manager.set_screen(id, screen);
     }
 
     /// Get the currently active screen ID.
     #[must_use]
     pub const fn active_screen(&self) -> MailScreenId {
-        self.active_screen
+        self.screen_manager.active_screen()
     }
 
     /// Whether the help overlay is currently shown.
@@ -550,15 +621,11 @@ impl MailAppModel {
     ) -> Cmd<MailMsg> {
         match action {
             ActionKind::Navigate(screen_id) => {
-                self.active_screen = screen_id;
+                self.screen_manager.set_active_screen(screen_id);
                 Cmd::none()
             }
             ActionKind::DeepLink(target) => {
-                // Apply deep-link to target screen
-                if let Some(screen) = self.screens.get_mut(&target.target_screen()) {
-                    let _ = screen.receive_deep_link(&target);
-                }
-                self.active_screen = target.target_screen();
+                self.screen_manager.apply_deep_link(&target);
                 Cmd::none()
             }
             ActionKind::Execute(operation) => {
@@ -635,9 +702,9 @@ impl MailAppModel {
         if self.command_palette.is_visible() {
             return true;
         }
-        self.screens
-            .get(&self.active_screen)
-            .is_some_and(|s| s.consumes_text_input())
+        self.screen_manager
+            .active_screen_ref()
+            .is_some_and(MailScreen::consumes_text_input)
     }
 
     fn sync_palette_hints(&mut self, actions: &[ActionItem]) {
@@ -645,16 +712,16 @@ impl MailAppModel {
             &mut self.hint_ranker,
             &mut self.palette_hint_ids,
             actions,
-            screen_palette_action_id(self.active_screen),
+            screen_palette_action_id(self.screen_manager.active_screen()),
         );
     }
 
     fn rank_palette_actions(&mut self, actions: Vec<ActionItem>) -> Vec<ActionItem> {
         self.sync_palette_hints(&actions);
 
-        let (ordering, _) = self
-            .hint_ranker
-            .rank(Some(screen_palette_action_id(self.active_screen)));
+        let (ordering, _) = self.hint_ranker.rank(Some(screen_palette_action_id(
+            self.screen_manager.active_screen(),
+        )));
         if ordering.is_empty() {
             return actions;
         }
@@ -777,7 +844,7 @@ impl MailAppModel {
         let mut actions = build_palette_actions(&self.state);
 
         // Inject context-aware quick actions from the focused entity.
-        if let Some(screen) = self.screens.get(&self.active_screen) {
+        if let Some(screen) = self.screen_manager.active_screen_ref() {
             if let Some(event) = screen.focused_event() {
                 let quick = crate::tui_screens::inspector::build_quick_actions(event);
                 for qa in quick.into_iter().rev() {
@@ -905,8 +972,8 @@ impl MailAppModel {
             }
             palette_action_ids::LAYOUT_RESET => {
                 let ok = self
-                    .screens
-                    .get_mut(&MailScreenId::Timeline)
+                    .screen_manager
+                    .get_mut(MailScreenId::Timeline)
                     .is_some_and(|s| s.reset_layout());
                 if ok {
                     self.notifications.notify(
@@ -924,9 +991,10 @@ impl MailAppModel {
                 return Cmd::none();
             }
             palette_action_ids::LAYOUT_EXPORT => {
+                self.screen_manager.ensure_screen(MailScreenId::Timeline);
                 let path = self
-                    .screens
-                    .get(&MailScreenId::Timeline)
+                    .screen_manager
+                    .get(MailScreenId::Timeline)
                     .and_then(|s| s.export_layout());
                 if let Some(path) = path {
                     self.notifications.notify(
@@ -945,8 +1013,8 @@ impl MailAppModel {
             }
             palette_action_ids::LAYOUT_IMPORT => {
                 let ok = self
-                    .screens
-                    .get_mut(&MailScreenId::Timeline)
+                    .screen_manager
+                    .get_mut(MailScreenId::Timeline)
                     .is_some_and(|s| s.import_layout());
                 if ok {
                     self.notifications.notify(
@@ -985,61 +1053,52 @@ impl MailAppModel {
 
         // ── Screen navigation ─────────────────────────────────────
         if let Some(screen_id) = screen_from_palette_action_id(id) {
-            self.active_screen = screen_id;
+            self.screen_manager.set_active_screen(screen_id);
             return Cmd::none();
         }
 
         // ── Dynamic sources ───────────────────────────────────────
         if id.starts_with(palette_action_ids::AGENT_PREFIX) {
-            self.active_screen = MailScreenId::Agents;
+            self.screen_manager.set_active_screen(MailScreenId::Agents);
             return Cmd::none();
         }
         if id.starts_with(palette_action_ids::THREAD_PREFIX) {
-            self.active_screen = MailScreenId::Threads;
+            self.screen_manager.set_active_screen(MailScreenId::Threads);
             return Cmd::none();
         }
         if let Some(id_str) = id.strip_prefix(palette_action_ids::MESSAGE_PREFIX) {
             if let Ok(msg_id) = id_str.parse::<i64>() {
                 let target = DeepLinkTarget::MessageById(msg_id);
-                self.active_screen = MailScreenId::Messages;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Messages) {
-                    screen.receive_deep_link(&target);
-                }
+                self.screen_manager.apply_deep_link(&target);
             } else {
-                self.active_screen = MailScreenId::Messages;
+                self.screen_manager
+                    .set_active_screen(MailScreenId::Messages);
             }
             return Cmd::none();
         }
         if id.starts_with(palette_action_ids::TOOL_PREFIX) {
-            self.active_screen = MailScreenId::ToolMetrics;
+            self.screen_manager
+                .set_active_screen(MailScreenId::ToolMetrics);
             return Cmd::none();
         }
         if let Some(slug) = id.strip_prefix(palette_action_ids::PROJECT_PREFIX) {
             let target = DeepLinkTarget::ProjectBySlug(slug.to_string());
-            self.active_screen = MailScreenId::Projects;
-            if let Some(screen) = self.screens.get_mut(&MailScreenId::Projects) {
-                screen.receive_deep_link(&target);
-            }
+            self.screen_manager.apply_deep_link(&target);
             return Cmd::none();
         }
         if let Some(pair) = id.strip_prefix(palette_action_ids::CONTACT_PREFIX) {
             if let Some((from, to)) = pair.split_once(':') {
                 let target = DeepLinkTarget::ContactByPair(from.to_string(), to.to_string());
-                self.active_screen = MailScreenId::Contacts;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Contacts) {
-                    screen.receive_deep_link(&target);
-                }
+                self.screen_manager.apply_deep_link(&target);
             } else {
-                self.active_screen = MailScreenId::Contacts;
+                self.screen_manager
+                    .set_active_screen(MailScreenId::Contacts);
             }
             return Cmd::none();
         }
         if let Some(agent) = id.strip_prefix(palette_action_ids::RESERVATION_PREFIX) {
             let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
-            self.active_screen = MailScreenId::Reservations;
-            if let Some(screen) = self.screens.get_mut(&MailScreenId::Reservations) {
-                screen.receive_deep_link(&target);
-            }
+            self.screen_manager.apply_deep_link(&target);
             return Cmd::none();
         }
 
@@ -1047,52 +1106,34 @@ impl MailAppModel {
         if let Some(rest) = id.strip_prefix("quick:") {
             if let Some(name) = rest.strip_prefix("agent:") {
                 let target = DeepLinkTarget::AgentByName(name.to_string());
-                self.active_screen = MailScreenId::Agents;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Agents) {
-                    screen.receive_deep_link(&target);
-                }
+                self.screen_manager.apply_deep_link(&target);
                 return Cmd::none();
             }
             if let Some(id_str) = rest.strip_prefix("thread:") {
                 let target = DeepLinkTarget::ThreadById(id_str.to_string());
-                self.active_screen = MailScreenId::Threads;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
-                    screen.receive_deep_link(&target);
-                }
+                self.screen_manager.apply_deep_link(&target);
                 return Cmd::none();
             }
             if let Some(name) = rest.strip_prefix("tool:") {
                 let target = DeepLinkTarget::ToolByName(name.to_string());
-                self.active_screen = MailScreenId::ToolMetrics;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::ToolMetrics) {
-                    screen.receive_deep_link(&target);
-                }
+                self.screen_manager.apply_deep_link(&target);
                 return Cmd::none();
             }
             if let Some(id_str) = rest.strip_prefix("message:") {
                 if let Ok(msg_id) = id_str.parse::<i64>() {
                     let target = DeepLinkTarget::MessageById(msg_id);
-                    self.active_screen = MailScreenId::Messages;
-                    if let Some(screen) = self.screens.get_mut(&MailScreenId::Messages) {
-                        screen.receive_deep_link(&target);
-                    }
+                    self.screen_manager.apply_deep_link(&target);
                 }
                 return Cmd::none();
             }
             if let Some(slug) = rest.strip_prefix("project:") {
                 let target = DeepLinkTarget::ProjectBySlug(slug.to_string());
-                self.active_screen = MailScreenId::Projects;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Projects) {
-                    screen.receive_deep_link(&target);
-                }
+                self.screen_manager.apply_deep_link(&target);
                 return Cmd::none();
             }
             if let Some(agent) = rest.strip_prefix("reservation:") {
                 let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
-                self.active_screen = MailScreenId::Reservations;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Reservations) {
-                    screen.receive_deep_link(&target);
-                }
+                self.screen_manager.apply_deep_link(&target);
                 return Cmd::none();
             }
         }
@@ -1128,46 +1169,31 @@ impl MailAppModel {
                     .duration(Duration::from_secs(4)),
             );
             let target = DeepLinkTarget::ThreadById(thread_id.to_string());
-            self.active_screen = MailScreenId::Threads;
-            if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
-                screen.receive_deep_link(&target);
-            }
+            self.screen_manager.apply_deep_link(&target);
             return Cmd::none();
         }
         if let Some(thread_id) = rest.strip_prefix("view_thread:") {
             let target = DeepLinkTarget::ThreadById(thread_id.to_string());
-            self.active_screen = MailScreenId::Threads;
-            if let Some(screen) = self.screens.get_mut(&MailScreenId::Threads) {
-                screen.receive_deep_link(&target);
-            }
+            self.screen_manager.apply_deep_link(&target);
             return Cmd::none();
         }
 
         // Agent macros
         if let Some(agent) = rest.strip_prefix("fetch_inbox:") {
             let target = DeepLinkTarget::ExplorerForAgent(agent.to_string());
-            self.active_screen = MailScreenId::Explorer;
-            if let Some(screen) = self.screens.get_mut(&MailScreenId::Explorer) {
-                screen.receive_deep_link(&target);
-            }
+            self.screen_manager.apply_deep_link(&target);
             return Cmd::none();
         }
         if let Some(agent) = rest.strip_prefix("view_reservations:") {
             let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
-            self.active_screen = MailScreenId::Reservations;
-            if let Some(screen) = self.screens.get_mut(&MailScreenId::Reservations) {
-                screen.receive_deep_link(&target);
-            }
+            self.screen_manager.apply_deep_link(&target);
             return Cmd::none();
         }
 
         // Tool macros
         if let Some(tool) = rest.strip_prefix("tool_history:") {
             let target = DeepLinkTarget::ToolByName(tool.to_string());
-            self.active_screen = MailScreenId::ToolMetrics;
-            if let Some(screen) = self.screens.get_mut(&MailScreenId::ToolMetrics) {
-                screen.receive_deep_link(&target);
-            }
+            self.screen_manager.apply_deep_link(&target);
             return Cmd::none();
         }
 
@@ -1175,10 +1201,7 @@ impl MailAppModel {
         if let Some(id_str) = rest.strip_prefix("view_message:") {
             if let Ok(msg_id) = id_str.parse::<i64>() {
                 let target = DeepLinkTarget::MessageById(msg_id);
-                self.active_screen = MailScreenId::Messages;
-                if let Some(screen) = self.screens.get_mut(&MailScreenId::Messages) {
-                    screen.receive_deep_link(&target);
-                }
+                self.screen_manager.apply_deep_link(&target);
             }
             return Cmd::none();
         }
@@ -1338,7 +1361,7 @@ impl Model for MailAppModel {
             // ── Tick ────────────────────────────────────────────────
             MailMsg::Terminal(Event::Tick) => {
                 self.tick_count += 1;
-                for screen in self.screens.values_mut() {
+                for screen in self.screen_manager.values_mut() {
                     screen.tick(self.tick_count, &self.state);
                 }
 
@@ -1603,16 +1626,16 @@ impl Model for MailAppModel {
                                 return Cmd::none();
                             }
                             KeyCode::Tab => {
-                                self.active_screen = self.active_screen.next();
+                                self.screen_manager.active_next();
                                 return Cmd::none();
                             }
                             KeyCode::BackTab => {
-                                self.active_screen = self.active_screen.prev();
+                                self.screen_manager.active_prev();
                                 return Cmd::none();
                             }
                             // Action menu: . opens contextual actions for selected item
                             KeyCode::Char('.') if !text_mode => {
-                                if let Some(screen) = self.screens.get(&self.active_screen) {
+                                if let Some(screen) = self.screen_manager.active_screen_ref() {
                                     if let Some((entries, anchor, ctx)) =
                                         screen.contextual_actions()
                                     {
@@ -1637,7 +1660,7 @@ impl Model for MailAppModel {
                             KeyCode::Char(c) if c.is_ascii_digit() && !text_mode => {
                                 let n = c.to_digit(10).unwrap_or(0) as usize;
                                 if let Some(id) = MailScreenId::from_number(n) {
-                                    self.active_screen = id;
+                                    self.screen_manager.set_active_screen(id);
                                     return Cmd::none();
                                 }
                             }
@@ -1647,7 +1670,7 @@ impl Model for MailAppModel {
                 }
 
                 // Forward unhandled events to the active screen
-                if let Some(screen) = self.screens.get_mut(&self.active_screen) {
+                if let Some(screen) = self.screen_manager.active_screen_mut() {
                     map_screen_cmd(screen.update(event, &self.state))
                 } else {
                     Cmd::none()
@@ -1656,28 +1679,12 @@ impl Model for MailAppModel {
 
             // ── Screen messages / direct navigation ─────────────────
             MailMsg::Screen(MailScreenMsg::Navigate(id)) | MailMsg::SwitchScreen(id) => {
-                self.active_screen = id;
+                self.screen_manager.set_active_screen(id);
                 Cmd::none()
             }
             MailMsg::Screen(MailScreenMsg::Noop) => Cmd::none(),
             MailMsg::Screen(MailScreenMsg::DeepLink(ref target)) => {
-                // Route deep-link to the appropriate screen.
-                use crate::tui_screens::DeepLinkTarget;
-                let target_screen = match target {
-                    DeepLinkTarget::TimelineAtTime(_) => MailScreenId::Timeline,
-                    DeepLinkTarget::ThreadById(_) => MailScreenId::Threads,
-                    DeepLinkTarget::MessageById(_) => MailScreenId::Messages,
-                    DeepLinkTarget::AgentByName(_) => MailScreenId::Agents,
-                    DeepLinkTarget::ToolByName(_) => MailScreenId::ToolMetrics,
-                    DeepLinkTarget::ProjectBySlug(_) => MailScreenId::Projects,
-                    DeepLinkTarget::ReservationByAgent(_) => MailScreenId::Reservations,
-                    DeepLinkTarget::ContactByPair(_, _) => MailScreenId::Contacts,
-                    DeepLinkTarget::ExplorerForAgent(_) => MailScreenId::Explorer,
-                };
-                self.active_screen = target_screen;
-                if let Some(screen) = self.screens.get_mut(&target_screen) {
-                    screen.receive_deep_link(target);
-                }
+                self.screen_manager.apply_deep_link(target);
                 Cmd::none()
             }
             MailMsg::ToggleHelp => {
@@ -1698,25 +1705,26 @@ impl Model for MailAppModel {
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let chrome = tui_chrome::chrome_layout(area);
+        let active_screen = self.screen_manager.active_screen();
 
         // 1. Tab bar (z=1)
-        tui_chrome::render_tab_bar(self.active_screen, frame, chrome.tab_bar);
+        tui_chrome::render_tab_bar(active_screen, frame, chrome.tab_bar);
 
         // 2. Screen content (z=2)
-        if let Some(screen) = self.screens.get(&self.active_screen) {
+        if let Some(screen) = self.screen_manager.active_screen_ref() {
             screen.view(frame, chrome.content, &self.state);
         }
 
         let screen_bindings = self
-            .screens
-            .get(&self.active_screen)
+            .screen_manager
+            .active_screen_ref()
             .map(|s| s.keybindings())
             .unwrap_or_default();
 
         // 3. Status line (z=3)
         tui_chrome::render_status_line(
             &self.state,
-            self.active_screen,
+            active_screen,
             self.help_visible,
             &self.accessibility,
             &screen_bindings,
@@ -1758,7 +1766,7 @@ impl Model for MailAppModel {
 
         // 6. Help overlay (z=6, topmost)
         if self.help_visible {
-            let screen_label = crate::tui_screens::screen_meta(self.active_screen).title;
+            let screen_label = crate::tui_screens::screen_meta(active_screen).title;
             let sections = self.keymap.contextual_help(&screen_bindings, screen_label);
             tui_chrome::render_help_overlay_sections(&sections, self.help_scroll, frame, area);
         }
@@ -2057,9 +2065,12 @@ struct PaletteMessageSummary {
 }
 
 #[derive(Debug, Clone, Default)]
-struct PaletteMessageCache {
+struct PaletteDbCache {
     database_url: String,
     fetched_at_micros: i64,
+    source_snapshot_micros: i64,
+    source_message_count: u64,
+    agent_metadata: HashMap<String, (String, String)>,
     messages: Vec<PaletteMessageSummary>,
 }
 
@@ -2077,7 +2088,24 @@ struct ReservationPaletteStats {
     ttl_remaining_secs: Option<u64>,
 }
 
-static PALETTE_MESSAGE_CACHE: OnceLock<Mutex<PaletteMessageCache>> = OnceLock::new();
+static PALETTE_DB_CACHE: OnceLock<Mutex<PaletteDbCache>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PaletteCacheBridgeState {
+    snapshot_micros: i64,
+    message_count: u64,
+}
+
+fn palette_cache_bridge_state(state: &TuiSharedState) -> PaletteCacheBridgeState {
+    state
+        .db_stats_snapshot()
+        .map_or(PaletteCacheBridgeState::default(), |snap| {
+            PaletteCacheBridgeState {
+                snapshot_micros: snap.timestamp_micros,
+                message_count: snap.messages,
+            }
+        })
+}
 
 fn query_palette_agent_metadata(
     state: &TuiSharedState,
@@ -2180,28 +2208,47 @@ fn query_palette_recent_messages(
     .unwrap_or_default()
 }
 
-fn fetch_palette_recent_messages(
+fn fetch_palette_db_data(
     state: &TuiSharedState,
-    limit: usize,
-) -> Vec<PaletteMessageSummary> {
+    agent_limit: usize,
+    message_limit: usize,
+) -> (
+    HashMap<String, (String, String)>,
+    Vec<PaletteMessageSummary>,
+) {
     let database_url = state.config_snapshot().database_url;
+    let bridge_state = palette_cache_bridge_state(state);
     let now = now_micros();
-    let cache = PALETTE_MESSAGE_CACHE.get_or_init(|| Mutex::new(PaletteMessageCache::default()));
+    let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
     if let Ok(guard) = cache.lock() {
         let fresh_enough =
             now.saturating_sub(guard.fetched_at_micros) <= PALETTE_DB_CACHE_TTL_MICROS;
-        if guard.database_url == database_url && fresh_enough {
-            return guard.messages.iter().take(limit).cloned().collect();
+        let bridge_matches = guard.source_snapshot_micros == bridge_state.snapshot_micros
+            && guard.source_message_count == bridge_state.message_count;
+        if guard.database_url == database_url && fresh_enough && bridge_matches {
+            return (
+                guard
+                    .agent_metadata
+                    .iter()
+                    .take(agent_limit)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                guard.messages.iter().take(message_limit).cloned().collect(),
+            );
         }
     }
 
-    let messages = query_palette_recent_messages(state, limit);
+    let agent_metadata = query_palette_agent_metadata(state, agent_limit);
+    let messages = query_palette_recent_messages(state, message_limit);
     if let Ok(mut guard) = cache.lock() {
         guard.database_url = database_url;
         guard.fetched_at_micros = now;
+        guard.source_snapshot_micros = bridge_state.snapshot_micros;
+        guard.source_message_count = bridge_state.message_count;
+        guard.agent_metadata = agent_metadata.clone();
         guard.messages = messages.clone();
     }
-    messages
+    (agent_metadata, messages)
 }
 
 fn format_timestamp_micros(micros: i64) -> String {
@@ -2342,8 +2389,11 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
     let Some(snap) = state.db_stats_snapshot() else {
         return;
     };
-    let agent_metadata = query_palette_agent_metadata(state, PALETTE_DYNAMIC_AGENT_CAP);
-    let recent_messages = fetch_palette_recent_messages(state, PALETTE_DYNAMIC_MESSAGE_CAP);
+    let (agent_metadata, recent_messages) = fetch_palette_db_data(
+        state,
+        PALETTE_DYNAMIC_AGENT_CAP,
+        PALETTE_DYNAMIC_MESSAGE_CAP,
+    );
 
     for agent in snap.agents_list.into_iter().take(PALETTE_DYNAMIC_AGENT_CAP) {
         let crate::tui_events::AgentSummary {
@@ -2894,11 +2944,47 @@ mod tests {
     }
 
     #[test]
-    fn all_screens_have_instances() {
+    fn only_dashboard_is_eagerly_initialized() {
         let model = test_model();
         for &id in ALL_SCREEN_IDS {
-            assert!(model.screens.contains_key(&id));
+            if id == MailScreenId::Dashboard {
+                assert!(model.screen_manager.has_screen(id));
+            } else {
+                assert!(!model.screen_manager.has_screen(id));
+            }
         }
+    }
+
+    #[test]
+    fn switching_screen_lazily_initializes_target() {
+        let mut model = test_model();
+        assert!(!model.screen_manager.has_screen(MailScreenId::Messages));
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        assert!(model.screen_manager.has_screen(MailScreenId::Messages));
+    }
+
+    #[test]
+    fn deep_link_lazily_initializes_target() {
+        let mut model = test_model();
+        assert!(!model.screen_manager.has_screen(MailScreenId::Agents));
+
+        let target = DeepLinkTarget::AgentByName("BlueLake".to_string());
+        model.update(MailMsg::Screen(MailScreenMsg::DeepLink(target)));
+
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+        assert!(model.screen_manager.has_screen(MailScreenId::Agents));
+    }
+
+    #[test]
+    fn layout_export_initializes_timeline_screen() {
+        let mut model = test_model();
+        assert!(!model.screen_manager.has_screen(MailScreenId::Timeline));
+
+        let _ = model.dispatch_palette_action(palette_action_ids::LAYOUT_EXPORT);
+
+        assert!(model.screen_manager.has_screen(MailScreenId::Timeline));
     }
 
     #[test]
@@ -2943,7 +3029,7 @@ mod tests {
         let mut model = test_model();
         let new_screen = Box::new(AgentsScreen::new());
         model.set_screen(MailScreenId::Agents, new_screen);
-        assert!(model.screens.contains_key(&MailScreenId::Agents));
+        assert!(model.screen_manager.has_screen(MailScreenId::Agents));
     }
 
     #[test]
@@ -3273,9 +3359,13 @@ mod tests {
         let model = MailAppModel::with_config(Arc::clone(&state), &config);
         assert_eq!(model.active_screen(), MailScreenId::Dashboard);
         assert!(!model.help_visible());
-        // Should have all screens
+        // Lazy-init: default screen is eager; with_config also preloads Timeline
         for &id in ALL_SCREEN_IDS {
-            assert!(model.screens.contains_key(&id));
+            if id == MailScreenId::Dashboard || id == MailScreenId::Timeline {
+                assert!(model.screen_manager.has_screen(id));
+            } else {
+                assert!(!model.screen_manager.has_screen(id));
+            }
         }
     }
 
@@ -3685,9 +3775,10 @@ mod tests {
     }
 
     #[test]
-    fn palette_message_cache_respects_ttl() {
+    fn palette_db_cache_respects_ttl() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
+        let bridge_state = palette_cache_bridge_state(&state);
         let db_url = state.config_snapshot().database_url;
         let expected = PaletteMessageSummary {
             id: 7,
@@ -3698,22 +3789,71 @@ mod tests {
             timestamp_micros: now_micros(),
         };
 
-        let cache =
-            PALETTE_MESSAGE_CACHE.get_or_init(|| Mutex::new(PaletteMessageCache::default()));
+        let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
         {
             let mut guard = cache.lock().expect("cache lock");
             guard.database_url = db_url;
             guard.fetched_at_micros = now_micros();
+            guard.source_snapshot_micros = bridge_state.snapshot_micros;
+            guard.source_message_count = bridge_state.message_count;
+            guard.agent_metadata.insert(
+                "BlueLake".to_string(),
+                ("gpt-5".to_string(), "proj-a".to_string()),
+            );
             guard.messages = vec![expected.clone()];
         }
 
-        let messages = fetch_palette_recent_messages(&state, 10);
+        let (agent_metadata, messages) = fetch_palette_db_data(&state, 10, 10);
+        assert_eq!(
+            agent_metadata.get("BlueLake"),
+            Some(&("gpt-5".to_string(), "proj-a".to_string()))
+        );
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, expected.id);
         assert_eq!(messages[0].subject, expected.subject);
 
         if let Ok(mut guard) = cache.lock() {
-            *guard = PaletteMessageCache::default();
+            *guard = PaletteDbCache::default();
+        }
+    }
+
+    #[test]
+    fn palette_db_cache_invalidates_when_bridge_snapshot_changes() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let bridge_state = palette_cache_bridge_state(&state);
+        let db_url = state.config_snapshot().database_url;
+        let expected = PaletteMessageSummary {
+            id: 11,
+            subject: "stale subject".to_string(),
+            from_agent: "BlueLake".to_string(),
+            to_agents: "RedFox".to_string(),
+            thread_id: "br-11".to_string(),
+            timestamp_micros: now_micros(),
+        };
+
+        let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
+        {
+            let mut guard = cache.lock().expect("cache lock");
+            guard.database_url = db_url;
+            guard.fetched_at_micros = now_micros();
+            guard.source_snapshot_micros = bridge_state.snapshot_micros;
+            guard.source_message_count = bridge_state.message_count;
+            guard.messages = vec![expected];
+        }
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            messages: bridge_state.message_count.saturating_add(1),
+            timestamp_micros: bridge_state.snapshot_micros.saturating_add(1),
+            ..Default::default()
+        });
+
+        let (agent_metadata, messages) = fetch_palette_db_data(&state, 10, 10);
+        assert!(agent_metadata.is_empty());
+        assert!(messages.is_empty());
+
+        if let Ok(mut guard) = cache.lock() {
+            *guard = PaletteDbCache::default();
         }
     }
 

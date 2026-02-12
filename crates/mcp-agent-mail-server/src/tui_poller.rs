@@ -29,6 +29,114 @@ const MAX_PROJECTS: usize = 100;
 /// Maximum contact links to fetch per poll cycle.
 const MAX_CONTACTS: usize = 200;
 
+/// Batched aggregate counters used to populate [`DbStatSnapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DbSnapshotCounts {
+    projects: u64,
+    agents: u64,
+    messages: u64,
+    file_reservations: u64,
+    contact_links: u64,
+    ack_pending: u64,
+}
+
+/// Groups DB queries used by the TUI poller so related reads can be fetched
+/// with fewer round-trips.
+struct DbStatQueryBatcher<'a> {
+    conn: &'a DbConn,
+}
+
+impl<'a> DbStatQueryBatcher<'a> {
+    const fn new(conn: &'a DbConn) -> Self {
+        Self { conn }
+    }
+
+    fn fetch_snapshot(&self) -> DbStatSnapshot {
+        let counts = self.fetch_counts();
+        DbStatSnapshot {
+            projects: counts.projects,
+            agents: counts.agents,
+            messages: counts.messages,
+            file_reservations: counts.file_reservations,
+            contact_links: counts.contact_links,
+            ack_pending: counts.ack_pending,
+            agents_list: fetch_agents_list(self.conn),
+            projects_list: fetch_projects_list(self.conn),
+            contacts_list: fetch_contacts_list(self.conn),
+            timestamp_micros: now_micros(),
+        }
+    }
+
+    fn fetch_counts(&self) -> DbSnapshotCounts {
+        let batched = self
+            .conn
+            .query_sync(
+                "SELECT \
+                 (SELECT COUNT(*) FROM projects) AS projects_count, \
+                 (SELECT COUNT(*) FROM agents) AS agents_count, \
+                 (SELECT COUNT(*) FROM messages) AS messages_count, \
+                 (SELECT COUNT(*) FROM file_reservations WHERE released_ts IS NULL) \
+                   AS reservations_count, \
+                 (SELECT COUNT(*) FROM agent_links) AS contacts_count, \
+                 (SELECT COUNT(*) FROM message_recipients mr \
+                    JOIN messages m ON m.id = mr.message_id \
+                   WHERE m.ack_required = 1 AND mr.ack_ts IS NULL) AS ack_pending_count",
+                &[],
+            )
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|row| {
+                let read_count = |key: &str| {
+                    row.get_named::<i64>(key)
+                        .ok()
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(0)
+                };
+                DbSnapshotCounts {
+                    projects: read_count("projects_count"),
+                    agents: read_count("agents_count"),
+                    messages: read_count("messages_count"),
+                    file_reservations: read_count("reservations_count"),
+                    contact_links: read_count("contacts_count"),
+                    ack_pending: read_count("ack_pending_count"),
+                }
+            });
+
+        if let Some(counts) = batched {
+            return counts;
+        }
+
+        self.fetch_counts_fallback()
+    }
+
+    fn fetch_counts_fallback(&self) -> DbSnapshotCounts {
+        DbSnapshotCounts {
+            projects: self.run_count_query("SELECT COUNT(*) AS c FROM projects"),
+            agents: self.run_count_query("SELECT COUNT(*) AS c FROM agents"),
+            messages: self.run_count_query("SELECT COUNT(*) AS c FROM messages"),
+            file_reservations: self.run_count_query(
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE released_ts IS NULL",
+            ),
+            contact_links: self.run_count_query("SELECT COUNT(*) AS c FROM agent_links"),
+            ack_pending: self.run_count_query(
+                "SELECT COUNT(*) AS c FROM message_recipients mr \
+                 JOIN messages m ON m.id = mr.message_id \
+                 WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
+            ),
+        }
+    }
+
+    fn run_count_query(&self, sql: &str) -> u64 {
+        self.conn
+            .query_sync(sql, &[])
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0)
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // DbPoller
 // ──────────────────────────────────────────────────────────────────────
@@ -153,30 +261,7 @@ fn fetch_db_stats(database_url: &str) -> DbStatSnapshot {
         return DbStatSnapshot::default();
     };
 
-    let agents_list = fetch_agents_list(&conn);
-    let projects_list = fetch_projects_list(&conn);
-    let contacts_list = fetch_contacts_list(&conn);
-
-    DbStatSnapshot {
-        projects: count_query(&conn, "SELECT COUNT(*) AS c FROM projects"),
-        agents: count_query(&conn, "SELECT COUNT(*) AS c FROM agents"),
-        messages: count_query(&conn, "SELECT COUNT(*) AS c FROM messages"),
-        file_reservations: count_query(
-            &conn,
-            "SELECT COUNT(*) AS c FROM file_reservations WHERE released_ts IS NULL",
-        ),
-        contact_links: count_query(&conn, "SELECT COUNT(*) AS c FROM agent_links"),
-        ack_pending: count_query(
-            &conn,
-            "SELECT COUNT(*) AS c FROM message_recipients mr \
-             JOIN messages m ON m.id = mr.message_id \
-             WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
-        ),
-        agents_list,
-        projects_list,
-        contacts_list,
-        timestamp_micros: now_micros(),
-    }
+    DbStatQueryBatcher::new(&conn).fetch_snapshot()
 }
 
 /// Open a sync `SQLite` connection from a database URL.
@@ -187,16 +272,6 @@ fn open_sync_connection(database_url: &str) -> Option<DbConn> {
     };
     let path = cfg.sqlite_path().ok()?;
     DbConn::open_file(&path).ok()
-}
-
-/// Run a `SELECT COUNT(*) AS c FROM ...` query and return the count.
-fn count_query(conn: &DbConn, sql: &str) -> u64 {
-    conn.query_sync(sql, &[])
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
-        .and_then(|row| row.get_named::<i64>("c").ok())
-        .and_then(|v| u64::try_from(v).ok())
-        .unwrap_or(0)
 }
 
 /// Fetch the agent list ordered by most recently active.
@@ -693,6 +768,95 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    #[test]
+    fn batcher_fetch_counts_aggregates_metrics_in_single_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_batch_counts.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, ack_required INTEGER)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, released_ts INTEGER)",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync(
+            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_agent_id INTEGER, b_agent_id INTEGER, a_project_id INTEGER, b_project_id INTEGER, status TEXT, reason TEXT, updated_ts INTEGER, expires_ts INTEGER)",
+            &[],
+        )
+        .expect("create links");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
+            &[],
+        )
+        .expect("create recipients");
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+             (1, 'proj-a', 'hk-a', 100), (2, 'proj-b', 'hk-b', 200)",
+            &[],
+        )
+        .expect("insert projects");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, last_active_ts) VALUES
+             (1, 1, 'BlueLake', 'codex', 100), (2, 1, 'RedFox', 'claude', 101), (3, 2, 'GoldPeak', 'codex', 102)",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, ack_required) VALUES
+             (10, 1, 1, 1), (11, 1, 2, 0)",
+            &[],
+        )
+        .expect("insert messages");
+        conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, released_ts) VALUES
+             (20, 1, NULL), (21, 1, 12345)",
+            &[],
+        )
+        .expect("insert reservations");
+        conn.execute_sync(
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, a_project_id, b_project_id, status, reason, updated_ts, expires_ts) VALUES
+             (30, 1, 2, 1, 1, 'accepted', '', 0, NULL),
+             (31, 2, 3, 1, 2, 'accepted', '', 0, NULL)",
+            &[],
+        )
+        .expect("insert links");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (id, message_id, ack_ts) VALUES
+             (40, 10, NULL), (41, 10, 99999), (42, 11, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let counts = DbStatQueryBatcher::new(&conn).fetch_counts();
+        assert_eq!(
+            counts,
+            DbSnapshotCounts {
+                projects: 2,
+                agents: 3,
+                messages: 2,
+                file_reservations: 1,
+                contact_links: 2,
+                ack_pending: 1,
+            }
+        );
     }
 
     // ── fetch_db_stats with nonexistent DB ───────────────────────────

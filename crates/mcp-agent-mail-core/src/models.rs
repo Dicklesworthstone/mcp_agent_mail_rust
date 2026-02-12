@@ -60,7 +60,7 @@ pub struct ProductProjectLink {
 ///
 /// # Naming Rules
 /// Agent names MUST be adjective+noun combinations (e.g., "`GreenLake`", "`BlueDog`").
-/// - 62 adjectives × 73 nouns = 4,526 valid combinations
+/// - 75 adjectives × 132 nouns = 9,900 valid combinations
 /// - Case-insensitive unique per project
 /// - NOT descriptive role names (e.g., "`BackendHarmonizer`" is INVALID)
 ///
@@ -321,12 +321,13 @@ pub struct ConsistencyReport {
 // Agent Name Validation
 // =============================================================================
 
-/// Valid adjectives for agent names (62 total).
+/// Valid adjectives for agent names (75 total).
 ///
 /// IMPORTANT: Keep this list in lockstep with legacy Python `mcp_agent_mail.utils.ADJECTIVES`.
 pub const VALID_ADJECTIVES: &[&str] = &[
     "red",
     "orange",
+    "yellow",
     "pink",
     "black",
     "purple",
@@ -343,6 +344,7 @@ pub const VALID_ADJECTIVES: &[&str] = &[
     "crimson",
     "cyan",
     "gold",
+    "golden",
     "gray",
     "indigo",
     "ivory",
@@ -367,6 +369,11 @@ pub const VALID_ADJECTIVES: &[&str] = &[
     "emerald",
     "sapphire",
     "turquoise",
+    "beige",
+    "tan",
+    "cream",
+    "peach",
+    "plum",
     "sunny",
     "misty",
     "foggy",
@@ -377,6 +384,10 @@ pub const VALID_ADJECTIVES: &[&str] = &[
     "hazy",
     "cloudy",
     "rainy",
+    "snowy",
+    "icy",
+    "mossy",
+    "sandy",
     "swift",
     "quiet",
     "bold",
@@ -387,19 +398,19 @@ pub const VALID_ADJECTIVES: &[&str] = &[
     "silent",
     "gentle",
     "rustic",
+    "noble",
+    "proud",
 ];
 
-/// Valid nouns for agent names (73 total).
+/// Valid nouns for agent names (132 total).
 ///
 /// IMPORTANT: Keep this list in lockstep with legacy Python `mcp_agent_mail.utils.NOUNS`.
 pub const VALID_NOUNS: &[&str] = &[
+    // Geography / Nature
     "stone",
     "lake",
-    "dog",
     "creek",
     "pond",
-    "cat",
-    "bear",
     "mountain",
     "hill",
     "snow",
@@ -433,26 +444,91 @@ pub const VALID_NOUNS: &[&str] = &[
     "cove",
     "bay",
     "harbor",
+    "coast",
+    "shore",
+    "bluff",
+    "knoll",
+    "summit",
+    "plateau",
+    // Animals - mammals
+    "dog",
+    "cat",
+    "bear",
     "fox",
     "wolf",
-    "hawk",
-    "eagle",
-    "owl",
     "deer",
     "elk",
     "moose",
+    "otter",
+    "beaver",
+    "badger",
+    "lynx",
+    "puma",
+    "squirrel",
+    "rabbit",
+    "hare",
+    "mouse",
+    "mink",
+    "seal",
+    "horse",
+    "lion",
+    "tiger",
+    "panther",
+    "leopard",
+    "jaguar",
+    "coyote",
+    "bison",
+    "ox",
+    // Animals - birds
+    "hawk",
+    "eagle",
+    "owl",
     "falcon",
     "raven",
     "heron",
     "crane",
-    "otter",
-    "beaver",
-    "badger",
     "finch",
     "robin",
     "sparrow",
-    "lynx",
-    "puma",
+    "duck",
+    "goose",
+    "swan",
+    "dove",
+    "wren",
+    "jay",
+    "lark",
+    "kite",
+    "condor",
+    "osprey",
+    "pelican",
+    "gull",
+    "tern",
+    "stork",
+    "ibis",
+    "cardinal",
+    "oriole",
+    "thrush",
+    // Animals - fish/reptiles
+    "trout",
+    "salmon",
+    "bass",
+    "pike",
+    "carp",
+    "turtle",
+    "frog",
+    // Trees/Plants
+    "pine",
+    "oak",
+    "maple",
+    "birch",
+    "cedar",
+    "willow",
+    "aspen",
+    "elm",
+    "orchid",
+    "lotus",
+    "ivy",
+    // Structures
     "tower",
     "bridge",
     "forge",
@@ -464,8 +540,10 @@ pub const VALID_NOUNS: &[&str] = &[
     "beacon",
     "compass",
     "horizon",
-    "orchid",
-    "duck",
+    "spire",
+    "chapel",
+    "citadel",
+    "fortress",
 ];
 
 /// Normalize a user-provided agent name; return `None` if nothing remains.
@@ -585,6 +663,17 @@ mod tests {
         assert!(is_valid_agent_name("VioletHorizon"));
         assert!(is_valid_agent_name("CrimsonOrchid"));
         assert!(is_valid_agent_name("GreenDuck"));
+        // Extended vocabulary (yellow, golden, squirrel, etc.)
+        assert!(is_valid_agent_name("YellowSquirrel"));
+        assert!(is_valid_agent_name("GoldenFalcon"));
+        assert!(is_valid_agent_name("GoldenEagle"));
+        assert!(is_valid_agent_name("YellowFinch"));
+        assert!(is_valid_agent_name("SnowyOwl"));
+        assert!(is_valid_agent_name("IcyPeak"));
+        assert!(is_valid_agent_name("NobleLion"));
+        assert!(is_valid_agent_name("ProudPanther"));
+        assert!(is_valid_agent_name("SwiftRabbit"));
+        assert!(is_valid_agent_name("SilentSwan"));
     }
 
     #[test]
@@ -872,9 +961,9 @@ mod tests {
 
     #[test]
     fn test_valid_name_count() {
-        // 62 adjectives x 73 nouns = 4,526 valid names
-        assert_eq!(VALID_ADJECTIVES.len(), 62);
-        assert_eq!(VALID_NOUNS.len(), 73);
-        assert_eq!(valid_names_set().len(), 62 * 73);
+        // 75 adjectives x 132 nouns = 9,900 valid names
+        assert_eq!(VALID_ADJECTIVES.len(), 75);
+        assert_eq!(VALID_NOUNS.len(), 132);
+        assert_eq!(valid_names_set().len(), 75 * 132);
     }
 }

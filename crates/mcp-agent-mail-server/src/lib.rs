@@ -1124,8 +1124,36 @@ fn is_tui_active() -> bool {
     tui_state_handle().is_some()
 }
 
-const fn should_emit_structured_request_line(use_ansi: bool, log_json_enabled: bool) -> bool {
-    !use_ansi || log_json_enabled
+/// Unified runtime output mode across TUI/headless text/headless JSON surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeOutputMode {
+    Tui,
+    HeadlessText,
+    HeadlessJson,
+}
+
+impl RuntimeOutputMode {
+    const fn is_tui(self) -> bool {
+        matches!(self, Self::Tui)
+    }
+
+    const fn should_emit_structured_request_line(self, use_ansi: bool) -> bool {
+        match self {
+            Self::Tui => false,
+            Self::HeadlessText => !use_ansi,
+            Self::HeadlessJson => true,
+        }
+    }
+}
+
+fn runtime_output_mode(config: &mcp_agent_mail_core::Config) -> RuntimeOutputMode {
+    if is_tui_active() {
+        RuntimeOutputMode::Tui
+    } else if config.log_json_enabled {
+        RuntimeOutputMode::HeadlessJson
+    } else {
+        RuntimeOutputMode::HeadlessText
+    }
 }
 
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -2783,6 +2811,15 @@ fn dashboard_write_log(text: &str) -> bool {
     })
 }
 
+fn emit_operator_panel_line(mode: RuntimeOutputMode, text: &str) {
+    if mode.is_tui() {
+        return;
+    }
+    if !dashboard_write_log(text) {
+        ftui_runtime::ftui_println!("{text}");
+    }
+}
+
 fn dashboard_emit_event(
     kind: console::ConsoleEventKind,
     severity: console::ConsoleEventSeverity,
@@ -3063,42 +3100,34 @@ impl HttpState {
             } else {
                 http_request_log_kv_line(&timestamp, method, path, status, duration_ms, client_ip)
             };
-            // When TUI is active, suppress duplicate console output
-            // (the TUI event pipeline renders these events instead).
-            if !is_tui_active() {
-                // In rich TTY mode, the request panel is the primary operator-facing output.
-                // Suppress the duplicate key/value line unless JSON logging is explicitly requested.
-                let use_ansi = self.config.log_rich_enabled && std::io::stdout().is_terminal();
-                if should_emit_structured_request_line(use_ansi, self.config.log_json_enabled) {
-                    ftui_runtime::ftui_eprintln!("{line}");
-                }
+            let output_mode = runtime_output_mode(&self.config);
+            if output_mode.is_tui() {
+                return;
+            }
 
-                // Rich-ish panel output (stdout), fallback to legacy plain-text line on any error.
-                // Gate: only render ANSI panel when rich output is enabled AND stdout is a TTY.
-                if let Some(panel) = console::render_http_request_panel(
-                    request_panel_width(),
-                    method,
-                    path,
-                    status,
-                    duration_ms,
-                    client_ip,
-                    use_ansi,
-                ) {
-                    if !dashboard_write_log(&panel) {
-                        ftui_runtime::ftui_println!("{panel}");
-                    }
-                } else {
-                    let fallback = http_request_log_fallback_line(
-                        method,
-                        path,
-                        status,
-                        duration_ms,
-                        client_ip,
-                    );
-                    if !dashboard_write_log(&fallback) {
-                        ftui_runtime::ftui_println!("{fallback}");
-                    }
-                }
+            // In rich TTY mode, the request panel is the primary operator-facing output.
+            // Suppress duplicate key/value line unless JSON mode requests structured logs.
+            let use_ansi = self.config.log_rich_enabled && std::io::stdout().is_terminal();
+            if output_mode.should_emit_structured_request_line(use_ansi) {
+                ftui_runtime::ftui_eprintln!("{line}");
+            }
+
+            // Rich-ish panel output (stdout), fallback to legacy plain-text line on any error.
+            // Gate: only render ANSI panel when rich output is enabled AND stdout is a TTY.
+            if let Some(panel) = console::render_http_request_panel(
+                request_panel_width(),
+                method,
+                path,
+                status,
+                duration_ms,
+                client_ip,
+                use_ansi,
+            ) {
+                emit_operator_panel_line(output_mode, &panel);
+            } else {
+                let fallback =
+                    http_request_log_fallback_line(method, path, status, duration_ms, client_ip);
+                emit_operator_panel_line(output_mode, &fallback);
             }
         }));
     }
@@ -3719,12 +3748,13 @@ impl HttpState {
                         "agent",
                     ],
                 );
+                let output_mode = runtime_output_mode(&self.config);
 
                 let tool_call_console_enabled = self.config.log_rich_enabled
                     && self.config.tools_log_enabled
                     && self.config.log_tool_calls_enabled
                     && std::io::stdout().is_terminal()
-                    && !is_tui_active();
+                    && !output_mode.is_tui();
 
                 // Emit tool-call-start panel if console tool logging is enabled.
                 let call_start = if tool_call_console_enabled {
@@ -3739,9 +3769,7 @@ impl HttpState {
                         agent_hint.as_deref(),
                     );
                     let panel = panel_lines.join("\n");
-                    if !dashboard_write_log(&panel) {
-                        ftui_runtime::ftui_println!("{panel}");
-                    }
+                    emit_operator_panel_line(output_mode, &panel);
                     Some(Instant::now())
                 } else {
                     None
@@ -3823,9 +3851,7 @@ impl HttpState {
                                 self.config.log_tool_calls_result_max_chars,
                             );
                             let panel = panel_lines.join("\n");
-                            if !dashboard_write_log(&panel) {
-                                ftui_runtime::ftui_println!("{panel}");
-                            }
+                            emit_operator_panel_line(output_mode, &panel);
                             dashboard_emit_event(
                                 console::ConsoleEventKind::ToolCallEnd,
                                 console::ConsoleEventSeverity::Error,
@@ -3853,9 +3879,7 @@ impl HttpState {
                         self.config.log_tool_calls_result_max_chars,
                     );
                     let panel = panel_lines.join("\n");
-                    if !dashboard_write_log(&panel) {
-                        ftui_runtime::ftui_println!("{panel}");
-                    }
+                    emit_operator_panel_line(output_mode, &panel);
                     dashboard_emit_event(
                         console::ConsoleEventKind::ToolCallEnd,
                         console::ConsoleEventSeverity::Info,
@@ -8738,10 +8762,11 @@ mod tests {
 
     #[test]
     fn request_log_line_policy_suppresses_duplicate_kv_in_rich_tty_mode() {
-        assert!(should_emit_structured_request_line(false, false));
-        assert!(should_emit_structured_request_line(false, true));
-        assert!(!should_emit_structured_request_line(true, false));
-        assert!(should_emit_structured_request_line(true, true));
+        assert!(RuntimeOutputMode::HeadlessText.should_emit_structured_request_line(false));
+        assert!(RuntimeOutputMode::HeadlessJson.should_emit_structured_request_line(false));
+        assert!(!RuntimeOutputMode::HeadlessText.should_emit_structured_request_line(true));
+        assert!(RuntimeOutputMode::HeadlessJson.should_emit_structured_request_line(true));
+        assert!(!RuntimeOutputMode::Tui.should_emit_structured_request_line(false));
     }
 
     #[test]

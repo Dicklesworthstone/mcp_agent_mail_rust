@@ -2,6 +2,7 @@
 //!
 //! Provides structured output that automatically adapts:
 //! - **JSON mode**: Machine-readable JSON via `--json` flag
+//! - **TOON mode**: Token-optimized output via `--format toon`
 //! - **TTY mode**: Styled table output with headers and borders
 //! - **Pipe mode**: Clean plain-text tables (no color, no decoration)
 
@@ -9,6 +10,65 @@
 
 use serde::Serialize;
 use std::io::IsTerminal;
+
+// ── Output format enum ────────────────────────────────────────────────────
+
+/// Output format for CLI commands supporting `--format`.
+///
+/// This is the format enum for non-robot commands. Robot commands use
+/// their own `OutputFormat` in `robot.rs` with additional variants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CliOutputFormat {
+    /// Human-readable table (default for TTY).
+    #[default]
+    Table,
+    /// Machine-readable JSON.
+    Json,
+    /// Token-optimized TOON encoding.
+    Toon,
+}
+
+impl std::fmt::Display for CliOutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Table => f.write_str("table"),
+            Self::Json => f.write_str("json"),
+            Self::Toon => f.write_str("toon"),
+        }
+    }
+}
+
+impl std::str::FromStr for CliOutputFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "table" => Ok(Self::Table),
+            "json" => Ok(Self::Json),
+            "toon" => Ok(Self::Toon),
+            other => Err(format!(
+                "unknown output format: {other} (expected table, json, or toon)"
+            )),
+        }
+    }
+}
+
+impl CliOutputFormat {
+    /// Resolve format from explicit `--format` flag or `--json` shorthand.
+    ///
+    /// Priority: explicit format > --json flag > default table
+    #[must_use]
+    pub fn resolve(explicit_format: Option<Self>, json_flag: bool) -> Self {
+        if let Some(fmt) = explicit_format {
+            return fmt;
+        }
+        if json_flag {
+            return Self::Json;
+        }
+        // Preserve legacy default behavior: table output unless explicitly overridden.
+        Self::Table
+    }
+}
 
 /// Detect whether stdout is a TTY.
 #[must_use]
@@ -157,6 +217,62 @@ where
         );
     } else {
         render();
+    }
+}
+
+// ── Format-aware output ─────────────────────────────────────────────────
+
+/// Emit data in the requested format.
+///
+/// This is the recommended way to output data from CLI commands that support
+/// `--format`. It handles JSON, TOON, and table output uniformly.
+///
+/// # Arguments
+/// - `data`: The data to output (must be Serialize for JSON/TOON)
+/// - `format`: The output format to use
+/// - `table_render`: Closure to render human-readable table output
+pub fn emit_output<T: Serialize, F>(data: &T, format: CliOutputFormat, table_render: F)
+where
+    F: FnOnce(),
+{
+    match format {
+        CliOutputFormat::Table => {
+            table_render();
+        }
+        CliOutputFormat::Json => {
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string())
+            );
+        }
+        CliOutputFormat::Toon => {
+            let json_str = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+            match toon::json_to_toon(&json_str) {
+                Ok(toon_str) => ftui_runtime::ftui_println!("{}", toon_str),
+                Err(_) => {
+                    // Fallback to JSON if TOON conversion fails
+                    ftui_runtime::ftui_println!(
+                        "{}",
+                        serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string())
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Emit an empty result in the requested format.
+pub fn emit_empty(format: CliOutputFormat, message: &str) {
+    match format {
+        CliOutputFormat::Table => {
+            ftui_runtime::ftui_println!("{message}");
+        }
+        CliOutputFormat::Json => {
+            ftui_runtime::ftui_println!("[]");
+        }
+        CliOutputFormat::Toon => {
+            ftui_runtime::ftui_println!("[]");
+        }
     }
 }
 
@@ -967,5 +1083,133 @@ mod tests {
         assert_eq!(parsed["inner"]["value"], 42);
         assert_eq!(parsed["inner"]["list"][0], "a");
         assert_eq!(parsed["inner"]["list"][1], "b");
+    }
+
+    // ── CliOutputFormat tests (br-1w06g) ─────────────────────────────────────
+
+    #[test]
+    fn cli_output_format_parse_valid() {
+        assert_eq!(
+            "table".parse::<CliOutputFormat>().unwrap(),
+            CliOutputFormat::Table
+        );
+        assert_eq!(
+            "json".parse::<CliOutputFormat>().unwrap(),
+            CliOutputFormat::Json
+        );
+        assert_eq!(
+            "toon".parse::<CliOutputFormat>().unwrap(),
+            CliOutputFormat::Toon
+        );
+        // Case insensitive
+        assert_eq!(
+            "JSON".parse::<CliOutputFormat>().unwrap(),
+            CliOutputFormat::Json
+        );
+        assert_eq!(
+            "TOON".parse::<CliOutputFormat>().unwrap(),
+            CliOutputFormat::Toon
+        );
+    }
+
+    #[test]
+    fn cli_output_format_parse_invalid() {
+        let result = "invalid".parse::<CliOutputFormat>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown output format"));
+    }
+
+    #[test]
+    fn cli_output_format_display() {
+        assert_eq!(CliOutputFormat::Table.to_string(), "table");
+        assert_eq!(CliOutputFormat::Json.to_string(), "json");
+        assert_eq!(CliOutputFormat::Toon.to_string(), "toon");
+    }
+
+    #[test]
+    fn cli_output_format_resolve_explicit_wins() {
+        // Explicit format takes precedence over --json flag
+        let fmt = CliOutputFormat::resolve(Some(CliOutputFormat::Toon), true);
+        assert_eq!(fmt, CliOutputFormat::Toon);
+    }
+
+    #[test]
+    fn cli_output_format_resolve_json_flag() {
+        // --json flag returns Json when no explicit format
+        let fmt = CliOutputFormat::resolve(None, true);
+        assert_eq!(fmt, CliOutputFormat::Json);
+    }
+
+    #[test]
+    fn cli_output_format_resolve_auto_detect() {
+        // Default should remain table even in non-TTY environments.
+        let fmt = CliOutputFormat::resolve(None, false);
+        assert_eq!(
+            fmt,
+            CliOutputFormat::Table,
+            "default should remain table when no explicit format is requested"
+        );
+    }
+
+    #[test]
+    fn emit_output_json_format() {
+        let data = serde_json::json!({"id": 1, "name": "test"});
+        let output = with_capture(|| {
+            emit_output(&data, CliOutputFormat::Json, || {
+                panic!("table render should not be called");
+            });
+        });
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["id"], 1);
+        assert_eq!(parsed["name"], "test");
+    }
+
+    #[test]
+    fn emit_output_table_format_calls_render() {
+        let data = serde_json::json!({"id": 1});
+        let mut called = false;
+        // Can't use with_capture for checking the render was called since we need &mut
+        emit_output(&data, CliOutputFormat::Table, || {
+            called = true;
+        });
+        assert!(called, "table render closure should be called");
+    }
+
+    #[test]
+    fn emit_output_toon_format() {
+        let data = serde_json::json!({"items": [1, 2, 3]});
+        let output = with_capture(|| {
+            emit_output(&data, CliOutputFormat::Toon, || {
+                panic!("table render should not be called");
+            });
+        });
+        // TOON output should be valid and different from JSON
+        assert!(!output.is_empty());
+        // TOON uses different formatting than pretty JSON
+        // Just verify it produces output without crashing
+    }
+
+    #[test]
+    fn emit_empty_json() {
+        let output = with_capture(|| {
+            emit_empty(CliOutputFormat::Json, "No results");
+        });
+        assert_eq!(output.trim(), "[]");
+    }
+
+    #[test]
+    fn emit_empty_toon() {
+        let output = with_capture(|| {
+            emit_empty(CliOutputFormat::Toon, "No results");
+        });
+        assert_eq!(output.trim(), "[]");
+    }
+
+    #[test]
+    fn emit_empty_table() {
+        let output = with_capture(|| {
+            emit_empty(CliOutputFormat::Table, "No results found.");
+        });
+        assert_eq!(output.trim(), "No results found.");
     }
 }
