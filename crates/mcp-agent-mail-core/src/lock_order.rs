@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(debug_assertions)]
 use std::cell::RefCell;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -349,7 +350,7 @@ thread_local! {
 }
 
 #[inline]
-fn check_before_acquire(level: LockLevel) {
+fn check_before_acquire(_level: LockLevel) {
     #[cfg(debug_assertions)]
     HELD_LOCKS.with(|held| {
         let held = held.borrow();
@@ -357,9 +358,9 @@ fn check_before_acquire(level: LockLevel) {
             return;
         };
         assert!(
-            level.rank() > last.rank(),
+            _level.rank() > last.rank(),
             "lock order violation: attempting to acquire {} while holding {}. held={:?}",
-            level,
+            _level,
             last,
             held.as_slice()
         );
@@ -367,21 +368,21 @@ fn check_before_acquire(level: LockLevel) {
 }
 
 #[inline]
-fn did_acquire(level: LockLevel) {
+fn did_acquire(_level: LockLevel) {
     #[cfg(debug_assertions)]
-    HELD_LOCKS.with(|held| held.borrow_mut().push(level));
+    HELD_LOCKS.with(|held| held.borrow_mut().push(_level));
 }
 
 #[inline]
-fn did_release(level: LockLevel) {
+fn did_release(_level: LockLevel) {
     #[cfg(debug_assertions)]
     HELD_LOCKS.with(|held| {
         let mut held = held.borrow_mut();
         let last = held.pop();
         assert!(
-            last == Some(level),
+            last == Some(_level),
             "lock tracking corrupted: expected to release {}, popped={:?}, held={:?}",
-            level,
+            _level,
             last,
             held.as_slice()
         );
@@ -670,6 +671,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "lock order violation")]
+    #[cfg(debug_assertions)]
     fn ordered_mutex_panics_on_out_of_order() {
         let tool_metrics = OrderedMutex::new(LockLevel::ToolsToolMetrics, ());
         let pool_cache = OrderedMutex::new(LockLevel::DbPoolCache, ());
