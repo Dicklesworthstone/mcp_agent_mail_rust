@@ -196,6 +196,201 @@ impl GateConfig {
 // Gate Result
 // ──────────────────────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Gate Error Classification
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Structured error information extracted from gate stderr.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GateError {
+    /// Last N lines of stderr output.
+    pub stderr_tail: String,
+    /// Number of errors detected (if parseable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_count: Option<u32>,
+    /// One-line summary of the error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_summary: Option<String>,
+    /// Files mentioned in error output.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub affected_files: Vec<String>,
+    /// Error category (compiler, test, clippy, format, unknown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<String>,
+}
+
+impl GateError {
+    /// Maximum number of lines to retain in stderr_tail.
+    const MAX_STDERR_LINES: usize = 100;
+
+    /// Creates a GateError from raw stderr output with error classification.
+    #[must_use]
+    pub fn from_stderr(stderr: &str) -> Self {
+        let lines: Vec<&str> = stderr.lines().collect();
+        let tail_lines = if lines.len() > Self::MAX_STDERR_LINES {
+            &lines[lines.len() - Self::MAX_STDERR_LINES..]
+        } else {
+            &lines[..]
+        };
+        let stderr_tail = tail_lines.join("\n");
+
+        let (error_category, error_count, error_summary) = classify_stderr(stderr);
+        let affected_files = extract_affected_files(stderr);
+
+        Self {
+            stderr_tail,
+            error_count,
+            error_summary,
+            affected_files,
+            error_category,
+        }
+    }
+
+    /// Creates a simple GateError with just a message (no classification).
+    #[must_use]
+    pub fn simple(message: impl Into<String>) -> Self {
+        let msg = message.into();
+        Self {
+            stderr_tail: msg.clone(),
+            error_summary: Some(msg),
+            ..Default::default()
+        }
+    }
+}
+
+/// Classifies stderr output and extracts error information.
+///
+/// Returns (category, error_count, error_summary).
+fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>) {
+    // Rust compiler error pattern: error[E0XXX]: message
+    let compiler_pattern = regex::Regex::new(r"^error\[E\d+\]: (.+)$").ok();
+    // Test failure patterns
+    let test_panic = regex::Regex::new(r"thread '(.+)' panicked").ok();
+    let test_failed = regex::Regex::new(r"^---- (.+) ----$").ok();
+    // Clippy warning/error
+    let clippy_pattern = regex::Regex::new(r"^warning: (.+)$").ok();
+    // rustfmt diff
+    let format_pattern = regex::Regex::new(r"^Diff in (.+):$").ok();
+
+    let mut compiler_errors = 0u32;
+    let mut test_failures = 0u32;
+    let mut clippy_warnings = 0u32;
+    let mut format_diffs = 0u32;
+    let mut first_compiler_msg: Option<String> = None;
+    let mut first_test_name: Option<String> = None;
+    let mut first_clippy_msg: Option<String> = None;
+    let mut first_format_file: Option<String> = None;
+
+    for line in stderr.lines() {
+        // Compiler errors
+        if let Some(ref re) = compiler_pattern {
+            if let Some(caps) = re.captures(line) {
+                compiler_errors += 1;
+                if first_compiler_msg.is_none() {
+                    first_compiler_msg = caps.get(1).map(|m| m.as_str().to_string());
+                }
+            }
+        }
+
+        // Test panics
+        if let Some(ref re) = test_panic {
+            if let Some(caps) = re.captures(line) {
+                test_failures += 1;
+                if first_test_name.is_none() {
+                    first_test_name = caps.get(1).map(|m| m.as_str().to_string());
+                }
+            }
+        }
+
+        // Test failures (---- test_name ----)
+        if let Some(ref re) = test_failed {
+            if let Some(caps) = re.captures(line) {
+                test_failures += 1;
+                if first_test_name.is_none() {
+                    first_test_name = caps.get(1).map(|m| m.as_str().to_string());
+                }
+            }
+        }
+
+        // Clippy warnings
+        if let Some(ref re) = clippy_pattern {
+            if let Some(caps) = re.captures(line) {
+                clippy_warnings += 1;
+                if first_clippy_msg.is_none() {
+                    first_clippy_msg = caps.get(1).map(|m| m.as_str().to_string());
+                }
+            }
+        }
+
+        // Format diffs
+        if let Some(ref re) = format_pattern {
+            if let Some(caps) = re.captures(line) {
+                format_diffs += 1;
+                if first_format_file.is_none() {
+                    first_format_file = caps.get(1).map(|m| m.as_str().to_string());
+                }
+            }
+        }
+    }
+
+    // Determine primary error category (priority order)
+    if compiler_errors > 0 {
+        let summary = first_compiler_msg
+            .map(|m| format!("{} compiler error(s): {}", compiler_errors, m))
+            .unwrap_or_else(|| format!("{} compiler error(s)", compiler_errors));
+        (Some("compiler".to_string()), Some(compiler_errors), Some(summary))
+    } else if test_failures > 0 {
+        let summary = first_test_name
+            .map(|t| format!("{} test failure(s), first: {}", test_failures, t))
+            .unwrap_or_else(|| format!("{} test failure(s)", test_failures));
+        (Some("test".to_string()), Some(test_failures), Some(summary))
+    } else if clippy_warnings > 0 {
+        let summary = first_clippy_msg
+            .map(|m| format!("{} clippy warning(s): {}", clippy_warnings, m))
+            .unwrap_or_else(|| format!("{} clippy warning(s)", clippy_warnings));
+        (Some("clippy".to_string()), Some(clippy_warnings), Some(summary))
+    } else if format_diffs > 0 {
+        let summary = first_format_file
+            .map(|f| format!("{} file(s) need formatting, first: {}", format_diffs, f))
+            .unwrap_or_else(|| format!("{} file(s) need formatting", format_diffs));
+        (Some("format".to_string()), Some(format_diffs), Some(summary))
+    } else if !stderr.trim().is_empty() {
+        // Unknown error with non-empty stderr
+        let first_line = stderr.lines().next().unwrap_or("unknown error");
+        (Some("unknown".to_string()), None, Some(first_line.to_string()))
+    } else {
+        (None, None, None)
+    }
+}
+
+/// Extracts file paths mentioned in stderr output.
+fn extract_affected_files(stderr: &str) -> Vec<String> {
+    // Pattern for Rust file references: path/to/file.rs:line:col
+    let file_pattern = regex::Regex::new(r"(?:^|\s)([\w./\-]+\.rs):(\d+)").ok();
+
+    let mut files = std::collections::HashSet::new();
+
+    if let Some(ref re) = file_pattern {
+        for caps in re.captures_iter(stderr) {
+            if let Some(path) = caps.get(1) {
+                let path_str = path.as_str();
+                // Filter out common false positives
+                if !path_str.starts_with("http") && !path_str.contains("://") {
+                    files.insert(path_str.to_string());
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<_> = files.into_iter().collect();
+    result.sort();
+    result
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Gate Result
+// ──────────────────────────────────────────────────────────────────────────────
+
 /// Result of running a single gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateResult {
@@ -210,8 +405,12 @@ pub struct GateResult {
     /// Command that was executed (display string).
     pub command: String,
     /// Last N lines of stderr on failure (for diagnostics).
+    /// Deprecated: use `error.stderr_tail` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_tail: Option<String>,
+    /// Structured error information (only present for failed gates).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<GateError>,
 }
 
 impl GateResult {
@@ -225,12 +424,25 @@ impl GateResult {
             elapsed_seconds: elapsed.as_secs(),
             command: config.command_display(),
             stderr_tail: None,
+            error: None,
         }
     }
 
-    /// Creates a fail result with optional stderr tail.
+    /// Creates a fail result with optional stderr.
+    ///
+    /// When `stderr` is provided, it is parsed to extract structured error
+    /// information including error count, summary, and affected files.
     #[must_use]
-    pub fn fail(config: &GateConfig, elapsed: Duration, stderr_tail: Option<String>) -> Self {
+    pub fn fail(config: &GateConfig, elapsed: Duration, stderr: Option<String>) -> Self {
+        let (stderr_tail, error) = match stderr {
+            Some(ref s) if !s.is_empty() => {
+                let gate_error = GateError::from_stderr(s);
+                // Keep stderr_tail for backward compatibility
+                (Some(gate_error.stderr_tail.clone()), Some(gate_error))
+            }
+            _ => (None, None),
+        };
+
         Self {
             name: config.name.clone(),
             category: config.category,
@@ -238,6 +450,22 @@ impl GateResult {
             elapsed_seconds: elapsed.as_secs(),
             command: config.command_display(),
             stderr_tail,
+            error,
+        }
+    }
+
+    /// Creates a fail result with a simple error message (no stderr parsing).
+    #[must_use]
+    pub fn fail_simple(config: &GateConfig, elapsed: Duration, message: impl Into<String>) -> Self {
+        let msg = message.into();
+        Self {
+            name: config.name.clone(),
+            category: config.category,
+            status: GateStatus::Fail,
+            elapsed_seconds: elapsed.as_secs(),
+            command: config.command_display(),
+            stderr_tail: Some(msg.clone()),
+            error: Some(GateError::simple(msg)),
         }
     }
 
@@ -251,6 +479,7 @@ impl GateResult {
             elapsed_seconds: 0,
             command: reason.into(),
             stderr_tail: None,
+            error: None,
         }
     }
 }
@@ -912,7 +1141,7 @@ pub fn run_gate(config: &GateConfig, runner_config: &GateRunnerConfig) -> GateRe
 
     // Validate command has at least one element
     if config.command.is_empty() {
-        return GateResult::fail(config, Duration::ZERO, Some("empty command".to_string()));
+        return GateResult::fail_simple(config, Duration::ZERO, "empty command");
     }
 
     let start = Instant::now();
@@ -940,7 +1169,7 @@ pub fn run_gate(config: &GateConfig, runner_config: &GateRunnerConfig) -> GateRe
         Ok(child) => child,
         Err(e) => {
             let elapsed = start.elapsed();
-            return GateResult::fail(config, elapsed, Some(format!("spawn failed: {e}")));
+            return GateResult::fail_simple(config, elapsed, format!("spawn failed: {e}"));
         }
     };
 
@@ -993,12 +1222,12 @@ pub fn run_gate(config: &GateConfig, runner_config: &GateRunnerConfig) -> GateRe
             };
             GateResult::fail(config, elapsed, stderr_tail)
         }
-        Err(GateRunnerError::Timeout { elapsed_secs }) => GateResult::fail(
+        Err(GateRunnerError::Timeout { elapsed_secs }) => GateResult::fail_simple(
             config,
             Duration::from_secs(elapsed_secs),
-            Some(format!("timeout after {}s", elapsed_secs)),
+            format!("timeout after {}s", elapsed_secs),
         ),
-        Err(e) => GateResult::fail(config, elapsed, Some(format!("{e}"))),
+        Err(e) => GateResult::fail_simple(config, elapsed, format!("{e}")),
     }
 }
 
@@ -1188,6 +1417,7 @@ mod tests {
                 elapsed_seconds: 10,
                 command: "test".to_string(),
                 stderr_tail: None,
+                error: None,
             },
             GateResult {
                 name: "Gate 2".to_string(),
@@ -1196,6 +1426,7 @@ mod tests {
                 elapsed_seconds: 5,
                 command: "test".to_string(),
                 stderr_tail: Some("error".to_string()),
+                error: Some(GateError::simple("error")),
             },
             GateResult {
                 name: "Gate 3".to_string(),
@@ -1204,6 +1435,7 @@ mod tests {
                 elapsed_seconds: 0,
                 command: "--quick".to_string(),
                 stderr_tail: None,
+                error: None,
             },
         ];
 
@@ -1224,6 +1456,7 @@ mod tests {
                 elapsed_seconds: 10,
                 command: "test".to_string(),
                 stderr_tail: None,
+                error: None,
             },
             GateResult {
                 name: "Quality 2".to_string(),
@@ -1232,6 +1465,7 @@ mod tests {
                 elapsed_seconds: 5,
                 command: "test".to_string(),
                 stderr_tail: None,
+                error: None,
             },
             GateResult {
                 name: "Quality 3".to_string(),
@@ -1240,6 +1474,7 @@ mod tests {
                 elapsed_seconds: 0,
                 command: "--quick".to_string(),
                 stderr_tail: None,
+                error: None,
             },
         ];
 
@@ -1258,6 +1493,7 @@ mod tests {
             elapsed_seconds: 10,
             command: "test".to_string(),
             stderr_tail: None,
+            error: None,
         }];
 
         let report = GateReport::new(RunMode::Full, results);
@@ -1274,6 +1510,7 @@ mod tests {
             elapsed_seconds: 10,
             command: "test".to_string(),
             stderr_tail: Some("compilation error".to_string()),
+            error: Some(GateError::simple("compilation error")),
         }];
 
         let report = GateReport::new(RunMode::Full, results);
@@ -1291,6 +1528,7 @@ mod tests {
             elapsed_seconds: 10,
             command: "test".to_string(),
             stderr_tail: None,
+            error: None,
         }];
 
         let report = GateReport::new(RunMode::Quick, results);
@@ -1311,6 +1549,7 @@ mod tests {
             elapsed_seconds: 2,
             command: "cargo fmt --all -- --check".to_string(),
             stderr_tail: None,
+            error: None,
         }];
 
         let report = GateReport::new(RunMode::Full, results);
@@ -1484,6 +1723,7 @@ mod tests {
                 elapsed_seconds: 10,
                 command: "test".to_string(),
                 stderr_tail: None,
+                error: None,
             },
             GateResult {
                 name: "Gate 2".to_string(),
@@ -1492,6 +1732,7 @@ mod tests {
                 elapsed_seconds: 25,
                 command: "test".to_string(),
                 stderr_tail: None,
+                error: None,
             },
         ];
 
@@ -1509,6 +1750,7 @@ mod tests {
                 elapsed_seconds: 10,
                 command: "test".to_string(),
                 stderr_tail: None,
+                error: None,
             },
             GateResult {
                 name: "Fail Gate".to_string(),
@@ -1517,6 +1759,7 @@ mod tests {
                 elapsed_seconds: 5,
                 command: "test".to_string(),
                 stderr_tail: Some("error".to_string()),
+                error: Some(GateError::simple("error")),
             },
         ];
 
@@ -1536,6 +1779,7 @@ mod tests {
                 elapsed_seconds: 10,
                 command: "test".to_string(),
                 stderr_tail: None,
+                error: None,
             },
             GateResult {
                 name: "Skip Gate".to_string(),
@@ -1544,6 +1788,7 @@ mod tests {
                 elapsed_seconds: 0,
                 command: "--quick".to_string(),
                 stderr_tail: None,
+                error: None,
             },
         ];
 
@@ -1562,6 +1807,7 @@ mod tests {
             elapsed_seconds: 10,
             command: "test".to_string(),
             stderr_tail: None,
+            error: None,
         }];
 
         let report = GateReport::new(RunMode::Full, results);
@@ -1577,6 +1823,7 @@ mod tests {
             elapsed_seconds: 5,
             command: "cargo clippy".to_string(),
             stderr_tail: Some("error: unused variable\n  --> src/main.rs:5".to_string()),
+            error: Some(GateError::from_stderr("error: unused variable\n  --> src/main.rs:5")),
         }];
 
         let report = GateReport::new(RunMode::Full, results);
@@ -1595,6 +1842,7 @@ mod tests {
             elapsed_seconds: 15,
             command: "cargo test".to_string(),
             stderr_tail: None,
+            error: None,
         }];
 
         let report = GateReport::new(RunMode::Full, results);
@@ -1620,6 +1868,7 @@ mod tests {
             elapsed_seconds: 5,
             command: "test".to_string(),
             stderr_tail: None,
+            error: None,
         }];
 
         let report = GateReport::new(RunMode::Full, results);
@@ -1636,5 +1885,271 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_file(temp_path);
+    }
+
+    // ── GateError Tests (T1.6) ────────────────────────────────────────────────
+
+    #[test]
+    fn test_gate_error_from_stderr_compiler_error() {
+        let stderr = r#"error[E0425]: cannot find value `foo` in this scope
+   --> src/main.rs:5:9
+    |
+5   |     let x = foo;
+    |             ^^^ not found in this scope
+
+error[E0308]: mismatched types
+   --> src/lib.rs:10:5
+    |
+10  |     42
+    |     ^^ expected `&str`, found integer
+
+error: aborting due to 2 previous errors"#;
+
+        let gate_error = GateError::from_stderr(stderr);
+
+        assert_eq!(gate_error.error_category, Some("compiler".to_string()));
+        assert_eq!(gate_error.error_count, Some(2));
+        assert!(gate_error
+            .error_summary
+            .as_ref()
+            .unwrap()
+            .contains("2 compiler error(s)"));
+        assert!(gate_error
+            .error_summary
+            .as_ref()
+            .unwrap()
+            .contains("cannot find value"));
+        assert!(gate_error.affected_files.contains(&"src/main.rs".to_string()));
+        assert!(gate_error.affected_files.contains(&"src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn test_gate_error_from_stderr_test_failure() {
+        let stderr = r#"running 3 tests
+test tests::test_pass ... ok
+test tests::test_fail ... FAILED
+test tests::test_another ... ok
+
+failures:
+
+---- tests::test_fail ----
+thread 'tests::test_fail' panicked at src/lib.rs:42:5:
+assertion failed: `(left == right)`
+  left: `1`,
+ right: `2`
+
+failures:
+    tests::test_fail
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored"#;
+
+        let gate_error = GateError::from_stderr(stderr);
+
+        assert_eq!(gate_error.error_category, Some("test".to_string()));
+        assert_eq!(gate_error.error_count, Some(2)); // test_fail header + panicked
+        assert!(gate_error
+            .error_summary
+            .as_ref()
+            .unwrap()
+            .contains("test failure(s)"));
+    }
+
+    #[test]
+    fn test_gate_error_from_stderr_clippy_warning() {
+        let stderr = r#"warning: unused variable: `x`
+ --> src/main.rs:3:9
+  |
+3 |     let x = 5;
+  |         ^ help: if this is intentional, prefix it with an underscore: `_x`
+  |
+  = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `y`
+ --> src/main.rs:4:9
+  |
+4 |     let y = 10;
+  |         ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+warning: `myproject` (bin "myproject") generated 2 warnings"#;
+
+        let gate_error = GateError::from_stderr(stderr);
+
+        assert_eq!(gate_error.error_category, Some("clippy".to_string()));
+        // At least 2 warnings
+        assert!(gate_error.error_count.unwrap() >= 2);
+        assert!(gate_error
+            .error_summary
+            .as_ref()
+            .unwrap()
+            .contains("clippy warning(s)"));
+    }
+
+    #[test]
+    fn test_gate_error_from_stderr_empty() {
+        let gate_error = GateError::from_stderr("");
+
+        assert!(gate_error.stderr_tail.is_empty());
+        assert!(gate_error.error_category.is_none());
+        assert!(gate_error.error_count.is_none());
+        assert!(gate_error.error_summary.is_none());
+        assert!(gate_error.affected_files.is_empty());
+    }
+
+    #[test]
+    fn test_gate_error_from_stderr_unknown() {
+        let stderr = "Some random error message\nAnother line";
+
+        let gate_error = GateError::from_stderr(stderr);
+
+        assert_eq!(gate_error.error_category, Some("unknown".to_string()));
+        assert!(gate_error.error_count.is_none());
+        assert!(gate_error
+            .error_summary
+            .as_ref()
+            .unwrap()
+            .contains("Some random error message"));
+    }
+
+    #[test]
+    fn test_gate_error_stderr_truncation() {
+        // Create stderr with more than 100 lines
+        let long_stderr: String = (0..150)
+            .map(|i| format!("line {}: error message", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let gate_error = GateError::from_stderr(&long_stderr);
+
+        // Should only have 100 lines (the last 100)
+        let line_count = gate_error.stderr_tail.lines().count();
+        assert_eq!(line_count, 100);
+        // Should contain the last line (line 149)
+        assert!(gate_error.stderr_tail.contains("line 149"));
+        // Should NOT contain the first line (line 0)
+        assert!(!gate_error.stderr_tail.contains("line 0:"));
+    }
+
+    #[test]
+    fn test_gate_error_simple() {
+        let gate_error = GateError::simple("spawn failed: command not found");
+
+        assert_eq!(gate_error.stderr_tail, "spawn failed: command not found");
+        assert_eq!(
+            gate_error.error_summary,
+            Some("spawn failed: command not found".to_string())
+        );
+        assert!(gate_error.error_category.is_none());
+        assert!(gate_error.error_count.is_none());
+    }
+
+    #[test]
+    fn test_gate_error_extract_affected_files() {
+        let stderr = r#"error[E0425]: cannot find value `foo`
+   --> src/main.rs:5:9
+error[E0425]: another error
+   --> src/lib.rs:10:5
+   --> tests/integration.rs:42:13"#;
+
+        let gate_error = GateError::from_stderr(stderr);
+
+        assert_eq!(gate_error.affected_files.len(), 3);
+        assert!(gate_error.affected_files.contains(&"src/main.rs".to_string()));
+        assert!(gate_error.affected_files.contains(&"src/lib.rs".to_string()));
+        assert!(gate_error
+            .affected_files
+            .contains(&"tests/integration.rs".to_string()));
+    }
+
+    #[test]
+    fn test_gate_result_fail_creates_structured_error() {
+        let gate = GateConfig::new("Compile", GateCategory::Quality, ["cargo", "build"]);
+        let stderr = "error[E0425]: cannot find value `x`\n   --> src/main.rs:5:9";
+
+        let result = GateResult::fail(&gate, Duration::from_secs(5), Some(stderr.to_string()));
+
+        assert!(result.error.is_some());
+        let error = result.error.unwrap();
+        assert_eq!(error.error_category, Some("compiler".to_string()));
+        assert_eq!(error.error_count, Some(1));
+        assert!(error.affected_files.contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn test_gate_result_pass_has_no_error() {
+        let gate = GateConfig::new("Build", GateCategory::Quality, ["cargo", "build"]);
+
+        let result = GateResult::pass(&gate, Duration::from_secs(10));
+
+        assert!(result.error.is_none());
+        assert!(result.stderr_tail.is_none());
+    }
+
+    #[test]
+    fn test_run_gate_produces_structured_error_on_failure() {
+        let gate = GateConfig::new(
+            "Stderr structured test",
+            GateCategory::Quality,
+            [
+                "bash",
+                "-c",
+                "echo 'error[E0425]: cannot find value' >&2 && echo '   --> src/test.rs:10:5' >&2 && exit 1",
+            ],
+        );
+        let config = GateRunnerConfig::default();
+
+        let result = run_gate(&gate, &config);
+
+        assert_eq!(result.status, GateStatus::Fail);
+        assert!(result.error.is_some());
+        let error = result.error.unwrap();
+        assert_eq!(error.error_category, Some("compiler".to_string()));
+        assert!(error.affected_files.contains(&"src/test.rs".to_string()));
+    }
+
+    #[test]
+    fn test_gate_error_appears_in_json_for_failing_gate() {
+        let results = vec![GateResult {
+            name: "Compile".to_string(),
+            category: GateCategory::Quality,
+            status: GateStatus::Fail,
+            elapsed_seconds: 5,
+            command: "cargo build".to_string(),
+            stderr_tail: Some("error[E0425]: cannot find value".to_string()),
+            error: Some(GateError {
+                stderr_tail: "error[E0425]: cannot find value".to_string(),
+                error_count: Some(1),
+                error_summary: Some("1 compiler error(s): cannot find value".to_string()),
+                affected_files: vec!["src/main.rs".to_string()],
+                error_category: Some("compiler".to_string()),
+            }),
+        }];
+
+        let report = GateReport::new(RunMode::Full, results);
+        let json = report.to_json().expect("serialization should work");
+
+        assert!(json.contains("\"error_category\": \"compiler\""));
+        assert!(json.contains("\"error_count\": 1"));
+        assert!(json.contains("\"affected_files\""));
+        assert!(json.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn test_gate_error_not_present_for_passing_gate() {
+        let results = vec![GateResult {
+            name: "Build".to_string(),
+            category: GateCategory::Quality,
+            status: GateStatus::Pass,
+            elapsed_seconds: 10,
+            command: "cargo build".to_string(),
+            stderr_tail: None,
+            error: None,
+        }];
+
+        let report = GateReport::new(RunMode::Full, results);
+        let json = report.to_json().expect("serialization should work");
+
+        // error field should not appear in JSON for passing gates
+        assert!(!json.contains("\"error\":"));
+        assert!(!json.contains("\"error_category\""));
     }
 }

@@ -38,6 +38,7 @@ zip.workspace = true
 toon.workspace = true
 crossterm = "0.28.1"
 glob.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 similar.workspace = true
