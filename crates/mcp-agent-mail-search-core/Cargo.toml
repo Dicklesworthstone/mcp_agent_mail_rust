@@ -1,0 +1,36 @@
+[package]
+name = "mcp-agent-mail-search-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pluggable search engine traits and types for MCP Agent Mail"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+regex.workspace = true
+
+# Optional: Tantivy lexical search engine
+tantivy = { workspace = true, optional = true }
+
+[features]
+# Enable Tantivy-based lexical search engine
+tantivy-engine = ["dep:tantivy"]
+# Enable vector/semantic search engine
+semantic = []
+# Enable hybrid fusion (requires both tantivy and semantic)
+hybrid = ["tantivy-engine", "semantic"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tantivy.workspace = true
+
+[lints]
+workspace = true
