@@ -5638,132 +5638,6 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
     Ok(())
 }
 
-// ── Legacy Python Wizard (deprecated) ───────────────────────────────────
-
-#[allow(dead_code)]
-struct ShareWizardScriptResolution {
-    source_path: PathBuf,
-    cwd_path: PathBuf,
-    legacy_path: PathBuf,
-    chosen: Option<PathBuf>,
-}
-
-#[allow(dead_code)]
-fn resolve_share_wizard_script(cwd: &Path) -> ShareWizardScriptResolution {
-    let cwd_path = cwd.join("scripts/share_to_github_pages.py");
-
-    // Workspace root relative to this crate (source tree).
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(manifest_dir);
-    let source_path = source_root.join("scripts/share_to_github_pages.py");
-
-    // Fallback: when running from this repo's source tree, allow using the legacy Python wizard.
-    // This keeps the installed-binary behavior unchanged (no hidden dependency on the legacy tree).
-    let legacy_path = source_root
-        .join("legacy_python_mcp_agent_mail_code/mcp_agent_mail/scripts/share_to_github_pages.py");
-    let allow_legacy = cwd.starts_with(source_root) && is_readable_file(&legacy_path);
-
-    let chosen = if is_readable_file(&cwd_path) {
-        Some(cwd_path.clone())
-    } else if is_readable_file(&source_path) {
-        Some(source_path.clone())
-    } else if allow_legacy {
-        Some(legacy_path.clone())
-    } else {
-        None
-    };
-
-    ShareWizardScriptResolution {
-        source_path,
-        cwd_path,
-        legacy_path,
-        chosen,
-    }
-}
-
-#[allow(dead_code)]
-fn is_readable_file(path: &Path) -> bool {
-    path.is_file() && std::fs::File::open(path).is_ok()
-}
-
-#[allow(dead_code)]
-fn run_share_wizard_in_cwd(cwd: &Path) -> CliResult<()> {
-    ftui_runtime::ftui_println!("Launching deployment wizard...");
-
-    let resolution = resolve_share_wizard_script(cwd);
-    let Some(script) = resolution.chosen.as_deref() else {
-        ftui_runtime::ftui_eprintln!("Wizard script not found.");
-        ftui_runtime::ftui_eprintln!("Expected locations:");
-        ftui_runtime::ftui_eprintln!("  - {}", resolution.source_path.display());
-        ftui_runtime::ftui_eprintln!("  - {}", resolution.cwd_path.display());
-        ftui_runtime::ftui_eprintln!("");
-        ftui_runtime::ftui_eprintln!("This command only works when running from source.");
-        ftui_runtime::ftui_eprintln!(
-            "Run the wizard directly: python scripts/share_to_github_pages.py"
-        );
-        return Err(CliError::ExitCode(1));
-    };
-
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root")
-        .to_path_buf();
-    let legacy_python_src = repo_root.join("legacy_python_mcp_agent_mail_code/mcp_agent_mail/src");
-
-    let extra_pythonpath = if script == resolution.legacy_path && legacy_python_src.is_dir() {
-        Some(legacy_python_src)
-    } else {
-        None
-    };
-
-    run_python_script_in_cwd(script, cwd, extra_pythonpath.as_deref())
-}
-
-#[allow(dead_code)]
-fn run_python_script_in_cwd(script: &Path, cwd: &Path, pythonpath: Option<&Path>) -> CliResult<()> {
-    let mut cmd = std::process::Command::new("python");
-    cmd.arg(script);
-    cmd.current_dir(cwd);
-    if let Some(pythonpath) = pythonpath {
-        let mut paths: Vec<PathBuf> = vec![pythonpath.to_path_buf()];
-        if let Some(existing) = std::env::var_os("PYTHONPATH") {
-            paths.extend(std::env::split_paths(&existing));
-        }
-        if let Ok(joined) = std::env::join_paths(paths) {
-            cmd.env("PYTHONPATH", joined);
-        }
-    }
-
-    let status = match cmd.status() {
-        Ok(status) => status,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let mut cmd = std::process::Command::new("python3");
-            cmd.arg(script);
-            cmd.current_dir(cwd);
-            if let Some(pythonpath) = pythonpath {
-                let mut paths: Vec<PathBuf> = vec![pythonpath.to_path_buf()];
-                if let Some(existing) = std::env::var_os("PYTHONPATH") {
-                    paths.extend(std::env::split_paths(&existing));
-                }
-                if let Ok(joined) = std::env::join_paths(paths) {
-                    cmd.env("PYTHONPATH", joined);
-                }
-            }
-            cmd.status()?
-        }
-        Err(err) => return Err(err.into()),
-    };
-    if status.success() {
-        Ok(())
-    } else {
-        Err(CliError::ExitCode(status.code().unwrap_or(1)))
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ProjectsAdoptRecord {
     id: i64,
@@ -9327,122 +9201,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn share_wizard_missing_script_emits_legacy_message_and_exit_code() {
-        let _capture_lock = stdio_capture_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
-        let temp = tempfile::TempDir::new().expect("tempdir");
-
-        let err = run_share_wizard_in_cwd(temp.path()).expect_err("expected error");
-        assert!(matches!(err, CliError::ExitCode(1)));
-
-        let output = capture.drain_to_string();
-
-        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("repo root")
-            .to_path_buf();
-        let artifact_dir = repo_root
-            .join("tests")
-            .join("artifacts")
-            .join("cli")
-            .join("share_wizard")
-            .join(ts);
-        std::fs::create_dir_all(&artifact_dir).expect("create artifacts dir");
-        std::fs::write(artifact_dir.join("missing_script_output.txt"), &output)
-            .expect("write artifact");
-
-        assert!(output.contains("Launching deployment wizard..."));
-        assert!(output.contains("Wizard script not found."));
-        assert!(output.contains("Expected locations:"));
-        assert!(output.contains("This command only works when running from source."));
-        assert!(
-            output.contains("Run the wizard directly: python scripts/share_to_github_pages.py")
-        );
-    }
-
-    #[test]
-    fn share_wizard_resolves_when_running_from_repo_root() {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("repo root")
-            .to_path_buf();
-
-        let resolution = resolve_share_wizard_script(&repo_root);
-        assert!(
-            resolution.chosen.is_some(),
-            "expected a wizard script to resolve when running from the repo root"
-        );
-        assert!(
-            resolution.legacy_path.is_file(),
-            "expected legacy wizard script to exist at {}",
-            resolution.legacy_path.display()
-        );
-    }
-
-    #[test]
-    fn share_wizard_runs_stub_script_and_passthrough_exit_code() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let scripts = temp.path().join("scripts");
-        std::fs::create_dir_all(&scripts).expect("create scripts dir");
-
-        let script = scripts.join("share_to_github_pages.py");
-        let invocation = scripts.join("invocation.json");
-        std::fs::write(
-            &script,
-            r#"import json
-import os
-import sys
-from pathlib import Path
-
-out = Path(__file__).with_name("invocation.json")
-out.write_text(json.dumps({
-  "argv": sys.argv,
-  "cwd": os.getcwd(),
-  "home": os.environ.get("HOME"),
-}))
-
-sys.exit(7)
-"#,
-        )
-        .expect("write stub wizard script");
-
-        let result = run_share_wizard_in_cwd(temp.path());
-
-        assert!(matches!(result, Err(CliError::ExitCode(7))));
-        assert!(
-            invocation.exists(),
-            "expected invocation.json to be written"
-        );
-
-        let payload: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&invocation).expect("read invocation.json"),
-        )
-        .expect("parse invocation.json");
-        let expected_home = std::env::var("HOME").ok();
-        assert_eq!(payload["home"].as_str(), expected_home.as_deref());
-
-        let cwd = payload["cwd"].as_str().unwrap_or_default();
-        assert_eq!(cwd, temp.path().to_string_lossy());
-
-        let argv0 = payload["argv"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        assert_eq!(argv0, script.to_string_lossy());
-        assert_eq!(
-            payload["argv"].as_array().map(Vec::len).unwrap_or(0),
-            1,
-            "expected no extra args"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Native Wizard Integration Tests (br-2xfi)
     // -----------------------------------------------------------------------
@@ -10716,7 +10474,7 @@ sys.exit(7)
         )
         .unwrap();
 
-        // Messages (FTS triggers will populate fts_messages)
+        // Messages (base schema has no FTS triggers; search uses LIKE fallback)
         let msg_insert = "INSERT INTO messages (\
                 id, project_id, sender_id, thread_id, subject, body_md, importance, \
                 ack_required, created_ts, attachments\
@@ -19114,7 +18872,9 @@ async fn handle_products_with(
             let placeholders = std::iter::repeat_n("?", project_ids.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!(
+
+            // Try FTS query first, fall back to LIKE if FTS table doesn't exist
+            let fts_sql = format!(
                 "SELECT m.id, m.subject, m.created_ts, a.name AS sender_name, m.project_id \
                  FROM fts_messages \
                  JOIN messages m ON m.id = fts_messages.message_id \
@@ -19123,11 +18883,47 @@ async fn handle_products_with(
                  ORDER BY bm25(fts_messages) ASC, m.id ASC \
                  LIMIT ?"
             );
-            let mut params: Vec<Value> = project_ids.into_iter().map(Value::BigInt).collect();
-            params.push(Value::Text(sanitized));
-            params.push(Value::BigInt(limit_i64));
+            let mut fts_params: Vec<Value> =
+                project_ids.iter().copied().map(Value::BigInt).collect();
+            fts_params.push(Value::Text(sanitized.clone()));
+            fts_params.push(Value::BigInt(limit_i64));
 
-            let rows = conn.query_sync(&sql, &params).unwrap_or_default(); // legacy: fail closed to empty
+            let rows = match conn.query_sync(&fts_sql, &fts_params) {
+                Ok(r) => r,
+                Err(_) => {
+                    // FTS query failed (likely fts_messages table doesn't exist), try LIKE fallback
+                    let terms = mcp_agent_mail_db::queries::extract_like_terms(&query, 5);
+                    if terms.is_empty() {
+                        Vec::new()
+                    } else {
+                        // Build LIKE query
+                        let mut like_parts = Vec::new();
+                        let mut like_params: Vec<Value> =
+                            project_ids.iter().copied().map(Value::BigInt).collect();
+                        for term in &terms {
+                            let escaped =
+                                format!("%{}%", mcp_agent_mail_db::queries::like_escape(term));
+                            like_parts.push(
+                                "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')"
+                                    .to_string(),
+                            );
+                            like_params.push(Value::Text(escaped.clone()));
+                            like_params.push(Value::Text(escaped));
+                        }
+                        like_params.push(Value::BigInt(limit_i64));
+                        let like_clause = like_parts.join(" AND ");
+                        let like_sql = format!(
+                            "SELECT m.id, m.subject, m.created_ts, a.name AS sender_name, m.project_id \
+                             FROM messages m \
+                             JOIN agents a ON a.id = m.sender_id \
+                             WHERE m.project_id IN ({placeholders}) AND {like_clause} \
+                             ORDER BY m.id ASC \
+                             LIMIT ?"
+                        );
+                        conn.query_sync(&like_sql, &like_params).unwrap_or_default()
+                    }
+                }
+            };
 
             let mut out = Vec::new();
             for r in rows {
@@ -20432,6 +20228,40 @@ fn handle_tooling_diagnostics(json_mode: bool) -> CliResult<()> {
         output::kv(
             "    Commits drained",
             &report.storage.commit_drained_total.to_string(),
+        );
+
+        output::section("  Search:");
+        output::kv(
+            "    Queries total",
+            &report.search.queries_total.to_string(),
+        );
+        output::kv(
+            "    V3 queries",
+            &report.search.queries_v3_total.to_string(),
+        );
+        output::kv(
+            "    Legacy queries",
+            &report.search.queries_legacy_total.to_string(),
+        );
+        output::kv(
+            "    Fallback to legacy",
+            &report.search.fallback_to_legacy_total.to_string(),
+        );
+        output::kv(
+            "    Shadow comparisons",
+            &report.search.shadow_comparisons_total.to_string(),
+        );
+        output::kv(
+            "    Shadow equivalence",
+            &format!("{:.1}%", report.search.shadow_equivalent_pct),
+        );
+        output::kv(
+            "    Tantivy docs",
+            &report.search.tantivy_doc_count.to_string(),
+        );
+        output::kv(
+            "    Tantivy size",
+            &format!("{} bytes", report.search.tantivy_index_size_bytes),
         );
 
         if !report.tools_detail.is_empty() {

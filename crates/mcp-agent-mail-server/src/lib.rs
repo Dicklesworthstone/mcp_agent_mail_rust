@@ -4936,7 +4936,9 @@ mod tests {
             "Budget deadline must be in the future! \
              deadline={:?}, now={:?}, timeout={}s. \
              This regression would cause all MCP requests to timeout immediately.",
-            deadline, check_time, timeout_secs
+            deadline,
+            check_time,
+            timeout_secs
         );
 
         // The deadline should be approximately 30 seconds from now

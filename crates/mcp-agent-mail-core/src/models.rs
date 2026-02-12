@@ -60,7 +60,7 @@ pub struct ProductProjectLink {
 ///
 /// # Naming Rules
 /// Agent names MUST be adjective+noun combinations (e.g., "`GreenLake`", "`BlueDog`").
-/// - 62 adjectives × 70 nouns = 4,340 valid combinations
+/// - 62 adjectives × 73 nouns = 4,526 valid combinations
 /// - Case-insensitive unique per project
 /// - NOT descriptive role names (e.g., "`BackendHarmonizer`" is INVALID)
 ///
@@ -389,7 +389,7 @@ pub const VALID_ADJECTIVES: &[&str] = &[
     "rustic",
 ];
 
-/// Valid nouns for agent names (70 total).
+/// Valid nouns for agent names (73 total).
 ///
 /// IMPORTANT: Keep this list in lockstep with legacy Python `mcp_agent_mail.utils.NOUNS`.
 pub const VALID_NOUNS: &[&str] = &[
@@ -463,6 +463,9 @@ pub const VALID_NOUNS: &[&str] = &[
     "lantern",
     "beacon",
     "compass",
+    "horizon",
+    "orchid",
+    "duck",
 ];
 
 /// Normalize a user-provided agent name; return `None` if nothing remains.
@@ -490,9 +493,9 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
     Some(cleaned)
 }
 
-/// Precomputed set of all 4,340 valid lowercased agent names for O(1) lookup.
+/// Precomputed set of all 4,526 valid lowercased agent names for O(1) lookup.
 ///
-/// Initialized on first access. 62 adjectives × 70 nouns ≈ 52 KB.
+/// Initialized on first access. 62 adjectives × 73 nouns ≈ 54 KB.
 fn valid_names_set() -> &'static std::collections::HashSet<String> {
     static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -509,8 +512,8 @@ fn valid_names_set() -> &'static std::collections::HashSet<String> {
 
 /// Validates that an agent name follows the adjective+noun pattern.
 ///
-/// Uses a precomputed `HashSet` of all 4,340 valid names for O(1) lookup,
-/// replacing the previous O(62×70) linear scan.
+/// Uses a precomputed `HashSet` of all 4,526 valid names for O(1) lookup,
+/// replacing the previous O(62×73) linear scan.
 ///
 /// # Examples
 /// ```
@@ -576,6 +579,12 @@ mod tests {
         assert!(is_valid_agent_name("BlueDog"));
         assert!(is_valid_agent_name("CrimsonGorge"));
         assert!(is_valid_agent_name("FuchsiaForge"));
+        // Newly added nouns (fern, horizon, orchid, duck)
+        assert!(is_valid_agent_name("ScarletFern"));
+        assert!(is_valid_agent_name("CrimsonFern"));
+        assert!(is_valid_agent_name("VioletHorizon"));
+        assert!(is_valid_agent_name("CrimsonOrchid"));
+        assert!(is_valid_agent_name("GreenDuck"));
     }
 
     #[test]
@@ -863,9 +872,9 @@ mod tests {
 
     #[test]
     fn test_valid_name_count() {
-        // 62 adjectives x 70 nouns = 4,340 valid names
+        // 62 adjectives x 73 nouns = 4,526 valid names
         assert_eq!(VALID_ADJECTIVES.len(), 62);
-        assert_eq!(VALID_NOUNS.len(), 70);
-        assert_eq!(valid_names_set().len(), 62 * 70);
+        assert_eq!(VALID_NOUNS.len(), 73);
+        assert_eq!(valid_names_set().len(), 62 * 73);
     }
 }
