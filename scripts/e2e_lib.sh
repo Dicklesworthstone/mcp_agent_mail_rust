@@ -2142,6 +2142,267 @@ e2e_fail() {
 }
 
 # ---------------------------------------------------------------------------
+# Database Assertion Helpers (br-3h13.12.3)
+# ---------------------------------------------------------------------------
+#
+# Provides direct database assertions for E2E tests, enabling verification
+# of DB state independent of API responses. Requires sqlite3 CLI.
+#
+# Usage:
+#   e2e_assert_db_row_count "/path/to/db.sqlite" "messages" 5
+#   e2e_assert_db_value "/path/to/db.sqlite" "SELECT name FROM agents WHERE id=1" "BrownHawk"
+#   e2e_assert_db_contains "/path/to/db.sqlite" "agents" "name" "BrownHawk"
+#   result=$(e2e_db_query "/path/to/db.sqlite" "SELECT COUNT(*) FROM messages")
+
+# e2e_db_query: Execute SQL query and return result
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: sql - SQL query to execute
+#
+# Returns:
+#   Query result on stdout, exit code from sqlite3
+#
+# Example:
+#   count=$(e2e_db_query "/tmp/db.sqlite" "SELECT COUNT(*) FROM messages")
+
+e2e_db_query() {
+    local db_path="$1"
+    local sql="$2"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "(sqlite3 not found)"
+        return 1
+    fi
+
+    if [ ! -f "$db_path" ]; then
+        echo "(database not found: $db_path)"
+        return 1
+    fi
+
+    sqlite3 -batch -noheader "$db_path" "$sql" 2>&1
+}
+
+# e2e_assert_db_row_count: Assert table has expected row count
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: table - Table name
+#   $3: expected_count - Expected row count
+#   $4: label (optional) - Assertion label
+#
+# Example:
+#   e2e_assert_db_row_count "/tmp/db.sqlite" "messages" 5 "messages table has 5 rows"
+
+e2e_assert_db_row_count() {
+    local db_path="$1"
+    local table="$2"
+    local expected_count="$3"
+    local label="${4:-DB row count: ${table}}"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        e2e_skip "${label} (sqlite3 not available)"
+        return 0
+    fi
+
+    local actual_count
+    actual_count="$(e2e_db_query "$db_path" "SELECT COUNT(*) FROM ${table}" 2>/dev/null | tr -d '[:space:]')"
+
+    if [ "$actual_count" = "$expected_count" ]; then
+        e2e_pass "${label} (${actual_count} rows)"
+    else
+        e2e_fail "${label}"
+        e2e_diff "row count in ${table}" "$expected_count" "$actual_count"
+    fi
+}
+
+# e2e_assert_db_value: Assert SQL query returns expected value
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: sql - SQL query (should return single value)
+#   $3: expected_value - Expected result
+#   $4: label (optional) - Assertion label
+#
+# Example:
+#   e2e_assert_db_value "/tmp/db.sqlite" "SELECT name FROM agents WHERE id=1" "BrownHawk"
+
+e2e_assert_db_value() {
+    local db_path="$1"
+    local sql="$2"
+    local expected_value="$3"
+    local label="${4:-DB value assertion}"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        e2e_skip "${label} (sqlite3 not available)"
+        return 0
+    fi
+
+    local actual_value
+    actual_value="$(e2e_db_query "$db_path" "$sql" 2>/dev/null | head -1 | tr -d '[:space:]')"
+
+    if [ "$actual_value" = "$expected_value" ]; then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label}"
+        e2e_diff "SQL result" "$expected_value" "$actual_value"
+        echo -e "    ${_e2e_color_dim}query: ${sql}${_e2e_color_reset}"
+    fi
+}
+
+# e2e_assert_db_contains: Assert table contains row with specific column value
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: table - Table name
+#   $3: column - Column name
+#   $4: value - Expected value
+#   $5: label (optional) - Assertion label
+#
+# Example:
+#   e2e_assert_db_contains "/tmp/db.sqlite" "agents" "name" "BrownHawk"
+
+e2e_assert_db_contains() {
+    local db_path="$1"
+    local table="$2"
+    local column="$3"
+    local value="$4"
+    local label="${5:-DB contains: ${table}.${column}='${value}'}"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        e2e_skip "${label} (sqlite3 not available)"
+        return 0
+    fi
+
+    # Escape single quotes in value for SQL
+    local escaped_value="${value//\'/\'\'}"
+    local sql="SELECT COUNT(*) FROM ${table} WHERE ${column} = '${escaped_value}'"
+
+    local count
+    count="$(e2e_db_query "$db_path" "$sql" 2>/dev/null | tr -d '[:space:]')"
+
+    if [ "$count" -gt 0 ] 2>/dev/null; then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label}"
+        echo -e "    ${_e2e_color_dim}no rows found matching ${column}='${value}' in ${table}${_e2e_color_reset}"
+    fi
+}
+
+# e2e_assert_db_not_contains: Assert table does NOT contain row with specific column value
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: table - Table name
+#   $3: column - Column name
+#   $4: value - Value that should NOT exist
+#   $5: label (optional) - Assertion label
+#
+# Example:
+#   e2e_assert_db_not_contains "/tmp/db.sqlite" "agents" "name" "DeletedAgent"
+
+e2e_assert_db_not_contains() {
+    local db_path="$1"
+    local table="$2"
+    local column="$3"
+    local value="$4"
+    local label="${5:-DB not contains: ${table}.${column}='${value}'}"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        e2e_skip "${label} (sqlite3 not available)"
+        return 0
+    fi
+
+    local escaped_value="${value//\'/\'\'}"
+    local sql="SELECT COUNT(*) FROM ${table} WHERE ${column} = '${escaped_value}'"
+
+    local count
+    count="$(e2e_db_query "$db_path" "$sql" 2>/dev/null | tr -d '[:space:]')"
+
+    if [ "$count" = "0" ] 2>/dev/null; then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label}"
+        echo -e "    ${_e2e_color_dim}found ${count} row(s) matching ${column}='${value}' in ${table}${_e2e_color_reset}"
+    fi
+}
+
+# e2e_db_dump_table: Dump table contents for debugging
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: table - Table name
+#   $3: limit (optional) - Max rows to dump (default: 10)
+#
+# Returns:
+#   Table contents on stdout
+#
+# Example:
+#   e2e_db_dump_table "/tmp/db.sqlite" "messages" 5
+
+e2e_db_dump_table() {
+    local db_path="$1"
+    local table="$2"
+    local limit="${3:-10}"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "(sqlite3 not found)"
+        return 1
+    fi
+
+    sqlite3 -batch -header -column "$db_path" "SELECT * FROM ${table} LIMIT ${limit}" 2>&1
+}
+
+# e2e_db_schema: Get table schema for debugging
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: table - Table name
+#
+# Returns:
+#   Table schema on stdout
+#
+# Example:
+#   e2e_db_schema "/tmp/db.sqlite" "messages"
+
+e2e_db_schema() {
+    local db_path="$1"
+    local table="$2"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "(sqlite3 not found)"
+        return 1
+    fi
+
+    sqlite3 -batch "$db_path" ".schema ${table}" 2>&1
+}
+
+# e2e_save_db_snapshot: Save table contents to artifacts for forensics
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: table - Table name
+#   $3: artifact_name (optional) - Artifact filename (default: db_${table}.txt)
+#
+# Example:
+#   e2e_save_db_snapshot "/tmp/db.sqlite" "messages"
+
+e2e_save_db_snapshot() {
+    local db_path="$1"
+    local table="$2"
+    local artifact_name="${3:-db_${table}.txt}"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        e2e_save_artifact "$artifact_name" "(sqlite3 not found)"
+        return 0
+    fi
+
+    local content
+    content="$(sqlite3 -batch -header -column "$db_path" "SELECT * FROM ${table}" 2>&1)"
+    e2e_save_artifact "$artifact_name" "$content"
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
