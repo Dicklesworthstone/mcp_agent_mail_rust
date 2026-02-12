@@ -404,7 +404,11 @@ impl TwoTierIndex {
             .map(|std::cmp::Reverse(entry)| ScoredResult {
                 idx: entry.idx,
                 doc_id: self.doc_ids[entry.idx],
-                doc_kind: self.doc_kinds.get(entry.idx).copied().unwrap_or(crate::document::DocKind::Message),
+                doc_kind: self
+                    .doc_kinds
+                    .get(entry.idx)
+                    .copied()
+                    .unwrap_or(crate::document::DocKind::Message),
                 project_id: self.project_ids.get(entry.idx).copied().flatten(),
                 score: entry.score,
             })
@@ -445,7 +449,11 @@ impl TwoTierIndex {
             .map(|std::cmp::Reverse(entry)| ScoredResult {
                 idx: entry.idx,
                 doc_id: self.doc_ids[entry.idx],
-                doc_kind: self.doc_kinds.get(entry.idx).copied().unwrap_or(crate::document::DocKind::Message),
+                doc_kind: self
+                    .doc_kinds
+                    .get(entry.idx)
+                    .copied()
+                    .unwrap_or(crate::document::DocKind::Message),
                 project_id: self.project_ids.get(entry.idx).copied().flatten(),
                 score: entry.score,
             })
@@ -769,13 +777,10 @@ impl Iterator for TwoTierSearchIter<'_> {
                 // Phase 2: Quality refinement
                 self.phase = 2;
 
-                let quality_embedder = match &self.searcher.quality_embedder {
-                    Some(e) => e,
-                    None => {
-                        return Some(SearchPhase::RefinementFailed {
-                            error: "quality embedder unavailable".to_string(),
-                        });
-                    }
+                let Some(quality_embedder) = &self.searcher.quality_embedder else {
+                    return Some(SearchPhase::RefinementFailed {
+                        error: "quality embedder unavailable".to_string(),
+                    });
                 };
 
                 let start = Instant::now();
@@ -846,6 +851,7 @@ impl Iterator for TwoTierSearchIter<'_> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::cast_precision_loss)]
     fn make_test_entries(count: usize, config: &TwoTierConfig) -> Vec<TwoTierEntry> {
         (0..count)
             .map(|i| TwoTierEntry {
@@ -867,8 +873,7 @@ mod tests {
         let config = TwoTierConfig::default();
         let entries = make_test_entries(10, &config);
 
-        let index =
-            TwoTierIndex::build("potion-128m", "minilm-384", &config, entries).unwrap();
+        let index = TwoTierIndex::build("potion-128m", "minilm-384", &config, entries).unwrap();
 
         assert_eq!(index.len(), 10);
         assert!(!index.is_empty());
@@ -883,8 +888,7 @@ mod tests {
         let config = TwoTierConfig::default();
         let entries: Vec<TwoTierEntry> = Vec::new();
 
-        let index =
-            TwoTierIndex::build("potion-128m", "minilm-384", &config, entries).unwrap();
+        let index = TwoTierIndex::build("potion-128m", "minilm-384", &config, entries).unwrap();
 
         assert_eq!(index.len(), 0);
         assert!(index.is_empty());
@@ -906,11 +910,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn test_fast_search() {
         let config = TwoTierConfig::default();
         let entries = make_test_entries(100, &config);
-        let index =
-            TwoTierIndex::build("potion-128m", "minilm-384", &config, entries).unwrap();
+        let index = TwoTierIndex::build("potion-128m", "minilm-384", &config, entries).unwrap();
 
         let query: Vec<f32> = (0..config.fast_dimension)
             .map(|i| i as f32 * 0.01)
@@ -925,11 +929,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn test_quality_search() {
         let config = TwoTierConfig::default();
         let entries = make_test_entries(100, &config);
-        let index =
-            TwoTierIndex::build("potion-128m", "minilm-384", &config, entries).unwrap();
+        let index = TwoTierIndex::build("potion-128m", "minilm-384", &config, entries).unwrap();
 
         let query: Vec<f32> = (0..config.quality_dimension)
             .map(|i| i as f32 * 0.01)
@@ -1026,7 +1030,7 @@ mod tests {
         let a: Vec<f16> = vec![];
         let b: Vec<f32> = vec![];
         let result = dot_product_f16_simd(&a, &b);
-        assert_eq!(result, 0.0);
+        assert!(result.abs() < f32::EPSILON);
     }
 
     #[test]

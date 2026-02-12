@@ -26,7 +26,7 @@
 //! This module is compiled when the `semantic` feature is enabled.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use crate::canonical::{CanonPolicy, canonicalize_and_hash};
 use crate::document::DocKind;
 use crate::embedder::{Embedder, EmbeddingResult, ModelTier};
+use crate::engine::IndexLifecycle;
 use crate::error::SearchResult;
 use crate::vector_index::{IndexEntry, VectorIndex, VectorMetadata};
 
@@ -101,6 +102,8 @@ pub struct EmbeddingRequest {
     pub retries: u32,
     /// When the request was enqueued
     pub enqueued_at: Instant,
+    /// Earliest time this request may be retried.
+    pub next_attempt_at: Instant,
 }
 
 impl EmbeddingRequest {
@@ -123,6 +126,7 @@ impl EmbeddingRequest {
             tier,
             retries: 0,
             enqueued_at: Instant::now(),
+            next_attempt_at: Instant::now(),
         }
     }
 
@@ -227,8 +231,8 @@ pub struct EmbeddingQueue {
 struct QueueState {
     /// Pending requests (FIFO)
     queue: VecDeque<EmbeddingRequest>,
-    /// Dedup map: (`doc_id`, `doc_kind`) -> position in queue
-    dedup: HashMap<(i64, DocKind), usize>,
+    /// Dedup set of pending keys across main + retry queues
+    dedup: HashSet<(i64, DocKind)>,
     /// Requests pending retry
     retry_queue: VecDeque<EmbeddingRequest>,
     /// Statistics
@@ -264,7 +268,7 @@ impl EmbeddingQueue {
             config,
             pending: Mutex::new(QueueState {
                 queue: VecDeque::new(),
-                dedup: HashMap::new(),
+                dedup: HashSet::new(),
                 retry_queue: VecDeque::new(),
                 stats: QueueStats::default(),
             }),
@@ -287,20 +291,39 @@ impl EmbeddingQueue {
 
         // Check dedup
         let key = request.dedup_key();
-        if let Some(&pos) = state.dedup.get(&key) {
-            // Replace existing request with newer one
-            if pos < state.queue.len() {
-                state.queue[pos] = request;
+        if state.dedup.contains(&key) {
+            if let Some(existing) = state
+                .queue
+                .iter_mut()
+                .find(|pending| pending.dedup_key() == key)
+            {
+                *existing = request;
                 state.stats.total_deduped += 1;
+                state.stats.pending_count = state.queue.len();
+                state.stats.retry_count = state.retry_queue.len();
                 return true;
             }
+            if let Some(existing) = state
+                .retry_queue
+                .iter_mut()
+                .find(|pending| pending.dedup_key() == key)
+            {
+                *existing = request;
+                state.stats.total_deduped += 1;
+                state.stats.pending_count = state.queue.len();
+                state.stats.retry_count = state.retry_queue.len();
+                return true;
+            }
+            // Stale dedup key; clear and continue with enqueue.
+            state.dedup.remove(&key);
         }
 
         // Add to queue
-        let pos = state.queue.len();
-        state.dedup.insert(key, pos);
+        state.dedup.insert(key);
         state.queue.push_back(request);
         state.stats.total_enqueued += 1;
+        state.stats.pending_count = state.queue.len();
+        state.stats.retry_count = state.retry_queue.len();
 
         true
     }
@@ -309,7 +332,24 @@ impl EmbeddingQueue {
     pub fn enqueue_retry(&self, mut request: EmbeddingRequest) {
         request.retries += 1;
         let mut state = self.pending.lock().expect("queue lock poisoned");
+        let key = request.dedup_key();
+        if state.dedup.contains(&key) {
+            state.stats.total_deduped += 1;
+            state.stats.pending_count = state.queue.len();
+            state.stats.retry_count = state.retry_queue.len();
+            return;
+        }
+        let shift = request.retries.saturating_sub(1).min(20);
+        let factor = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+        let delay_ms = self.config.retry_base_delay_ms.saturating_mul(factor);
+        let delay = Duration::from_millis(delay_ms);
+        request.next_attempt_at = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(Instant::now);
+        state.dedup.insert(key);
         state.retry_queue.push_back(request);
+        state.stats.pending_count = state.queue.len();
+        state.stats.retry_count = state.retry_queue.len();
     }
 
     /// Drain up to `batch_size` requests from the queue.
@@ -318,13 +358,19 @@ impl EmbeddingQueue {
     pub fn drain_batch(&self, batch_size: usize) -> Vec<EmbeddingRequest> {
         let mut state = self.pending.lock().expect("queue lock poisoned");
         let mut batch = Vec::with_capacity(batch_size);
+        let now = Instant::now();
 
         // Drain retry queue first (priority)
-        while batch.len() < batch_size && !state.retry_queue.is_empty() {
-            if let Some(req) = state.retry_queue.pop_front() {
+        let mut deferred_retry = VecDeque::with_capacity(state.retry_queue.len());
+        while let Some(req) = state.retry_queue.pop_front() {
+            if batch.len() < batch_size && req.next_attempt_at <= now {
+                state.dedup.remove(&req.dedup_key());
                 batch.push(req);
+            } else {
+                deferred_retry.push_back(req);
             }
         }
+        state.retry_queue = deferred_retry;
 
         // Then main queue
         while batch.len() < batch_size && !state.queue.is_empty() {
@@ -513,7 +559,15 @@ impl EmbeddingJobRunner {
     ///
     /// Returns the batch result and any requests that should be retried.
     pub fn process_batch(&self) -> SearchResult<BatchResult> {
-        let batch = self.queue.drain_batch(self.config.batch_size);
+        self.process_batch_limit(self.config.batch_size)
+    }
+
+    /// Process at most `batch_size` requests from the queue.
+    ///
+    /// This is used by the refresh worker to enforce per-cycle processing bounds.
+    pub fn process_batch_limit(&self, batch_size: usize) -> SearchResult<BatchResult> {
+        let effective_batch_size = batch_size.max(1).min(self.config.batch_size);
+        let batch = self.queue.drain_batch(effective_batch_size);
         if batch.is_empty() {
             return Ok(BatchResult::default());
         }
@@ -678,6 +732,7 @@ impl Default for RefreshWorkerConfig {
 pub struct IndexRefreshWorker {
     config: RefreshWorkerConfig,
     runner: Arc<EmbeddingJobRunner>,
+    rebuild_lifecycle: Option<Arc<dyn IndexLifecycle>>,
     shutdown: Arc<AtomicBool>,
     last_refresh: Mutex<Option<Instant>>,
 }
@@ -689,9 +744,17 @@ impl IndexRefreshWorker {
         Self {
             config,
             runner,
+            rebuild_lifecycle: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             last_refresh: Mutex::new(None),
         }
+    }
+
+    /// Attach an optional index lifecycle for startup rebuild hooks.
+    #[must_use]
+    pub fn with_rebuild_lifecycle(mut self, lifecycle: Arc<dyn IndexLifecycle>) -> Self {
+        self.rebuild_lifecycle = Some(lifecycle);
+        self
     }
 
     /// Get the shutdown flag for external control.
@@ -710,6 +773,7 @@ impl IndexRefreshWorker {
     /// This should be called from a dedicated thread.
     pub fn run(&self) {
         let interval = Duration::from_millis(self.config.refresh_interval_ms.max(100));
+        self.run_startup_rebuild();
 
         loop {
             if self.shutdown.load(Ordering::Acquire) {
@@ -717,18 +781,8 @@ impl IndexRefreshWorker {
             }
 
             // Process pending work
-            if self.runner.has_work() {
-                match self.runner.process_batch() {
-                    Ok(result) => {
-                        if result.total() > 0 {
-                            *self.last_refresh.lock().expect("last_refresh lock") =
-                                Some(Instant::now());
-                        }
-                    }
-                    Err(_e) => {
-                        // Log error but continue
-                    }
-                }
+            if self.run_cycle() > 0 {
+                *self.last_refresh.lock().expect("last_refresh lock") = Some(Instant::now());
             }
 
             // Sleep in small increments for responsive shutdown
@@ -754,6 +808,41 @@ impl IndexRefreshWorker {
     #[must_use]
     pub fn last_refresh(&self) -> Option<Instant> {
         *self.last_refresh.lock().expect("last_refresh lock")
+    }
+
+    /// Process one bounded refresh cycle.
+    ///
+    /// Returns the number of documents processed this cycle.
+    #[must_use]
+    pub fn run_cycle(&self) -> usize {
+        let max_docs = self.config.max_docs_per_cycle.max(1);
+        let mut processed = 0usize;
+        while self.runner.has_work() && processed < max_docs {
+            let remaining = max_docs.saturating_sub(processed).max(1);
+            match self.runner.process_batch_limit(remaining) {
+                Ok(result) => {
+                    let total = result.total();
+                    if total == 0 {
+                        break;
+                    }
+                    processed = processed.saturating_add(total);
+                }
+                Err(_e) => {
+                    // Log error but continue on next cycle.
+                    break;
+                }
+            }
+        }
+        processed
+    }
+
+    fn run_startup_rebuild(&self) {
+        if !self.config.rebuild_on_startup {
+            return;
+        }
+        if let Some(lifecycle) = self.rebuild_lifecycle.as_ref() {
+            let _ = lifecycle.rebuild();
+        }
     }
 }
 
@@ -795,8 +884,10 @@ impl RebuildProgress for NoProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embedder::HashEmbedder;
+    use crate::embedder::{Embedder, HashEmbedder, ModelInfo};
+    use crate::engine::{IndexHealth, IndexLifecycle, IndexStats};
     use crate::vector_index::VectorIndexConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_request(doc_id: i64) -> EmbeddingRequest {
         EmbeddingRequest::new(
@@ -807,6 +898,70 @@ mod tests {
             "Test body content",
             ModelTier::Fast,
         )
+    }
+
+    #[derive(Debug)]
+    struct FixedEmbedder {
+        info: ModelInfo,
+    }
+
+    impl FixedEmbedder {
+        fn new(dimension: usize) -> Self {
+            Self {
+                info: ModelInfo::new("fixed-fast", "Fixed Fast", ModelTier::Fast, dimension, 4096)
+                    .with_available(true),
+            }
+        }
+    }
+
+    impl Embedder for FixedEmbedder {
+        fn embed(&self, text: &str) -> SearchResult<EmbeddingResult> {
+            Ok(EmbeddingResult::new(
+                vec![0.25_f32; self.info.dimension],
+                self.info.id.clone(),
+                ModelTier::Fast,
+                Duration::from_millis(1),
+                crate::canonical::content_hash(text),
+            ))
+        }
+
+        fn model_info(&self) -> &ModelInfo {
+            &self.info
+        }
+    }
+
+    #[derive(Default)]
+    struct MockLifecycle {
+        rebuild_calls: AtomicUsize,
+    }
+
+    impl IndexLifecycle for MockLifecycle {
+        fn rebuild(&self) -> SearchResult<IndexStats> {
+            self.rebuild_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(IndexStats {
+                docs_indexed: 0,
+                docs_removed: 0,
+                elapsed_ms: 0,
+                warnings: Vec::new(),
+            })
+        }
+
+        fn update_incremental(
+            &self,
+            changes: &[crate::document::DocChange],
+        ) -> SearchResult<usize> {
+            Ok(changes.len())
+        }
+
+        fn health(&self) -> IndexHealth {
+            IndexHealth {
+                ready: true,
+                doc_count: 0,
+                size_bytes: None,
+                last_updated_ts: None,
+                status_message: "ok".to_owned(),
+            }
+        }
     }
 
     // ── EmbeddingQueue ──
@@ -862,7 +1017,11 @@ mod tests {
 
     #[test]
     fn queue_retry_priority() {
-        let queue = EmbeddingQueue::new();
+        let config = EmbeddingJobConfig {
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
+        let queue = EmbeddingQueue::with_config(config);
 
         // Enqueue normal requests
         queue.enqueue(make_request(1));
@@ -874,6 +1033,24 @@ mod tests {
         // Retry should come first
         let batch = queue.drain_batch(10);
         assert_eq!(batch[0].doc_id, 100);
+        assert_eq!(batch[0].retries, 1);
+    }
+
+    #[test]
+    fn queue_retry_backoff_delays_visibility() {
+        let config = EmbeddingJobConfig {
+            retry_base_delay_ms: 50,
+            ..Default::default()
+        };
+        let queue = EmbeddingQueue::with_config(config);
+        queue.enqueue_retry(make_request(1));
+
+        assert!(queue.drain_batch(1).is_empty());
+        std::thread::sleep(Duration::from_millis(70));
+
+        let batch = queue.drain_batch(1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].doc_id, 1);
         assert_eq!(batch[0].retries, 1);
     }
 
@@ -1015,5 +1192,65 @@ mod tests {
         let config = RefreshWorkerConfig::default();
         assert_eq!(config.refresh_interval_ms, 1000);
         assert!(!config.rebuild_on_startup);
+    }
+
+    #[test]
+    fn refresh_worker_cycle_respects_max_docs_per_cycle() {
+        let config = EmbeddingJobConfig {
+            batch_size: 16,
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        for id in 0..5 {
+            assert!(queue.enqueue(make_request(id)));
+        }
+
+        let embedder = Arc::new(FixedEmbedder::new(4));
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 4,
+            ..Default::default()
+        })));
+        let runner = Arc::new(EmbeddingJobRunner::new(
+            config,
+            queue.clone(),
+            embedder,
+            index,
+        ));
+        let worker = IndexRefreshWorker::new(
+            RefreshWorkerConfig {
+                max_docs_per_cycle: 3,
+                ..Default::default()
+            },
+            runner,
+        );
+
+        let processed = worker.run_cycle();
+        assert_eq!(processed, 3);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn refresh_worker_startup_rebuild_uses_lifecycle_hook() {
+        let config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(HashEmbedder::new());
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 0,
+            ..Default::default()
+        })));
+        let runner = Arc::new(EmbeddingJobRunner::new(config, queue, embedder, index));
+        let lifecycle = Arc::new(MockLifecycle::default());
+        let worker = IndexRefreshWorker::new(
+            RefreshWorkerConfig {
+                rebuild_on_startup: true,
+                ..Default::default()
+            },
+            runner,
+        )
+        .with_rebuild_lifecycle(lifecycle.clone());
+
+        worker.run_startup_rebuild();
+        assert_eq!(lifecycle.rebuild_calls.load(Ordering::Relaxed), 1);
     }
 }

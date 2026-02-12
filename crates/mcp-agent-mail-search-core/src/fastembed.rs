@@ -92,9 +92,10 @@ impl FastEmbedEmbedder {
             .map_err(|e| SearchError::Internal(format!("fastembed embed failed: {e}")))?;
         drop(model);
 
-        let mut embedding = embeddings.into_iter().next().ok_or_else(|| {
-            SearchError::Internal("fastembed returned no embedding".to_string())
-        })?;
+        let mut embedding = embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| SearchError::Internal("fastembed returned no embedding".to_string()))?;
 
         if embedding.len() != self.dimension {
             return Err(SearchError::Internal(format!(
@@ -211,7 +212,9 @@ mod tests {
     #[ignore = "requires model download"]
     fn test_minilm_embedding() {
         let embedder = FastEmbedEmbedder::load_minilm().expect("should load");
-        let embedding = embedder.embed_internal("hello world").expect("should embed");
+        let embedding = embedder
+            .embed_internal("hello world")
+            .expect("should embed");
 
         assert_eq!(embedding.len(), 384);
 

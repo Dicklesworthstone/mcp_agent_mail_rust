@@ -125,25 +125,25 @@ pub use embedding_jobs::{
 
 #[cfg(feature = "semantic")]
 pub use two_tier::{
-    IndexStatus as TwoTierIndexStatus, SearchPhase, ScoredResult, TwoTierConfig, TwoTierEmbedder,
+    IndexStatus as TwoTierIndexStatus, ScoredResult, SearchPhase, TwoTierConfig, TwoTierEmbedder,
     TwoTierEntry, TwoTierIndex, TwoTierMetadata, TwoTierSearcher, blend_scores,
     dot_product_f16_simd, normalize_scores,
 };
 
 #[cfg(feature = "semantic")]
 pub use model2vec::{
-    Model2VecEmbedder, MODEL_POTION_128M, MODEL_POTION_32M, get_fast_embedder,
+    MODEL_POTION_32M, MODEL_POTION_128M, Model2VecEmbedder, get_fast_embedder,
     is_fast_embedder_available,
 };
 
 #[cfg(feature = "semantic")]
 pub use fastembed::{
-    FastEmbedEmbedder, MODEL_MINILM_L6_V2, MODEL_BGE_SMALL, get_quality_embedder,
+    FastEmbedEmbedder, MODEL_BGE_SMALL, MODEL_MINILM_L6_V2, get_quality_embedder,
     is_quality_embedder_available,
 };
 
 #[cfg(feature = "semantic")]
 pub use auto_init::{
-    EmbedderInfo as TwoTierEmbedderInfo, TwoTierAvailability, TwoTierContext,
-    get_two_tier_context, is_full_two_tier_available, is_two_tier_available,
+    EmbedderInfo as TwoTierEmbedderInfo, TwoTierAvailability, TwoTierContext, get_two_tier_context,
+    is_full_two_tier_available, is_two_tier_available,
 };

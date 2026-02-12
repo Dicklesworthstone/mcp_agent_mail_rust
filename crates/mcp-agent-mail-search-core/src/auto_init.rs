@@ -187,12 +187,12 @@ impl TwoTierContext {
             None => return None,
         };
 
-        let quality_embedder: Option<Arc<dyn TwoTierEmbedder>> =
-            if get_quality_embedder().is_some() {
-                Some(Arc::new(QualityEmbedderWrapper))
-            } else {
-                None
-            };
+        let quality_embedder: Option<Arc<dyn TwoTierEmbedder>> = if get_quality_embedder().is_some()
+        {
+            Some(Arc::new(QualityEmbedderWrapper))
+        } else {
+            None
+        };
 
         Some(TwoTierSearcher::new(
             index,
@@ -313,7 +313,10 @@ mod tests {
 
     #[test]
     fn test_availability_display() {
-        assert_eq!(TwoTierAvailability::Full.to_string(), "full (fast + quality)");
+        assert_eq!(
+            TwoTierAvailability::Full.to_string(),
+            "full (fast + quality)"
+        );
         assert_eq!(TwoTierAvailability::FastOnly.to_string(), "fast-only");
         assert_eq!(TwoTierAvailability::QualityOnly.to_string(), "quality-only");
         assert_eq!(TwoTierAvailability::None.to_string(), "unavailable");

@@ -378,7 +378,10 @@ pub fn get_fast_embedder() -> Option<&'static Model2VecEmbedder> {
 
             // Fall back to potion-32M
             if let Ok(embedder) = Model2VecEmbedder::try_load(MODEL_POTION_32M) {
-                tracing::info!(model = MODEL_POTION_32M, "Fast embedder auto-initialized (fallback)");
+                tracing::info!(
+                    model = MODEL_POTION_32M,
+                    "Fast embedder auto-initialized (fallback)"
+                );
                 return Some(embedder);
             }
 
@@ -416,7 +419,11 @@ mod tests {
         assert!(!paths.is_empty());
 
         // Should include HuggingFace cache path
-        assert!(paths.iter().any(|p| p.to_string_lossy().contains("huggingface")));
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("huggingface"))
+        );
     }
 
     #[test]
