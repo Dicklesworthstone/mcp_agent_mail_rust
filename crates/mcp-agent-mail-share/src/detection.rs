@@ -418,6 +418,14 @@ fn determine_recommended_provider(env: &DetectedEnvironment) -> Option<HostingPr
         return Some(HostingProvider::Netlify);
     }
 
+    let has_github_workflow = env.signals.iter().any(|s| {
+        s.detail.contains("GitHub Actions workflow")
+            || s.detail.contains(".github/workflows/ directory exists")
+    });
+    if has_github_workflow {
+        return Some(HostingProvider::GithubPages);
+    }
+
     // S3 only if explicit signals
     if env.aws_env {
         let has_s3_script = env.signals.iter().any(|s| s.detail.contains("S3"));
@@ -602,5 +610,64 @@ mod tests {
         };
         let provider = determine_recommended_provider(&env);
         assert_eq!(provider, Some(HostingProvider::Netlify));
+    }
+
+    #[test]
+    fn detect_environment_recommends_cloudflare_from_wrangler_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("wrangler.toml"), "name = \"demo\"")
+            .expect("write wrangler.toml");
+
+        let env = detect_environment(None, dir.path());
+        assert_eq!(
+            env.recommended_provider,
+            Some(HostingProvider::CloudflarePages)
+        );
+        assert!(
+            env.signals
+                .iter()
+                .any(|s| s.detail.contains("wrangler.toml")),
+            "expected wrangler signal in detection output"
+        );
+    }
+
+    #[test]
+    fn detect_environment_recommends_netlify_from_netlify_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("netlify.toml"),
+            "[build]\npublish = \"dist\"",
+        )
+        .expect("write netlify.toml");
+
+        let env = detect_environment(None, dir.path());
+        assert_eq!(env.recommended_provider, Some(HostingProvider::Netlify));
+        assert!(
+            env.signals
+                .iter()
+                .any(|s| s.detail.contains("netlify.toml")),
+            "expected netlify signal in detection output"
+        );
+    }
+
+    #[test]
+    fn detect_environment_recommends_github_from_workflow_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("create workflows dir");
+        std::fs::write(
+            workflows.join("deploy-pages.yml"),
+            "name: Deploy\non: [push]\njobs: {}\n",
+        )
+        .expect("write workflow");
+
+        let env = detect_environment(None, dir.path());
+        assert_eq!(env.recommended_provider, Some(HostingProvider::GithubPages));
+        assert!(
+            env.signals
+                .iter()
+                .any(|s| s.detail.contains("GitHub Actions workflow found")),
+            "expected github workflow signal in detection output"
+        );
     }
 }

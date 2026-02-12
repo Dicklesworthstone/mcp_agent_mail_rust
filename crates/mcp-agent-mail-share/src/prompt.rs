@@ -714,6 +714,84 @@ mod tests {
     }
 
     #[test]
+    fn validate_non_interactive_requires_github_repo() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::GithubPages),
+            bundle_path: Some(PathBuf::from("/tmp/bundle")),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let err = validate_non_interactive(inputs, &env)
+            .expect_err("github provider should require --github-repo");
+        assert_eq!(err.code, WizardErrorCode::MissingRequiredOption);
+        assert!(err.message.contains("GitHub repository"));
+    }
+
+    #[test]
+    fn validate_non_interactive_requires_cloudflare_project() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::CloudflarePages),
+            bundle_path: Some(PathBuf::from("/tmp/bundle")),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let err = validate_non_interactive(inputs, &env)
+            .expect_err("cloudflare provider should require --cloudflare-project");
+        assert_eq!(err.code, WizardErrorCode::MissingRequiredOption);
+        assert!(err.message.contains("Cloudflare project"));
+    }
+
+    #[test]
+    fn validate_non_interactive_requires_netlify_site() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::Netlify),
+            bundle_path: Some(PathBuf::from("/tmp/bundle")),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let err = validate_non_interactive(inputs, &env)
+            .expect_err("netlify provider should require --netlify-site");
+        assert_eq!(err.code, WizardErrorCode::MissingRequiredOption);
+        assert!(err.message.contains("Netlify site"));
+    }
+
+    #[test]
+    fn validate_non_interactive_requires_s3_bucket() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::S3),
+            bundle_path: Some(PathBuf::from("/tmp/bundle")),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let err = validate_non_interactive(inputs, &env)
+            .expect_err("s3 provider should require --s3-bucket");
+        assert_eq!(err.code, WizardErrorCode::MissingRequiredOption);
+        assert!(err.message.contains("S3 bucket"));
+    }
+
+    #[test]
+    fn validate_non_interactive_accepts_detected_bundle_path() {
+        let detected_bundle = PathBuf::from("/tmp/detected-bundle");
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::Custom),
+            bundle_path: None,
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            existing_bundle: Some(detected_bundle.clone()),
+            ..Default::default()
+        };
+
+        let resolved = validate_non_interactive(inputs, &env)
+            .expect("detected bundle should satisfy non-interactive validation");
+        assert_eq!(resolved.bundle_path, Some(detected_bundle));
+    }
+
+    #[test]
     fn validate_provider_requirements_custom_has_none() {
         let inputs = WizardInputs::default();
         let result = validate_provider_requirements(HostingProvider::Custom, &inputs);
