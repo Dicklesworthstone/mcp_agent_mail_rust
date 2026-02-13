@@ -472,4 +472,130 @@ mod tests {
         assert!((vec[0] - 0.6).abs() < 1e-6);
         assert!((vec[1] - 0.8).abs() < 1e-6);
     }
+
+    // ── l2_normalize edge cases ──
+
+    #[test]
+    fn l2_normalize_zero_vector() {
+        let mut vec = vec![0.0, 0.0, 0.0];
+        l2_normalize(&mut vec);
+        // Zero vector should stay zero (norm <= EPSILON)
+        assert!(vec.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn l2_normalize_single_element() {
+        let mut vec = vec![5.0];
+        l2_normalize(&mut vec);
+        assert!((vec[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_normalize_already_normalized() {
+        let mut vec = vec![0.6, 0.8];
+        l2_normalize(&mut vec);
+        // Should be idempotent
+        assert!((vec[0] - 0.6).abs() < 1e-5);
+        assert!((vec[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn l2_normalize_negative_values() {
+        let mut vec = vec![-3.0, 4.0];
+        l2_normalize(&mut vec);
+        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert!((vec[0] - (-0.6)).abs() < 1e-6);
+        assert!((vec[1] - 0.8).abs() < 1e-6);
+    }
+
+    // ── tensor_to_embeddings edge cases ──
+
+    #[test]
+    fn tensor_to_embeddings_zero_vocab() {
+        let data: Vec<u8> = vec![];
+        let result = Model2VecEmbedder::tensor_to_embeddings(&data, 0, 3);
+        let embeddings = result.unwrap();
+        assert!(embeddings.is_empty());
+    }
+
+    #[test]
+    fn tensor_to_embeddings_single_element() {
+        // 1 vocab × 1 dim: [42.0]
+        let data = 42.0f32.to_le_bytes().to_vec();
+        let embeddings = Model2VecEmbedder::tensor_to_embeddings(&data, 1, 1).unwrap();
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), 1);
+        assert!((embeddings[0][0] - 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tensor_to_embeddings_size_too_large() {
+        // 2 vocab × 3 dims = 24 bytes, but provide 30
+        let data = vec![0u8; 30];
+        let result = Model2VecEmbedder::tensor_to_embeddings(&data, 2, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tensor_to_embeddings_size_too_small() {
+        // 2 vocab × 3 dims = 24 bytes, but provide 20
+        let data = vec![0u8; 20];
+        let result = Model2VecEmbedder::tensor_to_embeddings(&data, 2, 3);
+        assert!(result.is_err());
+    }
+
+    // ── model_search_paths ──
+
+    #[test]
+    fn model_search_paths_32m() {
+        let paths = Model2VecEmbedder::model_search_paths(MODEL_POTION_32M);
+        assert!(!paths.is_empty());
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("potion-retrieval-32M"))
+        );
+    }
+
+    #[test]
+    fn model_search_paths_custom_name() {
+        let paths = Model2VecEmbedder::model_search_paths("my-custom-model");
+        assert!(!paths.is_empty());
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("my-custom-model"))
+        );
+    }
+
+    // ── is_available ──
+
+    #[test]
+    fn is_available_nonexistent_model() {
+        assert!(!Model2VecEmbedder::is_available(
+            "nonexistent-model-xyz-12345"
+        ));
+    }
+
+    // ── required_files ──
+
+    #[test]
+    fn required_files_count() {
+        assert_eq!(REQUIRED_FILES.len(), 2);
+    }
+
+    // ── global embedder ──
+
+    #[test]
+    fn is_fast_embedder_available_no_panic() {
+        // Just verify the function doesn't panic
+        let _ = is_fast_embedder_available();
+    }
+
+    #[test]
+    fn get_fast_embedder_no_panic() {
+        // The global may or may not return Some depending on model availability
+        let _ = get_fast_embedder();
+    }
 }

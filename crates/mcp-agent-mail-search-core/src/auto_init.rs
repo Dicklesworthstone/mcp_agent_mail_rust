@@ -331,4 +331,174 @@ mod tests {
         let _ = ctx.config();
         let _ = ctx.is_available();
     }
+
+    // ── TwoTierAvailability trait coverage ──
+
+    #[test]
+    fn availability_debug_all_variants() {
+        let variants = [
+            TwoTierAvailability::Full,
+            TwoTierAvailability::FastOnly,
+            TwoTierAvailability::QualityOnly,
+            TwoTierAvailability::None,
+        ];
+        for v in &variants {
+            let debug = format!("{v:?}");
+            assert!(!debug.is_empty());
+        }
+    }
+
+    #[test]
+    fn availability_clone_copy() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let a = TwoTierAvailability::Full;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_clone(&a);
+    }
+
+    #[test]
+    fn availability_eq_same_variants() {
+        assert_eq!(TwoTierAvailability::Full, TwoTierAvailability::Full);
+        assert_eq!(TwoTierAvailability::FastOnly, TwoTierAvailability::FastOnly);
+        assert_eq!(
+            TwoTierAvailability::QualityOnly,
+            TwoTierAvailability::QualityOnly
+        );
+        assert_eq!(TwoTierAvailability::None, TwoTierAvailability::None);
+    }
+
+    #[test]
+    fn availability_ne_different_variants() {
+        assert_ne!(TwoTierAvailability::Full, TwoTierAvailability::None);
+        assert_ne!(TwoTierAvailability::FastOnly, TwoTierAvailability::Full);
+        assert_ne!(
+            TwoTierAvailability::QualityOnly,
+            TwoTierAvailability::FastOnly
+        );
+    }
+
+    #[test]
+    fn availability_four_distinct_variants() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(format!("{:?}", TwoTierAvailability::Full));
+        set.insert(format!("{:?}", TwoTierAvailability::FastOnly));
+        set.insert(format!("{:?}", TwoTierAvailability::QualityOnly));
+        set.insert(format!("{:?}", TwoTierAvailability::None));
+        assert_eq!(set.len(), 4);
+    }
+
+    // ── EmbedderInfo ──
+
+    #[test]
+    fn embedder_info_debug() {
+        let info = EmbedderInfo {
+            id: "test-model".to_string(),
+            dimension: 256,
+        };
+        let debug = format!("{info:?}");
+        assert!(debug.contains("test-model"));
+        assert!(debug.contains("256"));
+    }
+
+    #[test]
+    fn embedder_info_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let info = EmbedderInfo {
+            id: "model-a".to_string(),
+            dimension: 384,
+        };
+        assert_clone(&info);
+        assert_eq!(info.id, "model-a");
+        assert_eq!(info.dimension, 384);
+    }
+
+    // ── TwoTierContext accessors via global singleton ──
+
+    #[test]
+    fn context_is_full_consistency() {
+        let ctx = get_two_tier_context();
+        // is_full should equal (availability == Full)
+        assert_eq!(
+            ctx.is_full(),
+            ctx.availability() == TwoTierAvailability::Full
+        );
+    }
+
+    #[test]
+    fn context_is_available_consistency() {
+        let ctx = get_two_tier_context();
+        // is_available should equal (availability != None)
+        assert_eq!(
+            ctx.is_available(),
+            ctx.availability() != TwoTierAvailability::None
+        );
+    }
+
+    #[test]
+    fn context_config_dimensions() {
+        let ctx = get_two_tier_context();
+        let config = ctx.config();
+        // Dimensions should be reasonable values
+        assert!(config.fast_dimension > 0);
+        assert!(config.quality_dimension > 0);
+    }
+
+    #[test]
+    fn context_create_index() {
+        let ctx = get_two_tier_context();
+        let index = ctx.create_index();
+        // Just verify it doesn't panic and returns a valid index
+        let _ = format!("{index:?}");
+    }
+
+    #[test]
+    fn context_debug() {
+        let ctx = get_two_tier_context();
+        let debug = format!("{ctx:?}");
+        assert!(debug.contains("TwoTierContext"));
+    }
+
+    // ── Convenience functions ──
+
+    #[test]
+    fn is_two_tier_available_matches_context() {
+        let ctx = get_two_tier_context();
+        assert_eq!(is_two_tier_available(), ctx.is_available());
+    }
+
+    #[test]
+    fn is_full_two_tier_available_matches_context() {
+        let ctx = get_two_tier_context();
+        assert_eq!(is_full_two_tier_available(), ctx.is_full());
+    }
+
+    // ── Embedder info accessors ──
+
+    #[test]
+    fn context_fast_info_matches_availability() {
+        let ctx = get_two_tier_context();
+        match ctx.availability() {
+            TwoTierAvailability::Full | TwoTierAvailability::FastOnly => {
+                assert!(ctx.fast_info().is_some());
+            }
+            TwoTierAvailability::QualityOnly | TwoTierAvailability::None => {
+                assert!(ctx.fast_info().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn context_quality_info_matches_availability() {
+        let ctx = get_two_tier_context();
+        match ctx.availability() {
+            TwoTierAvailability::Full | TwoTierAvailability::QualityOnly => {
+                assert!(ctx.quality_info().is_some());
+            }
+            TwoTierAvailability::FastOnly | TwoTierAvailability::None => {
+                assert!(ctx.quality_info().is_none());
+            }
+        }
+    }
 }

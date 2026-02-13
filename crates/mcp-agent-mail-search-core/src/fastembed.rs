@@ -222,4 +222,62 @@ mod tests {
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5);
     }
+
+    // ── l2_normalize edge cases ──
+
+    #[test]
+    fn l2_normalize_zero_vector() {
+        let mut vec = vec![0.0, 0.0, 0.0];
+        l2_normalize(&mut vec);
+        assert!(vec.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn l2_normalize_single_element() {
+        let mut vec = vec![7.0];
+        l2_normalize(&mut vec);
+        assert!((vec[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_normalize_negative_values() {
+        let mut vec = vec![-3.0, 4.0];
+        l2_normalize(&mut vec);
+        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_normalize_large_vector() {
+        #[allow(clippy::cast_precision_loss)]
+        let mut vec: Vec<f32> = (1..=100).map(|i| i as f32).collect();
+        l2_normalize(&mut vec);
+        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    // ── global embedder ──
+
+    #[test]
+    fn is_quality_embedder_available_no_panic() {
+        let _ = is_quality_embedder_available();
+    }
+
+    #[test]
+    fn get_quality_embedder_no_panic() {
+        let _ = get_quality_embedder();
+    }
+
+    // ── constants ──
+
+    #[test]
+    fn model_constants_not_empty() {
+        assert!(!MODEL_MINILM_L6_V2.is_empty());
+        assert!(!MODEL_BGE_SMALL.is_empty());
+    }
+
+    #[test]
+    fn model_constants_distinct() {
+        assert_ne!(MODEL_MINILM_L6_V2, MODEL_BGE_SMALL);
+    }
 }
