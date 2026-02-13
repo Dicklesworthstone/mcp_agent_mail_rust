@@ -352,11 +352,11 @@ with concrete benchmark/replay evidence once `br-2tnl.7.15` and `br-2tnl.7.16` a
    ```
 2. Run a smoke query against production-like scope:
    ```bash
-   AM_INTERFACE_MODE=cli mcp-agent-mail search messages \
+   AM_INTERFACE_MODE=cli mcp-agent-mail mail search \
      --project /abs/path/to/project \
-     --query "coordination" \
      --limit 10 \
-     --json | jq '.results | length'
+     "coordination" \
+     --json | jq 'length'
    ```
 3. Verify no sustained queue pressure (`queues.wbq.warning=false`, `queues.commit_coalescer.warning=false`).
 
