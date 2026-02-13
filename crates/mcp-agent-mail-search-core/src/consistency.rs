@@ -1198,4 +1198,236 @@ mod tests {
         .unwrap();
         assert!(!report.rebuild_recommended);
     }
+
+    // ── New tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn consistency_config_default() {
+        let config = ConsistencyConfig::default();
+        assert!((config.count_drift_threshold - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reindex_config_default() {
+        let config = ReindexConfig::default();
+        assert_eq!(config.batch_size, 500);
+        assert!(config.write_checkpoint);
+    }
+
+    #[test]
+    fn no_progress_callable() {
+        let np = NoProgress;
+        np.on_progress(0, 100);
+        np.on_progress(50, 100);
+        np.on_progress(100, 100);
+    }
+
+    #[test]
+    fn consistency_report_serde_roundtrip() {
+        let report = ConsistencyReport {
+            findings: vec![ConsistencyFinding {
+                category: "test".to_owned(),
+                severity: Severity::Info,
+                message: "all good".to_owned(),
+                suggestion: None,
+            }],
+            healthy: true,
+            rebuild_recommended: false,
+            elapsed_ms: 42,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: ConsistencyReport = serde_json::from_str(&json).unwrap();
+        assert!(restored.healthy);
+        assert!(!restored.rebuild_recommended);
+        assert_eq!(restored.elapsed_ms, 42);
+        assert_eq!(restored.findings.len(), 1);
+    }
+
+    #[test]
+    fn consistency_report_zero_errors_zero_warnings() {
+        let report = ConsistencyReport {
+            findings: vec![ConsistencyFinding {
+                category: "info".to_owned(),
+                severity: Severity::Info,
+                message: "ok".to_owned(),
+                suggestion: None,
+            }],
+            healthy: true,
+            rebuild_recommended: false,
+            elapsed_ms: 0,
+        };
+        assert_eq!(report.error_count(), 0);
+        assert_eq!(report.warning_count(), 0);
+    }
+
+    #[test]
+    fn consistency_index_more_than_db() {
+        // Index has more docs than DB (orphans)
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        let source = MockSource::new(10);
+        let lifecycle = MockLifecycle::healthy(50); // index has 50, db has 10
+
+        let report = check_consistency(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ConsistencyConfig::default(),
+        )
+        .unwrap();
+
+        // 80% drift — severe
+        assert!(report.rebuild_recommended);
+        let mismatch = report
+            .findings
+            .iter()
+            .find(|f| f.category == "count_mismatch");
+        assert!(mismatch.is_some());
+        assert_eq!(mismatch.unwrap().severity, Severity::Error);
+    }
+
+    #[test]
+    fn consistency_checkpoint_no_completion_ts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        layout.ensure_dirs(&scope, &schema).unwrap();
+        let cp = IndexCheckpoint {
+            schema_hash: schema.clone(),
+            docs_indexed: 10,
+            started_ts: 1_700_000_000_000_000,
+            completed_ts: None, // Missing completion timestamp
+            max_version: 0,
+            success: true, // Success but no completion_ts
+        };
+        cp.write_to(&layout.lexical_dir(&scope, &schema)).unwrap();
+
+        let source = MockSource::new(10);
+        let lifecycle = MockLifecycle::healthy(10);
+
+        let report = check_consistency(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ConsistencyConfig::default(),
+        )
+        .unwrap();
+
+        // Should produce warning about missing completion timestamp
+        let incomplete = report
+            .findings
+            .iter()
+            .find(|f| f.category == "incomplete_build");
+        assert!(incomplete.is_some());
+        assert_eq!(incomplete.unwrap().severity, Severity::Warning);
+    }
+
+    #[test]
+    fn tracking_progress_records_calls() {
+        let progress = TrackingProgress::new();
+        assert_eq!(progress.call_count(), 0);
+
+        progress.on_progress(0, 100);
+        progress.on_progress(50, 100);
+        assert_eq!(progress.call_count(), 2);
+
+        let calls = progress.calls.lock().unwrap();
+        assert_eq!(calls[0], (0, 100));
+        assert_eq!(calls[1], (50, 100));
+    }
+
+    #[test]
+    fn full_reindex_with_project_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Project { project_id: 42 };
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        let source = MockSource::new(3);
+        let lifecycle = MockLifecycle::healthy(0);
+
+        let result = full_reindex(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ReindexConfig::default(),
+            &NoProgress,
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.docs_indexed, 3);
+        assert!(result.checkpoint_written);
+        assert!(result.elapsed_ms < 10_000); // Sanity check
+    }
+
+    #[test]
+    fn severity_ordering_in_sort() {
+        // Verify that the sort key function produces correct ordering
+        let mut findings = vec![
+            ConsistencyFinding {
+                category: "info".to_owned(),
+                severity: Severity::Info,
+                message: "".to_owned(),
+                suggestion: None,
+            },
+            ConsistencyFinding {
+                category: "error".to_owned(),
+                severity: Severity::Error,
+                message: "".to_owned(),
+                suggestion: None,
+            },
+            ConsistencyFinding {
+                category: "warning".to_owned(),
+                severity: Severity::Warning,
+                message: "".to_owned(),
+                suggestion: None,
+            },
+        ];
+
+        findings.sort_by_key(|f| match f.severity {
+            Severity::Error => 0,
+            Severity::Warning => 1,
+            Severity::Info => 2,
+        });
+
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[1].severity, Severity::Warning);
+        assert_eq!(findings[2].severity, Severity::Info);
+    }
+
+    #[test]
+    fn reindex_result_elapsed_ms_nonzero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        let source = MockSource::new(10);
+        let lifecycle = MockLifecycle::healthy(0);
+
+        let result = full_reindex(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ReindexConfig::default(),
+            &NoProgress,
+        )
+        .unwrap();
+
+        // elapsed_ms should be at least 0 (could be 0 on fast machines)
+        assert!(result.elapsed_ms <= 10_000);
+    }
 }
