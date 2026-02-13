@@ -45,7 +45,7 @@ use ftui_extras::theme;
 ///
 /// Each screen defines its own set of focus targets. Common targets
 /// include search bars, result lists, detail panels, and filter rails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FocusTarget {
     /// Text input field (search bar, filter input, etc.)
     TextInput(u8),
@@ -66,6 +66,7 @@ pub enum FocusTarget {
     /// Custom target with identifier
     Custom(u8),
     /// No focus (used for initial state or after blur)
+    #[default]
     None,
 }
 
@@ -89,11 +90,6 @@ impl FocusTarget {
     }
 }
 
-impl Default for FocusTarget {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // FocusContext — the current focus scope

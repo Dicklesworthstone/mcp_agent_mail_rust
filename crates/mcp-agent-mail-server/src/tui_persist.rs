@@ -36,6 +36,7 @@ pub type PaletteUsageMap = HashMap<String, (u32, i64)>;
 
 /// Accessibility settings for low-capability terminals and keyboard-only operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // Settings struct - booleans are intentional
 pub struct AccessibilitySettings {
     /// Use high-contrast color palette (brighter FG, darker BG).
     pub high_contrast: bool,

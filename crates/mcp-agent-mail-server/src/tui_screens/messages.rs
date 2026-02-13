@@ -200,18 +200,13 @@ impl RenderItem for MessageEntry {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Viewing mode for the Messages screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum InboxMode {
     /// Show messages from a single project.
     Local(String),
     /// Show messages from ALL projects.
+    #[default]
     Global,
-}
-
-impl Default for InboxMode {
-    fn default() -> Self {
-        Self::Global
-    }
 }
 
 impl InboxMode {

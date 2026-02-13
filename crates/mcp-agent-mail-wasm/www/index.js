@@ -206,9 +206,22 @@ function startRenderLoop() {
             }
         }
 
-        // Update screen info
+        // Update screen/telemetry from state-sync metadata
         if (app && app.is_connected) {
-            elements.currentScreen.textContent = `Screen ${app.screen_id}`;
+            const screenTitle = app.screen_title || `Screen ${app.screen_id}`;
+            elements.currentScreen.textContent = `${screenTitle} (#${app.screen_id})`;
+
+            const messageCount = Number(app.messages_received || 0);
+            elements.debugMessages.textContent = messageCount;
+
+            const timestampUs = Number(app.last_timestamp_us || 0);
+            if (timestampUs > 0) {
+                const nowUs = Date.now() * 1000;
+                const latencyMs = Math.max(0, Math.round((nowUs - timestampUs) / 1000));
+                elements.debugLatency.textContent = latencyMs;
+            } else {
+                elements.debugLatency.textContent = '-';
+            }
         }
 
         animationFrame = requestAnimationFrame(render);

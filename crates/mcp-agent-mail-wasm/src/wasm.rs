@@ -2,10 +2,12 @@
 //!
 //! This module provides the JavaScript-facing API for the Agent Mail TUI.
 
-use wasm_bindgen::prelude::*;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, WebSocket, console};
+use std::{cell::RefCell, rc::Rc};
 
-use crate::{AppConfig, InputEvent, StateSnapshot, WsMessage};
+use wasm_bindgen::prelude::*;
+use web_sys::{console, CanvasRenderingContext2d, HtmlCanvasElement, WebSocket};
+
+use crate::{AppConfig, InputEvent, StateSnapshot, SyncState, WsMessage};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Initialization
@@ -42,38 +44,11 @@ pub struct AgentMailApp {
     canvas: Option<HtmlCanvasElement>,
     ctx: Option<CanvasRenderingContext2d>,
     websocket: Option<WebSocket>,
-    state: AppState,
-}
-
-/// Internal application state.
-struct AppState {
-    connected: bool,
-    screen_id: u8,
-    cols: u16,
-    rows: u16,
-    cursor_x: u16,
-    cursor_y: u16,
-    cursor_visible: bool,
-    #[allow(dead_code)] // Reserved for future rendering
-    cells: Vec<u32>,
-    #[allow(dead_code)] // Reserved for delta tracking
-    last_seq: u64,
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            connected: false,
-            screen_id: 1,
-            cols: 80,
-            rows: 24,
-            cursor_x: 0,
-            cursor_y: 0,
-            cursor_visible: true,
-            cells: vec![0; 80 * 24],
-            last_seq: 0,
-        }
-    }
+    state: Rc<RefCell<SyncState>>,
+    onopen: Option<Closure<dyn FnMut()>>,
+    onmessage: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
+    onerror: Option<Closure<dyn FnMut(web_sys::ErrorEvent)>>,
+    onclose: Option<Closure<dyn FnMut(web_sys::CloseEvent)>>,
 }
 
 #[wasm_bindgen]
@@ -95,7 +70,11 @@ impl AgentMailApp {
             canvas: None,
             ctx: None,
             websocket: None,
-            state: AppState::default(),
+            state: Rc::new(RefCell::new(SyncState::default())),
+            onopen: None,
+            onmessage: None,
+            onerror: None,
+            onclose: None,
         }
     }
 
@@ -110,7 +89,11 @@ impl AgentMailApp {
             canvas: None,
             ctx: None,
             websocket: None,
-            state: AppState::default(),
+            state: Rc::new(RefCell::new(SyncState::default())),
+            onopen: None,
+            onmessage: None,
+            onerror: None,
+            onclose: None,
         })
     }
 
@@ -136,10 +119,11 @@ impl AgentMailApp {
             .map_err(|_| "Context is not CanvasRenderingContext2d")?;
 
         // Set canvas size based on terminal dimensions
+        let state = self.state.borrow();
         let char_width = self.config.font_size_px as f64 * 0.6;
         let char_height = self.config.font_size_px as f64;
-        canvas.set_width((self.state.cols as f64 * char_width) as u32);
-        canvas.set_height((self.state.rows as f64 * char_height) as u32);
+        canvas.set_width((state.cols as f64 * char_width) as u32);
+        canvas.set_height((state.rows as f64 * char_height) as u32);
 
         // Configure font
         let font = format!("{}px monospace", self.config.font_size_px);
@@ -159,33 +143,46 @@ impl AgentMailApp {
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
         // Set up event handlers
-        let onopen = Closure::<dyn FnMut()>::new(|| {
+        let state_for_open = Rc::clone(&self.state);
+        let onopen = Closure::<dyn FnMut()>::new(move || {
+            state_for_open.borrow_mut().connected = true;
             console::log_1(&"WebSocket connected".into());
         });
-        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
-        onopen.forget();
 
-        let onmessage =
-            Closure::<dyn FnMut(web_sys::MessageEvent)>::new(|event: web_sys::MessageEvent| {
+        let state_for_message = Rc::clone(&self.state);
+        let ws_for_message = ws.clone();
+        let onmessage = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+            move |event: web_sys::MessageEvent| {
                 if let Ok(text) = event.data().dyn_into::<js_sys::JsString>() {
                     let text_str: String = text.into();
-                    console::log_1(
-                        &format!("Received: {}", &text_str[..text_str.len().min(100)]).into(),
-                    );
+                    match serde_json::from_str::<WsMessage>(&text_str) {
+                        Ok(message) => {
+                            if matches!(message, WsMessage::Ping) {
+                                if let Ok(pong) = serde_json::to_string(&WsMessage::Pong) {
+                                    let _ = ws_for_message.send_with_str(&pong);
+                                }
+                            }
+                            state_for_message.borrow_mut().apply_message(&message);
+                        }
+                        Err(error) => {
+                            console::warn_1(
+                                &format!("Failed to parse WebSocket payload: {error}").into(),
+                            );
+                        }
+                    }
                 }
-            });
-        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        onmessage.forget();
+            },
+        );
 
         let onerror =
             Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(|event: web_sys::ErrorEvent| {
                 console::error_1(&format!("WebSocket error: {:?}", event.message()).into());
             });
-        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-        onerror.forget();
 
+        let state_for_close = Rc::clone(&self.state);
         let onclose =
-            Closure::<dyn FnMut(web_sys::CloseEvent)>::new(|event: web_sys::CloseEvent| {
+            Closure::<dyn FnMut(web_sys::CloseEvent)>::new(move |event: web_sys::CloseEvent| {
+                state_for_close.borrow_mut().connected = false;
                 console::log_1(
                     &format!(
                         "WebSocket closed: code={} reason={}",
@@ -195,12 +192,26 @@ impl AgentMailApp {
                     .into(),
                 );
             });
-        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
-        onclose.forget();
+
+        self.onopen = Some(onopen);
+        self.onmessage = Some(onmessage);
+        self.onerror = Some(onerror);
+        self.onclose = Some(onclose);
+
+        if let Some(handler) = self.onopen.as_ref() {
+            ws.set_onopen(Some(handler.as_ref().unchecked_ref()));
+        }
+        if let Some(handler) = self.onmessage.as_ref() {
+            ws.set_onmessage(Some(handler.as_ref().unchecked_ref()));
+        }
+        if let Some(handler) = self.onerror.as_ref() {
+            ws.set_onerror(Some(handler.as_ref().unchecked_ref()));
+        }
+        if let Some(handler) = self.onclose.as_ref() {
+            ws.set_onclose(Some(handler.as_ref().unchecked_ref()));
+        }
 
         self.websocket = Some(ws);
-        self.state.connected = true;
-
         Ok(())
     }
 
@@ -239,6 +250,7 @@ impl AgentMailApp {
     pub fn render(&self) -> Result<(), JsValue> {
         let ctx = self.ctx.as_ref().ok_or("Canvas not initialized")?;
         let canvas = self.canvas.as_ref().ok_or("Canvas not initialized")?;
+        let state = self.state.borrow();
 
         // Clear canvas
         ctx.set_fill_style_str(if self.config.high_contrast {
@@ -256,11 +268,11 @@ impl AgentMailApp {
         });
 
         // Draw cursor
-        if self.state.cursor_visible {
+        if state.cursor_visible {
             let char_width = self.config.font_size_px as f64 * 0.6;
             let char_height = self.config.font_size_px as f64;
-            let x = self.state.cursor_x as f64 * char_width;
-            let y = self.state.cursor_y as f64 * char_height;
+            let x = state.cursor_x as f64 * char_width;
+            let y = state.cursor_y as f64 * char_height;
 
             ctx.set_fill_style_str("#00ff00");
             ctx.fill_rect(x, y, char_width, char_height);
@@ -272,34 +284,60 @@ impl AgentMailApp {
     /// Check if connected to the server.
     #[wasm_bindgen(getter)]
     pub fn is_connected(&self) -> bool {
-        self.state.connected
+        self.state.borrow().connected
     }
 
     /// Get current screen ID.
     #[wasm_bindgen(getter)]
     pub fn screen_id(&self) -> u8 {
-        self.state.screen_id
+        self.state.borrow().screen_id
+    }
+
+    /// Get current screen title.
+    #[wasm_bindgen(getter)]
+    pub fn screen_title(&self) -> String {
+        self.state.borrow().screen_title.clone()
     }
 
     /// Get terminal columns.
     #[wasm_bindgen(getter)]
     pub fn cols(&self) -> u16 {
-        self.state.cols
+        self.state.borrow().cols
     }
 
     /// Get terminal rows.
     #[wasm_bindgen(getter)]
     pub fn rows(&self) -> u16 {
-        self.state.rows
+        self.state.borrow().rows
+    }
+
+    /// Get timestamp from the last server sync event (microseconds).
+    #[wasm_bindgen(getter)]
+    pub fn last_timestamp_us(&self) -> i64 {
+        self.state.borrow().last_timestamp_us
+    }
+
+    /// Get number of state-sync messages processed.
+    #[wasm_bindgen(getter)]
+    pub fn messages_received(&self) -> u64 {
+        self.state.borrow().messages_received
     }
 
     /// Disconnect from the server.
     #[wasm_bindgen]
     pub fn disconnect(&mut self) {
         if let Some(ws) = self.websocket.take() {
+            ws.set_onopen(None);
+            ws.set_onmessage(None);
+            ws.set_onerror(None);
+            ws.set_onclose(None);
             let _ = ws.close();
         }
-        self.state.connected = false;
+        self.onopen = None;
+        self.onmessage = None;
+        self.onerror = None;
+        self.onclose = None;
+        self.state.borrow_mut().connected = false;
         console::log_1(&"Disconnected".into());
     }
 }
