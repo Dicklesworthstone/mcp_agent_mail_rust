@@ -503,3 +503,69 @@ cp tests/artifacts/dual_mode/*/run_summary.json tests/artifacts/dry_run/
 | Golden benchmark checksums | br-3vwi.12.1 (rollout gate reference) | `benches/golden/checksums.sha256` |
 | Verify-live E2E matrix artifacts | br-dl1g / br-3efsl follow-through | `tests/artifacts/share_verify_live/*/` |
 | Verify-live contract + compatibility policy | br-dl1g / br-3tr5 follow-through | `docs/SPEC-verify-live-contract.md` |
+
+---
+
+## 9. Post-Launch Telemetry Review Loop
+
+This section operationalizes `br-3vwi.12.3` and records the latest review snapshot.
+
+### 9.1 Review Windows and Evidence
+
+| Window | Source | Decision | Summary |
+|--------|--------|----------|---------|
+| 2026-02-12 18:01Z | `tests/artifacts/ci/20260212_175803/case_02_report.json` | `no-go` | pass=3, fail=6, skip=4 |
+| 2026-02-12 18:04Z | `tests/artifacts/ci/20260212_180339/case_02_report.json` | `no-go` | pass=3, fail=6, skip=4 |
+| 2026-02-12 22:50Z | `tests/artifacts/ci/20260212_224845/case_02_report.json` | `no-go` | pass=2, fail=7, skip=4 |
+| 2026-02-13 03:17Z | `tests/artifacts/ci/20260213_031050/case_02_report.json` | `no-go` | full mode, pass=4, fail=9, skip=0 |
+| 2026-02-12 22:50Z | `tests/artifacts/ci/20260212_224845/case_06_parallel_report.json` | `no-go` | pass=0, fail=3, skip=10 |
+
+### 9.2 Projected vs Observed
+
+| Metric | Projected for promotion | Observed |
+|--------|--------------------------|----------|
+| Gate decision | `go` | `no-go` |
+| Release eligibility | `true` | `false` |
+| Compiler health | clean workspace build/test | blocked by `search_scope` compile errors |
+| Lint gate | clippy clean (`-D warnings`) | blocked by `significant_drop_tightening` in rate-limiter tests |
+| Full gate coverage | non-quick candidate run available | non-quick run now available (`tests/artifacts/ci/20260213_031050/case_02_report.json`), but failing gates still block promotion |
+
+### 9.3 Root-Cause Findings
+
+1. Search-scope compile regressions block build/test and all dependent gates.
+2. Clippy gate remains red due to deterministic rate-limiter test lint failures.
+3. Governance cadence is now defined around recurring non-quick release-candidate reports with explicit owner rotation.
+
+### 9.4 Follow-Up Beads Created
+
+| Bead | Purpose |
+|------|---------|
+| `br-3vwi.12.3.1` | Fix SearchScope compile regressions blocking CI gates |
+| `br-3vwi.12.3.2` | Fix clippy `significant_drop_tightening` failures in server rate-limiter tests |
+| `br-3vwi.12.3.3` | Add non-quick release-candidate gate run with published go/no-go artifact |
+
+### 9.5 Recurring Review Cadence
+
+Run this before each phase-promotion decision and record the artifact path in the sign-off ledger:
+
+```bash
+run_ts="$(date -u +%Y%m%d_%H%M%S)"
+bash scripts/ci.sh --report "tests/artifacts/ci/${run_ts}/case_02_report.json"
+jq '.decision, .release_eligible, .summary' "tests/artifacts/ci/${run_ts}/case_02_report.json"
+```
+
+Promotion remains blocked unless `decision=="go"` and `release_eligible==true`.
+
+Current non-quick reference artifact:
+- `tests/artifacts/ci/20260213_031050/case_02_report.json`
+
+Cadence:
+- Run once every 24 hours during active rollout.
+- Run again within 12 hours of any phase-promotion decision.
+
+Owner rotation for this artifact (weekly handoff at Monday 00:00 UTC):
+| Primary owner | Backup owner | Responsibility |
+|---------------|--------------|----------------|
+| Release owner | CI maintainer | Execute non-quick report run and publish artifact path in this section + `docs/RELEASE_CHECKLIST.md` |
+| CI maintainer | Agent integration lead | Validate report schema/completeness and stale-age threshold (must be <=24h) |
+| Agent integration lead | On-call operator | Confirm latest artifact is linked in rollout thread and sign-off ledger evidence fields |

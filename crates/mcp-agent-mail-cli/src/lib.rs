@@ -127,6 +127,34 @@ pub enum Commands {
         #[arg(long, short = 'p')]
         parallel: bool,
     },
+    /// Run native CLI benchmarks.
+    #[command(name = "bench")]
+    Bench {
+        /// Quick mode: warmup=1, runs=3 unless overridden.
+        #[arg(long, short = 'q')]
+        quick: bool,
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+        /// Path to baseline JSON for regression comparison.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Persist current benchmark p95 values as a baseline JSON file.
+        #[arg(long = "save-baseline")]
+        save_baseline: Option<PathBuf>,
+        /// Glob pattern to select benchmark names (example: "mail_*").
+        #[arg(long)]
+        filter: Option<String>,
+        /// List selected benchmarks without executing them.
+        #[arg(long, default_value_t = false)]
+        list: bool,
+        /// Override warmup iterations.
+        #[arg(long)]
+        warmup: Option<u32>,
+        /// Override measured iterations.
+        #[arg(long)]
+        runs: Option<u32>,
+    },
     Lint,
     Typecheck,
     /// Run E2E test suites.
@@ -1716,6 +1744,25 @@ fn execute(cli: Cli) -> CliResult<()> {
             json,
             parallel,
         } => handle_ci(quick, report, format, json, parallel),
+        Commands::Bench {
+            quick,
+            json,
+            baseline,
+            save_baseline,
+            filter,
+            list,
+            warmup,
+            runs,
+        } => handle_bench(
+            quick,
+            json,
+            baseline,
+            save_baseline,
+            filter,
+            list,
+            warmup,
+            runs,
+        ),
         Commands::Lint => handle_lint(),
         Commands::Typecheck => handle_typecheck(),
         Commands::E2e { action } => handle_e2e(action),
@@ -5356,6 +5403,323 @@ fn clear_and_reset_everything(
     })
 }
 
+const BENCH_DEFAULT_REGRESSION_THRESHOLD: f64 = 0.10;
+
+#[derive(Debug, Serialize)]
+struct BenchRunFailure {
+    name: String,
+    command: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchRunReport {
+    summary: bench::BenchSummary,
+    profile: bench::BenchProfile,
+    warmup: u32,
+    runs: u32,
+    filter: Option<String>,
+    baseline_path: Option<String>,
+    save_baseline_path: Option<String>,
+    seed_report: Option<bench::BenchSeedReport>,
+    skipped: Vec<String>,
+    failures: Vec<BenchRunFailure>,
+    regression_count: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_bench(
+    quick: bool,
+    json: bool,
+    baseline: Option<PathBuf>,
+    save_baseline: Option<PathBuf>,
+    filter: Option<String>,
+    list: bool,
+    warmup_override: Option<u32>,
+    runs_override: Option<u32>,
+) -> CliResult<()> {
+    let profile = if quick {
+        bench::BenchProfile::Quick
+    } else {
+        bench::BenchProfile::Normal
+    };
+    let warmup = warmup_override.unwrap_or(profile.warmup());
+    let runs = runs_override.unwrap_or(profile.runs());
+    if warmup == 0 {
+        return Err(CliError::InvalidArgument(
+            "--warmup must be greater than zero".to_string(),
+        ));
+    }
+    if runs == 0 {
+        return Err(CliError::InvalidArgument(
+            "--runs must be greater than zero".to_string(),
+        ));
+    }
+
+    let filter_pattern = if let Some(raw) = filter.as_deref() {
+        Some(glob::Pattern::new(raw).map_err(|err| {
+            CliError::InvalidArgument(format!("invalid --filter pattern '{raw}': {err}"))
+        })?)
+    } else {
+        None
+    };
+
+    let mut configs: Vec<bench::BenchConfig> = bench::DEFAULT_BENCHMARKS
+        .iter()
+        .map(|definition| definition.to_config(profile))
+        .collect();
+    for cfg in &mut configs {
+        cfg.warmup = warmup;
+        cfg.runs = runs;
+    }
+    configs.retain(|cfg| {
+        filter_pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.matches(&cfg.name))
+    });
+    if configs.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "no benchmarks matched the current --filter".to_string(),
+        ));
+    }
+
+    if list {
+        if json {
+            let payload: Vec<serde_json::Value> = configs
+                .iter()
+                .map(|cfg| {
+                    serde_json::json!({
+                        "name": cfg.name,
+                        "category": cfg.category,
+                        "command": cfg.command,
+                        "warmup": cfg.warmup,
+                        "runs": cfg.runs,
+                        "requires_seeded_db": cfg.requires_seeded_db,
+                        "conditional": cfg.conditional,
+                        "condition": cfg.condition,
+                    })
+                })
+                .collect();
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).map_err(|err| {
+                    CliError::Other(format!("failed to serialize benchmark list: {err}"))
+                })?
+            );
+        } else {
+            ftui_runtime::ftui_println!(
+                "Benchmarks (profile={:?}, warmup={warmup}, runs={runs}):",
+                profile
+            );
+            for cfg in &configs {
+                ftui_runtime::ftui_println!(
+                    "- {:<16} {:<12} {}",
+                    cfg.name,
+                    format!("{:?}", cfg.category),
+                    cfg.command.join(" ")
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|err| CliError::Other(format!("failed to read current directory: {err}")))?;
+    let executable = std::env::current_exe()
+        .map_err(|err| CliError::Other(format!("failed to resolve current executable: {err}")))?;
+    let executable = executable.to_string_lossy().into_owned();
+    let hardware = bench::HardwareInfo::detect();
+
+    let needs_seeded_db = configs.iter().any(|cfg| cfg.requires_seeded_db);
+    let mut bench_env = std::collections::BTreeMap::new();
+    let mut seed_report = None;
+    let mut temp_workspace: Option<tempfile::TempDir> = None;
+    if needs_seeded_db {
+        let workspace = tempfile::tempdir()
+            .map_err(|err| CliError::Other(format!("failed to create temp workspace: {err}")))?;
+        let db_path = workspace.path().join("bench.sqlite3");
+        let storage_root = workspace.path().join("archive");
+        std::fs::create_dir_all(&storage_root).map_err(|err| {
+            CliError::Other(format!("failed to create bench archive root: {err}"))
+        })?;
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_db_sync_with_database_url(&database_url)?;
+        let report = bench::seed_bench_database(&conn, false)
+            .map_err(|err| CliError::Other(format!("benchmark seed failed: {err}")))?;
+        bench_env.insert("DATABASE_URL".to_string(), database_url);
+        bench_env.insert(
+            "STORAGE_ROOT".to_string(),
+            storage_root.to_string_lossy().into_owned(),
+        );
+        seed_report = Some(report);
+        temp_workspace = Some(workspace);
+    }
+
+    let condition_context = bench::BenchConditionContext {
+        stub_encoder_available: cwd.join("scripts/toon_stub_encoder.sh").is_file(),
+        seeded_database_available: needs_seeded_db,
+    };
+    let mut summary = bench::BenchSummary::new(hardware.clone());
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+    for cfg in &configs {
+        cfg.validate().map_err(|err| {
+            CliError::Other(format!("invalid benchmark config '{}': {err}", cfg.name))
+        })?;
+        if !cfg.enabled_for(condition_context) {
+            skipped.push(cfg.name.clone());
+            continue;
+        }
+        let mut command = vec![executable.clone()];
+        command.extend(cfg.command.iter().cloned());
+        let command_display = command.join(" ");
+        let params_json = serde_json::json!({
+            "warmup": cfg.warmup,
+            "runs": cfg.runs,
+            "requires_seeded_db": cfg.requires_seeded_db,
+            "conditional": cfg.conditional,
+        })
+        .to_string();
+        let signature =
+            bench::fixture_signature(&cfg.name, &command_display, &params_json, &hardware);
+        match bench::run_timed(&command, cfg.warmup, cfg.runs, &bench_env, Some(&cwd)) {
+            Ok(timing) => match bench::BenchResult::from_samples(
+                cfg.name.clone(),
+                command_display,
+                &timing.samples_seconds,
+                signature,
+                None,
+            ) {
+                Ok(result) => summary.insert(result),
+                Err(err) => failures.push(BenchRunFailure {
+                    name: cfg.name.clone(),
+                    command: command.join(" "),
+                    error: err.to_string(),
+                }),
+            },
+            Err(err) => failures.push(BenchRunFailure {
+                name: cfg.name.clone(),
+                command: command.join(" "),
+                error: err.to_string(),
+            }),
+        }
+    }
+    if summary.benchmarks.is_empty() {
+        return Err(CliError::Other(
+            "no benchmarks completed successfully; check failure diagnostics".to_string(),
+        ));
+    }
+
+    let baseline_data = if let Some(path) = baseline.as_ref() {
+        Some(
+            bench::load_baseline(path)
+                .map_err(|err| CliError::Other(format!("failed to load baseline: {err}")))?,
+        )
+    } else {
+        None
+    };
+    if let Some(data) = baseline_data.as_ref() {
+        bench::apply_baseline_comparison(
+            &mut summary.benchmarks,
+            data,
+            BENCH_DEFAULT_REGRESSION_THRESHOLD,
+        );
+    }
+    if let Some(path) = save_baseline.as_ref() {
+        bench::save_baseline(&summary.benchmarks, path)
+            .map_err(|err| CliError::Other(format!("failed to save baseline: {err}")))?;
+    }
+
+    let regression_count = summary
+        .benchmarks
+        .values()
+        .filter(|result| result.baseline.regression)
+        .count();
+    let report = BenchRunReport {
+        summary,
+        profile,
+        warmup,
+        runs,
+        filter: filter.clone(),
+        baseline_path: baseline.map(|path| path.to_string_lossy().into_owned()),
+        save_baseline_path: save_baseline.map(|path| path.to_string_lossy().into_owned()),
+        seed_report,
+        skipped,
+        failures,
+        regression_count,
+    };
+
+    let results_dir = PathBuf::from("benches/results");
+    std::fs::create_dir_all(&results_dir)
+        .map_err(|err| CliError::Other(format!("failed to create benches/results: {err}")))?;
+    let report_path = results_dir.join(format!("summary_{}.json", report.summary.timestamp));
+    let encoded = serde_json::to_string_pretty(&report)
+        .map_err(|err| CliError::Other(format!("failed to encode bench report: {err}")))?;
+    std::fs::write(&report_path, &encoded)
+        .map_err(|err| CliError::Other(format!("failed to write bench report: {err}")))?;
+
+    if json {
+        ftui_runtime::ftui_println!("{encoded}");
+    } else {
+        ftui_runtime::ftui_println!(
+            "[bench] profile={:?} warmup={} runs={}",
+            report.profile,
+            report.warmup,
+            report.runs
+        );
+        ftui_runtime::ftui_println!(
+            "{:<18} {:>9} {:>9} {:>9} {:>12}",
+            "Benchmark",
+            "Mean",
+            "P95",
+            "P99",
+            "Baseline Δ"
+        );
+        for result in report.summary.benchmarks.values() {
+            let delta = result
+                .baseline
+                .delta_p95_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:+.2}ms"));
+            ftui_runtime::ftui_println!(
+                "{:<18} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>12}",
+                result.name,
+                result.mean_ms,
+                result.p95_ms,
+                result.p99_ms,
+                delta
+            );
+        }
+        if !report.skipped.is_empty() {
+            ftui_runtime::ftui_println!("skipped: {}", report.skipped.join(", "));
+        }
+        if !report.failures.is_empty() {
+            ftui_runtime::ftui_eprintln!("benchmark failures:");
+            for failure in &report.failures {
+                ftui_runtime::ftui_eprintln!(
+                    "- {} [{}]: {}",
+                    failure.name,
+                    failure.command,
+                    failure.error
+                );
+            }
+        }
+        ftui_runtime::ftui_println!("report: {}", report_path.display());
+    }
+
+    let _ = temp_workspace;
+    if !report.failures.is_empty() {
+        return Err(CliError::ExitCode(
+            bench::BenchExitCode::RuntimeError.code(),
+        ));
+    }
+    if report.regression_count > 0 {
+        return Err(CliError::ExitCode(
+            bench::BenchExitCode::RegressionDetected.code(),
+        ));
+    }
+    Ok(())
+}
+
 /// Handle the `am ci` command: run quality gates with optional flags.
 const fn ci_should_emit_progress(fmt: output::CliOutputFormat) -> bool {
     matches!(fmt, output::CliOutputFormat::Table)
@@ -8363,6 +8727,146 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_bench_with_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "bench",
+            "--quick",
+            "--json",
+            "--baseline",
+            "/tmp/base.json",
+            "--save-baseline",
+            "/tmp/new.json",
+            "--filter",
+            "mail_*",
+            "--warmup",
+            "2",
+            "--runs",
+            "5",
+        ])
+        .expect("failed to parse bench flags");
+        match cli.command {
+            Commands::Bench {
+                quick,
+                json,
+                baseline,
+                save_baseline,
+                filter,
+                list,
+                warmup,
+                runs,
+            } => {
+                assert!(quick);
+                assert!(json);
+                assert_eq!(baseline, Some(PathBuf::from("/tmp/base.json")));
+                assert_eq!(save_baseline, Some(PathBuf::from("/tmp/new.json")));
+                assert_eq!(filter.as_deref(), Some("mail_*"));
+                assert!(!list);
+                assert_eq!(warmup, Some(2));
+                assert_eq!(runs, Some(5));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_bench_list_mode() {
+        let cli = Cli::try_parse_from(["am", "bench", "--list"])
+            .expect("failed to parse bench list mode");
+        match cli.command {
+            Commands::Bench {
+                quick,
+                json,
+                baseline,
+                save_baseline,
+                filter,
+                list,
+                warmup,
+                runs,
+            } => {
+                assert!(!quick);
+                assert!(!json);
+                assert!(baseline.is_none());
+                assert!(save_baseline.is_none());
+                assert!(filter.is_none());
+                assert!(list);
+                assert!(warmup.is_none());
+                assert!(runs.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_bench_list_json_outputs_selected_benchmark_configs() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+        let result = handle_bench(
+            false,
+            true,
+            None,
+            None,
+            Some("help".to_string()),
+            true,
+            None,
+            None,
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "bench --list --json failed: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("valid benchmark list json");
+        let rows = parsed.as_array().expect("benchmark list array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "help");
+        assert_eq!(rows[0]["warmup"], 3);
+        assert_eq!(rows[0]["runs"], 10);
+    }
+
+    #[test]
+    fn handle_bench_quick_mode_uses_default_warmup_runs_and_writes_report() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CwdGuard::chdir(dir.path());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+
+        let result = handle_bench(
+            true,
+            true,
+            None,
+            None,
+            Some("help".to_string()),
+            false,
+            None,
+            None,
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "bench --quick --json failed: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("valid benchmark json");
+        assert_eq!(parsed["warmup"], 1);
+        assert_eq!(parsed["runs"], 3);
+        assert!(parsed["summary"]["benchmarks"]["help"].is_object());
+
+        let report_dir = dir.path().join("benches/results");
+        assert!(
+            report_dir.is_dir(),
+            "missing report dir: {}",
+            report_dir.display()
+        );
+        let report_files = std::fs::read_dir(&report_dir)
+            .expect("read report dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(report_files, 1, "expected one quick bench report file");
     }
 
     #[test]

@@ -4,7 +4,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 
 **Primary Beads:** br-3vwi.12.1, br-3vwi.12.2
 **Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
-**Last Updated:** 2026-02-11
+**Last Updated:** 2026-02-13
 
 ---
 
@@ -328,6 +328,27 @@ Fill one row per phase promotion decision.
 4. Record owner, UTC timestamp, and rationale in the ledger row for the phase transition.
 5. If any threshold fails, mark decision `no-go`, document blocker bead IDs, and do not promote.
 
+### Non-Quick Candidate Cadence (br-3vwi.12.3.3)
+
+Run a **non-quick** gate report at least once every 24 hours during active rollout and within 12 hours before any promotion decision.
+
+```bash
+run_ts="$(date -u +%Y%m%d_%H%M%S)"
+bash scripts/ci.sh --report "tests/artifacts/ci/${run_ts}/case_02_report.json"
+jq '.decision, .release_eligible, .summary' "tests/artifacts/ci/${run_ts}/case_02_report.json"
+```
+
+Latest non-quick artifact snapshot:
+- `tests/artifacts/ci/20260213_031050/case_02_report.json`
+- `decision="no-go"`, `release_eligible=false`, `summary={total:13, pass:4, fail:9, skip:0}`
+
+Owner rotation (weekly, Monday 00:00 UTC handoff):
+| Primary owner | Backup owner | Responsibility |
+|---------------|--------------|----------------|
+| Release owner | CI maintainer | Run non-quick report, update docs with latest artifact path + verdict, record ledger evidence links |
+| CI maintainer | Agent integration lead | Verify report schema/completeness and flag stale artifact age (>24h) |
+| Agent integration lead | On-call operator | Confirm rollout thread + bead updates reference latest artifact before promotion |
+
 | Phase | Decision (`go`/`no-go`) | Owner | UTC timestamp | Rationale | Evidence links |
 |------|--------------------------|-------|---------------|-----------|----------------|
 | Phase 0 -> Phase 1 |  |  |  |  |  |
@@ -335,6 +356,18 @@ Fill one row per phase promotion decision.
 | Phase 2 (25% -> 50%) |  |  |  |  |  |
 | Phase 2 (50% -> 100%) |  |  |  |  |  |
 | Phase 3 (GA confirmation) |  |  |  |  |  |
+
+## Post-Launch Telemetry Feedback Loop (br-3vwi.12.3)
+
+- [x] Latest release-candidate gate artifact is non-quick and stored at `tests/artifacts/ci/20260213_031050/case_02_report.json`
+- [x] Current reference non-quick artifact reviewed: `tests/artifacts/ci/20260213_031050/case_02_report.json` (mode=`full`, reviewed 2026-02-13T03:17Z)
+- [ ] Gate decision is `go` and `release_eligible` is `true`
+- [x] Projected-vs-observed summary is updated in `docs/ROLLOUT_PLAYBOOK.md` Section 9
+- [ ] Follow-up bead set is reviewed and triaged:
+  - `br-3vwi.12.3.1` (SearchScope compile blockers)
+  - `br-3vwi.12.3.2` (clippy rate-limiter lint blockers)
+  - `br-3vwi.12.3.3` (non-quick gate cadence + artifact publication)
+- [ ] Owner and timestamp recorded in the sign-off ledger row for this phase
 
 ---
 
