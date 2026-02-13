@@ -855,9 +855,7 @@ pub async fn register_agent(
             if let Some(mut row) = find_agent_by_name(&raw_rows, name) {
                 row.program = program.to_string();
                 row.model = model.to_string();
-                if let Some(task_desc) = task_description {
-                    row.task_description = task_desc.to_string();
-                }
+                row.task_description = task_description.unwrap_or_default().to_string();
                 row.last_active_ts = now;
                 row.attachments_policy = attach_pol.to_string();
                 match map_sql_outcome(update!(&row).execute(cx, &tracked).await) {
@@ -921,9 +919,7 @@ pub async fn register_agent(
                         };
                         fresh.program = program.to_string();
                         fresh.model = model.to_string();
-                        if let Some(task_desc) = task_description {
-                            fresh.task_description = task_desc.to_string();
-                        }
+                        fresh.task_description = task_description.unwrap_or_default().to_string();
                         fresh.last_active_ts = now;
                         fresh.attachments_policy = attach_pol.to_string();
                         crate::cache::read_cache().put_agent(&fresh);
@@ -5111,7 +5107,7 @@ mod tests {
     }
 
     #[test]
-    fn register_agent_without_task_description_preserves_existing_description() {
+    fn register_agent_without_task_description_clears_existing_description() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
 
@@ -5180,14 +5176,14 @@ mod tests {
             .await
             .into_result()
             .expect("update register agent");
-            assert_eq!(updated.task_description, "keep me");
+            assert_eq!(updated.task_description, "");
             assert_eq!(updated.model, "gpt-5.1");
 
             let fetched = get_agent(&cx, &pool, project_id, "BlueLake")
                 .await
                 .into_result()
                 .expect("get_agent after update");
-            assert_eq!(fetched.task_description, "keep me");
+            assert_eq!(fetched.task_description, "");
             assert_eq!(fetched.model, "gpt-5.1");
         });
     }

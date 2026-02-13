@@ -29,7 +29,7 @@ pub enum HealthLevel {
     Green = 0,
     /// Elevated load. Defer non-critical archive writes, reduce logging.
     Yellow = 1,
-    /// Overload. Reject low-priority tool calls (`health_check`, `whois`).
+    /// Overload. Optionally reject low-priority maintenance tool calls.
     Red = 2,
 }
 
@@ -265,19 +265,12 @@ pub fn level_transitions() -> u8 {
 /// Returns `true` if the named tool is considered low-priority and can
 /// be rejected under Red-level backpressure.
 ///
-/// High-priority tools (`send_message`, `fetch_inbox`, `register_agent`, etc.)
-/// are never shed — they are essential for agent coordination.
+/// Shedding is currently disabled until parity fixtures + long-run behavior
+/// can be validated against real workloads.
 #[must_use]
-pub fn is_shedable_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "health_check"
-            | "whois"
-            | "search_messages"
-            | "summarize_thread"
-            | "install_precommit_guard"
-            | "uninstall_precommit_guard"
-    )
+pub const fn is_shedable_tool(tool_name: &str) -> bool {
+    let _ = tool_name;
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -470,12 +463,12 @@ mod tests {
 
     #[test]
     fn shedable_classification() {
-        assert!(is_shedable_tool("health_check"));
-        assert!(is_shedable_tool("whois"));
-        assert!(is_shedable_tool("search_messages"));
-        assert!(is_shedable_tool("summarize_thread"));
-        assert!(is_shedable_tool("install_precommit_guard"));
-        assert!(is_shedable_tool("uninstall_precommit_guard"));
+        assert!(!is_shedable_tool("health_check"));
+        assert!(!is_shedable_tool("whois"));
+        assert!(!is_shedable_tool("search_messages"));
+        assert!(!is_shedable_tool("summarize_thread"));
+        assert!(!is_shedable_tool("install_precommit_guard"));
+        assert!(!is_shedable_tool("uninstall_precommit_guard"));
         assert!(!is_shedable_tool("send_message"));
         assert!(!is_shedable_tool("fetch_inbox"));
         assert!(!is_shedable_tool("register_agent"));
@@ -836,12 +829,12 @@ mod tests {
     #[test]
     fn shed_decision_matches_tool_categories() {
         let cases = [
-            ("health_check", true),
-            ("whois", true),
-            ("search_messages", true),
-            ("summarize_thread", true),
-            ("install_precommit_guard", true),
-            ("uninstall_precommit_guard", true),
+            ("health_check", false),
+            ("whois", false),
+            ("search_messages", false),
+            ("summarize_thread", false),
+            ("install_precommit_guard", false),
+            ("uninstall_precommit_guard", false),
             ("send_message", false),
             ("fetch_inbox", false),
             ("register_agent", false),
