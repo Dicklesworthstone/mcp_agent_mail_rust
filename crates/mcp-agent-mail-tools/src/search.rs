@@ -843,4 +843,153 @@ mod tests {
         let summary = summarize_messages(&rows);
         assert!(summary.mentions.len() <= 10);
     }
+
+    // -----------------------------------------------------------------------
+    // SearchResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_result_serializes_all_fields() {
+        let result = SearchResult {
+            id: 42,
+            subject: "Test subject".to_string(),
+            importance: "high".to_string(),
+            ack_required: 1,
+            created_ts: Some("2025-01-01T00:00:00Z".to_string()),
+            thread_id: Some("thread-123".to_string()),
+            from: "Alice".to_string(),
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"id\":42"));
+        assert!(json.contains("\"subject\":\"Test subject\""));
+        assert!(json.contains("\"importance\":\"high\""));
+        assert!(json.contains("\"ack_required\":1"));
+        assert!(json.contains("\"thread_id\":\"thread-123\""));
+        assert!(json.contains("\"from\":\"Alice\""));
+    }
+
+    #[test]
+    fn search_result_null_optional_fields() {
+        let result = SearchResult {
+            id: 1,
+            subject: "Test".to_string(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: None,
+            thread_id: None,
+            from: "Bob".to_string(),
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"created_ts\":null"));
+        assert!(json.contains("\"thread_id\":null"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TopMention enum serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn top_mention_name_variant_serializes_as_string() {
+        let mention = TopMention::Name("Alice".to_string());
+        let json = serde_json::to_string(&mention).expect("serialize");
+        assert_eq!(json, "\"Alice\"");
+    }
+
+    #[test]
+    fn top_mention_count_variant_serializes_as_object() {
+        let mention = TopMention::Count(MentionCount {
+            name: "Bob".to_string(),
+            count: 5,
+        });
+        let json = serde_json::to_string(&mention).expect("serialize");
+        assert!(json.contains("\"name\":\"Bob\""));
+        assert!(json.contains("\"count\":5"));
+    }
+
+    #[test]
+    fn top_mention_deserializes_from_string() {
+        let mention: TopMention = serde_json::from_str("\"Charlie\"").expect("deserialize");
+        assert!(matches!(mention, TopMention::Name(name) if name == "Charlie"));
+    }
+
+    #[test]
+    fn top_mention_deserializes_from_object() {
+        let json = r#"{"name":"Dave","count":3}"#;
+        let mention: TopMention = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(mention, TopMention::Count(mc) if mc.name == "Dave" && mc.count == 3));
+    }
+
+    // -----------------------------------------------------------------------
+    // ThreadSummary serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn thread_summary_omits_code_refs_when_none() {
+        let summary = ThreadSummary {
+            participants: vec!["Alice".to_string()],
+            key_points: Vec::new(),
+            action_items: Vec::new(),
+            total_messages: 1,
+            open_actions: 0,
+            done_actions: 0,
+            mentions: Vec::new(),
+            code_references: None,
+        };
+        let json = serde_json::to_string(&summary).expect("serialize");
+        assert!(!json.contains("code_references"));
+    }
+
+    #[test]
+    fn thread_summary_includes_code_refs_when_present() {
+        let summary = ThreadSummary {
+            participants: vec!["Alice".to_string()],
+            key_points: Vec::new(),
+            action_items: Vec::new(),
+            total_messages: 1,
+            open_actions: 0,
+            done_actions: 0,
+            mentions: Vec::new(),
+            code_references: Some(vec!["src/main.rs".to_string()]),
+        };
+        let json = serde_json::to_string(&summary).expect("serialize");
+        assert!(json.contains("\"code_references\""));
+        assert!(json.contains("\"src/main.rs\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_messages: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_handles_whitespace_only_body() {
+        let rows = vec![make_msg("Alice", "   \n\t  \n  ")];
+        let summary = summarize_messages(&rows);
+        assert!(summary.key_points.is_empty());
+        assert!(summary.mentions.is_empty());
+    }
+
+    #[test]
+    fn summarize_handles_very_long_lines() {
+        let long_line = "x".repeat(10000);
+        let rows = vec![make_msg("Alice", &format!("- {long_line}"))];
+        let summary = summarize_messages(&rows);
+        // Should extract the point but may truncate
+        assert!(!summary.key_points.is_empty());
+    }
+
+    #[test]
+    fn summarize_mention_at_start_of_line() {
+        let rows = vec![make_msg("Alice", "@Bob please check this")];
+        let summary = summarize_messages(&rows);
+        assert!(summary.mentions.iter().any(|m| m.name == "Bob"));
+    }
+
+    #[test]
+    fn summarize_mention_not_extracted_from_email() {
+        // Email addresses should not be extracted as mentions
+        let rows = vec![make_msg("Alice", "Contact alice@example.com")];
+        let summary = summarize_messages(&rows);
+        // "example.com" should not be in mentions
+        assert!(!summary.mentions.iter().any(|m| m.name == "example.com"));
+    }
 }

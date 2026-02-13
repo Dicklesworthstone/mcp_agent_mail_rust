@@ -41,6 +41,10 @@ pub struct AccessibilitySettings {
     pub high_contrast: bool,
     /// Show context-sensitive key hints in the status line.
     pub key_hints: bool,
+    /// Reduce/disable motion-heavy UI effects.
+    pub reduced_motion: bool,
+    /// Optimize text surfaces for screen readers.
+    pub screen_reader: bool,
 }
 
 impl Default for AccessibilitySettings {
@@ -48,6 +52,8 @@ impl Default for AccessibilitySettings {
         Self {
             high_contrast: false,
             key_hints: true,
+            reduced_motion: false,
+            screen_reader: false,
         }
     }
 }
@@ -150,6 +156,8 @@ impl TuiPreferences {
             accessibility: AccessibilitySettings {
                 high_contrast: config.tui_high_contrast,
                 key_hints: config.tui_key_hints,
+                reduced_motion: config.tui_reduced_motion,
+                screen_reader: config.tui_screen_reader,
             },
             keymap_profile,
             active_dashboard_preset: config.tui_active_preset.clone(),
@@ -203,6 +211,14 @@ impl TuiPreferences {
             self.accessibility.high_contrast.to_string(),
         );
         map.insert("TUI_KEY_HINTS", self.accessibility.key_hints.to_string());
+        map.insert(
+            "TUI_REDUCED_MOTION",
+            self.accessibility.reduced_motion.to_string(),
+        );
+        map.insert(
+            "TUI_SCREEN_READER",
+            self.accessibility.screen_reader.to_string(),
+        );
         map.insert(
             "TUI_KEYMAP_PROFILE",
             self.keymap_profile.label().to_ascii_lowercase(),
@@ -953,6 +969,8 @@ mod tests {
         let settings = AccessibilitySettings::default();
         assert!(!settings.high_contrast);
         assert!(settings.key_hints);
+        assert!(!settings.reduced_motion);
+        assert!(!settings.screen_reader);
     }
 
     #[test]
@@ -960,11 +978,15 @@ mod tests {
         let config = Config {
             tui_high_contrast: true,
             tui_key_hints: false,
+            tui_reduced_motion: true,
+            tui_screen_reader: true,
             ..Config::default()
         };
         let prefs = TuiPreferences::from_config(&config);
         assert!(prefs.accessibility.high_contrast);
         assert!(!prefs.accessibility.key_hints);
+        assert!(prefs.accessibility.reduced_motion);
+        assert!(prefs.accessibility.screen_reader);
     }
 
     #[test]
@@ -974,6 +996,8 @@ mod tests {
             accessibility: AccessibilitySettings {
                 high_contrast: true,
                 key_hints: false,
+                reduced_motion: true,
+                screen_reader: true,
             },
             ..Default::default()
         };
@@ -989,6 +1013,8 @@ mod tests {
         let prefs = TuiPreferences::from_json(json).unwrap();
         assert!(!prefs.accessibility.high_contrast);
         assert!(prefs.accessibility.key_hints);
+        assert!(!prefs.accessibility.reduced_motion);
+        assert!(!prefs.accessibility.screen_reader);
     }
 
     #[test]
@@ -998,12 +1024,16 @@ mod tests {
             accessibility: AccessibilitySettings {
                 high_contrast: true,
                 key_hints: false,
+                reduced_motion: true,
+                screen_reader: true,
             },
             ..Default::default()
         };
         let map = prefs.to_env_map();
         assert_eq!(map.get("TUI_HIGH_CONTRAST").unwrap(), "true");
         assert_eq!(map.get("TUI_KEY_HINTS").unwrap(), "false");
+        assert_eq!(map.get("TUI_REDUCED_MOTION").unwrap(), "true");
+        assert_eq!(map.get("TUI_SCREEN_READER").unwrap(), "true");
     }
 
     #[test]
@@ -1013,12 +1043,16 @@ mod tests {
             accessibility: AccessibilitySettings {
                 high_contrast: true,
                 key_hints: false,
+                reduced_motion: true,
+                screen_reader: true,
             },
             ..Default::default()
         };
         prefs.reset();
         assert!(!prefs.accessibility.high_contrast);
         assert!(prefs.accessibility.key_hints);
+        assert!(!prefs.accessibility.reduced_motion);
+        assert!(!prefs.accessibility.screen_reader);
     }
 
     // ── KeymapProfile persistence tests ──────────────────────────

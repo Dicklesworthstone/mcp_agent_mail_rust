@@ -832,6 +832,99 @@ impl<'a> TwoTierSearchIter<'a> {
             fast_results: None,
         }
     }
+
+    fn build_refined_results(&self, query_vec: &[f32]) -> Vec<ScoredResult> {
+        let Some(fast_results) = self.fast_results.as_ref() else {
+            // If no fast candidates are available, fall back to full quality search.
+            return self.searcher.index.search_quality(query_vec, self.k);
+        };
+
+        if fast_results.is_empty() {
+            return Vec::new();
+        }
+
+        let refinement_limit = self
+            .searcher
+            .config
+            .max_refinement_docs
+            .min(fast_results.len());
+
+        // Explicitly allow turning off refinement while still returning fast results.
+        if refinement_limit == 0 {
+            let mut passthrough = fast_results.clone();
+            passthrough.truncate(self.k);
+            return passthrough;
+        }
+
+        let candidates: Vec<usize> = fast_results
+            .iter()
+            .take(refinement_limit)
+            .map(|sr| sr.idx)
+            .collect();
+
+        let quality_scores = self
+            .searcher
+            .index
+            .quality_scores_for_indices(query_vec, &candidates);
+
+        // Blend scores, but only for docs with quality embeddings.
+        // Docs without quality use fast score only.
+        let weight = self.searcher.config.quality_weight;
+        let mut blended: Vec<ScoredResult> = fast_results
+            .iter()
+            .take(refinement_limit)
+            .zip(quality_scores.iter())
+            .map(|(fast, &quality)| {
+                // Check if this doc has a real quality embedding
+                let effective_weight = if self.searcher.index.has_quality(fast.idx) {
+                    weight
+                } else {
+                    // No quality embedding: use fast score only
+                    0.0
+                };
+                ScoredResult {
+                    idx: fast.idx,
+                    doc_id: fast.doc_id,
+                    doc_kind: fast.doc_kind,
+                    project_id: fast.project_id,
+                    score: (1.0 - effective_weight).mul_add(fast.score, effective_weight * quality),
+                }
+            })
+            .collect();
+
+        // Leave documents outside the refinement budget untouched.
+        blended.extend(fast_results.iter().skip(refinement_limit).cloned());
+
+        // Re-sort by blended score.
+        blended.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        blended.truncate(self.k);
+        blended
+    }
+
+    fn run_refinement_phase(&self) -> SearchPhase {
+        let Some(quality_embedder) = &self.searcher.quality_embedder else {
+            return SearchPhase::RefinementFailed {
+                error: "quality embedder unavailable".to_string(),
+            };
+        };
+
+        let start = Instant::now();
+
+        match quality_embedder.embed(&self.query) {
+            Ok(query_vec) => {
+                let results = self.build_refined_results(&query_vec);
+                #[allow(clippy::cast_possible_truncation)]
+                let latency_ms = start.elapsed().as_millis() as u64;
+                SearchPhase::Refined {
+                    results,
+                    latency_ms,
+                }
+            }
+            Err(e) => SearchPhase::RefinementFailed {
+                error: e.to_string(),
+            },
+        }
+    }
 }
 
 impl Iterator for TwoTierSearchIter<'_> {
@@ -854,6 +947,16 @@ impl Iterator for TwoTierSearchIter<'_> {
                         // If fast-only mode, skip refinement
                         if self.searcher.config.fast_only {
                             self.phase = 2;
+                            return Some(SearchPhase::Initial {
+                                results,
+                                latency_ms,
+                            });
+                        }
+
+                        // In quality-only mode, do not emit initial results.
+                        if self.searcher.config.quality_only {
+                            self.phase = 2;
+                            return Some(self.run_refinement_phase());
                         }
 
                         Some(SearchPhase::Initial {
@@ -863,6 +966,12 @@ impl Iterator for TwoTierSearchIter<'_> {
                     }
                     Err(e) => {
                         warn!(error = %e, "Fast embedding failed");
+
+                        if self.searcher.config.quality_only {
+                            self.phase = 2;
+                            return Some(self.run_refinement_phase());
+                        }
+
                         self.phase = 2;
                         None
                     }
@@ -871,79 +980,7 @@ impl Iterator for TwoTierSearchIter<'_> {
             1 => {
                 // Phase 2: Quality refinement
                 self.phase = 2;
-
-                let Some(quality_embedder) = &self.searcher.quality_embedder else {
-                    return Some(SearchPhase::RefinementFailed {
-                        error: "quality embedder unavailable".to_string(),
-                    });
-                };
-
-                let start = Instant::now();
-
-                match quality_embedder.embed(&self.query) {
-                    Ok(query_vec) => {
-                        // Get candidate indices from fast results
-                        let candidates: Vec<usize> = self
-                            .fast_results
-                            .as_ref()
-                            .map(|r| r.iter().map(|sr| sr.idx).collect())
-                            .unwrap_or_default();
-
-                        // If we have fast results, blend scores; otherwise full quality search
-                        let results = if candidates.is_empty() {
-                            self.searcher.index.search_quality(&query_vec, self.k)
-                        } else {
-                            let fast_results = self.fast_results.as_ref().unwrap();
-                            let quality_scores = self
-                                .searcher
-                                .index
-                                .quality_scores_for_indices(&query_vec, &candidates);
-
-                            // Blend scores, but only for docs with quality embeddings.
-                            // Docs without quality use fast score only.
-                            let weight = self.searcher.config.quality_weight;
-                            let mut blended: Vec<ScoredResult> = fast_results
-                                .iter()
-                                .zip(quality_scores.iter())
-                                .map(|(fast, &quality)| {
-                                    // Check if this doc has a real quality embedding
-                                    let effective_weight =
-                                        if self.searcher.index.has_quality(fast.idx) {
-                                            weight
-                                        } else {
-                                            // No quality embedding: use fast score only
-                                            0.0
-                                        };
-                                    ScoredResult {
-                                        idx: fast.idx,
-                                        doc_id: fast.doc_id,
-                                        doc_kind: fast.doc_kind,
-                                        project_id: fast.project_id,
-                                        score: (1.0 - effective_weight)
-                                            .mul_add(fast.score, effective_weight * quality),
-                                    }
-                                })
-                                .collect();
-
-                            // Re-sort by blended score
-                            blended.sort_by(|a, b| {
-                                b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)
-                            });
-                            blended.truncate(self.k);
-                            blended
-                        };
-
-                        #[allow(clippy::cast_possible_truncation)]
-                        let latency_ms = start.elapsed().as_millis() as u64;
-                        Some(SearchPhase::Refined {
-                            results,
-                            latency_ms,
-                        })
-                    }
-                    Err(e) => Some(SearchPhase::RefinementFailed {
-                        error: e.to_string(),
-                    }),
-                }
+                Some(self.run_refinement_phase())
             }
             _ => None,
         }
@@ -957,6 +994,7 @@ impl Iterator for TwoTierSearchIter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[allow(clippy::cast_precision_loss)]
     fn make_test_entries(count: usize, config: &TwoTierConfig) -> Vec<TwoTierEntry> {
@@ -974,6 +1012,54 @@ mod tests {
                 has_quality: true,
             })
             .collect()
+    }
+
+    struct StubEmbedder {
+        embedder_id: &'static str,
+        vector: Vec<f32>,
+    }
+
+    impl StubEmbedder {
+        fn new(embedder_id: &'static str, vector: Vec<f32>) -> Self {
+            Self {
+                embedder_id,
+                vector,
+            }
+        }
+    }
+
+    impl TwoTierEmbedder for StubEmbedder {
+        fn embed(&self, _text: &str) -> SearchResult<Vec<f32>> {
+            Ok(self.vector.clone())
+        }
+
+        fn dimension(&self) -> usize {
+            self.vector.len()
+        }
+
+        fn id(&self) -> &str {
+            self.embedder_id
+        }
+    }
+
+    fn axis_f16_embedding(value: f32, dim: usize) -> Vec<f16> {
+        let mut embedding = vec![f16::from_f32(0.0); dim];
+        if let Some(first) = embedding.first_mut() {
+            *first = f16::from_f32(value);
+        }
+        embedding
+    }
+
+    fn axis_query(dim: usize) -> Vec<f32> {
+        let mut query = vec![0.0; dim];
+        if let Some(first) = query.first_mut() {
+            *first = 1.0;
+        }
+        query
+    }
+
+    fn doc_ids(results: &[ScoredResult]) -> Vec<u64> {
+        results.iter().map(|hit| hit.doc_id).collect()
     }
 
     #[test]
@@ -1197,6 +1283,52 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_zero_quality_coverage() {
+        let config = TwoTierConfig::default();
+        let mut index = TwoTierIndex::new(&config);
+
+        for i in 0..10_u64 {
+            index
+                .add_entry(TwoTierEntry {
+                    doc_id: i,
+                    doc_kind: crate::document::DocKind::Message,
+                    project_id: Some(1),
+                    fast_embedding: vec![f16::from_f32(0.1 * i as f32); config.fast_dimension],
+                    quality_embedding: vec![f16::from_f32(0.0); config.quality_dimension],
+                    has_quality: false,
+                })
+                .expect("entry insertion should succeed");
+        }
+
+        assert!((index.quality_coverage() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_full_quality_coverage() {
+        let config = TwoTierConfig::default();
+        let mut index = TwoTierIndex::new(&config);
+
+        for i in 0..10_u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let value = 0.1 * (i + 1) as f32;
+            index
+                .add_entry(TwoTierEntry {
+                    doc_id: i,
+                    doc_kind: crate::document::DocKind::Message,
+                    project_id: Some(1),
+                    fast_embedding: vec![f16::from_f32(value); config.fast_dimension],
+                    quality_embedding: vec![f16::from_f32(value); config.quality_dimension],
+                    has_quality: true,
+                })
+                .expect("entry insertion should succeed");
+        }
+
+        assert!((index.quality_coverage() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
     fn test_zero_vector_detection() {
         let config = TwoTierConfig::default();
         let mut index = TwoTierIndex::new(&config);
@@ -1248,5 +1380,166 @@ mod tests {
 
         // After migration: correctly marked
         assert!(!index.has_quality(0));
+    }
+
+    #[test]
+    fn test_quality_only_search_emits_refined_phase_first() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            quality_only: true,
+            ..TwoTierConfig::default()
+        };
+
+        let entries = vec![
+            TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(2.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(2.0, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 2,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(1.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(1.0, config.quality_dimension),
+                has_quality: true,
+            },
+        ];
+
+        let index = TwoTierIndex::build("fast", "quality", &config, entries).unwrap();
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 2).collect();
+        assert_eq!(phases.len(), 1);
+        assert!(matches!(phases[0], SearchPhase::Refined { .. }));
+    }
+
+    #[test]
+    fn test_max_refinement_docs_zero_returns_fast_results_unchanged() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            quality_weight: 1.0,
+            max_refinement_docs: 0,
+            ..TwoTierConfig::default()
+        };
+
+        let entries = vec![
+            TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(3.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(1.0, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 2,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(2.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(2.0, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 3,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(1.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(3.0, config.quality_dimension),
+                has_quality: true,
+            },
+        ];
+
+        let index = TwoTierIndex::build("fast", "quality", &config, entries).unwrap();
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 3).collect();
+        assert_eq!(phases.len(), 2);
+        assert!(matches!(phases[0], SearchPhase::Initial { .. }));
+        assert!(matches!(phases[1], SearchPhase::Refined { .. }));
+        let initial_ids = if let SearchPhase::Initial { results, .. } = &phases[0] {
+            doc_ids(results)
+        } else {
+            Vec::new()
+        };
+        let refined_ids = if let SearchPhase::Refined { results, .. } = &phases[1] {
+            doc_ids(results)
+        } else {
+            Vec::new()
+        };
+        assert_eq!(refined_ids, initial_ids);
+    }
+
+    #[test]
+    fn test_max_refinement_docs_limits_refinement_scope() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            quality_weight: 1.0,
+            max_refinement_docs: 1,
+            ..TwoTierConfig::default()
+        };
+
+        let entries = vec![
+            TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(3.0, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(0.1, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 2,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(0.2, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(200.0, config.quality_dimension),
+                has_quality: true,
+            },
+            TwoTierEntry {
+                doc_id: 3,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: axis_f16_embedding(0.05, config.fast_dimension),
+                quality_embedding: axis_f16_embedding(300.0, config.quality_dimension),
+                has_quality: true,
+            },
+        ];
+
+        let index = TwoTierIndex::build("fast", "quality", &config, entries).unwrap();
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 3).collect();
+        assert_eq!(phases.len(), 2);
+        assert!(matches!(phases[1], SearchPhase::Refined { .. }));
+        let refined_ids = if let SearchPhase::Refined { results, .. } = &phases[1] {
+            doc_ids(results)
+        } else {
+            Vec::new()
+        };
+
+        // With refinement capped to 1 candidate, doc 3 must not jump to rank 1.
+        assert_eq!(refined_ids[0], 2);
     }
 }

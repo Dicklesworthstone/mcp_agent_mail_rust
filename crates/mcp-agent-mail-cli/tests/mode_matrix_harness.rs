@@ -128,6 +128,9 @@ fn digest(s: &str) -> String {
 const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["serve-http", "--help"],
     &["serve-stdio", "--help"],
+    &["check-inbox", "--help"],
+    &["ci", "--help"],
+    &["e2e", "--help"],
     &["share", "--help"],
     &["archive", "--help"],
     &["guard", "--help"],
@@ -151,6 +154,8 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["file_reservations", "--help"],
     &["setup", "--help"],
     &["golden", "--help"],
+    &["flake-triage", "--help"],
+    &["robot", "--help"],
 ];
 
 /// Commands that MCP binary should deny (exit code 2).
@@ -158,6 +163,9 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["share"],
     &["archive"],
     &["guard"],
+    &["check-inbox"],
+    &["ci"],
+    &["e2e"],
     &["acks"],
     &["migrate"],
     &["list-projects"],
@@ -175,6 +183,8 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["beads"],
     &["setup"],
     &["golden"],
+    &["flake-triage"],
+    &["robot"],
 ];
 
 /// Commands that MCP binary should allow (not deny).

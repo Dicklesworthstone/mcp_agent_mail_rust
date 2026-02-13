@@ -6,8 +6,11 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use chrono::Utc;
+use mcp_agent_mail_db::sqlmodel::Value;
+use mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -22,6 +25,20 @@ pub const DEFAULT_RUNS: u32 = 10;
 pub const QUICK_WARMUP: u32 = 1;
 /// Measured iterations for `--quick`.
 pub const QUICK_RUNS: u32 = 3;
+/// Human key used by operational benchmark fixtures.
+pub const BENCH_PROJECT_HUMAN_KEY: &str = "/tmp/bench";
+/// Deterministic slug used for operational benchmark fixtures.
+pub const BENCH_PROJECT_SLUG: &str = "tmp-bench";
+/// Primary benchmark sender agent.
+pub const BENCH_AGENT_BLUE: &str = "BlueLake";
+/// Secondary benchmark sender/recipient agent.
+pub const BENCH_AGENT_RED: &str = "RedFox";
+/// Number of `BlueLake -> RedFox` seed messages.
+pub const BENCH_SEED_FORWARD_MESSAGES: u32 = 50;
+/// Number of `RedFox -> BlueLake` reply seed messages.
+pub const BENCH_SEED_REPLY_MESSAGES: u32 = 10;
+/// Total number of seed messages for operational benchmarks.
+pub const BENCH_SEED_TOTAL_MESSAGES: u32 = BENCH_SEED_FORWARD_MESSAGES + BENCH_SEED_REPLY_MESSAGES;
 
 fn default_warmup() -> u32 {
     DEFAULT_WARMUP
@@ -230,20 +247,20 @@ const CMD_MAIL_INBOX: &[&str] = &[
     "mail",
     "inbox",
     "--project",
-    "/tmp/bench",
+    BENCH_PROJECT_HUMAN_KEY,
     "--agent",
-    "BlueLake",
+    BENCH_AGENT_BLUE,
     "--json",
 ];
 const CMD_MAIL_SEND: &[&str] = &[
     "mail",
     "send",
     "--project",
-    "/tmp/bench",
+    BENCH_PROJECT_HUMAN_KEY,
     "--from",
-    "BlueLake",
+    BENCH_AGENT_BLUE,
     "--to",
-    "RedFox",
+    BENCH_AGENT_RED,
     "--subject",
     "bench",
     "--body",
@@ -254,14 +271,348 @@ const CMD_MAIL_SEARCH: &[&str] = &[
     "mail",
     "search",
     "--project",
-    "/tmp/bench",
+    BENCH_PROJECT_HUMAN_KEY,
     "--json",
     "bench",
 ];
-const CMD_THREADS_LIST: &[&str] = &["mail", "threads", "--project", "/tmp/bench", "--json"];
+const CMD_THREADS_LIST: &[&str] = &[
+    "mail",
+    "threads",
+    "--project",
+    BENCH_PROJECT_HUMAN_KEY,
+    "--json",
+];
 const CMD_DOCTOR_CHECK: &[&str] = &["doctor", "check", "--json"];
-const CMD_MESSAGE_COUNT: &[&str] = &["mail", "count", "--project", "/tmp/bench", "--json"];
-const CMD_AGENTS_LIST: &[&str] = &["agents", "list", "--project", "/tmp/bench", "--json"];
+const CMD_MESSAGE_COUNT: &[&str] = &[
+    "mail",
+    "count",
+    "--project",
+    BENCH_PROJECT_HUMAN_KEY,
+    "--json",
+];
+const CMD_AGENTS_LIST: &[&str] = &[
+    "agents",
+    "list",
+    "--project",
+    BENCH_PROJECT_HUMAN_KEY,
+    "--json",
+];
+
+/// Errors emitted by native benchmark fixture seeding.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum BenchSeedError {
+    #[error("database error while {context}: {message}")]
+    Database {
+        context: &'static str,
+        message: String,
+    },
+    #[error("expected row missing: {0}")]
+    MissingRow(&'static str),
+}
+
+/// Structured diagnostics for benchmark fixture seeding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BenchSeedReport {
+    pub project_id: i64,
+    pub skipped: bool,
+    pub reseeded: bool,
+    pub existing_messages: u32,
+    pub inserted_agents: u32,
+    pub inserted_messages: u32,
+    pub elapsed_us: i64,
+}
+
+fn db_error(context: &'static str, err: impl std::fmt::Display) -> BenchSeedError {
+    BenchSeedError::Database {
+        context,
+        message: err.to_string(),
+    }
+}
+
+fn select_project_id(conn: &SqliteConnection) -> Result<Option<i64>, BenchSeedError> {
+    let rows = conn
+        .query_sync(
+            "SELECT id FROM projects WHERE human_key = ? ORDER BY id ASC LIMIT 1",
+            &[Value::Text(BENCH_PROJECT_HUMAN_KEY.to_string())],
+        )
+        .map_err(|e| db_error("selecting benchmark project", e))?;
+    Ok(rows.first().and_then(|row| row.get_named("id").ok()))
+}
+
+fn select_agent_id(
+    conn: &SqliteConnection,
+    project_id: i64,
+    agent_name: &str,
+) -> Result<Option<i64>, BenchSeedError> {
+    let rows = conn
+        .query_sync(
+            "SELECT id FROM agents WHERE project_id = ? AND name = ? LIMIT 1",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(agent_name.to_string()),
+            ],
+        )
+        .map_err(|e| db_error("selecting benchmark agent", e))?;
+    Ok(rows.first().and_then(|row| row.get_named("id").ok()))
+}
+
+fn count_project_messages(conn: &SqliteConnection, project_id: i64) -> Result<i64, BenchSeedError> {
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS count FROM messages WHERE project_id = ?",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| db_error("counting benchmark messages", e))?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get_named("count").ok())
+        .unwrap_or(0))
+}
+
+fn ensure_project(conn: &SqliteConnection, now_us: i64) -> Result<i64, BenchSeedError> {
+    if let Some(project_id) = select_project_id(conn)? {
+        return Ok(project_id);
+    }
+
+    conn.execute_sync(
+        "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+        &[
+            Value::Text(BENCH_PROJECT_SLUG.to_string()),
+            Value::Text(BENCH_PROJECT_HUMAN_KEY.to_string()),
+            Value::BigInt(now_us),
+        ],
+    )
+    .map_err(|e| db_error("creating benchmark project", e))?;
+    select_project_id(conn)?.ok_or(BenchSeedError::MissingRow("project"))
+}
+
+fn purge_project_rows(conn: &SqliteConnection, project_id: i64) -> Result<(), BenchSeedError> {
+    conn.execute_sync(
+        "DELETE FROM message_recipients \
+         WHERE message_id IN (SELECT id FROM messages WHERE project_id = ?)",
+        &[Value::BigInt(project_id)],
+    )
+    .map_err(|e| db_error("deleting benchmark message recipients", e))?;
+    conn.execute_sync(
+        "DELETE FROM messages WHERE project_id = ?",
+        &[Value::BigInt(project_id)],
+    )
+    .map_err(|e| db_error("deleting benchmark messages", e))?;
+    conn.execute_sync(
+        "DELETE FROM file_reservations WHERE project_id = ?",
+        &[Value::BigInt(project_id)],
+    )
+    .map_err(|e| db_error("deleting benchmark file reservations", e))?;
+    conn.execute_sync(
+        "DELETE FROM agent_links \
+         WHERE a_project_id = ? OR b_project_id = ? \
+         OR a_agent_id IN (SELECT id FROM agents WHERE project_id = ?) \
+         OR b_agent_id IN (SELECT id FROM agents WHERE project_id = ?)",
+        &[
+            Value::BigInt(project_id),
+            Value::BigInt(project_id),
+            Value::BigInt(project_id),
+            Value::BigInt(project_id),
+        ],
+    )
+    .map_err(|e| db_error("deleting benchmark agent links", e))?;
+    conn.execute_sync(
+        "DELETE FROM product_project_links WHERE project_id = ?",
+        &[Value::BigInt(project_id)],
+    )
+    .map_err(|e| db_error("deleting benchmark product links", e))?;
+    conn.execute_sync(
+        "DELETE FROM project_sibling_suggestions WHERE project_a_id = ? OR project_b_id = ?",
+        &[Value::BigInt(project_id), Value::BigInt(project_id)],
+    )
+    .map_err(|e| db_error("deleting benchmark sibling suggestions", e))?;
+    conn.execute_sync(
+        "DELETE FROM agents WHERE project_id = ?",
+        &[Value::BigInt(project_id)],
+    )
+    .map_err(|e| db_error("deleting benchmark agents", e))?;
+    Ok(())
+}
+
+fn insert_agent(
+    conn: &SqliteConnection,
+    project_id: i64,
+    agent_name: &str,
+    now_us: i64,
+) -> Result<i64, BenchSeedError> {
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO agents (\
+            project_id, name, program, model, task_description, inception_ts, \
+            last_active_ts, attachments_policy, contact_policy\
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            Value::BigInt(project_id),
+            Value::Text(agent_name.to_string()),
+            Value::Text("bench".to_string()),
+            Value::Text("bench".to_string()),
+            Value::Text("benchmark fixture".to_string()),
+            Value::BigInt(now_us),
+            Value::BigInt(now_us),
+            Value::Text("auto".to_string()),
+            Value::Text("auto".to_string()),
+        ],
+    )
+    .map_err(|e| db_error("inserting benchmark agent", e))?;
+    select_agent_id(conn, project_id, agent_name)?
+        .ok_or(BenchSeedError::MissingRow("agent after insert"))
+}
+
+fn insert_message(
+    conn: &SqliteConnection,
+    project_id: i64,
+    sender_id: i64,
+    recipient_id: i64,
+    subject: &str,
+    body_md: &str,
+    created_ts: i64,
+) -> Result<(), BenchSeedError> {
+    conn.execute_sync(
+        "INSERT INTO messages (\
+            project_id, sender_id, thread_id, subject, body_md, importance, \
+            ack_required, created_ts, attachments\
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            Value::BigInt(project_id),
+            Value::BigInt(sender_id),
+            Value::Null,
+            Value::Text(subject.to_string()),
+            Value::Text(body_md.to_string()),
+            Value::Text("normal".to_string()),
+            Value::BigInt(0),
+            Value::BigInt(created_ts),
+            Value::Text("[]".to_string()),
+        ],
+    )
+    .map_err(|e| db_error("inserting benchmark message", e))?;
+
+    let message_id = conn
+        .query_sync("SELECT last_insert_rowid() AS id", &[])
+        .map_err(|e| db_error("reading inserted benchmark message id", e))?
+        .first()
+        .and_then(|row| row.get_named("id").ok())
+        .ok_or(BenchSeedError::MissingRow(
+            "message id after benchmark insert",
+        ))?;
+
+    conn.execute_sync(
+        "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
+        &[
+            Value::BigInt(message_id),
+            Value::BigInt(recipient_id),
+            Value::Text("to".to_string()),
+        ],
+    )
+    .map_err(|e| db_error("inserting benchmark message recipient", e))?;
+
+    Ok(())
+}
+
+/// Seed the benchmark fixture dataset directly through native SQLite writes.
+///
+/// This removes the benchmark setup bottleneck caused by repeatedly spawning
+/// CLI subprocesses for project/agent/message creation.
+pub fn seed_bench_database(
+    conn: &SqliteConnection,
+    reseed: bool,
+) -> Result<BenchSeedReport, BenchSeedError> {
+    let started = Instant::now();
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        .map_err(|e| db_error("initializing schema for benchmark seed", e))?;
+    conn.execute_raw("BEGIN IMMEDIATE")
+        .map_err(|e| db_error("starting benchmark seed transaction", e))?;
+
+    let seed_result = (|| {
+        let now_us = mcp_agent_mail_db::timestamps::now_micros();
+        let project_id = ensure_project(conn, now_us)?;
+        let existing_messages = count_project_messages(conn, project_id)?;
+        let existing_messages_u32 = u32::try_from(existing_messages).unwrap_or(u32::MAX);
+
+        if existing_messages > 0 && !reseed {
+            return Ok(BenchSeedReport {
+                project_id,
+                skipped: true,
+                reseeded: false,
+                existing_messages: existing_messages_u32,
+                inserted_agents: 0,
+                inserted_messages: 0,
+                elapsed_us: 0,
+            });
+        }
+
+        purge_project_rows(conn, project_id)?;
+        let blue_id = insert_agent(conn, project_id, BENCH_AGENT_BLUE, now_us)?;
+        let red_id = insert_agent(conn, project_id, BENCH_AGENT_RED, now_us)?;
+
+        let mut inserted_messages = 0_u32;
+
+        insert_message(
+            conn,
+            project_id,
+            blue_id,
+            red_id,
+            "seed-0",
+            "initial seed",
+            now_us,
+        )?;
+        inserted_messages += 1;
+
+        for idx in 1..BENCH_SEED_FORWARD_MESSAGES {
+            let offset = i64::from(idx);
+            insert_message(
+                conn,
+                project_id,
+                blue_id,
+                red_id,
+                &format!("bench message {idx}"),
+                &format!("body of message {idx} for benchmarking"),
+                now_us + offset,
+            )?;
+            inserted_messages += 1;
+        }
+
+        for reply in 1..=BENCH_SEED_REPLY_MESSAGES {
+            let offset = i64::from(BENCH_SEED_FORWARD_MESSAGES + reply);
+            insert_message(
+                conn,
+                project_id,
+                red_id,
+                blue_id,
+                &format!("reply {reply}"),
+                &format!("reply body {reply}"),
+                now_us + offset,
+            )?;
+            inserted_messages += 1;
+        }
+
+        Ok(BenchSeedReport {
+            project_id,
+            skipped: false,
+            reseeded: reseed,
+            existing_messages: existing_messages_u32,
+            inserted_agents: 2,
+            inserted_messages,
+            elapsed_us: 0,
+        })
+    })();
+
+    match seed_result {
+        Ok(mut report) => {
+            conn.execute_raw("COMMIT")
+                .map_err(|e| db_error("committing benchmark seed transaction", e))?;
+            report.elapsed_us = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
+            Ok(report)
+        }
+        Err(err) => {
+            let _ = conn.execute_raw("ROLLBACK");
+            Err(err)
+        }
+    }
+}
 
 /// Built-in benchmark catalog, aligned to the existing benchmark script.
 pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
@@ -581,6 +932,14 @@ pub fn fixture_signature(
 mod tests {
     use super::*;
 
+    fn count_with_params(conn: &SqliteConnection, sql: &str, params: &[Value]) -> i64 {
+        conn.query_sync(sql, params)
+            .expect("query")
+            .first()
+            .and_then(|row| row.get_named("count").ok())
+            .unwrap_or(0)
+    }
+
     fn test_hw() -> HardwareInfo {
         HardwareInfo {
             hostname: "h1".to_string(),
@@ -705,5 +1064,156 @@ mod tests {
             stub_encoder_available: false,
             seeded_database_available: true,
         }));
+    }
+
+    #[test]
+    fn seed_bench_database_populates_expected_fixture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bench-seed.sqlite3");
+        let conn =
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite db");
+
+        let report = seed_bench_database(&conn, false).expect("seed benchmark db");
+        assert!(!report.skipped);
+        assert_eq!(report.inserted_agents, 2);
+        assert_eq!(report.inserted_messages, BENCH_SEED_TOTAL_MESSAGES);
+        assert!(report.elapsed_us >= 0);
+
+        let blue_messages = count_with_params(
+            &conn,
+            "SELECT COUNT(*) AS count \
+             FROM messages m \
+             JOIN agents a ON a.id = m.sender_id \
+             WHERE m.project_id = ? AND a.name = ?",
+            &[
+                Value::BigInt(report.project_id),
+                Value::Text(BENCH_AGENT_BLUE.to_string()),
+            ],
+        );
+        let red_messages = count_with_params(
+            &conn,
+            "SELECT COUNT(*) AS count \
+             FROM messages m \
+             JOIN agents a ON a.id = m.sender_id \
+             WHERE m.project_id = ? AND a.name = ?",
+            &[
+                Value::BigInt(report.project_id),
+                Value::Text(BENCH_AGENT_RED.to_string()),
+            ],
+        );
+        let recipient_rows = count_with_params(
+            &conn,
+            "SELECT COUNT(*) AS count \
+             FROM message_recipients mr \
+             JOIN messages m ON m.id = mr.message_id \
+             WHERE m.project_id = ?",
+            &[Value::BigInt(report.project_id)],
+        );
+
+        assert_eq!(blue_messages, i64::from(BENCH_SEED_FORWARD_MESSAGES));
+        assert_eq!(red_messages, i64::from(BENCH_SEED_REPLY_MESSAGES));
+        assert_eq!(recipient_rows, i64::from(BENCH_SEED_TOTAL_MESSAGES));
+    }
+
+    #[test]
+    fn seed_bench_database_is_idempotent_without_reseed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bench-idempotent.sqlite3");
+        let conn =
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite db");
+
+        let first = seed_bench_database(&conn, false).expect("first seed");
+        assert!(!first.skipped);
+
+        let second = seed_bench_database(&conn, false).expect("second seed");
+        assert!(second.skipped);
+        assert_eq!(second.inserted_agents, 0);
+        assert_eq!(second.inserted_messages, 0);
+        assert_eq!(second.existing_messages, BENCH_SEED_TOTAL_MESSAGES);
+
+        let total_messages = count_with_params(
+            &conn,
+            "SELECT COUNT(*) AS count FROM messages WHERE project_id = ?",
+            &[Value::BigInt(first.project_id)],
+        );
+        assert_eq!(total_messages, i64::from(BENCH_SEED_TOTAL_MESSAGES));
+    }
+
+    #[test]
+    fn seed_bench_database_reseed_rebuilds_fixture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bench-reseed.sqlite3");
+        let conn =
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite db");
+
+        let initial = seed_bench_database(&conn, false).expect("initial seed");
+        let blue_id = select_agent_id(&conn, initial.project_id, BENCH_AGENT_BLUE)
+            .expect("select blue")
+            .expect("blue exists");
+        let red_id = select_agent_id(&conn, initial.project_id, BENCH_AGENT_RED)
+            .expect("select red")
+            .expect("red exists");
+
+        insert_message(
+            &conn,
+            initial.project_id,
+            blue_id,
+            red_id,
+            "extra message",
+            "extra body",
+            mcp_agent_mail_db::timestamps::now_micros(),
+        )
+        .expect("insert extra message");
+
+        let pre_reseed_total = count_with_params(
+            &conn,
+            "SELECT COUNT(*) AS count FROM messages WHERE project_id = ?",
+            &[Value::BigInt(initial.project_id)],
+        );
+        assert_eq!(pre_reseed_total, i64::from(BENCH_SEED_TOTAL_MESSAGES) + 1);
+
+        let reseeded = seed_bench_database(&conn, true).expect("reseed");
+        assert!(!reseeded.skipped);
+        assert!(reseeded.reseeded);
+        assert_eq!(reseeded.inserted_messages, BENCH_SEED_TOTAL_MESSAGES);
+
+        let final_total = count_with_params(
+            &conn,
+            "SELECT COUNT(*) AS count FROM messages WHERE project_id = ?",
+            &[Value::BigInt(initial.project_id)],
+        );
+        assert_eq!(final_total, i64::from(BENCH_SEED_TOTAL_MESSAGES));
+    }
+
+    #[test]
+    fn seed_bench_database_reuses_existing_human_key_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bench-existing-project.sqlite3");
+        let conn =
+            SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+            .expect("init schema");
+
+        let now_us = mcp_agent_mail_db::timestamps::now_micros();
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("legacy-bench-slug".to_string()),
+                Value::Text(BENCH_PROJECT_HUMAN_KEY.to_string()),
+                Value::BigInt(now_us),
+            ],
+        )
+        .expect("insert existing benchmark project");
+
+        let report = seed_bench_database(&conn, false).expect("seed benchmark db");
+        let duplicate_projects = count_with_params(
+            &conn,
+            "SELECT COUNT(*) AS count FROM projects WHERE human_key = ?",
+            &[Value::Text(BENCH_PROJECT_HUMAN_KEY.to_string())],
+        );
+
+        assert_eq!(duplicate_projects, 1);
+        assert!(!report.skipped);
+        assert_eq!(report.inserted_messages, BENCH_SEED_TOTAL_MESSAGES);
     }
 }

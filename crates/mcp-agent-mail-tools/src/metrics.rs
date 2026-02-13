@@ -727,4 +727,165 @@ mod tests {
         assert!(lat.get("p99_ms").is_some());
         assert!(lat.get("is_slow").is_some());
     }
+
+    #[test]
+    fn reset_tool_metrics_clears_all_counters() {
+        let _guard = METRICS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_tool_metrics();
+
+        // Record some calls and errors.
+        let idx = tool_index("list_contacts").unwrap();
+        record_call_idx(idx);
+        record_call_idx(idx);
+        record_error_idx(idx);
+        record_latency_idx(idx, 1_000);
+
+        // Verify they were recorded.
+        let snap1 = tool_metrics_snapshot();
+        let lc = snap1.iter().find(|e| e.name == "list_contacts").unwrap();
+        assert_eq!(lc.calls, 2);
+        assert_eq!(lc.errors, 1);
+        assert!(lc.latency.is_some());
+
+        // Reset all metrics.
+        reset_tool_metrics();
+
+        // Verify everything is cleared.
+        let snap2 = tool_metrics_snapshot();
+        let lc2 = snap2.iter().find(|e| e.name == "list_contacts");
+        // Tool should not appear (calls == 0 filtered out).
+        assert!(lc2.is_none(), "list_contacts should not appear after reset");
+
+        // Check via full snapshot that counters are zero.
+        let full = tool_metrics_snapshot_full();
+        let lc_full = full.iter().find(|e| e.name == "list_contacts").unwrap();
+        assert_eq!(lc_full.calls, 0);
+        assert_eq!(lc_full.errors, 0);
+        assert!(lc_full.latency.is_none());
+    }
+
+    #[test]
+    fn snapshot_full_accurate_counts_after_calls() {
+        let _guard = METRICS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_tool_metrics();
+
+        // Record specific number of calls to multiple tools.
+        let hp_idx = tool_index("health_check").unwrap();
+        let sm_idx = tool_index("send_message").unwrap();
+        let fi_idx = tool_index("fetch_inbox").unwrap();
+
+        for _ in 0..5 {
+            record_call_idx(hp_idx);
+        }
+        for _ in 0..3 {
+            record_call_idx(sm_idx);
+            record_error_idx(sm_idx);
+        }
+        for _ in 0..10 {
+            record_call_idx(fi_idx);
+        }
+
+        // Verify exact counts in full snapshot.
+        let full = tool_metrics_snapshot_full();
+
+        let hp = full.iter().find(|e| e.name == "health_check").unwrap();
+        assert_eq!(hp.calls, 5, "health_check should have 5 calls");
+        assert_eq!(hp.errors, 0, "health_check should have 0 errors");
+
+        let sm = full.iter().find(|e| e.name == "send_message").unwrap();
+        assert_eq!(sm.calls, 3, "send_message should have 3 calls");
+        assert_eq!(sm.errors, 3, "send_message should have 3 errors");
+
+        let fi = full.iter().find(|e| e.name == "fetch_inbox").unwrap();
+        assert_eq!(fi.calls, 10, "fetch_inbox should have 10 calls");
+        assert_eq!(fi.errors, 0, "fetch_inbox should have 0 errors");
+    }
+
+    #[test]
+    fn latency_histogram_distribution_percentiles() {
+        let _guard = METRICS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_tool_metrics();
+
+        // Create a distribution with known percentile behavior:
+        // 50 samples at 100μs, 45 samples at 1000μs, 5 samples at 10000μs
+        // P50 should be around 100-1000μs range
+        // P95 should be around 1000-10000μs range
+        // P99 should be close to 10000μs
+        let idx = tool_index("request_contact").unwrap();
+
+        for _ in 0..50 {
+            record_call_idx(idx);
+            record_latency_idx(idx, 100); // 0.1ms
+        }
+        for _ in 0..45 {
+            record_call_idx(idx);
+            record_latency_idx(idx, 1_000); // 1ms
+        }
+        for _ in 0..5 {
+            record_call_idx(idx);
+            record_latency_idx(idx, 10_000); // 10ms
+        }
+
+        let snapshot = tool_metrics_snapshot();
+        let rc = snapshot
+            .iter()
+            .find(|e| e.name == "request_contact")
+            .unwrap();
+        assert_eq!(rc.calls, 100);
+
+        let lat = rc.latency.as_ref().expect("latency should be present");
+
+        // P50 (50th percentile) should capture the lower range values.
+        // With 50% at 0.1ms and 45% at 1ms, p50 should be <= 1ms.
+        assert!(
+            lat.p50_ms <= 2.0,
+            "p50_ms should be <= 2ms, got {}",
+            lat.p50_ms
+        );
+
+        // P95 (95th percentile) should capture values up to but not the top 5%.
+        // 95% of values are at most 1ms, so p95 should be around 1ms.
+        assert!(
+            lat.p95_ms <= 5.0,
+            "p95_ms should be <= 5ms, got {}",
+            lat.p95_ms
+        );
+
+        // P99 (99th percentile) should be close to the maximum.
+        assert!(
+            lat.p99_ms >= 1.0,
+            "p99_ms should be >= 1ms, got {}",
+            lat.p99_ms
+        );
+
+        // Min should be around 0.1ms.
+        assert!(
+            lat.min_ms <= 0.2,
+            "min_ms should be <= 0.2ms, got {}",
+            lat.min_ms
+        );
+
+        // Max should be around 10ms.
+        assert!(
+            lat.max_ms >= 9.0,
+            "max_ms should be >= 9ms, got {}",
+            lat.max_ms
+        );
+
+        // Average: (50*0.1 + 45*1 + 5*10) / 100 = (5 + 45 + 50) / 100 = 1ms
+        assert!(
+            lat.avg_ms >= 0.5 && lat.avg_ms <= 2.0,
+            "avg_ms should be ~1ms, got {}",
+            lat.avg_ms
+        );
+
+        // Should not be flagged as slow (p95 well below 500ms threshold).
+        assert!(!lat.is_slow, "should not be flagged as slow");
+    }
 }

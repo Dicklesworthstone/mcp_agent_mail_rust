@@ -21,6 +21,7 @@ use ftui::widgets::notification_queue::NotificationStack;
 use ftui::widgets::toast::ToastPosition;
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
 use ftui::{Event, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
 use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 
@@ -51,6 +52,29 @@ const PALETTE_DYNAMIC_RESERVATION_CAP: usize = 30;
 const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
 const PALETTE_DB_CACHE_TTL_MICROS: i64 = 5 * 1_000_000;
 const PALETTE_USAGE_HALF_LIFE_MICROS: i64 = 60 * 60 * 1_000_000;
+const SCREEN_TRANSITION_TICKS: u8 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenTransition {
+    from: MailScreenId,
+    to: MailScreenId,
+    ticks_remaining: u8,
+}
+
+impl ScreenTransition {
+    const fn new(from: MailScreenId, to: MailScreenId) -> Self {
+        Self {
+            from,
+            to,
+            ticks_remaining: SCREEN_TRANSITION_TICKS,
+        }
+    }
+
+    fn progress(self) -> f32 {
+        let done = SCREEN_TRANSITION_TICKS.saturating_sub(self.ticks_remaining);
+        f32::from(done) / f32::from(SCREEN_TRANSITION_TICKS.max(1))
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // MailMsg — top-level message type
@@ -411,14 +435,6 @@ impl ScreenManager {
         self.ensure_screen(id);
     }
 
-    fn active_next(&mut self) {
-        self.set_active_screen(self.active_screen.next());
-    }
-
-    fn active_prev(&mut self) {
-        self.set_active_screen(self.active_screen.prev());
-    }
-
     fn get(&self, id: MailScreenId) -> Option<&dyn MailScreen> {
         self.screens.get(&id).map(Box::as_ref)
     }
@@ -471,6 +487,7 @@ pub struct MailAppModel {
     hint_ranker: HintRanker,
     palette_hint_ids: HashMap<String, usize>,
     palette_usage_path: Option<PathBuf>,
+    appearance_persist_path: Option<PathBuf>,
     palette_usage_stats: crate::tui_persist::PaletteUsageMap,
     palette_usage_dirty: bool,
     notifications: NotificationQueue,
@@ -498,6 +515,9 @@ pub struct MailAppModel {
     modal_manager: ModalManager,
     /// Action menu for contextual per-item actions.
     action_menu: ActionMenuManager,
+    /// Last non-high-contrast theme to restore after toggling HC off.
+    last_non_hc_theme: ThemeId,
+    screen_transition: Option<ScreenTransition>,
 }
 
 impl MailAppModel {
@@ -517,6 +537,12 @@ impl MailAppModel {
             &static_actions,
             screen_palette_action_id(MailScreenId::Dashboard),
         );
+        let initial_theme = crate::tui_theme::current_theme_id();
+        let last_non_hc_theme = if initial_theme == ThemeId::HighContrast {
+            ThemeId::CyberpunkAurora
+        } else {
+            initial_theme
+        };
         Self {
             state,
             screen_manager,
@@ -527,6 +553,7 @@ impl MailAppModel {
             hint_ranker,
             palette_hint_ids,
             palette_usage_path: None,
+            appearance_persist_path: None,
             palette_usage_stats: HashMap::new(),
             palette_usage_dirty: false,
             notifications: NotificationQueue::new(QueueConfig::default()),
@@ -544,6 +571,8 @@ impl MailAppModel {
             toast_focus_index: None,
             modal_manager: ModalManager::new(),
             action_menu: ActionMenuManager::new(),
+            last_non_hc_theme,
+            screen_transition: None,
         }
     }
 
@@ -551,17 +580,14 @@ impl MailAppModel {
     #[must_use]
     pub fn with_config(state: Arc<TuiSharedState>, config: &mcp_agent_mail_core::Config) -> Self {
         let mut model = Self::new(state);
-        // Load accessibility settings from config.
-        model.accessibility = crate::tui_persist::AccessibilitySettings {
-            high_contrast: config.tui_high_contrast,
-            key_hints: config.tui_key_hints,
-        };
-        // Restore keymap profile from persisted config.
         let prefs = crate::tui_persist::TuiPreferences::from_config(config);
+        // Load accessibility settings + keymap profile from persisted config.
+        model.accessibility = prefs.accessibility.clone();
         model.keymap.set_profile(prefs.keymap_profile);
         let usage_path = crate::tui_persist::palette_usage_path(&config.console_persist_path);
         model.palette_usage_stats = crate::tui_persist::load_palette_usage_or_default(&usage_path);
         model.palette_usage_path = Some(usage_path);
+        model.appearance_persist_path = Some(config.console_persist_path.clone());
         model.toast_severity = ToastSeverityThreshold::from_config(config);
         model.toast_muted = !config.tui_toast_enabled;
         model.toast_info_dismiss_secs = config.tui_toast_info_dismiss_secs.max(1);
@@ -583,7 +609,41 @@ impl MailAppModel {
             MailScreenId::Timeline,
             Box::new(TimelineScreen::with_config(config)),
         );
+        let initial_theme = crate::tui_theme::current_theme_id();
+        model.last_non_hc_theme = if initial_theme == ThemeId::HighContrast {
+            ThemeId::CyberpunkAurora
+        } else {
+            initial_theme
+        };
+        if model.accessibility.high_contrast && initial_theme != ThemeId::HighContrast {
+            let _ = crate::tui_theme::set_theme_and_get_name(ThemeId::HighContrast);
+            model.sync_theme_snapshot();
+        }
+        model.accessibility.high_contrast = model.accessibility.high_contrast
+            || crate::tui_theme::current_theme_id() == ThemeId::HighContrast;
         model
+    }
+
+    fn start_screen_transition(&mut self, from: MailScreenId, to: MailScreenId) {
+        if from == to || self.accessibility.reduced_motion {
+            self.screen_transition = None;
+            return;
+        }
+        self.screen_transition = Some(ScreenTransition::new(from, to));
+    }
+
+    fn activate_screen(&mut self, id: MailScreenId) {
+        let from = self.screen_manager.active_screen();
+        self.screen_manager.set_active_screen(id);
+        let to = self.screen_manager.active_screen();
+        self.start_screen_transition(from, to);
+    }
+
+    fn apply_deep_link_with_transition(&mut self, target: &DeepLinkTarget) {
+        let from = self.screen_manager.active_screen();
+        self.screen_manager.apply_deep_link(target);
+        let to = self.screen_manager.active_screen();
+        self.start_screen_transition(from, to);
     }
 
     /// Replace a screen implementation (used when real screens are ready).
@@ -621,11 +681,11 @@ impl MailAppModel {
     ) -> Cmd<MailMsg> {
         match action {
             ActionKind::Navigate(screen_id) => {
-                self.screen_manager.set_active_screen(screen_id);
+                self.activate_screen(screen_id);
                 Cmd::none()
             }
             ActionKind::DeepLink(target) => {
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
                 Cmd::none()
             }
             ActionKind::Execute(operation) => {
@@ -807,8 +867,83 @@ impl MailAppModel {
         }
     }
 
+    fn persist_appearance_settings(&self) {
+        let Some(path) = self.appearance_persist_path.as_deref() else {
+            return;
+        };
+
+        let mut map: HashMap<&'static str, String> = HashMap::with_capacity(5);
+        map.insert(
+            "CONSOLE_THEME",
+            crate::tui_theme::current_theme_env_value().to_string(),
+        );
+        map.insert(
+            "TUI_HIGH_CONTRAST",
+            self.accessibility.high_contrast.to_string(),
+        );
+        map.insert("TUI_KEY_HINTS", self.accessibility.key_hints.to_string());
+        map.insert(
+            "TUI_REDUCED_MOTION",
+            self.accessibility.reduced_motion.to_string(),
+        );
+        map.insert(
+            "TUI_SCREEN_READER",
+            self.accessibility.screen_reader.to_string(),
+        );
+
+        if let Err(e) = mcp_agent_mail_core::config::update_envfile(path, &map) {
+            eprintln!(
+                "tui_app: failed to persist appearance settings to {}: {e}",
+                path.display()
+            );
+        }
+    }
+
+    fn sync_theme_snapshot(&self) {
+        let mut snapshot = self.state.config_snapshot();
+        snapshot.console_theme = crate::tui_theme::current_theme_name().to_string();
+        self.state.update_config_snapshot(snapshot);
+    }
+
+    fn apply_theme(&mut self, theme_id: ThemeId) -> &'static str {
+        let name = crate::tui_theme::set_theme_and_get_name(theme_id);
+        self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
+        if theme_id != ThemeId::HighContrast {
+            self.last_non_hc_theme = theme_id;
+        }
+        self.sync_theme_snapshot();
+        self.persist_appearance_settings();
+        name
+    }
+
+    fn cycle_theme(&mut self) -> &'static str {
+        let name = crate::tui_theme::cycle_and_get_name();
+        let theme_id = crate::tui_theme::current_theme_id();
+        self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
+        if theme_id != ThemeId::HighContrast {
+            self.last_non_hc_theme = theme_id;
+        }
+        self.sync_theme_snapshot();
+        self.persist_appearance_settings();
+        name
+    }
+
+    fn toggle_high_contrast_theme(&mut self) -> &'static str {
+        if self.accessibility.high_contrast {
+            let restore = self.last_non_hc_theme;
+            self.apply_theme(restore)
+        } else {
+            let current_theme = crate::tui_theme::current_theme_id();
+            if current_theme != ThemeId::HighContrast {
+                self.last_non_hc_theme = current_theme;
+            }
+            self.apply_theme(ThemeId::HighContrast)
+        }
+    }
+
     fn flush_before_shutdown(&mut self) {
         self.persist_palette_usage();
+        self.persist_appearance_settings();
     }
 
     fn toast_dismiss_secs(&self, icon: ToastIcon) -> u64 {
@@ -1032,15 +1167,103 @@ impl MailAppModel {
                 return Cmd::none();
             }
             palette_action_ids::A11Y_TOGGLE_HC => {
-                self.accessibility.high_contrast = !self.accessibility.high_contrast;
+                let name = self.toggle_high_contrast_theme();
+                self.notifications.notify(
+                    Toast::new(format!("Theme: {name}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
                 return Cmd::none();
             }
             palette_action_ids::A11Y_TOGGLE_HINTS => {
                 self.accessibility.key_hints = !self.accessibility.key_hints;
+                self.persist_appearance_settings();
+                return Cmd::none();
+            }
+            palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION => {
+                self.accessibility.reduced_motion = !self.accessibility.reduced_motion;
+                if self.accessibility.reduced_motion {
+                    self.screen_transition = None;
+                }
+                let label = if self.accessibility.reduced_motion {
+                    "Reduced motion enabled"
+                } else {
+                    "Reduced motion disabled"
+                };
+                self.persist_appearance_settings();
+                self.notifications.notify(
+                    Toast::new(label)
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                return Cmd::none();
+            }
+            palette_action_ids::A11Y_TOGGLE_SCREEN_READER => {
+                self.accessibility.screen_reader = !self.accessibility.screen_reader;
+                // Screen-reader mode favors cleaner status text over key-hint noise.
+                if self.accessibility.screen_reader {
+                    self.accessibility.key_hints = false;
+                }
+                let label = if self.accessibility.screen_reader {
+                    "Screen reader mode enabled"
+                } else {
+                    "Screen reader mode disabled"
+                };
+                self.persist_appearance_settings();
+                self.notifications.notify(
+                    Toast::new(label)
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
                 return Cmd::none();
             }
             palette_action_ids::THEME_CYCLE => {
-                let name = crate::tui_theme::cycle_and_get_name();
+                let name = self.cycle_theme();
+                self.notifications.notify(
+                    Toast::new(format!("Theme: {name}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                return Cmd::none();
+            }
+            palette_action_ids::THEME_CYBERPUNK => {
+                let name = self.apply_theme(ThemeId::CyberpunkAurora);
+                self.notifications.notify(
+                    Toast::new(format!("Theme: {name}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                return Cmd::none();
+            }
+            palette_action_ids::THEME_DARCULA => {
+                let name = self.apply_theme(ThemeId::Darcula);
+                self.notifications.notify(
+                    Toast::new(format!("Theme: {name}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                return Cmd::none();
+            }
+            palette_action_ids::THEME_LUMEN => {
+                let name = self.apply_theme(ThemeId::LumenLight);
+                self.notifications.notify(
+                    Toast::new(format!("Theme: {name}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                return Cmd::none();
+            }
+            palette_action_ids::THEME_NORDIC => {
+                let name = self.apply_theme(ThemeId::NordicFrost);
+                self.notifications.notify(
+                    Toast::new(format!("Theme: {name}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                return Cmd::none();
+            }
+            palette_action_ids::THEME_HIGH_CONTRAST => {
+                let name = self.apply_theme(ThemeId::HighContrast);
                 self.notifications.notify(
                     Toast::new(format!("Theme: {name}"))
                         .icon(ToastIcon::Info)
@@ -1053,52 +1276,49 @@ impl MailAppModel {
 
         // ── Screen navigation ─────────────────────────────────────
         if let Some(screen_id) = screen_from_palette_action_id(id) {
-            self.screen_manager.set_active_screen(screen_id);
+            self.activate_screen(screen_id);
             return Cmd::none();
         }
 
         // ── Dynamic sources ───────────────────────────────────────
         if id.starts_with(palette_action_ids::AGENT_PREFIX) {
-            self.screen_manager.set_active_screen(MailScreenId::Agents);
+            self.activate_screen(MailScreenId::Agents);
             return Cmd::none();
         }
         if id.starts_with(palette_action_ids::THREAD_PREFIX) {
-            self.screen_manager.set_active_screen(MailScreenId::Threads);
+            self.activate_screen(MailScreenId::Threads);
             return Cmd::none();
         }
         if let Some(id_str) = id.strip_prefix(palette_action_ids::MESSAGE_PREFIX) {
             if let Ok(msg_id) = id_str.parse::<i64>() {
                 let target = DeepLinkTarget::MessageById(msg_id);
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
             } else {
-                self.screen_manager
-                    .set_active_screen(MailScreenId::Messages);
+                self.activate_screen(MailScreenId::Messages);
             }
             return Cmd::none();
         }
         if id.starts_with(palette_action_ids::TOOL_PREFIX) {
-            self.screen_manager
-                .set_active_screen(MailScreenId::ToolMetrics);
+            self.activate_screen(MailScreenId::ToolMetrics);
             return Cmd::none();
         }
         if let Some(slug) = id.strip_prefix(palette_action_ids::PROJECT_PREFIX) {
             let target = DeepLinkTarget::ProjectBySlug(slug.to_string());
-            self.screen_manager.apply_deep_link(&target);
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
         if let Some(pair) = id.strip_prefix(palette_action_ids::CONTACT_PREFIX) {
             if let Some((from, to)) = pair.split_once(':') {
                 let target = DeepLinkTarget::ContactByPair(from.to_string(), to.to_string());
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
             } else {
-                self.screen_manager
-                    .set_active_screen(MailScreenId::Contacts);
+                self.activate_screen(MailScreenId::Contacts);
             }
             return Cmd::none();
         }
         if let Some(agent) = id.strip_prefix(palette_action_ids::RESERVATION_PREFIX) {
             let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
-            self.screen_manager.apply_deep_link(&target);
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
 
@@ -1106,34 +1326,34 @@ impl MailAppModel {
         if let Some(rest) = id.strip_prefix("quick:") {
             if let Some(name) = rest.strip_prefix("agent:") {
                 let target = DeepLinkTarget::AgentByName(name.to_string());
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
                 return Cmd::none();
             }
             if let Some(id_str) = rest.strip_prefix("thread:") {
                 let target = DeepLinkTarget::ThreadById(id_str.to_string());
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
                 return Cmd::none();
             }
             if let Some(name) = rest.strip_prefix("tool:") {
                 let target = DeepLinkTarget::ToolByName(name.to_string());
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
                 return Cmd::none();
             }
             if let Some(id_str) = rest.strip_prefix("message:") {
                 if let Ok(msg_id) = id_str.parse::<i64>() {
                     let target = DeepLinkTarget::MessageById(msg_id);
-                    self.screen_manager.apply_deep_link(&target);
+                    self.apply_deep_link_with_transition(&target);
                 }
                 return Cmd::none();
             }
             if let Some(slug) = rest.strip_prefix("project:") {
                 let target = DeepLinkTarget::ProjectBySlug(slug.to_string());
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
                 return Cmd::none();
             }
             if let Some(agent) = rest.strip_prefix("reservation:") {
                 let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
                 return Cmd::none();
             }
         }
@@ -1169,31 +1389,31 @@ impl MailAppModel {
                     .duration(Duration::from_secs(4)),
             );
             let target = DeepLinkTarget::ThreadById(thread_id.to_string());
-            self.screen_manager.apply_deep_link(&target);
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
         if let Some(thread_id) = rest.strip_prefix("view_thread:") {
             let target = DeepLinkTarget::ThreadById(thread_id.to_string());
-            self.screen_manager.apply_deep_link(&target);
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
 
         // Agent macros
         if let Some(agent) = rest.strip_prefix("fetch_inbox:") {
             let target = DeepLinkTarget::ExplorerForAgent(agent.to_string());
-            self.screen_manager.apply_deep_link(&target);
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
         if let Some(agent) = rest.strip_prefix("view_reservations:") {
             let target = DeepLinkTarget::ReservationByAgent(agent.to_string());
-            self.screen_manager.apply_deep_link(&target);
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
 
         // Tool macros
         if let Some(tool) = rest.strip_prefix("tool_history:") {
             let target = DeepLinkTarget::ToolByName(tool.to_string());
-            self.screen_manager.apply_deep_link(&target);
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
 
@@ -1201,7 +1421,7 @@ impl MailAppModel {
         if let Some(id_str) = rest.strip_prefix("view_message:") {
             if let Ok(msg_id) = id_str.parse::<i64>() {
                 let target = DeepLinkTarget::MessageById(msg_id);
-                self.screen_manager.apply_deep_link(&target);
+                self.apply_deep_link_with_transition(&target);
             }
             return Cmd::none();
         }
@@ -1361,6 +1581,14 @@ impl Model for MailAppModel {
             // ── Tick ────────────────────────────────────────────────
             MailMsg::Terminal(Event::Tick) => {
                 self.tick_count += 1;
+                if let Some(mut transition) = self.screen_transition {
+                    transition.ticks_remaining = transition.ticks_remaining.saturating_sub(1);
+                    self.screen_transition = if transition.ticks_remaining == 0 {
+                        None
+                    } else {
+                        Some(transition)
+                    };
+                }
                 for screen in self.screen_manager.values_mut() {
                     screen.tick(self.tick_count, &self.state);
                 }
@@ -1617,7 +1845,7 @@ impl Model for MailAppModel {
                                 return Cmd::none();
                             }
                             KeyCode::Char('T') if !text_mode => {
-                                let name = crate::tui_theme::cycle_and_get_name();
+                                let name = self.cycle_theme();
                                 self.notifications.notify(
                                     Toast::new(format!("Theme: {name}"))
                                         .icon(ToastIcon::Info)
@@ -1626,11 +1854,13 @@ impl Model for MailAppModel {
                                 return Cmd::none();
                             }
                             KeyCode::Tab => {
-                                self.screen_manager.active_next();
+                                let next = self.screen_manager.active_screen().next();
+                                self.activate_screen(next);
                                 return Cmd::none();
                             }
                             KeyCode::BackTab => {
-                                self.screen_manager.active_prev();
+                                let prev = self.screen_manager.active_screen().prev();
+                                self.activate_screen(prev);
                                 return Cmd::none();
                             }
                             // Action menu: . opens contextual actions for selected item
@@ -1660,7 +1890,7 @@ impl Model for MailAppModel {
                             KeyCode::Char(c) if c.is_ascii_digit() && !text_mode => {
                                 let n = c.to_digit(10).unwrap_or(0) as usize;
                                 if let Some(id) = MailScreenId::from_number(n) {
-                                    self.screen_manager.set_active_screen(id);
+                                    self.activate_screen(id);
                                     return Cmd::none();
                                 }
                             }
@@ -1679,12 +1909,12 @@ impl Model for MailAppModel {
 
             // ── Screen messages / direct navigation ─────────────────
             MailMsg::Screen(MailScreenMsg::Navigate(id)) | MailMsg::SwitchScreen(id) => {
-                self.screen_manager.set_active_screen(id);
+                self.activate_screen(id);
                 Cmd::none()
             }
             MailMsg::Screen(MailScreenMsg::Noop) => Cmd::none(),
             MailMsg::Screen(MailScreenMsg::DeepLink(ref target)) => {
-                self.screen_manager.apply_deep_link(target);
+                self.apply_deep_link_with_transition(target);
                 Cmd::none()
             }
             MailMsg::ToggleHelp => {
@@ -1713,6 +1943,9 @@ impl Model for MailAppModel {
         // 2. Screen content (z=2)
         if let Some(screen) = self.screen_manager.active_screen_ref() {
             screen.view(frame, chrome.content, &self.state);
+        }
+        if let Some(transition) = self.screen_transition {
+            render_screen_transition_overlay(transition, chrome.content, frame);
         }
 
         let screen_bindings = self
@@ -1818,8 +2051,15 @@ mod palette_action_ids {
 
     pub const A11Y_TOGGLE_HC: &str = "a11y:toggle_high_contrast";
     pub const A11Y_TOGGLE_HINTS: &str = "a11y:toggle_key_hints";
+    pub const A11Y_TOGGLE_REDUCED_MOTION: &str = "a11y:toggle_reduced_motion";
+    pub const A11Y_TOGGLE_SCREEN_READER: &str = "a11y:toggle_screen_reader";
 
     pub const THEME_CYCLE: &str = "theme:cycle";
+    pub const THEME_CYBERPUNK: &str = "theme:cyberpunk_aurora";
+    pub const THEME_DARCULA: &str = "theme:darcula";
+    pub const THEME_LUMEN: &str = "theme:lumen_light";
+    pub const THEME_NORDIC: &str = "theme:nordic_frost";
+    pub const THEME_HIGH_CONTRAST: &str = "theme:high_contrast";
 
     pub const AGENT_PREFIX: &str = "agent:";
     pub const THREAD_PREFIX: &str = "thread:";
@@ -1955,6 +2195,42 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
             .with_tags(&["theme", "colors", "appearance"])
             .with_category("Appearance"),
     );
+    out.push(
+        ActionItem::new(
+            palette_action_ids::THEME_CYBERPUNK,
+            "Theme: Cyberpunk Aurora",
+        )
+        .with_description("Set theme to Cyberpunk Aurora")
+        .with_tags(&["theme", "colors", "appearance"])
+        .with_category("Appearance"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::THEME_DARCULA, "Theme: Darcula")
+            .with_description("Set theme to Darcula")
+            .with_tags(&["theme", "colors", "appearance"])
+            .with_category("Appearance"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::THEME_LUMEN, "Theme: Lumen Light")
+            .with_description("Set theme to Lumen Light")
+            .with_tags(&["theme", "colors", "appearance"])
+            .with_category("Appearance"),
+    );
+    out.push(
+        ActionItem::new(palette_action_ids::THEME_NORDIC, "Theme: Nordic Frost")
+            .with_description("Set theme to Nordic Frost")
+            .with_tags(&["theme", "colors", "appearance"])
+            .with_category("Appearance"),
+    );
+    out.push(
+        ActionItem::new(
+            palette_action_ids::THEME_HIGH_CONTRAST,
+            "Theme: High Contrast",
+        )
+        .with_description("Set theme to High Contrast")
+        .with_tags(&["theme", "colors", "appearance", "a11y"])
+        .with_category("Appearance"),
+    );
 
     out.push(
         ActionItem::new(palette_action_ids::A11Y_TOGGLE_HC, "Toggle High Contrast")
@@ -1967,6 +2243,24 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
             .with_description("Show/hide context-sensitive key hints in the status area")
             .with_tags(&["accessibility", "hints", "keys", "a11y"])
             .with_category("Accessibility"),
+    );
+    out.push(
+        ActionItem::new(
+            palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION,
+            "Toggle Reduced Motion",
+        )
+        .with_description("Reduce animated/rapidly changing visual effects")
+        .with_tags(&["accessibility", "motion", "a11y"])
+        .with_category("Accessibility"),
+    );
+    out.push(
+        ActionItem::new(
+            palette_action_ids::A11Y_TOGGLE_SCREEN_READER,
+            "Toggle Screen Reader Mode",
+        )
+        .with_description("Optimize status text for screen-reader output")
+        .with_tags(&["accessibility", "screen-reader", "a11y"])
+        .with_category("Accessibility"),
     );
 
     out.push(
@@ -2608,6 +2902,13 @@ fn palette_action_label(id: &str) -> String {
         palette_action_ids::APP_QUIT => "Quit".into(),
         palette_action_ids::TRANSPORT_TOGGLE => "Toggle Transport".into(),
         palette_action_ids::THEME_CYCLE => "Cycle Theme".into(),
+        palette_action_ids::THEME_CYBERPUNK => "Theme: Cyberpunk Aurora".into(),
+        palette_action_ids::THEME_DARCULA => "Theme: Darcula".into(),
+        palette_action_ids::THEME_LUMEN => "Theme: Lumen Light".into(),
+        palette_action_ids::THEME_NORDIC => "Theme: Nordic Frost".into(),
+        palette_action_ids::THEME_HIGH_CONTRAST => "Theme: High Contrast".into(),
+        palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION => "Toggle Reduced Motion".into(),
+        palette_action_ids::A11Y_TOGGLE_SCREEN_READER => "Toggle Screen Reader Mode".into(),
         palette_action_ids::LAYOUT_RESET => "Reset Layout".into(),
         _ => id.to_string(),
     }
@@ -2737,6 +3038,44 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
         Some(toast)
     } else {
         None
+    }
+}
+
+fn render_screen_transition_overlay(transition: ScreenTransition, area: Rect, frame: &mut Frame) {
+    if area.width < 4 || area.height == 0 {
+        return;
+    }
+
+    let theme = crate::tui_theme::TuiThemePalette::current();
+    let progress = transition.progress().clamp(0.0, 1.0);
+    let remaining_ratio = 1.0 - progress;
+    let wipe_width = ((f32::from(area.width) * remaining_ratio).round() as u16).min(area.width);
+
+    if wipe_width > 0 {
+        let wipe_height = area.height.min(2);
+        ftui::widgets::paragraph::Paragraph::new("")
+            .style(Style::default().bg(theme.tab_active_bg))
+            .render(Rect::new(area.x, area.y, wipe_width, wipe_height), frame);
+    }
+
+    let from_title = screen_meta(transition.from).title;
+    let to_title = screen_meta(transition.to).title;
+    let label = format!("Transition: {from_title} -> {to_title}");
+    let label_area = Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(2),
+        1,
+    );
+    if label_area.width > 0 {
+        ftui::widgets::paragraph::Paragraph::new(label)
+            .style(
+                Style::default()
+                    .fg(theme.status_accent)
+                    .bg(theme.tab_active_bg)
+                    .bold(),
+            )
+            .render(label_area, frame);
     }
 }
 
@@ -2890,6 +3229,7 @@ mod tests {
     use crate::tui_macro::{MacroDef, MacroStep};
     use crate::tui_screens::MailScreenMsg;
     use ftui::KeyEvent;
+    use ftui_extras::theme::{ScopedThemeLock, ThemeId};
     use ftui_widgets::NotificationPriority;
     use mcp_agent_mail_core::Config;
     use serde::Serialize;
@@ -3160,6 +3500,39 @@ mod tests {
                 "screen {id:?} not visited in reverse"
             );
         }
+    }
+
+    #[test]
+    fn screen_switch_starts_transition_when_motion_enabled() {
+        let mut model = test_model();
+        assert!(model.screen_transition.is_none());
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        let transition = model.screen_transition.expect("transition should start");
+        assert_eq!(transition.from, MailScreenId::Dashboard);
+        assert_eq!(transition.to, MailScreenId::Messages);
+    }
+
+    #[test]
+    fn screen_switch_skips_transition_when_reduced_motion_enabled() {
+        let mut model = test_model();
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION);
+        assert!(model.accessibility().reduced_motion);
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        assert!(model.screen_transition.is_none());
+    }
+
+    #[test]
+    fn transition_expires_after_tick_budget() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        assert!(model.screen_transition.is_some());
+
+        for _ in 0..SCREEN_TRANSITION_TICKS {
+            model.update(MailMsg::Terminal(Event::Tick));
+        }
+        assert!(model.screen_transition.is_none());
     }
 
     #[test]
@@ -3531,6 +3904,8 @@ mod tests {
         let model = test_model();
         assert!(!model.accessibility().high_contrast);
         assert!(model.accessibility().key_hints);
+        assert!(!model.accessibility().reduced_motion);
+        assert!(!model.accessibility().screen_reader);
     }
 
     #[test]
@@ -3554,24 +3929,122 @@ mod tests {
     }
 
     #[test]
+    fn toggle_reduced_motion_via_palette() {
+        let mut model = test_model();
+        assert!(!model.accessibility().reduced_motion);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION);
+        assert!(model.accessibility().reduced_motion);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION);
+        assert!(!model.accessibility().reduced_motion);
+    }
+
+    #[test]
+    fn toggle_screen_reader_via_palette_disables_key_hints() {
+        let mut model = test_model();
+        assert!(!model.accessibility().screen_reader);
+        assert!(model.accessibility().key_hints);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_SCREEN_READER);
+        assert!(model.accessibility().screen_reader);
+        assert!(!model.accessibility().key_hints);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_SCREEN_READER);
+        assert!(!model.accessibility().screen_reader);
+    }
+
+    #[test]
     fn palette_static_actions_include_accessibility_controls() {
         let actions = build_palette_actions_static();
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
         assert!(ids.contains(&palette_action_ids::A11Y_TOGGLE_HC));
         assert!(ids.contains(&palette_action_ids::A11Y_TOGGLE_HINTS));
+        assert!(ids.contains(&palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION));
+        assert!(ids.contains(&palette_action_ids::A11Y_TOGGLE_SCREEN_READER));
+    }
+
+    #[test]
+    fn palette_static_actions_include_theme_controls() {
+        let actions = build_palette_actions_static();
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&palette_action_ids::THEME_CYCLE));
+        assert!(ids.contains(&palette_action_ids::THEME_CYBERPUNK));
+        assert!(ids.contains(&palette_action_ids::THEME_DARCULA));
+        assert!(ids.contains(&palette_action_ids::THEME_LUMEN));
+        assert!(ids.contains(&palette_action_ids::THEME_NORDIC));
+        assert!(ids.contains(&palette_action_ids::THEME_HIGH_CONTRAST));
+    }
+
+    #[test]
+    fn explicit_theme_actions_switch_runtime_theme() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let mut model = test_model();
+
+        model.dispatch_palette_action(palette_action_ids::THEME_DARCULA);
+        assert_eq!(crate::tui_theme::current_theme_id(), ThemeId::Darcula);
+        assert!(!model.accessibility().high_contrast);
+
+        model.dispatch_palette_action(palette_action_ids::THEME_HIGH_CONTRAST);
+        assert_eq!(crate::tui_theme::current_theme_id(), ThemeId::HighContrast);
+        assert!(model.accessibility().high_contrast);
+    }
+
+    #[test]
+    fn toggle_high_contrast_restores_previous_theme() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let mut model = test_model();
+        model.dispatch_palette_action(palette_action_ids::THEME_NORDIC);
+        assert_eq!(crate::tui_theme::current_theme_id(), ThemeId::NordicFrost);
+
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_HC);
+        assert_eq!(crate::tui_theme::current_theme_id(), ThemeId::HighContrast);
+        assert!(model.accessibility().high_contrast);
+
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_HC);
+        assert_eq!(crate::tui_theme::current_theme_id(), ThemeId::NordicFrost);
+        assert!(!model.accessibility().high_contrast);
     }
 
     #[test]
     fn with_config_loads_accessibility_settings() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let config = mcp_agent_mail_core::Config {
             tui_high_contrast: true,
             tui_key_hints: false,
+            tui_reduced_motion: true,
+            tui_screen_reader: true,
             ..mcp_agent_mail_core::Config::default()
         };
         let state = TuiSharedState::new(&config);
         let model = MailAppModel::with_config(Arc::clone(&state), &config);
         assert!(model.accessibility().high_contrast);
         assert!(!model.accessibility().key_hints);
+        assert!(model.accessibility().reduced_motion);
+        assert!(model.accessibility().screen_reader);
+        assert_eq!(crate::tui_theme::current_theme_id(), ThemeId::HighContrast);
+    }
+
+    #[test]
+    fn flush_before_shutdown_persists_theme_and_accessibility_settings() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_path = tmp.path().join("config.env");
+        let config = Config {
+            console_persist_path: env_path.clone(),
+            ..Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let mut model = MailAppModel::with_config(state, &config);
+
+        model.dispatch_palette_action(palette_action_ids::THEME_DARCULA);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_HINTS);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_SCREEN_READER);
+        model.flush_before_shutdown();
+
+        let contents = std::fs::read_to_string(env_path).expect("read env");
+        assert!(contents.contains("CONSOLE_THEME=darcula"));
+        assert!(contents.contains("TUI_HIGH_CONTRAST=false"));
+        assert!(contents.contains("TUI_KEY_HINTS=false"));
+        assert!(contents.contains("TUI_REDUCED_MOTION=true"));
+        assert!(contents.contains("TUI_SCREEN_READER=true"));
     }
 
     // ── Quick action dispatch tests ─────────────────────────────

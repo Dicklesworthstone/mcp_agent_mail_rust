@@ -311,21 +311,20 @@ fn probe_http_path(config: &Config) -> ProbeResult {
 ///
 /// Uses cross-platform port detection via `check_port_status()`:
 /// - If the port is free, the probe passes.
-/// - If an Agent Mail server is already running, the probe passes (server can be reused).
+/// - If an Agent Mail server is already running, the probe fails with reuse guidance.
 /// - If another process is using the port, the probe fails with guidance.
 fn probe_port(config: &Config) -> ProbeResult {
     match check_port_status(&config.http_host, config.http_port) {
         PortStatus::Free => ProbeResult::Ok { name: "port" },
 
-        PortStatus::AgentMailServer => {
-            // An Agent Mail server is already running - this is OK for reuse
-            tracing::info!(
-                port = config.http_port,
-                host = %config.http_host,
-                "Agent Mail server already running on port - can be reused"
-            );
-            ProbeResult::Ok { name: "port" }
-        }
+        PortStatus::AgentMailServer => ProbeResult::Fail(ProbeFailure {
+            name: "port",
+            problem: format!(
+                "An Agent Mail server is already running on {}:{}",
+                config.http_host, config.http_port
+            ),
+            fix: "Reuse the running server (for CLI: use --reuse-running), stop the existing server, or choose a different HTTP_PORT".into(),
+        }),
 
         PortStatus::OtherProcess { description } => ProbeResult::Fail(ProbeFailure {
             name: "port",
@@ -1036,5 +1035,51 @@ mod tests {
         );
 
         drop(listener);
+    }
+
+    #[test]
+    fn probe_port_fails_when_agent_mail_server_running() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).expect("read request line");
+                if bytes == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+
+            let body = r#"{"status":"healthy"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Server: mcp-agent-mail-test\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write health response");
+            stream.flush().expect("flush health response");
+        });
+
+        let mut config = default_config();
+        config.http_host = "127.0.0.1".into();
+        config.http_port = port;
+
+        let result = probe_port(&config);
+        assert!(
+            matches!(result, ProbeResult::Fail(_)),
+            "expected Fail, got {result:?}"
+        );
+
+        server_thread.join().expect("join test server");
     }
 }

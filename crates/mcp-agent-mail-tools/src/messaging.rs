@@ -15,6 +15,7 @@ use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde_json::json;
 
@@ -168,6 +169,7 @@ fn validate_message_size_limits(
     subject: &str,
     body_md: &str,
     attachment_paths: Option<&[String]>,
+    attachment_base_dir: Option<&Path>,
 ) -> McpResult<()> {
     // Subject size
     if config.max_subject_bytes > 0 && subject.len() > config.max_subject_bytes {
@@ -210,7 +212,19 @@ fn validate_message_size_limits(
     let mut total_size = subject.len().saturating_add(body_md.len());
     if let Some(paths) = attachment_paths {
         for path in paths {
-            if let Ok(meta) = std::fs::metadata(path) {
+            let metadata = if let Some(base_dir) = attachment_base_dir {
+                // When a project base dir is provided, only size-check resolved
+                // paths accepted by attachment path policy. Invalid paths are
+                // deferred to downstream attachment validation.
+                match mcp_agent_mail_storage::resolve_attachment_source_path(base_dir, config, path)
+                {
+                    Ok(resolved) => std::fs::metadata(resolved),
+                    Err(_) => continue,
+                }
+            } else {
+                std::fs::metadata(path)
+            };
+            if let Ok(meta) = metadata {
                 let file_size = usize::try_from(meta.len()).unwrap_or(usize::MAX);
                 if config.max_attachment_bytes > 0 && file_size > config.max_attachment_bytes {
                     return Err(legacy_tool_error(
@@ -516,8 +530,8 @@ pub async fn send_message(
 
     let config = &Config::get();
 
-    // ── Per-message size limits (fail fast before any DB/archive work) ──
-    validate_message_size_limits(config, &subject, &body_md, attachment_paths.as_deref())?;
+    // ── Per-message size limits (subject/body) before any DB/archive work ──
+    validate_message_size_limits(config, &subject, &body_md, None, None)?;
 
     if config.disk_space_monitor_enabled {
         let pressure = mcp_agent_mail_core::disk::DiskPressure::from_u64(
@@ -552,6 +566,16 @@ effective_free_bytes={free}"
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
+    let base_dir = Path::new(&project.human_key);
+
+    // Validate attachment + total sizes with project-relative path resolution.
+    validate_message_size_limits(
+        config,
+        &subject,
+        &body_md,
+        attachment_paths.as_deref(),
+        Some(base_dir),
+    )?;
 
     // Resolve sender
     let sender = resolve_agent(ctx, &pool, project_id, &sender_name).await?;
@@ -634,8 +658,6 @@ effective_free_bytes={free}"
     let attachment_count = attachment_paths.as_ref().map_or(0, Vec::len);
     let mut all_attachment_meta: Vec<serde_json::Value> = Vec::with_capacity(attachment_count + 4);
     let mut all_attachment_rel_paths: Vec<String> = Vec::with_capacity(attachment_count + 4);
-    let base_dir = std::path::Path::new(&project.human_key);
-
     if do_convert {
         let slug = &project.slug;
         match mcp_agent_mail_storage::ensure_archive(config, slug) {
@@ -2046,7 +2068,7 @@ mod tests {
     #[test]
     fn size_limits_pass_when_under() {
         let cfg = config_with_limits(1024, 1024, 2048, 256);
-        let result = validate_message_size_limits(&cfg, "Hello", "Body text", None);
+        let result = validate_message_size_limits(&cfg, "Hello", "Body text", None, None);
         assert!(result.is_ok());
     }
 
@@ -2054,7 +2076,7 @@ mod tests {
     fn size_limits_pass_when_zero_unlimited() {
         let cfg = config_with_limits(0, 0, 0, 0);
         let big = "x".repeat(10_000_000);
-        let result = validate_message_size_limits(&cfg, &big, &big, None);
+        let result = validate_message_size_limits(&cfg, &big, &big, None, None);
         assert!(result.is_ok());
     }
 
@@ -2062,7 +2084,7 @@ mod tests {
     fn size_limits_reject_oversized_subject() {
         let cfg = config_with_limits(0, 0, 0, 10);
         let subject = "A".repeat(11);
-        let result = validate_message_size_limits(&cfg, &subject, "", None);
+        let result = validate_message_size_limits(&cfg, &subject, "", None, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("subject") || err.to_string().contains("Subject"));
@@ -2072,7 +2094,7 @@ mod tests {
     fn size_limits_accept_exact_subject() {
         let cfg = config_with_limits(0, 0, 0, 10);
         let subject = "A".repeat(10);
-        let result = validate_message_size_limits(&cfg, &subject, "", None);
+        let result = validate_message_size_limits(&cfg, &subject, "", None, None);
         assert!(result.is_ok());
     }
 
@@ -2080,7 +2102,7 @@ mod tests {
     fn size_limits_reject_oversized_body() {
         let cfg = config_with_limits(100, 0, 0, 0);
         let body = "B".repeat(101);
-        let result = validate_message_size_limits(&cfg, "", &body, None);
+        let result = validate_message_size_limits(&cfg, "", &body, None, None);
         assert!(result.is_err());
     }
 
@@ -2088,7 +2110,7 @@ mod tests {
     fn size_limits_accept_exact_body() {
         let cfg = config_with_limits(100, 0, 0, 0);
         let body = "B".repeat(100);
-        let result = validate_message_size_limits(&cfg, "", &body, None);
+        let result = validate_message_size_limits(&cfg, "", &body, None, None);
         assert!(result.is_ok());
     }
 
@@ -2096,7 +2118,7 @@ mod tests {
     fn size_limits_reject_total_overflow() {
         // Subject + body exceed total even though each is within individual limits
         let cfg = config_with_limits(100, 0, 50, 100);
-        let result = validate_message_size_limits(&cfg, "sub", &"x".repeat(50), None);
+        let result = validate_message_size_limits(&cfg, "sub", &"x".repeat(50), None, None);
         assert!(result.is_err());
     }
 
@@ -2108,7 +2130,7 @@ mod tests {
         let path = dir.path().join("big.txt");
         std::fs::write(&path, "x".repeat(20)).unwrap();
         let paths = vec![path.to_string_lossy().to_string()];
-        let result = validate_message_size_limits(&cfg, "", "", Some(&paths));
+        let result = validate_message_size_limits(&cfg, "", "", Some(&paths), None);
         assert!(result.is_err());
     }
 
@@ -2119,7 +2141,39 @@ mod tests {
         let path = dir.path().join("small.txt");
         std::fs::write(&path, "hello").unwrap();
         let paths = vec![path.to_string_lossy().to_string()];
-        let result = validate_message_size_limits(&cfg, "", "", Some(&paths));
+        let result = validate_message_size_limits(&cfg, "", "", Some(&paths), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_limits_resolve_relative_attachment_from_project_base_dir() {
+        let cfg = config_with_limits(0, 10, 0, 0);
+        let project_dir = tempfile::tempdir().unwrap();
+        let attachments_dir = project_dir.path().join("attachments");
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+        std::fs::write(attachments_dir.join("big.txt"), "x".repeat(20)).unwrap();
+
+        let paths = vec!["attachments/big.txt".to_string()];
+        let result =
+            validate_message_size_limits(&cfg, "", "", Some(&paths), Some(project_dir.path()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn size_limits_skip_disallowed_absolute_paths_when_base_dir_provided() {
+        let mut cfg = config_with_limits(0, 10, 0, 0);
+        cfg.allow_absolute_attachment_paths = false;
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let external_dir = tempfile::tempdir().unwrap();
+        let external_file = external_dir.path().join("big.txt");
+        std::fs::write(&external_file, "x".repeat(20)).unwrap();
+
+        let paths = vec![external_file.to_string_lossy().to_string()];
+        // Disallowed absolute paths should be validated by downstream
+        // attachment resolution, not by this size pre-check.
+        let result =
+            validate_message_size_limits(&cfg, "", "", Some(&paths), Some(project_dir.path()));
         assert!(result.is_ok());
     }
 
@@ -2131,7 +2185,7 @@ mod tests {
         std::fs::write(&path, "x".repeat(45)).unwrap();
         let paths = vec![path.to_string_lossy().to_string()];
         // body (10) + attachment (45) = 55 > total limit of 50
-        let result = validate_message_size_limits(&cfg, "", &"y".repeat(10), Some(&paths));
+        let result = validate_message_size_limits(&cfg, "", &"y".repeat(10), Some(&paths), None);
         assert!(result.is_err());
     }
 
@@ -2140,7 +2194,7 @@ mod tests {
         let cfg = config_with_limits(0, 10, 0, 0);
         let paths = vec!["/nonexistent/file.txt".to_string()];
         // Non-existent files are skipped (downstream handles the error)
-        let result = validate_message_size_limits(&cfg, "", "", Some(&paths));
+        let result = validate_message_size_limits(&cfg, "", "", Some(&paths), None);
         assert!(result.is_ok());
     }
 
@@ -2489,7 +2543,7 @@ mod tests {
             p2.to_string_lossy().to_string(),
         ];
         // subject(0) + body(25) + a(40) + b(40) = 105 > 100
-        let result = validate_message_size_limits(&cfg, "", &"z".repeat(25), Some(&paths));
+        let result = validate_message_size_limits(&cfg, "", &"z".repeat(25), Some(&paths), None);
         assert!(result.is_err());
     }
 
@@ -2497,14 +2551,14 @@ mod tests {
     fn size_limits_empty_subject_and_body_pass() {
         let cfg = config_with_limits(1, 1, 1, 1);
         // Empty strings have length 0 which is ≤ any positive limit
-        let result = validate_message_size_limits(&cfg, "", "", None);
+        let result = validate_message_size_limits(&cfg, "", "", None, None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn size_limits_error_message_contains_field_info() {
         let cfg = config_with_limits(10, 0, 0, 0);
-        let err = validate_message_size_limits(&cfg, "", &"x".repeat(20), None).unwrap_err();
+        let err = validate_message_size_limits(&cfg, "", &"x".repeat(20), None, None).unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("body") || err_str.contains("Body"),
@@ -2515,7 +2569,7 @@ mod tests {
     #[test]
     fn size_limits_subject_error_mentions_subject() {
         let cfg = config_with_limits(0, 0, 0, 5);
-        let err = validate_message_size_limits(&cfg, "toolong", "", None).unwrap_err();
+        let err = validate_message_size_limits(&cfg, "toolong", "", None, None).unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("ubject"),
@@ -2530,12 +2584,12 @@ mod tests {
         let cfg = config_with_limits(0, 0, 100, 0);
         // Even without real filesystem paths, we can test the accumulation logic:
         // subject(5) + body(10) = 15, which is under 100.
-        let result = validate_message_size_limits(&cfg, "hello", &"x".repeat(10), None);
+        let result = validate_message_size_limits(&cfg, "hello", &"x".repeat(10), None, None);
         assert!(result.is_ok());
 
         // Now with total limit = 10, subject(5) + body(10) = 15 > 10 via saturating_add
         let cfg2 = config_with_limits(0, 0, 10, 0);
-        let result = validate_message_size_limits(&cfg2, "hello", &"x".repeat(10), None);
+        let result = validate_message_size_limits(&cfg2, "hello", &"x".repeat(10), None, None);
         assert!(result.is_err());
     }
 

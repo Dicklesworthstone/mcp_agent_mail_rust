@@ -2346,6 +2346,32 @@ fn build_http_config(
     path: Option<String>,
     no_auth: bool,
 ) -> Config {
+    fn normalize_http_path(raw: &str) -> String {
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "mcp" | "/mcp" | "/mcp/" => return "/mcp/".to_string(),
+            "api" | "/api" | "/api/" => return "/api/".to_string(),
+            _ => {}
+        }
+
+        if trimmed.is_empty() {
+            return "/".to_string();
+        }
+
+        let mut with_leading = trimmed.to_string();
+        if !with_leading.starts_with('/') {
+            with_leading.insert(0, '/');
+        }
+
+        let without_trailing = with_leading.trim_end_matches('/');
+        if without_trailing.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{without_trailing}/")
+        }
+    }
+
     let mut config = Config::from_env();
     if let Some(host) = host {
         config.http_host = host;
@@ -2354,7 +2380,7 @@ fn build_http_config(
         config.http_port = port;
     }
     if let Some(path) = path {
-        config.http_path = path;
+        config.http_path = normalize_http_path(&path);
     }
     if no_auth {
         // Disable bearer token authentication for this run
@@ -8136,6 +8162,25 @@ mod tests {
     }
 
     #[test]
+    fn rate_limiter_blocks_when_lockfile_write_fails() {
+        let limiter = CheckInboxRateLimiter::new("TestWriteFailure", Some(60));
+        limiter.reset();
+
+        let path = limiter.lockfile_path();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create directory at lockfile path");
+
+        assert!(limiter.should_check(), "first check should be allowed");
+        assert!(
+            !limiter.should_check(),
+            "second immediate check should still be blocked"
+        );
+
+        limiter.reset();
+    }
+
+    #[test]
     fn serve_http_overrides_are_applied() {
         let config = build_http_config(
             Some("0.0.0.0".to_string()),
@@ -8146,6 +8191,21 @@ mod tests {
         assert_eq!(config.http_host, "0.0.0.0");
         assert_eq!(config.http_port, 9000);
         assert_eq!(config.http_path, "/api/v2/");
+    }
+
+    #[test]
+    fn serve_http_path_aliases_are_normalized() {
+        let config_mcp = build_http_config(None, None, Some("mcp".to_string()), false);
+        assert_eq!(config_mcp.http_path, "/mcp/");
+
+        let config_api = build_http_config(None, None, Some("/api".to_string()), false);
+        assert_eq!(config_api.http_path, "/api/");
+    }
+
+    #[test]
+    fn serve_http_relative_path_is_normalized() {
+        let config = build_http_config(None, None, Some("custom/path".to_string()), false);
+        assert_eq!(config.http_path, "/custom/path/");
     }
 
     #[test]
@@ -18388,6 +18448,13 @@ impl CheckInboxRateLimiter {
         std::path::PathBuf::from(format!("/tmp/mcp-mail-check-{}", self.agent_sanitized))
     }
 
+    fn process_local_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, u64>>,
+        > = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
     /// Check if enough time has elapsed since the last check.
     ///
     /// Returns `true` if a check should proceed, `false` if rate-limited.
@@ -18397,15 +18464,26 @@ impl CheckInboxRateLimiter {
     #[must_use]
     pub fn should_check(&self) -> bool {
         let path = self.lockfile_path();
+        let cache_key = path.to_string_lossy().to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
         // Read last check timestamp from file
-        let last_check = std::fs::read_to_string(&path)
+        let fs_last_check = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok());
+        let mem_last_check = Self::process_local_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key).copied());
+        let last_check = match (fs_last_check, mem_last_check) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
 
         // Check if enough time has elapsed
         if let Some(last) = last_check {
@@ -18416,8 +18494,13 @@ impl CheckInboxRateLimiter {
             }
         }
 
-        // Update timestamp and proceed
-        // Write errors are ignored (fail-open)
+        // Update process-local timestamp first so failing filesystem writes
+        // still rate-limit this process.
+        if let Ok(mut cache) = Self::process_local_cache().lock() {
+            cache.insert(cache_key, now);
+        }
+
+        // Best-effort cross-process timestamp persistence.
         let _ = std::fs::write(&path, now.to_string());
 
         true
@@ -18427,7 +18510,14 @@ impl CheckInboxRateLimiter {
     ///
     /// Errors are ignored.
     pub fn reset(&self) {
-        let _ = std::fs::remove_file(self.lockfile_path());
+        let path = self.lockfile_path();
+        let _ = std::fs::remove_file(&path);
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        if let Ok(mut cache) = Self::process_local_cache().lock() {
+            cache.remove(path.to_string_lossy().as_ref());
+        }
     }
 }
 

@@ -228,6 +228,8 @@ pub struct Config {
     pub tui_dock_visible: bool,
     pub tui_high_contrast: bool,
     pub tui_key_hints: bool,
+    pub tui_reduced_motion: bool,
+    pub tui_screen_reader: bool,
     pub tui_keymap_profile: String,
     pub tui_active_preset: String,
     pub tui_toast_enabled: bool,
@@ -789,6 +791,8 @@ impl Default for Config {
             tui_dock_visible: true,
             tui_high_contrast: false,
             tui_key_hints: true,
+            tui_reduced_motion: false,
+            tui_screen_reader: false,
             tui_keymap_profile: "default".to_string(),
             tui_active_preset: "default".to_string(),
             tui_toast_enabled: true,
@@ -1376,6 +1380,8 @@ impl Config {
         config.tui_dock_visible = console_bool("TUI_DOCK_VISIBLE", config.tui_dock_visible);
         config.tui_high_contrast = console_bool("TUI_HIGH_CONTRAST", config.tui_high_contrast);
         config.tui_key_hints = console_bool("TUI_KEY_HINTS", config.tui_key_hints);
+        config.tui_reduced_motion = console_bool("TUI_REDUCED_MOTION", config.tui_reduced_motion);
+        config.tui_screen_reader = console_bool("TUI_SCREEN_READER", config.tui_screen_reader);
         if let Some(v) = console_value("TUI_KEYMAP_PROFILE") {
             let lower = v.trim().to_ascii_lowercase();
             if matches!(
@@ -2173,6 +2179,26 @@ mod tests {
         assert_eq!(config.console_ui_anchor, ConsoleUiAnchor::Top);
         assert!(config.console_ui_auto_size);
         assert_eq!(config.console_theme, ConsoleThemeId::Darcula);
+    }
+
+    #[test]
+    fn test_tui_accessibility_reads_user_envfile_when_env_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(
+            &env_path,
+            "TUI_HIGH_CONTRAST=true\nTUI_KEY_HINTS=false\nTUI_REDUCED_MOTION=1\nTUI_SCREEN_READER=yes\n",
+        )
+        .expect("write envfile");
+        let env_path_str = env_path.to_string_lossy().to_string();
+        let vars = vec![("CONSOLE_PERSIST_PATH", env_path_str.as_str())];
+        let _env = TestEnvOverrideGuard::set(&vars);
+
+        let config = Config::from_env();
+        assert!(config.tui_high_contrast);
+        assert!(!config.tui_key_hints);
+        assert!(config.tui_reduced_motion);
+        assert!(config.tui_screen_reader);
     }
 
     #[test]

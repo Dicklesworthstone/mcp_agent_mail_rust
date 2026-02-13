@@ -613,7 +613,7 @@ impl TwoTierBridge {
     /// Check if two-tier search is available (at least fast embedder).
     #[must_use]
     pub fn is_available(&self) -> bool {
-        get_two_tier_context().is_available()
+        get_two_tier_context().fast_info().is_some()
     }
 
     /// Check if full two-tier search is available (both tiers).
@@ -634,11 +634,11 @@ impl TwoTierBridge {
     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
         let ctx = get_two_tier_context();
 
-        // Check availability
-        if !ctx.is_available() {
+        // Two-tier bridge requires fast embeddings for both query and indexed docs.
+        if ctx.fast_info().is_none() {
             tracing::debug!(
                 target: "search.semantic",
-                "no embedders available, skipping two-tier search"
+                "fast embedder unavailable, skipping two-tier search"
             );
             return Vec::new();
         }
@@ -693,8 +693,8 @@ impl TwoTierBridge {
     ) -> Result<(), String> {
         let ctx = get_two_tier_context();
 
-        if !ctx.is_available() {
-            return Err("no embedders available".to_string());
+        if ctx.fast_info().is_none() {
+            return Err("fast embedder unavailable".to_string());
         }
 
         // Embed with fast tier
@@ -1660,7 +1660,7 @@ mod tests {
         use std::thread;
 
         let barrier = Arc::new(std::sync::Barrier::new(10));
-        let pointers: Vec<_> = (0..10)
+        let results: Vec<_> = (0..10)
             .map(|_| {
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
@@ -1669,13 +1669,15 @@ mod tests {
                     get_or_init_two_tier_bridge().map(|arc| Arc::as_ptr(&arc) as usize)
                 })
             })
+            .filter_map(|h| h.join().ok())
             .collect();
 
-        let results: Vec<_> = pointers.into_iter().filter_map(|h| h.join().ok()).collect();
+        // All 10 threads should complete (no panics).
+        assert_eq!(results.len(), 10, "all 10 threads should complete");
 
         // All threads should have gotten Some(bridge)
         assert!(
-            results.iter().all(|r| r.is_some()),
+            results.iter().all(std::option::Option::is_some),
             "all threads should get a bridge"
         );
 
@@ -1703,8 +1705,7 @@ mod tests {
         // 1000 cached accesses should complete in <10ms (avg <10µs each)
         assert!(
             elapsed.as_millis() < 10,
-            "1000 cached accesses took {:?}, expected <10ms",
-            elapsed
+            "1000 cached accesses took {elapsed:?}, expected <10ms"
         );
     }
 
@@ -1715,7 +1716,7 @@ mod tests {
         use std::thread;
 
         let barrier = Arc::new(std::sync::Barrier::new(100));
-        let handles: Vec<_> = (0..100)
+        let results: Vec<_> = (0..100)
             .map(|_| {
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
@@ -1723,14 +1724,13 @@ mod tests {
                     get_or_init_two_tier_bridge().map(|arc| Arc::as_ptr(&arc) as usize)
                 })
             })
+            .filter_map(|h| h.join().ok())
             .collect();
-
-        let results: Vec<_> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
 
         // All 100 threads should succeed
         assert_eq!(results.len(), 100, "all 100 threads should complete");
         assert!(
-            results.iter().all(|r| r.is_some()),
+            results.iter().all(std::option::Option::is_some),
             "all threads should get a bridge"
         );
 

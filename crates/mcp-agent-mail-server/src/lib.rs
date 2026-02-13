@@ -3304,22 +3304,32 @@ impl HttpState {
         false
     }
 
-    fn check_bearer_auth(&self, req: &Http1Request) -> Option<Http1Response> {
+    fn has_expected_bearer_header(&self, req: &Http1Request) -> bool {
         let Some(expected) = &self.config.http_bearer_token else {
-            return None;
+            return false;
         };
+        let auth = header_value(req, "authorization").unwrap_or("");
+        let expected_header = format!("Bearer {expected}");
+        constant_time_eq(auth, expected_header.as_str())
+    }
+
+    fn check_bearer_auth(&self, req: &Http1Request) -> Option<Http1Response> {
+        self.config.http_bearer_token.as_ref()?;
 
         if self.allow_local_unauthenticated(req) {
             return None;
         }
 
-        // Legacy parity: compare the full header value (no trimming/coercion).
-        let auth = header_value(req, "authorization").unwrap_or("");
-        let expected_header = format!("Bearer {expected}");
-        if !constant_time_eq(auth, expected_header.as_str()) {
-            return Some(self.error_response(req, 401, "Unauthorized"));
+        // Legacy parity: static bearer checks compare the full header value
+        // (no trimming/coercion). In mixed static+JWT mode, non-static bearer
+        // tokens are deferred to JWT validation in `check_rbac_and_rate_limit`.
+        if self.has_expected_bearer_header(req) {
+            return None;
         }
-        None
+        if self.config.http_jwt_enabled && Self::parse_bearer_token(req).is_ok() {
+            return None;
+        }
+        Some(self.error_response(req, 401, "Unauthorized"))
     }
 
     async fn fetch_jwks(&self, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
@@ -3628,9 +3638,13 @@ impl HttpState {
         let is_local_ok = self.allow_local_unauthenticated(req);
 
         let (roles, jwt_sub) = if self.config.http_jwt_enabled {
-            match self.decode_jwt(req).await {
-                Ok(ctx) => (ctx.roles, ctx.sub),
-                Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
+            if self.has_expected_bearer_header(req) {
+                (vec![self.config.http_rbac_default_role.clone()], None)
+            } else {
+                match self.decode_jwt(req).await {
+                    Ok(ctx) => (ctx.roles, ctx.sub),
+                    Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
+                }
             }
         } else {
             (vec![self.config.http_rbac_default_role.clone()], None)
@@ -11823,6 +11837,64 @@ mod tests {
         assert!(
             resp.is_none(),
             "valid JWT should be accepted when both auth modes configured"
+        );
+    }
+
+    #[test]
+    fn mixed_auth_handle_allows_static_bearer_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("static-secret-token".to_string()),
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("jwt-secret".to_string()),
+            http_rbac_enabled: false,
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", "Bearer static-secret-token")],
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 1)).expect("json");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 200,
+            "static bearer token should pass mixed auth end-to-end"
+        );
+    }
+
+    #[test]
+    fn mixed_auth_handle_allows_valid_jwt() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("static-secret-token".to_string()),
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("jwt-secret".to_string()),
+            http_rbac_enabled: false,
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+        let jwt_token = hs256_token(b"jwt-secret", &claims);
+        let auth = format!("Bearer {jwt_token}");
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 1)).expect("json");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 200,
+            "valid JWT should pass mixed auth end-to-end"
         );
     }
 

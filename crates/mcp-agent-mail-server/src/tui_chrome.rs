@@ -188,7 +188,13 @@ pub fn render_status_line(
     // Build right section
     let help_hint = if help_visible { "[?] Help" } else { "? help" };
     let muted_hint = if toast_muted { " [Toasts: muted]" } else { "" };
-    let right_str = format!("{help_hint}{muted_hint}");
+    let a11y_hint = match (accessibility.reduced_motion, accessibility.screen_reader) {
+        (false, false) => "",
+        (true, false) => " [A11y: reduced-motion]",
+        (false, true) => " [A11y: screen-reader]",
+        (true, true) => " [A11y: reduced-motion,screen-reader]",
+    };
+    let right_str = format!("{help_hint}{muted_hint}{a11y_hint}");
 
     // Calculate widths
     let title = meta.title;
@@ -203,6 +209,7 @@ pub fn render_status_line(
     let sep = " | ";
     let sep_len = u16::try_from(sep.len()).unwrap_or(u16::MAX);
     let key_hints = if accessibility.key_hints
+        && !accessibility.screen_reader
         && !screen_bindings.is_empty()
         && left_len
             .saturating_add(center_len)
@@ -837,6 +844,8 @@ mod tests {
         let settings = AccessibilitySettings {
             high_contrast: true,
             key_hints: true,
+            reduced_motion: false,
+            screen_reader: false,
         };
         let p = ChromePalette::from_settings(&settings);
         assert_eq!(p.tab_active_bg, HC_TAB_ACTIVE_BG);
@@ -849,6 +858,8 @@ mod tests {
         let settings = AccessibilitySettings {
             high_contrast: false,
             key_hints: true,
+            reduced_motion: false,
+            screen_reader: false,
         };
         let p = ChromePalette::from_settings(&settings);
         // Non-HC mode now derives from the active ftui theme, not static constants.

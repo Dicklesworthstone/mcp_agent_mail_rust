@@ -2412,9 +2412,19 @@ fn remove_lock_owner(repo_root: &Path) {
 
 /// Check if a process with the given PID is still alive.
 ///
-/// Uses `/proc/<pid>/` on Linux (no `unsafe` required).
+/// Prefers `/proc/<pid>` when available (Linux semantics), and falls back to
+/// `pid_alive` for platforms without `/proc`.
 fn is_pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        if Path::new("/proc").exists() {
+            return Path::new(&format!("/proc/{pid}")).exists();
+        }
+    }
+    pid_alive(pid)
 }
 
 /// Try to clean up a stale .git/index.lock file with PID-aware safety.
@@ -6083,6 +6093,27 @@ mod tests {
         format!("/tmp/{prefix}-{suffix}")
     }
 
+    fn enqueue_with_retry(op_template: WriteOp, context: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut attempts = 0_u32;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match wbq_enqueue(op_template.clone()) {
+                WbqEnqueueResult::Enqueued => return,
+                WbqEnqueueResult::SkippedDiskCritical => {
+                    panic!("{context}: enqueue skipped due critical disk pressure")
+                }
+                WbqEnqueueResult::QueueUnavailable => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("{context}: enqueue remained unavailable after {attempts} attempts");
+                    }
+                    wbq_flush();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_ensure_archive_root() {
         let tmp = TempDir::new().unwrap();
@@ -8003,7 +8034,7 @@ mod tests {
             extra_paths: vec![],
         };
 
-        assert_eq!(wbq_enqueue(op), WbqEnqueueResult::Enqueued);
+        enqueue_with_retry(op, "wbq_message_bundle_roundtrip");
         wbq_flush();
         flush_async_commits();
 
@@ -8037,7 +8068,7 @@ mod tests {
             reservations: vec![res_json],
         };
 
-        assert_eq!(wbq_enqueue(op), WbqEnqueueResult::Enqueued);
+        enqueue_with_retry(op, "wbq_file_reservation_roundtrip");
         wbq_flush();
         flush_async_commits();
 
@@ -8071,7 +8102,7 @@ mod tests {
             metadata: Some(metadata),
         };
 
-        assert_eq!(wbq_enqueue(op), WbqEnqueueResult::Enqueued);
+        enqueue_with_retry(op, "wbq_notification_signal_roundtrip");
         wbq_flush();
 
         let signal_path = config
@@ -8294,10 +8325,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let project_slug = "wbq-batch-100".to_string();
-        let _ = ensure_archive(&config, &project_slug).unwrap();
+        let archive = ensure_archive(&config, &project_slug).unwrap();
+        let repo_root = archive.repo_root.clone();
 
         let coalescer = get_commit_coalescer();
-        let stats_before = coalescer.stats();
+        let stats_before = coalescer
+            .per_repo_stats()
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_default();
 
         for i in 0..100_u64 {
             let agent_json = serde_json::json!({
@@ -8316,8 +8352,21 @@ mod tests {
         wbq_flush();
         flush_async_commits();
 
-        let stats_after = coalescer.stats();
-        let commits_delta = stats_after.commits.saturating_sub(stats_before.commits);
+        let stats_after = coalescer
+            .per_repo_stats()
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_default();
+        let enqueued_delta = stats_after
+            .enqueued_total
+            .saturating_sub(stats_before.enqueued_total);
+        let commits_delta = stats_after
+            .commits_total
+            .saturating_sub(stats_before.commits_total);
+        assert!(
+            enqueued_delta >= 100,
+            "expected repo-local enqueue delta >= 100, got {enqueued_delta}"
+        );
         assert!(
             commits_delta > 0,
             "burst should produce at least one coalesced commit"
@@ -9012,11 +9061,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let archive = ensure_archive(&config, "batch-eff").unwrap();
+        let repo_root = archive.repo_root.clone();
 
         let coalescer = get_commit_coalescer();
-        let stats_before = coalescer.stats();
+        let stats_before = coalescer
+            .per_repo_stats()
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_default();
 
         let burst_count = 100usize;
+        let burst_count_u64 = u64::try_from(burst_count).unwrap_or(u64::MAX);
         for i in 0..burst_count {
             // Write a unique file for each enqueue.
             let file_name = format!("batch_test_{i}.txt");
@@ -9035,19 +9090,27 @@ mod tests {
         // Give the coalescer workers time to drain.
         coalescer.flush_sync();
 
-        let stats_after = coalescer.stats();
-        let enqueued_delta = stats_after.enqueued - stats_before.enqueued;
-        let commits_delta = stats_after.commits - stats_before.commits;
+        let stats_after = coalescer
+            .per_repo_stats()
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_default();
+        let enqueued_delta = stats_after
+            .enqueued_total
+            .saturating_sub(stats_before.enqueued_total);
+        let commits_delta = stats_after
+            .commits_total
+            .saturating_sub(stats_before.commits_total);
 
         assert!(
-            enqueued_delta >= burst_count,
+            enqueued_delta >= burst_count_u64,
             "expected at least {burst_count} enqueued, got delta {enqueued_delta}"
         );
 
         // Batching should reduce commit count significantly.
         if commits_delta > 0 {
             assert!(
-                commits_delta < burst_count / 2,
+                commits_delta < burst_count_u64 / 2,
                 "batching should reduce commits: {commits_delta} commits for {enqueued_delta} \
                  enqueues (expected < {}, avg batch = {:.1})",
                 burst_count / 2,

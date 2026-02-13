@@ -1146,7 +1146,7 @@ impl GateRunnerConfig {
 /// # Returns
 /// A `GateResult` with pass/fail/skip status and timing.
 pub fn run_gate(config: &GateConfig, runner_config: &GateRunnerConfig) -> GateResult {
-    use std::io::{BufRead, BufReader};
+    use std::io::{self, BufRead, BufReader};
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
@@ -1189,14 +1189,21 @@ pub fn run_gate(config: &GateConfig, runner_config: &GateRunnerConfig) -> GateRe
         }
     };
 
-    // Capture stderr in background
-    let stderr_handle = child.stderr.take();
-    let stderr_lines: Vec<String> = if let Some(stderr) = stderr_handle {
-        let reader = BufReader::new(stderr);
-        reader.lines().filter_map(Result::ok).collect()
-    } else {
-        Vec::new()
-    };
+    // Drain stdout/stderr in background so child processes cannot block
+    // on full pipe buffers. Keep stderr lines for diagnostics.
+    let stdout_drain = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut sink = io::sink();
+            let _ = io::copy(&mut reader, &mut sink);
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            reader.lines().map_while(Result::ok).collect::<Vec<_>>()
+        })
+    });
 
     // Wait for completion with timeout
     let timeout = Duration::from_secs(runner_config.timeout_secs);
@@ -1219,6 +1226,12 @@ pub fn run_gate(config: &GateConfig, runner_config: &GateRunnerConfig) -> GateRe
     };
 
     let elapsed = start.elapsed();
+    let stderr_lines = stderr_reader
+        .and_then(|join| join.join().ok())
+        .unwrap_or_default();
+    if let Some(join) = stdout_drain {
+        let _ = join.join();
+    }
 
     match status {
         Ok(exit_status) if exit_status.success() => GateResult::pass(config, elapsed),
@@ -1807,6 +1820,28 @@ mod tests {
     }
 
     #[test]
+    fn test_run_gate_enforces_timeout_without_stderr_output() {
+        let gate = GateConfig::new(
+            "Timeout test",
+            GateCategory::Quality,
+            ["bash", "-c", "sleep 2"],
+        );
+        let config = GateRunnerConfig::default().timeout_secs(1);
+
+        let result = run_gate(&gate, &config);
+
+        assert_eq!(result.status, GateStatus::Fail);
+        assert!(
+            result
+                .stderr_tail
+                .as_deref()
+                .is_some_and(|tail| tail.contains("timeout")),
+            "expected timeout diagnostic, got {:?}",
+            result.stderr_tail
+        );
+    }
+
+    #[test]
     fn test_run_gate_empty_command() {
         let gate = GateConfig {
             name: "Empty".to_string(),
@@ -2115,19 +2150,20 @@ mod tests {
         }];
 
         let report = GateReport::new(RunMode::Full, results);
-        let temp_path = "/tmp/gate_report_test.json";
+        let temp_dir = tempfile::tempdir().expect("tempdir should create");
+        let temp_path = temp_dir.path().join("gate_report_test.json");
 
         // Write to file
-        report.write_to_file(temp_path).expect("write should work");
+        report.write_to_file(&temp_path).expect("write should work");
 
         // Read back
-        let loaded = GateReport::from_file(temp_path).expect("read should work");
+        let loaded = GateReport::from_file(&temp_path).expect("read should work");
 
         assert_eq!(loaded.schema_version, report.schema_version);
         assert_eq!(loaded.gates[0].name, "File IO Test");
 
         // Cleanup
-        let _ = fs::remove_file(temp_path);
+        let _ = fs::remove_file(&temp_path);
     }
 
     // ── GateError Tests (T1.6) ────────────────────────────────────────────────

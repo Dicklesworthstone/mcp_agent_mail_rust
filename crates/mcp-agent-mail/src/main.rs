@@ -290,6 +290,7 @@ fn resolve_reuse_running_setting(
 enum ReusePreflightDecision {
     Proceed,
     ReusedExistingServer,
+    AgentMailServerRunning,
     PortOccupiedByOtherProcess { description: String },
 }
 
@@ -298,7 +299,10 @@ fn decide_reuse_preflight(
     port_status: PortStatus,
 ) -> ReusePreflightDecision {
     if !reuse_running_enabled {
-        return ReusePreflightDecision::Proceed;
+        return match port_status {
+            PortStatus::AgentMailServer => ReusePreflightDecision::AgentMailServerRunning,
+            _ => ReusePreflightDecision::Proceed,
+        };
     }
 
     match port_status {
@@ -412,6 +416,16 @@ fn main() {
                         config.http_host, config.http_port
                     );
                     return;
+                }
+                ReusePreflightDecision::AgentMailServerRunning => {
+                    eprintln!(
+                        "am: an Agent Mail server is already running on {}:{}.",
+                        config.http_host, config.http_port
+                    );
+                    eprintln!(
+                        "am: use --reuse-running to reuse it, or stop it before starting a new instance."
+                    );
+                    std::process::exit(2);
                 }
                 ReusePreflightDecision::PortOccupiedByOtherProcess { description } => {
                     eprintln!(
@@ -672,6 +686,10 @@ mod tests {
                 }
             ),
             ReusePreflightDecision::Proceed
+        );
+        assert_eq!(
+            decide_reuse_preflight(false, PortStatus::AgentMailServer),
+            ReusePreflightDecision::AgentMailServerRunning
         );
 
         assert_eq!(
