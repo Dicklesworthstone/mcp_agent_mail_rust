@@ -893,4 +893,457 @@ mod tests {
         assert!(index.is_empty());
         assert_eq!(index.len(), 0);
     }
+
+    // ── New tests ────────────────────────────────────────────────────
+
+    // ── VectorHit ──
+
+    #[test]
+    fn vector_hit_new_constructor() {
+        let hit = VectorHit::new(42, DocKind::Agent, Some(7), 0.85, 3);
+        assert_eq!(hit.doc_id, 42);
+        assert_eq!(hit.doc_kind, DocKind::Agent);
+        assert_eq!(hit.project_id, Some(7));
+        assert!((hit.score - 0.85).abs() < f32::EPSILON);
+        assert_eq!(hit.index_position, 3);
+    }
+
+    #[test]
+    fn vector_hit_serde_roundtrip() {
+        let hit = VectorHit::new(1, DocKind::Message, Some(5), 0.95, 0);
+        let json = serde_json::to_string(&hit).unwrap();
+        let restored: VectorHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.doc_id, 1);
+        assert_eq!(restored.doc_kind, DocKind::Message);
+        assert!((restored.score - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn vector_hit_equality() {
+        let a = VectorHit::new(1, DocKind::Message, None, 0.5, 0);
+        let b = VectorHit::new(1, DocKind::Message, None, 0.5, 99);
+        // PartialEq checks doc_id, doc_kind, score — not index_position
+        assert_eq!(a, b);
+
+        let c = VectorHit::new(2, DocKind::Message, None, 0.5, 0);
+        assert_ne!(a, c); // Different doc_id
+    }
+
+    #[test]
+    fn vector_hit_ordering_nan_score() {
+        let a = VectorHit::new(1, DocKind::Message, None, f32::NAN, 0);
+        let b = VectorHit::new(2, DocKind::Message, None, 0.5, 1);
+        // NaN comparison falls through to doc_id tiebreak
+        let _ = a.cmp(&b); // Should not panic
+    }
+
+    // ── VectorMetadata ──
+
+    #[test]
+    fn metadata_new_and_builders() {
+        let meta = VectorMetadata::new(10, DocKind::Project, "model-v1")
+            .with_project(42)
+            .with_hash("abc123");
+        assert_eq!(meta.doc_id, 10);
+        assert_eq!(meta.doc_kind, DocKind::Project);
+        assert_eq!(meta.project_id, Some(42));
+        assert_eq!(meta.model_id, "model-v1");
+        assert_eq!(meta.content_hash, "abc123");
+        assert!(meta.extra.is_empty());
+    }
+
+    #[test]
+    fn metadata_default() {
+        let meta = VectorMetadata::default();
+        assert_eq!(meta.doc_id, 0);
+        assert_eq!(meta.doc_kind, DocKind::Message);
+        assert!(meta.project_id.is_none());
+        assert!(meta.model_id.is_empty());
+        assert!(meta.content_hash.is_empty());
+    }
+
+    #[test]
+    fn metadata_serde_roundtrip() {
+        let mut meta = VectorMetadata::new(5, DocKind::Agent, "model-x").with_project(3);
+        meta.extra.insert("custom".to_owned(), "value".to_owned());
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let restored: VectorMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.doc_id, 5);
+        assert_eq!(restored.doc_kind, DocKind::Agent);
+        assert_eq!(restored.project_id, Some(3));
+        assert_eq!(restored.extra.get("custom"), Some(&"value".to_owned()));
+    }
+
+    // ── VectorFilter extended ──
+
+    #[test]
+    fn filter_by_model() {
+        let filter = VectorFilter::new().with_model("model-v2");
+        let meta_match = VectorMetadata::new(1, DocKind::Message, "model-v2");
+        let meta_no_match = VectorMetadata::new(2, DocKind::Message, "model-v1");
+
+        assert!(filter.matches(&meta_match));
+        assert!(!filter.matches(&meta_no_match));
+    }
+
+    #[test]
+    fn filter_combined_all_criteria() {
+        let filter = VectorFilter::new()
+            .with_project(42)
+            .with_doc_kinds(vec![DocKind::Message])
+            .with_model("model-v1")
+            .with_exclusions(vec![99]);
+
+        assert!(!filter.is_empty());
+
+        // Matches all criteria
+        let meta_ok = VectorMetadata::new(1, DocKind::Message, "model-v1").with_project(42);
+        assert!(filter.matches(&meta_ok));
+
+        // Wrong project
+        let meta_bad_proj = VectorMetadata::new(1, DocKind::Message, "model-v1").with_project(99);
+        assert!(!filter.matches(&meta_bad_proj));
+
+        // Wrong kind
+        let meta_bad_kind = VectorMetadata::new(1, DocKind::Agent, "model-v1").with_project(42);
+        assert!(!filter.matches(&meta_bad_kind));
+
+        // Wrong model
+        let meta_bad_model = VectorMetadata::new(1, DocKind::Message, "model-v2").with_project(42);
+        assert!(!filter.matches(&meta_bad_model));
+
+        // Excluded doc_id
+        let meta_excluded = VectorMetadata::new(99, DocKind::Message, "model-v1").with_project(42);
+        assert!(!filter.matches(&meta_excluded));
+    }
+
+    #[test]
+    fn filter_default_is_empty() {
+        let filter = VectorFilter::default();
+        assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn filter_serde_roundtrip() {
+        let filter = VectorFilter::new()
+            .with_project(7)
+            .with_doc_kinds(vec![DocKind::Message, DocKind::Agent])
+            .with_exclusions(vec![1, 2]);
+
+        let json = serde_json::to_string(&filter).unwrap();
+        let restored: VectorFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.project_id, Some(7));
+        assert_eq!(
+            restored.doc_kinds,
+            Some(vec![DocKind::Message, DocKind::Agent])
+        );
+        assert_eq!(restored.exclude_doc_ids, Some(vec![1, 2]));
+    }
+
+    // ── VectorIndexConfig ──
+
+    #[test]
+    fn config_default_values() {
+        let config = VectorIndexConfig::default();
+        assert_eq!(config.dimension, 384);
+        assert_eq!(config.max_vectors, 0);
+        assert!(!config.use_mmap);
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = VectorIndexConfig {
+            dimension: 768,
+            max_vectors: 50_000,
+            use_mmap: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: VectorIndexConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.dimension, 768);
+        assert_eq!(restored.max_vectors, 50_000);
+        assert!(restored.use_mmap);
+    }
+
+    // ── VectorIndex extended ──
+
+    #[test]
+    fn index_default_trait() {
+        let index = VectorIndex::default();
+        assert!(index.is_empty());
+        assert_eq!(index.config().dimension, 384);
+    }
+
+    #[test]
+    fn index_config_accessor() {
+        let index = VectorIndex::new(VectorIndexConfig {
+            dimension: 128,
+            max_vectors: 1000,
+            use_mmap: false,
+        });
+        assert_eq!(index.config().dimension, 128);
+        assert_eq!(index.config().max_vectors, 1000);
+    }
+
+    #[test]
+    fn index_max_vectors_enforcement() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            max_vectors: 2,
+            use_mmap: false,
+        });
+
+        index
+            .upsert(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .upsert(make_entry(2, DocKind::Message, &[0.0, 1.0, 0.0]))
+            .unwrap();
+        // Third should fail
+        let result = index.upsert(make_entry(3, DocKind::Message, &[0.0, 0.0, 1.0]));
+        assert!(result.is_err());
+        assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn index_max_vectors_rejects_upsert_at_capacity() {
+        // Note: upsert checks capacity BEFORE checking for existing entries,
+        // so updating an existing entry also fails when at max_vectors.
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            max_vectors: 1,
+            use_mmap: false,
+        });
+
+        index
+            .upsert(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
+            .unwrap();
+        // Even updating existing entry fails at capacity
+        let result = index.upsert(make_entry(1, DocKind::Message, &[0.0, 1.0, 0.0]));
+        assert!(result.is_err());
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn index_get_returns_none_for_missing() {
+        let index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+        assert!(index.get(999, DocKind::Message).is_none());
+    }
+
+    #[test]
+    fn search_query_dimension_mismatch() {
+        let index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+        let result = index.search(&[1.0, 0.0], 10, None); // Wrong dimension
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn search_with_multiple_doc_kinds() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+
+        index
+            .upsert(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .upsert(make_entry(2, DocKind::Agent, &[1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .upsert(make_entry(3, DocKind::Project, &[1.0, 0.0, 0.0]))
+            .unwrap();
+
+        // Filter only messages and agents
+        let filter = VectorFilter::new().with_doc_kinds(vec![DocKind::Message, DocKind::Agent]);
+        let results = index.search(&[1.0, 0.0, 0.0], 10, Some(&filter)).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|h| h.doc_kind != DocKind::Project));
+    }
+
+    #[test]
+    fn remove_then_search_works() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+
+        index
+            .upsert(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .upsert(make_entry(2, DocKind::Message, &[0.0, 1.0, 0.0]))
+            .unwrap();
+        index
+            .upsert(make_entry(3, DocKind::Message, &[0.0, 0.0, 1.0]))
+            .unwrap();
+
+        index.remove(2, DocKind::Message);
+
+        let results = index.search(&[1.0, 0.0, 0.0], 10, None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|h| h.doc_id != 2));
+    }
+
+    #[test]
+    fn remove_swap_removes_correctly() {
+        // Remove a middle entry and verify the swap-remove doesn't corrupt the index
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+
+        index
+            .upsert(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .upsert(make_entry(2, DocKind::Message, &[0.0, 1.0, 0.0]))
+            .unwrap();
+        index
+            .upsert(make_entry(3, DocKind::Message, &[0.0, 0.0, 1.0]))
+            .unwrap();
+
+        // Remove first entry (triggers swap with last)
+        index.remove(1, DocKind::Message);
+        assert_eq!(index.len(), 2);
+
+        // All remaining entries should be findable
+        assert!(index.contains(2, DocKind::Message));
+        assert!(index.contains(3, DocKind::Message));
+        assert!(!index.contains(1, DocKind::Message));
+
+        // Search should still work correctly
+        let results = index.search(&[0.0, 1.0, 0.0], 10, None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc_id, 2); // Best match
+    }
+
+    #[test]
+    fn index_estimated_memory() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 384,
+            ..Default::default()
+        });
+        assert_eq!(index.estimated_memory(), 0);
+
+        index
+            .upsert(make_entry(1, DocKind::Message, &vec![0.1; 384]))
+            .unwrap();
+        let mem = index.estimated_memory();
+        // 1 entry * (384 * 4 + 200 + 32)
+        assert!(mem > 0);
+        assert!(mem > 384 * 4); // At least vector bytes
+    }
+
+    // ── IndexEntry ──
+
+    #[test]
+    fn index_entry_normalizes_vector() {
+        let entry = IndexEntry::new(&[3.0, 4.0], VectorMetadata::new(1, DocKind::Message, "m"));
+        // 3-4-5 triangle: normalized = [0.6, 0.8]
+        assert!((entry.vector[0] - 0.6).abs() < 0.01);
+        assert!((entry.vector[1] - 0.8).abs() < 0.01);
+    }
+
+    // ── VectorIndexStats ──
+
+    #[test]
+    fn stats_serde_roundtrip() {
+        let mut by_kind = HashMap::new();
+        by_kind.insert("message".to_owned(), 10);
+        by_kind.insert("agent".to_owned(), 3);
+        let mut by_project = HashMap::new();
+        by_project.insert(1, 8);
+        by_project.insert(2, 5);
+
+        let stats = VectorIndexStats {
+            total_vectors: 13,
+            dimension: 384,
+            by_doc_kind: by_kind,
+            by_project,
+            memory_bytes: 50000,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let restored: VectorIndexStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.total_vectors, 13);
+        assert_eq!(restored.dimension, 384);
+        assert_eq!(restored.by_doc_kind.get("message"), Some(&10));
+    }
+
+    #[test]
+    fn stats_empty_index() {
+        let index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+        let stats = index.stats();
+        assert_eq!(stats.total_vectors, 0);
+        assert_eq!(stats.dimension, 3);
+        assert!(stats.by_doc_kind.is_empty());
+        assert!(stats.by_project.is_empty());
+        assert_eq!(stats.memory_bytes, 0);
+    }
+
+    // ── dot_product ──
+
+    #[test]
+    fn dot_product_identical_unit_vectors() {
+        let v = [1.0_f32, 0.0, 0.0];
+        assert!((dot_product(&v, &v) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dot_product_orthogonal_vectors() {
+        let a = [1.0_f32, 0.0, 0.0];
+        let b = [0.0_f32, 1.0, 0.0];
+        assert!(dot_product(&a, &b).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dot_product_empty_vectors() {
+        assert!(dot_product(&[], &[]).abs() < f32::EPSILON);
+    }
+
+    // ── Search edge cases ──
+
+    #[test]
+    fn search_k_zero_returns_empty() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+        index
+            .upsert(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
+            .unwrap();
+
+        let results = index.search(&[1.0, 0.0, 0.0], 0, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_with_exclusion_filter() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+
+        for id in 1..=5 {
+            index
+                .upsert(make_entry(id, DocKind::Message, &[1.0, 0.0, 0.0]))
+                .unwrap();
+        }
+
+        let filter = VectorFilter::new().with_exclusions(vec![2, 4]);
+        let results = index.search(&[1.0, 0.0, 0.0], 10, Some(&filter)).unwrap();
+        assert_eq!(results.len(), 3);
+        let ids: Vec<i64> = results.iter().map(|h| h.doc_id).collect();
+        assert!(!ids.contains(&2));
+        assert!(!ids.contains(&4));
+    }
 }
