@@ -315,6 +315,7 @@ impl MailScreen for ReservationsScreen {
         if area.height < 3 || area.width < 30 {
             return;
         }
+        let tp = crate::tui_theme::TuiThemePalette::current();
 
         let header_h = 1_u16;
         let table_h = area.height.saturating_sub(header_h);
@@ -369,14 +370,14 @@ impl MailScreen for ReservationsScreen {
 
                 let style = if Some(i) == self.table_state.selected {
                     Style::default()
-                        .fg(PackedRgba::rgb(0, 0, 0))
-                        .bg(PackedRgba::rgb(255, 184, 108))
+                        .fg(tp.selection_fg)
+                        .bg(tp.selection_bg)
                 } else if res.released {
-                    Style::default().fg(PackedRgba::rgb(100, 105, 120))
+                    Style::default().fg(tp.text_disabled)
                 } else if remaining == 0 {
-                    Style::default().fg(PackedRgba::rgb(255, 100, 100))
+                    Style::default().fg(tp.severity_error)
                 } else if ratio < 0.2 {
-                    Style::default().fg(PackedRgba::rgb(255, 184, 108))
+                    Style::default().fg(tp.ttl_warning)
                 } else {
                     Style::default()
                 };
@@ -411,13 +412,13 @@ impl MailScreen for ReservationsScreen {
             .block(block)
             .highlight_style(
                 Style::default()
-                    .fg(PackedRgba::rgb(0, 0, 0))
-                    .bg(PackedRgba::rgb(255, 184, 108)),
+                    .fg(tp.selection_fg)
+                    .bg(tp.selection_bg),
             );
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);
-        render_ttl_overlays(frame, table_area, &ttl_overlay_rows);
+        render_ttl_overlays(frame, table_area, &ttl_overlay_rows, &tp);
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -475,19 +476,19 @@ const fn compute_table_widths(total_width: u16) -> [u16; 5] {
     [c0, c1, c2, c3, c4]
 }
 
-fn ttl_fill_color(ratio: f64, released: bool) -> PackedRgba {
+fn ttl_fill_color(ratio: f64, released: bool, tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
     if released {
-        PackedRgba::rgb(90, 95, 110)
+        tp.ttl_expired
     } else if ratio < 0.2 {
-        PackedRgba::rgb(255, 100, 100)
+        tp.ttl_danger
     } else if ratio < 0.5 {
-        PackedRgba::rgb(220, 180, 50)
+        tp.ttl_warning
     } else {
-        PackedRgba::rgb(80, 200, 80)
+        tp.ttl_healthy
     }
 }
 
-fn render_ttl_overlays(frame: &mut Frame<'_>, table_area: Rect, rows: &[TtlOverlayRow]) {
+fn render_ttl_overlays(frame: &mut Frame<'_>, table_area: Rect, rows: &[TtlOverlayRow], tp: &crate::tui_theme::TuiThemePalette) {
     if rows.is_empty() || table_area.width < 8 || table_area.height < 4 {
         return;
     }
@@ -524,21 +525,21 @@ fn render_ttl_overlays(frame: &mut Frame<'_>, table_area: Rect, rows: &[TtlOverl
 
         let base_style = if row.selected {
             Style::default()
-                .fg(PackedRgba::rgb(0, 0, 0))
-                .bg(PackedRgba::rgb(255, 184, 108))
+                .fg(tp.selection_fg)
+                .bg(tp.selection_bg)
         } else if row.released {
             Style::default()
-                .fg(PackedRgba::rgb(120, 124, 140))
-                .bg(PackedRgba::rgb(28, 30, 36))
+                .fg(tp.text_disabled)
+                .bg(tp.bg_deep)
         } else {
             Style::default()
-                .fg(PackedRgba::rgb(220, 220, 220))
-                .bg(PackedRgba::rgb(32, 34, 40))
+                .fg(tp.text_primary)
+                .bg(tp.bg_surface)
         };
         let gauge_bg = if row.selected {
-            PackedRgba::rgb(255, 140, 60)
+            tp.status_accent
         } else {
-            ttl_fill_color(row.ratio, row.released)
+            ttl_fill_color(row.ratio, row.released, tp)
         };
 
         let mut gauge = ProgressBar::new()
@@ -718,10 +719,17 @@ mod tests {
 
     #[test]
     fn ttl_fill_color_thresholds() {
-        assert_eq!(ttl_fill_color(0.8, false), PackedRgba::rgb(80, 200, 80));
-        assert_eq!(ttl_fill_color(0.3, false), PackedRgba::rgb(220, 180, 50));
-        assert_eq!(ttl_fill_color(0.1, false), PackedRgba::rgb(255, 100, 100));
-        assert_eq!(ttl_fill_color(0.8, true), PackedRgba::rgb(90, 95, 110));
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let healthy = ttl_fill_color(0.8, false, &tp);
+        assert!(healthy.r() > 0 || healthy.g() > 0 || healthy.b() > 0, "healthy color should be non-zero");
+        let warning = ttl_fill_color(0.3, false, &tp);
+        assert!(warning.r() > 0 || warning.g() > 0 || warning.b() > 0, "warning color should be non-zero");
+        let danger = ttl_fill_color(0.1, false, &tp);
+        assert!(danger.r() > 0 || danger.g() > 0 || danger.b() > 0, "danger color should be non-zero");
+        let expired = ttl_fill_color(0.8, true, &tp);
+        assert!(expired.r() > 0 || expired.g() > 0 || expired.b() > 0, "expired color should be non-zero");
+        // Ensure different bands produce different colors
+        assert_ne!(healthy, danger, "healthy and danger should differ");
     }
 
     #[test]

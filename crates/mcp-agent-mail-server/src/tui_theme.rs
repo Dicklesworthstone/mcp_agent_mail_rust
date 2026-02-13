@@ -14,6 +14,21 @@ static CUSTOM_THEME_OVERRIDE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // ──────────────────────────────────────────────────────────────────────
+// Spacing system
+// ──────────────────────────────────────────────────────────────────────
+
+pub const SP_XS: u16 = 1;
+pub const SP_SM: u16 = 2;
+pub const SP_MD: u16 = 3;
+pub const SP_LG: u16 = 4;
+pub const SP_XL: u16 = 6;
+// Semantic aliases
+pub const INLINE_GAP: u16 = SP_XS;
+pub const ITEM_GAP: u16 = SP_SM;
+pub const PANEL_PADDING: u16 = SP_MD;
+pub const SECTION_GAP: u16 = SP_LG;
+
+// ──────────────────────────────────────────────────────────────────────
 // TuiThemePalette
 // ──────────────────────────────────────────────────────────────────────
 
@@ -51,6 +66,82 @@ pub struct TuiThemePalette {
     // ── Table ────────────────────────────────────────────────────
     pub table_header_fg: PackedRgba,
     pub table_row_alt_bg: PackedRgba,
+
+    // ── Selection ────────────────────────────────────────────────
+    pub selection_bg: PackedRgba,
+    pub selection_fg: PackedRgba,
+
+    // ── Severity ─────────────────────────────────────────────────
+    pub severity_ok: PackedRgba,
+    pub severity_error: PackedRgba,
+    pub severity_warn: PackedRgba,
+    pub severity_critical: PackedRgba,
+
+    // ── Panel ────────────────────────────────────────────────────
+    pub panel_border: PackedRgba,
+    pub panel_border_focused: PackedRgba,
+    pub panel_border_dim: PackedRgba,
+    pub panel_bg: PackedRgba,
+    pub panel_title_fg: PackedRgba,
+
+    // ── Selection extras ─────────────────────────────────────────
+    pub selection_indicator: PackedRgba,
+    pub list_hover_bg: PackedRgba,
+
+    // ── Data visualization ───────────────────────────────────────
+    pub chart_series: [PackedRgba; 6],
+    pub chart_axis: PackedRgba,
+    pub chart_grid: PackedRgba,
+
+    // ── Badges ───────────────────────────────────────────────────
+    pub badge_urgent_bg: PackedRgba,
+    pub badge_urgent_fg: PackedRgba,
+    pub badge_info_bg: PackedRgba,
+    pub badge_info_fg: PackedRgba,
+
+    // ── TTL bands ────────────────────────────────────────────────
+    pub ttl_healthy: PackedRgba,
+    pub ttl_warning: PackedRgba,
+    pub ttl_danger: PackedRgba,
+    pub ttl_expired: PackedRgba,
+
+    // ── Metric tiles ─────────────────────────────────────────────
+    pub metric_uptime: PackedRgba,
+    pub metric_requests: PackedRgba,
+    pub metric_latency: PackedRgba,
+    pub metric_messages: PackedRgba,
+    pub metric_agents: PackedRgba,
+    pub metric_ack_ok: PackedRgba,
+    pub metric_ack_bad: PackedRgba,
+
+    // ── Agent palette ────────────────────────────────────────────
+    pub agent_palette: [PackedRgba; 8],
+
+    // ── Contact status ───────────────────────────────────────────
+    pub contact_approved: PackedRgba,
+    pub contact_pending: PackedRgba,
+    pub contact_blocked: PackedRgba,
+
+    // ── Activity recency ─────────────────────────────────────────
+    pub activity_active: PackedRgba,
+    pub activity_idle: PackedRgba,
+    pub activity_stale: PackedRgba,
+
+    // ── Text / background ────────────────────────────────────────
+    pub text_muted: PackedRgba,
+    pub text_primary: PackedRgba,
+    pub text_secondary: PackedRgba,
+    pub text_disabled: PackedRgba,
+    pub bg_deep: PackedRgba,
+    pub bg_surface: PackedRgba,
+    pub bg_overlay: PackedRgba,
+
+    // ── JSON token styles ────────────────────────────────────────
+    pub json_key: PackedRgba,
+    pub json_string: PackedRgba,
+    pub json_number: PackedRgba,
+    pub json_literal: PackedRgba,
+    pub json_punctuation: PackedRgba,
 }
 
 impl TuiThemePalette {
@@ -96,6 +187,85 @@ impl TuiThemePalette {
 
             table_header_fg: accent,
             table_row_alt_bg: bg_surface,
+
+            selection_bg: PackedRgba::rgb(40, 70, 40),
+            selection_fg: fg_primary,
+
+            severity_ok: PackedRgba::rgb(80, 220, 100),
+            severity_error: PackedRgba::rgb(220, 50, 50),
+            severity_warn: warning,
+            severity_critical: PackedRgba::rgb(255, 40, 40),
+
+            panel_border: fg_muted,
+            panel_border_focused: accent,
+            panel_border_dim: PackedRgba::rgb(40, 60, 40),
+            panel_bg: bg_deep,
+            panel_title_fg: fg_primary,
+
+            selection_indicator: accent,
+            list_hover_bg: PackedRgba::rgb(30, 50, 30),
+
+            chart_series: [
+                PackedRgba::rgb(80, 220, 100),
+                PackedRgba::rgb(100, 180, 255),
+                PackedRgba::rgb(255, 184, 108),
+                PackedRgba::rgb(255, 100, 150),
+                PackedRgba::rgb(180, 80, 220),
+                PackedRgba::rgb(220, 200, 50),
+            ],
+            chart_axis: fg_muted,
+            chart_grid: PackedRgba::rgb(30, 50, 30),
+
+            badge_urgent_bg: PackedRgba::rgb(200, 50, 50),
+            badge_urgent_fg: PackedRgba::rgb(255, 255, 255),
+            badge_info_bg: PackedRgba::rgb(40, 80, 120),
+            badge_info_fg: PackedRgba::rgb(180, 220, 255),
+
+            ttl_healthy: PackedRgba::rgb(80, 220, 100),
+            ttl_warning: warning,
+            ttl_danger: PackedRgba::rgb(220, 80, 50),
+            ttl_expired: PackedRgba::rgb(120, 60, 60),
+
+            metric_uptime: PackedRgba::rgb(80, 220, 100),
+            metric_requests: PackedRgba::rgb(100, 180, 255),
+            metric_latency: PackedRgba::rgb(255, 184, 108),
+            metric_messages: PackedRgba::rgb(180, 140, 255),
+            metric_agents: PackedRgba::rgb(255, 100, 150),
+            metric_ack_ok: PackedRgba::rgb(80, 220, 100),
+            metric_ack_bad: PackedRgba::rgb(220, 50, 50),
+
+            agent_palette: [
+                PackedRgba::rgb(92, 201, 255),
+                PackedRgba::rgb(123, 214, 153),
+                PackedRgba::rgb(255, 184, 108),
+                PackedRgba::rgb(255, 122, 162),
+                PackedRgba::rgb(180, 140, 255),
+                PackedRgba::rgb(100, 220, 220),
+                PackedRgba::rgb(220, 180, 100),
+                PackedRgba::rgb(200, 200, 200),
+            ],
+
+            contact_approved: PackedRgba::rgb(80, 220, 100),
+            contact_pending: warning,
+            contact_blocked: PackedRgba::rgb(220, 50, 50),
+
+            activity_active: PackedRgba::rgb(170, 240, 195),
+            activity_idle: PackedRgba::rgb(120, 170, 145),
+            activity_stale: PackedRgba::rgb(85, 100, 90),
+
+            text_muted: fg_muted,
+            text_primary: fg_primary,
+            text_secondary: PackedRgba::rgb(140, 200, 120),
+            text_disabled: PackedRgba::rgb(50, 70, 50),
+            bg_deep,
+            bg_surface,
+            bg_overlay: PackedRgba::rgb(30, 55, 30),
+
+            json_key: accent,
+            json_string: PackedRgba::rgb(80, 220, 100),
+            json_number: PackedRgba::rgb(255, 184, 108),
+            json_literal: PackedRgba::rgb(100, 180, 255),
+            json_punctuation: fg_muted,
         }
     }
 
@@ -130,6 +300,85 @@ impl TuiThemePalette {
 
             table_header_fg: p.accent_primary,
             table_row_alt_bg: p.bg_surface,
+
+            selection_bg: p.bg_highlight,
+            selection_fg: p.fg_primary,
+
+            severity_ok: p.accent_success,
+            severity_error: p.accent_error,
+            severity_warn: p.accent_warning,
+            severity_critical: p.accent_error,
+
+            panel_border: p.fg_muted,
+            panel_border_focused: p.accent_primary,
+            panel_border_dim: p.fg_disabled,
+            panel_bg: p.bg_deep,
+            panel_title_fg: p.fg_primary,
+
+            selection_indicator: p.accent_primary,
+            list_hover_bg: p.bg_overlay,
+
+            chart_series: [
+                p.accent_success,
+                p.accent_info,
+                p.accent_warning,
+                p.accent_error,
+                p.accent_primary,
+                p.accent_secondary,
+            ],
+            chart_axis: p.fg_muted,
+            chart_grid: p.bg_surface,
+
+            badge_urgent_bg: p.accent_error,
+            badge_urgent_fg: p.fg_primary,
+            badge_info_bg: p.bg_overlay,
+            badge_info_fg: p.accent_info,
+
+            ttl_healthy: p.accent_success,
+            ttl_warning: p.accent_warning,
+            ttl_danger: p.accent_error,
+            ttl_expired: p.fg_disabled,
+
+            metric_uptime: p.accent_success,
+            metric_requests: p.accent_info,
+            metric_latency: p.accent_warning,
+            metric_messages: p.accent_primary,
+            metric_agents: p.accent_secondary,
+            metric_ack_ok: p.accent_success,
+            metric_ack_bad: p.accent_error,
+
+            agent_palette: [
+                p.accent_slots[0],
+                p.accent_slots[1],
+                p.accent_slots[2],
+                p.accent_slots[3],
+                p.accent_slots[4],
+                p.accent_slots[5],
+                p.accent_slots[6],
+                p.accent_slots[7],
+            ],
+
+            contact_approved: p.accent_success,
+            contact_pending: p.accent_warning,
+            contact_blocked: p.accent_error,
+
+            activity_active: p.accent_success,
+            activity_idle: p.accent_warning,
+            activity_stale: p.fg_disabled,
+
+            text_muted: p.fg_muted,
+            text_primary: p.fg_primary,
+            text_secondary: p.fg_secondary,
+            text_disabled: p.fg_disabled,
+            bg_deep: p.bg_deep,
+            bg_surface: p.bg_surface,
+            bg_overlay: p.bg_overlay,
+
+            json_key: p.syntax_keyword,
+            json_string: p.syntax_string,
+            json_number: p.syntax_number,
+            json_literal: p.syntax_type,
+            json_punctuation: p.fg_muted,
         }
     }
 
@@ -384,6 +633,58 @@ pub fn markdown_theme() -> MarkdownTheme {
         admonition_warning: Style::default().fg(p.accent_warning).bold(),
         admonition_caution: Style::default().fg(p.accent_error).bold(),
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Color utilities
+// ──────────────────────────────────────────────────────────────────────
+
+/// Linearly interpolate between two colors.
+///
+/// `t` is clamped to `[0.0, 1.0]`.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn lerp_color(a: PackedRgba, b: PackedRgba, t: f32) -> PackedRgba {
+    let t = t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    let r = (f32::from(a.r()) * inv + f32::from(b.r()) * t) as u8;
+    let g = (f32::from(a.g()) * inv + f32::from(b.g()) * t) as u8;
+    let bl = (f32::from(a.b()) * inv + f32::from(b.b()) * t) as u8;
+    PackedRgba::rgb(r, g, bl)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// JSON token style helpers
+// ──────────────────────────────────────────────────────────────────────
+
+/// Style for a JSON object key (e.g. `"name":`).
+#[must_use]
+pub fn style_json_key(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.json_key)
+}
+
+/// Style for a JSON string value.
+#[must_use]
+pub fn style_json_string(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.json_string)
+}
+
+/// Style for a JSON numeric value.
+#[must_use]
+pub fn style_json_number(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.json_number)
+}
+
+/// Style for a JSON boolean or null literal.
+#[must_use]
+pub fn style_json_literal(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.json_literal)
+}
+
+/// Style for JSON punctuation (`{`, `}`, `[`, `]`, `:`, `,`).
+#[must_use]
+pub fn style_json_punctuation(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.json_punctuation)
 }
 
 // ──────────────────────────────────────────────────────────────────────

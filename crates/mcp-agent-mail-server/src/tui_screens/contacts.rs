@@ -8,7 +8,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_runtime::program::Cmd;
 
@@ -401,6 +401,7 @@ impl ContactsScreen {
         clippy::cast_precision_loss
     )]
     fn render_graph(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Network Graph")
             .border_type(BorderType::Rounded);
@@ -424,9 +425,9 @@ impl ContactsScreen {
                 self.find_node(&contact.to_agent),
             ) {
                 let color = match contact.status.as_str() {
-                    "approved" => PackedRgba::rgb(80, 200, 120), // Green
-                    "blocked" => PackedRgba::rgb(220, 80, 80),   // Red
-                    _ => PackedRgba::rgb(220, 200, 60),          // Yellow
+                    "approved" => tp.contact_approved,
+                    "blocked" => tp.contact_blocked,
+                    _ => tp.contact_pending,
                 };
 
                 let x1 = (start.1 * w) as i32;
@@ -445,7 +446,7 @@ impl ContactsScreen {
             // Draw small filled area for node
             for dx in -1..=1_i32 {
                 for dy in -1..=1_i32 {
-                    painter.point_colored(x + dx, y + dy, PackedRgba::rgb(255, 255, 255));
+                    painter.point_colored(x + dx, y + dy, tp.text_primary);
                 }
             }
         }
@@ -467,8 +468,8 @@ impl ContactsScreen {
                 && cy >= inner.y
                 && cy < inner.bottom()
             {
-                let fg_color = PackedRgba::rgb(200, 200, 255);
-                let bg_color = PackedRgba::rgb(0, 0, 0);
+                let fg_color = tp.panel_title_fg;
+                let bg_color = tp.bg_deep;
                 for (i, ch) in label.chars().enumerate() {
                     if let Some(cell) = frame.buffer.get_mut(lx + i as u16, cy) {
                         cell.content = ftui::Cell::from_char(ch).content;
@@ -485,6 +486,7 @@ impl ContactsScreen {
     }
 
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         // Build table rows
         let header = Row::new(["From", "To", "Status", "Reason", "Updated", "Expires"])
             .style(Style::default().bold());
@@ -501,8 +503,8 @@ impl ContactsScreen {
                 let status_style = status_color(&contact.status);
                 let row_style = if Some(i) == self.table_state.selected {
                     Style::default()
-                        .fg(PackedRgba::rgb(0, 0, 0))
-                        .bg(PackedRgba::rgb(180, 140, 220))
+                        .fg(tp.selection_fg)
+                        .bg(tp.selection_bg)
                 } else {
                     status_style
                 };
@@ -536,8 +538,8 @@ impl ContactsScreen {
             .block(block)
             .highlight_style(
                 Style::default()
-                    .fg(PackedRgba::rgb(0, 0, 0))
-                    .bg(PackedRgba::rgb(180, 140, 220)),
+                    .fg(tp.selection_fg)
+                    .bg(tp.selection_bg),
             );
 
         let mut ts = self.table_state.clone();
@@ -547,10 +549,11 @@ impl ContactsScreen {
 
 /// Color style based on contact status.
 fn status_color(status: &str) -> Style {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     match status {
-        "approved" => Style::default().fg(PackedRgba::rgb(80, 200, 120)),
-        "pending" => Style::default().fg(PackedRgba::rgb(220, 200, 60)),
-        "blocked" => Style::default().fg(PackedRgba::rgb(220, 80, 80)),
+        "approved" => Style::default().fg(tp.contact_approved),
+        "pending" => Style::default().fg(tp.contact_pending),
+        "blocked" => Style::default().fg(tp.contact_blocked),
         _ => Style::default(),
     }
 }

@@ -43,16 +43,9 @@ const LOAD_OLDER_BATCH_SIZE: usize = 15;
 const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
 
 /// Color palette for deterministic per-agent coloring in thread cards.
-const AGENT_COLOR_PALETTE: [PackedRgba; 8] = [
-    PackedRgba::rgb(92, 201, 255),
-    PackedRgba::rgb(123, 214, 153),
-    PackedRgba::rgb(255, 184, 108),
-    PackedRgba::rgb(255, 122, 162),
-    PackedRgba::rgb(180, 166, 255),
-    PackedRgba::rgb(141, 222, 255),
-    PackedRgba::rgb(255, 219, 109),
-    PackedRgba::rgb(163, 229, 124),
-];
+fn agent_color_palette() -> [PackedRgba; 8] {
+    crate::tui_theme::TuiThemePalette::current().agent_palette
+}
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
@@ -84,10 +77,11 @@ fn agent_color(name: &str) -> PackedRgba {
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let palette_len_u64 = u64::try_from(AGENT_COLOR_PALETTE.len()).unwrap_or(1);
+    let palette = agent_color_palette();
+    let palette_len_u64 = u64::try_from(palette.len()).unwrap_or(1);
     let idx_u64 = hash % palette_len_u64;
     let idx = usize::try_from(idx_u64).unwrap_or(0);
-    AGENT_COLOR_PALETTE[idx]
+    palette[idx]
 }
 
 fn iso_compact_time(iso: &str) -> &str {

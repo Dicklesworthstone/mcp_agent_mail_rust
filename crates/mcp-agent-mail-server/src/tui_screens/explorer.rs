@@ -10,7 +10,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
@@ -1214,10 +1214,6 @@ fn compute_stats(entries: &[DisplayEntry]) -> ExplorerStats {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-const FILTER_ACTIVE_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xAF, 0xFF, 0xFF);
-const FILTER_LABEL_FG: PackedRgba = PackedRgba::rgba(0x87, 0x87, 0x87, 0xFF);
-const CURSOR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0xD7, 0x00, 0xFF);
-const ERROR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0x5F, 0x5F, 0xFF);
 
 fn render_header(
     frame: &mut Frame<'_>,
@@ -1225,6 +1221,7 @@ fn render_header(
     input: &TextInput,
     screen: &MailExplorerScreen,
 ) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let dir = direction_label(screen.direction);
     let count = screen.entries.len();
     let focus_label = if screen.focus == Focus::SearchBar {
@@ -1294,13 +1291,13 @@ fn render_header(
             || {
                 (
                     truncate_str(&stat_line, w),
-                    Style::default().fg(FILTER_LABEL_FG),
+                    Style::default().fg(tp.text_muted),
                 )
             },
             |err| {
                 (
                     truncate_str(&format!("ERR: {err}"), w),
-                    Style::default().fg(ERROR_FG),
+                    Style::default().fg(tp.severity_error),
                 )
             },
         );
@@ -1311,6 +1308,7 @@ fn render_header(
 }
 
 fn render_filter_rail(frame: &mut Frame<'_>, area: Rect, screen: &MailExplorerScreen) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Filters")
         .border_type(BorderType::Rounded);
@@ -1346,9 +1344,9 @@ fn render_filter_rail(frame: &mut Frame<'_>, area: Rect, screen: &MailExplorerSc
         let marker = if is_active { '>' } else { ' ' };
 
         let label_style = if is_active {
-            Style::default().fg(FILTER_ACTIVE_FG)
+            Style::default().fg(tp.status_accent)
         } else {
-            Style::default().fg(FILTER_LABEL_FG)
+            Style::default().fg(tp.text_muted)
         };
 
         let label_text = format!("{marker} {label}");
@@ -1364,7 +1362,7 @@ fn render_filter_rail(frame: &mut Frame<'_>, area: Rect, screen: &MailExplorerSc
             let val_line = truncate_str(&val_text, w);
             let val_area = Rect::new(inner.x, value_y, inner.width, 1);
             let val_style = if is_active {
-                Style::default().fg(CURSOR_FG)
+                Style::default().fg(tp.selection_indicator)
             } else {
                 Style::default()
             };
@@ -1384,7 +1382,7 @@ fn render_filter_rail(frame: &mut Frame<'_>, area: Rect, screen: &MailExplorerSc
         };
         let hint_area = Rect::new(inner.x, help_y, inner.width, 1);
         Paragraph::new(truncate_str(hint, w))
-            .style(Style::default().fg(FILTER_LABEL_FG))
+            .style(Style::default().fg(tp.text_muted))
             .render(hint_area, frame);
     }
 }
@@ -1479,14 +1477,10 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&DisplayEntry>
 // Pressure board rendering
 // ──────────────────────────────────────────────────────────────────────
 
-const PRESSURE_ACK_FG: PackedRgba = PackedRgba::rgba(0xFF, 0x5F, 0x5F, 0xFF);
-const PRESSURE_UNREAD_FG: PackedRgba = PackedRgba::rgba(0xFF, 0xAF, 0x00, 0xFF);
-const PRESSURE_RESERVATION_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xD7, 0xFF, 0xFF);
-const PRESSURE_SECTION_FG: PackedRgba = PackedRgba::rgba(0xD7, 0x87, 0xFF, 0xFF);
-const PRESSURE_OK_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xAF, 0x5F, 0xFF);
 
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoard, cursor: usize) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Pressure Board")
         .border_type(BorderType::Rounded);
@@ -1499,7 +1493,7 @@ fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoar
 
     if board.is_empty() {
         Paragraph::new("  No pressure signals. All clear.")
-            .style(Style::default().fg(PRESSURE_OK_FG))
+            .style(Style::default().fg(tp.severity_ok))
             .render(inner, frame);
         return;
     }
@@ -1518,7 +1512,7 @@ fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoar
                 "\u{26A0} Overdue Acks ({} agent/project groups)",
                 board.overdue_acks.len()
             ),
-            Style::default().fg(PRESSURE_SECTION_FG),
+            Style::default().fg(tp.metric_messages),
         ));
 
         for card in &board.overdue_acks {
@@ -1542,9 +1536,9 @@ fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoar
             lines.push((
                 truncate_str(&line, w),
                 if card_index == cursor {
-                    Style::default().fg(CURSOR_FG)
+                    Style::default().fg(tp.selection_indicator)
                 } else {
-                    Style::default().fg(PRESSURE_ACK_FG)
+                    Style::default().fg(tp.severity_error)
                 },
             ));
             card_index += 1;
@@ -1559,7 +1553,7 @@ fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoar
                 "\u{1F4EC} Unread Concentrations ({} agent/project groups)",
                 board.unread_hotspots.len()
             ),
-            Style::default().fg(PRESSURE_SECTION_FG),
+            Style::default().fg(tp.metric_messages),
         ));
 
         for card in &board.unread_hotspots {
@@ -1579,9 +1573,9 @@ fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoar
             lines.push((
                 truncate_str(&line, w),
                 if card_index == cursor {
-                    Style::default().fg(CURSOR_FG)
+                    Style::default().fg(tp.selection_indicator)
                 } else {
-                    Style::default().fg(PRESSURE_UNREAD_FG)
+                    Style::default().fg(tp.severity_warn)
                 },
             ));
             card_index += 1;
@@ -1596,7 +1590,7 @@ fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoar
                 "\u{1F512} Reservation Pressure ({} active)",
                 board.reservation_pressure.len()
             ),
-            Style::default().fg(PRESSURE_SECTION_FG),
+            Style::default().fg(tp.metric_messages),
         ));
 
         for card in &board.reservation_pressure {
@@ -1618,11 +1612,11 @@ fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoar
             );
             card_line_indices.push(lines.len());
             let style = if card_index == cursor {
-                Style::default().fg(CURSOR_FG)
+                Style::default().fg(tp.selection_indicator)
             } else if card.ttl_remaining_minutes <= 10 {
-                Style::default().fg(PRESSURE_ACK_FG)
+                Style::default().fg(tp.severity_error)
             } else {
-                Style::default().fg(PRESSURE_RESERVATION_FG)
+                Style::default().fg(tp.metric_requests)
             };
             lines.push((truncate_str(&line, w), style));
             card_index += 1;

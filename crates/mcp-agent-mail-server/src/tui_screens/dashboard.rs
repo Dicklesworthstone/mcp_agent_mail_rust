@@ -893,14 +893,9 @@ fn render_summary_band(
     };
 
     // Calculate pulse color for Requests
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let pulse = f32::midpoint(pulse_phase.sin(), 1.0); // 0.0 to 1.0
-    let base_req = PackedRgba::rgb(120, 200, 255);
-    let glow_req = PackedRgba::rgb(200, 240, 255);
-    // Simple lerp
-    let r = f32::from(base_req.r()).mul_add(1.0 - pulse, f32::from(glow_req.r()) * pulse) as u8;
-    let g = f32::from(base_req.g()).mul_add(1.0 - pulse, f32::from(glow_req.g()) * pulse) as u8;
-    let b = f32::from(base_req.b()).mul_add(1.0 - pulse, f32::from(glow_req.b()) * pulse) as u8;
-    let req_color = PackedRgba::rgb(r, g, b);
+    let req_color = crate::tui_theme::lerp_color(tp.metric_requests, tp.sparkline_hi, pulse);
 
     // Build tiles based on density.
     let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
@@ -909,36 +904,36 @@ fn render_summary_band(
                 "Up",
                 &uptime_str,
                 MetricTrend::Flat,
-                PackedRgba::rgb(200, 200, 200),
+                tp.metric_uptime,
             ),
             ("Req", &req_str, MetricTrend::Flat, req_color),
-            ("Msg", &msg_str, msg_trend, PackedRgba::rgb(200, 200, 120)),
+            ("Msg", &msg_str, msg_trend, tp.metric_messages),
         ],
         DensityHint::Normal => vec![
             (
                 "Uptime",
                 &uptime_str,
                 MetricTrend::Flat,
-                PackedRgba::rgb(200, 200, 200),
+                tp.metric_uptime,
             ),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             (
                 "Avg Lat",
                 &avg_str,
                 MetricTrend::Flat,
-                PackedRgba::rgb(180, 140, 255),
+                tp.metric_latency,
             ),
             (
                 "Messages",
                 &msg_str,
                 msg_trend,
-                PackedRgba::rgb(200, 200, 120),
+                tp.metric_messages,
             ),
             (
                 "Agents",
                 &agent_str,
                 agent_trend,
-                PackedRgba::rgb(120, 220, 160),
+                tp.metric_agents,
             ),
         ],
         DensityHint::Detailed => vec![
@@ -946,35 +941,35 @@ fn render_summary_band(
                 "Uptime",
                 &uptime_str,
                 MetricTrend::Flat,
-                PackedRgba::rgb(200, 200, 200),
+                tp.metric_uptime,
             ),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             (
                 "Avg Lat",
                 &avg_str,
                 MetricTrend::Flat,
-                PackedRgba::rgb(180, 140, 255),
+                tp.metric_latency,
             ),
             (
                 "Messages",
                 &msg_str,
                 msg_trend,
-                PackedRgba::rgb(200, 200, 120),
+                tp.metric_messages,
             ),
             (
                 "Agents",
                 &agent_str,
                 agent_trend,
-                PackedRgba::rgb(120, 220, 160),
+                tp.metric_agents,
             ),
             (
                 "Ack Pend",
                 &ack_str,
                 ack_trend,
                 if db.ack_pending > 0 {
-                    PackedRgba::rgb(255, 100, 100)
+                    tp.metric_ack_bad
                 } else {
-                    PackedRgba::rgb(120, 200, 120)
+                    tp.metric_ack_ok
                 },
             ),
         ],
@@ -1070,8 +1065,9 @@ fn render_trend_panel(
 
         // Label row.
         if inner.height > 1 && inner.width > 0 {
+            let tp = crate::tui_theme::TuiThemePalette::current();
             let label =
-                Paragraph::new("Throughput").style(Style::new().fg(PackedRgba::rgb(180, 180, 180)));
+                Paragraph::new("Throughput").style(Style::new().fg(tp.text_muted));
             label.render(
                 Rect {
                     x: inner.x,
@@ -1096,7 +1092,7 @@ fn render_trend_panel(
                 let slice = &throughput_history[start_idx..];
                 let sparkline = Sparkline::new(slice)
                     .min(0.0)
-                    .style(Style::new().fg(PackedRgba::rgb(80, 200, 255)));
+                    .style(Style::new().fg(tp.metric_requests));
                 sparkline.render(spark_area, frame);
             }
         }
@@ -1162,22 +1158,14 @@ fn pulsing_severity_badge(
         return severity.styled_badge();
     }
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let pulse = pulse_phase.sin().abs();
     let (base, highlight) = match severity {
-        EventSeverity::Warn => ((176_u8, 122_u8, 32_u8), (255_u8, 198_u8, 90_u8)),
-        EventSeverity::Error => ((148_u8, 54_u8, 54_u8), (255_u8, 96_u8, 96_u8)),
+        EventSeverity::Warn => (tp.severity_warn, tp.severity_critical),
+        EventSeverity::Error => (tp.severity_error, tp.severity_critical),
         _ => return severity.styled_badge(),
     };
-    let lerp = |start: u8, end: u8| -> u8 {
-        let start = f32::from(start);
-        let end = f32::from(end);
-        ((end - start).mul_add(pulse, start)).round() as u8
-    };
-    let color = PackedRgba::rgb(
-        lerp(base.0, highlight.0),
-        lerp(base.1, highlight.1),
-        lerp(base.2, highlight.2),
-    );
+    let color = crate::tui_theme::lerp_color(base, highlight, pulse);
     Span::styled(
         severity.badge().to_string(),
         Style::default().fg(color).bold(),
@@ -1350,28 +1338,34 @@ const ACTIVE_THRESHOLD_US: i64 = 60 * 1_000_000; // 60 seconds
 #[cfg(test)]
 const IDLE_THRESHOLD_US: i64 = 5 * 60 * 1_000_000; // 5 minutes
 
-/// Activity dot colors (used in tests).
+/// Activity dot colors (used in tests), derived from the theme palette.
 #[cfg(test)]
-const ACTIVITY_GREEN: PackedRgba = PackedRgba::rgb(80, 220, 100);
+fn activity_green() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().activity_active
+}
 #[cfg(test)]
-const ACTIVITY_YELLOW: PackedRgba = PackedRgba::rgb(220, 200, 60);
+fn activity_yellow() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().activity_idle
+}
 #[cfg(test)]
-const ACTIVITY_GRAY: PackedRgba = PackedRgba::rgb(120, 120, 120);
+fn activity_gray() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().activity_stale
+}
 
 /// Returns an activity dot character and color based on how recently an agent
 /// was active. Green = active (<60s), yellow = idle (<5m), gray = stale.
 #[cfg(test)]
-const fn activity_indicator(now_us: i64, last_active_us: i64) -> (char, PackedRgba) {
+fn activity_indicator(now_us: i64, last_active_us: i64) -> (char, PackedRgba) {
     if last_active_us == 0 {
-        return ('○', ACTIVITY_GRAY);
+        return ('○', activity_gray());
     }
     let age = now_us.saturating_sub(last_active_us);
     if age < ACTIVE_THRESHOLD_US {
-        ('●', ACTIVITY_GREEN)
+        ('●', activity_green())
     } else if age < IDLE_THRESHOLD_US {
-        ('●', ACTIVITY_YELLOW)
+        ('●', activity_yellow())
     } else {
-        ('○', ACTIVITY_GRAY)
+        ('○', activity_gray())
     }
 }
 
@@ -2351,7 +2345,7 @@ mod tests {
         let recent = now - 30_000_000; // 30 seconds ago
         let (dot, color) = activity_indicator(now, recent);
         assert_eq!(dot, '●');
-        assert_eq!(color, ACTIVITY_GREEN);
+        assert_eq!(color, activity_green());
     }
 
     #[test]
@@ -2360,7 +2354,7 @@ mod tests {
         let idle = now - 120_000_000; // 2 minutes ago
         let (dot, color) = activity_indicator(now, idle);
         assert_eq!(dot, '●');
-        assert_eq!(color, ACTIVITY_YELLOW);
+        assert_eq!(color, activity_yellow());
     }
 
     #[test]
@@ -2369,14 +2363,14 @@ mod tests {
         let stale = now - 600_000_000; // 10 minutes ago
         let (dot, color) = activity_indicator(now, stale);
         assert_eq!(dot, '○');
-        assert_eq!(color, ACTIVITY_GRAY);
+        assert_eq!(color, activity_gray());
     }
 
     #[test]
     fn activity_indicator_zero_ts_is_gray() {
         let (dot, color) = activity_indicator(1_000_000_000, 0);
         assert_eq!(dot, '○');
-        assert_eq!(color, ACTIVITY_GRAY);
+        assert_eq!(color, activity_gray());
     }
 
     #[test]
@@ -2385,11 +2379,11 @@ mod tests {
         // Exactly at boundary: 60s ago
         let at_boundary = now - ACTIVE_THRESHOLD_US;
         let (_, color) = activity_indicator(now, at_boundary);
-        assert_eq!(color, ACTIVITY_YELLOW, "exactly 60s should be idle/yellow");
+        assert_eq!(color, activity_yellow(), "exactly 60s should be idle/yellow");
         // 1us before boundary: 59.999999s ago
         let just_inside = now - ACTIVE_THRESHOLD_US + 1;
         let (_, color) = activity_indicator(now, just_inside);
-        assert_eq!(color, ACTIVITY_GREEN, "just under 60s should be green");
+        assert_eq!(color, activity_green(), "just under 60s should be green");
     }
 
     #[test]
@@ -2398,11 +2392,11 @@ mod tests {
         let at_boundary = now - IDLE_THRESHOLD_US;
         let (dot, color) = activity_indicator(now, at_boundary);
         assert_eq!(dot, '○');
-        assert_eq!(color, ACTIVITY_GRAY, "exactly 5m should be stale/gray");
+        assert_eq!(color, activity_gray(), "exactly 5m should be stale/gray");
         let just_inside = now - IDLE_THRESHOLD_US + 1;
         let (dot, color) = activity_indicator(now, just_inside);
         assert_eq!(dot, '●');
-        assert_eq!(color, ACTIVITY_YELLOW, "just under 5m should be yellow");
+        assert_eq!(color, activity_yellow(), "just under 5m should be yellow");
     }
 
     /// Test that `render_sparkline` uses `Sparkline` widget correctly (br-2bbt.4.1).

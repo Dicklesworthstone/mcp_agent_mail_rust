@@ -8,7 +8,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
@@ -223,10 +223,11 @@ impl MailScreen for ProjectsScreen {
             .enumerate()
             .map(|(i, proj)| {
                 let created_str = format_created_time(proj.created_at);
+                let tp = crate::tui_theme::TuiThemePalette::current();
                 let style = if Some(i) == self.table_state.selected {
                     Style::default()
-                        .fg(PackedRgba::rgb(0, 0, 0))
-                        .bg(PackedRgba::rgb(100, 180, 240))
+                        .fg(tp.selection_fg)
+                        .bg(tp.selection_bg)
                 } else {
                     Style::default()
                 };
@@ -260,11 +261,12 @@ impl MailScreen for ProjectsScreen {
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .highlight_style(
+            .highlight_style({
+                let tp = crate::tui_theme::TuiThemePalette::current();
                 Style::default()
-                    .fg(PackedRgba::rgb(0, 0, 0))
-                    .bg(PackedRgba::rgb(100, 180, 240)),
-            );
+                    .fg(tp.selection_fg)
+                    .bg(tp.selection_bg)
+            });
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);

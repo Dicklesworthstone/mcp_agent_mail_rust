@@ -383,7 +383,7 @@ impl RenderItem for SearchResultRow {
         let title = truncate_str(&self.entry.title, title_space);
 
         // Build line with optional highlighting
-        let highlight_style = Style::default().fg(RESULT_CURSOR_FG).bold();
+        let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::raw(prefix));
 
@@ -1996,12 +1996,18 @@ fn url_encode_component(s: &str) -> String {
 // Rendering helpers
 // ──────────────────────────────────────────────────────────────────────
 
-const FACET_ACTIVE_FG: PackedRgba = PackedRgba::rgba(0x5F, 0xAF, 0xFF, 0xFF); // Blue
-const FACET_LABEL_FG: PackedRgba = PackedRgba::rgba(0x87, 0x87, 0x87, 0xFF); // Grey
-const RESULT_CURSOR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0xD7, 0x00, 0xFF); // Yellow
-const ERROR_FG: PackedRgba = PackedRgba::rgba(0xFF, 0x5F, 0x5F, 0xFF); // Red
-const ACTION_KEY_FG: PackedRgba = PackedRgba::rgba(0x87, 0xD7, 0x87, 0xFF); // Green
-const QUERY_HELP_BG: PackedRgba = PackedRgba::rgba(0x10, 0x10, 0x10, 0xFF); // Dim panel
+#[allow(non_snake_case)]
+fn FACET_ACTIVE_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().status_accent }
+#[allow(non_snake_case)]
+fn FACET_LABEL_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().text_muted }
+#[allow(non_snake_case)]
+fn RESULT_CURSOR_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().selection_indicator }
+#[allow(non_snake_case)]
+fn ERROR_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().severity_error }
+#[allow(non_snake_case)]
+fn ACTION_KEY_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().severity_ok }
+#[allow(non_snake_case)]
+fn QUERY_HELP_BG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().bg_deep }
 
 fn render_query_bar(
     frame: &mut Frame<'_>,
@@ -2047,19 +2053,19 @@ fn render_query_bar(
                         if screen.focus == Focus::QueryBar {
                             (
                                 "Syntax: \"phrase\" term* AND/OR/NOT (no leading *)".to_string(),
-                                Style::default().fg(FACET_LABEL_FG),
+                                Style::default().fg(FACET_LABEL_FG()),
                             )
                         } else {
                             (
                                 format!("Route: {}", screen.route_string()),
-                                Style::default().fg(FACET_LABEL_FG),
+                                Style::default().fg(FACET_LABEL_FG()),
                             )
                         }
                     },
-                    |line| (line, Style::default().fg(FACET_LABEL_FG)),
+                    |line| (line, Style::default().fg(FACET_LABEL_FG())),
                 )
             },
-            |err| (format!("ERR: {err}"), Style::default().fg(ERROR_FG)),
+            |err| (format!("ERR: {err}"), Style::default().fg(ERROR_FG())),
         );
 
         let hint_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
@@ -2091,7 +2097,7 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
         .borders(Borders::ALL)
         .title("Query Syntax Help")
         .border_type(BorderType::Rounded)
-        .style(Style::default().fg(FACET_LABEL_FG).bg(QUERY_HELP_BG));
+        .style(Style::default().fg(FACET_LABEL_FG()).bg(QUERY_HELP_BG()));
     let inner = block.inner(popup_area);
     block.render(popup_area, frame);
     if inner.height == 0 || inner.width == 0 {
@@ -2106,7 +2112,7 @@ Column: subject:deploy\n\
 Esc/any key: close";
 
     Paragraph::new(text)
-        .style(Style::default().fg(FACET_LABEL_FG).bg(QUERY_HELP_BG))
+        .style(Style::default().fg(FACET_LABEL_FG()).bg(QUERY_HELP_BG()))
         .render(inner, frame);
 }
 
@@ -2148,9 +2154,9 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
         let marker = if is_active { '>' } else { ' ' };
 
         let label_style = if is_active {
-            Style::default().fg(FACET_ACTIVE_FG)
+            Style::default().fg(FACET_ACTIVE_FG())
         } else {
-            Style::default().fg(FACET_LABEL_FG)
+            Style::default().fg(FACET_LABEL_FG())
         };
 
         // Label row
@@ -2168,7 +2174,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
             let val_line = truncate_str(&val_text, w);
             let val_area = Rect::new(inner.x, value_y, inner.width, 1);
             let val_style = if is_active {
-                Style::default().fg(RESULT_CURSOR_FG)
+                Style::default().fg(RESULT_CURSOR_FG())
             } else {
                 Style::default()
             };
@@ -2185,7 +2191,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
             let thread_text = format!("  Thread: {}", truncate_str(tid, w.saturating_sub(10)));
             let thread_area = Rect::new(inner.x, y, inner.width, 1);
             Paragraph::new(thread_text)
-                .style(Style::default().fg(FACET_ACTIVE_FG))
+                .style(Style::default().fg(FACET_ACTIVE_FG()))
                 .render(thread_area, frame);
         }
     }
@@ -2200,7 +2206,7 @@ fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitSc
         };
         let hint_area = Rect::new(inner.x, help_y, inner.width, 1);
         Paragraph::new(truncate_str(hint, w))
-            .style(Style::default().fg(FACET_LABEL_FG))
+            .style(Style::default().fg(FACET_LABEL_FG()))
             .render(hint_area, frame);
     }
 }
@@ -2412,8 +2418,8 @@ fn render_detail(
     let content_area = Rect::new(inner.x, inner.y, inner.width, content_h);
     let action_area = Rect::new(inner.x, inner.y + content_h, inner.width, action_bar_h);
 
-    let label_style = Style::default().fg(FACET_LABEL_FG);
-    let highlight_style = Style::default().fg(RESULT_CURSOR_FG).bold();
+    let label_style = Style::default().fg(FACET_LABEL_FG());
+    let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(format!("Type:    {:?}", entry.doc_kind)));
@@ -2493,8 +2499,8 @@ fn render_action_bar(frame: &mut Frame<'_>, area: Rect, entry: &ResultEntry) {
     if area.width < 10 || area.height == 0 {
         return;
     }
-    let key_style = Style::default().fg(ACTION_KEY_FG).bold();
-    let label_style = Style::default().fg(FACET_LABEL_FG);
+    let key_style = Style::default().fg(ACTION_KEY_FG()).bold();
+    let label_style = Style::default().fg(FACET_LABEL_FG());
 
     let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -3235,8 +3241,8 @@ mod tests {
             kind: QueryTermKind::Word,
             negated: false,
         }];
-        let base = Style::default().fg(FACET_LABEL_FG);
-        let highlight = Style::default().fg(RESULT_CURSOR_FG).bold();
+        let base = Style::default().fg(FACET_LABEL_FG());
+        let highlight = Style::default().fg(RESULT_CURSOR_FG()).bold();
         let spans = highlight_spans("xxNEEDLEyy", &terms, Some(base), highlight);
 
         let plain: String = spans.iter().map(Span::as_str).collect();

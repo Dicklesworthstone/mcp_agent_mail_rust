@@ -122,11 +122,26 @@ pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
             (tp.tab_inactive_fg, tp.tab_inactive_bg)
         };
 
+        // Inter-tab separator (before each tab except the first)
+        if i > 0 && x + 1 <= area.x + available {
+            let sep_area = Rect::new(x, area.y, 1, 1);
+            Paragraph::new("│")
+                .style(Style::default().fg(tp.tab_inactive_fg).bg(tp.tab_inactive_bg))
+                .render(sep_area, frame);
+            x += 1;
+        }
+
+        let label_style = if is_active {
+            Style::default().fg(fg).bg(bg).bold()
+        } else {
+            Style::default().fg(fg).bg(bg)
+        };
+
         let spans = vec![
             Span::styled(" ", Style::default().bg(bg)),
             Span::styled(key_str, Style::default().fg(tp.tab_key_fg).bg(bg)),
             Span::styled(":", Style::default().fg(tp.tab_inactive_fg).bg(bg)),
-            Span::styled(label, Style::default().fg(fg).bg(bg)),
+            Span::styled(label, label_style),
             Span::styled(" ", Style::default().bg(bg)),
         ];
 
@@ -371,7 +386,7 @@ pub fn render_help_overlay(
 
     // Render border frame
     let block = Block::bordered()
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Rounded)
         .title(" Keyboard Shortcuts (Esc to close) ")
         .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
 
@@ -487,7 +502,7 @@ pub fn render_help_overlay_sections(
 
     let title = format!(" Keyboard Shortcuts{scroll_hint}(Esc to close) ");
     let block = Block::bordered()
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Rounded)
         .title(title.as_str())
         .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
 

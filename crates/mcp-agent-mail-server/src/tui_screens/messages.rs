@@ -14,7 +14,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
@@ -161,16 +161,17 @@ impl RenderItem for MessageEntry {
 
         // Importance badge
         let pulse_on = MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed);
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let (badge, badge_style) = match self.importance.as_str() {
             "high" => (
                 "!",
-                Style::default().fg(PackedRgba::rgb(235, 176, 70)).bold(),
+                Style::default().fg(tp.severity_warn).bold(),
             ),
             "urgent" => {
                 let fg = if pulse_on {
-                    PackedRgba::rgb(255, 86, 86)
+                    tp.badge_urgent_bg
                 } else {
-                    PackedRgba::rgb(164, 66, 66)
+                    crate::tui_theme::lerp_color(tp.badge_urgent_bg, tp.text_disabled, 0.5)
                 };
                 ("!!", Style::default().fg(fg).bold())
             }

@@ -10,7 +10,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::{AnomalySeverity, InsightCard, InsightFeed, quick_insight_feed};
 
@@ -136,11 +136,12 @@ impl Default for AnalyticsScreen {
 // ── Rendering helpers ──────────────────────────────────────────────────
 
 fn severity_style(severity: AnomalySeverity) -> Style {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     match severity {
-        AnomalySeverity::Critical => Style::default().fg(PackedRgba::rgb(255, 60, 60)).bold(),
-        AnomalySeverity::High => Style::default().fg(PackedRgba::rgb(255, 165, 0)).bold(),
-        AnomalySeverity::Medium => Style::default().fg(PackedRgba::rgb(255, 255, 0)),
-        AnomalySeverity::Low => Style::default().fg(PackedRgba::rgb(100, 200, 100)),
+        AnomalySeverity::Critical => Style::default().fg(tp.severity_critical).bold(),
+        AnomalySeverity::High => Style::default().fg(tp.severity_warn).bold(),
+        AnomalySeverity::Medium => Style::default().fg(tp.severity_warn),
+        AnomalySeverity::Low => Style::default().fg(tp.severity_ok),
     }
 }
 
@@ -174,8 +175,9 @@ fn render_card_list(
     selected: usize,
     table_state: &mut TableState,
 ) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let header = Row::new(vec!["Sev", "Conf", "Headline"])
-        .style(Style::default().fg(PackedRgba::rgb(180, 180, 220)).bold());
+        .style(Style::default().fg(tp.panel_title_fg).bold());
 
     let rows: Vec<Row> = feed
         .cards
@@ -220,6 +222,7 @@ fn render_card_list(
 fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scroll: u16) {
     use ftui::text::{Line, Span, Text};
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let mut lines = Vec::new();
 
     // Header: severity + confidence
@@ -231,7 +234,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
         Span::raw("  "),
         Span::styled(
             confidence_bar(card.confidence),
-            Style::default().fg(PackedRgba::rgb(120, 180, 255)),
+            Style::default().fg(tp.status_accent),
         ),
     ]));
     lines.push(Line::raw(""));
@@ -255,7 +258,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
         lines.push(Line::from_spans(vec![
             Span::styled(
                 "Likely Cause: ",
-                Style::default().fg(PackedRgba::rgb(255, 200, 100)).bold(),
+                Style::default().fg(tp.severity_warn).bold(),
             ),
             Span::raw(cause),
         ]));
@@ -266,7 +269,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     if !card.next_steps.is_empty() {
         lines.push(Line::styled(
             "Next Steps:",
-            Style::default().fg(PackedRgba::rgb(100, 220, 100)).bold(),
+            Style::default().fg(tp.severity_ok).bold(),
         ));
         for (i, step) in card.next_steps.iter().enumerate() {
             lines.push(Line::raw(format!("  {}. {step}", i + 1)));
@@ -278,7 +281,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     if !card.deep_links.is_empty() {
         lines.push(Line::styled(
             "Deep Links (Enter to navigate):",
-            Style::default().fg(PackedRgba::rgb(120, 120, 220)),
+            Style::default().fg(tp.text_muted),
         ));
         for link in &card.deep_links {
             lines.push(Line::raw(format!("  → {link}")));
@@ -290,7 +293,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     if !card.supporting_trends.is_empty() {
         lines.push(Line::styled(
             format!("Supporting Trends ({})", card.supporting_trends.len()),
-            Style::default().fg(PackedRgba::rgb(160, 160, 200)),
+            Style::default().fg(tp.text_secondary),
         ));
         for trend in &card.supporting_trends {
             lines.push(Line::raw(format!(
@@ -309,7 +312,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
                 "Supporting Correlations ({})",
                 card.supporting_correlations.len()
             ),
-            Style::default().fg(PackedRgba::rgb(160, 160, 200)),
+            Style::default().fg(tp.text_secondary),
         ));
         for corr in &card.supporting_correlations {
             lines.push(Line::raw(format!(

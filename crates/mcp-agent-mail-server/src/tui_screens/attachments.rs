@@ -7,7 +7,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 
 use mcp_agent_mail_db::DbConn;
@@ -455,10 +455,11 @@ impl AttachmentExplorerScreen {
                     e.subject.clone()
                 };
 
+                let tp = crate::tui_theme::TuiThemePalette::current();
                 let style = if Some(i) == self.table_state.selected {
                     Style::default()
-                        .fg(PackedRgba::rgb(0, 0, 0))
-                        .bg(PackedRgba::rgb(255, 184, 108))
+                        .fg(tp.selection_fg)
+                        .bg(tp.selection_bg)
                 } else {
                     Style::default()
                 };
@@ -500,7 +501,8 @@ impl AttachmentExplorerScreen {
         );
 
         let summary_style = if self.text_filter_active {
-            Style::default().fg(PackedRgba::rgb(255, 184, 108))
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            Style::default().fg(tp.status_accent)
         } else {
             Style::default()
         };
@@ -696,8 +698,9 @@ impl MailScreen for AttachmentExplorerScreen {
         self.render_header(frame, header_area);
 
         if let Some(err) = &self.last_error {
+            let tp = crate::tui_theme::TuiThemePalette::current();
             let err_p = Paragraph::new(format!(" Error: {err}"))
-                .style(Style::default().fg(PackedRgba::rgb(255, 85, 85)));
+                .style(Style::default().fg(tp.severity_error));
             err_p.render(table_area, frame);
             return;
         }
@@ -722,11 +725,12 @@ impl MailScreen for AttachmentExplorerScreen {
         let table = Table::new(rows, widths)
             .header(header_row)
             .block(block)
-            .highlight_style(
+            .highlight_style({
+                let tp = crate::tui_theme::TuiThemePalette::current();
                 Style::default()
-                    .fg(PackedRgba::rgb(0, 0, 0))
-                    .bg(PackedRgba::rgb(255, 184, 108)),
-            );
+                    .fg(tp.selection_fg)
+                    .bg(tp.selection_bg)
+            });
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);

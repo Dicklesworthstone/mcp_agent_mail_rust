@@ -17,7 +17,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
@@ -349,6 +349,7 @@ impl ToolMetricsScreen {
 
     /// Render the table view (original view).
     fn render_table_view(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let header_h = 1_u16;
         let table_h = area.height.saturating_sub(header_h);
         let header_area = Rect::new(area.x, area.y, area.width, header_h);
@@ -388,10 +389,10 @@ impl ToolMetricsScreen {
                 let spark = stats.sparkline_str();
                 let style = if Some(i) == self.table_state.selected {
                     Style::default()
-                        .fg(PackedRgba::rgb(0, 0, 0))
-                        .bg(PackedRgba::rgb(100, 200, 230))
+                        .fg(tp.selection_fg)
+                        .bg(tp.selection_bg)
                 } else if stats.err_pct() > 5.0 {
-                    Style::default().fg(PackedRgba::rgb(255, 100, 100))
+                    Style::default().fg(tp.severity_error)
                 } else {
                     Style::default()
                 };
@@ -427,8 +428,8 @@ impl ToolMetricsScreen {
             .block(block)
             .highlight_style(
                 Style::default()
-                    .fg(PackedRgba::rgb(0, 0, 0))
-                    .bg(PackedRgba::rgb(100, 200, 230)),
+                    .fg(tp.selection_fg)
+                    .bg(tp.selection_bg),
             );
 
         let mut ts = self.table_state.clone();
@@ -472,6 +473,7 @@ impl ToolMetricsScreen {
 
     /// Render the top metric tile row.
     fn render_metric_tiles(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         if area.width < 10 || area.height < 1 {
             return;
         }
@@ -523,9 +525,9 @@ impl ToolMetricsScreen {
 
         MetricTile::new("Error Rate", &err_rate, trend_errors)
             .value_color(if total_errors > 0 {
-                PackedRgba::rgb(255, 100, 100)
+                tp.severity_error
             } else {
-                PackedRgba::rgb(80, 200, 80)
+                tp.severity_ok
             })
             .render(tile3, frame);
     }

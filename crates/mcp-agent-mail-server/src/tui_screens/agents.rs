@@ -63,12 +63,14 @@ impl AgentStatus {
         }
     }
 
-    const fn rgb(self) -> (u8, u8, u8) {
-        match self {
-            Self::Active => (170, 240, 195),
-            Self::Idle => (120, 170, 145),
-            Self::Inactive => (85, 100, 90),
-        }
+    fn rgb(self) -> (u8, u8, u8) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let c = match self {
+            Self::Active => tp.activity_active,
+            Self::Idle => tp.activity_idle,
+            Self::Inactive => tp.activity_stale,
+        };
+        (c.r(), c.g(), c.b())
     }
 }
 
@@ -378,13 +380,14 @@ impl AgentsScreen {
     }
 
     fn row_style(&self, row_index: usize, agent: &AgentRow, now_ts: i64) -> Style {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         if Some(row_index) == self.table_state.selected {
             return Style::default()
-                .fg(PackedRgba::rgb(0, 0, 0))
-                .bg(PackedRgba::rgb(120, 220, 150));
+                .fg(tp.selection_fg)
+                .bg(tp.selection_bg);
         }
         if !self.reduced_motion && self.stagger_reveal_ticks.contains_key(&agent.name) {
-            return Style::default().fg(PackedRgba::rgb(55, 65, 60));
+            return Style::default().fg(tp.text_disabled);
         }
 
         let status_color = self.status_color(agent, now_ts);
@@ -393,10 +396,12 @@ impl AgentsScreen {
             && let Some(remaining) = self.message_flash_ticks.get(&agent.name)
         {
             let intensity = f32::from(*remaining) / f32::from(MESSAGE_FLASH_TICKS.max(1));
-            let (r, g, b) = blend_rgb((95, 145, 120), (190, 245, 210), intensity);
+            let dim = (tp.text_muted.r(), tp.text_muted.g(), tp.text_muted.b());
+            let bright = (tp.selection_bg.r(), tp.selection_bg.g(), tp.selection_bg.b());
+            let (r, g, b) = blend_rgb(dim, bright, intensity);
             style = style
                 .bg(PackedRgba::rgb(r, g, b))
-                .fg(PackedRgba::rgb(0, 0, 0));
+                .fg(tp.selection_fg);
         }
         style
     }
@@ -559,13 +564,14 @@ impl MailScreen for AgentsScreen {
             .title("Agents")
             .border_type(BorderType::Rounded);
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
             .highlight_style(
                 Style::default()
-                    .fg(PackedRgba::rgb(0, 0, 0))
-                    .bg(PackedRgba::rgb(120, 220, 150)),
+                    .fg(tp.selection_fg)
+                    .bg(tp.selection_bg),
             );
 
         let mut ts = self.table_state.clone();
