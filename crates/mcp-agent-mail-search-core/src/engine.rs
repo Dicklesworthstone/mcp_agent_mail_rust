@@ -349,4 +349,79 @@ mod tests {
         let docs = source.fetch_all_batched(50, 100).unwrap();
         assert!(docs.is_empty());
     }
+
+    // ── IndexHealth trait coverage ─────────────────────────────────────
+
+    #[test]
+    fn index_health_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let health = IndexHealth {
+            ready: true,
+            doc_count: 100,
+            size_bytes: None,
+            last_updated_ts: None,
+            status_message: "ok".to_owned(),
+        };
+        let debug = format!("{health:?}");
+        assert!(debug.contains("IndexHealth"));
+        assert_clone(&health);
+    }
+
+    #[test]
+    fn index_health_optional_fields_present() {
+        let health = IndexHealth {
+            ready: true,
+            doc_count: 500,
+            size_bytes: Some(1_048_576),
+            last_updated_ts: Some(1_700_000_000_000_000),
+            status_message: "indexed".to_owned(),
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        assert!(json.contains("1048576"));
+        assert!(json.contains("1700000000000000"));
+    }
+
+    // ── IndexStats trait coverage ──────────────────────────────────────
+
+    #[test]
+    fn index_stats_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let stats = IndexStats {
+            docs_indexed: 10,
+            docs_removed: 2,
+            elapsed_ms: 50,
+            warnings: vec!["warn1".to_owned()],
+        };
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("IndexStats"));
+        assert_clone(&stats);
+    }
+
+    #[test]
+    fn index_stats_multiple_warnings() {
+        let stats = IndexStats {
+            docs_indexed: 100,
+            docs_removed: 0,
+            elapsed_ms: 999,
+            warnings: vec![
+                "slow batch 1".to_owned(),
+                "missing field".to_owned(),
+                "truncated body".to_owned(),
+            ],
+        };
+        assert_eq!(stats.warnings.len(), 3);
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: IndexStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.warnings.len(), 3);
+    }
+
+    // ── Send + Sync trait bounds verified ──────────────────────────────
+
+    #[test]
+    fn trait_bounds_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StubEngine>();
+        assert_send_sync::<StubLifecycle>();
+        assert_send_sync::<StubSource>();
+    }
 }

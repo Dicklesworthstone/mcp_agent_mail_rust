@@ -256,4 +256,55 @@ mod tests {
         assert_eq!(try_search(true).unwrap(), 42);
         assert!(try_search(false).is_err());
     }
+
+    // ── Display message formatting ──────────────────────────────────────
+
+    #[test]
+    fn display_mode_unavailable() {
+        let err = SearchError::ModeUnavailable("semantic not compiled".into());
+        let msg = err.to_string();
+        assert!(msg.contains("semantic not compiled"));
+        assert!(msg.contains("unavailable"));
+    }
+
+    #[test]
+    fn display_timeout() {
+        let err = SearchError::Timeout("exceeded 5s limit".into());
+        assert!(err.to_string().contains("exceeded 5s limit"));
+    }
+
+    #[test]
+    fn display_document_not_found() {
+        let err = SearchError::DocumentNotFound("msg-42".into());
+        assert!(err.to_string().contains("msg-42"));
+    }
+
+    #[test]
+    fn display_internal() {
+        let err = SearchError::Internal("null pointer".into());
+        assert!(err.to_string().contains("null pointer"));
+    }
+
+    // ── Error type all 9 variants covered ───────────────────────────────
+
+    #[test]
+    fn error_type_count() {
+        // Ensure we test all 9 variants
+        let types = [
+            SearchError::IndexNotReady(String::new()).error_type(),
+            SearchError::IndexCorrupted(String::new()).error_type(),
+            SearchError::InvalidQuery(String::new()).error_type(),
+            SearchError::ModeUnavailable(String::new()).error_type(),
+            SearchError::DocumentNotFound(String::new()).error_type(),
+            SearchError::Timeout(String::new()).error_type(),
+            SearchError::Io(std::io::Error::other("")).error_type(),
+            SearchError::Serialization(serde_json::from_str::<i32>("x").unwrap_err()).error_type(),
+            SearchError::Internal(String::new()).error_type(),
+        ];
+        // All 9 types should be distinct
+        let mut unique: Vec<&str> = types.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 9);
+    }
 }

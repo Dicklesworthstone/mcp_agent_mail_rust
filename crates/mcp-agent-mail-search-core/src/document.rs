@@ -270,4 +270,89 @@ mod tests {
             assert_eq!(change.doc_kind(), kind);
         }
     }
+
+    // ── DocKind trait coverage ─────────────────────────────────────────
+
+    #[test]
+    fn doc_kind_debug() {
+        let debug = format!("{:?}", DocKind::Message);
+        assert!(debug.contains("Message"));
+    }
+
+    #[test]
+    fn doc_kind_clone_copy_eq() {
+        let a = DocKind::Agent;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(a, DocKind::Project);
+    }
+
+    // ── Document edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn document_empty_fields() {
+        let doc = Document {
+            id: 0,
+            kind: DocKind::Thread,
+            body: String::new(),
+            title: String::new(),
+            project_id: None,
+            created_ts: 0,
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, 0);
+        assert!(back.body.is_empty());
+        assert!(back.title.is_empty());
+    }
+
+    #[test]
+    fn document_negative_timestamp() {
+        let doc = Document {
+            id: 1,
+            kind: DocKind::Message,
+            body: "pre-epoch".to_owned(),
+            title: "old".to_owned(),
+            project_id: None,
+            created_ts: -1_000_000,
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.created_ts, -1_000_000);
+    }
+
+    // ── DocChange upsert for all kinds ────────────────────────────────
+
+    #[test]
+    fn doc_change_upsert_all_kinds() {
+        for kind in [
+            DocKind::Message,
+            DocKind::Agent,
+            DocKind::Project,
+            DocKind::Thread,
+        ] {
+            let doc = Document {
+                id: 42,
+                kind,
+                body: String::new(),
+                title: String::new(),
+                project_id: None,
+                created_ts: 0,
+                metadata: HashMap::new(),
+            };
+            let change = DocChange::Upsert(doc);
+            assert_eq!(change.doc_id(), 42);
+            assert_eq!(change.doc_kind(), kind);
+        }
+    }
+
+    // ── DocId type alias ──────────────────────────────────────────────
+
+    #[test]
+    fn doc_id_is_i64() {
+        let id: DocId = -1;
+        assert_eq!(id, -1_i64);
+    }
 }
