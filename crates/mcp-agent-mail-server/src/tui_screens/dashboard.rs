@@ -1178,10 +1178,14 @@ fn pulsing_severity_badge(
         lerp(base.1, highlight.1),
         lerp(base.2, highlight.2),
     );
-    Span::styled(severity.badge().to_string(), Style::default().fg(color).bold())
+    Span::styled(
+        severity.badge().to_string(),
+        Style::default().fg(color).bold(),
+    )
 }
 
 /// Render the scrollable event log.
+#[allow(clippy::too_many_arguments)]
 fn render_event_log(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1999,6 +2003,20 @@ mod tests {
         let entry = format_event(&event);
         assert_eq!(entry.severity, EventSeverity::Info);
         assert_eq!(entry.severity.badge(), "INF");
+    }
+
+    #[test]
+    fn pulsing_badge_falls_back_when_reduced_motion() {
+        let static_badge =
+            pulsing_severity_badge(EventSeverity::Error, std::f32::consts::FRAC_PI_2, true);
+        assert_eq!(static_badge, EventSeverity::Error.styled_badge());
+    }
+
+    #[test]
+    fn pulsing_badge_differs_for_urgent_severity_when_enabled() {
+        let pulsed =
+            pulsing_severity_badge(EventSeverity::Warn, std::f32::consts::FRAC_PI_2, false);
+        assert_ne!(pulsed, EventSeverity::Warn.styled_badge());
     }
 
     #[test]

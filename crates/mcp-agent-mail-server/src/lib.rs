@@ -7652,11 +7652,12 @@ mod tests {
         assert!(limiter.allow_memory(key, 6000, 1, t0, false));
         assert!(!limiter.allow_memory(key, 6000, 1, t0, false));
 
-        // After 0.01s (10ms), exactly 1 token refilled (100 * 0.01 = 1.0).
-        assert!(limiter.allow_memory(key, 6000, 1, t0 + 0.01, false));
-        assert!(!limiter.allow_memory(key, 6000, 1, t0 + 0.01, false));
+        // After 0.011s (11ms), >1 token refilled (100 * 0.011 = 1.1).
+        // Use 0.011 instead of exact 0.01 to avoid f64 boundary precision.
+        assert!(limiter.allow_memory(key, 6000, 1, t0 + 0.011, false));
+        assert!(!limiter.allow_memory(key, 6000, 1, t0 + 0.011, false));
 
-        // 0.009s is not enough (100 * 0.009 = 0.9 < 1.0).
+        // 0.008s later is not enough (100 * 0.008 = 0.8 < 1.0).
         assert!(!limiter.allow_memory(key, 6000, 1, t0 + 0.019, false));
     }
 

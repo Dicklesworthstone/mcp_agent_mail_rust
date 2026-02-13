@@ -162,7 +162,10 @@ impl RenderItem for MessageEntry {
         // Importance badge
         let pulse_on = MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed);
         let (badge, badge_style) = match self.importance.as_str() {
-            "high" => ("!", Style::default().fg(PackedRgba::rgb(235, 176, 70)).bold()),
+            "high" => (
+                "!",
+                Style::default().fg(PackedRgba::rgb(235, 176, 70)).bold(),
+            ),
             "urgent" => {
                 let fg = if pulse_on {
                     PackedRgba::rgb(255, 86, 86)
@@ -338,7 +341,7 @@ impl MessageBrowserScreen {
             MESSAGE_URGENT_PULSE_ON.store(true, Ordering::Relaxed);
             return;
         }
-        let pulse_on = (tick_count / URGENT_PULSE_HALF_PERIOD_TICKS).is_multiple_of(2);
+        let pulse_on = ((tick_count / URGENT_PULSE_HALF_PERIOD_TICKS) % 2) == 0;
         MESSAGE_URGENT_PULSE_ON.store(pulse_on, Ordering::Relaxed);
     }
 
@@ -2063,5 +2066,26 @@ mod tests {
                 .iter()
                 .any(|b| b.key == "g" && b.action.contains("Local/Global"))
         );
+    }
+
+    #[test]
+    fn urgent_pulse_toggles_on_tick_boundary() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.reduced_motion = false;
+
+        screen.update_urgent_pulse(0);
+        assert!(MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed));
+
+        screen.update_urgent_pulse(URGENT_PULSE_HALF_PERIOD_TICKS);
+        assert!(!MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn urgent_pulse_forces_on_when_reduced_motion_enabled() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.reduced_motion = true;
+
+        screen.update_urgent_pulse(URGENT_PULSE_HALF_PERIOD_TICKS);
+        assert!(MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed));
     }
 }

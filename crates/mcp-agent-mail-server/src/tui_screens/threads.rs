@@ -40,6 +40,7 @@ const DEFAULT_THREAD_PAGE_SIZE: usize = 20;
 
 /// Number of older messages to load when clicking "Load older".
 const LOAD_OLDER_BATCH_SIZE: usize = 15;
+const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
 
 /// Color palette for deterministic per-agent coloring in thread cards.
 const AGENT_COLOR_PALETTE: [PackedRgba; 8] = [
@@ -52,6 +53,17 @@ const AGENT_COLOR_PALETTE: [PackedRgba; 8] = [
     PackedRgba::rgb(255, 219, 109),
     PackedRgba::rgb(163, 229, 124),
 ];
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn reduced_motion_enabled() -> bool {
+    env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
+}
 
 fn parse_thread_page_size(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
@@ -267,6 +279,10 @@ pub struct ThreadExplorerScreen {
     page_size: usize,
     /// Whether "Load older" button is selected (when at scroll 0).
     load_older_selected: bool,
+    /// Urgent badge pulse phase for escalated threads.
+    urgent_pulse_on: bool,
+    /// Reduced-motion mode disables pulse animation.
+    reduced_motion: bool,
 }
 
 impl ThreadExplorerScreen {
@@ -294,6 +310,8 @@ impl ThreadExplorerScreen {
             expanded_message_ids: HashSet::new(),
             page_size: get_thread_page_size(),
             load_older_selected: false,
+            urgent_pulse_on: true,
+            reduced_motion: reduced_motion_enabled(),
         }
     }
 
@@ -722,7 +740,9 @@ impl MailScreen for ThreadExplorerScreen {
         Cmd::None
     }
 
-    fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
+    fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        self.urgent_pulse_on =
+            self.reduced_motion || ((tick_count / URGENT_PULSE_HALF_PERIOD_TICKS) % 2) == 0;
         // Initial load or dirty flag
         if self.list_dirty {
             self.refresh_thread_list(state);
@@ -808,6 +828,7 @@ impl MailScreen for ThreadExplorerScreen {
                 matches!(self.focus, Focus::ThreadList),
                 self.view_lens,
                 self.sort_mode,
+                self.urgent_pulse_on,
             );
             render_thread_detail(
                 frame,
@@ -836,6 +857,7 @@ impl MailScreen for ThreadExplorerScreen {
                         true,
                         self.view_lens,
                         self.sort_mode,
+                        self.urgent_pulse_on,
                     );
                 }
                 Focus::DetailPanel => {
@@ -1144,6 +1166,7 @@ fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, text: &str, editing: boo
 }
 
 /// Render the thread list panel.
+#[allow(clippy::too_many_arguments)]
 fn render_thread_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1152,6 +1175,7 @@ fn render_thread_list(
     focused: bool,
     view_lens: ViewLens,
     sort_mode: SortMode,
+    urgent_pulse_on: bool,
 ) {
     let focus_tag = if focused { "" } else { " (inactive)" };
     let escalated = threads.iter().filter(|t| t.has_escalation).count();
@@ -1195,7 +1219,11 @@ fn render_thread_list(
     for (view_idx, thread) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
         let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
-        let esc_badge = if thread.has_escalation { "!" } else { " " };
+        let esc_badge = if thread.has_escalation {
+            if urgent_pulse_on { "!" } else { "·" }
+        } else {
+            " "
+        };
 
         // Compact timestamp (HH:MM from ISO string)
         let time_short = if thread.last_timestamp_iso.len() >= 16 {
@@ -2259,6 +2287,29 @@ mod tests {
         let c = agent_color("FrostyCompass");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn urgent_pulse_toggles_from_tick_count() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.reduced_motion = false;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        screen.tick(0, &state);
+        assert!(screen.urgent_pulse_on);
+
+        screen.tick(URGENT_PULSE_HALF_PERIOD_TICKS, &state);
+        assert!(!screen.urgent_pulse_on);
+    }
+
+    #[test]
+    fn urgent_pulse_is_static_in_reduced_motion() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.reduced_motion = true;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        screen.tick(URGENT_PULSE_HALF_PERIOD_TICKS, &state);
+        assert!(screen.urgent_pulse_on);
     }
 
     fn make_message(id: i64) -> ThreadMessage {
