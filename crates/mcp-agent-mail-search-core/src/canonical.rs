@@ -642,4 +642,200 @@ mod tests {
             "Should redact both secrets"
         );
     }
+
+    // ── CanonPolicy trait coverage ──
+
+    #[test]
+    fn canon_policy_default() {
+        assert_eq!(CanonPolicy::default(), CanonPolicy::Full);
+    }
+
+    #[test]
+    fn canon_policy_debug() {
+        for policy in [
+            CanonPolicy::Full,
+            CanonPolicy::RedactSecrets,
+            CanonPolicy::TitleOnly,
+        ] {
+            let debug = format!("{policy:?}");
+            assert!(!debug.is_empty());
+        }
+    }
+
+    #[test]
+    fn canon_policy_clone_copy_eq() {
+        let a = CanonPolicy::RedactSecrets;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(a, CanonPolicy::TitleOnly);
+    }
+
+    // ── strip_markdown additional cases ──
+
+    #[test]
+    fn strip_indented_list_markers() {
+        let input = "  - nested item 1\n    - deeper item";
+        let result = strip_markdown(input);
+        assert!(result.contains("nested item 1"));
+        assert!(result.contains("deeper item"));
+    }
+
+    #[test]
+    fn strip_code_fence_with_language() {
+        let input = "```python\nprint('hello')\n```\nAfter code.";
+        let result = strip_markdown(input);
+        assert!(!result.contains("print"));
+        assert!(result.contains("After code"));
+    }
+
+    #[test]
+    fn strip_multiple_code_fences() {
+        let input = "```\nfirst\n```\nmiddle\n```\nsecond\n```\nend";
+        let result = strip_markdown(input);
+        assert!(!result.contains("first"));
+        assert!(!result.contains("second"));
+        assert!(result.contains("middle"));
+        assert!(result.contains("end"));
+    }
+
+    #[test]
+    fn strip_plus_list_markers() {
+        let input = "+ item a\n+ item b";
+        let result = strip_markdown(input);
+        assert!(result.contains("item a"));
+        assert!(result.contains("item b"));
+        assert!(!result.contains("+ "));
+    }
+
+    #[test]
+    fn strip_empty_input() {
+        assert_eq!(strip_markdown(""), "");
+    }
+
+    // ── Secret redaction additional ──
+
+    #[test]
+    fn redact_gitlab_token() {
+        let input = "token glpat-abcdefghijklmnopqrstuvwxyz";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("glpat-"));
+    }
+
+    #[test]
+    fn redact_slack_token() {
+        // Use xoxs- variant to avoid GitHub push protection on xoxb-
+        let input = "slack xoxs-test000000-faketoken1234";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("xoxs-"));
+    }
+
+    #[test]
+    fn redact_github_pat() {
+        let input = "pat github_pat_abcdefghijklmnopqrstuvwxyz";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("github_pat_"));
+    }
+
+    #[test]
+    fn redact_jwt_token() {
+        let input = "JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkw.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("eyJ"));
+    }
+
+    // ── Normalization edge cases ──
+
+    #[test]
+    fn normalize_unicode_whitespace() {
+        // Non-breaking space (U+00A0) and other Unicode whitespace
+        let input = "hello\u{00A0}world";
+        let result = normalize_text(input);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn normalize_mixed_whitespace() {
+        let input = " \t\n\r hello \t world \n ";
+        let result = normalize_text(input);
+        assert_eq!(result, "hello world");
+    }
+
+    // ── extract_text edge cases ──
+
+    #[test]
+    fn extract_thread_same_as_message() {
+        let msg = extract_text(DocKind::Message, "Subject", "Body");
+        let thr = extract_text(DocKind::Thread, "Subject", "Body");
+        assert_eq!(msg, thr);
+    }
+
+    #[test]
+    fn extract_both_empty() {
+        assert_eq!(extract_text(DocKind::Message, "", ""), "");
+        assert_eq!(extract_text(DocKind::Agent, "", ""), "");
+    }
+
+    // ── canonicalize additional ──
+
+    #[test]
+    fn canonicalize_redact_secrets_policy() {
+        let result = canonicalize(
+            DocKind::Message,
+            "Config",
+            "key: sk-1234567890abcdefghijklmn",
+            CanonPolicy::RedactSecrets,
+        );
+        assert!(result.contains("[redacted]"));
+        assert!(!result.contains("sk-"));
+    }
+
+    #[test]
+    fn canonicalize_whitespace_only() {
+        let result = canonicalize(DocKind::Message, "   ", "   ", CanonPolicy::Full);
+        assert_eq!(result, "");
+    }
+
+    // ── content_hash edge cases ──
+
+    #[test]
+    fn content_hash_empty_string() {
+        let hash = content_hash("");
+        assert_eq!(hash.len(), 64);
+        // SHA-256 of "" is a well-known constant
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn content_hash_unicode() {
+        let h1 = content_hash("日本語");
+        let h2 = content_hash("日本語");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+    }
+
+    // ── canonicalize_and_hash edge cases ──
+
+    #[test]
+    fn canonicalize_and_hash_empty() {
+        let (text, hash) = canonicalize_and_hash(DocKind::Agent, "", "", CanonPolicy::TitleOnly);
+        assert_eq!(text, "");
+        assert_eq!(hash, content_hash(""));
+    }
+
+    #[test]
+    fn canonicalize_and_hash_title_only_ignores_body() {
+        let (text1, hash1) =
+            canonicalize_and_hash(DocKind::Message, "Title", "body1", CanonPolicy::TitleOnly);
+        let (text2, hash2) =
+            canonicalize_and_hash(DocKind::Message, "Title", "body2", CanonPolicy::TitleOnly);
+        assert_eq!(text1, text2);
+        assert_eq!(hash1, hash2);
+    }
 }

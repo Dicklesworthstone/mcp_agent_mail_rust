@@ -968,4 +968,266 @@ mod tests {
         let budget2: CandidateBudget = serde_json::from_str(&json).unwrap();
         assert_eq!(budget, budget2);
     }
+
+    // ── Trait coverage ──────────────────────────────────────────────
+
+    #[test]
+    fn candidate_mode_debug_clone_copy() {
+        let mode = CandidateMode::Hybrid;
+        let debug = format!("{mode:?}");
+        assert!(debug.contains("Hybrid"));
+        let copied = mode; // Copy
+        assert_eq!(mode, copied);
+    }
+
+    #[test]
+    fn query_class_debug_clone_copy() {
+        let qc = QueryClass::Identifier;
+        let debug = format!("{qc:?}");
+        assert!(debug.contains("Identifier"));
+        let copied = qc;
+        assert_eq!(qc, copied);
+    }
+
+    #[test]
+    fn candidate_source_debug_clone_copy() {
+        let src = CandidateSource::Lexical;
+        let debug = format!("{src:?}");
+        assert!(debug.contains("Lexical"));
+        let copied = src;
+        assert_eq!(src, copied);
+    }
+
+    #[test]
+    fn candidate_budget_config_serde_roundtrip() {
+        let config = CandidateBudgetConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let config2: CandidateBudgetConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.min_lexical, config2.min_lexical);
+        assert_eq!(config.max_combined, config2.max_combined);
+    }
+
+    #[test]
+    fn candidate_budget_config_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let config = CandidateBudgetConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("CandidateBudgetConfig"));
+        assert_clone(&config);
+    }
+
+    #[test]
+    fn candidate_hit_serde_roundtrip() {
+        let hit = CandidateHit::new(42, 0.95);
+        let json = serde_json::to_string(&hit).unwrap();
+        let hit2: CandidateHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(hit, hit2);
+    }
+
+    #[test]
+    fn candidate_hit_debug_clone() {
+        let hit = CandidateHit::new(1, 0.5);
+        let debug = format!("{hit:?}");
+        assert!(debug.contains("CandidateHit"));
+        let cloned = hit;
+        assert_eq!(hit.doc_id, cloned.doc_id);
+    }
+
+    #[test]
+    fn prepared_candidate_serde_roundtrip() {
+        let candidate = PreparedCandidate {
+            doc_id: 10,
+            lexical_rank: Some(1),
+            semantic_rank: Some(3),
+            lexical_score: Some(0.9),
+            semantic_score: Some(0.7),
+            first_source: CandidateSource::Lexical,
+        };
+        let json = serde_json::to_string(&candidate).unwrap();
+        let candidate2: PreparedCandidate = serde_json::from_str(&json).unwrap();
+        assert_eq!(candidate, candidate2);
+    }
+
+    #[test]
+    fn stage_counts_serde_roundtrip() {
+        let counts = CandidateStageCounts {
+            lexical_considered: 100,
+            semantic_considered: 50,
+            lexical_selected: 20,
+            semantic_selected: 15,
+            deduped_selected: 30,
+            duplicates_removed: 5,
+        };
+        let json = serde_json::to_string(&counts).unwrap();
+        let counts2: CandidateStageCounts = serde_json::from_str(&json).unwrap();
+        assert_eq!(counts, counts2);
+    }
+
+    #[test]
+    fn candidate_preparation_serde_roundtrip() {
+        let prep = CandidatePreparation {
+            budget: CandidateBudget {
+                lexical_limit: 10,
+                semantic_limit: 10,
+                combined_limit: 20,
+            },
+            counts: CandidateStageCounts::default(),
+            candidates: vec![PreparedCandidate {
+                doc_id: 1,
+                lexical_rank: Some(1),
+                semantic_rank: None,
+                lexical_score: Some(0.8),
+                semantic_score: None,
+                first_source: CandidateSource::Lexical,
+            }],
+        };
+        let json = serde_json::to_string(&prep).unwrap();
+        let prep2: CandidatePreparation = serde_json::from_str(&json).unwrap();
+        assert_eq!(prep, prep2);
+    }
+
+    // ── QueryClass::classify additional edge cases ──────────────────
+
+    #[test]
+    fn query_classifies_hyphenated_only_as_identifier() {
+        // All tokens hyphenated + alphanumeric only → identifier
+        assert_eq!(
+            QueryClass::classify("mcp-agent-mail"),
+            QueryClass::Identifier
+        );
+    }
+
+    #[test]
+    fn query_classifies_thread_prefix_as_identifier() {
+        assert_eq!(QueryClass::classify("thread:main"), QueryClass::Identifier);
+    }
+
+    #[test]
+    fn query_classifies_three_short_words_as_natural_language() {
+        // 3 tokens → not ShortKeyword (≤2), but short avg → NaturalLanguage
+        assert_eq!(
+            QueryClass::classify("fix the bug"),
+            QueryClass::NaturalLanguage
+        );
+    }
+
+    #[test]
+    fn query_classifies_long_single_word_as_short_keyword() {
+        // Single token, 10 chars → ShortKeyword (avg_len ≤ 10)
+        assert_eq!(QueryClass::classify("embeddings"), QueryClass::ShortKeyword);
+    }
+
+    #[test]
+    fn candidate_mode_serde_snake_case() {
+        let json = serde_json::to_string(&CandidateMode::LexicalFallback).unwrap();
+        assert_eq!(json, "\"lexical_fallback\"");
+    }
+
+    #[test]
+    fn query_class_serde_snake_case() {
+        let json = serde_json::to_string(&QueryClass::ShortKeyword).unwrap();
+        assert_eq!(json, "\"short_keyword\"");
+        let json2 = serde_json::to_string(&QueryClass::NaturalLanguage).unwrap();
+        assert_eq!(json2, "\"natural_language\"");
+    }
+
+    // ── best_rank ──────────────────────────────────────────────────
+
+    #[test]
+    fn best_rank_picks_minimum() {
+        let candidate = PreparedCandidate {
+            doc_id: 1,
+            lexical_rank: Some(5),
+            semantic_rank: Some(2),
+            lexical_score: None,
+            semantic_score: None,
+            first_source: CandidateSource::Semantic,
+        };
+        assert_eq!(candidate.best_rank(), 2);
+    }
+
+    #[test]
+    fn best_rank_with_only_lexical() {
+        let candidate = PreparedCandidate {
+            doc_id: 1,
+            lexical_rank: Some(3),
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            first_source: CandidateSource::Lexical,
+        };
+        assert_eq!(candidate.best_rank(), 3);
+    }
+
+    #[test]
+    fn best_rank_with_no_ranks() {
+        let candidate = PreparedCandidate {
+            doc_id: 1,
+            lexical_rank: None,
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            first_source: CandidateSource::Lexical,
+        };
+        assert_eq!(candidate.best_rank(), usize::MAX);
+    }
+
+    // ── score_cmp_desc and rank_or_max ─────────────────────────────
+
+    #[test]
+    fn rank_or_max_some_returns_value() {
+        assert_eq!(rank_or_max(Some(5)), 5);
+    }
+
+    #[test]
+    fn rank_or_max_none_returns_max() {
+        assert_eq!(rank_or_max(None), usize::MAX);
+    }
+
+    #[test]
+    fn score_cmp_desc_both_some() {
+        // Higher score should come first (descending)
+        assert_eq!(score_cmp_desc(Some(0.9), Some(0.5)), Ordering::Less);
+        assert_eq!(score_cmp_desc(Some(0.5), Some(0.9)), Ordering::Greater);
+        assert_eq!(score_cmp_desc(Some(0.5), Some(0.5)), Ordering::Equal);
+    }
+
+    #[test]
+    fn score_cmp_desc_none_values() {
+        // None treated as NEG_INFINITY; function does b.cmp(a) for descending
+        // score_cmp_desc(a=None, b=Some(0.5)) = 0.5.cmp(NEG_INF) = Greater
+        assert_eq!(score_cmp_desc(None, Some(0.5)), Ordering::Greater);
+        // score_cmp_desc(a=Some(0.5), b=None) = NEG_INF.cmp(0.5) = Less
+        assert_eq!(score_cmp_desc(Some(0.5), None), Ordering::Less);
+        assert_eq!(score_cmp_desc(None, None), Ordering::Equal);
+    }
+
+    // ── prepare_candidates with negative scores ────────────────────
+
+    #[test]
+    fn prepare_candidates_negative_scores() {
+        let lexical = vec![CandidateHit::new(1, -0.5), CandidateHit::new(2, -1.0)];
+        let semantic = vec![CandidateHit::new(3, -0.1)];
+        let budget = CandidateBudget {
+            lexical_limit: 10,
+            semantic_limit: 10,
+            combined_limit: 10,
+        };
+        let prepared = prepare_candidates(&lexical, &semantic, budget);
+        assert_eq!(prepared.candidates.len(), 3);
+    }
+
+    #[test]
+    fn prepare_candidates_single_hit_each() {
+        let lexical = vec![CandidateHit::new(100, 0.9)];
+        let semantic = vec![CandidateHit::new(200, 0.8)];
+        let budget = CandidateBudget {
+            lexical_limit: 1,
+            semantic_limit: 1,
+            combined_limit: 2,
+        };
+        let prepared = prepare_candidates(&lexical, &semantic, budget);
+        assert_eq!(prepared.candidates.len(), 2);
+        assert_eq!(prepared.counts.duplicates_removed, 0);
+    }
 }

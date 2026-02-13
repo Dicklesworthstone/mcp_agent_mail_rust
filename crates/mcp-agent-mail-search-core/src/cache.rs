@@ -931,7 +931,7 @@ mod tests {
         cache.bump_epoch(); // epoch → 1
         // Try to insert with epoch 0 (stale)
         let stale_key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
-        cache.put(stale_key.clone(), 42);
+        cache.put(stale_key, 42);
         let metrics = cache.metrics();
         assert_eq!(metrics.inserts, 0, "stale epoch put should be rejected");
     }
@@ -1260,5 +1260,188 @@ mod tests {
 
         // Should still be one entry
         assert_eq!(cache.metrics().current_entries, 1);
+    }
+
+    // ── Trait coverage ──────────────────────────────────────────────
+
+    #[test]
+    fn cache_metrics_debug_clone_copy() {
+        let metrics = CacheMetrics {
+            hits: 10,
+            misses: 5,
+            ..Default::default()
+        };
+        let debug = format!("{metrics:?}");
+        assert!(debug.contains("CacheMetrics"));
+        let copied = metrics; // Copy
+        assert_eq!(copied.hits, 10);
+    }
+
+    #[test]
+    fn cache_config_serde_roundtrip() {
+        let config = CacheConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let config2: CacheConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.max_entries, config2.max_entries);
+        assert!(config2.enabled);
+    }
+
+    #[test]
+    fn cache_config_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let config = CacheConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("CacheConfig"));
+        assert_clone(&config);
+    }
+
+    #[test]
+    fn warm_worker_config_serde_roundtrip() {
+        let config = WarmWorkerConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let config2: WarmWorkerConfig = serde_json::from_str(&json).unwrap();
+        assert!(config2.warmup_on_startup);
+        assert_eq!(config2.max_retries, config.max_retries);
+    }
+
+    #[test]
+    fn warm_worker_config_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let config = WarmWorkerConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("WarmWorkerConfig"));
+        assert_clone(&config);
+    }
+
+    #[test]
+    fn warm_status_debug_clone_serde() {
+        let status = WarmStatus {
+            resource: WarmResource::LexicalIndex,
+            state: WarmState::Warm,
+            warm_duration_ms: Some(100),
+            last_attempt: Some("2026-01-01T00:00:00Z".to_string()),
+            error: None,
+        };
+        let debug = format!("{status:?}");
+        assert!(debug.contains("WarmStatus"));
+        let json = serde_json::to_string(&status).unwrap();
+        let status2: WarmStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(status2.state, WarmState::Warm);
+    }
+
+    #[test]
+    fn invalidation_event_debug_clone_serde() {
+        let event = InvalidationEvent {
+            trigger: InvalidationTrigger::IndexUpdate,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            entries_invalidated: 42,
+            new_epoch: 5,
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("InvalidationEvent"));
+        let json = serde_json::to_string(&event).unwrap();
+        let event2: InvalidationEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event2.entries_invalidated, 42);
+    }
+
+    #[test]
+    fn cache_entry_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let entry = CacheEntry::new(42_i64);
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("CacheEntry"));
+        assert_clone(&entry);
+        assert_eq!(entry.value, 42);
+        assert_eq!(entry.access_count, 1);
+    }
+
+    #[test]
+    fn warm_state_debug_clone_copy_eq() {
+        let state = WarmState::Cold;
+        let debug = format!("{state:?}");
+        assert!(debug.contains("Cold"));
+        let copied = state; // Copy
+        assert_eq!(state, copied);
+        assert_ne!(state, WarmState::Warm);
+    }
+
+    #[test]
+    fn warm_resource_debug_clone_copy_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(WarmResource::LexicalIndex);
+        set.insert(WarmResource::SemanticEmbedder);
+        set.insert(WarmResource::VectorIndex);
+        set.insert(WarmResource::Reranker);
+        assert_eq!(set.len(), 4);
+        let debug = format!("{:?}", WarmResource::Reranker);
+        assert!(debug.contains("Reranker"));
+    }
+
+    #[test]
+    fn invalidation_trigger_debug_clone_copy_eq() {
+        let t = InvalidationTrigger::Manual;
+        let debug = format!("{t:?}");
+        assert!(debug.contains("Manual"));
+        let copied = t; // Copy
+        assert_eq!(t, copied);
+        assert_ne!(t, InvalidationTrigger::TtlExpiry);
+    }
+
+    #[test]
+    fn query_cache_key_hash_trait() {
+        use std::collections::HashSet;
+        let filter = SearchFilter::default();
+        let key1 = QueryCacheKey::new("test", SearchMode::Hybrid, &filter, 0, 0, 10);
+        let key2 = QueryCacheKey::new("test", SearchMode::Hybrid, &filter, 0, 0, 10);
+        let key3 = QueryCacheKey::new("test", SearchMode::Lexical, &filter, 0, 0, 10);
+        let mut set = HashSet::new();
+        set.insert(key1);
+        set.insert(key2); // duplicate
+        set.insert(key3);
+        assert_eq!(set.len(), 2);
+    }
+
+    // ── WarmWorker edge cases ───────────────────────────────────────
+
+    #[test]
+    fn warm_worker_get_status_untracked_returns_none() {
+        let worker = WarmWorker::with_defaults();
+        assert!(worker.get_status(WarmResource::Reranker).is_none());
+    }
+
+    #[test]
+    fn warm_worker_config_accessor() {
+        let config = WarmWorkerConfig {
+            warmup_on_startup: false,
+            warmup_timeout: Duration::from_secs(60),
+            retry_on_failure: false,
+            max_retries: 0,
+        };
+        let worker = WarmWorker::new(config);
+        let got = worker.config();
+        assert!(!got.warmup_on_startup);
+        assert_eq!(got.warmup_timeout, Duration::from_secs(60));
+    }
+
+    // ── Constants ───────────────────────────────────────────────────
+
+    #[test]
+    fn constants_reasonable() {
+        const {
+            assert!(DEFAULT_CACHE_MAX_ENTRIES > 0);
+            assert!(DEFAULT_CACHE_TTL_SECONDS > 0);
+        }
+        assert!(!CACHE_MAX_ENTRIES_ENV.is_empty());
+        assert!(!CACHE_TTL_SECONDS_ENV.is_empty());
+    }
+
+    // ── Invalidator cache accessor ──────────────────────────────────
+
+    #[test]
+    fn invalidator_cache_accessor() {
+        let cache = Arc::new(QueryCache::<i64>::with_defaults());
+        let invalidator = CacheInvalidator::new(Arc::clone(&cache), 10);
+        assert_eq!(invalidator.cache().current_epoch(), 0);
     }
 }

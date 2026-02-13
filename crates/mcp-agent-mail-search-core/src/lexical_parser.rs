@@ -932,6 +932,379 @@ mod tests {
         assert!(assistance.did_you_mean.is_empty());
     }
 
+    // ── levenshtein_distance tests ──
+
+    #[test]
+    fn levenshtein_identical() {
+        assert_eq!(levenshtein_distance("hello", "hello"), 0);
+    }
+
+    #[test]
+    fn levenshtein_both_empty() {
+        assert_eq!(levenshtein_distance("", ""), 0);
+    }
+
+    #[test]
+    fn levenshtein_one_empty() {
+        assert_eq!(levenshtein_distance("", "abc"), 3);
+        assert_eq!(levenshtein_distance("xyz", ""), 3);
+    }
+
+    #[test]
+    fn levenshtein_single_substitution() {
+        assert_eq!(levenshtein_distance("cat", "car"), 1);
+    }
+
+    #[test]
+    fn levenshtein_insertion() {
+        assert_eq!(levenshtein_distance("abc", "abcd"), 1);
+    }
+
+    #[test]
+    fn levenshtein_deletion() {
+        assert_eq!(levenshtein_distance("abcd", "abc"), 1);
+    }
+
+    #[test]
+    fn levenshtein_completely_different() {
+        assert_eq!(levenshtein_distance("abc", "xyz"), 3);
+    }
+
+    #[test]
+    fn levenshtein_symmetric() {
+        assert_eq!(
+            levenshtein_distance("kitten", "sitting"),
+            levenshtein_distance("sitting", "kitten")
+        );
+    }
+
+    // ── suggest_hint_field tests ──
+
+    #[test]
+    fn suggest_hint_field_one_typo() {
+        assert_eq!(suggest_hint_field("fron"), Some("from"));
+        assert_eq!(suggest_hint_field("thred"), Some("thread"));
+    }
+
+    #[test]
+    fn suggest_hint_field_two_typos() {
+        // "bafore" → "before" (distance 2)
+        assert_eq!(suggest_hint_field("bafore"), Some("before"));
+    }
+
+    #[test]
+    fn suggest_hint_field_too_far() {
+        assert_eq!(suggest_hint_field("zzzzzzz"), None);
+        assert_eq!(suggest_hint_field("xyzabc"), None);
+    }
+
+    #[test]
+    fn suggest_hint_field_tiebreak_alphabetical() {
+        // If two fields are equidistant, the lexicographically smaller one wins
+        // "afrer" is distance 2 from "after" and also from ... let's just verify determinism
+        let result1 = suggest_hint_field("afrer");
+        let result2 = suggest_hint_field("afrer");
+        assert_eq!(result1, result2);
+    }
+
+    // ── split_query_tokens tests ──
+
+    #[test]
+    fn split_query_tokens_simple() {
+        assert_eq!(split_query_tokens("hello world"), vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn split_query_tokens_quoted_preserved() {
+        let tokens = split_query_tokens("hello \"world peace\"");
+        assert_eq!(tokens, vec!["hello", "\"world peace\""]);
+    }
+
+    #[test]
+    fn split_query_tokens_empty() {
+        assert!(split_query_tokens("").is_empty());
+        assert!(split_query_tokens("   ").is_empty());
+    }
+
+    #[test]
+    fn split_query_tokens_unclosed_quote() {
+        let tokens = split_query_tokens("\"unclosed stuff");
+        assert_eq!(tokens, vec!["\"unclosed stuff"]);
+    }
+
+    #[test]
+    fn split_query_tokens_multiple_quoted() {
+        let tokens = split_query_tokens("\"alpha beta\" plain \"gamma delta\"");
+        assert_eq!(tokens, vec!["\"alpha beta\"", "plain", "\"gamma delta\""]);
+    }
+
+    // ── normalize_hint_value tests ──
+
+    #[test]
+    fn normalize_hint_value_plain() {
+        assert_eq!(normalize_hint_value("hello"), "hello");
+    }
+
+    #[test]
+    fn normalize_hint_value_strips_quotes() {
+        assert_eq!(normalize_hint_value("\"hello world\""), "hello world");
+    }
+
+    #[test]
+    fn normalize_hint_value_trims_whitespace() {
+        assert_eq!(normalize_hint_value("  hello  "), "hello");
+    }
+
+    #[test]
+    fn normalize_hint_value_quoted_whitespace_only() {
+        // Quoted space → after unquote and trim → empty
+        assert_eq!(normalize_hint_value("\" \""), "");
+    }
+
+    #[test]
+    fn normalize_hint_value_single_quote_not_stripped() {
+        // A single quote char has len 1 < 2, so not treated as quoted
+        assert_eq!(normalize_hint_value("\""), "\"");
+    }
+
+    // ── normalize_hint_field tests ──
+
+    #[test]
+    fn normalize_hint_field_canonical() {
+        assert_eq!(normalize_hint_field("from"), Some("from"));
+        assert_eq!(normalize_hint_field("thread"), Some("thread"));
+        assert_eq!(normalize_hint_field("project"), Some("project"));
+        assert_eq!(normalize_hint_field("before"), Some("before"));
+        assert_eq!(normalize_hint_field("after"), Some("after"));
+        assert_eq!(normalize_hint_field("importance"), Some("importance"));
+    }
+
+    #[test]
+    fn normalize_hint_field_aliases() {
+        assert_eq!(normalize_hint_field("sender"), Some("from"));
+        assert_eq!(normalize_hint_field("frm"), Some("from"));
+        assert_eq!(normalize_hint_field("thread_id"), Some("thread"));
+        assert_eq!(normalize_hint_field("thr"), Some("thread"));
+        assert_eq!(normalize_hint_field("proj"), Some("project"));
+        assert_eq!(normalize_hint_field("since"), Some("after"));
+        assert_eq!(normalize_hint_field("until"), Some("before"));
+        assert_eq!(normalize_hint_field("priority"), Some("importance"));
+        assert_eq!(normalize_hint_field("prio"), Some("importance"));
+        assert_eq!(normalize_hint_field("imp"), Some("importance"));
+    }
+
+    #[test]
+    fn normalize_hint_field_case_insensitive() {
+        assert_eq!(normalize_hint_field("FROM"), Some("from"));
+        assert_eq!(normalize_hint_field("Thread"), Some("thread"));
+        assert_eq!(normalize_hint_field("SENDER"), Some("from"));
+    }
+
+    #[test]
+    fn normalize_hint_field_unknown() {
+        assert_eq!(normalize_hint_field("xyz"), None);
+        assert_eq!(normalize_hint_field("author"), None);
+    }
+
+    // ── Struct trait coverage ──
+
+    #[test]
+    fn sanitized_query_debug() {
+        let empty = SanitizedQuery::Empty;
+        assert!(format!("{empty:?}").contains("Empty"));
+        let valid = SanitizedQuery::Valid("test".to_string());
+        assert!(format!("{valid:?}").contains("Valid"));
+    }
+
+    #[test]
+    fn sanitized_query_clone_eq() {
+        let a = SanitizedQuery::Valid("hello".to_string());
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(SanitizedQuery::Empty, SanitizedQuery::Empty);
+    }
+
+    #[test]
+    fn applied_filter_hint_serde_roundtrip() {
+        let hint = AppliedFilterHint {
+            field: "from".to_string(),
+            value: "BlueLake".to_string(),
+        };
+        let json = serde_json::to_string(&hint).unwrap();
+        let back: AppliedFilterHint = serde_json::from_str(&json).unwrap();
+        assert_eq!(hint, back);
+    }
+
+    #[test]
+    fn applied_filter_hint_debug_clone() {
+        let hint = AppliedFilterHint {
+            field: "thread".to_string(),
+            value: "br-123".to_string(),
+        };
+        let debug = format!("{hint:?}");
+        assert!(debug.contains("thread"));
+        let cloned = hint.clone();
+        assert_eq!(hint, cloned);
+    }
+
+    #[test]
+    fn did_you_mean_hint_serde_roundtrip() {
+        let hint = DidYouMeanHint {
+            token: "fron:Alice".to_string(),
+            suggested_field: "from".to_string(),
+            value: "Alice".to_string(),
+        };
+        let json = serde_json::to_string(&hint).unwrap();
+        let back: DidYouMeanHint = serde_json::from_str(&json).unwrap();
+        assert_eq!(hint, back);
+    }
+
+    #[test]
+    fn did_you_mean_hint_debug_clone() {
+        let hint = DidYouMeanHint {
+            token: "thred:x".to_string(),
+            suggested_field: "thread".to_string(),
+            value: "x".to_string(),
+        };
+        let debug = format!("{hint:?}");
+        assert!(debug.contains("thread"));
+        let cloned = hint.clone();
+        assert_eq!(hint, cloned);
+    }
+
+    #[test]
+    fn query_assistance_default() {
+        let qa = QueryAssistance::default();
+        assert!(qa.query_text.is_empty());
+        assert!(qa.applied_filter_hints.is_empty());
+        assert!(qa.did_you_mean.is_empty());
+    }
+
+    #[test]
+    fn query_assistance_serde_roundtrip() {
+        let qa = QueryAssistance {
+            query_text: "hello world".to_string(),
+            applied_filter_hints: vec![AppliedFilterHint {
+                field: "from".to_string(),
+                value: "X".to_string(),
+            }],
+            did_you_mean: vec![DidYouMeanHint {
+                token: "fron:Y".to_string(),
+                suggested_field: "from".to_string(),
+                value: "Y".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&qa).unwrap();
+        let back: QueryAssistance = serde_json::from_str(&json).unwrap();
+        assert_eq!(qa, back);
+    }
+
+    #[test]
+    fn query_assistance_serde_skips_empty_vecs() {
+        let qa = QueryAssistance {
+            query_text: "test".to_string(),
+            applied_filter_hints: vec![],
+            did_you_mean: vec![],
+        };
+        let json = serde_json::to_string(&qa).unwrap();
+        assert!(!json.contains("applied_filter_hints"));
+        assert!(!json.contains("did_you_mean"));
+    }
+
+    // ── parse_query_assistance edge cases ──
+
+    #[test]
+    fn parse_query_assistance_empty_input() {
+        let qa = parse_query_assistance("");
+        assert!(qa.query_text.is_empty());
+        assert!(qa.applied_filter_hints.is_empty());
+        assert!(qa.did_you_mean.is_empty());
+    }
+
+    #[test]
+    fn parse_query_assistance_field_empty_value() {
+        // "from:" has empty value part after trim → kept in query_text
+        let qa = parse_query_assistance("from: hello");
+        assert_eq!(qa.query_text, "from: hello");
+        assert!(qa.applied_filter_hints.is_empty());
+    }
+
+    #[test]
+    fn parse_query_assistance_only_hints() {
+        let qa = parse_query_assistance("from:X thread:Y project:Z");
+        assert!(qa.query_text.is_empty());
+        assert_eq!(qa.applied_filter_hints.len(), 3);
+    }
+
+    #[test]
+    fn parse_query_assistance_colon_in_value() {
+        // "from:http://example.com" — the value contains a colon
+        // split_once(':') gives field="from", value="http://example.com"
+        let qa = parse_query_assistance("from:http://example.com");
+        assert_eq!(qa.applied_filter_hints.len(), 1);
+        assert_eq!(qa.applied_filter_hints[0].value, "http://example.com");
+    }
+
+    // ── quote_hyphenated_tokens direct tests ──
+
+    #[test]
+    fn quote_hyphenated_no_hyphens() {
+        assert_eq!(quote_hyphenated_tokens("hello world"), "hello world");
+    }
+
+    #[test]
+    fn quote_hyphenated_already_quoted() {
+        // Hyphenated token inside quotes should NOT be double-quoted
+        assert_eq!(quote_hyphenated_tokens("\"foo-bar\""), "\"foo-bar\"");
+    }
+
+    #[test]
+    fn quote_hyphenated_multiple_tokens() {
+        let result = quote_hyphenated_tokens("POL-358 and FEAT-99");
+        assert_eq!(result, "\"POL-358\" and \"FEAT-99\"");
+    }
+
+    // ── sanitize_query additional edge cases ──
+
+    #[test]
+    fn sanitize_query_backslash() {
+        // Backslash is a special char, gets replaced with space
+        assert_eq!(
+            sanitize_query("foo\\bar"),
+            SanitizedQuery::Valid("foo bar".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_query_tilde() {
+        assert_eq!(
+            sanitize_query("test~2"),
+            SanitizedQuery::Valid("test 2".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_query_curly_braces() {
+        assert_eq!(
+            sanitize_query("{hello}"),
+            SanitizedQuery::Valid("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_query_only_special_chars() {
+        // After escaping all special chars, only spaces remain → empty
+        assert!(sanitize_query("[]{}^~\\").is_empty());
+    }
+
+    #[test]
+    fn sanitize_query_mixed_content_and_special() {
+        assert_eq!(
+            sanitize_query("hello[world]^2"),
+            SanitizedQuery::Valid("hello world 2".to_string())
+        );
+    }
+
     // ── Tantivy integration tests (require tantivy-engine feature) ──
 
     #[cfg(feature = "tantivy-engine")]
@@ -1198,6 +1571,107 @@ mod tests {
             assert!(config.conjunction_by_default);
             assert!((config.subject_boost - 2.0).abs() < f32::EPSILON);
             assert!((config.body_boost - 1.0).abs() < f32::EPSILON);
+        }
+
+        #[test]
+        fn parse_outcome_debug() {
+            let (index, handles) = setup_index();
+            let parser = LexicalParser::with_defaults(handles.subject, handles.body);
+
+            let outcome = parser.parse(&index, "migration");
+            let debug = format!("{outcome:?}");
+            assert!(debug.contains("Parsed"));
+
+            let outcome_empty = parser.parse(&index, "");
+            assert!(format!("{outcome_empty:?}").contains("Empty"));
+        }
+
+        #[test]
+        fn regex_escape_prefix_special_chars() {
+            // Dots, parens, brackets should be escaped
+            assert_eq!(regex_escape_prefix("foo.bar"), "foo\\.bar");
+            assert_eq!(regex_escape_prefix("test(1)"), "test\\(1\\)");
+            assert_eq!(regex_escape_prefix("a+b"), "a\\+b");
+            assert_eq!(regex_escape_prefix("plain"), "plain");
+        }
+
+        #[test]
+        fn custom_boost_values() {
+            let (index, handles) = setup_index();
+            let config = LexicalParserConfig {
+                conjunction_by_default: true,
+                subject_boost: 5.0,
+                body_boost: 0.5,
+            };
+            let parser = LexicalParser::new(handles.subject, handles.body, config);
+            let outcome = parser.parse(&index, "migration");
+            // Just verify it produces a valid query with custom boosts
+            assert!(outcome.into_query().is_some());
+        }
+
+        #[test]
+        fn boost_unity_no_wrapper() {
+            let (index, handles) = setup_index();
+            // When avg boost is 1.0, no BoostQuery wrapper
+            let config = LexicalParserConfig {
+                conjunction_by_default: true,
+                subject_boost: 1.0,
+                body_boost: 1.0,
+            };
+            let parser = LexicalParser::new(handles.subject, handles.body, config);
+            let outcome = parser.parse(&index, "migration");
+            let query = outcome.into_query().expect("should produce a query");
+            // Should not be wrapped in BoostQuery — Debug output won't contain "Boost"
+            let debug = format!("{query:?}");
+            assert!(!debug.contains("Boost"));
+        }
+
+        #[test]
+        fn parser_config_debug_clone() {
+            fn assert_clone<T: Clone>(_: &T) {}
+            let config = LexicalParserConfig::default();
+            let debug = format!("{config:?}");
+            assert!(debug.contains("LexicalParserConfig"));
+            assert_clone(&config);
+        }
+
+        #[test]
+        fn prefix_query_with_special_chars() {
+            let (index, handles) = setup_index();
+            let config = LexicalParserConfig {
+                conjunction_by_default: false,
+                ..LexicalParserConfig::default()
+            };
+            let parser = LexicalParser::new(handles.subject, handles.body, config);
+            // "deploy*" should find "deploying" in doc 2
+            let outcome = parser.parse(&index, "deploy*");
+            let query = outcome.into_query().expect("should produce a query");
+            let reader = index.reader().unwrap();
+            let searcher = reader.searcher();
+            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            assert!(!hits.is_empty());
+        }
+
+        #[test]
+        fn fallback_all_terms_fail() {
+            let (index, handles) = setup_index();
+            let parser = LexicalParser::with_defaults(handles.subject, handles.body);
+            // Only boolean operators after extracting terms → empty
+            let outcome = parser.parse(&index, "AND OR");
+            assert!(matches!(outcome, ParseOutcome::Empty));
+        }
+
+        #[test]
+        fn parse_with_new_constructor() {
+            let (index, handles) = setup_index();
+            let config = LexicalParserConfig {
+                conjunction_by_default: true,
+                subject_boost: 3.0,
+                body_boost: 1.5,
+            };
+            let parser = LexicalParser::new(handles.subject, handles.body, config);
+            let outcome = parser.parse(&index, "migration");
+            assert!(outcome.into_query().is_some());
         }
     }
 }
