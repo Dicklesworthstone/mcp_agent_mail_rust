@@ -6970,14 +6970,17 @@ mod tests {
             assert!(limiter.allow_memory(key, 0, 0, rate_limit_now(), false));
         }
 
-        let buckets = limiter
-            .buckets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            buckets.is_empty(),
-            "unlimited bucket should not allocate state"
-        );
+        {
+            let buckets = limiter
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                buckets.is_empty(),
+                "unlimited bucket should not allocate state"
+            );
+            drop(buckets);
+        }
     }
 
     #[test]
@@ -7015,14 +7018,17 @@ mod tests {
 
         limiter.cleanup(now);
 
-        let buckets = limiter
-            .buckets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            buckets.contains_key("old"),
-            "cleanup should be skipped when called before 60s interval"
-        );
+        {
+            let buckets = limiter
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                buckets.contains_key("old"),
+                "cleanup should be skipped when called before 60s interval"
+            );
+            drop(buckets);
+        }
     }
 
     #[test]
@@ -7049,13 +7055,16 @@ mod tests {
 
         assert!(limiter.allow_memory("tools:new:ip-unknown", 60, 1, now, true));
 
-        let buckets = limiter
-            .buckets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(!buckets.contains_key("stale"));
-        assert!(buckets.contains_key("fresh"));
-        assert!(buckets.contains_key("tools:new:ip-unknown"));
+        {
+            let buckets = limiter
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!buckets.contains_key("stale"));
+            assert!(buckets.contains_key("fresh"));
+            assert!(buckets.contains_key("tools:new:ip-unknown"));
+            drop(buckets);
+        }
     }
 
     #[test]

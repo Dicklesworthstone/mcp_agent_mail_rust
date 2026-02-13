@@ -2,6 +2,7 @@
 
 **Status:** Active
 **Bead:** br-2tnl.8.3
+**Supplemental Bead:** br-1x3h5
 **Author:** MagentaMantis (claude-code/opus-4.5)
 **Date:** 2026-02-12
 
@@ -335,6 +336,94 @@ Investigate specific queries before deciding if divergence is acceptable.
 
 ---
 
+## Steady-State Operations (Post-Cutover)
+
+This section is the operational slice for `br-1x3h5` and is intended to be finalized
+with concrete benchmark/replay evidence once `br-2tnl.7.15` and `br-2tnl.7.16` are complete.
+
+### Daily Verification (Operator Checklist)
+
+1. Confirm serving engine and health pulse:
+   ```bash
+   curl -sS -X POST http://127.0.0.1:8765/mcp/ \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}' \
+     | jq '.result.content[0].text | fromjson | {search_engine_active,search_index_health,pool_utilization,queues}'
+   ```
+2. Run a smoke query against production-like scope:
+   ```bash
+   AM_INTERFACE_MODE=cli mcp-agent-mail search messages \
+     --project /abs/path/to/project \
+     --query "coordination" \
+     --limit 10 \
+     --json | jq '.results | length'
+   ```
+3. Verify no sustained queue pressure (`queues.wbq.warning=false`, `queues.commit_coalescer.warning=false`).
+
+### Weekly Verification (Quality + Performance)
+
+1. Execute quick CI gates and archive report:
+   ```bash
+   scripts/am ci --quick --json --report tests/artifacts/ci/search_v3_weekly.json
+   ```
+2. Run Search V3-focused E2E/parity suites when available:
+   - `tests/e2e/test_search_v3_shadow_parity.sh`
+   - `tests/e2e/test_search_v3_resilience.sh`
+3. Compare overlap and latency drift versus prior weekly artifact; open a bead if thresholds regress.
+
+### Incident Triage Matrix
+
+| Symptom | Immediate Action | Next Step |
+|---------|------------------|-----------|
+| Empty or near-empty results | Check `search_index_health` + last rebuild timestamp | Rebuild lexical index (Procedure A) |
+| Latency spike in hybrid mode | Set `AM_SEARCH_SEMANTIC_ENABLED=false` temporarily | Profile embedding/vector path; tune batch/backpressure |
+| Rising divergence in compare/shadow logs | Capture top divergent queries from server log | Run focused replay/parity script; decide rollback/cutover hold |
+| V3 error rate >1% | Set `AM_SEARCH_ENGINE=legacy` if user impact is high | Open P0 bug bead with failing queries + artifacts |
+
+### Repair Procedures
+
+#### Procedure A: Lexical Index Rebuild
+
+```bash
+# 1) Stop server
+# 2) Backup and remove corrupted lexical index
+mv "${STORAGE_ROOT}/search_index" "${STORAGE_ROOT}/search_index.corrupt.$(date +%Y%m%d_%H%M%S)"
+
+# 3) Restart server to trigger rebuild
+scripts/am --no-tui
+```
+
+Post-check: `health_check` must report Search V3 index status `ready` and non-zero docs.
+
+#### Procedure B: Semantic/Vector Cache Repair
+
+```bash
+# Temporarily force lexical-only service while repairing semantic assets
+export AM_SEARCH_ENGINE=lexical
+export AM_SEARCH_SEMANTIC_ENABLED=false
+scripts/am --no-tui
+```
+
+Then clear/rebuild vector artifacts per deployment layout and re-enable semantic mode only after
+latency and overlap checks return to thresholds.
+
+### Follow-Up Bead Triggers
+
+Create a new bead immediately when any of the following is observed:
+
+- `v3_error_pct >= 1%` for more than 15 minutes
+- `avg_latency_delta_ms >= 100` sustained across weekly verification
+- `equivalent_pct < 75%` on replay/shadow checks
+- Any cross-project scope or redaction regression in search output
+
+When creating the bead, attach:
+- failing query samples,
+- health snapshot JSON,
+- relevant server log window,
+- command transcript used for reproduction.
+
+---
+
 ## Checklist Summary
 
 - [ ] Phase 1: Index built, health check passes
@@ -342,6 +431,9 @@ Investigate specific queries before deciding if divergence is acceptable.
 - [ ] Phase 3: Shadow compare for 7 days, no regressions
 - [ ] Phase 4: V3 serving, search functionality verified
 - [ ] Phase 5: FTS5 triggers removed (optional, irreversible)
+- [ ] Daily verification checklist running with retained artifacts
+- [ ] Weekly verification and drift review completed
+- [ ] Incident triage + repair procedures validated by operator dry run
 
 ---
 
