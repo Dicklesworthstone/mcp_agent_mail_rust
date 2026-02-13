@@ -1354,6 +1354,9 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
         let handles: Vec<_> = compile_gates
             .iter()
             .map(|(idx, gate)| {
+                if let Some(callback) = runner_config.on_gate_start {
+                    callback(&gate.name, *idx, total);
+                }
                 let gate = (*gate).clone();
                 let config = runner_config.clone();
                 let idx = *idx;
@@ -1361,6 +1364,9 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
                 thread::spawn(move || {
                     eprintln!("  [{}] Starting: {}", idx + 1, gate.name);
                     let result = run_gate(&gate, &config);
+                    if let Some(callback) = config.on_gate_complete {
+                        callback(&result);
+                    }
                     eprintln!(
                         "  [{}] Finished: {} - {}",
                         idx + 1,
@@ -1391,10 +1397,14 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
         // Add skip results for remaining gates
         let mut locked = results.lock().unwrap();
         for (idx, gate) in &other_gates {
-            locked.push((
-                *idx,
-                GateResult::skip(gate, "skipped due to compile failure"),
-            ));
+            if let Some(callback) = runner_config.on_gate_start {
+                callback(&gate.name, *idx, total);
+            }
+            let result = GateResult::skip(gate, "skipped due to compile failure");
+            if let Some(callback) = runner_config.on_gate_complete {
+                callback(&result);
+            }
+            locked.push((*idx, result));
         }
     } else {
         eprintln!(
@@ -1404,6 +1414,9 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
         let handles: Vec<_> = other_gates
             .iter()
             .map(|(idx, gate)| {
+                if let Some(callback) = runner_config.on_gate_start {
+                    callback(&gate.name, *idx, total);
+                }
                 let gate = (*gate).clone();
                 let config = runner_config.clone();
                 let idx = *idx;
@@ -1411,6 +1424,9 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
                 thread::spawn(move || {
                     eprintln!("  [{}] Starting: {}", idx + 1, gate.name);
                     let result = run_gate(&gate, &config);
+                    if let Some(callback) = config.on_gate_complete {
+                        callback(&result);
+                    }
                     eprintln!(
                         "  [{}] Finished: {} - {}",
                         idx + 1,
@@ -1494,6 +1510,18 @@ pub fn print_gate_summary(report: &GateReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PARALLEL_START_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static PARALLEL_COMPLETE_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn parallel_start_callback(_name: &str, _idx: usize, _total: usize) {
+        PARALLEL_START_CALLBACK_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn parallel_complete_callback(_result: &GateResult) {
+        PARALLEL_COMPLETE_CALLBACK_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
 
     #[test]
     fn test_gate_category_serialization() {
@@ -2665,5 +2693,31 @@ error[E0425]: another error
         assert!(par_json.contains("\"name\": \"Test 1\""));
         assert!(seq_json.contains("\"name\": \"Test 2\""));
         assert!(par_json.contains("\"name\": \"Test 2\""));
+    }
+
+    #[test]
+    fn test_parallel_callbacks_are_invoked_for_each_gate() {
+        PARALLEL_START_CALLBACK_COUNT.store(0, Ordering::SeqCst);
+        PARALLEL_COMPLETE_CALLBACK_COUNT.store(0, Ordering::SeqCst);
+
+        let gates = vec![
+            GateConfig::new("Callback 1", GateCategory::Quality, ["true"]),
+            GateConfig::new("Callback 2", GateCategory::Performance, ["true"]),
+            GateConfig::new("Callback 3", GateCategory::Security, ["true"]),
+        ];
+        let mut config = GateRunnerConfig::default().mode(RunMode::Full);
+        config.on_gate_start = Some(parallel_start_callback);
+        config.on_gate_complete = Some(parallel_complete_callback);
+
+        let report = run_gates_parallel(&gates, &config);
+        assert_eq!(report.gates.len(), gates.len());
+        assert_eq!(
+            PARALLEL_START_CALLBACK_COUNT.load(Ordering::SeqCst),
+            gates.len()
+        );
+        assert_eq!(
+            PARALLEL_COMPLETE_CALLBACK_COUNT.load(Ordering::SeqCst),
+            gates.len()
+        );
     }
 }

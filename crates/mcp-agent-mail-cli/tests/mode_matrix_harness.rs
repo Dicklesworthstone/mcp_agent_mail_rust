@@ -63,9 +63,9 @@ fn run_cli(args: &[&str], env_pairs: &[(String, String)]) -> Output {
     cmd.output().expect("spawn am cli")
 }
 
-/// Run the MCP server binary with given args.
+/// Run the MCP server binary with given args and env.
 /// The binary rejects CLI-only commands with exit code 2.
-fn run_mcp(args: &[&str]) -> Output {
+fn run_mcp(args: &[&str], env_pairs: &[(String, String)]) -> Output {
     // Find the mcp-agent-mail binary in the same target dir as the am binary.
     let am = am_bin();
     let target_dir = am.parent().expect("target dir");
@@ -85,6 +85,9 @@ fn run_mcp(args: &[&str]) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in env_pairs {
+        cmd.env(k, v);
+    }
     cmd.output().expect("spawn mcp-agent-mail")
 }
 
@@ -235,6 +238,7 @@ fn matrix_cli_binary_accepts_all_command_families() {
 
 #[test]
 fn matrix_mcp_binary_denies_cli_only_commands() {
+    let env = base_env();
     let am = am_bin();
     let target_dir = am.parent().expect("target dir");
     let mcp_bin = target_dir.join("mcp-agent-mail");
@@ -250,7 +254,7 @@ fn matrix_mcp_binary_denies_cli_only_commands() {
     let mut results = Vec::new();
 
     for args in MCP_DENY_COMMANDS {
-        let out = run_mcp(args);
+        let out = run_mcp(args, &env);
         let exit = out.status.code();
         let serr = stderr_str(&out);
 
@@ -307,6 +311,7 @@ fn matrix_mcp_binary_denies_cli_only_commands() {
 
 #[test]
 fn matrix_mcp_binary_allows_server_commands() {
+    let env = base_env();
     let am = am_bin();
     let target_dir = am.parent().expect("target dir");
     let mcp_bin = target_dir.join("mcp-agent-mail");
@@ -319,7 +324,7 @@ fn matrix_mcp_binary_allows_server_commands() {
     let mut results = Vec::new();
 
     for args in MCP_ALLOW_COMMANDS {
-        let out = run_mcp(args);
+        let out = run_mcp(args, &env);
         let exit = out.status.code();
 
         // --help triggers clap exit 0; "config" prints and exits 0.
@@ -356,6 +361,7 @@ fn matrix_mcp_binary_allows_server_commands() {
 
 #[test]
 fn matrix_mcp_denial_message_contains_remediation() {
+    let env = base_env();
     let am = am_bin();
     let target_dir = am.parent().expect("target dir");
     let mcp_bin = target_dir.join("mcp-agent-mail");
@@ -368,7 +374,7 @@ fn matrix_mcp_denial_message_contains_remediation() {
     // Test that the denial message includes the command name and remediation hint.
     let test_commands = &["share", "guard", "doctor"];
     for cmd in test_commands {
-        let out = run_mcp(&[cmd]);
+        let out = run_mcp(&[cmd], &env);
         let serr = stderr_str(&out);
 
         assert!(
@@ -446,6 +452,7 @@ fn assert_snapshot_match(case_label: &str, expected: &str, actual: &str, update_
 
 #[test]
 fn golden_denial_message_format_contract() {
+    let env = base_env();
     let am = am_bin();
     let target_dir = am.parent().expect("target dir");
     let mcp_bin = target_dir.join("mcp-agent-mail");
@@ -458,7 +465,7 @@ fn golden_denial_message_format_contract() {
     let denied_commands = ["share", "guard", "doctor", "archive", "migrate"];
 
     for cmd in &denied_commands {
-        let out = run_mcp(&[cmd]);
+        let out = run_mcp(&[cmd], &env);
         let serr = stderr_str(&out);
 
         // Verify canonical format structure

@@ -301,7 +301,10 @@ fn decide_reuse_preflight(
     if !reuse_running_enabled {
         return match port_status {
             PortStatus::AgentMailServer => ReusePreflightDecision::AgentMailServerRunning,
-            _ => ReusePreflightDecision::Proceed,
+            PortStatus::OtherProcess { description } => {
+                ReusePreflightDecision::PortOccupiedByOtherProcess { description }
+            }
+            PortStatus::Free | PortStatus::Error { .. } => ReusePreflightDecision::Proceed,
         };
     }
 
@@ -685,11 +688,23 @@ mod tests {
                     description: "x".to_string()
                 }
             ),
-            ReusePreflightDecision::Proceed
+            ReusePreflightDecision::PortOccupiedByOtherProcess {
+                description: "x".to_string(),
+            }
         );
         assert_eq!(
             decide_reuse_preflight(false, PortStatus::AgentMailServer),
             ReusePreflightDecision::AgentMailServerRunning
+        );
+        assert_eq!(
+            decide_reuse_preflight(
+                false,
+                PortStatus::Error {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    message: "denied".to_string(),
+                },
+            ),
+            ReusePreflightDecision::Proceed
         );
 
         assert_eq!(

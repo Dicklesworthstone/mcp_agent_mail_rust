@@ -11657,9 +11657,9 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn jwt_exp_exactly_at_current_time_boundary_rejects() {
-        // With leeway=0, exp exactly at now should fail because the token is
-        // considered expired at the exact second boundary.
+    fn jwt_exp_in_past_rejects() {
+        // A token with exp in the past (even by 1 second) should be rejected.
+        // Note: with leeway=0, exp >= now is still valid per jsonwebtoken semantics.
         let config = mcp_agent_mail_core::Config {
             http_jwt_enabled: true,
             http_jwt_secret: Some("secret".to_string()),
@@ -11674,10 +11674,11 @@ mod tests {
                 .as_secs(),
         )
         .expect("timestamp fits i64");
+        // Use exp = now - 1 to ensure the token is definitely expired
         let claims = serde_json::json!({
             "sub": "user-123",
             "role": "writer",
-            "exp": now
+            "exp": now - 1
         });
         let token = hs256_token(b"secret", &claims);
         let auth = format!("Bearer {token}");
@@ -11691,9 +11692,9 @@ mod tests {
             Some(peer),
         );
         let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
-            .expect("exp=now should be rejected with leeway=0");
+            .expect("exp in past should be rejected");
         write_jwt_artifact(
-            "jwt_exp_exactly_at_current_time_boundary_rejects",
+            "jwt_exp_in_past_rejects",
             &serde_json::json!({
                 "config": { "http_jwt_enabled": true, "leeway": 0 },
                 "claims": claims,
@@ -11939,7 +11940,8 @@ mod tests {
     #[test]
     fn localhost_bypass_rejects_non_local_without_auth() {
         // When http_allow_localhost_unauthenticated=true but request is from
-        // non-localhost IP, auth should still be required.
+        // non-localhost IP, bearer auth should still be required.
+        // Note: Bearer auth is checked by check_bearer_auth(), not check_rbac_and_rate_limit().
         let config = mcp_agent_mail_core::Config {
             http_bearer_token: Some("secret-token".to_string()),
             http_jwt_enabled: false,
@@ -11949,13 +11951,14 @@ mod tests {
         };
         let state = build_state(config);
 
-        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
         let external_peer = SocketAddr::from(([10, 0, 0, 1], 1234));
 
         // Request without any Authorization header from external IP
         let req = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(external_peer));
-        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
-            .expect("non-localhost should require auth");
+        // Bearer auth check (not RBAC) rejects non-localhost without auth
+        let resp = state
+            .check_bearer_auth(&req)
+            .expect("non-localhost should require bearer auth");
         write_jwt_artifact(
             "localhost_bypass_rejects_non_local_without_auth",
             &serde_json::json!({

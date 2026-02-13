@@ -57,7 +57,7 @@ impl ActionEntry {
 
     /// Mark as destructive.
     #[must_use]
-    pub fn destructive(mut self) -> Self {
+    pub const fn destructive(mut self) -> Self {
         self.is_destructive = true;
         self
     }

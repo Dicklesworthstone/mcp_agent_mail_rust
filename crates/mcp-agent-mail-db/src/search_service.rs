@@ -464,7 +464,12 @@ const fn convert_planner_doc_kind(kind: DocKind) -> SearchDocKind {
 #[cfg(feature = "hybrid")]
 pub fn init_semantic_bridge(config: VectorIndexConfig) -> Result<(), String> {
     let bridge = SemanticBridge::new(config);
-    let _ = SEMANTIC_BRIDGE.set(Some(Arc::new(bridge)));
+    if SEMANTIC_BRIDGE.set(Some(Arc::new(bridge))).is_err() {
+        return Err(
+            "semantic bridge is already initialized; restart process to apply a new config"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -797,17 +802,15 @@ fn get_or_init_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
 
 /// Try executing semantic candidate retrieval using two-tier system.
 ///
-/// Prefers the two-tier bridge if available, falls back to legacy `SemanticBridge`.
+/// Prefers the two-tier bridge when available. Falls back to legacy
+/// `SemanticBridge` only when the two-tier bridge is unavailable.
 #[cfg(feature = "hybrid")]
 fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
     // Use atomic get_or_init pattern to avoid race condition on initialization.
     // Only one TwoTierBridge instance is ever created under concurrent access.
     if let Some(bridge) = get_or_init_two_tier_bridge() {
         if bridge.is_available() {
-            let results = bridge.search(query, limit);
-            if !results.is_empty() {
-                return Some(results);
-            }
+            return Some(bridge.search(query, limit));
         }
     }
 

@@ -112,15 +112,14 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
     let addr = format!("{host}:{port}");
 
     // Try to connect with a short timeout
-    let stream = match TcpStream::connect_timeout(
+    let Ok(stream) = TcpStream::connect_timeout(
         &addr.parse().unwrap_or_else(|_| {
             // Fallback for invalid addresses
             std::net::SocketAddr::from(([127, 0, 0, 1], port))
         }),
         HEALTH_CHECK_TIMEOUT,
-    ) {
-        Ok(s) => s,
-        Err(_) => return false,
+    ) else {
+        return false;
     };
 
     // Set read/write timeouts

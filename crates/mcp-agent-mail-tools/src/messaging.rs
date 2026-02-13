@@ -89,6 +89,13 @@ pub(crate) fn enqueue_agent_semantic_index(agent: &mcp_agent_mail_db::AgentRow) 
     );
 }
 
+fn is_agent_unique_constraint_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("unique constraint failed")
+        && normalized.contains("agents.project_id")
+        && normalized.contains("agents.name")
+}
+
 async fn resolve_or_register_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -102,19 +109,37 @@ async fn resolve_or_register_agent(
     {
         Outcome::Ok(agent) => Ok(agent),
         Outcome::Err(DbError::NotFound { .. }) if config.messaging_auto_register_recipients => {
-            let _ = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::register_agent(
-                    ctx.cx(),
-                    pool,
-                    project_id,
-                    agent_name,
-                    &sender.program,
-                    &sender.model,
-                    Some(sender.task_description.as_str()),
-                    Some(sender.attachments_policy.as_str()),
-                )
-                .await,
-            )?;
+            match mcp_agent_mail_db::queries::register_agent(
+                ctx.cx(),
+                pool,
+                project_id,
+                agent_name,
+                &sender.program,
+                &sender.model,
+                Some(sender.task_description.as_str()),
+                Some(sender.attachments_policy.as_str()),
+            )
+            .await
+            {
+                Outcome::Ok(_) => {}
+                Outcome::Err(DbError::Sqlite(message))
+                    if is_agent_unique_constraint_error(&message) =>
+                {
+                    tracing::debug!(
+                        project_id,
+                        agent = %agent_name,
+                        "auto-register race detected; loading existing agent row"
+                    );
+                }
+                Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(p) => {
+                    return Err(McpError::internal_error(format!(
+                        "Internal panic: {}",
+                        p.message()
+                    )));
+                }
+            }
             db_outcome_to_mcp_result(
                 mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await,
             )
@@ -1681,6 +1706,19 @@ pub async fn acknowledge_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_unique_constraint_error_detection_matches_expected_sqlite_text() {
+        assert!(is_agent_unique_constraint_error(
+            "UNIQUE constraint failed: agents.project_id, agents.name"
+        ));
+        assert!(is_agent_unique_constraint_error(
+            "unique constraint failed: AGENTS.PROJECT_ID, AGENTS.NAME"
+        ));
+        assert!(!is_agent_unique_constraint_error(
+            "UNIQUE constraint failed: projects.slug"
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // is_valid_thread_id

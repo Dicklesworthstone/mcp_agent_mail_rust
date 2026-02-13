@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet};
 use crate::llm;
 use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
 
+const MAX_SUMMARIZE_THREAD_IDS: usize = 128;
+
 /// Search result entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -111,6 +113,15 @@ fn is_ordered_prefix(s: &str) -> bool {
         return false;
     }
     matches!(bytes[0], b'1' | b'2' | b'3' | b'4' | b'5') && bytes[1] == b'.'
+}
+
+fn parse_thread_ids(thread_id: &str) -> Vec<String> {
+    thread_id
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -383,11 +394,7 @@ pub async fn summarize_thread(
     let project_id = project.id.unwrap_or(0);
 
     // Check if multi-thread mode (comma-separated)
-    let thread_ids: Vec<&str> = thread_id
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
+    let thread_ids = parse_thread_ids(&thread_id);
 
     // Legacy parity: empty thread_id returns an empty multi-thread digest.
     if thread_ids.is_empty() {
@@ -401,6 +408,23 @@ pub async fn summarize_thread(
         };
         return serde_json::to_string(&response)
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
+    }
+
+    if thread_ids.len() > MAX_SUMMARIZE_THREAD_IDS {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Too many thread IDs: {} provided, limit is {}. Reduce the comma-separated thread list.",
+                thread_ids.len(),
+                MAX_SUMMARIZE_THREAD_IDS
+            ),
+            true,
+            json!({
+                "field": "thread_id",
+                "provided_count": thread_ids.len(),
+                "limit": MAX_SUMMARIZE_THREAD_IDS,
+            }),
+        ));
     }
 
     if thread_ids.len() > 1 {
@@ -430,7 +454,7 @@ pub async fn summarize_thread(
             all_points.extend(summary.key_points.clone());
 
             threads.push(ThreadEntry {
-                thread_id: (*tid).to_string(),
+                thread_id: tid.clone(),
                 summary,
             });
         }
@@ -516,7 +540,7 @@ pub async fn summarize_thread(
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
     } else {
         // Single-thread mode
-        let tid = thread_ids[0];
+        let tid = &thread_ids[0];
         let messages = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::list_thread_messages(
                 ctx.cx(),
@@ -580,7 +604,7 @@ pub async fn summarize_thread(
         };
 
         let response = SingleThreadResponse {
-            thread_id: tid.to_string(),
+            thread_id: tid.clone(),
             summary,
             examples,
         };
@@ -604,6 +628,18 @@ pub async fn summarize_thread(
 mod tests {
     use super::*;
     use mcp_agent_mail_db::queries::ThreadMessageRow;
+
+    #[test]
+    fn parse_thread_ids_trims_and_drops_empty_values() {
+        let parsed = parse_thread_ids("  br-1, , br-2 ,,br-3  ");
+        assert_eq!(parsed, vec!["br-1", "br-2", "br-3"]);
+    }
+
+    #[test]
+    fn parse_thread_ids_empty_input_returns_empty_vec() {
+        let parsed = parse_thread_ids("  , ,   ");
+        assert!(parsed.is_empty());
+    }
 
     fn make_msg(from: &str, body: &str) -> ThreadMessageRow {
         ThreadMessageRow {

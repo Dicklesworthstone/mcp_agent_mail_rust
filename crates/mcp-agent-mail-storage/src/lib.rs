@@ -2070,9 +2070,14 @@ fn coalescer_commit_batch(
             }
         }
         if let Some(e) = last_err {
-            tracing::warn!("[commit-coalescer] partial failure in sequential batch: {e}");
+            tracing::warn!(
+                "[commit-coalescer] partial failure in sequential batch: committed={total} total={} err={e}",
+                requests.len()
+            );
+            Err(e)
+        } else {
+            Ok(total)
         }
-        Ok(total)
     };
 
     // Update stats

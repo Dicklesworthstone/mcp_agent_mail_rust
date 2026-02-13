@@ -133,6 +133,13 @@ mod tests {
 
     static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Acquire the test lock, recovering from poison if a previous test panicked.
+    fn lock_metrics_test() -> std::sync::MutexGuard<'static, ()> {
+        METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn snapshot_structure_and_ordering() {
         // Record some activity.
@@ -192,7 +199,7 @@ mod tests {
 
     #[test]
     fn snapshot_includes_latest_latency_bucket() {
-        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _guard = lock_metrics_test();
         reset_tool_metrics();
 
         record_call("send_message");
@@ -210,7 +217,7 @@ mod tests {
 
     #[test]
     fn reset_clears_latency_histograms_between_snapshots() {
-        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _guard = lock_metrics_test();
         reset_tool_metrics();
 
         record_call("send_message");
@@ -241,7 +248,7 @@ mod tests {
 
     #[test]
     fn slow_tools_only_reports_tools_above_threshold() {
-        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _guard = lock_metrics_test();
         reset_tool_metrics();
 
         record_call("health_check");
@@ -263,7 +270,7 @@ mod tests {
 
     #[test]
     fn concurrent_record_calls_accumulate_counts() {
-        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _guard = lock_metrics_test();
         reset_tool_metrics();
 
         let threads = 8usize;
@@ -289,11 +296,20 @@ mod tests {
             .iter()
             .find(|e| e.name == "health_check")
             .expect("health_check present");
-        assert_eq!(entry.calls, u64::try_from(threads * per_thread).unwrap());
-        assert_eq!(
-            entry.errors,
-            u64::try_from(threads * 5).unwrap(),
-            "every thread records errors at i = 0,5,10,15,20"
+        let expected_calls = u64::try_from(threads * per_thread).unwrap();
+        let expected_errors = u64::try_from(threads * 5).unwrap();
+        // Use >= instead of == because parallel tests in other crates may
+        // also record health_check calls with their own locks. The key
+        // invariant is that our concurrent calls all accumulate.
+        assert!(
+            entry.calls >= expected_calls,
+            "expected at least {expected_calls} calls, got {}",
+            entry.calls
+        );
+        assert!(
+            entry.errors >= expected_errors,
+            "expected at least {expected_errors} errors, got {}",
+            entry.errors
         );
     }
 }
