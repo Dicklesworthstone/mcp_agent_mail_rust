@@ -187,7 +187,7 @@ fn render_card_list(
             let sev_text = severity_badge(card.severity);
             let conf_text = format!("{:3.0}%", card.confidence * 100.0);
             let style = if i == selected {
-                severity_style(card.severity).reverse()
+                severity_style(card.severity).bg(tp.selection_bg)
             } else {
                 severity_style(card.severity)
             };
@@ -214,7 +214,7 @@ fn render_card_list(
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(tp.panel_border)),
         )
-        .highlight_style(Style::default().reverse());
+        .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
     table_state.select(Some(selected));
     StatefulWidget::render(&table, area, frame, table_state);

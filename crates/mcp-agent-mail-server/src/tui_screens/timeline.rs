@@ -95,12 +95,13 @@ impl RenderItem for TimelineEntry {
 
         let sev = self.severity;
         let src_badge = source_badge(self.source);
-        let marker = if selected { '>' } else { ' ' };
-        let cursor_style = Style::default().bold().reverse();
+        let marker = if selected { crate::tui_theme::SELECTION_PREFIX } else { crate::tui_theme::SELECTION_PREFIX_EMPTY };
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let cursor_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
 
         let mut line = Line::from_spans([
             Span::raw(format!(
-                "{marker} {:>6} {} ",
+                "{marker}{:>6} {} ",
                 self.seq, self.display.timestamp
             )),
             sev.styled_badge(),
@@ -781,7 +782,7 @@ fn render_timeline(
     // Render VirtualizedList into inner area.
     let list = VirtualizedList::new(&filtered)
         .style(Style::default())
-        .highlight_style(Style::default().bold().reverse())
+        .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold())
         .show_scrollbar(true);
     StatefulWidget::render(&list, inner_area, frame, list_state);
 }

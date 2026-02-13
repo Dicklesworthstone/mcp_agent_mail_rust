@@ -187,8 +187,9 @@ impl RenderItem for ExplorerDisplayRow {
         let w = area.width as usize;
 
         // Marker for selected row
-        let marker = if selected { '>' } else { ' ' };
-        let cursor_style = Style::default().bold().reverse();
+        let marker = if selected { crate::tui_theme::SELECTION_PREFIX } else { crate::tui_theme::SELECTION_PREFIX_EMPTY };
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let cursor_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
 
         // Direction badge
         let dir_badge = match self.entry.direction {

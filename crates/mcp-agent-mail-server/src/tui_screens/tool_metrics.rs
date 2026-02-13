@@ -2,7 +2,7 @@
 //!
 //! Enhanced with advanced widget integration (br-3vwi.7.5):
 //! - `MetricTile` summary KPIs (total calls, avg latency, error rate)
-//! - `PercentileRibbon` for latency distribution (p50/p95/p99)
+//! - `BarChart` (horizontal) for per-tool latency distribution (p50/p95/p99)
 //! - `Leaderboard` for top tools by call count
 //! - `WidgetState` for loading/empty/ready states
 //! - View mode toggle: table view (default) vs widget dashboard view
@@ -17,14 +17,15 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui_extras::charts::{BarChart, BarDirection, BarGroup};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::{
-    LeaderboardEntry, MetricTile, MetricTrend, PercentileRibbon, PercentileSample, RankChange,
+    LeaderboardEntry, MetricTile, MetricTrend, PercentileSample, RankChange,
     WidgetState,
 };
 
@@ -136,7 +137,6 @@ impl ToolStats {
     }
 
     /// Compute percentile from recent latencies using nearest-rank method.
-    #[allow(dead_code)]
     fn percentile(&self, pct: f64) -> f64 {
         if self.recent_latencies.is_empty() {
             return 0.0;
@@ -533,11 +533,14 @@ impl ToolMetricsScreen {
             .render(tile3, frame);
     }
 
-    /// Render the latency percentile ribbon.
+    /// Render the latency distribution panel as a horizontal bar chart.
+    ///
+    /// Each tool becomes a `BarGroup` with three bars: P50, P95, P99.
+    /// Colors are taken from the theme palette's chart series.
     fn render_latency_ribbon(&self, frame: &mut Frame<'_>, area: Rect) {
-        let samples: Vec<PercentileSample> = self.percentile_samples.iter().copied().collect();
-
-        if samples.is_empty() {
+        if self.tool_map.is_empty()
+            || self.tool_map.values().all(|ts| ts.recent_latencies.is_empty())
+        {
             let widget: WidgetState<'_, Paragraph<'_>> = WidgetState::Loading {
                 message: "Collecting latency samples...",
             };
@@ -551,10 +554,50 @@ impl ToolMetricsScreen {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
 
-        PercentileRibbon::new(&samples)
-            .label("ms")
-            .block(block)
-            .render(area, frame);
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        if inner.is_empty() {
+            return;
+        }
+
+        // Build bar groups from tools sorted by call count (descending).
+        let mut sorted: Vec<&ToolStats> = self
+            .tool_map
+            .values()
+            .filter(|ts| !ts.recent_latencies.is_empty())
+            .collect();
+        sorted.sort_by_key(|ts| std::cmp::Reverse(ts.calls));
+
+        // Limit to the number of tools that can fit in the available height.
+        // Each group occupies 3 rows (p50, p95, p99) + 1 gap row between groups.
+        let max_groups = ((inner.height as usize) + 1) / 4;
+        let visible = sorted.len().min(max_groups.max(1));
+
+        let groups: Vec<BarGroup<'_>> = sorted[..visible]
+            .iter()
+            .map(|ts| {
+                BarGroup::new(
+                    &ts.name,
+                    vec![ts.percentile(50.0), ts.percentile(95.0), ts.percentile(99.0)],
+                )
+            })
+            .collect();
+
+        let colors: Vec<PackedRgba> = vec![
+            tp.chart_series[0], // P50
+            tp.chart_series[1], // P95
+            tp.chart_series[2], // P99
+        ];
+
+        let chart = BarChart::new(groups)
+            .direction(BarDirection::Horizontal)
+            .colors(colors)
+            .bar_width(1)
+            .bar_gap(0)
+            .group_gap(1);
+
+        chart.render(inner, frame);
     }
 
     /// Render the top-tools leaderboard.

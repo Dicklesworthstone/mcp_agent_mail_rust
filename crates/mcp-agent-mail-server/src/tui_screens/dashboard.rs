@@ -14,6 +14,7 @@ use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_extras::markdown::MarkdownTheme;
+use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
@@ -62,6 +63,14 @@ const fn anomaly_rail_height(tc: TerminalClass, anomaly_count: usize) -> u16 {
 
 /// Footer height by terminal class.
 const fn footer_bar_height(tc: TerminalClass) -> u16 {
+    match tc {
+        TerminalClass::Tiny => 0,
+        _ => 1,
+    }
+}
+
+/// Title band height by terminal class (0 on tiny terminals).
+const fn title_band_height(tc: TerminalClass) -> u16 {
     match tc {
         TerminalClass::Tiny => 0,
         _ => 1,
@@ -565,14 +574,17 @@ impl MailScreen for DashboardScreen {
         let density = DensityHint::from_terminal_class(tc);
 
         // ── Panel budgets (explicit per terminal class) ──────────
+        let title_h = title_band_height(tc);
         let summary_h = summary_band_height(tc);
         let anomaly_h = anomaly_rail_height(tc, self.anomalies.len());
         let footer_h = footer_bar_height(tc);
-        let chrome_h = summary_h + anomaly_h + footer_h;
+        let chrome_h = title_h + summary_h + anomaly_h + footer_h;
         let main_h = area.height.saturating_sub(chrome_h).max(3);
 
         // ── Rect allocation ──────────────────────────────────────
         let mut y = area.y;
+        let title_area = Rect::new(area.x, y, area.width, title_h);
+        y += title_h;
         let summary_area = Rect::new(area.x, y, area.width, summary_h);
         y += summary_h;
         let anomaly_area = Rect::new(area.x, y, area.width, anomaly_h);
@@ -580,6 +592,11 @@ impl MailScreen for DashboardScreen {
         let main_area = Rect::new(area.x, y, area.width, main_h);
         y += main_h;
         let footer_area = Rect::new(area.x, y, area.width, footer_h);
+
+        // ── Gradient title ───────────────────────────────────────
+        if title_h > 0 {
+            render_gradient_title(frame, title_area);
+        }
 
         // ── Render bands ─────────────────────────────────────────
         render_summary_band(
@@ -851,6 +868,31 @@ fn summarize_recipients(recipients: &[String]) -> String {
 // ──────────────────────────────────────────────────────────────────────
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
+
+/// Render the gradient-colored "Agent Mail Dashboard" title.
+///
+/// Uses [`StyledText`] with [`TextEffect::HorizontalGradient`] to produce
+/// a smooth color transition from `status_accent` to `severity_ok` across
+/// the title text.  The title is centered within the given area.
+fn render_gradient_title(frame: &mut Frame<'_>, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let gradient = ColorGradient::new(vec![
+        (0.0, tp.status_accent),
+        (1.0, tp.severity_ok),
+    ]);
+    let title_text = "Agent Mail Dashboard";
+    // Center the title horizontally within the area.
+    let text_len = title_text.len() as u16;
+    let x_offset = area.width.saturating_sub(text_len) / 2;
+    let title_widget = StyledText::new(title_text)
+        .effect(TextEffect::HorizontalGradient { gradient })
+        .base_color(tp.status_accent)
+        .bold();
+    title_widget.render(Rect::new(area.x + x_offset, area.y, text_len, 1), frame);
+}
 
 /// Render the summary band using `MetricTile` widgets.
 ///
@@ -1215,7 +1257,8 @@ fn render_event_log(
     } else {
         Some(total.saturating_sub(1 + scroll_offset))
     };
-    let focus_style = Style::default().reverse().bold();
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let focus_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
 
     // Build styled text lines with colored severity badges
     let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len());

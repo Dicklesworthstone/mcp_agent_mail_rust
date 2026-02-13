@@ -242,10 +242,14 @@ pub fn render_status_line(
         .saturating_add(center_total_len)
         .saturating_add(right_len);
 
+    // Responsive degradation thresholds
+    let show_center = available >= 100;
+    let show_left_detail = available >= 60;
+
     // Build spans
     let mut spans = Vec::with_capacity(8);
 
-    // Left: screen name + uptime
+    // Left: screen name (+ optional mode/uptime when wide enough)
     spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
     spans.push(Span::styled(
         title,
@@ -254,69 +258,75 @@ pub fn render_status_line(
             .bg(tp.status_bg)
             .bold(),
     ));
-    spans.push(Span::styled(
-        format!(" | mode:{transport_mode} up:{uptime_str} "),
-        Style::default().fg(tp.status_fg).bg(tp.status_bg),
-    ));
-
-    // Center padding + counters
-    if total_len < available {
-        let pad = (available - total_len) / 2;
-        if pad > 0 {
-            spans.push(Span::styled(
-                " ".repeat(pad as usize),
-                Style::default().bg(tp.status_bg),
-            ));
-        }
-    }
-
-    let counter_fg = if error_count > 0 {
-        tp.status_warn
-    } else {
-        tp.status_good
-    };
-    spans.push(Span::styled(
-        center_str,
-        Style::default().fg(counter_fg).bg(tp.status_bg),
-    ));
-
-    if !key_hints.is_empty() {
-        // Separator between counters and key hints.
+    if show_left_detail {
         spans.push(Span::styled(
-            sep,
+            format!(" | mode:{transport_mode} up:{uptime_str} "),
             Style::default().fg(tp.status_fg).bg(tp.status_bg),
         ));
+    } else {
+        spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
+    }
 
-        // Parse the hint string into styled spans: keys in accent, text in dim.
-        let mut rest = key_hints.as_str();
-        while let Some(open) = rest.find('[') {
-            if open > 0 {
+    // Center padding + counters (hidden on narrow terminals)
+    if show_center {
+        if total_len < available {
+            let pad = (available - total_len) / 2;
+            if pad > 0 {
                 spans.push(Span::styled(
-                    &rest[..open],
+                    " ".repeat(pad as usize),
+                    Style::default().bg(tp.status_bg),
+                ));
+            }
+        }
+
+        let counter_fg = if error_count > 0 {
+            tp.status_warn
+        } else {
+            tp.status_good
+        };
+        spans.push(Span::styled(
+            center_str,
+            Style::default().fg(counter_fg).bg(tp.status_bg),
+        ));
+
+        if !key_hints.is_empty() {
+            // Separator between counters and key hints.
+            spans.push(Span::styled(
+                sep,
+                Style::default().fg(tp.status_fg).bg(tp.status_bg),
+            ));
+
+            // Parse the hint string into styled spans: keys in accent, text in dim.
+            let mut rest = key_hints.as_str();
+            while let Some(open) = rest.find('[') {
+                if open > 0 {
+                    spans.push(Span::styled(
+                        &rest[..open],
+                        Style::default().fg(tp.status_fg).bg(tp.status_bg),
+                    ));
+                }
+                rest = &rest[open..];
+                if let Some(close) = rest.find(']') {
+                    spans.push(Span::styled(
+                        &rest[..=close],
+                        Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
+                    ));
+                    rest = &rest[close + 1..];
+                } else {
+                    break;
+                }
+            }
+            if !rest.is_empty() {
+                spans.push(Span::styled(
+                    rest,
                     Style::default().fg(tp.status_fg).bg(tp.status_bg),
                 ));
             }
-            rest = &rest[open..];
-            if let Some(close) = rest.find(']') {
-                spans.push(Span::styled(
-                    &rest[..=close],
-                    Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
-                ));
-                rest = &rest[close + 1..];
-            } else {
-                break;
-            }
-        }
-        if !rest.is_empty() {
-            spans.push(Span::styled(
-                rest,
-                Style::default().fg(tp.status_fg).bg(tp.status_bg),
-            ));
         }
     }
 
     // Right padding + help hint
-    if total_len < available {
+    if show_center && total_len < available {
         let used_with_center_pad = total_len + (available - total_len) / 2;
         let right_pad = available.saturating_sub(used_with_center_pad);
         if right_pad > 0 {

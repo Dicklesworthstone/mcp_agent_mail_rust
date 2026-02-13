@@ -337,8 +337,9 @@ impl RenderItem for SearchResultRow {
         let w = area.width as usize;
 
         // Marker for selected row
-        let marker = if selected { '>' } else { ' ' };
-        let cursor_style = Style::default().bold().reverse();
+        let marker = if selected { crate::tui_theme::SELECTION_PREFIX } else { crate::tui_theme::SELECTION_PREFIX_EMPTY };
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let cursor_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
 
         // Doc type badge
         let type_badge = match self.entry.doc_kind {
@@ -375,7 +376,7 @@ impl RenderItem for SearchResultRow {
         };
 
         // Build prefix: marker, type badge, importance, meta
-        let prefix = format!("{marker} [{type_badge}]{imp_badge:>2} {meta}");
+        let prefix = format!("{marker}[{type_badge}]{imp_badge:>2} {meta}");
         let prefix_len = prefix.chars().count();
 
         // Title with remaining space
@@ -2394,7 +2395,7 @@ fn render_results(
     // Render using VirtualizedList for efficient scrolling
     let list = VirtualizedList::new(&rows)
         .style(Style::default())
-        .highlight_style(Style::default().bold().reverse())
+        .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold())
         .show_scrollbar(true);
 
     list.render(inner, frame, list_state);

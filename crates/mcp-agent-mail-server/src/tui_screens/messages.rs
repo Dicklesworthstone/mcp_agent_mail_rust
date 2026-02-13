@@ -15,6 +15,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
+use ftui_extras::syntax::{JsonTokenizer, LineState, TokenKind, Tokenizer};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
@@ -156,12 +157,12 @@ impl RenderItem for MessageEntry {
         let inner_w = area.width as usize;
 
         // Marker for selected row
-        let marker = if selected { '>' } else { ' ' };
-        let cursor_style = Style::default().bold().reverse();
+        let marker = if selected { crate::tui_theme::SELECTION_PREFIX } else { crate::tui_theme::SELECTION_PREFIX_EMPTY };
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let cursor_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
 
         // Importance badge
         let pulse_on = MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed);
-        let tp = crate::tui_theme::TuiThemePalette::current();
         let (badge, badge_style) = match self.importance.as_str() {
             "high" => (
                 "!",
@@ -205,12 +206,12 @@ impl RenderItem for MessageEntry {
             String::new()
         };
 
-        let prefix = format!("{marker} {badge:>2} {id_str:>6} {time_short} {project_badge}");
+        let prefix = format!("{marker}{badge:>2} {id_str:>6} {time_short} {project_badge}");
         let remaining = inner_w.saturating_sub(prefix.len());
         let subj = truncate_str(&self.subject, remaining);
 
         let mut line = Line::from_spans([
-            Span::raw(format!("{marker} ")),
+            Span::raw(marker),
             Span::styled(format!("{badge:>2}"), badge_style),
             Span::raw(format!(" {id_str:>6} {time_short} {project_badge}{subj}")),
         ]);
@@ -1130,10 +1131,83 @@ fn render_results_list(
 
     let list = VirtualizedList::new(results)
         .style(Style::default())
-        .highlight_style(Style::default().bold().reverse())
+        .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold())
         .show_scrollbar(true);
 
     StatefulWidget::render(&list, inner, frame, list_state);
+}
+
+/// Returns `true` if `body` (after trimming whitespace) starts with `{` or `[`,
+/// indicating it is likely a JSON payload.
+fn looks_like_json(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+/// Colorize a JSON body into styled `Line`s using the current TUI theme palette.
+///
+/// Uses the `JsonTokenizer` from ftui-extras for lexing, then post-processes
+/// tokens to distinguish object keys from string values: a `String` token
+/// immediately followed (ignoring whitespace) by a `Punctuation` token whose
+/// text is `:` is classified as a key.
+fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Text {
+    let tokenizer = JsonTokenizer;
+    let key_style = crate::tui_theme::style_json_key(tp);
+    let string_style = crate::tui_theme::style_json_string(tp);
+    let number_style = crate::tui_theme::style_json_number(tp);
+    let literal_style = crate::tui_theme::style_json_literal(tp);
+    let punct_style = crate::tui_theme::style_json_punctuation(tp);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut state = LineState::Normal;
+
+    for raw_line in body.split('\n') {
+        // Strip trailing \r for CRLF sources
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let (tokens, new_state) = tokenizer.tokenize_line(line, state);
+        state = new_state;
+
+        if tokens.is_empty() {
+            lines.push(Line::raw(line));
+            continue;
+        }
+
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(tokens.len());
+
+        for (i, tok) in tokens.iter().enumerate() {
+            let text = &line[tok.range.clone()];
+            let style = match tok.kind {
+                TokenKind::String => {
+                    // Determine if this string is an object key by looking ahead
+                    // past any whitespace tokens for a ':' punctuation token.
+                    let mut is_key = false;
+                    for following in &tokens[i + 1..] {
+                        if following.kind == TokenKind::Whitespace {
+                            continue;
+                        }
+                        if following.kind == TokenKind::Punctuation {
+                            let ft = &line[following.range.clone()];
+                            if ft == ":" {
+                                is_key = true;
+                            }
+                        }
+                        break;
+                    }
+                    if is_key { key_style } else { string_style }
+                }
+                TokenKind::Number => number_style,
+                TokenKind::Boolean | TokenKind::Constant => literal_style,
+                TokenKind::Delimiter | TokenKind::Punctuation => punct_style,
+                _ => Style::default(),
+            };
+            // Allocate an owned String to decouple from the line borrow
+            spans.push(Span::styled(text.to_string(), style));
+        }
+
+        lines.push(Line::from_spans(spans));
+    }
+
+    Text::from_lines(lines)
 }
 
 /// Render the detail panel for the selected message.
@@ -1183,9 +1257,14 @@ fn render_detail_panel(
     lines.push(String::new()); // Blank separator
     lines.push("--- Body ---".to_string());
 
-    // Render message body with GFM markdown support using current TUI theme
-    let md_theme = crate::tui_theme::markdown_theme();
-    let body_text = crate::tui_markdown::render_body(&msg.body_md, &md_theme);
+    // Render message body: JSON bodies get syntax-colored spans,
+    // everything else gets GFM markdown rendering.
+    let body_text = if looks_like_json(&msg.body_md) {
+        colorize_json_body(&msg.body_md, &tp)
+    } else {
+        let md_theme = crate::tui_theme::markdown_theme();
+        crate::tui_markdown::render_body(&msg.body_md, &md_theme)
+    };
     let body_height = body_text.height();
 
     // Build header as plain text lines
