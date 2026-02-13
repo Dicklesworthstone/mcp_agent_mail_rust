@@ -10,7 +10,7 @@
 //! - **Observable**: exposed via `health_check` + tooling/metrics resources.
 
 use serde::Serialize;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::metrics::{GlobalMetricsSnapshot, global_metrics};
 use crate::slo;
@@ -259,18 +259,72 @@ pub fn level_transitions() -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Global shedding gate (AtomicBool, off by default)
+// ---------------------------------------------------------------------------
+
+static SHEDDING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Read the global shedding-enabled flag.
+///
+/// When `false` (the default), `should_shed_tool` never rejects, regardless
+/// of health level or tool classification.
+#[must_use]
+pub fn shedding_enabled() -> bool {
+    SHEDDING_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Set the global shedding-enabled flag.
+///
+/// Called once at server startup from `Config::backpressure_shedding_enabled`.
+pub fn set_shedding_enabled(enabled: bool) {
+    SHEDDING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
 // Shedable tool classification
 // ---------------------------------------------------------------------------
+
+/// Tool names that are considered low-priority (read-only, deferrable) and
+/// may be rejected under Red-level backpressure when shedding is enabled.
+///
+/// Criteria for inclusion:
+/// - The tool is **read-only** (no state mutation).
+/// - Agents have an alternative path or can safely retry later.
+/// - The tool is not required for agent lifecycle or coordination.
+const SHEDABLE_TOOLS: &[&str] = &[
+    // Search cluster — read-only, retryable
+    "search_messages",
+    "summarize_thread",
+    // Identity cluster — read-only lookup
+    "whois",
+    // Contacts cluster — read-only listing
+    "list_contacts",
+    // Product bus — cross-product reads (per-project fetch_inbox is unshed)
+    "search_messages_product",
+    "summarize_thread_product",
+    "fetch_inbox_product",
+];
 
 /// Returns `true` if the named tool is considered low-priority and can
 /// be rejected under Red-level backpressure.
 ///
-/// Shedding is currently disabled until parity fixtures + long-run behavior
-/// can be validated against real workloads.
+/// This is a pure classification function — it does NOT check whether
+/// shedding is globally enabled. Use [`should_shed_tool`] for the full
+/// dispatch-layer decision.
 #[must_use]
-pub const fn is_shedable_tool(tool_name: &str) -> bool {
-    let _ = tool_name;
-    false
+pub fn is_shedable_tool(tool_name: &str) -> bool {
+    SHEDABLE_TOOLS.contains(&tool_name)
+}
+
+/// Combined dispatch-layer decision: should this tool call be rejected?
+///
+/// Returns `true` only when **all three** conditions hold:
+/// 1. Shedding is globally enabled (`BACKPRESSURE_SHEDDING_ENABLED=true`).
+/// 2. The cached health level is Red.
+/// 3. The tool is classified as shedable.
+#[must_use]
+pub fn should_shed_tool(tool_name: &str) -> bool {
+    shedding_enabled() && cached_health_level().should_shed(is_shedable_tool(tool_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -462,21 +516,69 @@ mod tests {
     }
 
     #[test]
-    fn shedable_classification() {
+    fn shedable_tools_classified_correctly() {
+        // Shedable: read-only, deferrable tools
+        assert!(is_shedable_tool("search_messages"));
+        assert!(is_shedable_tool("summarize_thread"));
+        assert!(is_shedable_tool("whois"));
+        assert!(is_shedable_tool("list_contacts"));
+        assert!(is_shedable_tool("search_messages_product"));
+        assert!(is_shedable_tool("summarize_thread_product"));
+        assert!(is_shedable_tool("fetch_inbox_product"));
+    }
+
+    #[test]
+    fn critical_tools_not_shedable() {
+        // Infrastructure
         assert!(!is_shedable_tool("health_check"));
-        assert!(!is_shedable_tool("whois"));
-        assert!(!is_shedable_tool("search_messages"));
-        assert!(!is_shedable_tool("summarize_thread"));
+        assert!(!is_shedable_tool("ensure_project"));
         assert!(!is_shedable_tool("install_precommit_guard"));
         assert!(!is_shedable_tool("uninstall_precommit_guard"));
-        assert!(!is_shedable_tool("send_message"));
-        assert!(!is_shedable_tool("fetch_inbox"));
+
+        // Identity (writes)
         assert!(!is_shedable_tool("register_agent"));
-        assert!(!is_shedable_tool("ensure_project"));
+        assert!(!is_shedable_tool("create_agent_identity"));
+
+        // Messaging (core agent coordination)
+        assert!(!is_shedable_tool("send_message"));
+        assert!(!is_shedable_tool("reply_message"));
+        assert!(!is_shedable_tool("fetch_inbox"));
+        assert!(!is_shedable_tool("mark_message_read"));
+        assert!(!is_shedable_tool("acknowledge_message"));
+
+        // Contacts (writes)
+        assert!(!is_shedable_tool("request_contact"));
+        assert!(!is_shedable_tool("respond_contact"));
+        assert!(!is_shedable_tool("set_contact_policy"));
+
+        // File reservations (critical for multi-agent coordination)
         assert!(!is_shedable_tool("file_reservation_paths"));
+        assert!(!is_shedable_tool("release_file_reservations"));
+        assert!(!is_shedable_tool("renew_file_reservations"));
+        assert!(!is_shedable_tool("force_release_file_reservation"));
+
+        // Macros (compound writes)
+        assert!(!is_shedable_tool("macro_start_session"));
+        assert!(!is_shedable_tool("macro_prepare_thread"));
+        assert!(!is_shedable_tool("macro_file_reservation_cycle"));
+        assert!(!is_shedable_tool("macro_contact_handshake"));
+
+        // Product bus (writes)
+        assert!(!is_shedable_tool("ensure_product"));
+        assert!(!is_shedable_tool("products_link"));
+
+        // Build slots (coordination)
+        assert!(!is_shedable_tool("acquire_build_slot"));
+        assert!(!is_shedable_tool("renew_build_slot"));
+        assert!(!is_shedable_tool("release_build_slot"));
+    }
+
+    #[test]
+    fn unknown_tools_not_shedable() {
+        assert!(!is_shedable_tool(""));
         assert!(!is_shedable_tool("Health_Check"));
         assert!(!is_shedable_tool("health_check "));
-        assert!(!is_shedable_tool(""));
+        assert!(!is_shedable_tool("nonexistent_tool"));
     }
 
     #[test]
@@ -815,50 +917,47 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tools_are_not_shedable() {
-        let unknown = ["", "search_message", "HEALTH_CHECK", "macro_start_session"];
-        for tool in unknown {
-            assert!(!is_shedable_tool(tool), "unexpected shedable tool: {tool}");
-            assert!(
-                !HealthLevel::Red.should_shed(is_shedable_tool(tool)),
-                "red should not shed unknown non-shedable tool: {tool}"
-            );
-        }
+    fn shed_decision_integrates_classification_and_level() {
+        // Shedable tool at each health level
+        assert!(HealthLevel::Red.should_shed(is_shedable_tool("search_messages")));
+        assert!(!HealthLevel::Yellow.should_shed(is_shedable_tool("search_messages")));
+        assert!(!HealthLevel::Green.should_shed(is_shedable_tool("search_messages")));
+
+        // Non-shedable tool at Red → never shed
+        assert!(!HealthLevel::Red.should_shed(is_shedable_tool("send_message")));
+        assert!(!HealthLevel::Red.should_shed(is_shedable_tool("health_check")));
+        assert!(!HealthLevel::Red.should_shed(is_shedable_tool("fetch_inbox")));
+        assert!(!HealthLevel::Red.should_shed(is_shedable_tool("file_reservation_paths")));
     }
 
     #[test]
-    fn shed_decision_matches_tool_categories() {
-        let cases = [
-            ("health_check", false),
-            ("whois", false),
-            ("search_messages", false),
-            ("summarize_thread", false),
-            ("install_precommit_guard", false),
-            ("uninstall_precommit_guard", false),
-            ("send_message", false),
-            ("fetch_inbox", false),
-            ("register_agent", false),
-            ("ensure_project", false),
-            ("file_reservation_paths", false),
-            ("acknowledge_message", false),
-        ];
+    fn should_shed_tool_respects_global_flag() {
+        // Ensure flag is off (default)
+        set_shedding_enabled(false);
 
-        for (tool, expected_shedable) in cases {
-            assert_eq!(
-                is_shedable_tool(tool),
-                expected_shedable,
-                "unexpected shedability for tool {tool}"
-            );
-            assert_eq!(
-                HealthLevel::Red.should_shed(is_shedable_tool(tool)),
-                expected_shedable,
-                "unexpected red shed decision for tool {tool}"
-            );
-            assert!(
-                !HealthLevel::Yellow.should_shed(is_shedable_tool(tool)),
-                "yellow should not shed tool {tool}"
-            );
-        }
+        // Even with Red level in the cache, should_shed_tool returns false
+        // when the flag is off. We can't easily force the cached level to Red
+        // in a unit test, but we can verify the flag gate directly.
+        assert!(!should_shed_tool("search_messages"));
+        assert!(!should_shed_tool("whois"));
+
+        // Non-shedable tools always return false regardless of flag
+        set_shedding_enabled(true);
+        assert!(!should_shed_tool("send_message"));
+        assert!(!should_shed_tool("register_agent"));
+
+        // Reset to default
+        set_shedding_enabled(false);
+    }
+
+    #[test]
+    fn shedding_enabled_flag_roundtrip() {
+        let original = shedding_enabled();
+        set_shedding_enabled(true);
+        assert!(shedding_enabled());
+        set_shedding_enabled(false);
+        assert!(!shedding_enabled());
+        set_shedding_enabled(original);
     }
 
     #[test]

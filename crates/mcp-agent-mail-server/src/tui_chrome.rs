@@ -143,7 +143,7 @@ pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Render the status line into a 1-row area.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_status_line(
     state: &TuiSharedState,
     active: MailScreenId,

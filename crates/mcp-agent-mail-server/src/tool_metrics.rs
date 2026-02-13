@@ -137,7 +137,7 @@ mod tests {
     fn lock_metrics_test() -> std::sync::MutexGuard<'static, ()> {
         METRICS_TEST_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]

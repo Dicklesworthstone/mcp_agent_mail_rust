@@ -175,9 +175,8 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        // Backpressure gate: reject shedable tools under Red
-        let bp_level = mcp_agent_mail_core::cached_health_level();
-        if bp_level.should_shed(mcp_agent_mail_core::is_shedable_tool(self.tool_name)) {
+        // Backpressure gate: reject shedable tools under Red (when enabled)
+        if mcp_agent_mail_core::should_shed_tool(self.tool_name) {
             return Err(McpError::new(
                 McpErrorCode::InternalError,
                 format!(
@@ -239,9 +238,8 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         ctx: &'a McpContext,
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
-        // Backpressure gate: reject shedable tools under Red
-        let bp_level = mcp_agent_mail_core::cached_health_level();
-        if bp_level.should_shed(mcp_agent_mail_core::is_shedable_tool(self.tool_name)) {
+        // Backpressure gate: reject shedable tools under Red (when enabled)
+        if mcp_agent_mail_core::should_shed_tool(self.tool_name) {
             return Box::pin(std::future::ready(fastmcp_core::Outcome::Err(
                 McpError::new(
                     McpErrorCode::InternalError,
@@ -410,6 +408,9 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
+    // Wire the config flag into the global atomic gate.
+    mcp_agent_mail_core::set_shedding_enabled(config.backpressure_shedding_enabled);
+
     let server = Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"));
 
     let server = add_tool(
@@ -7259,6 +7260,391 @@ mod tests {
         let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
             .expect("ip-unknown fallback bucket should rate-limit on second request");
         assert_eq!(resp.status, 429);
+    }
+
+    // ── br-3h13.5.3: Rate limiter unit tests (MistyRobin) ─────────────
+
+    #[test]
+    fn rate_limiter_tokens_cap_at_burst_after_long_idle() {
+        let limiter = RateLimiter::new();
+        let key = "tools:cap_test:ip-unknown";
+        let t0 = rate_limit_now();
+
+        // rpm=60, burst=3 → 1 token/sec, max 3 tokens.
+        // Consume all 3 tokens.
+        assert!(limiter.allow_memory(key, 60, 3, t0, false));
+        assert!(limiter.allow_memory(key, 60, 3, t0, false));
+        assert!(limiter.allow_memory(key, 60, 3, t0, false));
+        assert!(!limiter.allow_memory(key, 60, 3, t0, false));
+
+        // Wait a very long time (1000s). Tokens should cap at burst=3, not 1000.
+        assert!(limiter.allow_memory(key, 60, 3, t0 + 1000.0, false));
+        assert!(limiter.allow_memory(key, 60, 3, t0 + 1000.0, false));
+        assert!(limiter.allow_memory(key, 60, 3, t0 + 1000.0, false));
+        assert!(
+            !limiter.allow_memory(key, 60, 3, t0 + 1000.0, false),
+            "tokens must never exceed burst capacity even after long idle"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_multiple_keys_are_independent() {
+        let limiter = RateLimiter::new();
+        let t0 = rate_limit_now();
+
+        // Two different keys with burst=1 each.
+        assert!(limiter.allow_memory("tools:a:ip-1", 60, 1, t0, false));
+        assert!(limiter.allow_memory("tools:b:ip-2", 60, 1, t0, false));
+
+        // Each should be exhausted independently.
+        assert!(!limiter.allow_memory("tools:a:ip-1", 60, 1, t0, false));
+        assert!(!limiter.allow_memory("tools:b:ip-2", 60, 1, t0, false));
+
+        // Refilling key a should not affect key b.
+        assert!(limiter.allow_memory("tools:a:ip-1", 60, 1, t0 + 1.0, false));
+        assert!(!limiter.allow_memory("tools:b:ip-2", 60, 1, t0 + 0.5, false));
+    }
+
+    #[test]
+    fn rate_limiter_gradual_recovery_after_exhaustion() {
+        let limiter = RateLimiter::new();
+        let key = "tools:recovery:ip-unknown";
+        let t0 = rate_limit_now();
+
+        // rpm=60 => 1 token/sec, burst=3.
+        // Exhaust all tokens.
+        assert!(limiter.allow_memory(key, 60, 3, t0, false));
+        assert!(limiter.allow_memory(key, 60, 3, t0, false));
+        assert!(limiter.allow_memory(key, 60, 3, t0, false));
+        assert!(!limiter.allow_memory(key, 60, 3, t0, false));
+
+        // After 1s, exactly 1 token refilled.
+        assert!(limiter.allow_memory(key, 60, 3, t0 + 1.0, false));
+        assert!(!limiter.allow_memory(key, 60, 3, t0 + 1.0, false));
+
+        // After 2s total, another token.
+        assert!(limiter.allow_memory(key, 60, 3, t0 + 2.0, false));
+        assert!(!limiter.allow_memory(key, 60, 3, t0 + 2.0, false));
+
+        // After 3s total, another token (now back to 1 available).
+        assert!(limiter.allow_memory(key, 60, 3, t0 + 3.0, false));
+        assert!(!limiter.allow_memory(key, 60, 3, t0 + 3.0, false));
+    }
+
+    #[test]
+    fn rate_limiter_burst_greater_than_rpm_is_valid() {
+        let limiter = RateLimiter::new();
+        let key = "tools:big_burst:ip-unknown";
+        let t0 = rate_limit_now();
+
+        // rpm=5, burst=10 → 5/60 ≈ 0.0833 tokens/sec, but start with 10 tokens.
+        for _ in 0..10 {
+            assert!(limiter.allow_memory(key, 5, 10, t0, false));
+        }
+        assert!(!limiter.allow_memory(key, 5, 10, t0, false));
+
+        // Need 1/0.0833 = 12s to refill one token.
+        assert!(!limiter.allow_memory(key, 5, 10, t0 + 11.0, false));
+        assert!(limiter.allow_memory(key, 5, 10, t0 + 12.0, false));
+    }
+
+    #[test]
+    fn rate_limit_429_response_body_contains_detail() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({ "name": "health_check", "arguments": {} })),
+            1,
+        );
+
+        let req1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
+
+        let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
+            .expect("should be rate limited");
+        assert_eq!(resp.status, 429);
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("429 response body must be valid JSON");
+        assert_eq!(
+            body["detail"], "Rate limit exceeded",
+            "429 response must contain detail field with rate limit message"
+        );
+    }
+
+    #[test]
+    fn rate_limit_disabled_never_blocks() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: false,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({ "name": "health_check", "arguments": {} })),
+            1,
+        );
+
+        // Even with rpm=1 burst=1, disabling rate limiting should allow all requests.
+        for _ in 0..10 {
+            let req = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+            assert!(
+                block_on(state.check_rbac_and_rate_limit(&req, &json_rpc)).is_none(),
+                "rate limiting disabled should never block"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limiter_concurrent_different_keys_all_succeed() {
+        use std::sync::atomic::AtomicUsize;
+
+        let limiter = Arc::new(RateLimiter::new());
+        let successes = Arc::new(AtomicUsize::new(0));
+        let now = rate_limit_now();
+
+        // 16 threads, each with its own unique key and burst=1.
+        // Every thread should succeed exactly once.
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let limiter = Arc::clone(&limiter);
+                let successes = Arc::clone(&successes);
+                scope.spawn(move || {
+                    let key = format!("tools:concurrent_{i}:ip-unknown");
+                    if limiter.allow_memory(&key, 60, 1, now, false) {
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            successes.load(Ordering::Relaxed),
+            16,
+            "all threads with unique keys should succeed"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_cleanup_removes_all_stale_entries() {
+        let limiter = RateLimiter::new();
+        let now = rate_limit_now();
+        let cutoff = now - 3600.0;
+
+        {
+            let mut buckets = limiter
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for i in 0..10 {
+                buckets.insert(format!("stale_{i}"), (1.0, cutoff - f64::from(i) - 1.0));
+            }
+        }
+        {
+            let mut last = limiter
+                .last_cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *last = now - 61.0;
+        }
+
+        limiter.cleanup(now);
+
+        let count = limiter
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(count, 0, "all stale entries should be removed");
+    }
+
+    #[test]
+    fn rate_limiter_high_rpm_rapid_refill() {
+        let limiter = RateLimiter::new();
+        let key = "tools:high_rpm:ip-unknown";
+        // Use a controlled base to avoid f64 precision loss at epoch-second scale.
+        let t0 = 1000.0_f64;
+
+        // rpm=6000 => 100 tokens/sec, burst=1.
+        assert!(limiter.allow_memory(key, 6000, 1, t0, false));
+        assert!(!limiter.allow_memory(key, 6000, 1, t0, false));
+
+        // After 0.01s (10ms), exactly 1 token refilled (100 * 0.01 = 1.0).
+        assert!(limiter.allow_memory(key, 6000, 1, t0 + 0.01, false));
+        assert!(!limiter.allow_memory(key, 6000, 1, t0 + 0.01, false));
+
+        // 0.009s is not enough (100 * 0.009 = 0.9 < 1.0).
+        assert!(!limiter.allow_memory(key, 6000, 1, t0 + 0.019, false));
+    }
+
+    #[test]
+    fn rate_limiter_fractional_rpm_precision() {
+        let limiter = RateLimiter::new();
+        let key = "tools:fractional:ip-unknown";
+        // Use controlled base to avoid f64 precision loss at epoch scale.
+        let t0 = 1000.0_f64;
+
+        // rpm=7 => 7/60 ≈ 0.11667 tokens/sec, burst=1.
+        assert!(limiter.allow_memory(key, 7, 1, t0, false));
+        assert!(!limiter.allow_memory(key, 7, 1, t0, false));
+
+        // 60/7 ≈ 8.571s needed for one token. 8.5s is NOT enough.
+        assert!(!limiter.allow_memory(key, 7, 1, t0 + 8.5, false));
+
+        // 8.572s should be enough (7/60 * 8.572 ≈ 1.0001).
+        assert!(limiter.allow_memory(key, 7, 1, t0 + 8.572, false));
+    }
+
+    #[test]
+    fn rate_limit_per_identity_isolation_via_pipeline() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({ "name": "health_check", "arguments": {} })),
+            1,
+        );
+
+        let peer_a = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let peer_b = SocketAddr::from(([10, 0, 0, 2], 1234));
+
+        // Each identity gets its own burst independently.
+        let office_network_request =
+            make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer_a));
+        assert!(
+            block_on(state.check_rbac_and_rate_limit(&office_network_request, &json_rpc)).is_none()
+        );
+
+        let home_wifi_request =
+            make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer_b));
+        assert!(
+            block_on(state.check_rbac_and_rate_limit(&home_wifi_request, &json_rpc)).is_none(),
+            "different IP should have independent rate limit bucket"
+        );
+
+        // Both should be exhausted now.
+        let office_retry_request =
+            make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer_a));
+        assert!(
+            block_on(state.check_rbac_and_rate_limit(&office_retry_request, &json_rpc)).is_some()
+        );
+
+        let wifi_retry_request =
+            make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer_b));
+        assert!(
+            block_on(state.check_rbac_and_rate_limit(&wifi_retry_request, &json_rpc)).is_some()
+        );
+    }
+
+    #[test]
+    fn rate_limiter_do_cleanup_false_preserves_stale_entries() {
+        let limiter = RateLimiter::new();
+        let now = rate_limit_now();
+        let cutoff = now - 3600.0;
+
+        {
+            let mut buckets = limiter
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            buckets.insert("stale_key".to_string(), (1.0, cutoff - 10.0));
+        }
+        {
+            let mut last = limiter
+                .last_cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *last = now - 61.0; // would normally trigger cleanup
+        }
+
+        // do_cleanup=false should skip cleanup even when interval elapsed.
+        limiter.allow_memory("tools:new:ip-unknown", 60, 1, now, false);
+
+        let has_stale = limiter
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key("stale_key");
+        assert!(has_stale, "do_cleanup=false must not prune stale entries");
+    }
+
+    #[test]
+    fn rate_limiter_burst_one_is_strict_one_per_interval() {
+        let limiter = RateLimiter::new();
+        let key = "tools:strict:ip-unknown";
+        let t0 = rate_limit_now();
+
+        // rpm=60, burst=1 → 1 token/sec, start with 1 token.
+        assert!(limiter.allow_memory(key, 60, 1, t0, false));
+
+        // Immediate subsequent requests should all fail.
+        for ms in [0.0, 0.1, 0.5, 0.9, 0.999] {
+            assert!(
+                !limiter.allow_memory(key, 60, 1, t0 + ms, false),
+                "burst=1 should deny at t0+{ms}s"
+            );
+        }
+
+        // Exactly at 1.0s, should succeed again.
+        assert!(limiter.allow_memory(key, 60, 1, t0 + 1.0, false));
+    }
+
+    #[test]
+    fn rate_limit_resources_use_separate_config_values() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 100,
+            http_rate_limit_tools_burst: 100,
+            http_rate_limit_resources_per_minute: 1,
+            http_rate_limit_resources_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let resource_rpc = JsonRpcRequest::new("resources/list", None, 1);
+
+        // First resource request should pass.
+        let req1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(block_on(state.check_rbac_and_rate_limit(&req1, &resource_rpc)).is_none());
+
+        // Second should fail (resources rpm=1, burst=1).
+        let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let resp = block_on(state.check_rbac_and_rate_limit(&req2, &resource_rpc))
+            .expect("resource rate limit should trigger");
+        assert_eq!(resp.status, 429);
+
+        // But tools should still be fine (tools rpm=100).
+        let tool_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({ "name": "health_check", "arguments": {} })),
+            2,
+        );
+        let req3 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(
+            block_on(state.check_rbac_and_rate_limit(&req3, &tool_rpc)).is_none(),
+            "tools should use separate config with higher limit"
+        );
     }
 
     #[test]

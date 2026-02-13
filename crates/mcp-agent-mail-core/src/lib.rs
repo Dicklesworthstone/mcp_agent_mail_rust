@@ -35,6 +35,7 @@ pub use agent_detect::{
 pub use backpressure::{
     HealthLevel, HealthSignals, cached_health_level, compute_health_level,
     compute_health_level_with_signals, is_shedable_tool, level_transitions, refresh_health_level,
+    set_shedding_enabled, shedding_enabled, should_shed_tool,
 };
 pub use config::{AppEnvironment, Config, InterfaceMode, ProjectIdentityMode, RateLimitBackend};
 pub use diagnostics::{

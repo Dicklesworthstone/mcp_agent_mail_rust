@@ -629,7 +629,7 @@ mod tests {
         let r = &reservations[0];
         let ttl_us = r.expires_ts - r.created_ts;
         assert!(
-            ttl_us >= 110_000_000 && ttl_us <= 130_000_000,
+            (110_000_000..=130_000_000).contains(&ttl_us),
             "reservation TTL should be close to configured 120 seconds, got {ttl_us}us"
         );
     }

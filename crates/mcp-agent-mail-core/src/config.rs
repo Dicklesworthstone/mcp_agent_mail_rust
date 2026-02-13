@@ -179,6 +179,12 @@ pub struct Config {
     // Tool filtering
     pub tool_filter: ToolFilterSettings,
 
+    // Backpressure shedding
+    /// When `true`, the dispatch layer rejects shedable (read-only, deferrable)
+    /// tool calls while the system health level is Red.  Disabled by default
+    /// to avoid false denials until validated against production workloads.
+    pub backpressure_shedding_enabled: bool,
+
     // Instrumentation / query tracking
     pub instrumentation_enabled: bool,
     pub instrumentation_slow_query_ms: u64,
@@ -733,6 +739,9 @@ impl Default for Config {
             // Tool filtering
             tool_filter: ToolFilterSettings::default(),
 
+            // Backpressure shedding
+            backpressure_shedding_enabled: false,
+
             // Instrumentation
             instrumentation_enabled: false,
             instrumentation_slow_query_ms: 250,
@@ -1196,6 +1205,12 @@ impl Config {
         config.notifications_debounce_ms = env_u64(
             "NOTIFICATIONS_DEBOUNCE_MS",
             config.notifications_debounce_ms,
+        );
+
+        // Backpressure shedding
+        config.backpressure_shedding_enabled = env_bool(
+            "BACKPRESSURE_SHEDDING_ENABLED",
+            config.backpressure_shedding_enabled,
         );
 
         // Instrumentation

@@ -134,10 +134,10 @@ impl ToastSeverityThreshold {
     }
 
     fn from_config(config: &mcp_agent_mail_core::Config) -> Self {
-        if !config.tui_toast_enabled {
-            Self::Off
-        } else {
+        if config.tui_toast_enabled {
             Self::parse(config.tui_toast_severity.as_str())
+        } else {
+            Self::Off
         }
     }
 
@@ -172,6 +172,7 @@ fn now_micros() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn decayed_palette_usage_weight(
     usage_count: u32,
     last_used_micros: i64,
@@ -182,7 +183,7 @@ fn decayed_palette_usage_weight(
     }
     let age_micros = ranking_now_micros.saturating_sub(last_used_micros).max(0) as f64;
     let half_life = PALETTE_USAGE_HALF_LIFE_MICROS as f64;
-    let decay = 2.0_f64.powf(-age_micros / half_life);
+    let decay = (-age_micros / half_life).exp2();
     f64::from(usage_count) * decay
 }
 
@@ -250,7 +251,7 @@ impl ModalManager {
 
     /// Returns `true` if a modal is currently active.
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.active.is_some()
     }
 
@@ -664,12 +665,12 @@ impl MailAppModel {
     }
 
     /// Get mutable access to the modal manager for showing confirmation dialogs.
-    pub fn modal_manager_mut(&mut self) -> &mut ModalManager {
+    pub const fn modal_manager_mut(&mut self) -> &mut ModalManager {
         &mut self.modal_manager
     }
 
     /// Get mutable access to the action menu manager.
-    pub fn action_menu_mut(&mut self) -> &mut ActionMenuManager {
+    pub const fn action_menu_mut(&mut self) -> &mut ActionMenuManager {
         &mut self.action_menu
     }
 
@@ -677,7 +678,7 @@ impl MailAppModel {
     fn dispatch_action_menu_selection(
         &mut self,
         action: ActionKind,
-        context: String,
+        context: &str,
     ) -> Cmd<MailMsg> {
         match action {
             ActionKind::Navigate(screen_id) => {
@@ -1689,10 +1690,11 @@ impl Model for MailAppModel {
                 // When action menu is active, route all events to it (focus trapping).
                 if let Some(result) = self.action_menu.handle_event(event) {
                     match result {
-                        ActionMenuResult::Consumed => return Cmd::none(),
-                        ActionMenuResult::Dismissed => return Cmd::none(),
+                        ActionMenuResult::Consumed | ActionMenuResult::Dismissed => {
+                            return Cmd::none();
+                        }
                         ActionMenuResult::Selected(action, context) => {
-                            return self.dispatch_action_menu_selection(action, context);
+                            return self.dispatch_action_menu_selection(action, &context);
                         }
                     }
                 }
@@ -2393,7 +2395,7 @@ struct PaletteCacheBridgeState {
 fn palette_cache_bridge_state(state: &TuiSharedState) -> PaletteCacheBridgeState {
     state
         .db_stats_snapshot()
-        .map_or(PaletteCacheBridgeState::default(), |snap| {
+        .map_or_else(PaletteCacheBridgeState::default, |snap| {
             PaletteCacheBridgeState {
                 snapshot_micros: snap.timestamp_micros,
                 message_count: snap.messages,
@@ -2539,8 +2541,8 @@ fn fetch_palette_db_data(
         guard.fetched_at_micros = now;
         guard.source_snapshot_micros = bridge_state.snapshot_micros;
         guard.source_message_count = bridge_state.message_count;
-        guard.agent_metadata = agent_metadata.clone();
-        guard.messages = messages.clone();
+        guard.agent_metadata.clone_from(&agent_metadata);
+        guard.messages.clone_from(&messages);
     }
     (agent_metadata, messages)
 }
@@ -2758,6 +2760,7 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
 }
 
 /// Append palette entries derived from the recent event stream (threads, tools, reservations).
+#[allow(clippy::too_many_lines)]
 fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<ActionItem>) {
     let events = state.recent_events(PALETTE_DYNAMIC_EVENT_SCAN);
     let thread_stats = collect_thread_palette_stats(&events);
@@ -2780,17 +2783,18 @@ fn build_palette_actions_from_events(state: &TuiSharedState, out: &mut Vec<Actio
         if threads_seen.len() < PALETTE_DYNAMIC_THREAD_CAP {
             if let Some((thread_id, subject)) = extract_thread(ev) {
                 if threads_seen.insert(thread_id.to_string()) {
-                    let thread_desc = if let Some(stats) = thread_stats.get(thread_id) {
-                        let participants = format_participant_list(&stats.participants, 3);
-                        format!(
-                            "{} msgs • {} • latest: {}",
-                            stats.message_count,
-                            participants,
-                            truncate_subject(&stats.latest_subject, 42)
-                        )
-                    } else {
-                        format!("Latest: {subject}")
-                    };
+                    let thread_desc = thread_stats.get(thread_id).map_or_else(
+                        || format!("Latest: {subject}"),
+                        |stats| {
+                            let participants = format_participant_list(&stats.participants, 3);
+                            format!(
+                                "{} msgs • {} • latest: {}",
+                                stats.message_count,
+                                participants,
+                                truncate_subject(&stats.latest_subject, 42)
+                            )
+                        },
+                    );
                     out.push(
                         ActionItem::new(
                             format!("{}{}", palette_action_ids::THREAD_PREFIX, thread_id),
@@ -2923,6 +2927,7 @@ fn screen_name_from_id(id: MailScreenId) -> &'static str {
 ///
 /// Returns `None` for routine events that shouldn't produce toasts,
 /// or if the toast's severity is below the configured threshold.
+#[allow(clippy::too_many_lines)]
 fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Option<Toast> {
     let (icon, toast) = match event {
         // ── Messaging ────────────────────────────────────────────
@@ -3041,6 +3046,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn render_screen_transition_overlay(transition: ScreenTransition, area: Rect, frame: &mut Frame) {
     if area.width < 4 || area.height == 0 {
         return;
@@ -3139,7 +3145,9 @@ fn render_focus_hint(
 ) {
     let hint = "Ctrl+T:exit  \u{2191}\u{2193}:nav  Enter:dismiss";
     let hint_y = positions.last().map_or(default_y, |(_, _, py)| {
-        let (_, lh) = visible.last().map_or((0, 3), |t| t.calculate_dimensions());
+        let (_, lh) = visible
+            .last()
+            .map_or((0, 3), ftui_widgets::Toast::calculate_dimensions);
         area.y.saturating_add(*py).saturating_add(lh)
     });
 
@@ -5365,7 +5373,7 @@ mod tests {
         model.warned_reservations.insert(key.clone());
         assert!(model.warned_reservations.contains(&key));
         // Second insert is a no-op
-        model.warned_reservations.insert(key.clone());
+        model.warned_reservations.insert(key);
         assert_eq!(model.warned_reservations.len(), 1);
     }
 
@@ -5689,6 +5697,7 @@ mod tests {
     ///
     /// Budget: sparkline render should complete in < 500µs.
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn perf_sparkline_100points() {
         use ftui_widgets::sparkline::Sparkline;
         use std::time::Instant;
@@ -5807,7 +5816,7 @@ mod tests {
             };
             palette.register_action(
                 ActionItem::new(
-                    format!("action:{}", i),
+                    format!("action:{i}"),
                     format!("Action Item Number {} Description", i),
                 )
                 .with_description(format!(

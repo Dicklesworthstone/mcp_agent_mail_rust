@@ -1281,6 +1281,126 @@ fn tool_filter_profiles_match_fixtures() {
 }
 
 #[test]
+fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("backpressure-shedding.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage = tmp.path().join("archive");
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
+        ("WORKTREES_ENABLED", "1"),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("BACKPRESSURE_SHEDDING_ENABLED", "1"),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+    ]);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    assert!(
+        config.backpressure_shedding_enabled,
+        "test precondition: shedding must be enabled via env"
+    );
+
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+
+    // Save and restore global metric state because backpressure cache/metrics are process-wide.
+    let metrics = mcp_agent_mail_core::metrics::global_metrics();
+    let original_pool_total = metrics.db.pool_total_connections.load();
+    let original_pool_active = metrics.db.pool_active_connections.load();
+    let original_pool_idle = metrics.db.pool_idle_connections.load();
+    let original_shedding_enabled = mcp_agent_mail_core::shedding_enabled();
+
+    // Force a deterministic Red level via pool utilization threshold.
+    metrics.db.pool_total_connections.set(100);
+    metrics.db.pool_active_connections.set(95);
+    metrics.db.pool_idle_connections.set(5);
+    let (level, _) = mcp_agent_mail_core::refresh_health_level();
+    assert_eq!(
+        level,
+        mcp_agent_mail_core::HealthLevel::Red,
+        "test precondition: forced metrics should classify as Red"
+    );
+
+    // Shedable tool should be rejected before tool-specific argument parsing.
+    let shedable_params = CallToolParams {
+        name: "whois".to_string(),
+        arguments: Some(serde_json::json!({
+            "project_key": "/tmp/nonexistent-project-for-shedding-test",
+            "agent_name": "NoSuchAgent",
+        })),
+        meta: None,
+    };
+    let shedable_result = router.handle_tools_call(
+        &cx,
+        req_id,
+        shedable_params,
+        &budget,
+        SessionState::new(),
+        None,
+        None,
+    );
+    req_id += 1;
+    match shedable_result {
+        Ok(call_result) => {
+            assert!(call_result.is_error, "expected whois to be shed");
+            let text = call_result
+                .content
+                .first()
+                .and_then(|c| match c {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("<non-text error>");
+            assert!(
+                text.contains("Server overloaded") && text.contains("whois"),
+                "unexpected shed error content: {text}"
+            );
+        }
+        Err(err) => {
+            assert!(
+                err.message.contains("Server overloaded") && err.message.contains("whois"),
+                "unexpected shed router error: {}",
+                err.message
+            );
+        }
+    }
+
+    // Non-shedable critical tool should still execute under Red.
+    let critical_params = CallToolParams {
+        name: "health_check".to_string(),
+        arguments: Some(serde_json::json!({})),
+        meta: None,
+    };
+    let critical_result = router
+        .handle_tools_call(
+            &cx,
+            req_id,
+            critical_params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("health_check should not be shed: {e}"));
+    assert!(
+        !critical_result.is_error,
+        "health_check must remain available even under Red"
+    );
+
+    // Restore process-global state for other tests.
+    metrics.db.pool_total_connections.set(original_pool_total);
+    metrics.db.pool_active_connections.set(original_pool_active);
+    metrics.db.pool_idle_connections.set(original_pool_idle);
+    mcp_agent_mail_core::set_shedding_enabled(original_shedding_enabled);
+    let _ = mcp_agent_mail_core::refresh_health_level();
+}
+
+#[test]
 fn product_bus_tools_end_to_end_across_linked_projects() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
 

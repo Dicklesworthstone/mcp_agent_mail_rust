@@ -377,7 +377,7 @@ impl ActionMenuManager {
 
     /// Returns `true` if a menu is currently active.
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.active.is_some()
     }
 

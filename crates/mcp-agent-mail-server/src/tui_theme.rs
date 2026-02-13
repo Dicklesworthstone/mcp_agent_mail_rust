@@ -55,7 +55,8 @@ pub struct TuiThemePalette {
 
 impl TuiThemePalette {
     /// Frankenstein's Monster Theme (Showcase)
-    pub fn frankenstein() -> Self {
+    #[must_use]
+    pub const fn frankenstein() -> Self {
         // Palette:
         // Dark Green BG: 20, 30, 20
         // Electric Green FG: 100, 255, 100

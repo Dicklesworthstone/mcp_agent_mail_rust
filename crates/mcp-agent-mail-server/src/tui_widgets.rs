@@ -2033,7 +2033,7 @@ pub fn truncate_at_word_boundary(body: &str, max_chars: usize) -> String {
 /// ```
 #[derive(Debug, Clone)]
 pub struct MessageCard<'a> {
-    /// Sender name (e.g., "AlphaDog").
+    /// Sender name (e.g., "`AlphaDog`").
     sender: &'a str,
     /// Timestamp display string (e.g., "2m ago", "Jan 5").
     timestamp: &'a str,
@@ -2273,6 +2273,7 @@ impl MessageCard<'_> {
     }
 
     /// Render expanded state: full header + separator + body + footer.
+    #[allow(clippy::too_many_lines)]
     fn render_expanded(&self, inner: Rect, frame: &mut Frame) {
         let mut y = inner.y;
 
@@ -3000,7 +3001,7 @@ mod tests {
         assert_ne!(colors[0], colors[2]);
     }
 
-    /// Test that MetricTile sparkline uses Sparkline widget correctly (br-2bbt.4.1).
+    /// Test that `MetricTile` sparkline uses `Sparkline` widget correctly (br-2bbt.4.1).
     #[test]
     fn metric_tile_sparkline_uses_sparkline_widget() {
         // Verify that the sparkline renders block characters from ftui_widgets::Sparkline.
@@ -3557,7 +3558,7 @@ mod tests {
         let colors: Vec<PackedRgba> = names.iter().map(|n| sender_color_hash(n)).collect();
 
         // Count distinct colors.
-        let mut unique = colors.clone();
+        let mut unique = colors.to_vec();
         unique.sort_by_key(|c| (c.r(), c.g(), c.b()));
         unique.dedup();
 
@@ -3732,7 +3733,7 @@ mod tests {
         let wrapped = wrap_text(text, 80);
         // Should have blank line between paragraphs.
         assert!(
-            wrapped.iter().any(|l| l.is_empty()),
+            wrapped.iter().any(String::is_empty),
             "should preserve blank lines"
         );
     }

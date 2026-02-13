@@ -3808,6 +3808,562 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 }
 
 #[cfg(test)]
+mod resource_shape_tests {
+    use super::*;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::{Cx, Outcome};
+    use mcp_agent_mail_db::{DbPool, MessageRow, ProjectRow, queries};
+    use serde_json::Value;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static RESOURCE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_suffix() -> u64 {
+        let micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+        let time_component = u64::try_from(micros).unwrap_or(u64::MAX);
+        time_component.wrapping_add(RESOURCE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn with_serialized_resources<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _lock = RESOURCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f()
+    }
+
+    fn run_async<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce(Cx) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let cx = Cx::for_testing();
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(f(cx))
+    }
+
+    async fn ensure_project(cx: &Cx, pool: &DbPool, human_key: &str) -> ProjectRow {
+        match queries::ensure_project(cx, pool, human_key).await {
+            Outcome::Ok(project) => project,
+            other => panic!("ensure_project failed: {other:?}"),
+        }
+    }
+
+    async fn register_agent(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        name: &str,
+    ) -> mcp_agent_mail_db::AgentRow {
+        match queries::register_agent(
+            cx,
+            pool,
+            project_id,
+            name,
+            "codex-cli",
+            "gpt-5",
+            Some("resource-shape test"),
+            None,
+        )
+        .await
+        {
+            Outcome::Ok(agent) => agent,
+            other => panic!("register_agent({name}) failed: {other:?}"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_message(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        sender_id: i64,
+        recipient_id: i64,
+        subject: &str,
+        body_md: &str,
+        thread_id: &str,
+        ack_required: bool,
+    ) -> MessageRow {
+        match queries::create_message_with_recipients(
+            cx,
+            pool,
+            project_id,
+            sender_id,
+            subject,
+            body_md,
+            Some(thread_id),
+            "high",
+            ack_required,
+            "[]",
+            &[(recipient_id, "to")],
+        )
+        .await
+        {
+            Outcome::Ok(message) => message,
+            other => panic!("create_message_with_recipients failed: {other:?}"),
+        }
+    }
+
+    fn parse_json(payload: &str) -> Value {
+        serde_json::from_str(payload).expect("valid JSON")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn empty_dataset_resources_return_expected_shapes() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-empty-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "BlueOtter").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.human_key.clone();
+                let agent_name = agent.name.clone();
+
+                let config_value = parse_json(&config_environment(&ctx).expect("config env"));
+                assert!(config_value.is_object());
+                let config_query_value = parse_json(
+                    &config_environment_query(&ctx, "format=json".to_string())
+                        .expect("config env query"),
+                );
+                assert!(config_query_value.is_object());
+
+                let identity_value =
+                    parse_json(&identity_project(&ctx, project_ref.clone()).expect("identity"));
+                assert_eq!(identity_value["slug"], project.slug);
+                assert_eq!(identity_value["human_key"], project_ref);
+
+                let directory = parse_json(&tooling_directory(&ctx).expect("directory"));
+                let directory_query = parse_json(
+                    &tooling_directory_query(&ctx, "format=json".to_string())
+                        .expect("directory query"),
+                );
+                assert!(directory.is_object());
+                assert_eq!(directory, directory_query);
+
+                let schemas = parse_json(&tooling_schemas(&ctx).expect("schemas"));
+                let schemas_query = parse_json(
+                    &tooling_schemas_query(&ctx, "cluster=messaging".to_string())
+                        .expect("schemas query"),
+                );
+                assert!(schemas.is_object());
+                assert!(schemas_query.is_object());
+
+                assert!(parse_json(&tooling_metrics(&ctx).expect("tooling metrics")).is_object());
+                assert!(
+                    parse_json(
+                        &tooling_metrics_query(&ctx, "window=60".to_string())
+                            .expect("tooling metrics query")
+                    )
+                    .is_object()
+                );
+                assert!(
+                    parse_json(&tooling_metrics_core(&ctx).expect("tooling core metrics"))
+                        .is_object()
+                );
+                assert!(
+                    parse_json(
+                        &tooling_metrics_core_query(&ctx, "window=60".to_string())
+                            .expect("tooling core metrics query")
+                    )
+                    .is_object()
+                );
+                assert!(
+                    parse_json(&tooling_diagnostics(&ctx).expect("tooling diagnostics"))
+                        .is_object()
+                );
+                assert!(
+                    parse_json(
+                        &tooling_diagnostics_query(&ctx, "format=json".to_string())
+                            .expect("tooling diagnostics query")
+                    )
+                    .is_object()
+                );
+                assert!(parse_json(&tooling_locks(&ctx).expect("tooling locks")).is_object());
+                assert!(
+                    parse_json(
+                        &tooling_locks_query(&ctx, "format=json".to_string())
+                            .expect("tooling locks query")
+                    )
+                    .is_object()
+                );
+                assert!(
+                    parse_json(
+                        &tooling_capabilities(&ctx, agent_name.clone())
+                            .expect("tooling capabilities")
+                    )
+                    .is_object()
+                );
+                assert!(
+                    parse_json(&tooling_recent(&ctx, "3600".to_string()).expect("tooling recent"))
+                        .is_object()
+                );
+
+                let projects = parse_json(&projects_list(&ctx).await.expect("projects list"));
+                let projects_array = projects.as_array().expect("projects array");
+                assert!(
+                    projects_array
+                        .iter()
+                        .any(|entry| entry["slug"] == project.slug),
+                    "projects list should include seeded project"
+                );
+                let projects_query = parse_json(
+                    &projects_list_query(&ctx, "format=json".to_string())
+                        .await
+                        .expect("projects list query"),
+                );
+                assert_eq!(projects, projects_query);
+                assert!(
+                    parse_json(
+                        &project_details(&ctx, project.slug.clone())
+                            .await
+                            .expect("project details")
+                    )
+                    .is_object()
+                );
+
+                let agents = parse_json(
+                    &agents_list(&ctx, project.human_key.clone())
+                        .await
+                        .expect("agents list"),
+                );
+                assert_eq!(agents["project"]["slug"], project.slug);
+                assert_eq!(agents["agents"].as_array().map_or(0, Vec::len), 1);
+
+                let inbox_payload = inbox(&ctx, format!("{agent_name}?project={project_ref}"))
+                    .await
+                    .expect("inbox");
+                let inbox_value = parse_json(&inbox_payload);
+                assert_eq!(inbox_value["count"], 0);
+                assert_eq!(inbox_value["messages"].as_array().map_or(0, Vec::len), 0);
+
+                let mailbox_payload = mailbox(&ctx, format!("{agent_name}?project={project_ref}"))
+                    .await
+                    .expect("mailbox");
+                let mailbox_value = parse_json(&mailbox_payload);
+                assert_eq!(mailbox_value["count"], 0);
+
+                let mailbox_commits_payload =
+                    mailbox_with_commits(&ctx, format!("{agent_name}?project={project_ref}"))
+                        .await
+                        .expect("mailbox with commits");
+                let mailbox_commits_value = parse_json(&mailbox_commits_payload);
+                assert_eq!(mailbox_commits_value["count"], 0);
+
+                let outbox_payload = outbox(&ctx, format!("{agent_name}?project={project_ref}"))
+                    .await
+                    .expect("outbox");
+                let outbox_value = parse_json(&outbox_payload);
+                assert_eq!(outbox_value["count"], 0);
+
+                let urgent_payload =
+                    views_urgent_unread(&ctx, format!("{agent_name}?project={project_ref}"))
+                        .await
+                        .expect("urgent view");
+                let urgent_value = parse_json(&urgent_payload);
+                assert_eq!(urgent_value["count"], 0);
+
+                let ack_required_payload =
+                    views_ack_required(&ctx, format!("{agent_name}?project={project_ref}"))
+                        .await
+                        .expect("ack required view");
+                let ack_required_value = parse_json(&ack_required_payload);
+                assert_eq!(ack_required_value["count"], 0);
+
+                let stale_payload =
+                    views_acks_stale(&ctx, format!("{agent_name}?project={project_ref}"))
+                        .await
+                        .expect("acks stale view");
+                let stale_value = parse_json(&stale_payload);
+                assert_eq!(stale_value["count"], 0);
+
+                let overdue_payload =
+                    views_ack_overdue(&ctx, format!("{agent_name}?project={project_ref}"))
+                        .await
+                        .expect("ack overdue view");
+                let overdue_value = parse_json(&overdue_payload);
+                assert_eq!(overdue_value["count"], 0);
+
+                let reservations = parse_json(
+                    &file_reservations(&ctx, project.slug.clone())
+                        .await
+                        .expect("file reservations"),
+                );
+                assert_eq!(reservations.as_array().map_or(0, Vec::len), 0);
+            });
+        });
+    }
+
+    #[test]
+    fn populated_dataset_message_mailbox_and_views_are_non_empty() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-populated-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "SilverFox").await;
+                let recipient = register_agent(&cx, &pool, project_id, "GoldenLynx").await;
+                let thread_id = format!("thread-{}", unique_suffix());
+                let message = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    "Integration Subject",
+                    "Hello from integration test.",
+                    &thread_id,
+                    true,
+                )
+                .await;
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.human_key.clone();
+
+                let inbox_payload = inbox(
+                    &ctx,
+                    format!(
+                        "{}?project={}&include_bodies=true",
+                        recipient.name, project_ref
+                    ),
+                )
+                .await
+                .expect("inbox");
+                let inbox_value = parse_json(&inbox_payload);
+                assert_eq!(inbox_value["count"], 1);
+                assert_eq!(inbox_value["messages"][0]["subject"], "Integration Subject");
+                assert_eq!(
+                    inbox_value["messages"][0]["body_md"],
+                    "Hello from integration test."
+                );
+
+                let mailbox_payload =
+                    mailbox(&ctx, format!("{}?project={}", recipient.name, project_ref))
+                        .await
+                        .expect("mailbox");
+                let mailbox_value = parse_json(&mailbox_payload);
+                assert_eq!(mailbox_value["count"], 1);
+
+                let outbox_payload =
+                    outbox(&ctx, format!("{}?project={}", sender.name, project_ref))
+                        .await
+                        .expect("outbox");
+                let outbox_value = parse_json(&outbox_payload);
+                assert_eq!(outbox_value["count"], 1);
+                assert_eq!(
+                    outbox_value["messages"][0]["subject"],
+                    "Integration Subject"
+                );
+
+                let ack_required_payload =
+                    views_ack_required(&ctx, format!("{}?project={}", recipient.name, project_ref))
+                        .await
+                        .expect("ack-required view");
+                let ack_required_value = parse_json(&ack_required_payload);
+                assert_eq!(ack_required_value["count"], 1);
+
+                let msg_id = message.id.unwrap_or(0);
+                let message_details_payload =
+                    message_details(&ctx, format!("{msg_id}?project={project_ref}"))
+                        .await
+                        .expect("message details");
+                let message_details_value = parse_json(&message_details_payload);
+                assert_eq!(message_details_value["subject"], "Integration Subject");
+                assert_eq!(message_details_value["from"], sender.name);
+
+                let thread_payload = thread_details(
+                    &ctx,
+                    format!("{thread_id}?project={project_ref}&include_bodies=true"),
+                )
+                .await
+                .expect("thread details");
+                let thread_value = parse_json(&thread_payload);
+                assert_eq!(thread_value["messages"].as_array().map_or(0, Vec::len), 1);
+                assert_eq!(
+                    thread_value["messages"][0]["body_md"],
+                    "Hello from integration test."
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn thread_details_respects_include_bodies_toggle() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-thread-toggle-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "GrayPine").await;
+                let recipient = register_agent(&cx, &pool, project_id, "MistyPeak").await;
+                let thread_id = format!("thread-toggle-{}", unique_suffix());
+                let _ = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    "Thread Toggle Subject",
+                    "Thread toggle body text",
+                    &thread_id,
+                    false,
+                )
+                .await;
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.human_key;
+
+                let without_bodies =
+                    thread_details(&ctx, format!("{thread_id}?project={project_ref}"))
+                        .await
+                        .expect("thread without bodies");
+                let without_bodies_value = parse_json(&without_bodies);
+                assert!(without_bodies_value["messages"][0]["body_md"].is_null());
+
+                let with_bodies = thread_details(
+                    &ctx,
+                    format!("{thread_id}?project={project_ref}&include_bodies=true"),
+                )
+                .await
+                .expect("thread with bodies");
+                let with_bodies_value = parse_json(&with_bodies);
+                assert_eq!(
+                    with_bodies_value["messages"][0]["body_md"],
+                    "Thread toggle body text"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn file_reservations_active_only_filters_released_rows() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-reservations-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let agent_id = agent.id.unwrap_or(0);
+
+                let active_rows = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/**", "docs/**"],
+                    3600,
+                    true,
+                    "resource-shape test",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create active reservations failed: {other:?}"),
+                };
+
+                let released_path = active_rows
+                    .iter()
+                    .find(|row| row.path_pattern == "docs/**")
+                    .map(|row| row.path_pattern.as_str())
+                    .expect("docs reservation path");
+                match queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    Some(&[released_path]),
+                    None,
+                )
+                .await
+                {
+                    Outcome::Ok(affected) => assert_eq!(affected, 1),
+                    other => panic!("release_reservations failed: {other:?}"),
+                }
+
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                let active_only_payload = file_reservations(&ctx, project.slug.clone())
+                    .await
+                    .expect("file reservations active_only");
+                let active_only = parse_json(&active_only_payload);
+                let active_paths = active_only
+                    .as_array()
+                    .expect("active reservations array")
+                    .iter()
+                    .map(|row| row["path_pattern"].as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>();
+                assert!(
+                    active_paths.iter().all(|path| path == "src/**"),
+                    "active-only view should only contain src/** entries"
+                );
+                assert!(
+                    active_paths.iter().any(|path| path == "src/**"),
+                    "active-only view should contain src/**"
+                );
+
+                let include_all_payload =
+                    file_reservations(&ctx, format!("{}?active_only=false", project.slug))
+                        .await
+                        .expect("file reservations include all");
+                let include_all = parse_json(&include_all_payload);
+                let all_paths = include_all
+                    .as_array()
+                    .expect("all reservations array")
+                    .iter()
+                    .map(|row| row["path_pattern"].as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>();
+                assert!(
+                    all_paths.iter().any(|path| path == "src/**"),
+                    "active reservation should be present"
+                );
+                assert!(
+                    all_paths.iter().any(|path| path == "docs/**"),
+                    "released reservation should be present when active_only=false"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn tooling_query_variants_preserve_response_shape() {
+        with_serialized_resources(|| {
+            let ctx = McpContext::new(Cx::for_testing(), 1);
+            let directory = parse_json(&tooling_directory(&ctx).expect("directory"));
+            let directory_query = parse_json(
+                &tooling_directory_query(&ctx, "format=json".to_string()).expect("directory query"),
+            );
+            assert_eq!(directory, directory_query);
+
+            let schemas = parse_json(&tooling_schemas(&ctx).expect("schemas"));
+            let schemas_query = parse_json(
+                &tooling_schemas_query(&ctx, "cluster=search".to_string()).expect("schemas query"),
+            );
+            assert!(schemas.is_object());
+            assert!(schemas_query.is_object());
+            assert_eq!(
+                schemas["schemas"].is_array(),
+                schemas_query["schemas"].is_array()
+            );
+        });
+    }
+}
+
+#[cfg(test)]
 mod query_param_tests {
     use super::*;
     use std::fs;
