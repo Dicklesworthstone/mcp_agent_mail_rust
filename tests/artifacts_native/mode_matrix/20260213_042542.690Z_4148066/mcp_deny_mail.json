@@ -1,0 +1,12 @@
+{
+  "binary": "mcp-agent-mail",
+  "command": "mail",
+  "args": [
+    "mail"
+  ],
+  "expected_decision": "deny",
+  "actual_exit_code": 2,
+  "stdout_digest": "",
+  "stderr_digest": "Error: \"mail\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am mail\nOr enable CLI mode: AM_INTERFACE_MODE=cli mcp... (221 bytes)",
+  "passed": true
+}

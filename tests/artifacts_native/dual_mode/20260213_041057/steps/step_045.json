@@ -1,0 +1,13 @@
+{
+  "step_id": "045",
+  "timestamp": "2026-02-13T04:10:58.124999171+00:00",
+  "binary": "mcp-agent-mail",
+  "command": "share",
+  "mode": "mcp",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "deny_contract",
+  "actual_exit_code": 2,
+  "stdout_excerpt": "",
+  "stderr_excerpt": "Error: \"share\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am share\nOr enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail share ...\n",
+  "passed": true
+}

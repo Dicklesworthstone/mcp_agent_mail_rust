@@ -1,0 +1,12 @@
+{
+  "binary": "mcp-agent-mail",
+  "command": "guard",
+  "args": [
+    "guard"
+  ],
+  "expected_decision": "deny",
+  "actual_exit_code": 2,
+  "stdout_digest": "",
+  "stderr_digest": "Error: \"guard\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am guard\nOr enable CLI mode: AM_INTERFACE_MODE=cli m... (224 bytes)",
+  "passed": true
+}

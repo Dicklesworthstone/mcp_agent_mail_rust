@@ -1,0 +1,15 @@
+[0;90m[e2e][0m Artifacts: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451
+[0;90m[e2e][0m Starting server (run1): 127.0.0.1:22745
+[0;90m[e2e][0m   log: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451/server_run1.log
+[0;90m[e2e][0m Starting server (run2): 127.0.0.1:5707
+[0;90m[e2e][0m   log: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451/server_run2.log
+[0;90m[e2e][0m Starting server (run3_full): 127.0.0.1:54845
+[0;90m[e2e][0m   log: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451/server_run3_full.log
+[0;90m[e2e][0m Starting server (run3_minimal): 127.0.0.1:30927
+[0;90m[e2e][0m   log: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451/server_run3_minimal.log
+[0;90m[e2e][0m Starting server (run3_custom): 127.0.0.1:31387
+[0;90m[e2e][0m   log: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451/server_run3_custom.log
+[0;90m[e2e][0m Starting server (run4): 127.0.0.1:29389
+[0;90m[e2e][0m   log: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451/server_run4.log
+[0;90m[e2e][0m Starting server (run5): 127.0.0.1:56859
+[0;90m[e2e][0m   log: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451/server_run5.log

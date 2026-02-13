@@ -1,0 +1,16 @@
+  am: Starting MCP Agent Mail server
+  ├─ interface_mode: mcp (default)
+  ├─ host:    127.0.0.1 (cli)
+  ├─ port:    29389 (cli)
+  ├─ path:    /mcp/ (default)
+  ├─ auth:    none (default)
+  ├─ db:      sqlite://///data/tmp/e2e_http_run4.rMgCH5/db.sqlite3 (env)
+  ├─ storage: /data/tmp/e2e_http_run4.rMgCH5/storage_root (env)
+  └─ mode:    HTTP (headless)
+
+2026-02-13T06:34:58.001104Z  INFO mcp_agent_mail_server::disk_monitor: disk monitor worker started interval_secs=60
+2026-02-13T06:35:00.322808Z  WARN mcp_agent_mail_search_core::model2vec: No fast embedder model available
+2026-02-13T06:35:01.369020Z  INFO mcp_agent_mail_search_core::fastembed: FastEmbed model loaded model="all-MiniLM-L6-v2" dimension=384
+2026-02-13T06:35:01.369178Z  INFO mcp_agent_mail_search_core::fastembed: Quality embedder auto-initialized model="all-MiniLM-L6-v2"
+2026-02-13T06:35:01.369301Z  INFO mcp_agent_mail_search_core::auto_init: Two-tier search context initialized availability=quality-only fast=None quality=Some("all-MiniLM-L6-v2")
+2026-02-13T06:35:01.436089Z  INFO mcp_agent_mail_server: tool_query_stats tool="ensure_project" project="data-tmp-e2e-http-run4-rmgch5-proj" agent="" queries=4 query_time_ms=61.99 per_table=Object {"projects": Number(3)} slow_query_ms=0.0

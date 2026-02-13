@@ -1,0 +1,19 @@
+  am: Starting MCP Agent Mail server
+  ├─ interface_mode: mcp (default)
+  ├─ host:    127.0.0.1 (cli)
+  ├─ port:    56859 (cli)
+  ├─ path:    /mcp/ (default)
+  ├─ auth:    none (default)
+  ├─ db:      sqlite://///data/tmp/e2e_http_run5.tczu8N/db.sqlite3 (env)
+  ├─ storage: /data/tmp/e2e_http_run5.tczu8N/storage_root (env)
+  └─ mode:    HTTP (headless)
+
+2026-02-13T06:35:01.795315Z  INFO mcp_agent_mail_server::disk_monitor: disk monitor worker started interval_secs=60
+2026-02-13T06:35:01.795395Z  INFO mcp_agent_mail_server::ack_ttl: ACK TTL scan worker started interval_secs=5 ttl_seconds=0 escalation_enabled=true escalation_mode=file_reservation
+2026-02-13T06:35:03.604165Z  WARN mcp_agent_mail_search_core::model2vec: No fast embedder model available
+2026-02-13T06:35:03.926765Z  INFO mcp_agent_mail_search_core::fastembed: FastEmbed model loaded model="all-MiniLM-L6-v2" dimension=384
+2026-02-13T06:35:03.926799Z  INFO mcp_agent_mail_search_core::fastembed: Quality embedder auto-initialized model="all-MiniLM-L6-v2"
+2026-02-13T06:35:03.926806Z  INFO mcp_agent_mail_search_core::auto_init: Two-tier search context initialized availability=quality-only fast=None quality=Some("all-MiniLM-L6-v2")
+2026-02-13T06:35:08.581611Z  WARN mcp_agent_mail_server::ack_ttl: ACK overdue event="ack_overdue" message_id=1 project_id=1 agent_id=2 age_s=3 ttl_s=0
+2026-02-13T06:35:08.637746Z  INFO mcp_agent_mail_server::ack_ttl: ACK escalation: created file reservation event="ack_escalation" message_id=1 project_id=1 holder_agent_id=3 pattern=agents/GreenCastle/inbox/2026/02/*.md reservations_created=1
+2026-02-13T06:35:08.637877Z  INFO mcp_agent_mail_server::ack_ttl: ACK TTL scan completed event="ack_ttl_scan" scanned=1 overdue=1

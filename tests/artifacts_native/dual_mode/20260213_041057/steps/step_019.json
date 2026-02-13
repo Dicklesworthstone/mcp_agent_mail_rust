@@ -1,0 +1,13 @@
+{
+  "step_id": "019",
+  "timestamp": "2026-02-13T04:10:57.924531495+00:00",
+  "binary": "am",
+  "command": "tooling --help",
+  "mode": "cli",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "Usage: am tooling <COMMAND>\n\nCommands:\n  directory     List all available MCP tools with cluster and capability metadata\n  schemas       Show tool schemas and parameter definitions\n  metrics       Show tool call counts and error rates\n  metrics-core  Show core system metrics (HTTP/DB/Storage/Locks)\n  diagnostics   Show comprehensive diagnostic report with health metrics and recommendations\n  locks         Show active archive locks\n  help          Print this message or the help of the given subco...",
+  "stderr_excerpt": "",
+  "passed": true
+}

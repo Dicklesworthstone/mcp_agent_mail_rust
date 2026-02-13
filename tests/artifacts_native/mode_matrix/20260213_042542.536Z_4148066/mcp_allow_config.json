@@ -1,0 +1,12 @@
+{
+  "binary": "mcp-agent-mail",
+  "command": "config",
+  "args": [
+    "config"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Config {\n    app_environment: Development,\n    database_url: \"sqlite:////data/tmp/mode_matrix_test/test.sqlite3\",\n    http_host: \"127.0.0.1\",\n    http_port: 1,\n    http_path: \"/mcp/\",\n    http_bearer_... (372 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

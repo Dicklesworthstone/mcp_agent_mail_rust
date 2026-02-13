@@ -1,0 +1,13 @@
+{
+  "step_id": "041",
+  "timestamp": "2026-02-13T04:10:58.109908828+00:00",
+  "binary": "mcp-agent-mail",
+  "command": "--help",
+  "mode": "mcp",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "MCP Agent Mail server (HTTP/MCP runtime + TUI)\n\nUsage: mcp-agent-mail [OPTIONS] [COMMAND]\n\nCommands:\n  serve   Start the MCP server (default)\n  config  Show configuration\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -v, --verbose  Enable verbose logging\n  -h, --help     Print help\n  -V, --version  Print version\n\nOperator CLI commands live in `am`:\n  am --help\n\nOr enable the CLI surface on this same binary:\n  AM_INTERFACE_MODE=cli mcp-agent-mail --help\n",
+  "stderr_excerpt": "",
+  "passed": true
+}

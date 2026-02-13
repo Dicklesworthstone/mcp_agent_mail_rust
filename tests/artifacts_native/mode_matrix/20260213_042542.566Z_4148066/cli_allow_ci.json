@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "ci --help",
+  "args": [
+    "ci",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Run CI quality gates (format, lint, build, test)\n\nUsage: am ci [OPTIONS]\n\nOptions:\n  -q, --quick            Quick mode: skip long-running E2E gates\n  -r, --report <REPORT>  Write JSON report to this p... (469 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

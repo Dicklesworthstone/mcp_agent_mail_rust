@@ -1,0 +1,13 @@
+{
+  "step_id": "003",
+  "timestamp": "2026-02-13T04:10:57.786118043+00:00",
+  "binary": "am",
+  "command": "share --help",
+  "mode": "cli",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "Usage: am share <COMMAND>\n\nCommands:\n  export         \n  update         \n  preview        \n  verify         \n  decrypt        \n  wizard         \n  static-export  \n  deploy         \n  help           Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n",
+  "stderr_excerpt": "",
+  "passed": true
+}

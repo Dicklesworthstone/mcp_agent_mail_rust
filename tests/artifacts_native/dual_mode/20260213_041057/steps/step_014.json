@@ -1,0 +1,13 @@
+{
+  "step_id": "014",
+  "timestamp": "2026-02-13T04:10:57.883188344+00:00",
+  "binary": "am",
+  "command": "mail --help",
+  "mode": "cli",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "Usage: am mail <COMMAND>\n\nCommands:\n  status            \n  send              Send a message to one or more agents\n  reply             Reply to an existing message\n  inbox             Fetch inbox messages for an agent\n  read              Mark a message as read\n  ack               Acknowledge a message (also marks as read)\n  search            Full-text search over messages\n  summarize-thread  Summarize a thread (requires LLM API key)\n  help              Print this message or the help of the given ...",
+  "stderr_excerpt": "",
+  "passed": true
+}

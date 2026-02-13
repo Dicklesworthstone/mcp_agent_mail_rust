@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "suite": "tui_a11y",
+  "timestamp": "20260213_054145",
+  "generated_at": "2026-02-13T05:44:07Z",
+  "status": "pass",
+  "exit_code": 0,
+  "artifact_dir": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145",
+  "summary_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/summary.json",
+  "bundle_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/bundle.json",
+  "trace_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/trace/events.jsonl"
+}

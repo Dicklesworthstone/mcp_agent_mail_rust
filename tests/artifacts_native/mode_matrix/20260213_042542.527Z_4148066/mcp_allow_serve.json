@@ -1,0 +1,13 @@
+{
+  "binary": "mcp-agent-mail",
+  "command": "serve --help",
+  "args": [
+    "serve",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Start the MCP server (default)\n\nUsage: mcp-agent-mail serve [OPTIONS]\n\nOptions:\n      --host <HOST>\n          Host to bind to\n\n      --port <PORT>\n          Port to bind to\n\n      --path <PATH>\n      ... (1110 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

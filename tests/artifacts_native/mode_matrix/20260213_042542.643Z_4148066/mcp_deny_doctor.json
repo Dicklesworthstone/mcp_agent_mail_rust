@@ -1,0 +1,12 @@
+{
+  "binary": "mcp-agent-mail",
+  "command": "doctor",
+  "args": [
+    "doctor"
+  ],
+  "expected_decision": "deny",
+  "actual_exit_code": 2,
+  "stdout_digest": "",
+  "stderr_digest": "Error: \"doctor\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am doctor\nOr enable CLI mode: AM_INTERFACE_MODE=cli... (227 bytes)",
+  "passed": true
+}

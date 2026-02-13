@@ -1,0 +1,11 @@
+  am: Starting MCP Agent Mail server
+  ├─ interface_mode: mcp (default)
+  ├─ host:    127.0.0.1 (cli)
+  ├─ port:    22745 (cli)
+  ├─ path:    /mcp/ (default)
+  ├─ auth:    Bearer ****oken (env)
+  ├─ db:      sqlite://///data/tmp/e2e_http_run1.UmAt7r/db.sqlite3 (env)
+  ├─ storage: /data/tmp/e2e_http_run1.UmAt7r/storage_root (env)
+  └─ mode:    HTTP (headless)
+
+2026-02-13T06:34:52.009086Z  INFO mcp_agent_mail_server::disk_monitor: disk monitor worker started interval_secs=60

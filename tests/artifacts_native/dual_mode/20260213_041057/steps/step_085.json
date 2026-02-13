@@ -1,0 +1,13 @@
+{
+  "step_id": "085",
+  "timestamp": "2026-02-13T04:10:58.344260570+00:00",
+  "binary": "am",
+  "command": "am tooling directory --json",
+  "mode": "cli-functional",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "{\n  \"tool_count\": 34,\n  \"clusters\": {\n    \"build_slots\": [\n      \"acquire_build_slot\",\n      \"renew_build_slot\",\n      \"release_build_slot\"\n    ],\n    \"contact\": [\n      \"request_contact\",\n      \"respond_contact\",\n      \"list_contacts\",\n      \"set_contact_policy\"\n    ],\n    \"file_reservations\": [\n      \"file_reservation_paths\",\n      \"release_file_reservations\",\n      \"renew_file_reservations\",\n      \"force_release_file_reservation\"\n    ],\n    \"identity\": [\n      \"register_agent\",\n      \"create_...",
+  "stderr_excerpt": "",
+  "passed": true
+}

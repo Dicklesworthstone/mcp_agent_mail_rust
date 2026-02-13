@@ -1,0 +1,13 @@
+{
+  "step_id": "040",
+  "timestamp": "2026-02-13T04:10:58.102133240+00:00",
+  "binary": "mcp-agent-mail",
+  "command": "config",
+  "mode": "mcp",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "Config {\n    app_environment: Development,\n    database_url: \"sqlite:////data/tmp/.tmpvIfMnN/test.sqlite3\",\n    http_host: \"127.0.0.1\",\n    http_port: 1,\n    http_path: \"/mcp/\",\n    http_bearer_token: Some(\n        \"[REDACTED]\",\n    ),\n    http_jwt_secret: None,\n    storage_root: \"/data/tmp/.tmpvIfMnN/storage\",\n    log_level: \"INFO\",\n    tui_enabled: true,\n    ..\n}\n",
+  "stderr_excerpt": "",
+  "passed": true
+}

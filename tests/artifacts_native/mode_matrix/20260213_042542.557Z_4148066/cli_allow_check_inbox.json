@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "check-inbox --help",
+  "args": [
+    "check-inbox",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Check agent inbox for unread messages (for git hooks and editor integrations)\n\nUsage: am check-inbox [OPTIONS]\n\nOptions:\n      --agent <AGENT>            Agent name to check inbox for (default: AGENT_... (1067 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

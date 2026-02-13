@@ -1,0 +1,13 @@
+{
+  "step_id": "029",
+  "timestamp": "2026-02-13T04:10:58.010757418+00:00",
+  "binary": "mcp-agent-mail",
+  "command": "clear-and-reset-everything",
+  "mode": "mcp",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "deny",
+  "actual_exit_code": 2,
+  "stdout_excerpt": "",
+  "stderr_excerpt": "Error: \"clear-and-reset-everything\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am clear-and-reset-everything\nOr enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail clear-and-reset-everything ...\n",
+  "passed": true
+}

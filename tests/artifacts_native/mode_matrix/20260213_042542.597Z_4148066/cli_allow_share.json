@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "share --help",
+  "args": [
+    "share",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Usage: am share <COMMAND>\n\nCommands:\n  export         \n  update         \n  preview        \n  verify         \n  decrypt        \n  wizard         \n  static-export  \n  deploy         \n  help           Pr... (291 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

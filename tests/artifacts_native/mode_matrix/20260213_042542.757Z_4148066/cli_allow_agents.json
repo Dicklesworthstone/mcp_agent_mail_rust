@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "agents --help",
+  "args": [
+    "agents",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Usage: am agents <COMMAND>\n\nCommands:\n  register  Register or update an agent identity in a project (idempotent)\n  create    Create a new, unique agent identity (never updates existing)\n  list      Li... (443 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

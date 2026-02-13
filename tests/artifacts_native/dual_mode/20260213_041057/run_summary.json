@@ -1,0 +1,10 @@
+{
+  "suite": "dual_mode",
+  "runner": "native",
+  "total_steps": 87,
+  "step_failures": 0,
+  "e2e_pass": 87,
+  "e2e_fail": 0,
+  "e2e_skip": 0,
+  "generated_at": "2026-02-13T04:10:58.364113276+00:00"
+}

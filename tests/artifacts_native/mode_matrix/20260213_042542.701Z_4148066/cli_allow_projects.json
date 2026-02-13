@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "projects --help",
+  "args": [
+    "projects",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Usage: am projects <COMMAND>\n\nCommands:\n  mark-identity   \n  discovery-init  \n  adopt           \n  help            Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Pri... (208 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

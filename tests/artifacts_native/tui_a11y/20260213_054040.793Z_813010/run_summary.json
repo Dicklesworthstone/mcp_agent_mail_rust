@@ -1,0 +1,182 @@
+{
+  "suite": "tui_a11y",
+  "runner": "native_hybrid",
+  "generated_at": "2026-02-13T05:44:07.332833507+00:00",
+  "duration_ms": 206539,
+  "passed": true,
+  "require_no_skip": true,
+  "steps": [
+    {
+      "step": 1,
+      "name": "contrast_native",
+      "command": "cargo test -p mcp-agent-mail-server theme_palettes_meet_min_contrast_thresholds -- --nocapture",
+      "cwd": "/data/projects/mcp_agent_mail_rust",
+      "timeout_ms": 300000,
+      "duration_ms": 64914,
+      "exit_code": 0,
+      "timed_out": false,
+      "passed": true,
+      "stdout_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/tui_a11y/20260213_054040.793Z_813010/steps/step_001_contrast_native.stdout.log",
+      "stderr_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/tui_a11y/20260213_054040.793Z_813010/steps/step_001_contrast_native.stderr.log",
+      "checks": [
+        {
+          "scenario_id": "contrast.exit_code",
+          "expected": "exit_code == 0",
+          "actual": "exit_code=Some(0)",
+          "passed": true,
+          "debug_hint": "Re-run the contrast test directly and inspect theme-level failures."
+        },
+        {
+          "scenario_id": "contrast.output_contains_theme",
+          "expected": "output contains `theme=` lines",
+          "actual": "contains theme=",
+          "passed": true,
+          "debug_hint": "Run with --nocapture and verify contrast reporting is emitted."
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "name": "shell_adapter",
+      "command": "bash scripts/e2e_tui_a11y.sh (AM_TUI_A11Y_SKIP_CONTRAST=1, AM_TUI_A11Y_ADAPTER_OUTPUT=<path>)",
+      "cwd": "/data/projects/mcp_agent_mail_rust",
+      "timeout_ms": 900000,
+      "duration_ms": 141623,
+      "exit_code": 0,
+      "timed_out": false,
+      "passed": true,
+      "stdout_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/tui_a11y/20260213_054040.793Z_813010/steps/step_002_shell_adapter.stdout.log",
+      "stderr_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/tui_a11y/20260213_054040.793Z_813010/steps/step_002_shell_adapter.stderr.log",
+      "checks": [
+        {
+          "scenario_id": "adapter.exit_code",
+          "expected": "adapter exit_code == 0",
+          "actual": "exit_code=Some(0)",
+          "passed": true,
+          "debug_hint": "Open step_002 logs to identify failing case in scripts/e2e_tui_a11y.sh."
+        },
+        {
+          "scenario_id": "adapter.manifest_exists",
+          "expected": "adapter_result.json exists",
+          "actual": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/tui_a11y/20260213_054040.793Z_813010/adapter_result.json",
+          "passed": true,
+          "debug_hint": "Verify AM_TUI_A11Y_ADAPTER_OUTPUT is set and writable."
+        },
+        {
+          "scenario_id": "adapter.suite_name",
+          "expected": "adapter suite == tui_a11y",
+          "actual": "suite=tui_a11y",
+          "passed": true,
+          "debug_hint": "Ensure scripts/e2e_tui_a11y.sh writes suite metadata from E2E_SUITE."
+        },
+        {
+          "scenario_id": "adapter.status",
+          "expected": "adapter status == pass",
+          "actual": "status=pass",
+          "passed": true,
+          "debug_hint": "Inspect summary.json + trace/events.jsonl in adapter artifact dir."
+        },
+        {
+          "scenario_id": "adapter.exit_code_field",
+          "expected": "adapter exit_code field == 0",
+          "actual": "exit_code=0",
+          "passed": true,
+          "debug_hint": "Adapter metadata must mirror the actual script exit code."
+        },
+        {
+          "scenario_id": "adapter.summary_exists",
+          "expected": "summary_path points to existing file",
+          "actual": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/summary.json",
+          "passed": true,
+          "debug_hint": "summary.json should always be emitted by e2e_summary."
+        },
+        {
+          "scenario_id": "adapter.bundle_exists",
+          "expected": "bundle_path points to existing file",
+          "actual": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/bundle.json",
+          "passed": true,
+          "debug_hint": "bundle.json is required for forensic artifact contract."
+        },
+        {
+          "scenario_id": "adapter.trace_exists",
+          "expected": "trace_path points to existing file",
+          "actual": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/trace/events.jsonl",
+          "passed": true,
+          "debug_hint": "trace/events.jsonl is required for step-by-step command traceability."
+        },
+        {
+          "scenario_id": "adapter.summary_fail_zero",
+          "expected": "summary.fail == 0",
+          "actual": "fail=0",
+          "passed": true,
+          "debug_hint": "Open trace/events.jsonl and case artifacts to find first failing assertion."
+        },
+        {
+          "scenario_id": "adapter.summary_pass_positive",
+          "expected": "summary.pass >= 1",
+          "actual": "pass=10",
+          "passed": true,
+          "debug_hint": "A fully skipped suite should not satisfy migration evidence requirements."
+        },
+        {
+          "scenario_id": "adapter.summary_skip_zero",
+          "expected": "summary.skip <= 1 (contrast delegation only)",
+          "actual": "skip=1",
+          "passed": true,
+          "debug_hint": "Only contrast delegation may be skipped; all interactive a11y cases must run."
+        },
+        {
+          "scenario_id": "adapter.summary_total_minimum",
+          "expected": "summary.total >= 4 (all a11y cases executed)",
+          "actual": "total=4",
+          "passed": true,
+          "debug_hint": "Ensure keyboard and key-hint scenarios are not bypassed."
+        },
+        {
+          "scenario_id": "adapter.artifact.trace/core_focus_trace.jsonl",
+          "expected": "required adapter artifact exists",
+          "actual": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/trace/core_focus_trace.jsonl",
+          "passed": true,
+          "debug_hint": "Confirm the expect flow completed and raw PTY logs were rendered."
+        },
+        {
+          "scenario_id": "adapter.artifact.core_screens.rendered.txt",
+          "expected": "required adapter artifact exists",
+          "actual": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/core_screens.rendered.txt",
+          "passed": true,
+          "debug_hint": "Confirm the expect flow completed and raw PTY logs were rendered."
+        },
+        {
+          "scenario_id": "adapter.artifact.key_hints_default.rendered.txt",
+          "expected": "required adapter artifact exists",
+          "actual": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/key_hints_default.rendered.txt",
+          "passed": true,
+          "debug_hint": "Confirm the expect flow completed and raw PTY logs were rendered."
+        },
+        {
+          "scenario_id": "adapter.artifact.key_hints.rendered.txt",
+          "expected": "required adapter artifact exists",
+          "actual": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/key_hints.rendered.txt",
+          "passed": true,
+          "debug_hint": "Confirm the expect flow completed and raw PTY logs were rendered."
+        }
+      ]
+    }
+  ],
+  "failures": [],
+  "environment": {
+    "repo_root": "/data/projects/mcp_agent_mail_rust",
+    "artifact_root": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/tui_a11y/20260213_054040.793Z_813010",
+    "strict_skip_enforcement": true,
+    "adapter": {
+      "suite": "tui_a11y",
+      "timestamp": "20260213_054145",
+      "status": "pass",
+      "exit_code": 0,
+      "artifact_dir": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145",
+      "summary_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/summary.json",
+      "bundle_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/bundle.json",
+      "trace_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts/tui_a11y/20260213_054145/trace/events.jsonl"
+    }
+  }
+}

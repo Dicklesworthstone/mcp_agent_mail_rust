@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "suite": "http",
+  "timestamp": "20260213_063451",
+  "files": [
+    {"path": "server_run1.log", "bytes": 510, "sha256": "4e02db85148845b9fccf15f9e59f596a5a759aa69f1ff3c3feec69f7d997f353"}
+    ,
+    {"path": "server_run2.log", "bytes": 1139, "sha256": "00d8d1b0a249630361487c54457c1a3d523296793b9162b62fbbc5058519c63f"}
+    ,
+    {"path": "server_run3_custom.log", "bytes": 505, "sha256": "b8eb6231bed721421737d72bc736eb6219d0966a7cb6cb693d0071c0e1cec6e5"}
+    ,
+    {"path": "server_run3_full.log", "bytes": 505, "sha256": "8e70ee5259cd1b9cb01b61bab44341d80c8f9d40b067a112eff5aca0ee18dfa8"}
+    ,
+    {"path": "server_run3_minimal.log", "bytes": 505, "sha256": "b971cd0e95614ddca712e69a0942482e73a7b0e5c3657f7354f91bbe38854411"}
+    ,
+    {"path": "server_run4.log", "bytes": 1293, "sha256": "405e570f49fdbd3a6ec45157e33d44eba8c9068e619dbd8472da43b6ddb1867a"}
+    ,
+    {"path": "server_run5.log", "bytes": 1759, "sha256": "81ed48827af8ebabbd7bd5baa537fed83e11209d4867f3b2575314c054963c7a"}
+  ]
+}

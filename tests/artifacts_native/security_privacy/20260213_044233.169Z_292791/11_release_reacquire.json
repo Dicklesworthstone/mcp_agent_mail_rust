@@ -1,0 +1,48 @@
+{
+  "case": "11_release_reacquire",
+  "exit_code": 0,
+  "stdout": "{\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{},\"resources\":{},\"logging\":{}},\"serverInfo\":{\"name\":\"mcp-agent-mail\",\"version\":\"0.1.0\"}},\"id\":1}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"released\\\":1,\\\"released_at\\\":\\\"2026-02-13T04:42:37.732602Z\\\"}\"}]},\"id\":1100}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"granted\\\":[{\\\"id\\\":2,\\\"path_pattern\\\":\\\"src/critical.rs\\\",\\\"exclusive\\\":true,\\\"reason\\\":\\\"RedFox released\\\",\\\"expires_ts\\\":\\\"2026-02-13T05:42:37.733301Z\\\"}],\\\"conflicts\\\":[]}\"}]},\"id\":1101}\n",
+  "stderr": "FastMCP Server: mcp-agent-mail v0.1.0\n  Tools: 34\n  Resources: 8\n  Prompts: 0\n  Transport: stdio\nServer ready.\n",
+  "responses": [
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+          "tools": {},
+          "resources": {},
+          "logging": {}
+        },
+        "serverInfo": {
+          "name": "mcp-agent-mail",
+          "version": "0.1.0"
+        }
+      },
+      "id": 1
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"released\":1,\"released_at\":\"2026-02-13T04:42:37.732602Z\"}"
+          }
+        ]
+      },
+      "id": 1100
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"granted\":[{\"id\":2,\"path_pattern\":\"src/critical.rs\",\"exclusive\":true,\"reason\":\"RedFox released\",\"expires_ts\":\"2026-02-13T05:42:37.733301Z\"}],\"conflicts\":[]}"
+          }
+        ]
+      },
+      "id": 1101
+    }
+  ]
+}

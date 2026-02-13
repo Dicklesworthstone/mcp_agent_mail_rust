@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "start --help",
+  "args": [
+    "start",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Start the Agent Mail HTTP server and interactive TUI with sensible defaults\n\nUsage: am start [OPTIONS]\n\nOptions:\n      --host <HOST>       HTTP host (default: 127.0.0.1, overridable via HTTP_HOST)\n   ... (782 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

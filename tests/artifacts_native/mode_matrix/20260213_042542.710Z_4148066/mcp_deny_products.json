@@ -1,0 +1,12 @@
+{
+  "binary": "mcp-agent-mail",
+  "command": "products",
+  "args": [
+    "products"
+  ],
+  "expected_decision": "deny",
+  "actual_exit_code": 2,
+  "stdout_digest": "",
+  "stderr_digest": "Error: \"products\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am products\nOr enable CLI mode: AM_INTERFACE_MODE... (233 bytes)",
+  "passed": true
+}

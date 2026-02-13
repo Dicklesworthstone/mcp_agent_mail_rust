@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "golden --help",
+  "args": [
+    "golden",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Capture, verify, and inspect deterministic golden CLI artifacts\n\nUsage: am golden <COMMAND>\n\nCommands:\n  capture  Regenerate golden outputs and rewrite checksums\n  verify   Verify current command outp... (404 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

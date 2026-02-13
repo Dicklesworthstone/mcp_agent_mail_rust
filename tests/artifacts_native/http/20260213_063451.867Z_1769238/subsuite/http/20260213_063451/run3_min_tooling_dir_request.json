@@ -1,0 +1,1 @@
+{"jsonrpc": "2.0", "method": "resources/read", "id": 1, "params": {"uri": "resource://tooling/directory"}}

@@ -1,0 +1,13 @@
+{
+  "step_id": "084",
+  "timestamp": "2026-02-13T04:10:58.334556709+00:00",
+  "binary": "am",
+  "command": "am list-projects --json",
+  "mode": "cli-functional",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "[]\n",
+  "stderr_excerpt": "",
+  "passed": true
+}

@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "list-acks --help",
+  "args": [
+    "list-acks",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Usage: am list-acks [OPTIONS] --project <PROJECT_KEY> --agent <AGENT_NAME>\n\nOptions:\n      --project <PROJECT_KEY>  \n      --agent <AGENT_NAME>     \n      --limit <LIMIT>          [default: 20]\n  -h, ... (236 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "setup --help",
+  "args": [
+    "setup",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Detect coding agents and configure MCP server connections\n\nUsage: am setup <COMMAND>\n\nCommands:\n  run     Auto-detect agents and write MCP config files (default subcommand)\n  status  Show current setu... (343 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

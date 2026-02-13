@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "suite": "http",
+  "timestamp": "20260213_063451",
+  "started_at": "2026-02-13T06:34:51Z",
+  "ended_at": "2026-02-13T06:35:09Z",
+  "git": {
+    "commit": "a7b0afa4100327b41b41c7555b239419bb8fda7b",
+    "branch": "main",
+    "dirty": true
+  },
+  "runner": {
+    "user": "ubuntu",
+    "hostname": "threadripperje",
+    "os": "Linux",
+    "arch": "x86_64",
+    "bash": "5.2.37(1)-release",
+    "python": "Python 3.13.7"
+  },
+  "paths": {
+    "project_root": "/data/projects/mcp_agent_mail_rust",
+    "artifact_dir": "/data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451"
+  },
+  "determinism": {
+    "clock_mode": "wall",
+    "seed": 20260213063451,
+    "run_start_epoch_s": 1770964491
+  }
+}

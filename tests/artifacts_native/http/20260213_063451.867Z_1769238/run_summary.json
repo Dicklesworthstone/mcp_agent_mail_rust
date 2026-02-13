@@ -1,0 +1,22 @@
+{
+  "suite": "http",
+  "runner": "native",
+  "adapter_mode": "shell_managed",
+  "strict_mode": true,
+  "include_focused_subsuites": false,
+  "generated_at": "2026-02-13T06:35:14.753244781+00:00",
+  "duration_ms": 22885,
+  "passed": true,
+  "adapter_script": "tests/e2e/test_http.sh",
+  "adapter_exit_code": 0,
+  "adapter_timed_out": false,
+  "adapter_duration_ms": 22870,
+  "adapter_stdout_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/http/20260213_063451.867Z_1769238/adapter.stdout.log",
+  "adapter_stderr_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/http/20260213_063451.867Z_1769238/adapter.stderr.log",
+  "legacy_artifacts_root": "/data/projects/mcp_agent_mail_rust/tests/artifacts/http",
+  "new_legacy_runs": [
+    "20260213_063451"
+  ],
+  "copied_legacy_run_path": "/data/projects/mcp_agent_mail_rust/tests/artifacts_native/http/20260213_063451.867Z_1769238/subsuite/http/20260213_063451",
+  "notes": []
+}

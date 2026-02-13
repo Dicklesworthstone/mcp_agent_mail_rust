@@ -1,0 +1,13 @@
+{
+  "step_id": "082",
+  "timestamp": "2026-02-13T04:10:58.278897465+00:00",
+  "binary": "am",
+  "command": "am migrate",
+  "mode": "cli-functional",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "✓ Database schema created from model definitions!\nNote: To apply model changes, delete storage.sqlite3 and run this again.\n",
+  "stderr_excerpt": "",
+  "passed": true
+}

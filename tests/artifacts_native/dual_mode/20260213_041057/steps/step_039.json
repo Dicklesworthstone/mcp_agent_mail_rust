@@ -1,0 +1,13 @@
+{
+  "step_id": "039",
+  "timestamp": "2026-02-13T04:10:58.094116549+00:00",
+  "binary": "mcp-agent-mail",
+  "command": "serve --help",
+  "mode": "mcp",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "Start the MCP server (default)\n\nUsage: mcp-agent-mail serve [OPTIONS]\n\nOptions:\n      --host <HOST>\n          Host to bind to\n\n      --port <PORT>\n          Port to bind to\n\n      --path <PATH>\n          Explicit MCP base path (`mcp`, `api`, `/custom/`).\n          \n          Takes precedence over `--transport` and `HTTP_PATH`.\n\n      --transport <TRANSPORT>\n          Transport preset for base-path selection.\n          \n          `auto` uses `HTTP_PATH` when present, otherwise defaults to `/mcp/`...",
+  "stderr_excerpt": "",
+  "passed": true
+}

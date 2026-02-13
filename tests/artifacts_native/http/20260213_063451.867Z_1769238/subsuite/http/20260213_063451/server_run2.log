@@ -1,0 +1,16 @@
+  am: Starting MCP Agent Mail server
+  ├─ interface_mode: mcp (default)
+  ├─ host:    127.0.0.1 (cli)
+  ├─ port:    5707 (cli)
+  ├─ path:    /mcp/ (default)
+  ├─ auth:    none (default)
+  ├─ db:      sqlite://///data/tmp/e2e_http_run2.MDY0HG/db.sqlite3 (env)
+  ├─ storage: /data/tmp/e2e_http_run2.MDY0HG/storage_root (env)
+  └─ mode:    HTTP (headless)
+
+2026-02-13T06:34:55.146546Z  INFO mcp_agent_mail_server::disk_monitor: disk monitor worker started interval_secs=60
+event='request' path='/health/liveness' status=200 method='GET' duration_ms=0 client_ip='127.0.0.1' timestamp='2026-02-13T06:34:55.393340Z' level='info'
++----------------------------------------------------------------------------------------------------------------------+
+| GET  /health/liveness  200  0ms                                                                                      |
+| client: 127.0.0.1                                                                                                    |
++----------------------------------------------------------------------------------------------------------------------+

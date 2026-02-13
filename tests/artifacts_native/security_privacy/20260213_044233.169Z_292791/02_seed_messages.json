@@ -1,0 +1,84 @@
+{
+  "case": "02_seed_messages",
+  "exit_code": 0,
+  "stdout": "{\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{},\"resources\":{},\"logging\":{}},\"serverInfo\":{\"name\":\"mcp-agent-mail\",\"version\":\"0.1.0\"}},\"id\":1}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"deliveries\\\":[{\\\"project\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"payload\\\":{\\\"id\\\":1,\\\"project_id\\\":1,\\\"sender_id\\\":1,\\\"thread_id\\\":null,\\\"subject\\\":\\\"Alpha secret plan\\\",\\\"body_md\\\":\\\"The deployment key is sk-ant-abc123secret\\\",\\\"importance\\\":\\\"normal\\\",\\\"ack_required\\\":false,\\\"created_ts\\\":\\\"2026-02-13T04:42:36.045969Z\\\",\\\"attachments\\\":[],\\\"from\\\":\\\"RedFox\\\",\\\"to\\\":[\\\"BlueLake\\\"],\\\"cc\\\":[],\\\"bcc\\\":[]}}],\\\"count\\\":1,\\\"attachments\\\":[]}\"}]},\"id\":20}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"deliveries\\\":[{\\\"project\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"payload\\\":{\\\"id\\\":2,\\\"project_id\\\":1,\\\"sender_id\\\":1,\\\"thread_id\\\":null,\\\"subject\\\":\\\"BCC test message\\\",\\\"body_md\\\":\\\"GoldPeak is BCC on this\\\",\\\"importance\\\":\\\"normal\\\",\\\"ack_required\\\":false,\\\"created_ts\\\":\\\"2026-02-13T04:42:36.090566Z\\\",\\\"attachments\\\":[],\\\"from\\\":\\\"RedFox\\\",\\\"to\\\":[\\\"BlueLake\\\"],\\\"cc\\\":[],\\\"bcc\\\":[\\\"GoldPeak\\\"]}}],\\\"count\\\":1,\\\"attachments\\\":[]}\"}]},\"id\":21}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"deliveries\\\":[{\\\"project\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"payload\\\":{\\\"id\\\":3,\\\"project_id\\\":1,\\\"sender_id\\\":2,\\\"thread_id\\\":null,\\\"subject\\\":\\\"Private to GoldPeak\\\",\\\"body_md\\\":\\\"Only GoldPeak should see this in inbox\\\",\\\"importance\\\":\\\"normal\\\",\\\"ack_required\\\":false,\\\"created_ts\\\":\\\"2026-02-13T04:42:36.133894Z\\\",\\\"attachments\\\":[],\\\"from\\\":\\\"BlueLake\\\",\\\"to\\\":[\\\"GoldPeak\\\"],\\\"cc\\\":[],\\\"bcc\\\":[]}}],\\\"count\\\":1,\\\"attachments\\\":[]}\"}]},\"id\":22}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"deliveries\\\":[{\\\"project\\\":\\\"/tmp/e2e_sec_beta\\\",\\\"payload\\\":{\\\"id\\\":4,\\\"project_id\\\":2,\\\"sender_id\\\":4,\\\"thread_id\\\":null,\\\"subject\\\":\\\"Beta internal note\\\",\\\"body_md\\\":\\\"This message lives in project beta only\\\",\\\"importance\\\":\\\"normal\\\",\\\"ack_required\\\":false,\\\"created_ts\\\":\\\"2026-02-13T04:42:36.156333Z\\\",\\\"attachments\\\":[],\\\"from\\\":\\\"SilverCove\\\",\\\"to\\\":[\\\"SilverCove\\\"],\\\"cc\\\":[],\\\"bcc\\\":[]}}],\\\"count\\\":1,\\\"attachments\\\":[]}\"}]},\"id\":23}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"deliveries\\\":[{\\\"project\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"payload\\\":{\\\"id\\\":5,\\\"project_id\\\":1,\\\"sender_id\\\":1,\\\"thread_id\\\":null,\\\"subject\\\":\\\"Hostile markdown test\\\",\\\"body_md\\\":\\\"<script>alert(1)</script>\\\\n![img](javascript:alert(1))\\\\n[click](data:text/html,<h1>xss</h1>)\\\",\\\"importance\\\":\\\"normal\\\",\\\"ack_required\\\":false,\\\"created_ts\\\":\\\"2026-02-13T04:42:36.179712Z\\\",\\\"attachments\\\":[],\\\"from\\\":\\\"RedFox\\\",\\\"to\\\":[\\\"BlueLake\\\"],\\\"cc\\\":[],\\\"bcc\\\":[]}}],\\\"count\\\":1,\\\"attachments\\\":[]}\"}]},\"id\":24}\n",
+  "stderr": "FastMCP Server: mcp-agent-mail v0.1.0\n  Tools: 34\n  Resources: 8\n  Prompts: 0\n  Transport: stdio\nServer ready.\n",
+  "responses": [
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+          "tools": {},
+          "resources": {},
+          "logging": {}
+        },
+        "serverInfo": {
+          "name": "mcp-agent-mail",
+          "version": "0.1.0"
+        }
+      },
+      "id": 1
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"deliveries\":[{\"project\":\"/tmp/e2e_sec_alpha\",\"payload\":{\"id\":1,\"project_id\":1,\"sender_id\":1,\"thread_id\":null,\"subject\":\"Alpha secret plan\",\"body_md\":\"The deployment key is sk-ant-abc123secret\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-02-13T04:42:36.045969Z\",\"attachments\":[],\"from\":\"RedFox\",\"to\":[\"BlueLake\"],\"cc\":[],\"bcc\":[]}}],\"count\":1,\"attachments\":[]}"
+          }
+        ]
+      },
+      "id": 20
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"deliveries\":[{\"project\":\"/tmp/e2e_sec_alpha\",\"payload\":{\"id\":2,\"project_id\":1,\"sender_id\":1,\"thread_id\":null,\"subject\":\"BCC test message\",\"body_md\":\"GoldPeak is BCC on this\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-02-13T04:42:36.090566Z\",\"attachments\":[],\"from\":\"RedFox\",\"to\":[\"BlueLake\"],\"cc\":[],\"bcc\":[\"GoldPeak\"]}}],\"count\":1,\"attachments\":[]}"
+          }
+        ]
+      },
+      "id": 21
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"deliveries\":[{\"project\":\"/tmp/e2e_sec_alpha\",\"payload\":{\"id\":3,\"project_id\":1,\"sender_id\":2,\"thread_id\":null,\"subject\":\"Private to GoldPeak\",\"body_md\":\"Only GoldPeak should see this in inbox\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-02-13T04:42:36.133894Z\",\"attachments\":[],\"from\":\"BlueLake\",\"to\":[\"GoldPeak\"],\"cc\":[],\"bcc\":[]}}],\"count\":1,\"attachments\":[]}"
+          }
+        ]
+      },
+      "id": 22
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"deliveries\":[{\"project\":\"/tmp/e2e_sec_beta\",\"payload\":{\"id\":4,\"project_id\":2,\"sender_id\":4,\"thread_id\":null,\"subject\":\"Beta internal note\",\"body_md\":\"This message lives in project beta only\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-02-13T04:42:36.156333Z\",\"attachments\":[],\"from\":\"SilverCove\",\"to\":[\"SilverCove\"],\"cc\":[],\"bcc\":[]}}],\"count\":1,\"attachments\":[]}"
+          }
+        ]
+      },
+      "id": 23
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"deliveries\":[{\"project\":\"/tmp/e2e_sec_alpha\",\"payload\":{\"id\":5,\"project_id\":1,\"sender_id\":1,\"thread_id\":null,\"subject\":\"Hostile markdown test\",\"body_md\":\"<script>alert(1)</script>\\n![img](javascript:alert(1))\\n[click](data:text/html,<h1>xss</h1>)\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-02-13T04:42:36.179712Z\",\"attachments\":[],\"from\":\"RedFox\",\"to\":[\"BlueLake\"],\"cc\":[],\"bcc\":[]}}],\"count\":1,\"attachments\":[]}"
+          }
+        ]
+      },
+      "id": 24
+    }
+  ]
+}

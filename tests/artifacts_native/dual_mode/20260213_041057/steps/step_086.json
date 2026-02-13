@@ -1,0 +1,13 @@
+{
+  "step_id": "086",
+  "timestamp": "2026-02-13T04:10:58.354149197+00:00",
+  "binary": "am",
+  "command": "am tooling schemas --json",
+  "mode": "cli-functional",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "{\n  \"tool_count\": 34,\n  \"tools\": {\n    \"acknowledge_message\": {\n      \"cluster\": \"messaging\",\n      \"capabilities\": [\n        \"ack\",\n        \"messaging\"\n      ],\n      \"complexity\": \"medium\"\n    },\n    \"acquire_build_slot\": {\n      \"cluster\": \"build_slots\",\n      \"capabilities\": [\n        \"build\"\n      ],\n      \"complexity\": \"medium\"\n    },\n    \"create_agent_identity\": {\n      \"cluster\": \"identity\",\n      \"capabilities\": [\n        \"identity\"\n      ],\n      \"complexity\": \"medium\"\n    },\n    \"ensu...",
+  "stderr_excerpt": "",
+  "passed": true
+}

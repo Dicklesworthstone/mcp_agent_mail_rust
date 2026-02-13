@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"send_message","arguments":{"project_key":"/data/tmp/e2e_http_run5.tczu8N/proj","sender_name":"BlueLake","to":["GreenCastle"],"subject":"ack ttl e2e","body_md":"hello","ack_required":true,"thread_id":"br-2ei.9.6"}}}

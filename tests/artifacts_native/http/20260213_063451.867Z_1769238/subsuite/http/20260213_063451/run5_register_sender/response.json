@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"id\":1,\"name\":\"BlueLake\",\"program\":\"e2e\",\"model\":\"test\",\"task_description\":\"e2e\",\"inception_ts\":\"2026-02-13T06:35:04.167170Z\",\"last_active_ts\":\"2026-02-13T06:35:04.167170Z\",\"project_id\":1,\"attachments_policy\":\"auto\"}"}]},"id":1}

@@ -1,0 +1,16 @@
+HTTP_ERROR
+status=401
+case_id=run1_post_missing_auth
+url=http://127.0.0.1:22745/api/
+elapsed_ms=0
+
+=== response headers ===
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+Content-Length: 25
+
+
+=== response body ===
+{"detail":"Unauthorized"}
+=== request ===
+{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"health_check","arguments":{}}}

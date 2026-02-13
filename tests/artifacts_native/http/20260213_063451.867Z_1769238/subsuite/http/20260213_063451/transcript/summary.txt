@@ -1,0 +1,24 @@
+suite: http
+timestamp: 20260213_063451
+started_at: 2026-02-13T06:34:51Z
+ended_at: 2026-02-13T06:35:09Z
+clock_mode: wall
+seed: 20260213063451
+run_start_epoch_s: 1770964491
+repro_command: cd /data/projects/mcp_agent_mail_rust && AM_E2E_KEEP_TMP=1 E2E_CLOCK_MODE=wall E2E_SEED=20260213063451 E2E_RUN_STARTED_AT=2026-02-13T06:34:51Z E2E_RUN_START_EPOCH_S=1770964491 ./scripts/e2e_test.sh http
+counts: total=17 pass=41 fail=0 skip=1
+git: commit=a7b0afa4100327b41b41c7555b239419bb8fda7b branch=main dirty=true
+artifacts_dir: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451
+files:
+  bundle: bundle.json
+  summary: summary.json
+  meta: meta.json
+  metrics: metrics.json
+  trace: trace/events.jsonl
+  logs_index: logs/index.json
+  screenshots_index: screenshots/index.json
+  fixtures: fixtures.json
+  repro: repro.txt
+  repro_json: repro.json
+  env: diagnostics/env_redacted.txt
+  tree: diagnostics/tree.txt

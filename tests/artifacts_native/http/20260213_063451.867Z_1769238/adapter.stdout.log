@@ -1,0 +1,106 @@
+
+[0;34m════════════════════════════════════════════════════════════[0m
+[0;34m  HTTP Unified E2E Test Suite[0m
+[0;34m════════════════════════════════════════════════════════════[0m
+
+[0;34m════════════════════════════════════════════════════════════[0m
+[0;34m  Run 1: health + bearer auth + OPTIONS bypass + CORS + well-known[0m
+[0;34m════════════════════════════════════════════════════════════[0m
+
+[0;34m── Case: GET /health/liveness bypasses auth ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m body has alive
+
+[0;34m── Case: GET /health/readiness bypasses auth ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m body has ready
+
+[0;34m── Case: GET /health bypasses auth (alias) ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m body has ready
+
+[0;34m── Case: GET /healthz bypasses auth (alias) ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m body has alive
+
+[0;34m── Case: OPTIONS /api/ bypasses auth and includes CORS headers ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m has access-control-allow-origin
+
+[0;34m── Case: POST /api/ without Authorization returns 401 ──[0m
+  [0;32mPASS[0m HTTP 401
+  [0;32mPASS[0m detail Unauthorized
+
+[0;34m── Case: POST /api/ with Authorization succeeds ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m jsonrpc result
+
+[0;34m── Case: Well-known endpoints require auth and return expected JSON ──[0m
+  [0;32mPASS[0m HTTP 401
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m body has mcp_oauth false
+
+[0;34m════════════════════════════════════════════════════════════[0m
+[0;34m  Run 2: request logging + OTEL no-op (misconfig)[0m
+[0;34m════════════════════════════════════════════════════════════[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m request log emitted (kv)
+
+[0;34m════════════════════════════════════════════════════════════[0m
+[0;34m  Run 3: tool filtering (baseline/minimal/custom)[0m
+[0;34m════════════════════════════════════════════════════════════[0m
+
+[0;34m── Case: tools/list baseline (filter disabled) ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m baseline tool count=34
+
+[0;34m── Case: tools/list minimal profile returns fewer tools ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m minimal tool count=6 (< 34)
+
+[0;34m── Case: resource://tooling/directory reflects filtered set (minimal) ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m tooling directory returned
+
+[0;34m── Case: custom exclude removes health_check tool ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m health_check is excluded
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m tooling directory does not list excluded health_check
+
+[0;34m════════════════════════════════════════════════════════════[0m
+[0;34m  Run 4: instrumentation emits tool_query_stats[0m
+[0;34m════════════════════════════════════════════════════════════[0m
+
+[0;34m── Case: ensure_project triggers DB-backed tool call ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m instrumentation emitted tool_query_stats
+
+[0;34m════════════════════════════════════════════════════════════[0m
+[0;34m  Run 5: ACK TTL worker logs ack_overdue + escalation smoke[0m
+[0;34m════════════════════════════════════════════════════════════[0m
+
+[0;34m── Case: Create ack_required message ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m register_agent sender returns JSON-RPC result
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m register_agent recipient returns JSON-RPC result
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m send_message returns JSON-RPC result
+
+[0;34m── Case: Wait for ack_overdue log ──[0m
+  [0;32mPASS[0m ack_overdue observed in logs
+
+[0;34m── Case: Escalation creates a file reservation (smoke via resource read) ──[0m
+  [0;32mPASS[0m HTTP 200
+  [0;32mPASS[0m ack escalation created file reservation(s): count=1
+
+[0;34m── Case: Focused subsuites disabled ──[0m
+  [0;33mSKIP[0m focused subsuites disabled via AM_E2E_HTTP_INCLUDE_FOCUSED_SUBSUITES=0
+
+[0;34m════════════════════════════════════════════════════════════[0m
+  Suite: http
+  Total: 17  [0;32mPass: 41[0m  [0;31mFail: 0[0m  [0;33mSkip: 1[0m
+  Artifacts: /data/projects/mcp_agent_mail_rust/tests/artifacts/http/20260213_063451
+[0;34m════════════════════════════════════════════════════════════[0m

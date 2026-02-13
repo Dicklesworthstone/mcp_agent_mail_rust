@@ -1,0 +1,96 @@
+{
+  "case": "01_setup",
+  "exit_code": 0,
+  "stdout": "{\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{},\"resources\":{},\"logging\":{}},\"serverInfo\":{\"name\":\"mcp-agent-mail\",\"version\":\"0.1.0\"}},\"id\":1}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"id\\\":1,\\\"created_at\\\":\\\"2026-02-13T04:42:35.004588Z\\\",\\\"slug\\\":\\\"tmp-e2e-sec-alpha\\\",\\\"identity_mode_used\\\":\\\"dir\\\",\\\"canonical_path\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"human_key\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"repo_root\\\":null,\\\"git_common_dir\\\":null,\\\"branch\\\":null,\\\"worktree_name\\\":null,\\\"core_ignorecase\\\":null,\\\"normalized_remote\\\":null,\\\"project_uid\\\":\\\"9e200e176cdb5877ec78\\\",\\\"discovery\\\":null}\"}]},\"id\":10}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"id\\\":2,\\\"created_at\\\":\\\"2026-02-13T04:42:35.284784Z\\\",\\\"slug\\\":\\\"tmp-e2e-sec-beta\\\",\\\"identity_mode_used\\\":\\\"dir\\\",\\\"canonical_path\\\":\\\"/tmp/e2e_sec_beta\\\",\\\"human_key\\\":\\\"/tmp/e2e_sec_beta\\\",\\\"repo_root\\\":null,\\\"git_common_dir\\\":null,\\\"branch\\\":null,\\\"worktree_name\\\":null,\\\"core_ignorecase\\\":null,\\\"normalized_remote\\\":null,\\\"project_uid\\\":\\\"6c2db05cb87fa85ec492\\\",\\\"discovery\\\":null}\"}]},\"id\":11}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"id\\\":1,\\\"name\\\":\\\"RedFox\\\",\\\"program\\\":\\\"test\\\",\\\"model\\\":\\\"test\\\",\\\"task_description\\\":\\\"\\\",\\\"inception_ts\\\":\\\"2026-02-13T04:42:35.317854Z\\\",\\\"last_active_ts\\\":\\\"2026-02-13T04:42:35.317854Z\\\",\\\"project_id\\\":1,\\\"attachments_policy\\\":\\\"auto\\\"}\"}]},\"id\":12}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"id\\\":2,\\\"name\\\":\\\"BlueLake\\\",\\\"program\\\":\\\"test\\\",\\\"model\\\":\\\"test\\\",\\\"task_description\\\":\\\"\\\",\\\"inception_ts\\\":\\\"2026-02-13T04:42:35.342663Z\\\",\\\"last_active_ts\\\":\\\"2026-02-13T04:42:35.342663Z\\\",\\\"project_id\\\":1,\\\"attachments_policy\\\":\\\"auto\\\"}\"}]},\"id\":13}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"id\\\":3,\\\"name\\\":\\\"GoldPeak\\\",\\\"program\\\":\\\"test\\\",\\\"model\\\":\\\"test\\\",\\\"task_description\\\":\\\"\\\",\\\"inception_ts\\\":\\\"2026-02-13T04:42:35.363744Z\\\",\\\"last_active_ts\\\":\\\"2026-02-13T04:42:35.363744Z\\\",\\\"project_id\\\":1,\\\"attachments_policy\\\":\\\"auto\\\"}\"}]},\"id\":14}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"id\\\":4,\\\"name\\\":\\\"SilverCove\\\",\\\"program\\\":\\\"test\\\",\\\"model\\\":\\\"test\\\",\\\"task_description\\\":\\\"\\\",\\\"inception_ts\\\":\\\"2026-02-13T04:42:35.386629Z\\\",\\\"last_active_ts\\\":\\\"2026-02-13T04:42:35.386629Z\\\",\\\"project_id\\\":2,\\\"attachments_policy\\\":\\\"auto\\\"}\"}]},\"id\":15}\n",
+  "stderr": "FastMCP Server: mcp-agent-mail v0.1.0\n  Tools: 34\n  Resources: 8\n  Prompts: 0\n  Transport: stdio\nServer ready.\n",
+  "responses": [
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+          "tools": {},
+          "resources": {},
+          "logging": {}
+        },
+        "serverInfo": {
+          "name": "mcp-agent-mail",
+          "version": "0.1.0"
+        }
+      },
+      "id": 1
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"id\":1,\"created_at\":\"2026-02-13T04:42:35.004588Z\",\"slug\":\"tmp-e2e-sec-alpha\",\"identity_mode_used\":\"dir\",\"canonical_path\":\"/tmp/e2e_sec_alpha\",\"human_key\":\"/tmp/e2e_sec_alpha\",\"repo_root\":null,\"git_common_dir\":null,\"branch\":null,\"worktree_name\":null,\"core_ignorecase\":null,\"normalized_remote\":null,\"project_uid\":\"9e200e176cdb5877ec78\",\"discovery\":null}"
+          }
+        ]
+      },
+      "id": 10
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"id\":2,\"created_at\":\"2026-02-13T04:42:35.284784Z\",\"slug\":\"tmp-e2e-sec-beta\",\"identity_mode_used\":\"dir\",\"canonical_path\":\"/tmp/e2e_sec_beta\",\"human_key\":\"/tmp/e2e_sec_beta\",\"repo_root\":null,\"git_common_dir\":null,\"branch\":null,\"worktree_name\":null,\"core_ignorecase\":null,\"normalized_remote\":null,\"project_uid\":\"6c2db05cb87fa85ec492\",\"discovery\":null}"
+          }
+        ]
+      },
+      "id": 11
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"id\":1,\"name\":\"RedFox\",\"program\":\"test\",\"model\":\"test\",\"task_description\":\"\",\"inception_ts\":\"2026-02-13T04:42:35.317854Z\",\"last_active_ts\":\"2026-02-13T04:42:35.317854Z\",\"project_id\":1,\"attachments_policy\":\"auto\"}"
+          }
+        ]
+      },
+      "id": 12
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"id\":2,\"name\":\"BlueLake\",\"program\":\"test\",\"model\":\"test\",\"task_description\":\"\",\"inception_ts\":\"2026-02-13T04:42:35.342663Z\",\"last_active_ts\":\"2026-02-13T04:42:35.342663Z\",\"project_id\":1,\"attachments_policy\":\"auto\"}"
+          }
+        ]
+      },
+      "id": 13
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"id\":3,\"name\":\"GoldPeak\",\"program\":\"test\",\"model\":\"test\",\"task_description\":\"\",\"inception_ts\":\"2026-02-13T04:42:35.363744Z\",\"last_active_ts\":\"2026-02-13T04:42:35.363744Z\",\"project_id\":1,\"attachments_policy\":\"auto\"}"
+          }
+        ]
+      },
+      "id": 14
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"id\":4,\"name\":\"SilverCove\",\"program\":\"test\",\"model\":\"test\",\"task_description\":\"\",\"inception_ts\":\"2026-02-13T04:42:35.386629Z\",\"last_active_ts\":\"2026-02-13T04:42:35.386629Z\",\"project_id\":2,\"attachments_policy\":\"auto\"}"
+          }
+        ]
+      },
+      "id": 15
+    }
+  ]
+}

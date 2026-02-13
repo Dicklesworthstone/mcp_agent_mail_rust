@@ -1,0 +1,55 @@
+    Updating crates.io index
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on artifact directory
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.36
+   Compiling rustls-webpki v0.103.9
+   Compiling ureq v2.12.1
+   Compiling asupersync v0.1.1 (/data/projects/asupersync)
+   Compiling ort-sys v2.0.0-rc.9
+   Compiling hf-hub v0.4.3
+   Compiling ort v2.0.0-rc.9
+   Compiling fastembed v4.9.1
+   Compiling mcp-agent-mail-search-core v0.1.0 (/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core)
+   Compiling sqlmodel-core v0.1.1 (/data/projects/sqlmodel_rust/crates/sqlmodel-core)
+   Compiling fastmcp-core v0.1.0 (/data/projects/fastmcp_rust/crates/fastmcp-core)
+   Compiling mcp-agent-mail-storage v0.1.0 (/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-storage)
+   Compiling fastmcp-protocol v0.1.0 (/data/projects/fastmcp_rust/crates/fastmcp-protocol)
+   Compiling sqlmodel-query v0.1.1 (/data/projects/sqlmodel_rust/crates/sqlmodel-query)
+   Compiling sqlmodel-pool v0.1.1 (/data/projects/sqlmodel_rust/crates/sqlmodel-pool)
+   Compiling sqlmodel-schema v0.1.1 (/data/projects/sqlmodel_rust/crates/sqlmodel-schema)
+   Compiling sqlmodel-sqlite v0.1.1 (/data/projects/sqlmodel_rust/crates/sqlmodel-sqlite)
+   Compiling sqlmodel-frankensqlite v0.1.1 (/data/projects/sqlmodel_rust/crates/sqlmodel-frankensqlite)
+   Compiling sqlmodel-session v0.1.1 (/data/projects/sqlmodel_rust/crates/sqlmodel-session)
+   Compiling fastmcp-transport v0.1.0 (/data/projects/fastmcp_rust/crates/fastmcp-transport)
+   Compiling fastmcp-console v0.1.0 (/data/projects/fastmcp_rust/crates/fastmcp-console)
+   Compiling fastmcp-client v0.1.0 (/data/projects/fastmcp_rust/crates/fastmcp-client)
+   Compiling sqlmodel v0.1.1 (/data/projects/sqlmodel_rust/crates/sqlmodel)
+   Compiling mcp-agent-mail-db v0.1.0 (/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db)
+   Compiling fastmcp-server v0.1.0 (/data/projects/fastmcp_rust/crates/fastmcp-server)
+   Compiling fastmcp-rust v0.1.0 (/data/projects/fastmcp_rust/crates/fastmcp)
+   Compiling mcp-agent-mail-tools v0.1.0 (/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-tools)
+   Compiling mcp-agent-mail-share v0.1.0 (/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-share)
+   Compiling mcp-agent-mail-server v0.1.0 (/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-server)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1m 04s
+     Running unittests src/lib.rs (/data/tmp/cargo-target/debug/deps/mcp_agent_mail_server-3b0a83cd7b624ac4)
+theme=CyberpunkAurora tab_active=12.81 tab_inactive=6.13 status=12.91 help=15.93 key_hint=7.55
+theme=Darcula tab_active=5.19 tab_inactive=3.35 status=5.36 help=6.93 key_hint=4.54
+theme=LumenLight tab_active=12.31 tab_inactive=3.23 status=8.37 help=14.01 key_hint=4.91
+theme=NordicFrost tab_active=7.49 tab_inactive=4.69 status=9.25 help=10.84 key_hint=6.24
+theme=HighContrast tab_active=18.42 tab_inactive=10.13 status=16.83 help=21.00 key_hint=16.75
+     Running tests/console_output.rs (/data/tmp/cargo-target/debug/deps/console_output-c863bbe0d5c1d66d)
+     Running tests/fixture_matrix.rs (/data/tmp/cargo-target/debug/deps/fixture_matrix-13680011c375a736)
+     Running tests/golden_markdown_snapshots.rs (/data/tmp/cargo-target/debug/deps/golden_markdown_snapshots-31ce1e7b6ce258cb)
+     Running tests/golden_snapshots.rs (/data/tmp/cargo-target/debug/deps/golden_snapshots-6dc7c70f2a16b396)
+     Running tests/health_endpoints.rs (/data/tmp/cargo-target/debug/deps/health_endpoints-11e6fc60a86b4053)
+     Running tests/http_logging.rs (/data/tmp/cargo-target/debug/deps/http_logging-0044dcfcc33dd09e)
+     Running tests/pty_e2e_search.rs (/data/tmp/cargo-target/debug/deps/pty_e2e_search-e4ea35bcd71dee99)
+     Running tests/startup_compat.rs (/data/tmp/cargo-target/debug/deps/startup_compat-c313dbdf1d53a181)
+     Running tests/tui_perf_baselines.rs (/data/tmp/cargo-target/debug/deps/tui_perf_baselines-20f3c78a725a4b7c)
+     Running tests/tui_soak_replay.rs (/data/tmp/cargo-target/debug/deps/tui_soak_replay-083cf427da9f2945)
+     Running tests/ui_markdown_templates.rs (/data/tmp/cargo-target/debug/deps/ui_markdown_templates-0c8f5dfa16a87fa7)
+     Running tests/web_ui_parity_contract_guard.rs (/data/tmp/cargo-target/debug/deps/web_ui_parity_contract_guard-ca97248462224fe8)
+     Running tests/workers.rs (/data/tmp/cargo-target/debug/deps/workers-51c58cc0c087a1da)

@@ -1,0 +1,13 @@
+{
+  "step_id": "087",
+  "timestamp": "2026-02-13T04:10:58.363483396+00:00",
+  "binary": "am",
+  "command": "am agents list --help",
+  "mode": "cli-functional",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "List agents registered in a project\n\nUsage: am agents list [OPTIONS] --project <PROJECT_KEY>\n\nOptions:\n  -p, --project <PROJECT_KEY>  Project key (slug or human_key / absolute path)\n      --json                   Output as JSON\n  -h, --help                   Print help\n",
+  "stderr_excerpt": "",
+  "passed": true
+}

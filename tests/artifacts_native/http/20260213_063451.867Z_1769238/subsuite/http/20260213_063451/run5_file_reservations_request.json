@@ -1,0 +1,1 @@
+{"jsonrpc": "2.0", "method": "resources/read", "id": 1, "params": {"uri": "resource://file_reservations/data-tmp-e2e-http-run5-tczu8n-proj?active_only=true"}}

@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "contacts --help",
+  "args": [
+    "contacts",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Contact request/approve/reject/policy lifecycle\n\nUsage: am contacts <COMMAND>\n\nCommands:\n  request  Request contact with another agent\n  respond  Approve or reject a contact request\n  list     List co... (367 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

@@ -1,0 +1,13 @@
+{
+  "binary": "am",
+  "command": "beads --help",
+  "args": [
+    "beads",
+    "--help"
+  ],
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_digest": "Query beads (issue tracker) status for the current project\n\nUsage: am beads <COMMAND>\n\nCommands:\n  ready   List issues ready to work on (unblocked, not deferred)\n  list    List issues with optional st... (430 bytes)",
+  "stderr_digest": "",
+  "passed": true
+}

@@ -1,0 +1,13 @@
+{
+  "step_id": "018",
+  "timestamp": "2026-02-13T04:10:57.915336647+00:00",
+  "binary": "am",
+  "command": "agents --help",
+  "mode": "cli",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "Usage: am agents <COMMAND>\n\nCommands:\n  register  Register or update an agent identity in a project (idempotent)\n  create    Create a new, unique agent identity (never updates existing)\n  list      List agents registered in a project\n  show      Show details for a specific agent\n  detect    Detect installed coding agents on this system\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n",
+  "stderr_excerpt": "",
+  "passed": true
+}

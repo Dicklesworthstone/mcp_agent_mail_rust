@@ -1,0 +1,13 @@
+{
+  "step_id": "035",
+  "timestamp": "2026-02-13T04:10:58.060244086+00:00",
+  "binary": "mcp-agent-mail",
+  "command": "mail",
+  "mode": "mcp",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "deny",
+  "actual_exit_code": 2,
+  "stdout_excerpt": "",
+  "stderr_excerpt": "Error: \"mail\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am mail\nOr enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail mail ...\n",
+  "passed": true
+}

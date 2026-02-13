@@ -1,0 +1,13 @@
+{
+  "step_id": "083",
+  "timestamp": "2026-02-13T04:10:58.324170799+00:00",
+  "binary": "am",
+  "command": "am doctor check --json",
+  "mode": "cli-functional",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "{\n  \"healthy\": true,\n  \"checks\": [\n    {\n      \"check\": \"database\",\n      \"status\": \"ok\",\n      \"detail\": \"SQLite database accessible\"\n    },\n    {\n      \"check\": \"storage_root\",\n      \"status\": \"ok\",\n      \"detail\": \"/data/tmp/.tmpvIfMnN/storage\"\n    },\n    {\n      \"check\": \"installed_agents\",\n      \"status\": \"ok\",\n      \"detail\": \"5 detected of 15 connector(s)\"\n    },\n    {\n      \"check\": \"beads_issue_awareness\",\n      \"status\": \"ok\",\n      \"detail\": \"39 ready / 97 open / 23 in_progress\"\n    }...",
+  "stderr_excerpt": "",
+  "passed": true
+}

@@ -1,0 +1,37 @@
+{
+  "case": "12_nonexistent_agent",
+  "exit_code": 0,
+  "stdout": "{\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{},\"resources\":{},\"logging\":{}},\"serverInfo\":{\"name\":\"mcp-agent-mail\",\"version\":\"0.1.0\"}},\"id\":1}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Agent not found: 1:NoSuchAgent\"}],\"isError\":true},\"id\":1200}\n",
+  "stderr": "FastMCP Server: mcp-agent-mail v0.1.0\n  Tools: 34\n  Resources: 8\n  Prompts: 0\n  Transport: stdio\nServer ready.\n",
+  "responses": [
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+          "tools": {},
+          "resources": {},
+          "logging": {}
+        },
+        "serverInfo": {
+          "name": "mcp-agent-mail",
+          "version": "0.1.0"
+        }
+      },
+      "id": 1
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "Agent not found: 1:NoSuchAgent"
+          }
+        ],
+        "isError": true
+      },
+      "id": 1200
+    }
+  ]
+}

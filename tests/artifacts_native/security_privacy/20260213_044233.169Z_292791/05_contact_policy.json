@@ -1,0 +1,96 @@
+{
+  "case": "05_contact_policy",
+  "exit_code": 0,
+  "stdout": "{\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{},\"resources\":{},\"logging\":{}},\"serverInfo\":{\"name\":\"mcp-agent-mail\",\"version\":\"0.1.0\"}},\"id\":1}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"agent\\\":\\\"GoldPeak\\\",\\\"policy\\\":\\\"block_all\\\"}\"}]},\"id\":400}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"from\\\":\\\"RedFox\\\",\\\"from_project\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"to\\\":\\\"GoldPeak\\\",\\\"to_project\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"status\\\":\\\"pending\\\",\\\"expires_ts\\\":\\\"2026-02-20T04:42:36.682448Z\\\"}\"}]},\"id\":401}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"agent\\\":\\\"BlueLake\\\",\\\"policy\\\":\\\"contacts_only\\\"}\"}]},\"id\":500}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"from\\\":\\\"GoldPeak\\\",\\\"from_project\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"to\\\":\\\"BlueLake\\\",\\\"to_project\\\":\\\"/tmp/e2e_sec_alpha\\\",\\\"status\\\":\\\"pending\\\",\\\"expires_ts\\\":\\\"2026-02-20T04:42:36.999085Z\\\"}\"}]},\"id\":501}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"from\\\":\\\"GoldPeak\\\",\\\"to\\\":\\\"BlueLake\\\",\\\"approved\\\":true,\\\"expires_ts\\\":\\\"2026-03-15T04:42:37.033119Z\\\",\\\"updated\\\":1}\"}]},\"id\":502}\n{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"[{\\\"to\\\":\\\"GoldPeak\\\",\\\"status\\\":\\\"approved\\\",\\\"reason\\\":\\\"auto-handshake by send_message\\\",\\\"updated_ts\\\":null,\\\"expires_ts\\\":null}]\"}]},\"id\":503}\n",
+  "stderr": "FastMCP Server: mcp-agent-mail v0.1.0\n  Tools: 34\n  Resources: 8\n  Prompts: 0\n  Transport: stdio\nServer ready.\n",
+  "responses": [
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+          "tools": {},
+          "resources": {},
+          "logging": {}
+        },
+        "serverInfo": {
+          "name": "mcp-agent-mail",
+          "version": "0.1.0"
+        }
+      },
+      "id": 1
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"agent\":\"GoldPeak\",\"policy\":\"block_all\"}"
+          }
+        ]
+      },
+      "id": 400
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"from\":\"RedFox\",\"from_project\":\"/tmp/e2e_sec_alpha\",\"to\":\"GoldPeak\",\"to_project\":\"/tmp/e2e_sec_alpha\",\"status\":\"pending\",\"expires_ts\":\"2026-02-20T04:42:36.682448Z\"}"
+          }
+        ]
+      },
+      "id": 401
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"agent\":\"BlueLake\",\"policy\":\"contacts_only\"}"
+          }
+        ]
+      },
+      "id": 500
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"from\":\"GoldPeak\",\"from_project\":\"/tmp/e2e_sec_alpha\",\"to\":\"BlueLake\",\"to_project\":\"/tmp/e2e_sec_alpha\",\"status\":\"pending\",\"expires_ts\":\"2026-02-20T04:42:36.999085Z\"}"
+          }
+        ]
+      },
+      "id": 501
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"from\":\"GoldPeak\",\"to\":\"BlueLake\",\"approved\":true,\"expires_ts\":\"2026-03-15T04:42:37.033119Z\",\"updated\":1}"
+          }
+        ]
+      },
+      "id": 502
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "[{\"to\":\"GoldPeak\",\"status\":\"approved\",\"reason\":\"auto-handshake by send_message\",\"updated_ts\":null,\"expires_ts\":null}]"
+          }
+        ]
+      },
+      "id": 503
+    }
+  ]
+}

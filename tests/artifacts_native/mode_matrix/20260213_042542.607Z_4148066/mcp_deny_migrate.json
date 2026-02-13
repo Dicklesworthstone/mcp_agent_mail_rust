@@ -1,0 +1,12 @@
+{
+  "binary": "mcp-agent-mail",
+  "command": "migrate",
+  "args": [
+    "migrate"
+  ],
+  "expected_decision": "deny",
+  "actual_exit_code": 2,
+  "stdout_digest": "",
+  "stderr_digest": "Error: \"migrate\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am migrate\nOr enable CLI mode: AM_INTERFACE_MODE=c... (230 bytes)",
+  "passed": true
+}

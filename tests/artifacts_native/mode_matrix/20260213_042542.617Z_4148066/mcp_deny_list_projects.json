@@ -1,0 +1,12 @@
+{
+  "binary": "mcp-agent-mail",
+  "command": "list-projects",
+  "args": [
+    "list-projects"
+  ],
+  "expected_decision": "deny",
+  "actual_exit_code": 2,
+  "stdout_digest": "",
+  "stderr_digest": "Error: \"list-projects\" is not an MCP server command.\n\nAgent Mail is not a CLI.\nAgent Mail MCP server accepts: serve, config\nFor operator CLI commands, use: am list-projects\nOr enable CLI mode: AM_INTE... (248 bytes)",
+  "passed": true
+}

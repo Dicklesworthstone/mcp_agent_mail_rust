@@ -1,0 +1,2 @@
+Repro (br-3vwi.10.19):
+cd /data/projects/mcp_agent_mail_rust && AM_E2E_KEEP_TMP=1 E2E_CLOCK_MODE=wall E2E_SEED=20260213063451 E2E_RUN_STARTED_AT=2026-02-13T06:34:51Z E2E_RUN_START_EPOCH_S=1770964491 ./scripts/e2e_test.sh http

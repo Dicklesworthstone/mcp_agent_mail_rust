@@ -1,0 +1,13 @@
+{
+  "step_id": "042",
+  "timestamp": "2026-02-13T04:10:58.116115226+00:00",
+  "binary": "mcp-agent-mail",
+  "command": "--version",
+  "mode": "mcp",
+  "mode_provenance": "native-e2e-runner",
+  "expected_decision": "allow",
+  "actual_exit_code": 0,
+  "stdout_excerpt": "mcp-agent-mail 0.1.0\n",
+  "stderr_excerpt": "",
+  "passed": true
+}
