@@ -844,7 +844,6 @@ pub async fn register_agent(
 
     let tracked = tracked(&*conn);
 
-    let task_desc = task_description.unwrap_or_default();
     let attach_pol = attachments_policy.unwrap_or("auto");
 
     // Use raw SQL with explicit column names to avoid ORM row decoding issues
@@ -856,7 +855,9 @@ pub async fn register_agent(
             if let Some(mut row) = find_agent_by_name(&raw_rows, name) {
                 row.program = program.to_string();
                 row.model = model.to_string();
-                row.task_description = task_desc.to_string();
+                if let Some(task_desc) = task_description {
+                    row.task_description = task_desc.to_string();
+                }
                 row.last_active_ts = now;
                 row.attachments_policy = attach_pol.to_string();
                 match map_sql_outcome(update!(&row).execute(cx, &tracked).await) {
@@ -882,7 +883,7 @@ pub async fn register_agent(
                     name: name.to_string(),
                     program: program.to_string(),
                     model: model.to_string(),
-                    task_description: task_desc.to_string(),
+                    task_description: task_description.unwrap_or_default().to_string(),
                     inception_ts: now,
                     last_active_ts: now,
                     attachments_policy: attach_pol.to_string(),
@@ -920,7 +921,9 @@ pub async fn register_agent(
                         };
                         fresh.program = program.to_string();
                         fresh.model = model.to_string();
-                        fresh.task_description = task_desc.to_string();
+                        if let Some(task_desc) = task_description {
+                            fresh.task_description = task_desc.to_string();
+                        }
                         fresh.last_active_ts = now;
                         fresh.attachments_policy = attach_pol.to_string();
                         crate::cache::read_cache().put_agent(&fresh);
@@ -979,40 +982,29 @@ pub async fn create_agent(
     let task_desc = task_description.unwrap_or_default();
     let attach_pol = attachments_policy.unwrap_or("auto");
 
-    // Use a project-scoped fetch and filter in Rust for robust name matching.
-    let check_sql = "SELECT id, project_id, name, program, model, task_description, \
-                     inception_ts, last_active_ts, attachments_policy, contact_policy \
-                     FROM agents WHERE project_id = ?";
-    let check_params = [Value::BigInt(project_id)];
-
-    let exists = match map_sql_outcome(traw_query(cx, &tracked, check_sql, &check_params).await) {
-        Outcome::Ok(rows) => find_agent_by_name(&rows, name).is_some(),
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    if exists {
-        return Outcome::Err(DbError::duplicate(
-            "agent",
-            format!("{name} (project {project_id})"),
-        ));
-    }
-
-    let row = AgentRow {
-        id: None,
-        project_id,
-        name: name.to_string(),
-        program: program.to_string(),
-        model: model.to_string(),
-        task_description: task_desc.to_string(),
-        inception_ts: now,
-        last_active_ts: now,
-        attachments_policy: attach_pol.to_string(),
-        contact_policy: "auto".to_string(),
-    };
-    match map_sql_outcome(insert!(&row).execute(cx, &tracked).await) {
-        Outcome::Ok(_) => {
+    let insert_sql = "INSERT INTO agents \
+        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        ON CONFLICT(project_id, name) DO NOTHING";
+    let insert_params = [
+        Value::BigInt(project_id),
+        Value::Text(name.to_string()),
+        Value::Text(program.to_string()),
+        Value::Text(model.to_string()),
+        Value::Text(task_desc.to_string()),
+        Value::BigInt(now),
+        Value::BigInt(now),
+        Value::Text(attach_pol.to_string()),
+        Value::Text("auto".to_string()),
+    ];
+    match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await) {
+        Outcome::Ok(rows_affected) => {
+            if rows_affected == 0 {
+                return Outcome::Err(DbError::duplicate(
+                    "agent",
+                    format!("{name} (project {project_id})"),
+                ));
+            }
             match rebuild_indexes(cx, &tracked).await {
                 Outcome::Ok(()) => {}
                 Outcome::Err(e) => return Outcome::Err(e),
@@ -2211,7 +2203,8 @@ async fn run_like_fallback(
         params.push(Value::Text(escaped));
         where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
     }
-    let where_clause = where_parts.join(" AND ");
+    // Approximate FTS whitespace semantics (term union) in LIKE fallback mode.
+    let where_clause = where_parts.join(" OR ");
     params.push(Value::BigInt(limit));
 
     let sql = format!(
@@ -2244,7 +2237,8 @@ async fn run_like_fallback_product(
         params.push(Value::Text(escaped));
         where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
     }
-    let where_clause = where_parts.join(" AND ");
+    // Approximate FTS whitespace semantics (term union) in LIKE fallback mode.
+    let where_clause = where_parts.join(" OR ");
     params.push(Value::BigInt(limit));
 
     let sql = format!(
@@ -2805,7 +2799,7 @@ async fn run_like_fallback_global(
          WHERE {} \
          ORDER BY m.created_ts DESC \
          LIMIT ?",
-        conditions.join(" AND ")
+        conditions.join(" OR ")
     );
     params.push(Value::BigInt(limit));
 
@@ -5117,6 +5111,169 @@ mod tests {
     }
 
     #[test]
+    fn register_agent_without_task_description_preserves_existing_description() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_agent_preserve_task_desc.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-agent-preserve-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let initial = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("keep me"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("initial register agent");
+            assert_eq!(initial.task_description, "keep me");
+
+            let updated = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5.1",
+                None,
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("update register agent");
+            assert_eq!(updated.task_description, "keep me");
+            assert_eq!(updated.model, "gpt-5.1");
+
+            let fetched = get_agent(&cx, &pool, project_id, "BlueLake")
+                .await
+                .into_result()
+                .expect("get_agent after update");
+            assert_eq!(fetched.task_description, "keep me");
+            assert_eq!(fetched.model, "gpt-5.1");
+        });
+    }
+
+    #[test]
+    fn create_agent_duplicate_returns_duplicate_error() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("create_agent_duplicate_error.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-agent-dup-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("first"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("first create agent");
+
+            let err = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("second"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect_err("duplicate create should fail");
+
+            match err {
+                asupersync::OutcomeError::Err(DbError::Duplicate { entity, identifier }) => {
+                    assert_eq!(entity, "agent");
+                    assert!(identifier.contains("BlueLake"));
+                    assert!(identifier.contains(&project_id.to_string()));
+                }
+                other => panic!("expected duplicate error, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn ensure_project_and_project_lookups_succeed() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -5361,6 +5518,96 @@ mod tests {
             assert!(
                 subject.contains("term01"),
                 "returned message should contain seeded subject terms"
+            );
+        });
+    }
+
+    #[test]
+    fn run_like_fallback_uses_term_union_semantics() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("like_fallback_union.db");
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-like-union-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("like fallback union"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            create_message(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "needle only",
+                "contains needle token",
+                Some("THREAD-LIKE-UNION"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire conn");
+            let search_tracked = tracked(&*conn);
+            let terms = vec!["needle".to_string(), "missing".to_string()];
+
+            let rows = run_like_fallback(&cx, &search_tracked, project_id, &terms, 25)
+                .await
+                .into_result()
+                .expect("run like fallback");
+            assert_eq!(
+                rows.len(),
+                1,
+                "fallback should match when any extracted term appears"
             );
         });
     }
