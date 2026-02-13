@@ -35,7 +35,7 @@ workflows to native Rust commands.
 | Script | Native Equivalent | Status | Notes |
 |--------|-------------------|--------|-------|
 | `ci.sh` | -- | **Gap** | Add `am ci` command with `--quick`, `--report` flags |
-| `bench_cli.sh` | -- | **Gap** | Add `am bench cli` subcommand |
+| `bench_cli.sh` | `am bench` | **Migrated** | Native bench command is authoritative; script retained as compatibility shim with deprecation warning |
 | `bench_golden.sh` | -- | **Gap** | Add `am bench golden` subcommand |
 
 ### Flake Triage
@@ -186,7 +186,6 @@ workflows to native Rust commands.
 | Gap | Proposed Command | Rationale | Owner | Risk |
 |-----|------------------|-----------|-------|------|
 | CI runner | `am ci --quick --report <path>` | Frequently used in dev workflow | TBD | Low |
-| CLI benchmarks | `am bench cli` | Performance regression tracking | TBD | Low |
 | Golden benchmarks | `am bench golden` | Performance regression tracking | TBD | Low |
 
 ### Design Considerations
@@ -198,7 +197,7 @@ workflows to native Rust commands.
 - Should invoke existing Rust tooling, not shell out to cargo
 
 **`am bench` cluster:**
-- `am bench cli` — CLI operation latency benchmarks
+- `am bench` — CLI operation latency benchmarks (`--quick`, `--json`, `--baseline`, `--save-baseline`)
 - `am bench golden` — Regression tests against golden outputs
 - `am bench stress` — Load testing (future)
 
@@ -289,14 +288,14 @@ If rollback is triggered:
 | Category | Migrated | Partial | Gap | Retained |
 |----------|----------|---------|-----|----------|
 | Server/Wrappers | 0 | 0 | 0 | 1 |
-| CI/Quality | 0 | 0 | 3 | 0 |
+| CI/Quality | 1 | 0 | 2 | 0 |
 | Flake Triage | 1 | 0 | 0 | 0 |
 | Legacy Hooks | 1 | 0 | 0 | 0 |
 | E2E Harnesses | 0 | 0 | 0 | 15 |
 | TUI Tests | 0 | 0 | 0 | 5 |
 | Utility | 0 | 0 | 0 | 2 |
 | tests/e2e/ | 0 | 0 | 0 | 30 |
-| **Total** | **2** | **0** | **3** | **53** |
+| **Total** | **3** | **0** | **2** | **53** |
 
 ### Key Insights
 
@@ -306,9 +305,8 @@ If rollback is triggered:
 2. **The `scripts/am` wrapper is retained** for operator convenience — it handles
    auth token discovery and port reuse logic that would be awkward in the binary.
 
-3. **Only 3 gaps identified:**
+3. **Only 2 gaps identified:**
    - `ci.sh` → `am ci`
-   - `bench_cli.sh` → `am bench cli`
    - `bench_golden.sh` → `am bench golden`
 
 4. **`flake_triage.sh` is fully migrated** to `am flake-triage` with subcommands

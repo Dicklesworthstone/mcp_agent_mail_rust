@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# bench_cli.sh - CLI performance benchmarks using hyperfine.
+# DEPRECATED: Native `am bench` is authoritative for benchmark workflows.
+# bench_cli.sh - compatibility shim for legacy benchmark invocations.
 #
 # Usage:
-#   ./scripts/bench_cli.sh              # Run all benchmarks
-#   ./scripts/bench_cli.sh --json       # Output JSON summary
-#   ./scripts/bench_cli.sh --quick      # Quick mode (fewer runs)
+#   ./scripts/bench_cli.sh              # Deprecated: use `am bench`
+#   ./scripts/bench_cli.sh --json       # Deprecated: use `am bench --json`
+#   ./scripts/bench_cli.sh --quick      # Deprecated: use `am bench --quick`
 #
 # Requires: hyperfine
 # Outputs: benches/results/cli_<timestamp>.json
+#
+# Command mapping:
+#   ./scripts/bench_cli.sh              -> am bench
+#   ./scripts/bench_cli.sh --quick      -> am bench --quick
+#   ./scripts/bench_cli.sh --json       -> am bench --json
 
 set -euo pipefail
 
@@ -36,6 +42,9 @@ for arg in "$@"; do
         --quick) WARMUP=1; RUNS=3 ;;
     esac
 done
+
+echo "WARNING: scripts/bench_cli.sh is deprecated. Use 'am bench' instead." >&2
+echo "         Artifacts: benches/results/*.json (legacy) and am bench reports (native)." >&2
 
 # Check prerequisites
 if ! command -v hyperfine &>/dev/null; then

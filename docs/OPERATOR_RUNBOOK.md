@@ -390,6 +390,22 @@ am share deploy verify-live https://example.github.io/agent-mail \
 jq '{verdict, summary, remote_checks: [.stages.remote.checks[] | {id, severity, passed, message}]}' /tmp/verify-live.json
 ```
 
+Cloudflare Pages deployment path (native artifacts + verification):
+
+```bash
+# Generate deployment tooling files, including Cloudflare workflow + wrangler template
+am share deploy tooling /tmp/agent-mail-bundle
+
+# Expected Cloudflare artifacts
+ls /tmp/agent-mail-bundle/.github/workflows/deploy-cf-pages.yml
+ls /tmp/agent-mail-bundle/wrangler.toml.template
+
+# Verify a Cloudflare Pages host against the same bundle
+am share deploy verify-live https://<project>.pages.dev \
+  --bundle /tmp/agent-mail-bundle \
+  --json > /tmp/verify-live-cf.json
+```
+
 Interpretation:
 - Exit `0`: pass, or warning-only in non-strict mode.
 - Exit `1`: at least one error check failed, or warning-only with `--strict`.

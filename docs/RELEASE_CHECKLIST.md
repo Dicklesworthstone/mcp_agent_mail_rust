@@ -225,6 +225,13 @@ jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifact
    am share deploy verify-live https://example.github.io/agent-mail --bundle /tmp/agent-mail-bundle --json > /tmp/verify-live.json
    jq '.verdict, .summary' /tmp/verify-live.json
 
+   # Cloudflare Pages tooling + validation path:
+   am share deploy tooling /tmp/agent-mail-bundle
+   test -f /tmp/agent-mail-bundle/.github/workflows/deploy-cf-pages.yml
+   test -f /tmp/agent-mail-bundle/wrangler.toml.template
+   am share deploy verify-live https://example.pages.dev --bundle /tmp/agent-mail-bundle --json > /tmp/verify-live-cf.json
+   jq '.verdict, .summary' /tmp/verify-live-cf.json
+
    # MCP server starts:
    mcp-agent-mail serve --help      # Should exit 0
    ```

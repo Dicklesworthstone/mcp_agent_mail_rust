@@ -1,7 +1,7 @@
 # Performance Budgets
 
 Baseline performance targets for mcp-agent-mail Rust port.
-Updated via `scripts/bench_cli.sh` and `cargo bench`.
+Updated via native `am bench` and `cargo bench` (`scripts/bench_cli.sh` is compatibility-only/deprecated).
 
 ## Optimization Workflow
 
@@ -46,7 +46,7 @@ Targets based on initial baseline (2026-02-05). Budgets are 2x the measured base
 
 ## CLI Operational Budgets
 
-Baseline captured via `scripts/bench_cli.sh --quick` (2026-02-09). Seeded with 60 messages (50 BlueLake→RedFox + 10 RedFox→BlueLake).
+Baseline captured via `am bench --quick` (2026-02-09). Seeded with 60 messages (50 BlueLake→RedFox + 10 RedFox→BlueLake).
 
 | Command | Baseline (mean) | Budget | Notes |
 |---------|----------------|--------|-------|
