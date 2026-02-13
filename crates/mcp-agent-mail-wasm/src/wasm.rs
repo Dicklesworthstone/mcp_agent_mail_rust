@@ -5,7 +5,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use wasm_bindgen::prelude::*;
-use web_sys::{console, CanvasRenderingContext2d, HtmlCanvasElement, WebSocket};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, WebSocket, console};
 
 use crate::{AppConfig, InputEvent, StateSnapshot, SyncState, WsMessage};
 

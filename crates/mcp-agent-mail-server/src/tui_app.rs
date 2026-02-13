@@ -1109,7 +1109,7 @@ impl MailAppModel {
                 let ok = self
                     .screen_manager
                     .get_mut(MailScreenId::Timeline)
-                    .is_some_and(|s| s.reset_layout());
+                    .is_some_and(super::tui_screens::MailScreen::reset_layout);
                 if ok {
                     self.notifications.notify(
                         Toast::new("Layout reset")
@@ -1130,7 +1130,7 @@ impl MailAppModel {
                 let path = self
                     .screen_manager
                     .get(MailScreenId::Timeline)
-                    .and_then(|s| s.export_layout());
+                    .and_then(super::tui_screens::MailScreen::export_layout);
                 if let Some(path) = path {
                     self.notifications.notify(
                         Toast::new(format!("Exported layout to {}", path.display()))
@@ -1150,7 +1150,7 @@ impl MailAppModel {
                 let ok = self
                     .screen_manager
                     .get_mut(MailScreenId::Timeline)
-                    .is_some_and(|s| s.import_layout());
+                    .is_some_and(super::tui_screens::MailScreen::import_layout);
                 if ok {
                     self.notifications.notify(
                         Toast::new("Imported layout")
@@ -1951,7 +1951,7 @@ impl Model for MailAppModel {
         let screen_bindings = self
             .screen_manager
             .active_screen_ref()
-            .map(|s| s.keybindings())
+            .map(super::tui_screens::MailScreen::keybindings)
             .unwrap_or_default();
 
         // 3. Status line (z=3)

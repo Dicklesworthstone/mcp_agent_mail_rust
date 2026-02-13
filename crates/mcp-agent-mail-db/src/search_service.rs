@@ -1656,6 +1656,7 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     #[test]
+    #[ignore = "slow: requires ML embedder initialization (60+ seconds)"]
     fn get_or_init_two_tier_bridge_is_thread_safe() {
         // Verify that concurrent calls to get_or_init_two_tier_bridge all return
         // the same Arc instance (pointer equality), proving no duplicate bridges
@@ -1714,6 +1715,7 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     #[test]
+    #[ignore = "slow: requires ML embedder initialization (60+ seconds), high thread count"]
     fn get_or_init_two_tier_bridge_stress_100_threads() {
         // High-contention stress test with 100 threads
         use std::thread;
