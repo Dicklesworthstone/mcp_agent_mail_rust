@@ -6101,7 +6101,13 @@ mod tests {
             match wbq_enqueue(op_template.clone()) {
                 WbqEnqueueResult::Enqueued => return,
                 WbqEnqueueResult::SkippedDiskCritical => {
-                    panic!("{context}: enqueue skipped due critical disk pressure")
+                    if std::time::Instant::now() >= deadline {
+                        panic!(
+                            "{context}: enqueue remained skipped due critical disk pressure \
+                             after {attempts} attempts"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
                 WbqEnqueueResult::QueueUnavailable => {
                     if std::time::Instant::now() >= deadline {
