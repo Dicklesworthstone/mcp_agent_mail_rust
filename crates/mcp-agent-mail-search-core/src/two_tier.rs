@@ -125,6 +125,10 @@ pub struct TwoTierEntry {
     pub fast_embedding: Vec<f16>,
     /// Quality embedding (f16 quantized, `MiniLM`). Optional for incremental adds.
     pub quality_embedding: Vec<f16>,
+    /// Whether a real quality embedding was computed (not zero-filled fallback).
+    /// Documents without quality embeddings participate in fast search but are
+    /// excluded from quality refinement scoring.
+    pub has_quality: bool,
 }
 
 /// Search result with score and metadata.
@@ -210,8 +214,19 @@ pub struct TwoTierIndex {
     doc_kinds: Vec<crate::document::DocKind>,
     /// Project IDs in index order.
     project_ids: Vec<Option<i64>>,
+    /// Whether each document has a real quality embedding (not zero-filled).
+    has_quality_flags: Vec<bool>,
     /// Configuration.
     config: TwoTierConfig,
+}
+
+/// Check if an f16 embedding is effectively a zero vector.
+///
+/// Returns true if all components are zero (or very close to zero),
+/// indicating the embedding was filled with zeros as a fallback.
+#[inline]
+fn is_zero_vector_f16(embedding: &[f16]) -> bool {
+    embedding.iter().all(|&v| f32::from(v).abs() < f32::EPSILON)
 }
 
 impl TwoTierIndex {
@@ -234,6 +249,7 @@ impl TwoTierIndex {
             doc_ids: Vec::new(),
             doc_kinds: Vec::new(),
             project_ids: Vec::new(),
+            has_quality_flags: Vec::new(),
             config: config.clone(),
         }
     }
@@ -269,6 +285,7 @@ impl TwoTierIndex {
                 doc_ids: Vec::new(),
                 doc_kinds: Vec::new(),
                 project_ids: Vec::new(),
+                has_quality_flags: Vec::new(),
                 config: config.clone(),
             });
         }
@@ -299,13 +316,17 @@ impl TwoTierIndex {
         let mut doc_ids = Vec::with_capacity(doc_count);
         let mut doc_kinds = Vec::with_capacity(doc_count);
         let mut project_ids = Vec::with_capacity(doc_count);
+        let mut has_quality_flags = Vec::with_capacity(doc_count);
 
         for entry in entries {
+            // Determine has_quality: use explicit flag if set, otherwise detect zero vectors
+            let has_quality = entry.has_quality && !is_zero_vector_f16(&entry.quality_embedding);
             fast_embeddings.extend(entry.fast_embedding);
             quality_embeddings.extend(entry.quality_embedding);
             doc_ids.push(entry.doc_id);
             doc_kinds.push(entry.doc_kind);
             project_ids.push(entry.project_id);
+            has_quality_flags.push(has_quality);
         }
 
         Ok(Self {
@@ -324,6 +345,7 @@ impl TwoTierIndex {
             doc_ids,
             doc_kinds,
             project_ids,
+            has_quality_flags,
             config: config.clone(),
         })
     }
@@ -344,6 +366,75 @@ impl TwoTierIndex {
     #[must_use]
     pub fn doc_id(&self, idx: usize) -> Option<u64> {
         self.doc_ids.get(idx).copied()
+    }
+
+    /// Check if document at index has a real quality embedding.
+    #[must_use]
+    pub fn has_quality(&self, idx: usize) -> bool {
+        self.has_quality_flags.get(idx).copied().unwrap_or(false)
+    }
+
+    /// Get the count of documents with quality embeddings.
+    #[must_use]
+    pub fn quality_count(&self) -> usize {
+        self.has_quality_flags.iter().filter(|&&v| v).count()
+    }
+
+    /// Get quality embedding coverage as a ratio (0.0 to 1.0).
+    #[must_use]
+    pub fn quality_coverage(&self) -> f32 {
+        if self.metadata.doc_count == 0 {
+            return 1.0; // Empty index has "full" coverage
+        }
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.quality_count() as f32 / self.metadata.doc_count as f32
+        }
+    }
+
+    /// Detect documents with zero-vector quality embeddings.
+    ///
+    /// Returns document IDs that have `has_quality=true` but actually contain
+    /// zero vectors (indicating data corruption or migration issues).
+    #[must_use]
+    pub fn detect_zero_quality_docs(&self) -> Vec<u64> {
+        self.doc_ids
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| {
+                // Only check docs marked as having quality
+                if !self.has_quality(*idx) {
+                    return false;
+                }
+                // Check if their embedding is actually zero
+                self.quality_embedding(*idx).is_some_and(is_zero_vector_f16)
+            })
+            .map(|(_, &id)| id)
+            .collect()
+    }
+
+    /// Migrate zero-vector quality documents to `has_quality=false`.
+    ///
+    /// Returns the count of documents migrated.
+    pub fn migrate_zero_quality_to_no_quality(&mut self) -> usize {
+        let mut count = 0;
+        for idx in 0..self.metadata.doc_count {
+            if self.has_quality_flags.get(idx).copied().unwrap_or(false) {
+                if let Some(emb) = self.quality_embedding(idx) {
+                    if is_zero_vector_f16(emb) {
+                        self.has_quality_flags[idx] = false;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        if count > 0 {
+            debug!(
+                migrated = count,
+                "Migrated zero-quality docs to has_quality=false"
+            );
+        }
+        count
     }
 
     /// Get fast embedding at index.
@@ -493,11 +584,15 @@ impl TwoTierIndex {
             )));
         }
 
+        // Determine has_quality: use explicit flag if set, otherwise detect zero vectors
+        let has_quality = entry.has_quality && !is_zero_vector_f16(&entry.quality_embedding);
+
         self.fast_embeddings.extend(entry.fast_embedding);
         self.quality_embeddings.extend(entry.quality_embedding);
         self.doc_ids.push(entry.doc_id);
         self.doc_kinds.push(entry.doc_kind);
         self.project_ids.push(entry.project_id);
+        self.has_quality_flags.push(has_quality);
         self.metadata.doc_count += 1;
 
         Ok(())
@@ -804,17 +899,29 @@ impl Iterator for TwoTierSearchIter<'_> {
                                 .index
                                 .quality_scores_for_indices(&query_vec, &candidates);
 
-                            // Blend scores
+                            // Blend scores, but only for docs with quality embeddings.
+                            // Docs without quality use fast score only.
                             let weight = self.searcher.config.quality_weight;
                             let mut blended: Vec<ScoredResult> = fast_results
                                 .iter()
                                 .zip(quality_scores.iter())
-                                .map(|(fast, &quality)| ScoredResult {
-                                    idx: fast.idx,
-                                    doc_id: fast.doc_id,
-                                    doc_kind: fast.doc_kind,
-                                    project_id: fast.project_id,
-                                    score: (1.0 - weight).mul_add(fast.score, weight * quality),
+                                .map(|(fast, &quality)| {
+                                    // Check if this doc has a real quality embedding
+                                    let effective_weight =
+                                        if self.searcher.index.has_quality(fast.idx) {
+                                            weight
+                                        } else {
+                                            // No quality embedding: use fast score only
+                                            0.0
+                                        };
+                                    ScoredResult {
+                                        idx: fast.idx,
+                                        doc_id: fast.doc_id,
+                                        doc_kind: fast.doc_kind,
+                                        project_id: fast.project_id,
+                                        score: (1.0 - effective_weight)
+                                            .mul_add(fast.score, effective_weight * quality),
+                                    }
                                 })
                                 .collect();
 
@@ -864,6 +971,7 @@ mod tests {
                 quality_embedding: (0..config.quality_dimension)
                     .map(|j| f16::from_f32((i + j) as f32 * 0.01))
                     .collect(),
+                has_quality: true,
             })
             .collect()
     }
@@ -903,6 +1011,7 @@ mod tests {
             project_id: Some(1),
             fast_embedding: vec![f16::from_f32(1.0); 128], // Wrong dimension
             quality_embedding: vec![f16::from_f32(1.0); config.quality_dimension],
+            has_quality: true,
         }];
 
         let result = TwoTierIndex::build("fast", "quality", &config, entries);
@@ -1044,10 +1153,100 @@ mod tests {
             project_id: Some(1),
             fast_embedding: vec![f16::from_f32(1.0); config.fast_dimension],
             quality_embedding: vec![f16::from_f32(1.0); config.quality_dimension],
+            has_quality: true,
         };
 
         index.add_entry(entry).unwrap();
         assert_eq!(index.len(), 1);
         assert_eq!(index.doc_id(0), Some(42));
+        assert!(index.has_quality(0));
+    }
+
+    #[test]
+    fn test_has_quality_flag() {
+        let config = TwoTierConfig::default();
+        let mut index = TwoTierIndex::new(&config);
+
+        // Add entry with quality
+        let entry_with_quality = TwoTierEntry {
+            doc_id: 1,
+            doc_kind: crate::document::DocKind::Message,
+            project_id: Some(1),
+            fast_embedding: vec![f16::from_f32(1.0); config.fast_dimension],
+            quality_embedding: vec![f16::from_f32(1.0); config.quality_dimension],
+            has_quality: true,
+        };
+        index.add_entry(entry_with_quality).unwrap();
+
+        // Add entry without quality (zero vector)
+        let entry_without_quality = TwoTierEntry {
+            doc_id: 2,
+            doc_kind: crate::document::DocKind::Message,
+            project_id: Some(1),
+            fast_embedding: vec![f16::from_f32(1.0); config.fast_dimension],
+            quality_embedding: vec![f16::from_f32(0.0); config.quality_dimension],
+            has_quality: false,
+        };
+        index.add_entry(entry_without_quality).unwrap();
+
+        assert_eq!(index.len(), 2);
+        assert!(index.has_quality(0));
+        assert!(!index.has_quality(1));
+        assert_eq!(index.quality_count(), 1);
+        assert!((index.quality_coverage() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_zero_vector_detection() {
+        let config = TwoTierConfig::default();
+        let mut index = TwoTierIndex::new(&config);
+
+        // Add entry marked as having quality but with zero vector (corruption case)
+        let entry = TwoTierEntry {
+            doc_id: 99,
+            doc_kind: crate::document::DocKind::Message,
+            project_id: Some(1),
+            fast_embedding: vec![f16::from_f32(1.0); config.fast_dimension],
+            quality_embedding: vec![f16::from_f32(0.0); config.quality_dimension],
+            has_quality: true, // Marked true but embedding is zero
+        };
+        index.add_entry(entry).unwrap();
+
+        // The add_entry should detect zero vector and set has_quality=false
+        assert!(!index.has_quality(0));
+        assert_eq!(index.quality_count(), 0);
+    }
+
+    #[test]
+    fn test_migrate_zero_quality() {
+        let config = TwoTierConfig::default();
+
+        // Build index with a mix of real and zero-vector quality embeddings
+        // Note: build() also detects zero vectors, so we test migration on
+        // an index where has_quality_flags were manually set incorrectly
+        let mut index = TwoTierIndex::new(&config);
+
+        // Manually add entries to simulate pre-migration state
+        index
+            .fast_embeddings
+            .extend(vec![f16::from_f32(1.0); config.fast_dimension]);
+        index
+            .quality_embeddings
+            .extend(vec![f16::from_f32(0.0); config.quality_dimension]);
+        index.doc_ids.push(1);
+        index.doc_kinds.push(crate::document::DocKind::Message);
+        index.project_ids.push(Some(1));
+        index.has_quality_flags.push(true); // Incorrectly marked as having quality
+        index.metadata.doc_count = 1;
+
+        // Before migration: incorrectly marked
+        assert!(index.has_quality_flags[0]);
+
+        // Run migration
+        let migrated = index.migrate_zero_quality_to_no_quality();
+        assert_eq!(migrated, 1);
+
+        // After migration: correctly marked
+        assert!(!index.has_quality(0));
     }
 }

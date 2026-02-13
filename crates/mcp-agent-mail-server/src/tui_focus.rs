@@ -18,8 +18,8 @@
 //!
 //! // Set up focus ring for a screen
 //! focus.set_focus_ring(vec![
-//!     FocusTarget::SearchBar,
-//!     FocusTarget::ResultList,
+//!     FocusTarget::TextInput(0),  // Search bar
+//!     FocusTarget::List(0),       // Result list
 //!     FocusTarget::DetailPanel,
 //! ]);
 //!
@@ -29,7 +29,7 @@
 //! }
 //!
 //! // Check current focus
-//! if focus.is_focused(FocusTarget::SearchBar) {
+//! if focus.is_focused(FocusTarget::TextInput(0)) {
 //!     // Handle search bar input
 //! }
 //! ```
@@ -132,6 +132,12 @@ impl FocusContext {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FocusSnapshot {
+    context: FocusContext,
+    target: FocusTarget,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // FocusManager — centralized focus tracking
 // ──────────────────────────────────────────────────────────────────────
@@ -150,8 +156,8 @@ pub struct FocusManager {
     focus_ring: Vec<FocusTarget>,
     /// Index into focus_ring for current focus
     ring_index: usize,
-    /// Previous focus target (for restoration after modal closes)
-    previous: FocusTarget,
+    /// Stack of context/target snapshots for nested focus traps.
+    snapshot_stack: Vec<FocusSnapshot>,
     /// Whether focus indicator should be visible
     indicator_visible: bool,
 }
@@ -171,7 +177,7 @@ impl FocusManager {
             current: FocusTarget::None,
             focus_ring: Vec::new(),
             ring_index: 0,
-            previous: FocusTarget::None,
+            snapshot_stack: Vec::new(),
             indicator_visible: true,
         }
     }
@@ -185,8 +191,29 @@ impl FocusManager {
             current,
             focus_ring: ring,
             ring_index: 0,
-            previous: FocusTarget::None,
+            snapshot_stack: Vec::new(),
             indicator_visible: true,
+        }
+    }
+
+    fn ring_index_of(&self, target: FocusTarget) -> Option<usize> {
+        self.focus_ring.iter().position(|&t| t == target)
+    }
+
+    fn restore_target(&mut self, target: FocusTarget) {
+        self.current = target;
+        if let Some(idx) = self.ring_index_of(target) {
+            self.ring_index = idx;
+        }
+    }
+
+    fn default_target_for_context(context: FocusContext) -> Option<FocusTarget> {
+        match context {
+            FocusContext::Modal => Some(FocusTarget::ModalContent),
+            FocusContext::CommandPalette => Some(FocusTarget::TextInput(0)),
+            FocusContext::ActionMenu => Some(FocusTarget::List(0)),
+            FocusContext::ToastPanel => Some(FocusTarget::List(0)),
+            FocusContext::Screen => None,
         }
     }
 
@@ -235,9 +262,22 @@ impl FocusManager {
     /// The first element becomes the default focus target.
     pub fn set_focus_ring(&mut self, ring: Vec<FocusTarget>) {
         self.focus_ring = ring;
+        if self.focus_ring.is_empty() {
+            self.ring_index = 0;
+            if self.context == FocusContext::Screen {
+                self.current = FocusTarget::None;
+            }
+            return;
+        }
+
+        if let Some(idx) = self.ring_index_of(self.current) {
+            self.ring_index = idx;
+            return;
+        }
+
         self.ring_index = 0;
-        if let Some(&first) = self.focus_ring.first() {
-            if self.current == FocusTarget::None {
+        if self.context == FocusContext::Screen {
+            if let Some(&first) = self.focus_ring.first() {
                 self.current = first;
             }
         }
@@ -258,11 +298,10 @@ impl FocusManager {
         if self.current == target {
             return false;
         }
-        self.previous = self.current;
         self.current = target;
 
         // Update ring index if target is in the ring
-        if let Some(idx) = self.focus_ring.iter().position(|&t| t == target) {
+        if let Some(idx) = self.ring_index_of(target) {
             self.ring_index = idx;
         }
         true
@@ -275,7 +314,13 @@ impl FocusManager {
         if self.focus_ring.is_empty() {
             return false;
         }
-        self.ring_index = (self.ring_index + 1) % self.focus_ring.len();
+        let len = self.focus_ring.len();
+        self.ring_index = if let Some(idx) = self.ring_index_of(self.current) {
+            idx
+        } else {
+            len - 1
+        };
+        self.ring_index = (self.ring_index + 1) % len;
         let target = self.focus_ring[self.ring_index];
         self.focus(target)
     }
@@ -288,6 +333,7 @@ impl FocusManager {
             return false;
         }
         let len = self.focus_ring.len();
+        self.ring_index = self.ring_index_of(self.current).unwrap_or(0);
         self.ring_index = (self.ring_index + len - 1) % len;
         let target = self.focus_ring[self.ring_index];
         self.focus(target)
@@ -306,13 +352,14 @@ impl FocusManager {
         }
     }
 
-    /// Restore focus to the previous target.
+    /// Restore focus to the previous context/target snapshot.
     ///
-    /// Used when closing modals or canceling operations.
+    /// Used when closing nested modals/menus or canceling operations.
+    /// No-op when no snapshot exists.
     pub fn restore(&mut self) {
-        if self.previous != FocusTarget::None {
-            let target = self.previous;
-            self.focus(target);
+        if let Some(snapshot) = self.snapshot_stack.pop() {
+            self.context = snapshot.context;
+            self.restore_target(snapshot.target);
         }
     }
 
@@ -322,24 +369,26 @@ impl FocusManager {
     ///
     /// Saves the current focus target for later restoration.
     pub fn push_context(&mut self, context: FocusContext) {
-        self.previous = self.current;
+        self.snapshot_stack.push(FocusSnapshot {
+            context: self.context,
+            target: self.current,
+        });
         self.context = context;
 
         // Set appropriate default focus for the context
-        match context {
-            FocusContext::Modal => self.current = FocusTarget::ModalContent,
-            FocusContext::CommandPalette => self.current = FocusTarget::TextInput(0),
-            FocusContext::ActionMenu => self.current = FocusTarget::List(0),
-            FocusContext::ToastPanel => self.current = FocusTarget::List(0),
-            FocusContext::Screen => {}
+        if let Some(target) = Self::default_target_for_context(context) {
+            self.restore_target(target);
         }
     }
 
     /// Pop the current focus context (e.g., closing a modal).
     ///
-    /// Restores the previous focus target.
+    /// Restores the previous focus context/target snapshot.
     pub fn pop_context(&mut self) {
-        self.context = FocusContext::Screen;
+        if self.snapshot_stack.is_empty() {
+            self.context = FocusContext::Screen;
+            return;
+        }
         self.restore();
     }
 
@@ -378,19 +427,14 @@ pub fn focus_style() -> Style {
 #[must_use]
 pub fn focus_input_style() -> Style {
     let p = theme::current_palette();
-    Style::default()
-        .fg(p.fg_primary)
-        .bg(p.bg_highlight)
+    Style::default().fg(p.fg_primary).bg(p.bg_highlight)
 }
 
 /// Style for a focused list item.
 #[must_use]
 pub fn focus_list_style() -> Style {
     let p = theme::current_palette();
-    Style::default()
-        .fg(p.fg_primary)
-        .bg(p.bg_surface)
-        .bold()
+    Style::default().fg(p.fg_primary).bg(p.bg_surface).bold()
 }
 
 /// Style for the focus indicator border.
@@ -515,10 +559,7 @@ mod tests {
 
     #[test]
     fn focus_manager_with_ring() {
-        let fm = FocusManager::with_ring(vec![
-            FocusTarget::TextInput(0),
-            FocusTarget::List(0),
-        ]);
+        let fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0), FocusTarget::List(0)]);
         assert_eq!(fm.current(), FocusTarget::TextInput(0));
     }
 
@@ -565,10 +606,7 @@ mod tests {
 
     #[test]
     fn focus_context_push_pop() {
-        let mut fm = FocusManager::with_ring(vec![
-            FocusTarget::TextInput(0),
-            FocusTarget::List(0),
-        ]);
+        let mut fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0), FocusTarget::List(0)]);
 
         fm.focus(FocusTarget::List(0));
         assert_eq!(fm.current(), FocusTarget::List(0));
@@ -585,6 +623,28 @@ mod tests {
         assert_eq!(fm.context(), FocusContext::Screen);
         assert_eq!(fm.current(), FocusTarget::List(0));
         assert!(!fm.is_trapped());
+    }
+
+    #[test]
+    fn nested_focus_context_pop_restores_lifo() {
+        let mut fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0), FocusTarget::List(0)]);
+        fm.focus(FocusTarget::List(0));
+
+        fm.push_context(FocusContext::Modal);
+        assert_eq!(fm.context(), FocusContext::Modal);
+        assert_eq!(fm.current(), FocusTarget::ModalContent);
+
+        fm.push_context(FocusContext::ActionMenu);
+        assert_eq!(fm.context(), FocusContext::ActionMenu);
+        assert_eq!(fm.current(), FocusTarget::List(0));
+
+        fm.pop_context();
+        assert_eq!(fm.context(), FocusContext::Modal);
+        assert_eq!(fm.current(), FocusTarget::ModalContent);
+
+        fm.pop_context();
+        assert_eq!(fm.context(), FocusContext::Screen);
+        assert_eq!(fm.current(), FocusTarget::List(0));
     }
 
     #[test]
@@ -636,6 +696,45 @@ mod tests {
         let mut fm = FocusManager::new();
         assert!(!fm.handle_tab(false));
         assert!(!fm.handle_tab(true));
+    }
+
+    #[test]
+    fn tab_from_non_ring_focus_moves_to_ring_edges() {
+        let mut fm = FocusManager::with_ring(vec![
+            FocusTarget::TextInput(0),
+            FocusTarget::List(0),
+            FocusTarget::DetailPanel,
+        ]);
+
+        fm.focus(FocusTarget::ModalContent);
+        assert!(fm.handle_tab(false));
+        assert_eq!(fm.current(), FocusTarget::TextInput(0));
+
+        fm.focus(FocusTarget::ModalContent);
+        assert!(fm.handle_tab(true));
+        assert_eq!(fm.current(), FocusTarget::DetailPanel);
+    }
+
+    #[test]
+    fn set_focus_ring_adopts_first_target_when_current_missing_on_screen() {
+        let mut fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0), FocusTarget::List(0)]);
+        fm.focus(FocusTarget::DetailPanel);
+
+        fm.set_focus_ring(vec![FocusTarget::Button(0), FocusTarget::List(1)]);
+        assert_eq!(fm.current(), FocusTarget::Button(0));
+        assert!(fm.handle_tab(false));
+        assert_eq!(fm.current(), FocusTarget::List(1));
+    }
+
+    #[test]
+    fn set_focus_ring_does_not_clobber_modal_focus() {
+        let mut fm = FocusManager::with_ring(vec![FocusTarget::TextInput(0), FocusTarget::List(0)]);
+        fm.push_context(FocusContext::Modal);
+        assert_eq!(fm.current(), FocusTarget::ModalContent);
+
+        fm.set_focus_ring(vec![FocusTarget::Button(1), FocusTarget::List(1)]);
+        assert_eq!(fm.context(), FocusContext::Modal);
+        assert_eq!(fm.current(), FocusTarget::ModalContent);
     }
 
     #[test]
