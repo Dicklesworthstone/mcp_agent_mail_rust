@@ -220,4 +220,133 @@ mod tests {
         let docs = source.fetch_all_batched(100, 0).unwrap();
         assert!(docs.is_empty());
     }
+
+    // ── IndexHealth serde ───────────────────────────────────────────────
+
+    #[test]
+    fn index_health_serde_roundtrip() {
+        let health = IndexHealth {
+            ready: true,
+            doc_count: 1000,
+            size_bytes: Some(4096),
+            last_updated_ts: Some(1_700_000_000_000_000),
+            status_message: "all good".to_owned(),
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        let back: IndexHealth = serde_json::from_str(&json).unwrap();
+        assert!(back.ready);
+        assert_eq!(back.doc_count, 1000);
+        assert_eq!(back.size_bytes, Some(4096));
+        assert_eq!(back.last_updated_ts, Some(1_700_000_000_000_000));
+        assert_eq!(back.status_message, "all good");
+    }
+
+    #[test]
+    fn index_health_not_ready() {
+        let health = IndexHealth {
+            ready: false,
+            doc_count: 0,
+            size_bytes: None,
+            last_updated_ts: None,
+            status_message: "building".to_owned(),
+        };
+        assert!(!health.ready);
+        assert!(health.size_bytes.is_none());
+    }
+
+    // ── IndexStats serde ────────────────────────────────────────────────
+
+    #[test]
+    fn index_stats_serde_roundtrip() {
+        let stats = IndexStats {
+            docs_indexed: 500,
+            docs_removed: 10,
+            elapsed_ms: 1234,
+            warnings: vec!["slow batch".to_owned()],
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: IndexStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.docs_indexed, 500);
+        assert_eq!(back.docs_removed, 10);
+        assert_eq!(back.elapsed_ms, 1234);
+        assert_eq!(back.warnings, vec!["slow batch"]);
+    }
+
+    #[test]
+    fn index_stats_empty_warnings() {
+        let stats = IndexStats {
+            docs_indexed: 0,
+            docs_removed: 0,
+            elapsed_ms: 0,
+            warnings: vec![],
+        };
+        assert!(stats.warnings.is_empty());
+    }
+
+    // ── Trait object safety ─────────────────────────────────────────────
+
+    #[test]
+    fn search_engine_trait_object_safe() {
+        let engine: Box<dyn SearchEngine> = Box::new(StubEngine);
+        let query = SearchQuery::new("test");
+        let results = engine.search(&query).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn index_lifecycle_trait_object_safe() {
+        let lifecycle: Box<dyn IndexLifecycle> = Box::new(StubLifecycle);
+        assert!(lifecycle.health().ready);
+    }
+
+    #[test]
+    fn document_source_trait_object_safe() {
+        let source: Box<dyn DocumentSource> = Box::new(StubSource);
+        assert_eq!(source.total_count().unwrap(), 0);
+    }
+
+    // ── StubLifecycle incremental with changes ──────────────────────────
+
+    #[test]
+    fn stub_lifecycle_incremental_with_changes() {
+        use crate::document::{DocKind, Document};
+        use std::collections::HashMap;
+
+        let lifecycle = StubLifecycle;
+        let doc = Document {
+            id: 1,
+            kind: DocKind::Message,
+            body: "test body".to_owned(),
+            title: "test title".to_owned(),
+            project_id: Some(1),
+            created_ts: 1_000_000,
+            metadata: HashMap::new(),
+        };
+        let changes = vec![
+            DocChange::Upsert(doc),
+            DocChange::Delete {
+                id: 2,
+                kind: DocKind::Message,
+            },
+        ];
+        let count = lifecycle.update_incremental(&changes).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ── StubSource batch with IDs ───────────────────────────────────────
+
+    #[test]
+    fn stub_source_fetch_batch_with_ids_returns_empty() {
+        let source = StubSource;
+        let docs = source.fetch_batch(&[1, 2, 3]).unwrap();
+        // Stub returns empty regardless of input
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn stub_source_fetch_all_batched_with_offset() {
+        let source = StubSource;
+        let docs = source.fetch_all_batched(50, 100).unwrap();
+        assert!(docs.is_empty());
+    }
 }

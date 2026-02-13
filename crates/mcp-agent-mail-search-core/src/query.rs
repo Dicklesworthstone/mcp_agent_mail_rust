@@ -253,4 +253,178 @@ mod tests {
         assert_eq!(range2.start, Some(1_000_000));
         assert_eq!(range2.end, Some(2_000_000));
     }
+
+    // ── SearchMode serde ────────────────────────────────────────────────
+
+    #[test]
+    fn search_mode_serde_all_variants() {
+        for mode in [
+            SearchMode::Lexical,
+            SearchMode::Semantic,
+            SearchMode::Hybrid,
+            SearchMode::Auto,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: SearchMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, mode);
+        }
+    }
+
+    #[test]
+    fn search_mode_serde_snake_case() {
+        let json = serde_json::to_string(&SearchMode::Lexical).unwrap();
+        assert_eq!(json, "\"lexical\"");
+        let json = serde_json::to_string(&SearchMode::Auto).unwrap();
+        assert_eq!(json, "\"auto\"");
+    }
+
+    #[test]
+    fn search_mode_hash_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(SearchMode::Lexical);
+        set.insert(SearchMode::Semantic);
+        set.insert(SearchMode::Hybrid);
+        set.insert(SearchMode::Auto);
+        assert_eq!(set.len(), 4);
+    }
+
+    // ── ImportanceFilter serde ──────────────────────────────────────────
+
+    #[test]
+    fn importance_filter_serde_all_variants() {
+        for filter in [
+            ImportanceFilter::Any,
+            ImportanceFilter::Urgent,
+            ImportanceFilter::High,
+            ImportanceFilter::Normal,
+            ImportanceFilter::Low,
+        ] {
+            let json = serde_json::to_string(&filter).unwrap();
+            let back: ImportanceFilter = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, filter);
+        }
+    }
+
+    // ── DateRange edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn date_range_start_only() {
+        let range = DateRange {
+            start: Some(100),
+            end: None,
+        };
+        let json = serde_json::to_string(&range).unwrap();
+        let back: DateRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.start, Some(100));
+        assert!(back.end.is_none());
+    }
+
+    #[test]
+    fn date_range_end_only() {
+        let range = DateRange {
+            start: None,
+            end: Some(200),
+        };
+        let json = serde_json::to_string(&range).unwrap();
+        let back: DateRange = serde_json::from_str(&json).unwrap();
+        assert!(back.start.is_none());
+        assert_eq!(back.end, Some(200));
+    }
+
+    #[test]
+    fn date_range_both_none() {
+        let range = DateRange {
+            start: None,
+            end: None,
+        };
+        let json = serde_json::to_string(&range).unwrap();
+        let back: DateRange = serde_json::from_str(&json).unwrap();
+        assert!(back.start.is_none());
+        assert!(back.end.is_none());
+    }
+
+    // ── SearchFilter populated ──────────────────────────────────────────
+
+    #[test]
+    fn search_filter_all_fields_set() {
+        let filter = SearchFilter {
+            sender: Some("Agent".to_owned()),
+            project_id: Some(1),
+            date_range: Some(DateRange {
+                start: Some(100),
+                end: Some(200),
+            }),
+            importance: Some(ImportanceFilter::Urgent),
+            thread_id: Some("thread-1".to_owned()),
+            doc_kind: Some(DocKind::Message),
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        let back: SearchFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sender.as_deref(), Some("Agent"));
+        assert_eq!(back.project_id, Some(1));
+        assert_eq!(back.importance, Some(ImportanceFilter::Urgent));
+        assert_eq!(back.thread_id.as_deref(), Some("thread-1"));
+    }
+
+    // ── SearchQuery deserialization defaults ─────────────────────────────
+
+    #[test]
+    fn query_deserialize_minimal_json() {
+        let json = r#"{"raw_query": "test"}"#;
+        let q: SearchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.raw_query, "test");
+        assert_eq!(q.mode, SearchMode::Auto); // default
+        assert_eq!(q.limit, 20); // default_limit
+        assert_eq!(q.offset, 0); // default
+        assert!(!q.explain); // default
+    }
+
+    #[test]
+    fn query_with_mode_returns_correct_mode() {
+        let q = SearchQuery::new("x").with_mode(SearchMode::Semantic);
+        assert_eq!(q.mode, SearchMode::Semantic);
+    }
+
+    #[test]
+    fn query_with_limit_returns_correct_limit() {
+        let q = SearchQuery::new("x").with_limit(100);
+        assert_eq!(q.limit, 100);
+    }
+
+    #[test]
+    fn query_with_offset_returns_correct_offset() {
+        let q = SearchQuery::new("x").with_offset(42);
+        assert_eq!(q.offset, 42);
+    }
+
+    #[test]
+    fn query_with_explain_sets_true() {
+        let q = SearchQuery::new("x").with_explain();
+        assert!(q.explain);
+    }
+
+    // ── SearchFilter doc_kind variants ──────────────────────────────────
+
+    #[test]
+    fn search_filter_doc_kind_agent() {
+        let filter = SearchFilter {
+            doc_kind: Some(DocKind::Agent),
+            ..SearchFilter::default()
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        let back: SearchFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.doc_kind, Some(DocKind::Agent));
+    }
+
+    #[test]
+    fn search_filter_doc_kind_project() {
+        let filter = SearchFilter {
+            doc_kind: Some(DocKind::Project),
+            ..SearchFilter::default()
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        let back: SearchFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.doc_kind, Some(DocKind::Project));
+    }
 }
