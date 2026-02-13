@@ -734,10 +734,15 @@ trap - EXIT
 # Focused subsuites (copied into this artifact dir)
 # ---------------------------------------------------------------------------
 
-e2e_banner "Focused subsuites (copied)"
+if [ "${AM_E2E_HTTP_INCLUDE_FOCUSED_SUBSUITES:-1}" = "1" ]; then
+    e2e_banner "Focused subsuites (copied)"
 
-for suite in jwt rate_limit peer_addr mail_ui http_streamable; do
-    run_subsuite_and_copy "${suite}" || e2e_fatal "subsuite failed: ${suite}"
-done
+    for suite in jwt rate_limit peer_addr mail_ui http_streamable; do
+        run_subsuite_and_copy "${suite}" || e2e_fatal "subsuite failed: ${suite}"
+    done
+else
+    e2e_case_banner "Focused subsuites disabled"
+    e2e_skip "focused subsuites disabled via AM_E2E_HTTP_INCLUDE_FOCUSED_SUBSUITES=0"
+fi
 
 e2e_summary

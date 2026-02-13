@@ -369,9 +369,11 @@ struct SuiteExecution {
 }
 
 impl Runner {
+    const NATIVE_HTTP_SUITE: &'static str = "http";
     const NATIVE_DUAL_MODE_SUITE: &'static str = "dual_mode";
     const NATIVE_MODE_MATRIX_SUITE: &'static str = "mode_matrix";
     const NATIVE_SECURITY_PRIVACY_SUITE: &'static str = "security_privacy";
+    const NATIVE_TUI_A11Y_SUITE: &'static str = "tui_a11y";
 
     /// Creates a new runner.
     pub fn new(project_root: impl AsRef<Path>, config: RunConfig) -> std::io::Result<Self> {
@@ -443,10 +445,14 @@ impl Runner {
     /// Runs a single suite.
     fn run_suite(&self, suite: &Suite) -> SuiteResult {
         if Self::is_native_suite(&suite.name) {
-            return if suite.name == Self::NATIVE_MODE_MATRIX_SUITE {
+            return if suite.name == Self::NATIVE_HTTP_SUITE {
+                self.run_native_http_suite(suite)
+            } else if suite.name == Self::NATIVE_MODE_MATRIX_SUITE {
                 self.run_native_mode_matrix_suite(suite)
             } else if suite.name == Self::NATIVE_SECURITY_PRIVACY_SUITE {
                 self.run_native_security_privacy_suite(suite)
+            } else if suite.name == Self::NATIVE_TUI_A11Y_SUITE {
+                self.run_native_tui_a11y_suite(suite)
             } else {
                 self.run_native_dual_mode_suite(suite)
             };
@@ -601,9 +607,78 @@ impl Runner {
     }
 
     fn is_native_suite(name: &str) -> bool {
-        name == Self::NATIVE_DUAL_MODE_SUITE
+        name == Self::NATIVE_HTTP_SUITE
+            || name == Self::NATIVE_DUAL_MODE_SUITE
             || name == Self::NATIVE_MODE_MATRIX_SUITE
             || name == Self::NATIVE_SECURITY_PRIVACY_SUITE
+            || name == Self::NATIVE_TUI_A11Y_SUITE
+    }
+
+    fn run_native_http_suite(&self, suite: &Suite) -> SuiteResult {
+        let started_at = Utc::now();
+        let start_instant = Instant::now();
+
+        let mut cmd = Command::new("cargo");
+        cmd.args([
+            "test",
+            "-p",
+            "mcp-agent-mail-cli",
+            "--test",
+            "http_transport_harness",
+            "--",
+            "--nocapture",
+        ]);
+        cmd.current_dir(&self.config.project_root);
+        if self.config.keep_tmp {
+            cmd.env("AM_E2E_KEEP_TMP", "1");
+        }
+        for (key, value) in &self.config.env {
+            cmd.env(key, value);
+        }
+        cmd.env("AM_E2E_HTTP_REQUIRE_PASS", "1");
+        if let Some(artifact_root) = &self.config.artifact_dir {
+            cmd.env("AM_HTTP_ARTIFACT_DIR", artifact_root);
+        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let output = cmd.output();
+        let elapsed = start_instant.elapsed();
+        let ended_at = Utc::now();
+
+        match output {
+            Ok(output) => {
+                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
+                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
+                let passed = output.status.success();
+                SuiteResult {
+                    name: suite.name.clone(),
+                    passed,
+                    exit_code: output.status.code().unwrap_or(-1),
+                    duration_ms: elapsed.as_millis() as u64,
+                    stdout,
+                    stderr,
+                    assertions_passed: if passed { 1 } else { 0 },
+                    assertions_failed: if passed { 0 } else { 1 },
+                    assertions_skipped: 0,
+                    started_at: started_at.to_rfc3339(),
+                    ended_at: ended_at.to_rfc3339(),
+                }
+            }
+            Err(error) => SuiteResult {
+                name: suite.name.clone(),
+                passed: false,
+                exit_code: -1,
+                duration_ms: elapsed.as_millis() as u64,
+                stdout: String::new(),
+                stderr: format!("Failed to execute native http suite: {error}"),
+                assertions_passed: 0,
+                assertions_failed: 1,
+                assertions_skipped: 0,
+                started_at: started_at.to_rfc3339(),
+                ended_at: ended_at.to_rfc3339(),
+            },
+        }
     }
 
     fn run_native_mode_matrix_suite(&self, suite: &Suite) -> SuiteResult {
@@ -729,6 +804,74 @@ impl Runner {
                 duration_ms: elapsed.as_millis() as u64,
                 stdout: String::new(),
                 stderr: format!("Failed to execute native security/privacy suite: {error}"),
+                assertions_passed: 0,
+                assertions_failed: 1,
+                assertions_skipped: 0,
+                started_at: started_at.to_rfc3339(),
+                ended_at: ended_at.to_rfc3339(),
+            },
+        }
+    }
+
+    fn run_native_tui_a11y_suite(&self, suite: &Suite) -> SuiteResult {
+        let started_at = Utc::now();
+        let start_instant = Instant::now();
+
+        let mut cmd = Command::new("cargo");
+        cmd.args([
+            "test",
+            "-p",
+            "mcp-agent-mail-cli",
+            "--test",
+            "tui_accessibility_harness",
+            "--",
+            "--nocapture",
+        ]);
+        cmd.current_dir(&self.config.project_root);
+        if self.config.keep_tmp {
+            cmd.env("AM_E2E_KEEP_TMP", "1");
+        }
+        for (key, value) in &self.config.env {
+            cmd.env(key, value);
+        }
+        if let Some(artifact_root) = &self.config.artifact_dir {
+            cmd.env("AM_TUI_A11Y_ARTIFACT_DIR", artifact_root);
+        }
+        // CI-quality gate: skipping keyboard/adapter cases is not acceptable.
+        cmd.env("AM_E2E_TUI_A11Y_REQUIRE_NO_SKIP", "1");
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let output = cmd.output();
+        let elapsed = start_instant.elapsed();
+        let ended_at = Utc::now();
+
+        match output {
+            Ok(output) => {
+                let stdout = Self::truncate_output(&output.stdout, self.config.max_output_bytes);
+                let stderr = Self::truncate_output(&output.stderr, self.config.max_output_bytes);
+                let passed = output.status.success();
+                SuiteResult {
+                    name: suite.name.clone(),
+                    passed,
+                    exit_code: output.status.code().unwrap_or(-1),
+                    duration_ms: elapsed.as_millis() as u64,
+                    stdout,
+                    stderr,
+                    assertions_passed: if passed { 1 } else { 0 },
+                    assertions_failed: if passed { 0 } else { 1 },
+                    assertions_skipped: 0,
+                    started_at: started_at.to_rfc3339(),
+                    ended_at: ended_at.to_rfc3339(),
+                }
+            }
+            Err(error) => SuiteResult {
+                name: suite.name.clone(),
+                passed: false,
+                exit_code: -1,
+                duration_ms: elapsed.as_millis() as u64,
+                stdout: String::new(),
+                stderr: format!("Failed to execute native tui_a11y suite: {error}"),
                 assertions_passed: 0,
                 assertions_failed: 1,
                 assertions_skipped: 0,
@@ -1902,9 +2045,11 @@ exit 1
 
     #[test]
     fn test_native_suite_detection_matches_enabled_native_suites() {
+        assert!(Runner::is_native_suite("http"));
         assert!(Runner::is_native_suite("dual_mode"));
         assert!(Runner::is_native_suite("mode_matrix"));
         assert!(Runner::is_native_suite("security_privacy"));
+        assert!(Runner::is_native_suite("tui_a11y"));
         assert!(!Runner::is_native_suite("guard"));
         assert!(!Runner::is_native_suite("dual_mode_extra"));
     }
