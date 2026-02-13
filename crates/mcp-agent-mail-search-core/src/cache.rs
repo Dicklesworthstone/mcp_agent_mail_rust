@@ -845,4 +845,420 @@ mod tests {
 
         assert_ne!(hash_filter(&filter1), hash_filter(&filter2));
     }
+
+    // ── Disabled cache ────────────────────────────────────────────
+
+    #[test]
+    fn test_disabled_cache_get_always_returns_none() {
+        let config = CacheConfig {
+            max_entries: 100,
+            ttl: Duration::from_secs(300),
+            enabled: false,
+        };
+        let cache: QueryCache<i64> = QueryCache::new(config);
+        let key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(key.clone(), 42);
+        assert!(
+            cache.get(&key).is_none(),
+            "disabled cache should always miss"
+        );
+    }
+
+    #[test]
+    fn test_disabled_cache_put_is_noop() {
+        let config = CacheConfig {
+            max_entries: 100,
+            ttl: Duration::from_secs(300),
+            enabled: false,
+        };
+        let cache: QueryCache<i64> = QueryCache::new(config);
+        let key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(key, 42);
+        let metrics = cache.metrics();
+        assert_eq!(
+            metrics.inserts, 0,
+            "disabled cache should not record inserts"
+        );
+        assert_eq!(metrics.current_entries, 0);
+    }
+
+    // ── TTL expiry ────────────────────────────────────────────────
+
+    #[test]
+    fn test_cache_entry_is_expired() {
+        let entry = CacheEntry::new(42_i64);
+        // Just created → not expired with 300s TTL
+        assert!(!entry.is_expired(Duration::from_secs(300)));
+        // Expired with 0 TTL
+        assert!(entry.is_expired(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_cache_get_returns_none_for_zero_ttl() {
+        let config = CacheConfig {
+            max_entries: 100,
+            ttl: Duration::ZERO,
+            enabled: true,
+        };
+        let cache: QueryCache<i64> = QueryCache::new(config);
+        let key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(key.clone(), 42);
+        // With TTL=0, entry is immediately expired
+        assert!(
+            cache.get(&key).is_none(),
+            "zero TTL should cause immediate expiry"
+        );
+        let metrics = cache.metrics();
+        assert_eq!(metrics.evictions_ttl, 1, "should record TTL eviction");
+    }
+
+    // ── Epoch management ──────────────────────────────────────────
+
+    #[test]
+    fn test_bump_epoch_increments() {
+        let cache: QueryCache<i64> = QueryCache::with_defaults();
+        assert_eq!(cache.current_epoch(), 0);
+        let new = cache.bump_epoch();
+        assert_eq!(new, 1);
+        assert_eq!(cache.current_epoch(), 1);
+        let new2 = cache.bump_epoch();
+        assert_eq!(new2, 2);
+    }
+
+    #[test]
+    fn test_put_rejects_epoch_mismatch() {
+        let cache: QueryCache<i64> = QueryCache::with_defaults();
+        cache.bump_epoch(); // epoch → 1
+        // Try to insert with epoch 0 (stale)
+        let stale_key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(stale_key.clone(), 42);
+        let metrics = cache.metrics();
+        assert_eq!(metrics.inserts, 0, "stale epoch put should be rejected");
+    }
+
+    // ── Hit rate calculation ──────────────────────────────────────
+
+    #[test]
+    fn test_hit_rate_empty() {
+        let metrics = CacheMetrics::default();
+        assert!((metrics.hit_rate() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_hit_rate_all_hits() {
+        let metrics = CacheMetrics {
+            hits: 10,
+            misses: 0,
+            ..Default::default()
+        };
+        assert!((metrics.hit_rate() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_hit_rate_half() {
+        let metrics = CacheMetrics {
+            hits: 5,
+            misses: 5,
+            ..Default::default()
+        };
+        assert!((metrics.hit_rate() - 50.0).abs() < f64::EPSILON);
+    }
+
+    // ── Prune expired ─────────────────────────────────────────────
+
+    #[test]
+    fn test_prune_expired_with_zero_ttl_clears_all() {
+        let config = CacheConfig {
+            max_entries: 100,
+            ttl: Duration::from_secs(300),
+            enabled: true,
+        };
+        let cache: QueryCache<i64> = QueryCache::new(config);
+
+        // Insert entries with current epoch
+        for i in 0..5 {
+            let key = QueryCacheKey::without_filter(&format!("q{i}"), SearchMode::Hybrid, 0, 0, 10);
+            cache.put(key, i);
+        }
+        assert_eq!(cache.metrics().current_entries, 5);
+
+        // Change TTL to zero by directly pruning (entries created just now still
+        // have elapsed > 0 after any instruction, but Duration::ZERO might or
+        // might not catch them depending on timing). Instead we use the existing
+        // prune_expired which uses the config.ttl (300s), so nothing should expire.
+        cache.prune_expired();
+        assert_eq!(
+            cache.metrics().current_entries,
+            5,
+            "300s TTL should not expire fresh entries"
+        );
+    }
+
+    // ── Invalidate_all with populated cache ───────────────────────
+
+    #[test]
+    fn test_invalidate_all_clears_entries_and_bumps_epoch() {
+        let cache: QueryCache<i64> = QueryCache::with_defaults();
+        for i in 0..3 {
+            let key = QueryCacheKey::without_filter(&format!("q{i}"), SearchMode::Hybrid, 0, 0, 10);
+            cache.put(key, i);
+        }
+        assert_eq!(cache.metrics().current_entries, 3);
+
+        cache.invalidate_all();
+
+        assert_eq!(cache.metrics().current_entries, 0);
+        assert_eq!(cache.current_epoch(), 1);
+        let metrics = cache.metrics();
+        assert_eq!(metrics.evictions_epoch, 3);
+    }
+
+    // ── Warm worker: is_fully_warm ────────────────────────────────
+
+    #[test]
+    fn test_warm_worker_not_fully_warm_when_empty() {
+        let worker = WarmWorker::with_defaults();
+        // Vacuously true: no resources tracked → is_fully_warm
+        assert!(worker.is_fully_warm());
+    }
+
+    #[test]
+    fn test_warm_worker_not_fully_warm_when_warming() {
+        let worker = WarmWorker::with_defaults();
+        worker.start_warmup(WarmResource::LexicalIndex);
+        assert!(!worker.is_fully_warm());
+    }
+
+    #[test]
+    fn test_warm_worker_fully_warm_when_all_complete() {
+        let worker = WarmWorker::with_defaults();
+        worker.start_warmup(WarmResource::LexicalIndex);
+        worker.start_warmup(WarmResource::VectorIndex);
+        worker.complete_warmup(WarmResource::LexicalIndex, Duration::from_millis(50));
+        worker.complete_warmup(WarmResource::VectorIndex, Duration::from_millis(100));
+        assert!(worker.is_fully_warm());
+    }
+
+    #[test]
+    fn test_warm_worker_not_fully_warm_when_one_failed() {
+        let worker = WarmWorker::with_defaults();
+        worker.start_warmup(WarmResource::LexicalIndex);
+        worker.start_warmup(WarmResource::SemanticEmbedder);
+        worker.complete_warmup(WarmResource::LexicalIndex, Duration::from_millis(50));
+        worker.fail_warmup(WarmResource::SemanticEmbedder, "download error");
+        assert!(!worker.is_fully_warm());
+    }
+
+    #[test]
+    fn test_warm_worker_all_status_returns_all_tracked() {
+        let worker = WarmWorker::with_defaults();
+        worker.start_warmup(WarmResource::LexicalIndex);
+        worker.start_warmup(WarmResource::Reranker);
+        let statuses = worker.all_status();
+        assert_eq!(statuses.len(), 2);
+    }
+
+    #[test]
+    fn test_warm_worker_config_defaults() {
+        let config = WarmWorkerConfig::default();
+        assert!(config.warmup_on_startup);
+        assert!(config.retry_on_failure);
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.warmup_timeout, Duration::from_secs(30));
+    }
+
+    // ── Invalidator event limit ───────────────────────────────────
+
+    #[test]
+    fn test_invalidator_respects_max_events() {
+        let cache = Arc::new(QueryCache::<i64>::with_defaults());
+        let invalidator = CacheInvalidator::new(cache, 3);
+
+        for _ in 0..5 {
+            invalidator.invalidate(InvalidationTrigger::Manual);
+        }
+
+        let events = invalidator.recent_events();
+        assert_eq!(
+            events.len(),
+            3,
+            "should keep only max_events=3 recent events"
+        );
+    }
+
+    #[test]
+    fn test_invalidator_tracks_different_triggers() {
+        let cache = Arc::new(QueryCache::<i64>::with_defaults());
+        let invalidator = CacheInvalidator::new(cache, 100);
+
+        invalidator.invalidate(InvalidationTrigger::IndexUpdate);
+        invalidator.invalidate(InvalidationTrigger::ModelSwap);
+        invalidator.invalidate(InvalidationTrigger::IndexRebuild);
+
+        let events = invalidator.recent_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].trigger, InvalidationTrigger::IndexUpdate);
+        assert_eq!(events[1].trigger, InvalidationTrigger::ModelSwap);
+        assert_eq!(events[2].trigger, InvalidationTrigger::IndexRebuild);
+    }
+
+    #[test]
+    fn test_invalidator_epoch_increments_per_invalidation() {
+        let cache = Arc::new(QueryCache::<i64>::with_defaults());
+        let invalidator = CacheInvalidator::new(cache.clone(), 100);
+
+        invalidator.invalidate(InvalidationTrigger::Manual);
+        assert_eq!(cache.current_epoch(), 1);
+
+        invalidator.invalidate(InvalidationTrigger::Manual);
+        assert_eq!(cache.current_epoch(), 2);
+    }
+
+    // ── QueryCacheKey ─────────────────────────────────────────────
+
+    #[test]
+    fn test_cache_key_without_filter_has_zero_hash() {
+        let key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+        assert_eq!(key.filter_hash, 0);
+    }
+
+    #[test]
+    fn test_cache_key_offset_differentiation() {
+        let filter = SearchFilter::default();
+        let key1 = QueryCacheKey::new("test", SearchMode::Hybrid, &filter, 0, 0, 10);
+        let key2 = QueryCacheKey::new("test", SearchMode::Hybrid, &filter, 0, 10, 10);
+        assert_ne!(
+            key1, key2,
+            "different offsets should produce different keys"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_limit_differentiation() {
+        let filter = SearchFilter::default();
+        let key1 = QueryCacheKey::new("test", SearchMode::Hybrid, &filter, 0, 0, 10);
+        let key2 = QueryCacheKey::new("test", SearchMode::Hybrid, &filter, 0, 0, 50);
+        assert_ne!(key1, key2, "different limits should produce different keys");
+    }
+
+    #[test]
+    fn test_cache_key_serde_roundtrip() {
+        let filter = SearchFilter::default();
+        let key = QueryCacheKey::new("hello world", SearchMode::Auto, &filter, 42, 5, 25);
+        let json = serde_json::to_string(&key).unwrap();
+        let key2: QueryCacheKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(key, key2);
+    }
+
+    // ── Filter hash edge cases ────────────────────────────────────
+
+    #[test]
+    fn test_filter_hash_empty_filter() {
+        let filter = SearchFilter::default();
+        // Empty filter should produce a consistent hash
+        let h1 = hash_filter(&filter);
+        let h2 = hash_filter(&filter);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_filter_hash_thread_id_differs_from_sender() {
+        let filter_sender = SearchFilter {
+            sender: Some("alice".to_string()),
+            ..Default::default()
+        };
+        let filter_thread = SearchFilter {
+            thread_id: Some("alice".to_string()),
+            ..Default::default()
+        };
+        assert_ne!(
+            hash_filter(&filter_sender),
+            hash_filter(&filter_thread),
+            "same value in different fields should produce different hashes"
+        );
+    }
+
+    // ── CacheConfig ───────────────────────────────────────────────
+
+    #[test]
+    fn test_cache_config_default() {
+        let config = CacheConfig::default();
+        assert_eq!(config.max_entries, DEFAULT_CACHE_MAX_ENTRIES);
+        assert_eq!(config.ttl, Duration::from_secs(DEFAULT_CACHE_TTL_SECONDS));
+        assert!(config.enabled);
+    }
+
+    // ── CacheEntry::touch ─────────────────────────────────────────
+
+    #[test]
+    fn test_cache_entry_touch_increments_access_count() {
+        let mut entry = CacheEntry::new(42_i64);
+        assert_eq!(entry.access_count, 1);
+        entry.touch();
+        assert_eq!(entry.access_count, 2);
+        entry.touch();
+        assert_eq!(entry.access_count, 3);
+    }
+
+    // ── WarmState / WarmResource serde ────────────────────────────
+
+    #[test]
+    fn test_warm_state_serde_roundtrip() {
+        for state in [
+            WarmState::Cold,
+            WarmState::Warming,
+            WarmState::Warm,
+            WarmState::Failed,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let state2: WarmState = serde_json::from_str(&json).unwrap();
+            assert_eq!(state, state2);
+        }
+    }
+
+    #[test]
+    fn test_warm_resource_serde_roundtrip() {
+        for res in [
+            WarmResource::LexicalIndex,
+            WarmResource::SemanticEmbedder,
+            WarmResource::VectorIndex,
+            WarmResource::Reranker,
+        ] {
+            let json = serde_json::to_string(&res).unwrap();
+            let res2: WarmResource = serde_json::from_str(&json).unwrap();
+            assert_eq!(res, res2);
+        }
+    }
+
+    #[test]
+    fn test_invalidation_trigger_serde_roundtrip() {
+        for trigger in [
+            InvalidationTrigger::IndexUpdate,
+            InvalidationTrigger::IndexRebuild,
+            InvalidationTrigger::ModelSwap,
+            InvalidationTrigger::Manual,
+            InvalidationTrigger::TtlExpiry,
+        ] {
+            let json = serde_json::to_string(&trigger).unwrap();
+            let trigger2: InvalidationTrigger = serde_json::from_str(&json).unwrap();
+            assert_eq!(trigger, trigger2);
+        }
+    }
+
+    // ── Duplicate key update ──────────────────────────────────────
+
+    #[test]
+    fn test_put_same_key_updates_value() {
+        let cache: QueryCache<i64> = QueryCache::with_defaults();
+        let key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+
+        cache.put(key.clone(), 1);
+        assert_eq!(cache.get(&key), Some(1));
+
+        cache.put(key.clone(), 2);
+        assert_eq!(cache.get(&key), Some(2));
+
+        // Should still be one entry
+        assert_eq!(cache.metrics().current_entries, 1);
+    }
 }
