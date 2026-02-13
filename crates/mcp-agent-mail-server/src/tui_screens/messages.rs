@@ -207,7 +207,7 @@ impl RenderItem for MessageEntry {
         };
 
         let prefix = format!("{marker}{badge:>2} {id_str:>6} {time_short} {project_badge}");
-        let remaining = inner_w.saturating_sub(prefix.len());
+        let remaining = inner_w.saturating_sub(prefix.chars().count());
         let subj = truncate_str(&self.subject, remaining);
 
         let mut line = Line::from_spans([

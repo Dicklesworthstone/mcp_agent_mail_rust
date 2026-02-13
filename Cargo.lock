@@ -2331,6 +2331,7 @@ name = "fsqlite-mvcc"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "crossbeam-epoch",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-pager",
@@ -2403,6 +2404,7 @@ dependencies = [
 name = "fsqlite-vdbe"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-deque",
  "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-error",
