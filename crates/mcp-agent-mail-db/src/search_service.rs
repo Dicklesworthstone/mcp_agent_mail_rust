@@ -1686,4 +1686,60 @@ mod tests {
             "all threads should get the same Arc<TwoTierBridge> instance"
         );
     }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn get_or_init_two_tier_bridge_cached_access_is_fast() {
+        // First call initializes the bridge (may take time due to embedder init)
+        let _ = get_or_init_two_tier_bridge();
+
+        // Subsequent calls should be nearly instant (just Arc clone)
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            let _ = get_or_init_two_tier_bridge();
+        }
+        let elapsed = start.elapsed();
+
+        // 1000 cached accesses should complete in <10ms (avg <10µs each)
+        assert!(
+            elapsed.as_millis() < 10,
+            "1000 cached accesses took {:?}, expected <10ms",
+            elapsed
+        );
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn get_or_init_two_tier_bridge_stress_100_threads() {
+        // High-contention stress test with 100 threads
+        use std::thread;
+
+        let barrier = Arc::new(std::sync::Barrier::new(100));
+        let handles: Vec<_> = (0..100)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    get_or_init_two_tier_bridge().map(|arc| Arc::as_ptr(&arc) as usize)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+
+        // All 100 threads should succeed
+        assert_eq!(results.len(), 100, "all 100 threads should complete");
+        assert!(
+            results.iter().all(|r| r.is_some()),
+            "all threads should get a bridge"
+        );
+
+        // All should point to the same Arc
+        let first_ptr = results[0].unwrap();
+        let all_same = results.iter().all(|r| r.unwrap() == first_ptr);
+        assert!(
+            all_same,
+            "all 100 threads should get the same Arc<TwoTierBridge>"
+        );
+    }
 }
