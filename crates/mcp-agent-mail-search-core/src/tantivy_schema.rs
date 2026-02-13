@@ -373,4 +373,226 @@ mod tests {
             .unwrap();
         assert_eq!(created, ts);
     }
+
+    // ── Schema determinism ──────────────────────────────────────────────
+
+    #[test]
+    fn build_schema_returns_same_handles_each_call() {
+        let (_, h1) = build_schema();
+        let (_, h2) = build_schema();
+        assert_eq!(h1.id.field_id(), h2.id.field_id());
+        assert_eq!(h1.subject.field_id(), h2.subject.field_id());
+        assert_eq!(h1.body.field_id(), h2.body.field_id());
+        assert_eq!(h1.created_ts.field_id(), h2.created_ts.field_id());
+    }
+
+    // ── Schema hash properties ──────────────────────────────────────────
+
+    #[test]
+    fn schema_hash_is_64_hex_chars() {
+        let hash = schema_hash();
+        assert_eq!(hash.len(), 64); // SHA-256 = 32 bytes = 64 hex
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn schema_hash_short_is_prefix_of_full() {
+        let full = schema_hash();
+        let short = schema_hash_short();
+        assert!(full.starts_with(&short));
+    }
+
+    // ── Constants ───────────────────────────────────────────────────────
+
+    #[test]
+    fn tokenizer_name_constant() {
+        assert_eq!(TOKENIZER_NAME, "am_default");
+    }
+
+    // ── Tokenizer edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn tokenizer_empty_input() {
+        let (schema, _) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_NAME).unwrap();
+        let mut stream = tokenizer.token_stream("");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn tokenizer_unicode_input() {
+        let (schema, _) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_NAME).unwrap();
+        let mut stream = tokenizer.token_stream("café résumé naïve");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert_eq!(tokens, vec!["café", "résumé", "naïve"]);
+    }
+
+    #[test]
+    fn tokenizer_punctuation_splitting() {
+        let (schema, _) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_NAME).unwrap();
+        let mut stream = tokenizer.token_stream("hello.world,foo;bar");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        // SimpleTokenizer splits on non-alphanumeric
+        assert!(tokens.contains(&"hello".to_string()));
+        assert!(tokens.contains(&"world".to_string()));
+        assert!(tokens.contains(&"foo".to_string()));
+        assert!(tokens.contains(&"bar".to_string()));
+    }
+
+    #[test]
+    fn tokenizer_token_at_255_bytes_kept() {
+        let (schema, _) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        // 255-byte token should be kept (under the 256 limit)
+        let token255 = "a".repeat(255);
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_NAME).unwrap();
+        let mut stream = tokenizer.token_stream(&token255);
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn tokenizer_token_at_256_bytes_removed() {
+        let (schema, _) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        // 256-byte token is removed by RemoveLongFilter::limit(256)
+        let token256 = "a".repeat(256);
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_NAME).unwrap();
+        let mut stream = tokenizer.token_stream(&token256);
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert!(tokens.is_empty());
+    }
+
+    // ── Multi-doc-kind index ────────────────────────────────────────────
+
+    #[test]
+    fn multiple_doc_kinds_coexist() {
+        let (schema, handles) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut writer = index.writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                handles.id => 1u64,
+                handles.doc_kind => "message",
+                handles.subject => "hello msg",
+                handles.body => "body of message",
+                handles.project_slug => "proj",
+                handles.project_id => 1u64,
+                handles.created_ts => 1_000_000i64
+            ))
+            .unwrap();
+        writer
+            .add_document(doc!(
+                handles.id => 2u64,
+                handles.doc_kind => "agent",
+                handles.subject => "AgentOne",
+                handles.body => "agent description",
+                handles.project_slug => "proj",
+                handles.project_id => 1u64,
+                handles.created_ts => 2_000_000i64,
+                handles.program => "claude-code",
+                handles.model => "opus"
+            ))
+            .unwrap();
+        writer
+            .add_document(doc!(
+                handles.id => 3u64,
+                handles.doc_kind => "project",
+                handles.subject => "My Project",
+                handles.body => "project description",
+                handles.project_slug => "proj",
+                handles.project_id => 1u64,
+                handles.created_ts => 3_000_000i64
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let top_docs = searcher
+            .search(&AllQuery, &TopDocs::with_limit(10))
+            .unwrap();
+        assert_eq!(top_docs.len(), 3);
+    }
+
+    #[test]
+    fn search_body_finds_content() {
+        let (schema, handles) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut writer = index.writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                handles.id => 1u64,
+                handles.doc_kind => "message",
+                handles.subject => "unrelated title",
+                handles.body => "the quick brown fox jumps over the lazy dog",
+                handles.project_slug => "proj",
+                handles.project_id => 1u64,
+                handles.created_ts => 1_000_000i64
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(&index, vec![handles.body]);
+        let query = parser.parse_query("fox").unwrap();
+        let results = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    // ── FieldHandles Debug derive ───────────────────────────────────────
+
+    #[test]
+    fn field_handles_debug() {
+        let (_, handles) = build_schema();
+        let debug_str = format!("{handles:?}");
+        assert!(debug_str.contains("FieldHandles"));
+    }
+
+    // ── FieldHandles Clone + Copy ───────────────────────────────────────
+
+    #[test]
+    fn field_handles_clone_and_copy() {
+        let (_, handles) = build_schema();
+        let cloned = handles;
+        assert_eq!(cloned.id.field_id(), handles.id.field_id());
+        let copied: FieldHandles = handles;
+        assert_eq!(copied.body.field_id(), handles.body.field_id());
+    }
 }
