@@ -25,8 +25,7 @@ use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::{
-    LeaderboardEntry, MetricTile, MetricTrend, PercentileSample, RankChange,
-    WidgetState,
+    LeaderboardEntry, MetricTile, MetricTrend, PercentileSample, RankChange, WidgetState,
 };
 
 const COL_NAME: usize = 0;
@@ -388,9 +387,7 @@ impl ToolMetricsScreen {
                 let err_pct = format!("{:.1}%", stats.err_pct());
                 let spark = stats.sparkline_str();
                 let style = if Some(i) == self.table_state.selected {
-                    Style::default()
-                        .fg(tp.selection_fg)
-                        .bg(tp.selection_bg)
+                    Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else if stats.err_pct() > 5.0 {
                     Style::default().fg(tp.severity_error)
                 } else {
@@ -427,11 +424,7 @@ impl ToolMetricsScreen {
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .highlight_style(
-                Style::default()
-                    .fg(tp.selection_fg)
-                    .bg(tp.selection_bg),
-            );
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);
@@ -539,7 +532,10 @@ impl ToolMetricsScreen {
     /// Colors are taken from the theme palette's chart series.
     fn render_latency_ribbon(&self, frame: &mut Frame<'_>, area: Rect) {
         if self.tool_map.is_empty()
-            || self.tool_map.values().all(|ts| ts.recent_latencies.is_empty())
+            || self
+                .tool_map
+                .values()
+                .all(|ts| ts.recent_latencies.is_empty())
         {
             let widget: WidgetState<'_, Paragraph<'_>> = WidgetState::Loading {
                 message: "Collecting latency samples...",
@@ -579,7 +575,11 @@ impl ToolMetricsScreen {
             .map(|ts| {
                 BarGroup::new(
                     &ts.name,
-                    vec![ts.percentile(50.0), ts.percentile(95.0), ts.percentile(99.0)],
+                    vec![
+                        ts.percentile(50.0),
+                        ts.percentile(95.0),
+                        ts.percentile(99.0),
+                    ],
                 )
             })
             .collect();

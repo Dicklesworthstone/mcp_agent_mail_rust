@@ -11,12 +11,12 @@
 //! [`CorrelationLink`] entries.  The inspector renders these with
 //! number-key indicators so the operator can press `1`..`9` to navigate.
 
-use ftui::{Frame, Style};
 use ftui::layout::Rect;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::{Frame, Style};
 use std::fmt::Write as _;
 
 use super::DeepLinkTarget;

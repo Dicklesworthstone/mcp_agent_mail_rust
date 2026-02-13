@@ -116,7 +116,11 @@ pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
         if i > 0 && x < area.x + available {
             let sep_area = Rect::new(x, area.y, 1, 1);
             Paragraph::new("│")
-                .style(Style::default().fg(tp.tab_inactive_fg).bg(tp.tab_inactive_bg))
+                .style(
+                    Style::default()
+                        .fg(tp.tab_inactive_fg)
+                        .bg(tp.tab_inactive_bg),
+                )
                 .render(sep_area, frame);
             x += 1;
         }
@@ -887,7 +891,10 @@ mod tests {
             + u32::from(p.tab_inactive_fg.g())
             + u32::from(p.tab_inactive_fg.b());
         assert!(fg_sum > 0, "standard inactive FG should be non-zero");
-        assert_ne!(p.tab_active_bg, p.tab_active_fg, "active BG and FG should differ");
+        assert_ne!(
+            p.tab_active_bg, p.tab_active_fg,
+            "active BG and FG should differ"
+        );
     }
 
     // ── Render key hint bar tests ───────────────────────────────

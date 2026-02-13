@@ -503,9 +503,7 @@ impl ContactsScreen {
                     .map_or_else(|| "never".to_string(), format_relative_ts);
                 let status_style = status_color(&contact.status);
                 let row_style = if Some(i) == self.table_state.selected {
-                    Style::default()
-                        .fg(tp.selection_fg)
-                        .bg(tp.selection_bg)
+                    Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else {
                     status_style
                 };
@@ -538,11 +536,7 @@ impl ContactsScreen {
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .highlight_style(
-                Style::default()
-                    .fg(tp.selection_fg)
-                    .bg(tp.selection_bg),
-            );
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, area, frame, &mut ts);

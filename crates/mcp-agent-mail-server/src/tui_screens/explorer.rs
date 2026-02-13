@@ -187,9 +187,16 @@ impl RenderItem for ExplorerDisplayRow {
         let w = area.width as usize;
 
         // Marker for selected row
-        let marker = if selected { crate::tui_theme::SELECTION_PREFIX } else { crate::tui_theme::SELECTION_PREFIX_EMPTY };
+        let marker = if selected {
+            crate::tui_theme::SELECTION_PREFIX
+        } else {
+            crate::tui_theme::SELECTION_PREFIX_EMPTY
+        };
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let cursor_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
+        let cursor_style = Style::default()
+            .fg(tp.selection_fg)
+            .bg(tp.selection_bg)
+            .bold();
 
         // Direction badge
         let dir_badge = match self.entry.direction {
@@ -950,11 +957,23 @@ impl MailScreen for MailExplorerScreen {
         let header_area = Rect::new(area.x, area.y, area.width, header_h);
         let body_area = Rect::new(area.x, area.y + header_h, area.width, body_h);
 
-        render_header(frame, header_area, &self.search_input, self, matches!(self.focus, Focus::SearchBar));
+        render_header(
+            frame,
+            header_area,
+            &self.search_input,
+            self,
+            matches!(self.focus, Focus::SearchBar),
+        );
 
         if self.pressure_mode {
             // Pressure board takes the full body area
-            render_pressure_board(frame, body_area, &self.pressure_board, self.pressure_cursor, matches!(self.focus, Focus::ResultList));
+            render_pressure_board(
+                frame,
+                body_area,
+                &self.pressure_board,
+                self.pressure_cursor,
+                matches!(self.focus, Focus::ResultList),
+            );
         } else {
             // Normal mode: filter rail (left) + results + detail (right)
             let filter_w: u16 = if area.width >= 100 { 18 } else { 14 };
@@ -1222,7 +1241,6 @@ fn compute_stats(entries: &[DisplayEntry]) -> ExplorerStats {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-
 fn render_header(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1317,7 +1335,12 @@ fn render_header(
     }
 }
 
-fn render_filter_rail(frame: &mut Frame<'_>, area: Rect, screen: &MailExplorerScreen, focused: bool) {
+fn render_filter_rail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    screen: &MailExplorerScreen,
+    focused: bool,
+) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Filters")
@@ -1436,7 +1459,13 @@ fn render_results(
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&DisplayEntry>, scroll: usize, focused: bool) {
+fn render_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entry: Option<&DisplayEntry>,
+    scroll: usize,
+    focused: bool,
+) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Detail")
@@ -1493,9 +1522,14 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&DisplayEntry>
 // Pressure board rendering
 // ──────────────────────────────────────────────────────────────────────
 
-
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
-fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoard, cursor: usize, focused: bool) {
+fn render_pressure_board(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    board: &PressureBoard,
+    cursor: usize,
+    focused: bool,
+) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Pressure Board")

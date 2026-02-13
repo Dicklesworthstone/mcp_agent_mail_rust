@@ -157,17 +157,21 @@ impl RenderItem for MessageEntry {
         let inner_w = area.width as usize;
 
         // Marker for selected row
-        let marker = if selected { crate::tui_theme::SELECTION_PREFIX } else { crate::tui_theme::SELECTION_PREFIX_EMPTY };
+        let marker = if selected {
+            crate::tui_theme::SELECTION_PREFIX
+        } else {
+            crate::tui_theme::SELECTION_PREFIX_EMPTY
+        };
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let cursor_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
+        let cursor_style = Style::default()
+            .fg(tp.selection_fg)
+            .bg(tp.selection_bg)
+            .bold();
 
         // Importance badge
         let pulse_on = MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed);
         let (badge, badge_style) = match self.importance.as_str() {
-            "high" => (
-                "!",
-                Style::default().fg(tp.severity_warn).bold(),
-            ),
+            "high" => ("!", Style::default().fg(tp.severity_warn).bold()),
             "urgent" => {
                 let fg = if pulse_on {
                     tp.badge_urgent_bg
@@ -741,7 +745,13 @@ impl MailScreen for MessageBrowserScreen {
             self.sync_list_state();
             let mut list_state = self.list_state.borrow_mut();
             let results_focused = matches!(self.focus, Focus::ResultList);
-            render_results_list(frame, results_area, &self.results, &mut list_state, results_focused);
+            render_results_list(
+                frame,
+                results_area,
+                &self.results,
+                &mut list_state,
+                results_focused,
+            );
             drop(list_state);
             render_detail_panel(
                 frame,
@@ -1131,7 +1141,12 @@ fn render_results_list(
 
     let list = VirtualizedList::new(results)
         .style(Style::default())
-        .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold())
+        .highlight_style(
+            Style::default()
+                .fg(tp.selection_fg)
+                .bg(tp.selection_bg)
+                .bold(),
+        )
         .show_scrollbar(true);
 
     StatefulWidget::render(&list, inner, frame, list_state);
@@ -1630,7 +1645,13 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         let mut list_state = VirtualizedListState::default();
-        render_results_list(&mut frame, Rect::new(0, 0, 40, 20), &[], &mut list_state, true);
+        render_results_list(
+            &mut frame,
+            Rect::new(0, 0, 40, 20),
+            &[],
+            &mut list_state,
+            true,
+        );
     }
 
     #[test]

@@ -337,9 +337,16 @@ impl RenderItem for SearchResultRow {
         let w = area.width as usize;
 
         // Marker for selected row
-        let marker = if selected { crate::tui_theme::SELECTION_PREFIX } else { crate::tui_theme::SELECTION_PREFIX_EMPTY };
+        let marker = if selected {
+            crate::tui_theme::SELECTION_PREFIX
+        } else {
+            crate::tui_theme::SELECTION_PREFIX_EMPTY
+        };
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let cursor_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
+        let cursor_style = Style::default()
+            .fg(tp.selection_fg)
+            .bg(tp.selection_bg)
+            .bold();
 
         // Doc type badge
         let type_badge = match self.entry.doc_kind {
@@ -1648,7 +1655,13 @@ impl MailScreen for SearchCockpitScreen {
         let body_area = Rect::new(area.x, area.y + query_h, area.width, body_h);
 
         // Render query bar
-        render_query_bar(frame, query_area, &self.query_input, self, matches!(self.focus, Focus::QueryBar));
+        render_query_bar(
+            frame,
+            query_area,
+            &self.query_input,
+            self,
+            matches!(self.focus, Focus::QueryBar),
+        );
 
         // Body: facet rail (left) + results + detail (right)
         let facet_w: u16 = if area.width >= 100 { 20 } else { 16 };
@@ -1673,7 +1686,12 @@ impl MailScreen for SearchCockpitScreen {
                 body_area.height,
             );
 
-            render_facet_rail(frame, facet_area, self, matches!(self.focus, Focus::FacetRail));
+            render_facet_rail(
+                frame,
+                facet_area,
+                self,
+                matches!(self.focus, Focus::FacetRail),
+            );
             self.sync_list_state();
             render_results(
                 frame,
@@ -1700,7 +1718,12 @@ impl MailScreen for SearchCockpitScreen {
                 remaining_w,
                 body_area.height,
             );
-            render_facet_rail(frame, facet_area, self, matches!(self.focus, Focus::FacetRail));
+            render_facet_rail(
+                frame,
+                facet_area,
+                self,
+                matches!(self.focus, Focus::FacetRail),
+            );
             self.sync_list_state();
             render_results(
                 frame,
@@ -2001,17 +2024,29 @@ fn url_encode_component(s: &str) -> String {
 // ──────────────────────────────────────────────────────────────────────
 
 #[allow(non_snake_case)]
-fn FACET_ACTIVE_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().status_accent }
+fn FACET_ACTIVE_FG() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().status_accent
+}
 #[allow(non_snake_case)]
-fn FACET_LABEL_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().text_muted }
+fn FACET_LABEL_FG() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().text_muted
+}
 #[allow(non_snake_case)]
-fn RESULT_CURSOR_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().selection_indicator }
+fn RESULT_CURSOR_FG() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().selection_indicator
+}
 #[allow(non_snake_case)]
-fn ERROR_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().severity_error }
+fn ERROR_FG() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().severity_error
+}
 #[allow(non_snake_case)]
-fn ACTION_KEY_FG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().severity_ok }
+fn ACTION_KEY_FG() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().severity_ok
+}
 #[allow(non_snake_case)]
-fn QUERY_HELP_BG() -> PackedRgba { crate::tui_theme::TuiThemePalette::current().bg_deep }
+fn QUERY_HELP_BG() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().bg_deep
+}
 
 fn render_query_bar(
     frame: &mut Frame<'_>,
@@ -2123,7 +2158,12 @@ Esc/any key: close";
         .render(inner, frame);
 }
 
-fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitScreen, focused: bool) {
+fn render_facet_rail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    screen: &SearchCockpitScreen,
+    focused: bool,
+) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Facets")
@@ -2395,7 +2435,12 @@ fn render_results(
     // Render using VirtualizedList for efficient scrolling
     let list = VirtualizedList::new(&rows)
         .style(Style::default())
-        .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold())
+        .highlight_style(
+            Style::default()
+                .fg(tp.selection_fg)
+                .bg(tp.selection_bg)
+                .bold(),
+        )
         .show_scrollbar(true);
 
     list.render(inner, frame, list_state);
@@ -3330,7 +3375,14 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 30, &mut pool);
         let entry = make_msg_entry();
-        render_detail(&mut frame, Rect::new(0, 0, 80, 30), Some(&entry), 0, &[], true);
+        render_detail(
+            &mut frame,
+            Rect::new(0, 0, 80, 30),
+            Some(&entry),
+            0,
+            &[],
+            true,
+        );
         let text = buffer_to_text(&frame.buffer);
         // Should contain the body header
         assert!(
@@ -3353,7 +3405,14 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 20, &mut pool);
         let entry = make_agent_entry();
-        render_detail(&mut frame, Rect::new(0, 0, 80, 20), Some(&entry), 0, &[], true);
+        render_detail(
+            &mut frame,
+            Rect::new(0, 0, 80, 20),
+            Some(&entry),
+            0,
+            &[],
+            true,
+        );
         let text = buffer_to_text(&frame.buffer);
         assert!(
             text.contains("Preview"),

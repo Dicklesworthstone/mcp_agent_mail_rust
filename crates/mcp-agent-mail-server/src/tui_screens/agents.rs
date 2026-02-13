@@ -382,9 +382,7 @@ impl AgentsScreen {
     fn row_style(&self, row_index: usize, agent: &AgentRow, now_ts: i64) -> Style {
         let tp = crate::tui_theme::TuiThemePalette::current();
         if Some(row_index) == self.table_state.selected {
-            return Style::default()
-                .fg(tp.selection_fg)
-                .bg(tp.selection_bg);
+            return Style::default().fg(tp.selection_fg).bg(tp.selection_bg);
         }
         if !self.reduced_motion && self.stagger_reveal_ticks.contains_key(&agent.name) {
             return Style::default().fg(tp.text_disabled);
@@ -397,11 +395,13 @@ impl AgentsScreen {
         {
             let intensity = f32::from(*remaining) / f32::from(MESSAGE_FLASH_TICKS.max(1));
             let dim = (tp.text_muted.r(), tp.text_muted.g(), tp.text_muted.b());
-            let bright = (tp.selection_bg.r(), tp.selection_bg.g(), tp.selection_bg.b());
+            let bright = (
+                tp.selection_bg.r(),
+                tp.selection_bg.g(),
+                tp.selection_bg.b(),
+            );
             let (r, g, b) = blend_rgb(dim, bright, intensity);
-            style = style
-                .bg(PackedRgba::rgb(r, g, b))
-                .fg(tp.selection_fg);
+            style = style.bg(PackedRgba::rgb(r, g, b)).fg(tp.selection_fg);
         }
         style
     }
@@ -568,11 +568,7 @@ impl MailScreen for AgentsScreen {
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .highlight_style(
-                Style::default()
-                    .fg(tp.selection_fg)
-                    .bg(tp.selection_bg),
-            );
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);

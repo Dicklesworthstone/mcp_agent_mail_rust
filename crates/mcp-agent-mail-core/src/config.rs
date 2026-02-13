@@ -238,6 +238,12 @@ pub struct Config {
     pub tui_screen_reader: bool,
     pub tui_keymap_profile: String,
     pub tui_active_preset: String,
+    pub tui_effects: bool,
+    pub tui_ambient: String,
+    pub tui_debug: bool,
+    pub export_dir: PathBuf,
+    pub tui_tree_style: String,
+    pub tui_theme: String,
     pub tui_toast_enabled: bool,
     pub tui_toast_severity: String,
     pub tui_toast_position: String,
@@ -804,6 +810,15 @@ impl Default for Config {
             tui_screen_reader: false,
             tui_keymap_profile: "default".to_string(),
             tui_active_preset: "default".to_string(),
+            tui_effects: true,
+            tui_ambient: "subtle".to_string(),
+            tui_debug: false,
+            export_dir: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".mcp_agent_mail")
+                .join("exports"),
+            tui_tree_style: "rounded".to_string(),
+            tui_theme: "default".to_string(),
             tui_toast_enabled: true,
             tui_toast_severity: "info".to_string(),
             tui_toast_position: "top-right".to_string(),
@@ -1410,6 +1425,38 @@ impl Config {
             let trimmed = v.trim().to_string();
             if !trimmed.is_empty() {
                 config.tui_active_preset = trimmed;
+            }
+        }
+        config.tui_effects = console_bool("AM_TUI_EFFECTS", config.tui_effects);
+        if let Some(v) = console_value("AM_TUI_AMBIENT") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(lower.as_str(), "off" | "subtle" | "full") {
+                config.tui_ambient = lower;
+            }
+        }
+        config.tui_debug = console_bool("AM_TUI_DEBUG", config.tui_debug);
+        if let Some(v) = console_value("AM_EXPORT_DIR") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                config.export_dir = PathBuf::from(trimmed);
+            }
+        }
+        if let Some(v) = console_value("AM_TUI_TREE_STYLE") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "rounded" | "plain" | "bold" | "double" | "ascii"
+            ) {
+                config.tui_tree_style = lower;
+            }
+        }
+        if let Some(v) = console_value("AM_TUI_THEME") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "default" | "solarized" | "dracula" | "nord" | "gruvbox"
+            ) {
+                config.tui_theme = lower;
             }
         }
         config.tui_toast_enabled = console_bool("AM_TUI_TOAST_ENABLED", config.tui_toast_enabled);
@@ -2613,6 +2660,59 @@ mod tests {
         assert_eq!(config.tui_toast_info_dismiss_secs, 1);
         assert_eq!(config.tui_toast_warn_dismiss_secs, 1);
         assert_eq!(config.tui_toast_error_dismiss_secs, 1);
+    }
+
+    #[test]
+    fn tui_v3_defaults() {
+        let config = Config::default();
+        assert!(config.tui_effects);
+        assert_eq!(config.tui_ambient, "subtle");
+        assert!(!config.tui_debug);
+        let expected_export_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".mcp_agent_mail")
+            .join("exports");
+        assert_eq!(config.export_dir, expected_export_dir);
+        assert_eq!(config.tui_tree_style, "rounded");
+        assert_eq!(config.tui_theme, "default");
+    }
+
+    #[test]
+    fn tui_v3_from_env_overrides() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_TUI_EFFECTS", "false"),
+            ("AM_TUI_AMBIENT", "full"),
+            ("AM_TUI_DEBUG", "true"),
+            ("AM_EXPORT_DIR", "/tmp/am-exports"),
+            ("AM_TUI_TREE_STYLE", "double"),
+            ("AM_TUI_THEME", "gruvbox"),
+        ]);
+        let config = Config::from_env();
+        assert!(!config.tui_effects);
+        assert_eq!(config.tui_ambient, "full");
+        assert!(config.tui_debug);
+        assert_eq!(config.export_dir, PathBuf::from("/tmp/am-exports"));
+        assert_eq!(config.tui_tree_style, "double");
+        assert_eq!(config.tui_theme, "gruvbox");
+    }
+
+    #[test]
+    fn tui_v3_invalid_values_fall_back() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_TUI_AMBIENT", "neon"),
+            ("AM_EXPORT_DIR", ""),
+            ("AM_TUI_TREE_STYLE", "zigzag"),
+            ("AM_TUI_THEME", "matrix"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.tui_ambient, "subtle");
+        let expected_export_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".mcp_agent_mail")
+            .join("exports");
+        assert_eq!(config.export_dir, expected_export_dir);
+        assert_eq!(config.tui_tree_style, "rounded");
+        assert_eq!(config.tui_theme, "default");
     }
 
     // -----------------------------------------------------------------------

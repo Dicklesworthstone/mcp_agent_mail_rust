@@ -369,9 +369,7 @@ impl MailScreen for ReservationsScreen {
                 });
 
                 let style = if Some(i) == self.table_state.selected {
-                    Style::default()
-                        .fg(tp.selection_fg)
-                        .bg(tp.selection_bg)
+                    Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else if res.released {
                     Style::default().fg(tp.text_disabled)
                 } else if remaining == 0 {
@@ -411,11 +409,7 @@ impl MailScreen for ReservationsScreen {
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .highlight_style(
-                Style::default()
-                    .fg(tp.selection_fg)
-                    .bg(tp.selection_bg),
-            );
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);
@@ -477,7 +471,11 @@ const fn compute_table_widths(total_width: u16) -> [u16; 5] {
     [c0, c1, c2, c3, c4]
 }
 
-fn ttl_fill_color(ratio: f64, released: bool, tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
+fn ttl_fill_color(
+    ratio: f64,
+    released: bool,
+    tp: &crate::tui_theme::TuiThemePalette,
+) -> PackedRgba {
     if released {
         tp.ttl_expired
     } else if ratio < 0.2 {
@@ -489,7 +487,12 @@ fn ttl_fill_color(ratio: f64, released: bool, tp: &crate::tui_theme::TuiThemePal
     }
 }
 
-fn render_ttl_overlays(frame: &mut Frame<'_>, table_area: Rect, rows: &[TtlOverlayRow], tp: &crate::tui_theme::TuiThemePalette) {
+fn render_ttl_overlays(
+    frame: &mut Frame<'_>,
+    table_area: Rect,
+    rows: &[TtlOverlayRow],
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
     if rows.is_empty() || table_area.width < 8 || table_area.height < 4 {
         return;
     }
@@ -525,17 +528,11 @@ fn render_ttl_overlays(frame: &mut Frame<'_>, table_area: Rect, rows: &[TtlOverl
         }
 
         let base_style = if row.selected {
-            Style::default()
-                .fg(tp.selection_fg)
-                .bg(tp.selection_bg)
+            Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
         } else if row.released {
-            Style::default()
-                .fg(tp.text_disabled)
-                .bg(tp.bg_deep)
+            Style::default().fg(tp.text_disabled).bg(tp.bg_deep)
         } else {
-            Style::default()
-                .fg(tp.text_primary)
-                .bg(tp.bg_surface)
+            Style::default().fg(tp.text_primary).bg(tp.bg_surface)
         };
         let gauge_bg = if row.selected {
             tp.status_accent
@@ -722,13 +719,25 @@ mod tests {
     fn ttl_fill_color_thresholds() {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let healthy = ttl_fill_color(0.8, false, &tp);
-        assert!(healthy.r() > 0 || healthy.g() > 0 || healthy.b() > 0, "healthy color should be non-zero");
+        assert!(
+            healthy.r() > 0 || healthy.g() > 0 || healthy.b() > 0,
+            "healthy color should be non-zero"
+        );
         let warning = ttl_fill_color(0.3, false, &tp);
-        assert!(warning.r() > 0 || warning.g() > 0 || warning.b() > 0, "warning color should be non-zero");
+        assert!(
+            warning.r() > 0 || warning.g() > 0 || warning.b() > 0,
+            "warning color should be non-zero"
+        );
         let danger = ttl_fill_color(0.1, false, &tp);
-        assert!(danger.r() > 0 || danger.g() > 0 || danger.b() > 0, "danger color should be non-zero");
+        assert!(
+            danger.r() > 0 || danger.g() > 0 || danger.b() > 0,
+            "danger color should be non-zero"
+        );
         let expired = ttl_fill_color(0.8, true, &tp);
-        assert!(expired.r() > 0 || expired.g() > 0 || expired.b() > 0, "expired color should be non-zero");
+        assert!(
+            expired.r() > 0 || expired.g() > 0 || expired.b() > 0,
+            "expired color should be non-zero"
+        );
         // Ensure different bands produce different colors
         assert_ne!(healthy, danger, "healthy and danger should differ");
     }

@@ -457,9 +457,7 @@ impl AttachmentExplorerScreen {
 
                 let tp = crate::tui_theme::TuiThemePalette::current();
                 let style = if Some(i) == self.table_state.selected {
-                    Style::default()
-                        .fg(tp.selection_fg)
-                        .bg(tp.selection_bg)
+                    Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else {
                     Style::default()
                 };
@@ -729,11 +727,7 @@ impl MailScreen for AttachmentExplorerScreen {
         let table = Table::new(rows, widths)
             .header(header_row)
             .block(block)
-            .highlight_style({
-                Style::default()
-                    .fg(tp.selection_fg)
-                    .bg(tp.selection_bg)
-            });
+            .highlight_style({ Style::default().fg(tp.selection_fg).bg(tp.selection_bg) });
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);

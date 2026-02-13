@@ -879,10 +879,7 @@ fn render_gradient_title(frame: &mut Frame<'_>, area: Rect) {
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let gradient = ColorGradient::new(vec![
-        (0.0, tp.status_accent),
-        (1.0, tp.severity_ok),
-    ]);
+    let gradient = ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.severity_ok)]);
     let title_text = "Agent Mail Dashboard";
     // Center the title horizontally within the area.
     let text_len = u16::try_from(title_text.len()).unwrap_or(u16::MAX);
@@ -942,68 +939,23 @@ fn render_summary_band(
     // Build tiles based on density.
     let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
         DensityHint::Minimal | DensityHint::Compact => vec![
-            (
-                "Up",
-                &uptime_str,
-                MetricTrend::Flat,
-                tp.metric_uptime,
-            ),
+            ("Up", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
             ("Req", &req_str, MetricTrend::Flat, req_color),
             ("Msg", &msg_str, msg_trend, tp.metric_messages),
         ],
         DensityHint::Normal => vec![
-            (
-                "Uptime",
-                &uptime_str,
-                MetricTrend::Flat,
-                tp.metric_uptime,
-            ),
+            ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
-            (
-                "Avg Lat",
-                &avg_str,
-                MetricTrend::Flat,
-                tp.metric_latency,
-            ),
-            (
-                "Messages",
-                &msg_str,
-                msg_trend,
-                tp.metric_messages,
-            ),
-            (
-                "Agents",
-                &agent_str,
-                agent_trend,
-                tp.metric_agents,
-            ),
+            ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
+            ("Messages", &msg_str, msg_trend, tp.metric_messages),
+            ("Agents", &agent_str, agent_trend, tp.metric_agents),
         ],
         DensityHint::Detailed => vec![
-            (
-                "Uptime",
-                &uptime_str,
-                MetricTrend::Flat,
-                tp.metric_uptime,
-            ),
+            ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
-            (
-                "Avg Lat",
-                &avg_str,
-                MetricTrend::Flat,
-                tp.metric_latency,
-            ),
-            (
-                "Messages",
-                &msg_str,
-                msg_trend,
-                tp.metric_messages,
-            ),
-            (
-                "Agents",
-                &agent_str,
-                agent_trend,
-                tp.metric_agents,
-            ),
+            ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
+            ("Messages", &msg_str, msg_trend, tp.metric_messages),
+            ("Agents", &agent_str, agent_trend, tp.metric_agents),
             (
                 "Ack Pend",
                 &ack_str,
@@ -1112,8 +1064,7 @@ fn render_trend_panel(
         // Label row.
         if inner.height > 1 && inner.width > 0 {
             let tp = crate::tui_theme::TuiThemePalette::current();
-            let label =
-                Paragraph::new("Throughput").style(Style::new().fg(tp.text_muted));
+            let label = Paragraph::new("Throughput").style(Style::new().fg(tp.text_muted));
             label.render(
                 Rect {
                     x: inner.x,
@@ -1258,7 +1209,10 @@ fn render_event_log(
         Some(total.saturating_sub(1 + scroll_offset))
     };
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let focus_style = Style::default().fg(tp.selection_fg).bg(tp.selection_bg).bold();
+    let focus_style = Style::default()
+        .fg(tp.selection_fg)
+        .bg(tp.selection_bg)
+        .bold();
 
     // Build styled text lines with colored severity badges
     let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len());
@@ -2431,7 +2385,11 @@ mod tests {
         // Exactly at boundary: 60s ago
         let at_boundary = now - ACTIVE_THRESHOLD_US;
         let (_, color) = activity_indicator(now, at_boundary);
-        assert_eq!(color, activity_yellow(), "exactly 60s should be idle/yellow");
+        assert_eq!(
+            color,
+            activity_yellow(),
+            "exactly 60s should be idle/yellow"
+        );
         // 1us before boundary: 59.999999s ago
         let just_inside = now - ACTIVE_THRESHOLD_US + 1;
         let (_, color) = activity_indicator(now, just_inside);
