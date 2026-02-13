@@ -2052,4 +2052,526 @@ mod tests {
         assert!(!contains_glob("app/api/users.py"));
         assert!(!contains_glob("plain_path"));
     }
+
+    // -----------------------------------------------------------------------
+    // guard_status tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn guard_status_on_fresh_repo_no_guard_installed() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+
+        let status = guard_status(&repo_dir).expect("guard_status");
+        assert!(!status.pre_commit_present);
+        assert!(!status.pre_push_present);
+        assert!(!status.worktrees_enabled);
+    }
+
+    #[test]
+    fn guard_status_after_install_shows_pre_commit_present() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+
+        install_guard("/test/project", &repo_dir).expect("install");
+
+        let status = guard_status(&repo_dir).expect("guard_status");
+        assert!(
+            status.pre_commit_present,
+            "pre-commit hook should be detected after install"
+        );
+        assert!(
+            status.hooks_dir.contains("hooks"),
+            "hooks_dir should point to hooks directory"
+        );
+    }
+
+    #[test]
+    fn guard_status_invalid_repo_returns_error() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let nonexistent = td.path().join("does_not_exist");
+
+        let result = guard_status(&nonexistent);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GuardError::InvalidRepo { .. }),
+            "expected InvalidRepo, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn guard_status_worktrees_detected_when_hooks_path_set() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+
+        // Set core.hooksPath so worktrees_enabled becomes true
+        let repo = git2::Repository::discover(&repo_dir).expect("repo");
+        repo.config()
+            .expect("config")
+            .set_str("core.hooksPath", "/some/hooks")
+            .expect("set");
+
+        let status = guard_status(&repo_dir).expect("guard_status");
+        assert!(
+            status.worktrees_enabled,
+            "worktrees_enabled should be true when core.hooksPath is set"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reservation edge case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_reservations_skips_malformed_json_files() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let res_dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&res_dir).expect("mkdir");
+
+        // Write malformed JSON
+        std::fs::write(res_dir.join("bad.json"), "this is not json {{{").expect("write");
+
+        // Write a valid reservation too
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let valid = serde_json::json!({
+            "path_pattern": "src/**",
+            "agent_name": "ValidAgent",
+            "exclusive": true,
+            "expires_ts": future.to_rfc3339(),
+            "released_ts": null
+        });
+        std::fs::write(res_dir.join("valid.json"), valid.to_string()).expect("write");
+
+        let records = read_active_reservations_from_archive(&archive).expect("read");
+        // Malformed JSON should be skipped, valid one should be read
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].agent_name, "ValidAgent");
+    }
+
+    #[test]
+    fn read_reservations_skips_non_json_files() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let res_dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&res_dir).expect("mkdir");
+
+        // Write a non-JSON file
+        std::fs::write(res_dir.join("readme.txt"), "this is a readme").expect("write");
+        std::fs::write(res_dir.join("notes.md"), "# notes").expect("write");
+
+        let records = read_active_reservations_from_archive(&archive).expect("read");
+        assert!(records.is_empty(), "non-json files should be ignored");
+    }
+
+    #[test]
+    fn read_reservations_skips_empty_path_pattern() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let res_dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&res_dir).expect("mkdir");
+
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let empty_pattern = serde_json::json!({
+            "path_pattern": "",
+            "agent_name": "Agent",
+            "exclusive": true,
+            "expires_ts": future.to_rfc3339(),
+            "released_ts": null
+        });
+        std::fs::write(res_dir.join("empty.json"), empty_pattern.to_string()).expect("write");
+
+        let records = read_active_reservations_from_archive(&archive).expect("read");
+        assert!(records.is_empty(), "empty path_pattern should be skipped");
+    }
+
+    #[test]
+    fn read_reservations_uses_agent_field_fallback() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let res_dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&res_dir).expect("mkdir");
+
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        // Use "agent" key instead of "agent_name"
+        let alt_key = serde_json::json!({
+            "path_pattern": "src/**",
+            "agent": "FallbackAgent",
+            "exclusive": true,
+            "expires_ts": future.to_rfc3339(),
+            "released_ts": null
+        });
+        std::fs::write(res_dir.join("alt.json"), alt_key.to_string()).expect("write");
+
+        let records = read_active_reservations_from_archive(&archive).expect("read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].agent_name, "FallbackAgent");
+    }
+
+    #[test]
+    fn read_reservations_missing_agent_defaults_to_unknown() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let res_dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&res_dir).expect("mkdir");
+
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let no_agent = serde_json::json!({
+            "path_pattern": "src/**",
+            "exclusive": true,
+            "expires_ts": future.to_rfc3339(),
+            "released_ts": null
+        });
+        std::fs::write(res_dir.join("noagent.json"), no_agent.to_string()).expect("write");
+
+        let records = read_active_reservations_from_archive(&archive).expect("read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].agent_name, "unknown");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_hooks_dir error path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_hooks_dir_nonexistent_path_returns_error() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let nonexistent = td.path().join("no_such_dir");
+        let result = resolve_hooks_dir(&nonexistent);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GuardError::InvalidRepo { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_hooks_dir_bare_repo_returns_error() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let bare_dir = td.path().join("bare.git");
+        run_git(
+            td.path(),
+            &["init", "-q", "--bare", bare_dir.to_str().unwrap()],
+        );
+
+        let result = resolve_hooks_dir(&bare_dir);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), GuardError::InvalidRepo { .. }),
+            "bare repos should be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // install_guard / uninstall_guard error and edge case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn install_guard_nonexistent_repo_returns_error() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let nonexistent = td.path().join("nonexistent");
+        let result = install_guard("/test/project", &nonexistent);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GuardError::InvalidRepo { .. }
+        ));
+    }
+
+    #[test]
+    fn install_guard_idempotent() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+
+        // Install twice - should not error
+        install_guard("/test/project", &repo_dir).expect("first install");
+        install_guard("/test/project", &repo_dir).expect("second install");
+
+        let status = guard_status(&repo_dir).expect("status");
+        assert!(status.pre_commit_present);
+    }
+
+    #[test]
+    fn uninstall_guard_nonexistent_repo_returns_error() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let nonexistent = td.path().join("nonexistent");
+        let result = uninstall_guard(&nonexistent);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GuardError::InvalidRepo { .. }
+        ));
+    }
+
+    #[test]
+    fn uninstall_guard_without_prior_install_is_noop() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+
+        // Uninstall on a repo without guard should succeed silently
+        uninstall_guard(&repo_dir).expect("uninstall without install");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_expired edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_expired_at_exact_boundary_is_expired() {
+        let now = chrono::Utc::now();
+        let ts = now.to_rfc3339();
+        assert!(
+            is_expired(&ts, &now),
+            "expiry at exact now should be expired (<= semantics)"
+        );
+    }
+
+    #[test]
+    fn is_expired_naive_without_fractional() {
+        let now = chrono::Utc::now();
+        let past = (now - chrono::Duration::hours(1))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        assert!(is_expired(&past, &now));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_legacy_single_file_guard tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn legacy_guard_detection() {
+        assert!(is_legacy_single_file_guard(
+            "#!/bin/sh\n# mcp-agent-mail guard hook\necho guard"
+        ));
+        assert!(is_legacy_single_file_guard(
+            "AGENT_NAME environment variable is required."
+        ));
+        assert!(!is_legacy_single_file_guard("#!/bin/sh\necho hello\n"));
+    }
+
+    // -----------------------------------------------------------------------
+    // expand_user tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expand_user_tilde_only() {
+        let result = expand_user("~");
+        // Should expand to home dir or fall back to "~"
+        assert!(!result.to_string_lossy().is_empty());
+    }
+
+    #[test]
+    fn expand_user_tilde_prefix() {
+        let result = expand_user("~/foo/bar");
+        let s = result.to_string_lossy();
+        assert!(s.ends_with("foo/bar"));
+    }
+
+    #[test]
+    fn expand_user_no_tilde() {
+        let result = expand_user("/abs/path");
+        assert_eq!(result, PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn expand_user_relative_no_tilde() {
+        let result = expand_user("relative/path");
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    // -----------------------------------------------------------------------
+    // render script tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chain_runner_pre_commit_contains_expected_markers() {
+        let script = render_chain_runner_script("pre-commit");
+        assert!(script.contains("mcp-agent-mail chain-runner (pre-commit)"));
+        assert!(script.contains("hooks.d"));
+        assert!(script.contains("pre-commit.orig"));
+        // pre-commit should NOT have stdin forwarding
+        assert!(!script.contains("stdin_bytes = sys.stdin.buffer.read()"));
+    }
+
+    #[test]
+    fn chain_runner_pre_push_forwards_stdin() {
+        let script = render_chain_runner_script("pre-push");
+        assert!(script.contains("mcp-agent-mail chain-runner (pre-push)"));
+        assert!(script.contains("stdin_bytes = sys.stdin.buffer.read()"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional paths_conflict boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn paths_conflict_slash_star_prefix_length_boundary() {
+        // Pattern "app/*" with path == prefix "app" (no trailing slash).
+        // path.len() == prefix.len() → should match (line 787 condition).
+        assert!(paths_conflict("app", "app/*"));
+    }
+
+    #[test]
+    fn paths_conflict_slash_star_not_matching_sibling() {
+        // Pattern "app/*" should NOT match "application/file.py"
+        // because "application" starts with "app" but next char is 'l', not '/'.
+        assert!(!paths_conflict("application/file.py", "app/*"));
+    }
+
+    #[test]
+    fn paths_conflict_double_star_suffix_matches_any_depth() {
+        // Pattern "src/**" should match deeply nested paths.
+        assert!(paths_conflict("src/a/b/c/d/e.rs", "src/**"));
+        // And direct children too.
+        assert!(paths_conflict("src/lib.rs", "src/**"));
+    }
+
+    #[test]
+    fn paths_conflict_empty_strings() {
+        assert!(paths_conflict("", ""));
+        assert!(!paths_conflict("", "app/api"));
+        assert!(!paths_conflict("app/api", ""));
+    }
+
+    #[test]
+    fn paths_conflict_symmetric_directory_match() {
+        // Reverse direction: path is the directory, pattern is the file.
+        assert!(paths_conflict("app/api", "app/api/users.py"));
+    }
+
+    #[test]
+    fn paths_conflict_directory_match_no_false_substring() {
+        // "app/api" should NOT match "app/api_v2/file.py" (no slash boundary).
+        assert!(!paths_conflict("app/api_v2/file.py", "app/api"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional parse_name_status_z edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_name_status_incomplete_rename() {
+        // Incomplete rename: status says R but only one path follows.
+        let raw = b"R100\0old.rs\0";
+        let paths = parse_name_status_z(raw).expect("parse");
+        // Should break out of loop without crashing (i + 2 >= parts.len()).
+        assert!(paths.is_empty() || paths == vec!["old.rs"]);
+    }
+
+    #[test]
+    fn parse_name_status_unknown_status() {
+        // Unknown status character should be skipped.
+        let raw = b"X\0mystery.rs\0A\0known.rs\0";
+        let paths = parse_name_status_z(raw).expect("parse");
+        assert!(
+            paths.contains(&"known.rs".to_string()),
+            "known.rs should be parsed after unknown status"
+        );
+    }
+
+    #[test]
+    fn parse_name_status_trailing_nuls() {
+        // Trailing NUL bytes should not produce spurious paths.
+        let raw = b"M\0src/lib.rs\0\0\0";
+        let paths = parse_name_status_z(raw).expect("parse");
+        assert_eq!(paths, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn parse_name_status_copy_entry() {
+        // 'C' (copy) status should produce both old and new paths.
+        let raw = b"C100\0original.rs\0copy.rs\0";
+        let paths = parse_name_status_z(raw).expect("parse");
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"original.rs".to_string()));
+        assert!(paths.contains(&"copy.rs".to_string()));
+    }
+
+    #[test]
+    fn parse_name_status_all_status_types() {
+        // Verify all known status types are handled.
+        let raw = b"A\0added.rs\0M\0modified.rs\0D\0deleted.rs\0T\0typechange.rs\0U\0unmerged.rs\0";
+        let paths = parse_name_status_z(raw).expect("parse");
+        assert_eq!(paths.len(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional fnmatch edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fnmatch_star_does_not_cross_directory() {
+        // Single * should NOT match across directory separators.
+        assert!(!fnmatch_simple("a/b/c.py", "a/*.py"));
+        assert!(fnmatch_simple("a/c.py", "a/*.py"));
+    }
+
+    #[test]
+    fn fnmatch_empty_pattern_only_matches_empty() {
+        assert!(fnmatch_simple("", ""));
+        assert!(!fnmatch_simple("anything", ""));
+    }
+
+    #[test]
+    fn fnmatch_star_at_beginning() {
+        assert!(fnmatch_simple("test.py", "*.py"));
+        assert!(fnmatch_simple(".py", "*.py"));
+    }
+
+    // -----------------------------------------------------------------------
+    // contains_glob tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn contains_glob_detects_all_chars() {
+        assert!(contains_glob("app/*.py"));
+        assert!(contains_glob("app/v?/file"));
+        assert!(contains_glob("app/[abc]/file"));
+        assert!(!contains_glob("app/api/file.py"));
+        assert!(!contains_glob(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_expired tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_expired_far_future_not_expired() {
+        let now = chrono::Utc::now();
+        assert!(!is_expired("2099-12-31T23:59:59Z", &now));
+    }
+
+    #[test]
+    fn is_expired_far_past_is_expired() {
+        let now = chrono::Utc::now();
+        assert!(is_expired("2000-01-01T00:00:00Z", &now));
+    }
+
+    #[test]
+    fn is_expired_empty_string_is_not_expired() {
+        // Unparseable timestamps are treated as not-expired (safe default).
+        let now = chrono::Utc::now();
+        assert!(!is_expired("", &now));
+    }
+
+    #[test]
+    fn guard_plugin_script_contains_project() {
+        let script = render_guard_plugin_script("/my/project", "pre-commit");
+        assert!(script.contains("mcp-agent-mail guard plugin (pre-commit)"));
+        assert!(script.contains("PROJECT = \"/my/project\""));
+        assert!(script.contains("get_staged_files"));
+        assert!(script.contains("check_conflicts"));
+    }
 }
