@@ -528,4 +528,380 @@ mod tests {
         assert!(controller.should_shadow());
         assert!(controller.should_return_v3());
     }
+
+    // ── ShadowComparison serde ──────────────────────────────────────────
+
+    #[test]
+    fn shadow_comparison_serde_roundtrip() {
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3],
+            &[2, 3, 4],
+            Duration::from_millis(10),
+            Duration::from_millis(12),
+            None,
+            "serde test",
+        );
+        let json = serde_json::to_string(&cmp).unwrap();
+        let back: ShadowComparison = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.query_text, "serde test");
+        assert!((back.result_overlap_pct - cmp.result_overlap_pct).abs() < 1e-10);
+        assert_eq!(back.legacy_result_count, 3);
+        assert_eq!(back.v3_result_count, 3);
+    }
+
+    // ── ShadowComparison partial overlap ────────────────────────────────
+
+    #[test]
+    fn shadow_comparison_partial_overlap_50pct() {
+        // Legacy: [1,2,3,4], V3: [3,4,5,6] → top-4 overlap = 2 of max(4,4) = 0.5
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3, 4],
+            &[3, 4, 5, 6],
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            None,
+            "partial",
+        );
+        assert!((cmp.result_overlap_pct - 0.5).abs() < 1e-10);
+        assert!(!cmp.is_equivalent()); // 0.5 < 0.8
+    }
+
+    // ── ShadowComparison::v3_is_better ──────────────────────────────────
+
+    #[test]
+    fn v3_is_better_when_faster_and_good_overlap() {
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3, 4, 5],
+            &[1, 2, 3, 4, 5],
+            Duration::from_millis(50),
+            Duration::from_millis(10), // V3 faster
+            None,
+            "v3 better",
+        );
+        assert!(cmp.v3_is_better());
+    }
+
+    #[test]
+    fn v3_is_not_better_when_slower() {
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3, 4, 5],
+            &[1, 2, 3, 4, 5],
+            Duration::from_millis(10),
+            Duration::from_millis(50), // V3 slower
+            None,
+            "v3 slower",
+        );
+        assert!(!cmp.v3_is_better());
+    }
+
+    #[test]
+    fn v3_is_not_better_with_error() {
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3],
+            &[1, 2, 3],
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            Some("oops"),
+            "error",
+        );
+        assert!(!cmp.v3_is_better());
+    }
+
+    #[test]
+    fn v3_is_not_better_with_low_overlap() {
+        // V3 faster but overlap < 0.7
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3, 4, 5],
+            &[6, 7, 8, 9, 10],
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            None,
+            "low overlap",
+        );
+        assert!(!cmp.v3_is_better());
+    }
+
+    // ── compute_kendall_tau edge cases ──────────────────────────────────
+
+    #[test]
+    fn kendall_tau_single_shared_returns_zero() {
+        let tau = compute_kendall_tau(&[1, 2, 3], &[3, 4, 5], &[3]);
+        assert!((tau - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn kendall_tau_empty_shared_returns_zero() {
+        let tau = compute_kendall_tau(&[1, 2], &[3, 4], &[]);
+        assert!((tau - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn kendall_tau_partial_agreement() {
+        // list_a: [1,2,3,4], list_b: [1,3,2,4], shared: [1,2,3,4]
+        // Pairs: (1,2) concordant, (1,3) concordant, (1,4) concordant,
+        //        (2,3) discordant (a: 2<3, b: 3>2), (2,4) concordant, (3,4) concordant
+        // C=5, D=1 → tau = (5-1)/6 = 2/3
+        let tau = compute_kendall_tau(&[1, 2, 3, 4], &[1, 3, 2, 4], &[1, 2, 3, 4]);
+        assert!((tau - (2.0 / 3.0)).abs() < 0.01);
+    }
+
+    // ── ShadowComparison empty inputs ───────────────────────────────────
+
+    #[test]
+    fn shadow_comparison_both_empty() {
+        let cmp = ShadowComparison::compute(
+            &[],
+            &[],
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            None,
+            "empty",
+        );
+        // max(0,0).max(1) = 1, overlap = 0/1 = 0.0
+        assert!((cmp.result_overlap_pct - 0.0).abs() < 1e-10);
+        assert_eq!(cmp.legacy_result_count, 0);
+        assert_eq!(cmp.v3_result_count, 0);
+    }
+
+    #[test]
+    fn shadow_comparison_legacy_empty_v3_populated() {
+        let cmp = ShadowComparison::compute(
+            &[],
+            &[1, 2, 3],
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            None,
+            "asymmetric",
+        );
+        assert!((cmp.result_overlap_pct - 0.0).abs() < 1e-10);
+        assert!(!cmp.is_equivalent());
+    }
+
+    // ── ShadowComparison latency delta ──────────────────────────────────
+
+    #[test]
+    fn shadow_comparison_latency_delta_sign() {
+        let cmp = ShadowComparison::compute(
+            &[1],
+            &[1],
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            None,
+            "latency",
+        );
+        assert_eq!(cmp.latency_delta_ms, 100); // v3 - legacy = +100
+    }
+
+    // ── ShadowMetrics ───────────────────────────────────────────────────
+
+    #[test]
+    fn shadow_metrics_default_is_empty() {
+        let m = ShadowMetrics::default();
+        let snap = m.snapshot();
+        assert_eq!(snap.total_comparisons, 0);
+        assert_eq!(snap.equivalent_count, 0);
+        assert_eq!(snap.v3_error_count, 0);
+        assert!((snap.avg_overlap_pct - 0.0).abs() < 1e-10);
+        assert_eq!(snap.avg_latency_delta_ms, 0);
+    }
+
+    #[test]
+    fn shadow_metrics_new_is_default() {
+        let m = ShadowMetrics::new();
+        assert_eq!(m.total_comparisons.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shadow_metrics_records_v3_errors() {
+        let m = ShadowMetrics::new();
+        let cmp = ShadowComparison::compute(
+            &[1],
+            &[],
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Some("error"),
+            "err",
+        );
+        m.record(&cmp);
+        let snap = m.snapshot();
+        assert_eq!(snap.v3_error_count, 1);
+        assert!((snap.v3_error_pct - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn shadow_metrics_equivalent_percentage() {
+        let m = ShadowMetrics::new();
+
+        // 1 equivalent
+        let eq = ShadowComparison::compute(
+            &[1, 2, 3],
+            &[1, 2, 3],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            None,
+            "eq",
+        );
+        m.record(&eq);
+
+        // 1 non-equivalent
+        let ne = ShadowComparison::compute(
+            &[1, 2, 3],
+            &[4, 5, 6],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            None,
+            "ne",
+        );
+        m.record(&ne);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.total_comparisons, 2);
+        assert_eq!(snap.equivalent_count, 1);
+        assert!((snap.equivalent_pct - 50.0).abs() < 1e-10);
+    }
+
+    // ── ShadowMetricsSnapshot serde ─────────────────────────────────────
+
+    #[test]
+    fn shadow_metrics_snapshot_serde_roundtrip() {
+        let snap = ShadowMetricsSnapshot {
+            total_comparisons: 42,
+            equivalent_count: 30,
+            equivalent_pct: 71.4,
+            v3_error_count: 2,
+            v3_error_pct: 4.8,
+            avg_overlap_pct: 85.2,
+            avg_latency_delta_ms: -15,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ShadowMetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_comparisons, 42);
+        assert_eq!(back.avg_latency_delta_ms, -15);
+    }
+
+    // ── RolloutController ───────────────────────────────────────────────
+
+    #[test]
+    fn rollout_controller_default_trait() {
+        let ctrl = RolloutController::default();
+        assert_eq!(ctrl.effective_engine("any"), SearchEngine::Legacy);
+        assert!(!ctrl.should_shadow());
+        assert!(!ctrl.should_return_v3());
+        assert!(ctrl.should_fallback_on_error());
+    }
+
+    #[test]
+    fn rollout_controller_config_accessor() {
+        let mut cfg = SearchRolloutConfig::default();
+        cfg.engine = SearchEngine::Lexical;
+        let ctrl = RolloutController::new(cfg);
+        assert_eq!(ctrl.config().engine, SearchEngine::Lexical);
+    }
+
+    #[test]
+    fn rollout_controller_metrics_snapshot_after_recording() {
+        let ctrl = RolloutController::default();
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3],
+            &[1, 2, 3],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            None,
+            "test",
+        );
+        ctrl.record_shadow_comparison(&cmp);
+        let snap = ctrl.metrics_snapshot();
+        assert_eq!(snap.total_comparisons, 1);
+    }
+
+    #[test]
+    fn rollout_controller_fallback_on_error_configurable() {
+        let cfg = SearchRolloutConfig {
+            fallback_on_error: false,
+            ..Default::default()
+        };
+        let ctrl = RolloutController::new(cfg);
+        assert!(!ctrl.should_fallback_on_error());
+    }
+
+    #[test]
+    fn rollout_controller_shadow_mode_off() {
+        let ctrl = RolloutController::default();
+        assert_eq!(ctrl.shadow_mode(), SearchShadowMode::Off);
+        assert!(!ctrl.should_shadow());
+    }
+
+    #[test]
+    fn rollout_controller_semantic_disabled_degrades_semantic_to_legacy() {
+        let cfg = SearchRolloutConfig {
+            engine: SearchEngine::Semantic,
+            semantic_enabled: false,
+            ..Default::default()
+        };
+        let ctrl = RolloutController::new(cfg);
+        // With semantic kill switch, should degrade
+        let eff = ctrl.effective_engine("search_messages");
+        assert_ne!(eff, SearchEngine::Semantic);
+    }
+
+    // ── ShadowComparison::is_equivalent boundary ────────────────────────
+
+    #[test]
+    fn is_equivalent_boundary_at_80pct() {
+        // Exactly 8/10 overlap = 0.8, no error → equivalent
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 11, 12],
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            None,
+            "boundary",
+        );
+        assert!(cmp.is_equivalent());
+    }
+
+    #[test]
+    fn is_not_equivalent_at_70pct() {
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            &[1, 2, 3, 4, 5, 6, 7, 11, 12, 13],
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            None,
+            "below",
+        );
+        assert!(!cmp.is_equivalent()); // 7/10 = 0.7 < 0.8
+    }
+
+    #[test]
+    fn is_not_equivalent_with_error_despite_full_overlap() {
+        let cmp = ShadowComparison::compute(
+            &[1, 2, 3],
+            &[1, 2, 3],
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Some("err"),
+            "error blocks equiv",
+        );
+        assert!(!cmp.is_equivalent());
+    }
+
+    // ── Large result set overlap uses top-10 only ───────────────────────
+
+    #[test]
+    fn overlap_computed_on_top_10_only() {
+        // 20 legacy, 20 v3. Top-10 of each share 5 results.
+        let legacy: Vec<i64> = (1..=20).collect();
+        let v3: Vec<i64> = (6..=25).collect(); // overlap: 6-10 in top-10
+        let cmp = ShadowComparison::compute(
+            &legacy,
+            &v3,
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            None,
+            "top10",
+        );
+        // Legacy top-10: 1..=10, V3 top-10: 6..=15, shared in top-10: 6..=10 = 5
+        assert!((cmp.result_overlap_pct - 0.5).abs() < 1e-10);
+    }
 }
