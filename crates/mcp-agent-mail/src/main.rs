@@ -309,12 +309,11 @@ fn decide_reuse_preflight(
     }
 
     match port_status {
-        PortStatus::Free => ReusePreflightDecision::Proceed,
         PortStatus::AgentMailServer => ReusePreflightDecision::ReusedExistingServer,
         PortStatus::OtherProcess { description } => {
             ReusePreflightDecision::PortOccupiedByOtherProcess { description }
         }
-        PortStatus::Error { .. } => ReusePreflightDecision::Proceed,
+        PortStatus::Free | PortStatus::Error { .. } => ReusePreflightDecision::Proceed,
     }
 }
 
@@ -641,14 +640,13 @@ mod tests {
             other => panic!("expected Serve, got {other:?}"),
         }
 
-        let err = match Cli::try_parse_from([
+        let Err(err) = Cli::try_parse_from([
             "mcp-agent-mail",
             "serve",
             "--reuse-running",
             "--no-reuse-running",
-        ]) {
-            Ok(_) => panic!("conflicting flags should fail"),
-            Err(err) => err,
+        ]) else {
+            panic!("conflicting flags should fail")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }

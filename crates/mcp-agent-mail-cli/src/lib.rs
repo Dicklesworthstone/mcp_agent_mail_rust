@@ -9502,7 +9502,7 @@ mod tests {
 
         let output = capture.drain_to_string();
         // JSON output should be parseable
-        let parsed: serde_json::Value = serde_json::from_str(&output.trim())
+        let parsed: serde_json::Value = serde_json::from_str(output.trim())
             .unwrap_or_else(|_| panic!("Failed to parse JSON output: {output}"));
 
         // Verify essential fields are present
