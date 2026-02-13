@@ -502,4 +502,399 @@ mod tests {
         assert_eq!(stats.flush_count, 2);
         assert!(stats.last_flush_duration.is_some());
     }
+
+    // ── New tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn should_flush_interval_elapsed() {
+        let updater = IncrementalUpdater::with_config(UpdaterConfig {
+            batch_size: 1000,                         // large so batch trigger never fires
+            flush_interval: Duration::from_millis(0), // zero = always elapsed
+            ..UpdaterConfig::default()
+        });
+
+        // Empty queue never triggers even with expired interval
+        assert!(!updater.should_flush());
+
+        updater.on_message_upsert(&sample_message_row());
+        // 1 item < batch_size but interval is 0ms → elapsed immediately
+        assert!(updater.should_flush());
+    }
+
+    #[test]
+    fn batch_size_one_triggers_immediately() {
+        let updater = IncrementalUpdater::with_config(UpdaterConfig {
+            batch_size: 1,
+            flush_interval: Duration::from_secs(3600), // long so interval never fires
+            ..UpdaterConfig::default()
+        });
+
+        assert!(!updater.should_flush());
+        updater.on_message_upsert(&sample_message_row());
+        assert!(updater.should_flush()); // 1 >= batch_size(1)
+    }
+
+    #[test]
+    fn backpressure_threshold_one_drops_second() {
+        let updater = IncrementalUpdater::with_config(UpdaterConfig {
+            backpressure_threshold: 1,
+            ..UpdaterConfig::default()
+        });
+
+        assert!(updater.enqueue(DocChange::Delete {
+            id: 1,
+            kind: DocKind::Message,
+        }));
+        // Second enqueue hits threshold
+        assert!(!updater.enqueue(DocChange::Delete {
+            id: 2,
+            kind: DocKind::Message,
+        }));
+
+        let stats = updater.stats();
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(stats.total_dropped, 1);
+    }
+
+    #[test]
+    fn multiple_backpressure_drops_accumulate() {
+        let updater = IncrementalUpdater::with_config(UpdaterConfig {
+            backpressure_threshold: 1,
+            ..UpdaterConfig::default()
+        });
+
+        updater.on_message_upsert(&sample_message_row());
+        assert!(!updater.on_message_upsert(&sample_message_row()));
+        assert!(!updater.on_message_upsert(&sample_message_row()));
+        assert!(!updater.on_message_upsert(&sample_message_row()));
+
+        let stats = updater.stats();
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(stats.total_dropped, 3);
+    }
+
+    #[test]
+    fn deduplicate_empty_input() {
+        let deduped = deduplicate_changes(vec![]);
+        assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn deduplicate_all_same_key() {
+        let changes: Vec<DocChange> = (0..5)
+            .map(|i| {
+                DocChange::Upsert(Document {
+                    id: 42,
+                    kind: DocKind::Message,
+                    body: format!("version {i}"),
+                    title: "title".to_owned(),
+                    project_id: Some(1),
+                    created_ts: i64::from(i) * 100,
+                    metadata: HashMap::new(),
+                })
+            })
+            .collect();
+
+        let deduped = deduplicate_changes(changes);
+        assert_eq!(deduped.len(), 1);
+        if let DocChange::Upsert(ref doc) = deduped[0] {
+            assert_eq!(doc.body, "version 4"); // last one wins
+        } else {
+            panic!("Expected upsert");
+        }
+    }
+
+    #[test]
+    fn deduplicate_preserves_distinct_key_order() {
+        let mk = |id, kind| {
+            DocChange::Upsert(Document {
+                id,
+                kind,
+                body: String::new(),
+                title: String::new(),
+                project_id: Some(1),
+                created_ts: 0,
+                metadata: HashMap::new(),
+            })
+        };
+
+        let changes = vec![
+            mk(3, DocKind::Agent),
+            mk(1, DocKind::Message),
+            mk(2, DocKind::Project),
+        ];
+
+        let deduped = deduplicate_changes(changes);
+        assert_eq!(deduped.len(), 3);
+        // Order should be preserved: agent:3, message:1, project:2
+        assert_eq!(deduped[0].doc_id(), 3);
+        assert_eq!(deduped[0].doc_kind(), DocKind::Agent);
+        assert_eq!(deduped[1].doc_id(), 1);
+        assert_eq!(deduped[1].doc_kind(), DocKind::Message);
+        assert_eq!(deduped[2].doc_id(), 2);
+        assert_eq!(deduped[2].doc_kind(), DocKind::Project);
+    }
+
+    #[test]
+    fn deduplicate_upsert_then_delete_then_upsert() {
+        let mk_upsert = |body: &str| {
+            DocChange::Upsert(Document {
+                id: 1,
+                kind: DocKind::Message,
+                body: body.to_owned(),
+                title: "t".to_owned(),
+                project_id: Some(1),
+                created_ts: 0,
+                metadata: HashMap::new(),
+            })
+        };
+        let mk_delete = DocChange::Delete {
+            id: 1,
+            kind: DocKind::Message,
+        };
+
+        // upsert → delete → upsert: last upsert wins
+        let changes = vec![mk_upsert("first"), mk_delete, mk_upsert("final")];
+        let deduped = deduplicate_changes(changes);
+        assert_eq!(deduped.len(), 1);
+        if let DocChange::Upsert(ref doc) = deduped[0] {
+            assert_eq!(doc.body, "final");
+        } else {
+            panic!("Expected upsert to win over earlier delete");
+        }
+    }
+
+    struct FailingLifecycle;
+
+    impl IndexLifecycle for FailingLifecycle {
+        fn rebuild(&self) -> SearchResult<IndexStats> {
+            Err(crate::error::SearchError::IndexNotReady(
+                "test failure".into(),
+            ))
+        }
+
+        fn update_incremental(&self, _changes: &[DocChange]) -> SearchResult<usize> {
+            Err(crate::error::SearchError::IndexNotReady(
+                "backend offline".into(),
+            ))
+        }
+
+        fn health(&self) -> IndexHealth {
+            IndexHealth {
+                ready: false,
+                doc_count: 0,
+                size_bytes: None,
+                last_updated_ts: None,
+                status_message: "failing".to_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn flush_propagates_backend_error() {
+        let updater = IncrementalUpdater::new();
+        let backend = FailingLifecycle;
+
+        updater.on_message_upsert(&sample_message_row());
+        let result = updater.flush(&backend);
+        assert!(result.is_err());
+
+        // Changes were drained even though backend failed
+        let stats = updater.stats();
+        assert_eq!(stats.pending_count, 0);
+        // But total_applied was NOT incremented (error path)
+        assert_eq!(stats.total_applied, 0);
+        assert_eq!(stats.flush_count, 0);
+    }
+
+    #[test]
+    fn default_trait_creates_updater() {
+        let updater = IncrementalUpdater::default();
+        assert_eq!(updater.config.batch_size, 100);
+        assert_eq!(updater.config.flush_interval, Duration::from_secs(5));
+        assert_eq!(updater.config.backpressure_threshold, 1000);
+        assert!(!updater.should_flush());
+    }
+
+    #[test]
+    fn updater_stats_default() {
+        let stats = UpdaterStats::default();
+        assert_eq!(stats.pending_count, 0);
+        assert_eq!(stats.total_applied, 0);
+        assert_eq!(stats.total_dropped, 0);
+        assert_eq!(stats.flush_count, 0);
+        assert!(stats.last_flush_duration.is_none());
+    }
+
+    #[test]
+    fn flush_resets_should_flush_timer() {
+        let updater = IncrementalUpdater::with_config(UpdaterConfig {
+            batch_size: 1000,
+            flush_interval: Duration::from_millis(0),
+            ..UpdaterConfig::default()
+        });
+        let backend = MockLifecycle::new();
+
+        updater.on_message_upsert(&sample_message_row());
+        assert!(updater.should_flush());
+
+        updater.flush(&backend).unwrap();
+        // After flush, queue is empty → should_flush false regardless of timer
+        assert!(!updater.should_flush());
+    }
+
+    #[test]
+    fn enqueue_after_drain_works() {
+        let updater = IncrementalUpdater::new();
+
+        updater.on_message_upsert(&sample_message_row());
+        let drained = updater.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(updater.stats().pending_count, 0);
+
+        // Enqueue again after drain
+        updater.on_agent_upsert(&sample_agent_row());
+        assert_eq!(updater.stats().pending_count, 1);
+
+        let backend = MockLifecycle::new();
+        let applied = updater.flush(&backend).unwrap();
+        assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn project_upsert_and_flush() {
+        let updater = IncrementalUpdater::new();
+        let backend = MockLifecycle::new();
+
+        assert!(updater.on_project_upsert(&sample_project_row()));
+        let stats = updater.stats();
+        assert_eq!(stats.pending_count, 1);
+
+        let applied = updater.flush(&backend).unwrap();
+        assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn mixed_operations_in_sequence() {
+        let updater = IncrementalUpdater::new();
+        let backend = MockLifecycle::new();
+
+        updater.on_message_upsert(&sample_message_row());
+        updater.on_agent_delete(5);
+        updater.on_project_upsert(&sample_project_row());
+        updater.on_message_delete(99);
+        updater.on_agent_upsert(&sample_agent_row());
+
+        assert_eq!(updater.stats().pending_count, 5);
+
+        let applied = updater.flush(&backend).unwrap();
+        assert_eq!(applied, 5);
+        assert_eq!(updater.stats().total_applied, 5);
+        assert_eq!(updater.stats().flush_count, 1);
+    }
+
+    #[test]
+    fn updater_config_clone() {
+        let config = UpdaterConfig {
+            batch_size: 42,
+            flush_interval: Duration::from_millis(123),
+            backpressure_threshold: 999,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.batch_size, 42);
+        assert_eq!(cloned.flush_interval, Duration::from_millis(123));
+        assert_eq!(cloned.backpressure_threshold, 999);
+    }
+
+    #[test]
+    fn updater_stats_clone() {
+        let mut stats = UpdaterStats::default();
+        stats.total_applied = 42;
+        stats.flush_count = 7;
+        stats.last_flush_duration = Some(Duration::from_millis(10));
+
+        let cloned = stats.clone();
+        assert_eq!(cloned.total_applied, 42);
+        assert_eq!(cloned.flush_count, 7);
+        assert_eq!(cloned.last_flush_duration, Some(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn deduplicate_single_change() {
+        let changes = vec![DocChange::Delete {
+            id: 1,
+            kind: DocKind::Agent,
+        }];
+        let deduped = deduplicate_changes(changes);
+        assert_eq!(deduped.len(), 1);
+        assert!(matches!(
+            deduped[0],
+            DocChange::Delete {
+                id: 1,
+                kind: DocKind::Agent
+            }
+        ));
+    }
+
+    #[test]
+    fn deduplicate_same_id_different_kind() {
+        let mk = |kind| {
+            DocChange::Upsert(Document {
+                id: 1,
+                kind,
+                body: format!("{kind:?}"),
+                title: String::new(),
+                project_id: Some(1),
+                created_ts: 0,
+                metadata: HashMap::new(),
+            })
+        };
+
+        // Same id=1 but different DocKind: these are distinct keys
+        let changes = vec![
+            mk(DocKind::Message),
+            mk(DocKind::Agent),
+            mk(DocKind::Project),
+        ];
+        let deduped = deduplicate_changes(changes);
+        assert_eq!(deduped.len(), 3); // All kept because (kind, id) differs
+    }
+
+    #[test]
+    fn flush_duration_is_recorded() {
+        let updater = IncrementalUpdater::new();
+        let backend = MockLifecycle::new();
+
+        assert!(updater.stats().last_flush_duration.is_none());
+
+        updater.on_message_upsert(&sample_message_row());
+        updater.flush(&backend).unwrap();
+
+        let duration = updater.stats().last_flush_duration;
+        assert!(duration.is_some());
+        // Duration should be very small for a mock
+        assert!(duration.unwrap() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backpressure_after_drain_allows_new_enqueues() {
+        let updater = IncrementalUpdater::with_config(UpdaterConfig {
+            backpressure_threshold: 2,
+            ..UpdaterConfig::default()
+        });
+
+        // Fill to threshold
+        assert!(updater.on_message_upsert(&sample_message_row()));
+        assert!(updater.on_message_upsert(&sample_message_row()));
+        assert!(!updater.on_message_upsert(&sample_message_row())); // dropped
+
+        // Drain frees space
+        updater.drain();
+
+        // Can enqueue again
+        assert!(updater.on_message_upsert(&sample_message_row()));
+        assert_eq!(updater.stats().pending_count, 1);
+        // But dropped count persists
+        assert_eq!(updater.stats().total_dropped, 1);
+    }
 }
