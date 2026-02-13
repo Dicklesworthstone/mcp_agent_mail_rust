@@ -815,11 +815,13 @@ mod tests {
 
     #[test]
     fn prepare_candidates_combined_limit_truncates() {
+        #[allow(clippy::cast_precision_loss)]
         let lexical = (1..=5)
-            .map(|id| CandidateHit::new(id, 1.0 - id as f64 * 0.1))
+            .map(|id| CandidateHit::new(id, (id as f64).mul_add(-0.1, 1.0)))
             .collect::<Vec<_>>();
+        #[allow(clippy::cast_precision_loss)]
         let semantic = (6..=10)
-            .map(|id| CandidateHit::new(id, 0.9 - id as f64 * 0.05))
+            .map(|id| CandidateHit::new(id, (id as f64).mul_add(-0.05, 0.9)))
             .collect::<Vec<_>>();
         let budget = CandidateBudget {
             lexical_limit: 5,

@@ -501,4 +501,261 @@ mod tests {
         assert_eq!(result.hits[0].doc_id, 100);
         assert_eq!(result.hits[1].doc_id, 200);
     }
+
+    // ── Serde roundtrips ────────────────────────────────────────────────
+
+    #[test]
+    fn rrf_config_serde_roundtrip() {
+        let cfg = RrfConfig {
+            k: 42.0,
+            epsilon: 1e-12,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: RrfConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn source_contribution_serde_roundtrip() {
+        let sc = SourceContribution {
+            source: "lexical".to_string(),
+            contribution: 0.01639,
+            rank: Some(1),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let back: SourceContribution = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, sc);
+    }
+
+    #[test]
+    fn fusion_explain_serde_roundtrip() {
+        let fe = FusionExplain {
+            lexical_rank: Some(3),
+            lexical_score: Some(0.85),
+            semantic_rank: None,
+            semantic_score: None,
+            rrf_score: 0.015_873,
+            source_contributions: vec![SourceContribution {
+                source: "lexical".to_string(),
+                contribution: 0.015_873,
+                rank: Some(3),
+            }],
+        };
+        let json = serde_json::to_string(&fe).unwrap();
+        let back: FusionExplain = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fe);
+    }
+
+    #[test]
+    fn fused_hit_serde_roundtrip() {
+        let hit = FusedHit {
+            doc_id: 42,
+            rrf_score: 0.032,
+            first_source: CandidateSource::Semantic,
+            explain: FusionExplain {
+                lexical_rank: None,
+                lexical_score: None,
+                semantic_rank: Some(1),
+                semantic_score: Some(0.95),
+                rrf_score: 0.032,
+                source_contributions: vec![],
+            },
+        };
+        let json = serde_json::to_string(&hit).unwrap();
+        let back: FusedHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hit);
+    }
+
+    #[test]
+    fn fusion_result_serde_roundtrip() {
+        let result = FusionResult {
+            config: RrfConfig::default(),
+            input_count: 5,
+            total_fused: 5,
+            hits: vec![],
+            offset_applied: 0,
+            limit_applied: 100,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: FusionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, result);
+    }
+
+    // ── Edge cases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fuse_rrf_empty_candidates() {
+        let result = fuse_rrf(&[], RrfConfig::default(), 0, 100);
+        assert_eq!(result.total_fused, 0);
+        assert!(result.hits.is_empty());
+        assert_eq!(result.input_count, 0);
+    }
+
+    #[test]
+    fn fuse_rrf_default_convenience() {
+        let candidates = vec![make_candidate(1, Some(1), None, Some(0.9), None)];
+        let result = fuse_rrf_default(&candidates);
+        assert_eq!(result.total_fused, 1);
+        assert_eq!(result.config, RrfConfig::default());
+        assert_eq!(result.offset_applied, 0);
+        assert_eq!(result.limit_applied, usize::MAX);
+    }
+
+    #[test]
+    fn fuse_rrf_limit_zero_clamped_to_one() {
+        let candidates = vec![
+            make_candidate(1, Some(1), None, Some(0.9), None),
+            make_candidate(2, Some(2), None, Some(0.8), None),
+        ];
+        let result = fuse_rrf(&candidates, RrfConfig::default(), 0, 0);
+        // limit.max(1) = 1
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.limit_applied, 0); // stores the original limit
+    }
+
+    #[test]
+    fn fuse_rrf_semantic_only_candidates() {
+        let candidates = vec![
+            make_candidate(10, None, Some(1), None, Some(0.95)),
+            make_candidate(20, None, Some(2), None, Some(0.85)),
+            make_candidate(30, None, Some(3), None, Some(0.75)),
+        ];
+        let result = fuse_rrf_default(&candidates);
+        assert_eq!(result.total_fused, 3);
+
+        // All should have lexical contribution = 0
+        for hit in &result.hits {
+            let lex = hit
+                .explain
+                .source_contributions
+                .iter()
+                .find(|c| c.source == "lexical")
+                .unwrap();
+            assert_eq!(lex.contribution, 0.0);
+            assert_eq!(lex.rank, None);
+        }
+
+        // Sorted by RRF desc → rank 1 first (highest score)
+        assert_eq!(result.hits[0].doc_id, 10);
+        assert_eq!(result.hits[1].doc_id, 20);
+        assert_eq!(result.hits[2].doc_id, 30);
+    }
+
+    #[test]
+    fn fuse_rrf_dual_source_beats_single() {
+        // Doc in both sources at rank 1 should score higher than doc in one source at rank 1
+        let candidates = vec![
+            make_candidate(1, Some(1), Some(1), Some(0.9), Some(0.9)), // both
+            make_candidate(2, Some(1), None, Some(0.95), None),        // lexical only
+        ];
+        let result = fuse_rrf_default(&candidates);
+        assert_eq!(result.hits[0].doc_id, 1); // dual-source wins
+        assert!(result.hits[0].rrf_score > result.hits[1].rrf_score);
+    }
+
+    #[test]
+    fn fuse_rrf_offset_beyond_results() {
+        let candidates = vec![make_candidate(1, Some(1), None, Some(0.9), None)];
+        let result = fuse_rrf(&candidates, RrfConfig::default(), 100, 10);
+        assert_eq!(result.total_fused, 1);
+        assert!(result.hits.is_empty());
+    }
+
+    #[test]
+    fn fuse_rrf_score_calculation_exact() {
+        let k = 60.0;
+        let cfg = RrfConfig { k, epsilon: 1e-9 };
+        // Doc at lexical rank 3, semantic rank 5
+        let candidates = vec![make_candidate(42, Some(3), Some(5), Some(0.7), Some(0.6))];
+        let result = fuse_rrf(&candidates, cfg, 0, 100);
+        let expected = 1.0 / (k + 3.0) + 1.0 / (k + 5.0);
+        assert!((result.hits[0].rrf_score - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fused_hit_cmp_nan_score_safety() {
+        // NaN scores should not cause panics
+        let a = FusedHit {
+            doc_id: 1,
+            rrf_score: f64::NAN,
+            first_source: CandidateSource::Lexical,
+            explain: FusionExplain {
+                lexical_rank: None,
+                lexical_score: None,
+                semantic_rank: None,
+                semantic_score: None,
+                rrf_score: f64::NAN,
+                source_contributions: vec![],
+            },
+        };
+        let b = FusedHit {
+            doc_id: 2,
+            rrf_score: 0.5,
+            first_source: CandidateSource::Lexical,
+            explain: FusionExplain {
+                lexical_rank: None,
+                lexical_score: None,
+                semantic_rank: None,
+                semantic_score: None,
+                rrf_score: 0.5,
+                source_contributions: vec![],
+            },
+        };
+        // Should not panic — just produces some ordering
+        let _ = fused_hit_cmp(&a, &b, 1e-9);
+        let _ = fused_hit_cmp(&b, &a, 1e-9);
+    }
+
+    #[test]
+    fn source_contribution_none_rank() {
+        let sc = SourceContribution {
+            source: "semantic".to_string(),
+            contribution: 0.0,
+            rank: None,
+        };
+        assert_eq!(sc.rank, None);
+        assert_eq!(sc.contribution, 0.0);
+    }
+
+    #[test]
+    fn fusion_result_preserves_pagination_metadata() {
+        let candidates: Vec<_> = (1..=5)
+            .map(|i| make_candidate(i, Some(i as usize), None, Some(1.0 / i as f64), None))
+            .collect();
+        let result = fuse_rrf(&candidates, RrfConfig::default(), 2, 2);
+        assert_eq!(result.offset_applied, 2);
+        assert_eq!(result.limit_applied, 2);
+        assert_eq!(result.total_fused, 5);
+        assert_eq!(result.hits.len(), 2);
+        assert_eq!(result.input_count, 5);
+    }
+
+    #[test]
+    fn rrf_contribution_rank_zero() {
+        // rank=0 gives 1/(k+0) = 1/k — valid edge case
+        let k = 60.0;
+        let contrib = rrf_contribution(k, Some(0));
+        assert!((contrib - 1.0 / 60.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fuse_rrf_single_candidate() {
+        let candidates = vec![make_candidate(99, Some(1), Some(1), Some(1.0), Some(1.0))];
+        let result = fuse_rrf_default(&candidates);
+        assert_eq!(result.total_fused, 1);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].doc_id, 99);
+    }
+
+    #[test]
+    fn fuse_rrf_lexical_tiebreak_when_rrf_equal() {
+        // Same RRF score (both at rank 1 in lexical only), different lexical scores
+        let candidates = vec![
+            make_candidate(1, Some(1), None, Some(0.5), None),
+            make_candidate(2, Some(1), None, Some(0.9), None),
+        ];
+        let result = fuse_rrf_default(&candidates);
+        // Higher lexical score wins tiebreak
+        assert_eq!(result.hits[0].doc_id, 2);
+    }
 }
