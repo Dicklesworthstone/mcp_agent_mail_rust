@@ -11,7 +11,7 @@
 //! [`CorrelationLink`] entries.  The inspector renders these with
 //! number-key indicators so the operator can press `1`..`9` to navigate.
 
-use ftui::Frame;
+use ftui::{Frame, Style};
 use ftui::layout::Rect;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
@@ -378,9 +378,11 @@ pub fn remediation_hints(event: &MailEvent) -> Vec<RemediationHint> {
 /// If `event` is `None`, renders an empty placeholder.
 pub fn render_inspector(frame: &mut Frame<'_>, area: Rect, event: Option<&MailEvent>) {
     let Some(event) = event else {
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Inspector")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
         let p = Paragraph::new("(select an event)").block(block);
         p.render(area, frame);
         return;
@@ -426,9 +428,11 @@ pub fn render_inspector(frame: &mut Frame<'_>, area: Rect, event: Option<&MailEv
     );
     let full_text = format!("{header}\n{body}{hints_section}{links_section}");
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
     let p = Paragraph::new(full_text).block(block);
     p.render(area, frame);
 }

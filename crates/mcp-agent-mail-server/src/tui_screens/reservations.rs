@@ -405,7 +405,8 @@ impl MailScreen for ReservationsScreen {
 
         let block = Block::default()
             .title("Reservations")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
 
         let table = Table::new(rows, widths)
             .header(header)

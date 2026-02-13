@@ -739,19 +739,21 @@ impl MailScreen for MessageBrowserScreen {
             // Sync and borrow list state for rendering
             self.sync_list_state();
             let mut list_state = self.list_state.borrow_mut();
-            render_results_list(frame, results_area, &self.results, &mut list_state);
+            let results_focused = matches!(self.focus, Focus::ResultList);
+            render_results_list(frame, results_area, &self.results, &mut list_state, results_focused);
             drop(list_state);
             render_detail_panel(
                 frame,
                 detail_area,
                 self.results.get(self.cursor),
                 self.detail_scroll,
+                !results_focused,
             );
         } else {
             // Narrow: results only
             self.sync_list_state();
             let mut list_state = self.list_state.borrow_mut();
-            render_results_list(frame, content_area, &self.results, &mut list_state);
+            render_results_list(frame, content_area, &self.results, &mut list_state, true);
         }
 
         // Also merge live events into display if searching
@@ -1086,9 +1088,11 @@ fn render_search_bar(
     if !mode_label.is_empty() {
         let _ = std::fmt::Write::write_fmt(&mut title, format_args!(" | [{mode_label}]"));
     }
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1104,10 +1108,13 @@ fn render_results_list(
     area: Rect,
     results: &[MessageEntry],
     list_state: &mut VirtualizedListState,
+    focused: bool,
 ) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Results")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1136,10 +1143,13 @@ fn render_detail_panel(
     area: Rect,
     entry: Option<&MessageEntry>,
     scroll: usize,
+    focused: bool,
 ) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Detail")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1541,7 +1551,7 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         let mut list_state = VirtualizedListState::default();
-        render_results_list(&mut frame, Rect::new(0, 0, 40, 20), &[], &mut list_state);
+        render_results_list(&mut frame, Rect::new(0, 0, 40, 20), &[], &mut list_state, true);
     }
 
     #[test]
@@ -1585,6 +1595,7 @@ mod tests {
             Rect::new(0, 0, 40, 20),
             &entries,
             &mut list_state,
+            true,
         );
     }
 
@@ -1592,7 +1603,7 @@ mod tests {
     fn render_detail_no_message_no_panic() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), None, 0);
+        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), None, 0, true);
     }
 
     #[test]
@@ -1614,7 +1625,7 @@ mod tests {
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0);
+        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0, true);
     }
 
     #[test]
@@ -1638,7 +1649,7 @@ mod tests {
         };
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
-        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 10);
+        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 10, true);
     }
 
     #[test]

@@ -1647,7 +1647,7 @@ impl MailScreen for SearchCockpitScreen {
         let body_area = Rect::new(area.x, area.y + query_h, area.width, body_h);
 
         // Render query bar
-        render_query_bar(frame, query_area, &self.query_input, self);
+        render_query_bar(frame, query_area, &self.query_input, self, matches!(self.focus, Focus::QueryBar));
 
         // Body: facet rail (left) + results + detail (right)
         let facet_w: u16 = if area.width >= 100 { 20 } else { 16 };
@@ -1672,7 +1672,7 @@ impl MailScreen for SearchCockpitScreen {
                 body_area.height,
             );
 
-            render_facet_rail(frame, facet_area, self);
+            render_facet_rail(frame, facet_area, self, matches!(self.focus, Focus::FacetRail));
             self.sync_list_state();
             render_results(
                 frame,
@@ -1681,6 +1681,7 @@ impl MailScreen for SearchCockpitScreen {
                 &mut self.list_state.borrow_mut(),
                 &self.highlight_terms,
                 self.sort_direction,
+                matches!(self.focus, Focus::ResultList),
             );
             render_detail(
                 frame,
@@ -1688,6 +1689,7 @@ impl MailScreen for SearchCockpitScreen {
                 self.results.get(self.cursor),
                 self.detail_scroll,
                 &self.highlight_terms,
+                false,
             );
         } else {
             // Narrow: facet rail + results only
@@ -1697,7 +1699,7 @@ impl MailScreen for SearchCockpitScreen {
                 remaining_w,
                 body_area.height,
             );
-            render_facet_rail(frame, facet_area, self);
+            render_facet_rail(frame, facet_area, self, matches!(self.focus, Focus::FacetRail));
             self.sync_list_state();
             render_results(
                 frame,
@@ -1706,6 +1708,7 @@ impl MailScreen for SearchCockpitScreen {
                 &mut self.list_state.borrow_mut(),
                 &self.highlight_terms,
                 self.sort_direction,
+                matches!(self.focus, Focus::ResultList),
             );
         }
 
@@ -2014,6 +2017,7 @@ fn render_query_bar(
     area: Rect,
     input: &TextInput,
     screen: &SearchCockpitScreen,
+    focused: bool,
 ) {
     let count = screen.results.len();
     let kind_label = screen.doc_kind_filter.label();
@@ -2030,9 +2034,11 @@ fn render_query_bar(
 
     let title = format!("Search {kind_label} ({count} results){thread_label}{focus_label}");
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -2116,10 +2122,12 @@ Esc/any key: close";
         .render(inner, frame);
 }
 
-fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitScreen) {
+fn render_facet_rail(frame: &mut Frame<'_>, area: Rect, screen: &SearchCockpitScreen, focused: bool) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Facets")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -2346,6 +2354,7 @@ fn render_results(
     list_state: &mut VirtualizedListState,
     highlight_terms: &[QueryTerm],
     sort_direction: SortDirection,
+    focused: bool,
 ) {
     // Show match count in header: "Results (42 matches)" or "Results"
     let title = if results.is_empty() {
@@ -2355,9 +2364,11 @@ fn render_results(
         let plural = if count == 1 { "match" } else { "matches" };
         format!("Results ({count} {plural})")
     };
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -2396,10 +2407,13 @@ fn render_detail(
     entry: Option<&ResultEntry>,
     scroll: usize,
     highlight_terms: &[QueryTerm],
+    focused: bool,
 ) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Detail")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -3315,7 +3329,7 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 30, &mut pool);
         let entry = make_msg_entry();
-        render_detail(&mut frame, Rect::new(0, 0, 80, 30), Some(&entry), 0, &[]);
+        render_detail(&mut frame, Rect::new(0, 0, 80, 30), Some(&entry), 0, &[], true);
         let text = buffer_to_text(&frame.buffer);
         // Should contain the body header
         assert!(
@@ -3338,7 +3352,7 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 20, &mut pool);
         let entry = make_agent_entry();
-        render_detail(&mut frame, Rect::new(0, 0, 80, 20), Some(&entry), 0, &[]);
+        render_detail(&mut frame, Rect::new(0, 0, 80, 20), Some(&entry), 0, &[], true);
         let text = buffer_to_text(&frame.buffer);
         assert!(
             text.contains("Preview"),
@@ -3350,7 +3364,7 @@ mod tests {
     fn render_detail_no_entry_shows_prompt() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(60, 10, &mut pool);
-        render_detail(&mut frame, Rect::new(0, 0, 60, 10), None, 0, &[]);
+        render_detail(&mut frame, Rect::new(0, 0, 60, 10), None, 0, &[], true);
         let text = buffer_to_text(&frame.buffer);
         assert!(
             text.contains("Select a result"),

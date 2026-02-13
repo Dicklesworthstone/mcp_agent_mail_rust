@@ -1030,6 +1030,7 @@ fn render_trend_panel(
     if area.width < 10 || area.height < 6 {
         return;
     }
+    let tp = crate::tui_theme::TuiThemePalette::current();
     // Split vertically: top half = percentile ribbon, bottom half = throughput
     let ribbon_h = area.height / 2;
     let activity_h = area.height.saturating_sub(ribbon_h);
@@ -1043,13 +1044,15 @@ fn render_trend_panel(
             .block(
                 Block::default()
                     .title("Latency P50/P95/P99")
-                    .border_type(BorderType::Rounded),
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(tp.panel_border)),
             );
         ribbon.render(ribbon_area, frame);
     } else {
         let block = Block::default()
             .title("Latency (collecting...)")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
         Paragraph::new("Awaiting data...")
             .block(block)
             .render(ribbon_area, frame);
@@ -1059,7 +1062,8 @@ fn render_trend_panel(
     if throughput_history.len() >= 2 {
         let block = Block::default()
             .title("Req/interval")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
         let inner = block.inner(activity_area);
         block.render(activity_area, frame);
 
@@ -1099,7 +1103,8 @@ fn render_trend_panel(
     } else {
         let block = Block::default()
             .title("Throughput (collecting...)")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
         Paragraph::new("Awaiting data...")
             .block(block)
             .render(activity_area, frame);
@@ -1116,9 +1121,11 @@ fn render_recent_message_preview_panel(
         return;
     }
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Recent Message Preview")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1246,9 +1253,11 @@ fn render_event_log(
     let title =
         format!("Events ({end}/{total}){follow_indicator}{verbosity_indicator}{filter_indicator}",);
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
     let p = Paragraph::new(text).block(block);
     p.render(area, frame);
 }

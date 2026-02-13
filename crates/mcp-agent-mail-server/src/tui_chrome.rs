@@ -36,19 +36,9 @@ const HELP_KEY_FG: PackedRgba = PackedRgba::rgb(100, 180, 255);
 const HELP_BORDER_FG: PackedRgba = PackedRgba::rgb(80, 100, 140);
 const HELP_CATEGORY_FG: PackedRgba = PackedRgba::rgb(180, 140, 255);
 
-// High-contrast palette — brighter foreground, darker background
-const HC_TAB_ACTIVE_BG: PackedRgba = PackedRgba::rgb(0, 50, 120);
-const HC_TAB_ACTIVE_FG: PackedRgba = PackedRgba::rgb(255, 255, 255);
-const HC_TAB_INACTIVE_FG: PackedRgba = PackedRgba::rgb(200, 210, 230);
-const HC_TAB_KEY_FG: PackedRgba = PackedRgba::rgb(80, 200, 255);
-const HC_STATUS_FG: PackedRgba = PackedRgba::rgb(220, 230, 240);
-const HC_STATUS_ACCENT: PackedRgba = PackedRgba::rgb(100, 220, 255);
-const HC_STATUS_GOOD: PackedRgba = PackedRgba::rgb(80, 255, 140);
-const HC_STATUS_WARN: PackedRgba = PackedRgba::rgb(255, 160, 80);
-const HC_HELP_FG: PackedRgba = PackedRgba::rgb(240, 245, 255);
-const HC_HELP_KEY_FG: PackedRgba = PackedRgba::rgb(80, 220, 255);
-const HC_HELP_BORDER_FG: PackedRgba = PackedRgba::rgb(120, 150, 200);
-const HC_HELP_CATEGORY_FG: PackedRgba = PackedRgba::rgb(220, 180, 255);
+// High-contrast palette is now handled at the theme level
+// (`ThemeId::HighContrast` in `TuiThemePalette`). Legacy HC_*
+// constants removed.
 
 // ──────────────────────────────────────────────────────────────────────
 // Chrome layout
@@ -123,7 +113,7 @@ pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
         };
 
         // Inter-tab separator (before each tab except the first)
-        if i > 0 && x + 1 <= area.x + available {
+        if i > 0 && x < area.x + available {
             let sep_area = Rect::new(x, area.y, 1, 1);
             Paragraph::new("│")
                 .style(Style::default().fg(tp.tab_inactive_fg).bg(tp.tab_inactive_bg))
@@ -606,28 +596,11 @@ pub struct ChromePalette {
 impl ChromePalette {
     /// Resolve the palette from accessibility settings.
     ///
-    /// When high-contrast mode is active, uses the dedicated HC constants.
-    /// Otherwise delegates to the theme-aware `TuiThemePalette`.
+    /// Always delegates to the theme-aware `TuiThemePalette::current()`.
+    /// High-contrast mode is handled at the theme level (`ThemeId::HighContrast`).
     #[must_use]
-    pub fn from_settings(settings: &AccessibilitySettings) -> Self {
-        if settings.high_contrast {
-            Self {
-                tab_active_bg: HC_TAB_ACTIVE_BG,
-                tab_active_fg: HC_TAB_ACTIVE_FG,
-                tab_inactive_fg: HC_TAB_INACTIVE_FG,
-                tab_key_fg: HC_TAB_KEY_FG,
-                status_fg: HC_STATUS_FG,
-                status_accent: HC_STATUS_ACCENT,
-                status_good: HC_STATUS_GOOD,
-                status_warn: HC_STATUS_WARN,
-                help_fg: HC_HELP_FG,
-                help_key_fg: HC_HELP_KEY_FG,
-                help_border_fg: HC_HELP_BORDER_FG,
-                help_category_fg: HC_HELP_CATEGORY_FG,
-            }
-        } else {
-            Self::from_theme()
-        }
+    pub fn from_settings(_settings: &AccessibilitySettings) -> Self {
+        Self::from_theme()
     }
 
     /// Resolve from the currently active ftui theme.
@@ -855,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_high_contrast_uses_hc_colors() {
+    fn palette_high_contrast_resolves_from_theme() {
         let settings = AccessibilitySettings {
             high_contrast: true,
             key_hints: true,
@@ -863,9 +836,10 @@ mod tests {
             screen_reader: false,
         };
         let p = ChromePalette::from_settings(&settings);
-        assert_eq!(p.tab_active_bg, HC_TAB_ACTIVE_BG);
-        assert_eq!(p.help_fg, HC_HELP_FG);
-        assert_eq!(p.status_accent, HC_STATUS_ACCENT);
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        assert_eq!(p.tab_active_bg, tp.tab_active_bg);
+        assert_eq!(p.help_fg, tp.help_fg);
+        assert_eq!(p.status_accent, tp.status_accent);
     }
 
     #[test]
@@ -896,18 +870,14 @@ mod tests {
     }
 
     #[test]
-    fn hc_colors_are_brighter_than_standard() {
-        // High-contrast FG colors should have higher brightness (sum of RGB)
-        let hc_fg_sum = u32::from(HC_TAB_INACTIVE_FG.r())
-            + u32::from(HC_TAB_INACTIVE_FG.g())
-            + u32::from(HC_TAB_INACTIVE_FG.b());
-        let std_fg_sum = u32::from(TAB_INACTIVE_FG.r())
-            + u32::from(TAB_INACTIVE_FG.g())
-            + u32::from(TAB_INACTIVE_FG.b());
-        assert!(
-            hc_fg_sum > std_fg_sum,
-            "HC inactive FG ({hc_fg_sum}) should be brighter than standard ({std_fg_sum})"
-        );
+    fn standard_palette_has_non_zero_colors() {
+        let p = ChromePalette::standard();
+        // Verify the standard palette constants are non-trivial
+        let fg_sum = u32::from(p.tab_inactive_fg.r())
+            + u32::from(p.tab_inactive_fg.g())
+            + u32::from(p.tab_inactive_fg.b());
+        assert!(fg_sum > 0, "standard inactive FG should be non-zero");
+        assert_ne!(p.tab_active_bg, p.tab_active_fg, "active BG and FG should differ");
     }
 
     // ── Render key hint bar tests ───────────────────────────────

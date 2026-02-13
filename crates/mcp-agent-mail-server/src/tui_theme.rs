@@ -643,15 +643,42 @@ pub fn markdown_theme() -> MarkdownTheme {
 ///
 /// `t` is clamped to `[0.0, 1.0]`.
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
+)]
 pub fn lerp_color(a: PackedRgba, b: PackedRgba, t: f32) -> PackedRgba {
     let t = t.clamp(0.0, 1.0);
     let inv = 1.0 - t;
-    let r = (f32::from(a.r()) * inv + f32::from(b.r()) * t) as u8;
-    let g = (f32::from(a.g()) * inv + f32::from(b.g()) * t) as u8;
-    let bl = (f32::from(a.b()) * inv + f32::from(b.b()) * t) as u8;
+    let r = f32::from(a.r()).mul_add(inv, f32::from(b.r()) * t) as u8;
+    let g = f32::from(a.g()).mul_add(inv, f32::from(b.g()) * t) as u8;
+    let bl = f32::from(a.b()).mul_add(inv, f32::from(b.b()) * t) as u8;
     PackedRgba::rgb(r, g, bl)
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Focus-aware panel helpers
+// ──────────────────────────────────────────────────────────────────────
+
+/// Return the border color for a panel based on focus state.
+#[must_use]
+pub const fn focus_border_color(tp: &TuiThemePalette, focused: bool) -> PackedRgba {
+    if focused {
+        tp.panel_border_focused
+    } else {
+        tp.panel_border_dim
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Selection indicator helpers
+// ──────────────────────────────────────────────────────────────────────
+
+/// Prefix string for a selected list item.
+pub const SELECTION_PREFIX: &str = "▶ ";
+/// Prefix string for an unselected list item (same width).
+pub const SELECTION_PREFIX_EMPTY: &str = "  ";
 
 // ──────────────────────────────────────────────────────────────────────
 // JSON token style helpers

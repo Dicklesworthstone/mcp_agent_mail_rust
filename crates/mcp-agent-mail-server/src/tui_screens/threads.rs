@@ -1184,9 +1184,11 @@ fn render_thread_list(
         view_lens.label(),
         sort_mode.label(),
     );
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1316,9 +1318,11 @@ fn render_thread_detail(
         },
     );
 
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 

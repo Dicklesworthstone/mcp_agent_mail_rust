@@ -404,7 +404,8 @@ impl ContactsScreen {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Network Graph")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
         let inner = block.inner(area);
         block.render(area, frame);
 
@@ -531,7 +532,8 @@ impl ContactsScreen {
 
         let block = Block::default()
             .title("Contacts")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
 
         let table = Table::new(rows, widths)
             .header(header)

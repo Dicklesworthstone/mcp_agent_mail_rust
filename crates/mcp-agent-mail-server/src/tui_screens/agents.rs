@@ -560,11 +560,11 @@ impl MailScreen for AgentsScreen {
             Constraint::Percentage(15.0),
         ];
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Agents")
-            .border_type(BorderType::Rounded);
-
-        let tp = crate::tui_theme::TuiThemePalette::current();
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)

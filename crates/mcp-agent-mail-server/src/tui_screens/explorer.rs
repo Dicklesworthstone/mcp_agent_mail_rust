@@ -949,11 +949,11 @@ impl MailScreen for MailExplorerScreen {
         let header_area = Rect::new(area.x, area.y, area.width, header_h);
         let body_area = Rect::new(area.x, area.y + header_h, area.width, body_h);
 
-        render_header(frame, header_area, &self.search_input, self);
+        render_header(frame, header_area, &self.search_input, self, matches!(self.focus, Focus::SearchBar));
 
         if self.pressure_mode {
             // Pressure board takes the full body area
-            render_pressure_board(frame, body_area, &self.pressure_board, self.pressure_cursor);
+            render_pressure_board(frame, body_area, &self.pressure_board, self.pressure_cursor, matches!(self.focus, Focus::ResultList));
         } else {
             // Normal mode: filter rail (left) + results + detail (right)
             let filter_w: u16 = if area.width >= 100 { 18 } else { 14 };
@@ -977,18 +977,22 @@ impl MailScreen for MailExplorerScreen {
                     body_area.height,
                 );
 
-                render_filter_rail(frame, filter_area, self);
+                let filter_focused = matches!(self.focus, Focus::FilterRail);
+                let results_focused = matches!(self.focus, Focus::ResultList);
+                render_filter_rail(frame, filter_area, self, filter_focused);
                 render_results(
                     frame,
                     results_area,
                     &self.entries,
                     &mut self.list_state.borrow_mut(),
+                    results_focused,
                 );
                 render_detail(
                     frame,
                     detail_area,
                     self.entries.get(self.cursor),
                     self.detail_scroll,
+                    results_focused,
                 );
             } else {
                 let results_area = Rect::new(
@@ -997,12 +1001,15 @@ impl MailScreen for MailExplorerScreen {
                     remaining_w,
                     body_area.height,
                 );
-                render_filter_rail(frame, filter_area, self);
+                let filter_focused = matches!(self.focus, Focus::FilterRail);
+                let results_focused = matches!(self.focus, Focus::ResultList);
+                render_filter_rail(frame, filter_area, self, filter_focused);
                 render_results(
                     frame,
                     results_area,
                     &self.entries,
                     &mut self.list_state.borrow_mut(),
+                    results_focused,
                 );
             }
         }
@@ -1220,6 +1227,7 @@ fn render_header(
     area: Rect,
     input: &TextInput,
     screen: &MailExplorerScreen,
+    focused: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let dir = direction_label(screen.direction);
@@ -1274,7 +1282,8 @@ fn render_header(
     let title = format!("Explorer {dir}{agent_label} ({count}){focus_label}{mode_label}");
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1307,11 +1316,12 @@ fn render_header(
     }
 }
 
-fn render_filter_rail(frame: &mut Frame<'_>, area: Rect, screen: &MailExplorerScreen) {
+fn render_filter_rail(frame: &mut Frame<'_>, area: Rect, screen: &MailExplorerScreen, focused: bool) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Filters")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1392,10 +1402,13 @@ fn render_results(
     area: Rect,
     entries: &[DisplayEntry],
     list_state: &mut VirtualizedListState,
+    focused: bool,
 ) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Messages")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1422,10 +1435,12 @@ fn render_results(
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&DisplayEntry>, scroll: usize) {
+fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&DisplayEntry>, scroll: usize, focused: bool) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Detail")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 
@@ -1479,11 +1494,12 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, entry: Option<&DisplayEntry>
 
 
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
-fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoard, cursor: usize) {
+fn render_pressure_board(frame: &mut Frame<'_>, area: Rect, board: &PressureBoard, cursor: usize, focused: bool) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title("Pressure Board")
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
     block.render(area, frame);
 

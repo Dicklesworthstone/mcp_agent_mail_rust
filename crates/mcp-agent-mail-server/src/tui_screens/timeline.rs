@@ -767,9 +767,11 @@ fn render_timeline(
     let title = format!("Timeline ({pos}){follow_tag}{verbosity_tag}{filter_tag}{dock_tag}");
 
     // Render block/border first.
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
     let inner_area = block.inner(area);
     block.render(area, frame);
 

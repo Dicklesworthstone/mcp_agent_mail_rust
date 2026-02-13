@@ -421,7 +421,8 @@ impl ToolMetricsScreen {
 
         let block = Block::default()
             .title("Tool Metrics")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
 
         let table = Table::new(rows, widths)
             .header(header)
@@ -544,9 +545,11 @@ impl ToolMetricsScreen {
             return;
         }
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Latency Distribution (p50/p95/p99)")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
 
         PercentileRibbon::new(&samples)
             .label("ms")
@@ -575,9 +578,11 @@ impl ToolMetricsScreen {
             return;
         }
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Top Tools by Call Count")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
 
         crate::tui_widgets::Leaderboard::new(&entries)
             .block(block)

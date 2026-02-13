@@ -211,7 +211,8 @@ fn render_card_list(
         .block(
             Block::new()
                 .title(title.as_str())
-                .border_type(BorderType::Rounded),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(tp.panel_border)),
         )
         .highlight_style(Style::default().reverse());
 
@@ -326,12 +327,14 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     let para = Paragraph::new(text).scroll((scroll, 0)).block(
         Block::new()
             .title(" Card Detail ")
-            .border_type(BorderType::Rounded),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border)),
     );
     para.render(area, frame);
 }
 
 fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
     let text = "No anomalies detected.\n\n\
                 The insight feed monitors real-time KPI metrics and surfaces\n\
                 anomaly explanation cards when deviations are detected.\n\n\
@@ -339,7 +342,8 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
     let para = Paragraph::new(text).block(
         Block::new()
             .title(" Insight Feed ")
-            .border_type(BorderType::Rounded),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border)),
     );
     para.render(area, frame);
 }

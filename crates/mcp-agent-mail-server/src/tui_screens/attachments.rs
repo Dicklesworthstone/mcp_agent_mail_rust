@@ -547,9 +547,11 @@ impl AttachmentExplorerScreen {
             .collect();
         let text = visible.join("\n");
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Attachment Detail")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
         let p = Paragraph::new(text).block(block);
         p.render(area, frame);
     }
@@ -718,15 +720,16 @@ impl MailScreen for AttachmentExplorerScreen {
             Constraint::Percentage(15.0),
         ];
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("Attachments")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
 
         let table = Table::new(rows, widths)
             .header(header_row)
             .block(block)
             .highlight_style({
-                let tp = crate::tui_theme::TuiThemePalette::current();
                 Style::default()
                     .fg(tp.selection_fg)
                     .bg(tp.selection_bg)

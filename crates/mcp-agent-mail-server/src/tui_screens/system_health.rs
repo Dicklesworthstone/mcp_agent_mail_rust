@@ -24,7 +24,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::Config;
 
@@ -276,9 +276,11 @@ impl SystemHealthScreen {
 
         body.push_str("\nKeys: r refresh | v dashboard\n");
 
+        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("System Health")
-            .border_type(BorderType::Rounded);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
         Paragraph::new(body).block(block).render(area, frame);
     }
 
