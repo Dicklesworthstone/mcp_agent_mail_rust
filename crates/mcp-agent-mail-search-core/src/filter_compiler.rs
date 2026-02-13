@@ -320,6 +320,133 @@ mod tests {
         assert_eq!(active_filter_count(&filter), 0);
     }
 
+    // ── Individual field checks for has_active_filters ──
+
+    #[test]
+    fn has_active_filters_project_id_only() {
+        let filter = SearchFilter {
+            project_id: Some(42),
+            ..SearchFilter::default()
+        };
+        assert!(has_active_filters(&filter));
+    }
+
+    #[test]
+    fn has_active_filters_thread_id_only() {
+        let filter = SearchFilter {
+            thread_id: Some("t-1".to_string()),
+            ..SearchFilter::default()
+        };
+        assert!(has_active_filters(&filter));
+    }
+
+    #[test]
+    fn has_active_filters_doc_kind_only() {
+        let filter = SearchFilter {
+            doc_kind: Some(DocKind::Message),
+            ..SearchFilter::default()
+        };
+        assert!(has_active_filters(&filter));
+    }
+
+    #[test]
+    fn has_active_filters_date_range_only() {
+        let filter = SearchFilter {
+            date_range: Some(DateRange {
+                start: Some(100),
+                end: None,
+            }),
+            ..SearchFilter::default()
+        };
+        assert!(has_active_filters(&filter));
+    }
+
+    #[test]
+    fn has_active_filters_importance_high() {
+        let filter = SearchFilter {
+            importance: Some(ImportanceFilter::High),
+            ..SearchFilter::default()
+        };
+        assert!(has_active_filters(&filter));
+    }
+
+    #[test]
+    fn has_active_filters_importance_normal() {
+        let filter = SearchFilter {
+            importance: Some(ImportanceFilter::Normal),
+            ..SearchFilter::default()
+        };
+        assert!(has_active_filters(&filter));
+    }
+
+    #[test]
+    fn has_active_filters_importance_low() {
+        let filter = SearchFilter {
+            importance: Some(ImportanceFilter::Low),
+            ..SearchFilter::default()
+        };
+        assert!(has_active_filters(&filter));
+    }
+
+    // ── Single-field active_filter_count ──
+
+    #[test]
+    fn active_filter_count_single_sender() {
+        let filter = SearchFilter {
+            sender: Some("A".to_string()),
+            ..SearchFilter::default()
+        };
+        assert_eq!(active_filter_count(&filter), 1);
+    }
+
+    #[test]
+    fn active_filter_count_single_project_id() {
+        let filter = SearchFilter {
+            project_id: Some(1),
+            ..SearchFilter::default()
+        };
+        assert_eq!(active_filter_count(&filter), 1);
+    }
+
+    #[test]
+    fn active_filter_count_single_thread_id() {
+        let filter = SearchFilter {
+            thread_id: Some("t".to_string()),
+            ..SearchFilter::default()
+        };
+        assert_eq!(active_filter_count(&filter), 1);
+    }
+
+    #[test]
+    fn active_filter_count_single_doc_kind() {
+        let filter = SearchFilter {
+            doc_kind: Some(DocKind::Agent),
+            ..SearchFilter::default()
+        };
+        assert_eq!(active_filter_count(&filter), 1);
+    }
+
+    #[test]
+    fn active_filter_count_single_date_range() {
+        let filter = SearchFilter {
+            date_range: Some(DateRange {
+                start: Some(0),
+                end: Some(100),
+            }),
+            ..SearchFilter::default()
+        };
+        assert_eq!(active_filter_count(&filter), 1);
+    }
+
+    #[test]
+    fn active_filter_count_single_importance_urgent() {
+        let filter = SearchFilter {
+            importance: Some(ImportanceFilter::Urgent),
+            ..SearchFilter::default()
+        };
+        assert_eq!(active_filter_count(&filter), 1);
+    }
+
     // ── Tantivy integration tests ──
 
     #[cfg(feature = "tantivy-engine")]
@@ -618,6 +745,296 @@ mod tests {
             let searcher = reader.searcher();
             let hits = searcher.search(&result, &TopDocs::with_limit(100)).unwrap();
             assert_eq!(hits.len(), 3);
+        }
+
+        // ── into_clauses ──
+
+        #[test]
+        fn into_clauses_returns_correct_count() {
+            let (_, handles) = setup_index();
+            let filter = SearchFilter {
+                sender: Some("BlueLake".to_string()),
+                project_id: Some(1),
+                ..SearchFilter::default()
+            };
+            let compiled = compile_filters(&filter, &handles);
+            let clauses = compiled.into_clauses();
+            assert_eq!(clauses.len(), 2);
+            // All clauses are Must
+            for (occur, _) in &clauses {
+                assert_eq!(*occur, Occur::Must);
+            }
+        }
+
+        #[test]
+        fn into_clauses_empty_for_default_filter() {
+            let (_, handles) = setup_index();
+            let compiled = compile_filters(&SearchFilter::default(), &handles);
+            let clauses = compiled.into_clauses();
+            assert!(clauses.is_empty());
+        }
+
+        // ── filter_by_importance_low ──
+
+        #[test]
+        fn filter_by_importance_low_no_match() {
+            // No docs in test data have importance "low"
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                importance: Some(ImportanceFilter::Low),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert!(ids.is_empty());
+        }
+
+        #[test]
+        fn filter_by_importance_low_with_matching_doc() {
+            // Add a doc with importance "low" and verify it matches
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_ram(schema);
+            register_tokenizer(&index);
+
+            let mut writer = index.writer(15_000_000).unwrap();
+            writer
+                .add_document(doc!(
+                    handles.id => 10u64,
+                    handles.doc_kind => "message",
+                    handles.subject => "Low priority note",
+                    handles.body => "This is a low priority item",
+                    handles.sender => "TestAgent",
+                    handles.project_slug => "test",
+                    handles.project_id => 1u64,
+                    handles.thread_id => "t-low",
+                    handles.importance => "low",
+                    handles.created_ts => 1_700_000_000_000_000i64
+                ))
+                .unwrap();
+            writer
+                .add_document(doc!(
+                    handles.id => 11u64,
+                    handles.doc_kind => "message",
+                    handles.subject => "High priority note",
+                    handles.body => "This is a high priority item",
+                    handles.sender => "TestAgent",
+                    handles.project_slug => "test",
+                    handles.project_id => 1u64,
+                    handles.thread_id => "t-high",
+                    handles.importance => "high",
+                    handles.created_ts => 1_700_000_000_000_000i64
+                ))
+                .unwrap();
+            writer.commit().unwrap();
+
+            let filter = SearchFilter {
+                importance: Some(ImportanceFilter::Low),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert_eq!(ids, vec![10]);
+        }
+
+        // ── Combined multi-filter ──
+
+        #[test]
+        fn combined_three_filters_sender_project_importance() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                sender: Some("BlueLake".to_string()),
+                project_id: Some(1),
+                importance: Some(ImportanceFilter::High),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            // BlueLake (project 1, importance high) → doc 1
+            assert_eq!(ids, vec![1]);
+        }
+
+        #[test]
+        fn combined_four_filters_with_date_range() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                sender: Some("RedPeak".to_string()),
+                project_id: Some(1),
+                thread_id: Some("br-456".to_string()),
+                date_range: Some(DateRange {
+                    start: Some(1_700_000_000_000_000),
+                    end: Some(1_700_200_000_000_000),
+                }),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert_eq!(ids, vec![2]);
+        }
+
+        #[test]
+        fn combined_all_filters_no_match() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                sender: Some("BlueLake".to_string()),
+                project_id: Some(2), // mismatch
+                thread_id: Some("br-123".to_string()),
+                doc_kind: Some(DocKind::Message),
+                importance: Some(ImportanceFilter::High),
+                date_range: Some(DateRange {
+                    start: Some(0),
+                    end: Some(i64::MAX),
+                }),
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert!(ids.is_empty());
+        }
+
+        // ── apply_to with filters wraps in BooleanQuery ──
+
+        #[test]
+        fn apply_to_with_filters_wraps_query() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                sender: Some("BlueLake".to_string()),
+                ..SearchFilter::default()
+            };
+            let compiled = compile_filters(&filter, &handles);
+            assert_eq!(compiled.len(), 1);
+            let query = Box::new(tantivy::query::AllQuery) as Box<dyn Query>;
+            let wrapped = compiled.apply_to(query);
+
+            // The wrapped query should still work and return only BlueLake's doc
+            let reader = index.reader().unwrap();
+            let searcher = reader.searcher();
+            let hits = searcher
+                .search(&wrapped, &TopDocs::with_limit(100))
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
+            let id = doc.get_first(handles.id).unwrap().as_u64().unwrap();
+            assert_eq!(id, 1);
+        }
+
+        // ── CompiledFilters Debug ──
+
+        #[test]
+        fn compiled_filters_debug_trait() {
+            let (_, handles) = setup_index();
+            let compiled = compile_filters(&SearchFilter::default(), &handles);
+            let debug = format!("{compiled:?}");
+            assert!(debug.contains("CompiledFilters"));
+        }
+
+        // ── Non-existent sender ──
+
+        #[test]
+        fn filter_by_sender_no_match() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                sender: Some("NonexistentAgent".to_string()),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert!(ids.is_empty());
+        }
+
+        // ── Date range exact boundary (inclusive) ──
+
+        #[test]
+        fn filter_by_date_range_exact_start_inclusive() {
+            let (index, handles) = setup_index();
+            // Doc 1 has created_ts = 1_700_000_000_000_000
+            let filter = SearchFilter {
+                date_range: Some(DateRange {
+                    start: Some(1_700_000_000_000_000),
+                    end: Some(1_700_000_000_000_000),
+                }),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert_eq!(ids, vec![1]);
+        }
+
+        // ── Doc kind: all variants ──
+
+        #[test]
+        fn filter_by_doc_kind_message() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                doc_kind: Some(DocKind::Message),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert_eq!(ids.len(), 2); // doc 1, doc 2
+            assert!(ids.contains(&1));
+            assert!(ids.contains(&2));
+        }
+
+        #[test]
+        fn filter_by_doc_kind_thread_no_match() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                doc_kind: Some(DocKind::Thread),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert!(ids.is_empty());
+        }
+
+        #[test]
+        fn filter_by_doc_kind_project_no_match() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                doc_kind: Some(DocKind::Project),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert!(ids.is_empty());
+        }
+
+        // ── compile_filters clause count for all 6 fields ──
+
+        #[test]
+        fn compiled_filters_all_six_fields() {
+            let (_, handles) = setup_index();
+            let filter = SearchFilter {
+                sender: Some("A".to_string()),
+                project_id: Some(1),
+                thread_id: Some("t".to_string()),
+                doc_kind: Some(DocKind::Message),
+                importance: Some(ImportanceFilter::Urgent),
+                date_range: Some(DateRange {
+                    start: Some(100),
+                    end: Some(200),
+                }),
+            };
+            let compiled = compile_filters(&filter, &handles);
+            assert_eq!(compiled.len(), 6);
+        }
+
+        // ── importance Any produces no clause ──
+
+        #[test]
+        fn compiled_importance_any_produces_no_clause() {
+            let (_, handles) = setup_index();
+            let filter = SearchFilter {
+                importance: Some(ImportanceFilter::Any),
+                ..SearchFilter::default()
+            };
+            let compiled = compile_filters(&filter, &handles);
+            assert!(compiled.is_empty());
+        }
+
+        // ── date_range both None produces no clause ──
+
+        #[test]
+        fn compiled_date_range_both_none_produces_no_clause() {
+            let (_, handles) = setup_index();
+            let filter = SearchFilter {
+                date_range: Some(DateRange {
+                    start: None,
+                    end: None,
+                }),
+                ..SearchFilter::default()
+            };
+            let compiled = compile_filters(&filter, &handles);
+            assert!(compiled.is_empty());
         }
     }
 }
