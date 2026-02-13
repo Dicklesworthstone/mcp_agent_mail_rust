@@ -579,12 +579,26 @@ mod tests {
             "custom holder should not default to recipient agent"
         );
 
-        let holder = match block_on(async { queries::get_agent_by_id(&cx, &pool, holder_id).await })
-        {
+        // Re-lookup the holder agent via insert_system_agent (which queries
+        // the DB directly, bypassing the global ReadCache that may contain
+        // stale entries from other tests in the same process).
+        let holder = match block_on(async {
+            queries::insert_system_agent(
+                &cx,
+                &pool,
+                unacked.project_id,
+                "OpsEscalation",
+                "ops",
+                "system",
+                "ops-escalation",
+            )
+            .await
+        }) {
             Outcome::Ok(agent) => agent,
-            other => panic!("get_agent_by_id failed: {other:?}"),
+            other => panic!("insert_system_agent re-lookup failed: {other:?}"),
         };
         assert_eq!(holder.name, "OpsEscalation");
+        assert_eq!(holder.id, Some(holder_id));
     }
 
     #[test]
@@ -605,6 +619,175 @@ mod tests {
             other => panic!("list_file_reservations failed: {other:?}"),
         };
         assert_eq!(reservations.len(), 1);
+    }
+
+    #[test]
+    fn message_age_exactly_at_ttl_boundary_not_overdue() {
+        // When age_micros == ttl_us, the check is `age_micros < ttl_us` → false,
+        // so exact boundary IS overdue.
+        let ttl_seconds: u64 = 300;
+        let ttl_us = i64::try_from(ttl_seconds).unwrap() * 1_000_000;
+        let now = 2_000_000_000_000i64;
+        let created_exact = now - ttl_us;
+        let age = now - created_exact;
+        assert!(
+            age >= ttl_us,
+            "at exact boundary, age==ttl should be overdue"
+        );
+    }
+
+    #[test]
+    fn message_one_microsecond_before_ttl_not_overdue() {
+        let ttl_seconds: u64 = 300;
+        let ttl_us = i64::try_from(ttl_seconds).unwrap() * 1_000_000;
+        let now = 2_000_000_000_000i64;
+        let created_just_under = now - ttl_us + 1;
+        let age = now - created_just_under;
+        assert!(
+            age < ttl_us,
+            "one microsecond before TTL should not be overdue"
+        );
+    }
+
+    #[test]
+    fn inbox_path_pattern_epoch_zero() {
+        // Timestamp at Unix epoch → 1970/01.
+        let ts_secs: i64 = 0;
+        let dt = chrono::DateTime::from_timestamp(ts_secs, 0).unwrap();
+        let y = dt.format("%Y").to_string();
+        let m = dt.format("%m").to_string();
+        assert_eq!(y, "1970");
+        assert_eq!(m, "01");
+
+        let pattern = format!("agents/TestAgent/inbox/{y}/{m}/*.md");
+        assert_eq!(pattern, "agents/TestAgent/inbox/1970/01/*.md");
+    }
+
+    #[test]
+    fn ack_ttl_cycle_multiple_overdue() {
+        // Seed two separate unacked messages (different senders/recipients).
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = make_test_pool(&tmp);
+        let cx = Cx::for_testing();
+
+        let project_root = tmp.path().join("project_root");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let human_key = project_root.to_string_lossy().to_string();
+
+        let project =
+            match block_on(async { queries::ensure_project(&cx, &pool, &human_key).await }) {
+                Outcome::Ok(p) => p,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+        let project_id = project.id.expect("project id");
+
+        let sender = match block_on(async {
+            queries::register_agent(
+                &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+            )
+            .await
+        }) {
+            Outcome::Ok(a) => a,
+            other => panic!("register_agent(sender) failed: {other:?}"),
+        };
+        let sender_id = sender.id.expect("sender id");
+
+        let recip1 = match block_on(async {
+            queries::register_agent(
+                &cx, &pool, project_id, "BlueBear", "test", "test", None, None,
+            )
+            .await
+        }) {
+            Outcome::Ok(a) => a,
+            other => panic!("register_agent(recip1) failed: {other:?}"),
+        };
+        let recip1_id = recip1.id.expect("recip1 id");
+
+        let recip2 = match block_on(async {
+            queries::register_agent(
+                &cx, &pool, project_id, "GoldHawk", "test", "test", None, None,
+            )
+            .await
+        }) {
+            Outcome::Ok(a) => a,
+            other => panic!("register_agent(recip2) failed: {other:?}"),
+        };
+        let recip2_id = recip2.id.expect("recip2 id");
+
+        // Create message 1 → recip1
+        match block_on(async {
+            queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "Msg 1",
+                "Body 1",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(recip1_id, "to")],
+            )
+            .await
+        }) {
+            Outcome::Ok(_) => {}
+            other => panic!("create_message 1 failed: {other:?}"),
+        }
+
+        // Create message 2 → recip2
+        match block_on(async {
+            queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "Msg 2",
+                "Body 2",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(recip2_id, "to")],
+            )
+            .await
+        }) {
+            Outcome::Ok(_) => {}
+            other => panic!("create_message 2 failed: {other:?}"),
+        }
+
+        let mut config = Config::from_env();
+        config.ack_ttl_seconds = 0; // All messages immediately overdue
+        config.ack_escalation_enabled = false;
+
+        let (scanned, overdue) = run_ack_ttl_cycle(&config, &pool).expect("run cycle");
+        assert_eq!(scanned, 2);
+        assert_eq!(overdue, 2);
+    }
+
+    #[test]
+    fn escalation_non_exclusive_reservation() {
+        let (_tmp, pool, cx, unacked) = seed_unacked_message();
+
+        let mut config = Config::from_env();
+        config.ack_escalation_enabled = true;
+        config.ack_escalation_mode = "file_reservation".to_string();
+        config.ack_escalation_claim_exclusive = false; // non-exclusive
+        config.ack_escalation_claim_holder_name.clear();
+
+        escalate(&config, &pool, &cx, &unacked, now_micros()).expect("escalate");
+
+        let reservations = match block_on(async {
+            queries::list_file_reservations(&cx, &pool, unacked.project_id, false).await
+        }) {
+            Outcome::Ok(rows) => rows,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(
+            reservations[0].exclusive, 0,
+            "reservation should be non-exclusive"
+        );
     }
 
     #[test]
