@@ -12,6 +12,7 @@ members = [
   "crates/mcp-agent-mail-share",
   "crates/mcp-agent-mail-conformance",
   "crates/mcp-agent-mail-search-core",
+  "crates/mcp-agent-mail-wasm",
 ]
 
 [workspace.package]
@@ -107,6 +108,9 @@ rayon = "1.10"
 dirs = "5"
 smallvec = { version = "1", features = ["serde"] }
 atty = "0.2"
+
+# WASM dependencies
+serde-wasm-bindgen = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

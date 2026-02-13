@@ -1,0 +1,85 @@
+[package]
+name = "mcp-agent-mail-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WASM frontend for MCP Agent Mail TUI dashboard"
+
+[lib]
+# cdylib for WASM, rlib for native tests
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enable console error panic hook for better debugging
+console-panic = ["console_error_panic_hook"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Platform-agnostic dependencies
+# ──────────────────────────────────────────────────────────────────────────────
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+# Core types (WASM-compatible subset)
+# Note: mcp-agent-mail-core has fs2/dirs deps that need conditional compilation
+# For now, we inline the minimal types needed for the TUI
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WASM-specific dependencies
+# ──────────────────────────────────────────────────────────────────────────────
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.85"
+wasm-bindgen = "0.2.108"
+wasm-bindgen-futures = "0.4.58"
+serde-wasm-bindgen.workspace = true
+console_error_panic_hook = { version = "0.1.7", optional = true }
+web-sys = { version = "0.3.85", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "console",
+    "WebSocket",
+    "BinaryType",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+    "Performance",
+    "KeyboardEvent",
+    "MouseEvent",
+    "WheelEvent",
+    "FocusEvent",
+] }
+web-time = "1.1.0"
+
+# FrankenTUI WASM rendering (when available)
+# ftui-web = { path = "../../../frankentui/crates/ftui-web", features = ["input-parser"] }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Native-only dev dependencies
+# ──────────────────────────────────────────────────────────────────────────────
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile.workspace = true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WASM-pack optimization settings
+# ──────────────────────────────────────────────────────────────────────────────
+
+[package.metadata.wasm-pack.profile.release]
+# wasm-opt flags for maximum size optimization
+# -Oz: maximum size optimization
+# --all-features: enable all wasm features (bulk-memory, etc.)
+# --converge: re-run optimization passes until output stabilizes
+wasm-opt = ["-Oz", "--all-features", "--converge"]
+
+[lints]
+workspace = true

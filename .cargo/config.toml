@@ -1,0 +1,59 @@
+# Cargo configuration for MCP Agent Mail
+# Supports both native and WASM targets
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WASM Target Configuration (wasm32-unknown-unknown)
+# ──────────────────────────────────────────────────────────────────────────────
+# Build WASM artifacts with: cargo build --target wasm32-unknown-unknown -p mcp-agent-mail-wasm
+# Or use wasm-pack: wasm-pack build crates/mcp-agent-mail-wasm --target web
+
+[target.wasm32-unknown-unknown]
+# Use wasm-bindgen for JavaScript interop
+rustflags = [
+    # Enable bulk memory operations for better performance
+    "-C", "target-feature=+bulk-memory",
+    # Enable atomics for thread-like operations (future: SharedArrayBuffer)
+    # "-C", "target-feature=+atomics",
+]
+
+# Build runner for WASM development
+# runner = "wasm-server-runner"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Native Build Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+[build]
+# Use all available cores for parallel compilation
+jobs = -1
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Target-specific linker settings (Linux)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # Use mold linker if available (much faster than ld)
+    # "-C", "link-arg=-fuse-ld=mold",
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Development settings
+# ──────────────────────────────────────────────────────────────────────────────
+
+[alias]
+# Build WASM crate
+wasm = "build --target wasm32-unknown-unknown -p mcp-agent-mail-wasm"
+# Build WASM with release optimizations
+wasm-release = "build --target wasm32-unknown-unknown -p mcp-agent-mail-wasm --release"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Registry configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+[net]
+# Use sparse registry protocol for faster dependency resolution
+git-fetch-with-cli = false
+
+[registries.crates-io]
+protocol = "sparse"
