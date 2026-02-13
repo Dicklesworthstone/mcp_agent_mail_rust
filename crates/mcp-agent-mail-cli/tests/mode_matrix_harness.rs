@@ -21,6 +21,9 @@ fn repo_root() -> PathBuf {
 }
 
 fn artifacts_dir() -> PathBuf {
+    if let Ok(override_root) = std::env::var("AM_MODE_MATRIX_ARTIFACT_DIR") {
+        return PathBuf::from(override_root).join("mode_matrix");
+    }
     repo_root().join("tests/artifacts/cli/mode_matrix")
 }
 
@@ -129,10 +132,12 @@ fn digest(s: &str) -> String {
 /// Commands that should be accepted (parsed) by the CLI binary.
 /// We test with --help to avoid side effects; exit code 0 means clap accepted it.
 const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
+    &["start", "--help"],
     &["serve-http", "--help"],
     &["serve-stdio", "--help"],
     &["check-inbox", "--help"],
     &["ci", "--help"],
+    &["bench", "--help"],
     &["e2e", "--help"],
     &["share", "--help"],
     &["archive", "--help"],
@@ -163,11 +168,13 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
 
 /// Commands that MCP binary should deny (exit code 2).
 const MCP_DENY_COMMANDS: &[&[&str]] = &[
+    &["start"],
     &["share"],
     &["archive"],
     &["guard"],
     &["check-inbox"],
     &["ci"],
+    &["bench"],
     &["e2e"],
     &["acks"],
     &["migrate"],
@@ -605,55 +612,41 @@ fn golden_usage_error_format() {
 /// Verify that the matrix rows cover all top-level CLI subcommands.
 #[test]
 fn matrix_coverage_complete() {
-    use clap::Parser;
+    use clap::CommandFactory;
     use mcp_agent_mail_cli::Cli;
 
-    let h = match Cli::try_parse_from(["am", "--help"]) {
-        Ok(_) => panic!("expected --help to trigger clap exit"),
-        Err(e) => e.to_string(),
-    };
+    let cli_commands: Vec<String> = CLI_ALLOW_COMMANDS
+        .iter()
+        .map(|args| args[0].to_string())
+        .collect();
 
-    let cli_commands: Vec<&str> = CLI_ALLOW_COMMANDS.iter().map(|args| args[0]).collect();
-
-    // Check that every command in the help text is in our matrix.
-    // Parse commands from help: they appear after "Commands:" section.
+    // Check that every actual clap subcommand is present in our matrix.
     let skip = ["help", "lint", "typecheck", "am-run"]; // meta/internal commands
-    let commands_section = h
-        .split("Commands:")
-        .nth(1)
-        .unwrap_or("")
-        .lines()
-        .take_while(|line| !line.trim_start().starts_with("Options:"))
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            let first_word = trimmed.split_whitespace().next()?;
-            if first_word.starts_with('-') || first_word.is_empty() {
-                return None;
-            }
-            // Ignore wrapped description continuation lines (e.g. "handshake", "cycles,").
-            // Command names are strictly [a-z0-9_-]+ in clap output.
-            if !first_word
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                return None;
-            }
-            Some(first_word)
-        })
-        .filter(|cmd| !skip.contains(cmd))
-        .collect::<Vec<_>>();
+    let mut commands_section: Vec<String> = Cli::command()
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_string())
+        .filter(|cmd| !skip.contains(&cmd.as_str()))
+        .collect();
+    commands_section.sort();
 
     let mut missing = Vec::new();
     for cmd in &commands_section {
         if !cli_commands.contains(cmd) {
-            missing.push(*cmd);
+            missing.push(cmd.clone());
         }
     }
 
-    if !missing.is_empty() {
+    let mut stale = Vec::new();
+    for cmd in &cli_commands {
+        if !commands_section.contains(cmd) && !skip.contains(&cmd.as_str()) {
+            stale.push(cmd.clone());
+        }
+    }
+
+    if !missing.is_empty() || !stale.is_empty() {
         panic!(
-            "CLI commands missing from matrix coverage: {:?}\nHelp commands: {:?}\nMatrix commands: {:?}",
-            missing, commands_section, cli_commands
+            "CLI matrix coverage mismatch.\nMissing from matrix: {:?}\nStale in matrix: {:?}\nClap commands: {:?}\nMatrix commands: {:?}",
+            missing, stale, commands_section, cli_commands
         );
     }
 }

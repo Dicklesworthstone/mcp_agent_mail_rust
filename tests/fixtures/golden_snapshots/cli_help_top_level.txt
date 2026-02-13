@@ -3,11 +3,14 @@ MCP Agent Mail CLI (Rust)
 Usage: am <COMMAND>
 
 Commands:
+  start                       Start the Agent Mail HTTP server and interactive TUI with sensible
+                              defaults
   serve-http                  
   serve-stdio                 
   check-inbox                 Check agent inbox for unread messages (for git hooks and editor
                               integrations)
   ci                          Run CI quality gates (format, lint, build, test)
+  bench                       Run native CLI benchmarks
   lint                        
   typecheck                   
   e2e                         Run E2E test suites
@@ -43,3 +46,7 @@ Commands:
 Options:
   -h, --help     Print help
   -V, --version  Print version
+
+Quick start:
+  am         Start HTTP server + TUI with sensible defaults
+  am start   Explicit start command (same behavior)

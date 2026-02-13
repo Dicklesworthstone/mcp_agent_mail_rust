@@ -93,6 +93,7 @@ failed_suites=()
 run_suite() {
     local suite_name="$1"
     local suite_file="${SUITES_DIR}/test_${suite_name}.sh"
+    local cli_bin="${CARGO_TARGET_DIR}/debug/am"
 
     if [ ! -f "$suite_file" ]; then
         echo -e "${_c_red}Suite not found: ${suite_name}${_c_reset}"
@@ -104,6 +105,33 @@ run_suite() {
     echo -e "${_c_blue}Running suite: ${suite_name}${_c_reset}"
     echo "  Script: ${suite_file}"
     echo ""
+
+    # Pilot migration: selected suites execute via native Rust runner.
+    if [ "$suite_name" = "dual_mode" ] || [ "$suite_name" = "mode_matrix" ] || [ "$suite_name" = "security_privacy" ]; then
+        if [ "${E2E_FORCE_BUILD:-0}" = "1" ] || [ ! -f "$cli_bin" ]; then
+            echo "  Building native E2E runner binary (am)..."
+            if ! cargo build -p mcp-agent-mail-cli > /dev/null 2>&1; then
+                echo -e "${_c_red}Failed to build mcp-agent-mail-cli for native ${suite_name} run${_c_reset}"
+                (( total_fail++ )) || true
+                failed_suites+=("$suite_name")
+                return
+            fi
+        fi
+
+        local native_artifacts
+        native_artifacts="${PROJECT_ROOT}/tests/artifacts_native"
+        mkdir -p "$native_artifacts"
+        echo "  Runner: native (am e2e)"
+        echo "  Artifacts: ${native_artifacts}"
+
+        if "$cli_bin" e2e run "$suite_name" --project "$PROJECT_ROOT" --artifacts "$native_artifacts"; then
+            (( total_pass++ )) || true
+        else
+            (( total_fail++ )) || true
+            failed_suites+=("$suite_name")
+        fi
+        return
+    fi
 
     if bash "$suite_file"; then
         (( total_pass++ )) || true
