@@ -440,6 +440,82 @@ mod tests {
         assert!(collect_matching_paths(tmp.path(), "[unterminated").is_empty());
     }
 
+    #[test]
+    fn collect_matching_question_mark_glob() {
+        let tmp = std::env::temp_dir().join("cleanup_test_qmark");
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(tmp.join("a.rs"), "").unwrap();
+        std::fs::write(tmp.join("b.rs"), "").unwrap();
+        std::fs::write(tmp.join("ab.rs"), "").unwrap(); // Won't match ?.rs
+
+        let matches = collect_matching_paths(&tmp, "?.rs");
+        assert!(
+            matches.len() >= 2,
+            "?.rs should match single-char filenames: {matches:?}"
+        );
+        // ab.rs should NOT match ?.rs (two chars before extension).
+        assert!(
+            !matches
+                .iter()
+                .any(|p| p.file_name().is_some_and(|f| f == "ab.rs")),
+            "ab.rs should not match ?.rs"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_matching_whitespace_only_pattern() {
+        let tmp = std::env::temp_dir();
+        assert!(collect_matching_paths(&tmp, "   \t  ").is_empty());
+    }
+
+    #[test]
+    fn collect_matching_nested_glob() {
+        let tmp = std::env::temp_dir().join("cleanup_test_nested");
+        let sub = tmp.join("sub");
+        let _ = std::fs::create_dir_all(&sub);
+        std::fs::write(sub.join("deep.rs"), "").unwrap();
+        std::fs::write(tmp.join("shallow.rs"), "").unwrap();
+
+        let matches = collect_matching_paths(&tmp, "**/*.rs");
+        assert!(
+            matches.len() >= 2,
+            "**/*.rs should match files in subdirectories too: {matches:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn filesystem_activity_nonexistent_workspace() {
+        let fake = Path::new("/definitely/does/not/exist");
+        assert!(!check_filesystem_activity(
+            fake,
+            "*.rs",
+            now_micros(),
+            1_000_000
+        ));
+    }
+
+    #[test]
+    fn filesystem_activity_no_matching_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Workspace exists but no files match the pattern.
+        assert!(!check_filesystem_activity(
+            tmp.path(),
+            "nonexistent.rs",
+            now_micros(),
+            1_000_000
+        ));
+    }
+
+    #[test]
+    fn git_activity_nonexistent_workspace() {
+        let fake = Path::new("/definitely/does/not/exist");
+        assert!(!check_git_activity(fake, "*.rs", now_micros(), 1_000_000));
+    }
+
     fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
         // NOTE: These tests are currently blocked by a FrankenSQLite limitation.
         // FrankenConnection cannot properly read schemas created by SqliteConnection,

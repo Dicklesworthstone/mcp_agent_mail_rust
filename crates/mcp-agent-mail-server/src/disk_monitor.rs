@@ -176,6 +176,59 @@ mod tests {
     }
 
     #[test]
+    fn all_disk_pressure_variants_same_level_no_alert() {
+        let all = [
+            DiskPressure::Ok,
+            DiskPressure::Warning,
+            DiskPressure::Critical,
+            DiskPressure::Fatal,
+        ];
+        for p in &all {
+            assert!(
+                !should_emit_pressure_change_alert(*p, *p),
+                "same-level {p:?} should not alert"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_transitions_all_alerted() {
+        // Fatal → Critical → Warning → Ok: each step is a recovery alert.
+        assert!(should_emit_pressure_change_alert(
+            DiskPressure::Fatal,
+            DiskPressure::Critical
+        ));
+        assert!(should_emit_pressure_change_alert(
+            DiskPressure::Critical,
+            DiskPressure::Warning
+        ));
+        assert!(should_emit_pressure_change_alert(
+            DiskPressure::Warning,
+            DiskPressure::Ok
+        ));
+        // Big jumps also alert.
+        assert!(should_emit_pressure_change_alert(
+            DiskPressure::Fatal,
+            DiskPressure::Ok
+        ));
+    }
+
+    #[test]
+    fn monitor_interval_large_value_preserved() {
+        assert_eq!(
+            monitor_interval_seconds(u64::MAX),
+            Duration::from_secs(u64::MAX)
+        );
+        assert_eq!(monitor_interval_seconds(3600), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn startup_warning_u64_max_no_warning() {
+        // Very large free space should never trigger a warning.
+        assert!(!should_emit_startup_warning(Some(u64::MAX)));
+    }
+
+    #[test]
     fn startup_warning_handles_unmounted_storage() {
         // When storage paths don't exist, normalize_probe_path falls back to
         // the root "/" (or "." on some systems) which still provides valid

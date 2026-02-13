@@ -269,6 +269,81 @@ mod tests {
     }
 
     #[test]
+    fn empty_snapshot_after_full_reset() {
+        let _guard = lock_metrics_test();
+        reset_tool_metrics();
+
+        // No calls recorded → snapshot should be empty.
+        let snapshot = tool_metrics_snapshot();
+        assert!(
+            snapshot.is_empty(),
+            "snapshot should be empty after full reset with no new calls"
+        );
+    }
+
+    #[test]
+    fn call_then_error_both_tracked() {
+        let _guard = lock_metrics_test();
+        reset_tool_metrics();
+
+        record_call("fetch_inbox");
+        record_error("fetch_inbox");
+
+        let snapshot = tool_metrics_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.name == "fetch_inbox")
+            .expect("tool should appear in snapshot after call+error");
+        assert!(entry.calls >= 1, "call count should be positive");
+        assert!(entry.errors >= 1, "error count should be positive");
+    }
+
+    #[test]
+    fn multiple_tools_all_present_and_sorted() {
+        let _guard = lock_metrics_test();
+        reset_tool_metrics();
+
+        let tools = ["whois", "send_message", "health_check", "fetch_inbox"];
+        for name in &tools {
+            record_call(name);
+            record_latency(name, 100_000);
+        }
+
+        let snapshot = tool_metrics_snapshot();
+        // All tools should be present.
+        for name in &tools {
+            assert!(
+                snapshot.iter().any(|e| e.name == *name),
+                "{name} should appear in snapshot"
+            );
+        }
+        // Sorted alphabetically.
+        for window in snapshot.windows(2) {
+            assert!(
+                window[0].name <= window[1].name,
+                "not sorted: {} > {}",
+                window[0].name,
+                window[1].name
+            );
+        }
+    }
+
+    #[test]
+    fn slow_tools_empty_when_all_fast() {
+        let _guard = lock_metrics_test();
+        reset_tool_metrics();
+
+        record_call("health_check");
+        record_latency("health_check", 50_000); // 50ms — well under 500ms threshold
+
+        let slow = slow_tools();
+        assert!(
+            !slow.iter().any(|e| e.name == "health_check"),
+            "50ms tool should not be flagged slow"
+        );
+    }
+
+    #[test]
     fn concurrent_record_calls_accumulate_counts() {
         let _guard = lock_metrics_test();
         reset_tool_metrics();

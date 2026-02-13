@@ -682,10 +682,8 @@ mod tests {
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {
-            queries::register_agent(
-                &cx, &pool, project_id, "RedFox", "test", "test", None, None,
-            )
-            .await
+            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None)
+                .await
         }) {
             Outcome::Ok(a) => a,
             other => panic!("register_agent(sender) failed: {other:?}"),
