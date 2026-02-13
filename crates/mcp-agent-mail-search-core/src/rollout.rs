@@ -904,4 +904,141 @@ mod tests {
         // Legacy top-10: 1..=10, V3 top-10: 6..=15, shared in top-10: 6..=10 = 5
         assert!((cmp.result_overlap_pct - 0.5).abs() < 1e-10);
     }
+
+    // ── Additional trait and edge case tests ───────────────────────
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn shadow_comparison_debug_clone() {
+        let cmp = ShadowComparison::compute(
+            &[1, 2],
+            &[1, 2],
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            None,
+            "debug",
+        );
+        let debug = format!("{cmp:?}");
+        assert!(debug.contains("ShadowComparison"));
+        let cloned = cmp.clone();
+        assert_eq!(cloned.query_text, "debug");
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn shadow_metrics_snapshot_debug_clone() {
+        let snap = ShadowMetricsSnapshot {
+            total_comparisons: 1,
+            equivalent_count: 1,
+            equivalent_pct: 100.0,
+            v3_error_count: 0,
+            v3_error_pct: 0.0,
+            avg_overlap_pct: 100.0,
+            avg_latency_delta_ms: 0,
+        };
+        let debug = format!("{snap:?}");
+        assert!(debug.contains("ShadowMetricsSnapshot"));
+        let cloned = snap.clone();
+        assert_eq!(cloned.total_comparisons, 1);
+    }
+
+    #[test]
+    fn shadow_metrics_debug() {
+        let m = ShadowMetrics::new();
+        let debug = format!("{m:?}");
+        assert!(debug.contains("ShadowMetrics"));
+    }
+
+    #[test]
+    fn shadow_comparison_timestamp_populated() {
+        let cmp = ShadowComparison::compute(
+            &[1],
+            &[1],
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            None,
+            "ts",
+        );
+        assert!(cmp.timestamp_us > 0);
+    }
+
+    #[test]
+    fn shadow_comparison_single_element_overlap() {
+        let cmp = ShadowComparison::compute(
+            &[42],
+            &[42],
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            None,
+            "single",
+        );
+        assert!((cmp.result_overlap_pct - 1.0).abs() < 1e-10);
+        assert!(cmp.is_equivalent());
+    }
+
+    #[test]
+    fn kendall_tau_two_elements_swapped() {
+        // list_a: [1, 2], list_b: [2, 1], shared: [1, 2]
+        // One pair, discordant → tau = -1.0
+        let tau = compute_kendall_tau(&[1, 2], &[2, 1], &[1, 2]);
+        assert!((tau - (-1.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn shadow_metrics_multiple_records_average_overlap() {
+        let m = ShadowMetrics::new();
+
+        // 100% overlap
+        let c1 = ShadowComparison::compute(
+            &[1, 2, 3],
+            &[1, 2, 3],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            None,
+            "full",
+        );
+        m.record(&c1);
+
+        // 0% overlap
+        let c2 = ShadowComparison::compute(
+            &[1, 2, 3],
+            &[4, 5, 6],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            None,
+            "none",
+        );
+        m.record(&c2);
+
+        let snap = m.snapshot();
+        // Average overlap should be ~50%
+        assert!(snap.avg_overlap_pct > 40.0 && snap.avg_overlap_pct < 60.0);
+    }
+
+    #[test]
+    fn rollout_controller_rerank_disabled() {
+        let cfg = SearchRolloutConfig {
+            rerank_enabled: false,
+            ..Default::default()
+        };
+        let ctrl = RolloutController::new(cfg);
+        assert!(!ctrl.config().rerank_enabled);
+    }
+
+    #[test]
+    fn shadow_comparison_v3_better_boundary() {
+        // V3 is 1ms faster with 70% overlap (boundary)
+        let legacy: Vec<i64> = (1..=10).collect();
+        let mut v3: Vec<i64> = (1..=7).collect();
+        v3.extend(11..=13); // 7/10 overlap = 0.7
+        let cmp = ShadowComparison::compute(
+            &legacy,
+            &v3,
+            Duration::from_millis(10),
+            Duration::from_millis(9), // 1ms faster
+            None,
+            "boundary",
+        );
+        assert!(cmp.v3_is_better()); // latency_delta=-1, no error, overlap=0.7
+    }
 }

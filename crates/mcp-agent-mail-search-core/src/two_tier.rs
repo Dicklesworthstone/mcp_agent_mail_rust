@@ -1940,4 +1940,310 @@ mod tests {
             "index should contain 60 docs (3 writers x 20)"
         );
     }
+
+    // ── Trait coverage and edge case tests ─────────────────────────
+
+    #[test]
+    fn two_tier_config_serde_roundtrip() {
+        let config = TwoTierConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: TwoTierConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.fast_dimension, 256);
+        assert_eq!(restored.quality_dimension, 384);
+        assert!((restored.quality_weight - 0.7).abs() < 0.001);
+        assert_eq!(restored.max_refinement_docs, 100);
+        assert!(!restored.fast_only);
+        assert!(!restored.quality_only);
+    }
+
+    #[test]
+    fn two_tier_metadata_serde_roundtrip() {
+        let meta = TwoTierMetadata {
+            fast_embedder_id: "fast".to_owned(),
+            quality_embedder_id: "quality".to_owned(),
+            doc_count: 42,
+            built_at: 1_700_000_000,
+            status: IndexStatus::Complete {
+                fast_latency_ms: 1,
+                quality_latency_ms: 10,
+            },
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let restored: TwoTierMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.doc_count, 42);
+        assert_eq!(restored.fast_embedder_id, "fast");
+    }
+
+    #[test]
+    fn index_status_serde_all_variants() {
+        let variants: Vec<IndexStatus> = vec![
+            IndexStatus::Building { progress: 0.5 },
+            IndexStatus::Complete {
+                fast_latency_ms: 1,
+                quality_latency_ms: 10,
+            },
+            IndexStatus::Failed {
+                error: "boom".to_owned(),
+            },
+        ];
+        for status in &variants {
+            let json = serde_json::to_string(status).unwrap();
+            let restored: IndexStatus = serde_json::from_str(&json).unwrap();
+            let debug = format!("{restored:?}");
+            assert!(!debug.is_empty());
+        }
+    }
+
+    #[test]
+    fn doc_id_out_of_bounds_returns_none() {
+        let config = TwoTierConfig::default();
+        let index = TwoTierIndex::new(&config);
+        assert!(index.doc_id(0).is_none());
+        assert!(index.doc_id(100).is_none());
+    }
+
+    #[test]
+    fn has_quality_out_of_bounds_returns_false() {
+        let config = TwoTierConfig::default();
+        let index = TwoTierIndex::new(&config);
+        assert!(!index.has_quality(0));
+        assert!(!index.has_quality(usize::MAX));
+    }
+
+    #[test]
+    fn quality_coverage_empty_is_one() {
+        let config = TwoTierConfig::default();
+        let index = TwoTierIndex::new(&config);
+        assert!((index.quality_coverage() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn normalize_scores_negative_values() {
+        let scores = vec![-1.0, 0.0, 1.0];
+        let normalized = normalize_scores(&scores);
+        assert!((normalized[0] - 0.0).abs() < 0.001); // min → 0
+        assert!((normalized[1] - 0.5).abs() < 0.001); // mid → 0.5
+        assert!((normalized[2] - 1.0).abs() < 0.001); // max → 1
+    }
+
+    #[test]
+    fn blend_scores_zero_weight_fast_only() {
+        let fast = vec![0.8, 0.2];
+        let quality = vec![0.2, 0.8];
+        let blended = blend_scores(&fast, &quality, 0.0);
+        // weight=0.0 means fast-only after normalization
+        assert!((blended[0] - 1.0).abs() < 0.001);
+        assert!((blended[1] - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn blend_scores_full_weight_quality_only() {
+        let fast = vec![0.8, 0.2];
+        let quality = vec![0.2, 0.8];
+        let blended = blend_scores(&fast, &quality, 1.0);
+        // weight=1.0 means quality-only after normalization
+        assert!((blended[0] - 0.0).abs() < 0.001);
+        assert!((blended[1] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn search_fast_k_zero_returns_empty() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+        let results = index.search_fast(&[1.0, 0.0, 0.0, 0.0], 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_fast_wrong_dimension_returns_empty() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+        // Query with wrong dimension (2 instead of 4)
+        let results = index.search_fast(&[1.0, 0.0], 10);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_quality_wrong_dimension_returns_empty() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+        let results = index.search_quality(&[1.0], 10);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn add_entry_wrong_quality_dimension_error() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+        let result = index.add_entry(TwoTierEntry {
+            doc_id: 1,
+            doc_kind: crate::document::DocKind::Message,
+            project_id: Some(1),
+            fast_embedding: vec![f16::from_f32(1.0); 4],
+            quality_embedding: vec![f16::from_f32(1.0); 2], // wrong dim
+            has_quality: true,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn add_entry_wrong_fast_dimension_error() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+        let mut index = TwoTierIndex::new(&config);
+        let result = index.add_entry(TwoTierEntry {
+            doc_id: 1,
+            doc_kind: crate::document::DocKind::Message,
+            project_id: Some(1),
+            fast_embedding: vec![f16::from_f32(1.0); 2], // wrong dim
+            quality_embedding: vec![f16::from_f32(1.0); 4],
+            has_quality: true,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_zero_quality_docs_empty_index() {
+        let config = TwoTierConfig::default();
+        let index = TwoTierIndex::new(&config);
+        assert!(index.detect_zero_quality_docs().is_empty());
+    }
+
+    #[test]
+    fn dimension_mismatch_quality_in_build() {
+        let config = TwoTierConfig::default();
+        let entries = vec![TwoTierEntry {
+            doc_id: 1,
+            doc_kind: crate::document::DocKind::Message,
+            project_id: Some(1),
+            fast_embedding: vec![f16::from_f32(1.0); config.fast_dimension],
+            quality_embedding: vec![f16::from_f32(1.0); 2], // wrong quality dim
+            has_quality: true,
+        }];
+        let result = TwoTierIndex::build("fast", "quality", &config, entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn scored_result_debug_clone() {
+        let sr = ScoredResult {
+            idx: 0,
+            doc_id: 42,
+            doc_kind: crate::document::DocKind::Agent,
+            project_id: None,
+            score: 0.99,
+        };
+        let debug = format!("{sr:?}");
+        assert!(debug.contains("42"));
+        let cloned = sr.clone();
+        assert_eq!(cloned.doc_id, 42);
+        assert!(cloned.project_id.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn search_phase_debug_clone() {
+        let phase = SearchPhase::Initial {
+            results: vec![],
+            latency_ms: 5,
+        };
+        let debug = format!("{phase:?}");
+        assert!(debug.contains("Initial"));
+        let cloned = phase.clone();
+        assert!(matches!(cloned, SearchPhase::Initial { latency_ms: 5, .. }));
+
+        let failed = SearchPhase::RefinementFailed {
+            error: "test".to_owned(),
+        };
+        let debug2 = format!("{failed:?}");
+        assert!(debug2.contains("RefinementFailed"));
+    }
+
+    #[test]
+    fn is_zero_vector_f16_mixed() {
+        // Not zero — should return false
+        let non_zero = vec![f16::from_f32(0.0), f16::from_f32(0.001)];
+        assert!(!is_zero_vector_f16(&non_zero));
+
+        // All zero — should return true
+        let zero = vec![f16::from_f32(0.0), f16::from_f32(0.0)];
+        assert!(is_zero_vector_f16(&zero));
+
+        // Empty — should return true (all elements are zero, vacuously)
+        assert!(is_zero_vector_f16(&[]));
+    }
+
+    #[test]
+    fn two_tier_index_debug() {
+        let config = TwoTierConfig::default();
+        let index = TwoTierIndex::new(&config);
+        let debug = format!("{index:?}");
+        assert!(debug.contains("TwoTierIndex"));
+    }
+
+    #[test]
+    fn quality_scores_for_indices_out_of_bounds() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+        let index = TwoTierIndex::new(&config);
+        // Out of bounds indices should return 0.0
+        let scores = index.quality_scores_for_indices(&[1.0, 0.0, 0.0, 0.0], &[0, 1, 999]);
+        assert_eq!(scores.len(), 3);
+        for &s in &scores {
+            assert!(s.abs() < f32::EPSILON);
+        }
+    }
 }

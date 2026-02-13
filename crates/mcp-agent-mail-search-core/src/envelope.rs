@@ -623,4 +623,110 @@ mod tests {
         assert_eq!(env.document.project_id, Some(row.id));
         assert_eq!(env.visibility.project_id, row.id);
     }
+
+    // ── Additional trait and edge case tests ───────────────────────
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn envelope_debug_clone() {
+        let row = sample_message_row();
+        let env = message_to_envelope(&row);
+        let debug = format!("{env:?}");
+        assert!(debug.contains("SearchDocumentEnvelope"));
+        let cloned = env.clone();
+        assert_eq!(cloned.document.id, 42);
+        assert_eq!(cloned.version, env.version);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn visibility_debug_clone() {
+        let vis = Visibility {
+            project_id: 1,
+            product_ids: vec![10, 20],
+        };
+        let debug = format!("{vis:?}");
+        assert!(debug.contains("Visibility"));
+        let cloned = vis.clone();
+        assert_eq!(cloned.project_id, 1);
+        assert_eq!(cloned.product_ids, vec![10, 20]);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn provenance_debug_clone() {
+        let p = Provenance {
+            source_kind: DocKind::Agent,
+            source_id: 7,
+            author_agent_id: None,
+            author_name: None,
+        };
+        let debug = format!("{p:?}");
+        assert!(debug.contains("Provenance"));
+        let cloned = p.clone();
+        assert_eq!(cloned.source_id, 7);
+    }
+
+    #[test]
+    fn doc_version_debug() {
+        let v = DocVersion(42);
+        let debug = format!("{v:?}");
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn message_envelope_empty_fields() {
+        let row = MessageRow {
+            id: 1,
+            project_id: 1,
+            sender_id: 1,
+            sender_name: None,
+            thread_id: None,
+            subject: String::new(),
+            body_md: String::new(),
+            importance: "normal".to_owned(),
+            ack_required: false,
+            created_ts: 0,
+            product_ids: vec![],
+        };
+        let env = message_to_envelope(&row);
+        assert!(env.document.title.is_empty());
+        assert!(env.document.body.is_empty());
+        assert!(env.visibility.product_ids.is_empty());
+    }
+
+    #[test]
+    fn agent_envelope_with_product_ids() {
+        let mut row = sample_agent_row();
+        row.product_ids = vec![100, 200, 300];
+        let env = agent_to_envelope(&row);
+        assert_eq!(env.visibility.product_ids, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn project_envelope_with_product_ids() {
+        let mut row = sample_project_row();
+        row.product_ids = vec![5, 10];
+        let env = project_to_envelope(&row);
+        assert_eq!(env.visibility.product_ids, vec![5, 10]);
+    }
+
+    #[test]
+    fn doc_version_negative_timestamp() {
+        let v = DocVersion::from_micros(-1_000_000);
+        assert_eq!(v.0, -1_000_000);
+        assert!(v < DocVersion(0));
+    }
+
+    #[test]
+    fn index_key_format_all_kinds() {
+        let msg = message_to_envelope(&sample_message_row());
+        assert_eq!(msg.index_key(), "message:42");
+
+        let agent = agent_to_envelope(&sample_agent_row());
+        assert_eq!(agent.index_key(), "agent:7");
+
+        let project = project_to_envelope(&sample_project_row());
+        assert_eq!(project.index_key(), "project:1");
+    }
 }

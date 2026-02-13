@@ -1332,6 +1332,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn tracking_progress_records_calls() {
         let progress = TrackingProgress::new();
         assert_eq!(progress.call_count(), 0);
@@ -1340,9 +1341,11 @@ mod tests {
         progress.on_progress(50, 100);
         assert_eq!(progress.call_count(), 2);
 
-        let calls = progress.calls.lock().unwrap();
-        assert_eq!(calls[0], (0, 100));
-        assert_eq!(calls[1], (50, 100));
+        {
+            let calls = progress.calls.lock().unwrap();
+            assert_eq!(calls[0], (0, 100));
+            assert_eq!(calls[1], (50, 100));
+        }
     }
 
     #[test]
@@ -1374,23 +1377,23 @@ mod tests {
     #[test]
     fn severity_ordering_in_sort() {
         // Verify that the sort key function produces correct ordering
-        let mut findings = vec![
+        let mut findings = [
             ConsistencyFinding {
                 category: "info".to_owned(),
                 severity: Severity::Info,
-                message: "".to_owned(),
+                message: String::new(),
                 suggestion: None,
             },
             ConsistencyFinding {
                 category: "error".to_owned(),
                 severity: Severity::Error,
-                message: "".to_owned(),
+                message: String::new(),
                 suggestion: None,
             },
             ConsistencyFinding {
                 category: "warning".to_owned(),
                 severity: Severity::Warning,
-                message: "".to_owned(),
+                message: String::new(),
                 suggestion: None,
             },
         ];
@@ -1429,5 +1432,211 @@ mod tests {
 
         // elapsed_ms should be at least 0 (could be 0 on fast machines)
         assert!(result.elapsed_ms <= 10_000);
+    }
+
+    // ── Trait coverage tests ───────────────────────────────────────
+
+    #[test]
+    fn severity_debug_clone_copy() {
+        let s = Severity::Warning;
+        let cloned = s;
+        let copied: Severity = s;
+        assert_eq!(cloned, copied);
+        let debug = format!("{s:?}");
+        assert!(debug.contains("Warning"));
+        // Eq
+        assert_eq!(Severity::Info, Severity::Info);
+        assert_ne!(Severity::Info, Severity::Error);
+    }
+
+    #[test]
+    fn severity_serde_snake_case_format() {
+        assert_eq!(serde_json::to_string(&Severity::Info).unwrap(), "\"info\"");
+        assert_eq!(
+            serde_json::to_string(&Severity::Warning).unwrap(),
+            "\"warning\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Severity::Error).unwrap(),
+            "\"error\""
+        );
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn consistency_finding_debug_clone() {
+        let finding = ConsistencyFinding {
+            category: "test".to_owned(),
+            severity: Severity::Info,
+            message: "msg".to_owned(),
+            suggestion: Some("fix".to_owned()),
+        };
+        let debug = format!("{finding:?}");
+        assert!(debug.contains("test"));
+        let cloned = finding.clone();
+        assert_eq!(cloned.category, "test");
+        assert_eq!(cloned.suggestion.as_deref(), Some("fix"));
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn consistency_report_debug_clone() {
+        let report = ConsistencyReport {
+            findings: vec![],
+            healthy: true,
+            rebuild_recommended: false,
+            elapsed_ms: 0,
+        };
+        let debug = format!("{report:?}");
+        assert!(debug.contains("healthy"));
+        let cloned = report.clone();
+        assert!(cloned.healthy);
+        assert_eq!(cloned.findings.len(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn consistency_config_debug_clone() {
+        let config = ConsistencyConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("count_drift_threshold"));
+        let cloned = config.clone();
+        assert!((cloned.count_drift_threshold - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn reindex_config_debug_clone() {
+        let config = ReindexConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("batch_size"));
+        let cloned = config.clone();
+        assert_eq!(cloned.batch_size, 500);
+        assert!(cloned.write_checkpoint);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn reindex_result_debug_clone() {
+        let result = ReindexResult {
+            stats: IndexStats {
+                docs_indexed: 10,
+                docs_removed: 0,
+                elapsed_ms: 5,
+                warnings: vec![],
+            },
+            checkpoint_written: true,
+            elapsed_ms: 10,
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("checkpoint_written"));
+        let cloned = result.clone();
+        assert_eq!(cloned.stats.docs_indexed, 10);
+        assert!(cloned.checkpoint_written);
+    }
+
+    #[test]
+    fn consistency_report_empty_findings() {
+        let report = ConsistencyReport {
+            findings: vec![],
+            healthy: true,
+            rebuild_recommended: false,
+            elapsed_ms: 0,
+        };
+        assert_eq!(report.error_count(), 0);
+        assert_eq!(report.warning_count(), 0);
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: ConsistencyReport = serde_json::from_str(&json).unwrap();
+        assert!(restored.findings.is_empty());
+    }
+
+    #[test]
+    fn count_drift_zero_threshold_always_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        // DB has 100, index has 99 — any drift at 0.0 threshold → error
+        let source = MockSource::new(100);
+        let lifecycle = MockLifecycle::healthy(99);
+
+        let report = check_consistency(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ConsistencyConfig {
+                count_drift_threshold: 0.0,
+            },
+        )
+        .unwrap();
+
+        assert!(report.rebuild_recommended);
+        let mismatch = report
+            .findings
+            .iter()
+            .find(|f| f.category == "count_mismatch");
+        assert!(mismatch.is_some());
+        assert_eq!(mismatch.unwrap().severity, Severity::Error);
+    }
+
+    #[test]
+    fn count_drift_full_threshold_always_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        // DB has 100, index has 1 — 99% drift, but threshold is 1.0 (100%)
+        let source = MockSource::new(100);
+        let lifecycle = MockLifecycle::healthy(1);
+
+        let report = check_consistency(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ConsistencyConfig {
+                count_drift_threshold: 1.0,
+            },
+        )
+        .unwrap();
+
+        // With 100% threshold, even 99% drift is only a warning
+        assert!(!report.rebuild_recommended);
+        let mismatch = report
+            .findings
+            .iter()
+            .find(|f| f.category == "count_mismatch");
+        assert!(mismatch.is_some());
+        assert_eq!(mismatch.unwrap().severity, Severity::Warning);
+    }
+
+    #[test]
+    fn no_progress_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NoProgress>();
+    }
+
+    #[test]
+    fn reindex_result_serde_no_warnings() {
+        let result = ReindexResult {
+            stats: IndexStats {
+                docs_indexed: 0,
+                docs_removed: 0,
+                elapsed_ms: 0,
+                warnings: vec![],
+            },
+            checkpoint_written: false,
+            elapsed_ms: 0,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: ReindexResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.stats.docs_indexed, 0);
+        assert!(!restored.checkpoint_written);
+        assert!(restored.stats.warnings.is_empty());
     }
 }

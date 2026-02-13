@@ -1129,7 +1129,7 @@ mod tests {
 
     #[test]
     fn factor_sort_by_abs_contribution_desc() {
-        let mut factors = vec![
+        let mut factors = [
             ScoreFactor {
                 code: ExplainReasonCode::LexicalBm25,
                 key: "a".to_owned(),
@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn factor_sort_tiebreak_by_code_then_key() {
-        let mut factors = vec![
+        let mut factors = [
             ScoreFactor {
                 code: ExplainReasonCode::LexicalTermCoverage,
                 key: "zeta".to_owned(),
@@ -1413,5 +1413,231 @@ mod tests {
         let json = serde_json::to_string(&hit).unwrap();
         let restored: SearchHit = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.highlight_ranges.len(), 2);
+    }
+
+    // ── Additional trait and edge case tests ───────────────────────
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn highlight_range_debug_clone() {
+        let range = HighlightRange {
+            field: "body".to_owned(),
+            start: 10,
+            end: 20,
+        };
+        let debug = format!("{range:?}");
+        assert!(debug.contains("body"));
+        let cloned = range.clone();
+        assert_eq!(cloned.start, 10);
+        assert_eq!(cloned.end, 20);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn search_hit_debug_clone() {
+        let hit = sample_hit();
+        let debug = format!("{hit:?}");
+        assert!(debug.contains("42"));
+        let cloned = hit.clone();
+        assert_eq!(cloned.doc_id, 42);
+        assert_eq!(cloned.doc_kind, DocKind::Message);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn explain_report_debug_clone() {
+        let config = ExplainComposerConfig::default();
+        let report = compose_explain_report(SearchMode::Auto, 10, HashMap::new(), vec![], &config);
+        let debug = format!("{report:?}");
+        assert!(debug.contains("ExplainReport"));
+        let cloned = report.clone();
+        assert_eq!(cloned.candidates_evaluated, 10);
+        assert_eq!(cloned.mode_used, SearchMode::Auto);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn search_results_debug_clone() {
+        let results = SearchResults {
+            hits: vec![sample_hit()],
+            total_count: 1,
+            mode_used: SearchMode::Lexical,
+            explain: None,
+            elapsed: Duration::from_millis(5),
+        };
+        let debug = format!("{results:?}");
+        assert!(debug.contains("SearchResults"));
+        let cloned = results.clone();
+        assert_eq!(cloned.total_count, 1);
+        assert_eq!(cloned.hits.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn stage_score_input_debug_clone() {
+        let input = StageScoreInput {
+            stage: ExplainStage::Fusion,
+            reason_code: ExplainReasonCode::FusionWeightedBlend,
+            summary: Some("blend".to_owned()),
+            stage_score: 0.7,
+            stage_weight: 0.5,
+            score_factors: vec![],
+        };
+        let debug = format!("{input:?}");
+        assert!(debug.contains("Fusion"));
+        let cloned = input.clone();
+        assert!((cloned.stage_score - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn explain_composer_config_debug_clone() {
+        let config = ExplainComposerConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("verbosity"));
+        let cloned = config.clone();
+        assert_eq!(cloned.max_factors_per_stage, 4);
+    }
+
+    #[test]
+    fn search_results_with_explain_serde() {
+        let config = ExplainComposerConfig::default();
+        let report = compose_explain_report(
+            SearchMode::Hybrid,
+            50,
+            HashMap::new(),
+            vec![sample_explain_hit(&config)],
+            &config,
+        );
+        let results = SearchResults {
+            hits: vec![sample_hit()],
+            total_count: 1,
+            mode_used: SearchMode::Hybrid,
+            explain: Some(report),
+            elapsed: Duration::from_millis(10),
+        };
+        let json = serde_json::to_string(&results).unwrap();
+        assert!(json.contains("explain"));
+        let restored: SearchResults = serde_json::from_str(&json).unwrap();
+        assert!(restored.explain.is_some());
+        let explain = restored.explain.unwrap();
+        assert_eq!(explain.hits.len(), 1);
+        assert_eq!(explain.candidates_evaluated, 50);
+    }
+
+    #[test]
+    fn explain_reason_code_ordering() {
+        // Verify Ord derives give stable ordering
+        assert!(ExplainReasonCode::LexicalBm25 < ExplainReasonCode::LexicalTermCoverage);
+        assert!(ExplainReasonCode::SemanticCosine < ExplainReasonCode::FusionWeightedBlend);
+        assert!(ExplainReasonCode::ScopeRedacted < ExplainReasonCode::ScopeDenied);
+    }
+
+    #[test]
+    fn explain_stage_hash_works() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ExplainStage::Lexical);
+        set.insert(ExplainStage::Semantic);
+        set.insert(ExplainStage::Fusion);
+        set.insert(ExplainStage::Rerank);
+        set.insert(ExplainStage::Lexical); // duplicate
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn explain_reason_code_hash_works() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ExplainReasonCode::LexicalBm25);
+        set.insert(ExplainReasonCode::SemanticCosine);
+        set.insert(ExplainReasonCode::LexicalBm25); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn search_hit_thread_doc_kind() {
+        let hit = SearchHit {
+            doc_id: 1,
+            doc_kind: DocKind::Thread,
+            score: 0.5,
+            snippet: None,
+            highlight_ranges: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&hit).unwrap();
+        let restored: SearchHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.doc_kind, DocKind::Thread);
+    }
+
+    #[test]
+    fn default_taxonomy_version_is_one() {
+        assert_eq!(default_taxonomy_version(), 1);
+    }
+
+    #[test]
+    fn default_stage_order_is_canonical() {
+        assert_eq!(
+            default_stage_order(),
+            ExplainStage::canonical_order().to_vec()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn score_factor_debug_clone() {
+        let factor = ScoreFactor {
+            code: ExplainReasonCode::RerankPolicyPenalty,
+            key: "penalty".to_owned(),
+            contribution: -0.3,
+            detail: None,
+        };
+        let debug = format!("{factor:?}");
+        assert!(debug.contains("RerankPolicyPenalty"));
+        let cloned = factor.clone();
+        assert!((cloned.contribution - (-0.3)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn hit_explanation_debug_clone() {
+        let config = ExplainComposerConfig::default();
+        let hit = sample_explain_hit(&config);
+        let debug = format!("{hit:?}");
+        assert!(debug.contains("42"));
+        let cloned = hit.clone();
+        assert_eq!(cloned.doc_id, 42);
+        assert_eq!(cloned.stages.len(), 4);
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn stage_explanation_debug_clone() {
+        let stage = missing_stage(ExplainStage::Rerank);
+        let debug = format!("{stage:?}");
+        assert!(debug.contains("Rerank"));
+        let cloned = stage.clone();
+        assert_eq!(cloned.reason_code, ExplainReasonCode::StageNotExecuted);
+        assert!(!cloned.redacted);
+    }
+
+    #[test]
+    fn factor_sort_cmp_nan_handling() {
+        // NaN contributions should not panic
+        let a = ScoreFactor {
+            code: ExplainReasonCode::LexicalBm25,
+            key: "a".to_owned(),
+            contribution: f64::NAN,
+            detail: None,
+        };
+        let b = ScoreFactor {
+            code: ExplainReasonCode::LexicalBm25,
+            key: "b".to_owned(),
+            contribution: 0.5,
+            detail: None,
+        };
+        // Should not panic
+        let _ = factor_sort_cmp(&a, &b);
+        let _ = factor_sort_cmp(&b, &a);
     }
 }

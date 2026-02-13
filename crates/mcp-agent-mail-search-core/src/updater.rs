@@ -794,6 +794,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn updater_config_clone() {
         let config = UpdaterConfig {
             batch_size: 42,
@@ -807,11 +808,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn updater_stats_clone() {
-        let mut stats = UpdaterStats::default();
-        stats.total_applied = 42;
-        stats.flush_count = 7;
-        stats.last_flush_duration = Some(Duration::from_millis(10));
+        let stats = UpdaterStats {
+            total_applied: 42,
+            flush_count: 7,
+            last_flush_duration: Some(Duration::from_millis(10)),
+            ..Default::default()
+        };
 
         let cloned = stats.clone();
         assert_eq!(cloned.total_applied, 42);
@@ -896,5 +900,135 @@ mod tests {
         assert_eq!(updater.stats().pending_count, 1);
         // But dropped count persists
         assert_eq!(updater.stats().total_dropped, 1);
+    }
+
+    // ── Additional trait and edge case tests ───────────────────────
+
+    #[test]
+    fn updater_config_debug() {
+        let config = UpdaterConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("batch_size"));
+        assert!(debug.contains("flush_interval"));
+        assert!(debug.contains("backpressure_threshold"));
+    }
+
+    #[test]
+    fn updater_stats_debug() {
+        let stats = UpdaterStats {
+            pending_count: 5,
+            total_applied: 100,
+            total_dropped: 3,
+            flush_count: 10,
+            last_flush_duration: Some(Duration::from_millis(42)),
+        };
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("pending_count"));
+        assert!(debug.contains("total_applied"));
+    }
+
+    #[test]
+    fn deduplicate_thread_doc_kind() {
+        let mk = |id| {
+            DocChange::Upsert(Document {
+                id,
+                kind: DocKind::Thread,
+                body: format!("thread {id}"),
+                title: String::new(),
+                project_id: Some(1),
+                created_ts: 0,
+                metadata: HashMap::new(),
+            })
+        };
+
+        // Two changes for same thread id → last wins
+        let changes = vec![mk(1), mk(1)];
+        let deduped = deduplicate_changes(changes);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].doc_kind(), DocKind::Thread);
+    }
+
+    #[test]
+    fn enqueue_raw_change_accepted() {
+        let updater = IncrementalUpdater::new();
+        let accepted = updater.enqueue(DocChange::Delete {
+            id: 99,
+            kind: DocKind::Project,
+        });
+        assert!(accepted);
+        assert_eq!(updater.stats().pending_count, 1);
+    }
+
+    #[test]
+    fn flush_twice_second_is_noop() {
+        let updater = IncrementalUpdater::new();
+        let backend = MockLifecycle::new();
+
+        updater.on_message_upsert(&sample_message_row());
+        let first = updater.flush(&backend).unwrap();
+        assert_eq!(first, 1);
+
+        // Second flush with nothing pending
+        let second = updater.flush(&backend).unwrap();
+        assert_eq!(second, 0);
+
+        let stats = updater.stats();
+        assert_eq!(stats.total_applied, 1); // Only first flush counted
+        assert_eq!(stats.flush_count, 1); // Empty flush returns early
+    }
+
+    #[test]
+    fn stats_pending_reflects_queue_size() {
+        let updater = IncrementalUpdater::new();
+
+        assert_eq!(updater.stats().pending_count, 0);
+        updater.on_message_upsert(&sample_message_row());
+        assert_eq!(updater.stats().pending_count, 1);
+        updater.on_agent_upsert(&sample_agent_row());
+        assert_eq!(updater.stats().pending_count, 2);
+        updater.on_message_delete(1);
+        assert_eq!(updater.stats().pending_count, 3);
+    }
+
+    #[test]
+    fn deduplicate_different_kinds_same_id_all_kept() {
+        // Same id=1, all 4 DocKind variants → all 4 kept (different keys)
+        let mk = |kind: DocKind| {
+            DocChange::Upsert(Document {
+                id: 1,
+                kind,
+                body: format!("{kind:?}"),
+                title: String::new(),
+                project_id: Some(1),
+                created_ts: 0,
+                metadata: HashMap::new(),
+            })
+        };
+
+        let changes = vec![
+            mk(DocKind::Message),
+            mk(DocKind::Agent),
+            mk(DocKind::Project),
+            mk(DocKind::Thread),
+        ];
+        let deduped = deduplicate_changes(changes);
+        assert_eq!(deduped.len(), 4);
+    }
+
+    #[test]
+    fn flush_after_backend_error_allows_new_enqueues() {
+        let updater = IncrementalUpdater::new();
+        let failing_backend = FailingLifecycle;
+        let good_backend = MockLifecycle::new();
+
+        updater.on_message_upsert(&sample_message_row());
+        assert!(updater.flush(&failing_backend).is_err());
+
+        // Queue was drained despite error — enqueue more and flush to good backend
+        updater.on_agent_upsert(&sample_agent_row());
+        let applied = updater.flush(&good_backend).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(updater.stats().total_applied, 1);
+        assert_eq!(updater.stats().flush_count, 1);
     }
 }
