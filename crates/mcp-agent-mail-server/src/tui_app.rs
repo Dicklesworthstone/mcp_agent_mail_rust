@@ -18,7 +18,7 @@ use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
 use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
 use ftui::widgets::modal::{Dialog, DialogResult, DialogState};
 use ftui::widgets::notification_queue::NotificationStack;
-use ftui::widgets::toast::ToastPosition;
+use ftui::widgets::toast::{ToastId, ToastPosition};
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
 use ftui::{Event, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_extras::theme::ThemeId;
@@ -53,6 +53,8 @@ const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
 const PALETTE_DB_CACHE_TTL_MICROS: i64 = 5 * 1_000_000;
 const PALETTE_USAGE_HALF_LIFE_MICROS: i64 = 60 * 60 * 1_000_000;
 const SCREEN_TRANSITION_TICKS: u8 = 4;
+const TOAST_ENTRANCE_TICKS: u8 = 4;
+const TOAST_EXIT_TICKS: u8 = 3;
 const REMOTE_EVENTS_PER_TICK: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +153,22 @@ impl ToastSeverityThreshold {
             Self::Info => true,
         }
     }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| {
+        let s = v.to_string_lossy();
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn toast_reduced_motion_enabled(accessibility: &crate::tui_persist::AccessibilitySettings) -> bool {
+    accessibility.reduced_motion
+        || env_flag_enabled("AM_TUI_REDUCED_MOTION")
+        || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
 }
 
 /// Duration threshold (ms) for slow tool call toasts.
@@ -578,6 +596,7 @@ pub struct MailAppModel {
     toast_info_dismiss_secs: u64,
     toast_warn_dismiss_secs: u64,
     toast_error_dismiss_secs: u64,
+    toast_age_ticks: HashMap<ToastId, u8>,
     /// When `Some(idx)`, the toast stack is in focus mode and the
     /// toast at `idx` has a highlight border. `Ctrl+T` toggles.
     toast_focus_index: Option<usize>,
@@ -638,6 +657,7 @@ impl MailAppModel {
             toast_info_dismiss_secs: 5,
             toast_warn_dismiss_secs: 8,
             toast_error_dismiss_secs: 15,
+            toast_age_ticks: HashMap::new(),
             toast_focus_index: None,
             modal_manager: ModalManager::new(),
             action_menu: ActionMenuManager::new(),
@@ -1027,7 +1047,30 @@ impl MailAppModel {
 
     fn apply_toast_policy(&self, toast: Toast) -> Toast {
         let icon = toast.content.icon.unwrap_or(ToastIcon::Info);
-        toast.duration(Duration::from_secs(self.toast_dismiss_secs(icon)))
+        let duration = Duration::from_secs(self.toast_dismiss_secs(icon));
+        let toast = toast
+            .duration(duration)
+            .entrance_duration(TICK_INTERVAL.saturating_mul(u32::from(TOAST_ENTRANCE_TICKS)))
+            .exit_duration(TICK_INTERVAL.saturating_mul(u32::from(TOAST_EXIT_TICKS)));
+        if toast_reduced_motion_enabled(&self.accessibility) {
+            toast.no_animation()
+        } else {
+            toast
+        }
+    }
+
+    fn tick_toast_animation_state(&mut self) {
+        let mut visible_ids = HashSet::new();
+        for toast in self.notifications.visible_mut() {
+            visible_ids.insert(toast.id);
+            let _ = toast.tick_animation();
+            self.toast_age_ticks
+                .entry(toast.id)
+                .and_modify(|age| *age = age.saturating_add(1))
+                .or_insert(0);
+        }
+        self.toast_age_ticks
+            .retain(|id, _| visible_ids.contains(id));
     }
 
     fn record_palette_action_usage(&mut self, action_id: &str) {
@@ -1734,6 +1777,7 @@ impl Model for MailAppModel {
 
                 // Advance notification timers
                 self.notifications.tick(TICK_INTERVAL);
+                self.tick_toast_animation_state();
 
                 // Drain browser-ingress events and process them through the
                 // same terminal handling path as local input.
@@ -2052,9 +2096,14 @@ impl Model for MailAppModel {
         );
 
         // 4. Toast notifications (z=4, overlay)
-        NotificationStack::new(&self.notifications)
-            .margin(1)
-            .render(area, frame);
+        let reduced_motion = toast_reduced_motion_enabled(&self.accessibility);
+        if reduced_motion {
+            NotificationStack::new(&self.notifications)
+                .margin(1)
+                .render(area, frame);
+        } else {
+            render_animated_toast_stack(&self.notifications, &self.toast_age_ticks, area, 1, frame);
+        }
 
         // 4b. Toast focus highlight overlay
         if let Some(focus_idx) = self.toast_focus_index {
@@ -3194,6 +3243,103 @@ fn render_toast_focus_highlight(
 
     highlight_toast_border(x, y, tw, th, frame);
     render_focus_hint(visible, &positions, area, x, y.saturating_add(th), frame);
+}
+
+fn render_animated_toast_stack(
+    queue: &NotificationQueue,
+    toast_age_ticks: &HashMap<ToastId, u8>,
+    area: Rect,
+    margin: u16,
+    frame: &mut Frame,
+) {
+    if area.is_empty() || queue.visible().is_empty() {
+        return;
+    }
+
+    let positions = queue.calculate_positions(area.width, area.height, margin);
+    for (toast, (_, rel_x, rel_y)) in queue.visible().iter().zip(positions.iter()) {
+        let age_ticks = toast_age_ticks.get(&toast.id).copied().unwrap_or(0);
+        let remaining = toast.remaining_time().map(remaining_ticks_from_duration);
+        let shift = entrance_slide_columns(age_ticks).saturating_add(exit_slide_columns(remaining));
+        let fade_level = exit_fade_level(remaining);
+
+        let (toast_width, toast_height) = toast.calculate_dimensions();
+        let x = area.x.saturating_add(*rel_x).saturating_add(shift);
+        let y = area.y.saturating_add(*rel_y);
+        let toast_area = Rect::new(x, y, toast_width, toast_height);
+        let render_area = toast_area.intersection(&area);
+        if render_area.is_empty() {
+            continue;
+        }
+
+        toast.render(render_area, frame);
+        if fade_level > 0 {
+            apply_fade_to_area(frame, render_area, fade_level);
+        }
+    }
+}
+
+fn remaining_ticks_from_duration(remaining: Duration) -> u8 {
+    let tick_ms = TICK_INTERVAL.as_millis().max(1);
+    let rem_ms = remaining.as_millis();
+    let ticks = rem_ms.div_ceil(tick_ms);
+    let capped = ticks.min(u128::from(u8::MAX));
+    u8::try_from(capped).unwrap_or(u8::MAX)
+}
+
+fn entrance_slide_columns(age_ticks: u8) -> u16 {
+    if age_ticks >= TOAST_ENTRANCE_TICKS {
+        return 0;
+    }
+    let remaining = TOAST_ENTRANCE_TICKS.saturating_sub(age_ticks);
+    u16::from(remaining).saturating_mul(2)
+}
+
+const fn exit_fade_level(remaining_ticks: Option<u8>) -> u8 {
+    let Some(remaining_ticks) = remaining_ticks else {
+        return 0;
+    };
+    if remaining_ticks == 0 || remaining_ticks > TOAST_EXIT_TICKS {
+        return 0;
+    }
+    TOAST_EXIT_TICKS
+        .saturating_sub(remaining_ticks)
+        .saturating_add(1)
+}
+
+fn exit_slide_columns(remaining_ticks: Option<u8>) -> u16 {
+    u16::from(exit_fade_level(remaining_ticks)).saturating_mul(2)
+}
+
+fn apply_fade_to_area(frame: &mut Frame, area: Rect, fade_level: u8) {
+    let t = match fade_level {
+        1 => 0.35_f32,
+        2 => 0.6_f32,
+        _ => 0.8_f32,
+    };
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                cell.fg = blend_to_bg(cell.fg, cell.bg, t);
+            }
+        }
+    }
+}
+
+fn blend_to_bg(fg: PackedRgba, bg: PackedRgba, t: f32) -> PackedRgba {
+    let t = t.clamp(0.0, 1.0);
+    let blend = |start: u8, end: u8| -> u8 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            ((f32::from(end) - f32::from(start)).mul_add(t, f32::from(start))).round() as u8
+        }
+    };
+    PackedRgba::rgba(
+        blend(fg.r(), bg.r()),
+        blend(fg.g(), bg.g()),
+        blend(fg.b(), bg.b()),
+        fg.a(),
+    )
 }
 
 /// Overwrite the border cells of the toast area with the highlight color.
@@ -5639,6 +5785,60 @@ mod tests {
             model.toast_focus_index = None;
         }
         assert!(model.toast_focus_index.is_none());
+    }
+
+    #[test]
+    fn toast_entrance_slide_progresses_over_four_ticks() {
+        assert_eq!(entrance_slide_columns(0), 8);
+        assert_eq!(entrance_slide_columns(1), 6);
+        assert_eq!(entrance_slide_columns(2), 4);
+        assert_eq!(entrance_slide_columns(3), 2);
+        assert_eq!(entrance_slide_columns(4), 0);
+        assert_eq!(entrance_slide_columns(9), 0);
+    }
+
+    #[test]
+    fn toast_exit_fade_levels_progress_over_three_ticks() {
+        assert_eq!(exit_fade_level(None), 0);
+        assert_eq!(exit_fade_level(Some(9)), 0);
+        assert_eq!(exit_fade_level(Some(3)), 1);
+        assert_eq!(exit_fade_level(Some(2)), 2);
+        assert_eq!(exit_fade_level(Some(1)), 3);
+        assert_eq!(exit_fade_level(Some(0)), 0);
+    }
+
+    #[test]
+    fn toast_remaining_ticks_rounds_up() {
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(1)), 1);
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 1);
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 1);
+        assert_eq!(remaining_ticks_from_duration(Duration::from_millis(101)), 2);
+    }
+
+    #[test]
+    fn animated_toast_stack_respects_entry_offset() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(area.width, area.height, &mut pool);
+        let mut queue =
+            NotificationQueue::new(QueueConfig::default().position(ToastPosition::TopLeft));
+        queue.notify(Toast::new("slide test").duration(Duration::from_secs(10)));
+        queue.tick(TICK_INTERVAL);
+
+        let id = queue.visible()[0].id;
+        let mut age = HashMap::new();
+        age.insert(id, 0);
+        render_animated_toast_stack(&queue, &age, area, 1, &mut frame);
+        let text = ftui_harness::buffer_to_text(&frame.buffer);
+        let first_non_space = text
+            .lines()
+            .find_map(|line| line.chars().position(|ch| !ch.is_whitespace()))
+            .expect("toast border should be rendered");
+
+        assert!(
+            first_non_space >= 9,
+            "expected entrance offset to shift toast right, got column {first_non_space}",
+        );
     }
 
     // ── Toast severity coloring tests ───────────────────────────

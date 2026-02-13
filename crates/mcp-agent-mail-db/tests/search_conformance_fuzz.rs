@@ -485,6 +485,10 @@ fn conformance_limit_clamping() {
 }
 
 /// Verify all three doc kinds produce valid plans.
+///
+/// Agent and Project searches use LIKE fallback because identity FTS tables
+/// (`fts_agents`, `fts_projects`) are dropped at runtime by
+/// `enforce_runtime_identity_fts_cleanup`.  Only Message search uses FTS.
 #[test]
 fn conformance_doc_kinds() {
     for kind in [DocKind::Message, DocKind::Agent, DocKind::Project] {
@@ -495,10 +499,13 @@ fn conformance_doc_kinds() {
             ..Default::default()
         };
         let plan = plan_search(&q);
+        let expected_method = match kind {
+            DocKind::Message | DocKind::Thread => PlanMethod::Fts,
+            DocKind::Agent | DocKind::Project => PlanMethod::Like,
+        };
         assert_eq!(
-            plan.method,
-            PlanMethod::Fts,
-            "{kind:?} with text should use FTS"
+            plan.method, expected_method,
+            "{kind:?} with text should use {expected_method:?}"
         );
         assert!(!plan.sql.is_empty(), "{kind:?} plan should have SQL");
         assert!(
