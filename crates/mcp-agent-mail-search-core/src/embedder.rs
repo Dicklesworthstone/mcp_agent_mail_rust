@@ -1036,4 +1036,371 @@ mod tests {
         assert!(!result.content_hash.is_empty());
         // The hash should be from canonicalized text, not raw
     }
+
+    // ── ModelTier extended ──
+
+    #[test]
+    fn model_tier_hash_trait() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ModelTier::Hash);
+        set.insert(ModelTier::Fast);
+        set.insert(ModelTier::Quality);
+        set.insert(ModelTier::Fast); // duplicate
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn model_tier_debug() {
+        for tier in [ModelTier::Hash, ModelTier::Fast, ModelTier::Quality] {
+            let debug = format!("{tier:?}");
+            assert!(!debug.is_empty());
+        }
+    }
+
+    // ── ModelInfo extended ──
+
+    #[test]
+    fn model_info_serde_roundtrip() {
+        let info = ModelInfo::new("test", "Test", ModelTier::Fast, 384, 512)
+            .with_provider("local")
+            .with_available(true);
+        let json = serde_json::to_string(&info).unwrap();
+        let info2: ModelInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info2.id, "test");
+        assert_eq!(info2.tier, ModelTier::Fast);
+        assert_eq!(info2.dimension, 384);
+        assert_eq!(info2.provider, Some("local".to_string()));
+        assert!(info2.available);
+    }
+
+    #[test]
+    fn model_info_debug() {
+        let info = ModelInfo::new("test", "Test", ModelTier::Fast, 384, 512);
+        let debug = format!("{info:?}");
+        assert!(debug.contains("test"));
+    }
+
+    #[test]
+    fn model_info_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let info = ModelInfo::new("test", "Test", ModelTier::Fast, 384, 512);
+        assert_clone(&info);
+    }
+
+    #[test]
+    fn model_info_default_available_false() {
+        let info = ModelInfo::new("x", "x", ModelTier::Fast, 1, 1);
+        assert!(!info.available);
+    }
+
+    #[test]
+    fn model_info_default_provider_none() {
+        let info = ModelInfo::new("x", "x", ModelTier::Fast, 1, 1);
+        assert!(info.provider.is_none());
+    }
+
+    #[test]
+    fn model_info_default_supports_batch() {
+        let info = ModelInfo::new("x", "x", ModelTier::Fast, 1, 1);
+        assert!(info.supports_batch);
+    }
+
+    // ── EmbeddingResult extended ──
+
+    #[test]
+    fn embedding_result_serde_roundtrip() {
+        let result = EmbeddingResult::new(
+            vec![0.1, 0.2],
+            "model",
+            ModelTier::Fast,
+            Duration::from_millis(5),
+            "hash",
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        let result2: EmbeddingResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result2.model_id, "model");
+        assert_eq!(result2.dimension, 2);
+    }
+
+    #[test]
+    fn embedding_result_is_hash_only_hash_tier_nonempty_vec() {
+        let result = EmbeddingResult {
+            vector: vec![1.0],
+            model_id: "hash".to_string(),
+            tier: ModelTier::Hash,
+            dimension: 1,
+            elapsed: Duration::ZERO,
+            content_hash: "abc".to_string(),
+        };
+        assert!(result.is_hash_only()); // Hash tier always counts as hash-only
+    }
+
+    #[test]
+    fn embedding_result_is_hash_only_empty_vec_non_hash_tier() {
+        let result = EmbeddingResult {
+            vector: vec![],
+            model_id: "fast".to_string(),
+            tier: ModelTier::Fast,
+            dimension: 0,
+            elapsed: Duration::ZERO,
+            content_hash: "abc".to_string(),
+        };
+        assert!(result.is_hash_only()); // Empty vector always counts as hash-only
+    }
+
+    #[test]
+    fn embedding_result_debug() {
+        let result = EmbeddingResult::from_hash("test");
+        let debug = format!("{result:?}");
+        assert!(debug.contains("hash"));
+    }
+
+    // ── HashEmbedder extended ──
+
+    #[test]
+    fn hash_embedder_default() {
+        let embedder = HashEmbedder::default();
+        assert_eq!(embedder.model_info().id, "hash");
+    }
+
+    #[test]
+    fn hash_embedder_debug() {
+        let embedder = HashEmbedder::new();
+        let debug = format!("{embedder:?}");
+        assert!(debug.contains("HashEmbedder"));
+    }
+
+    #[test]
+    fn hash_embedder_empty_batch() {
+        let embedder = HashEmbedder::new();
+        let results = embedder.embed_batch(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── RegistryConfig ──
+
+    #[test]
+    fn registry_config_default() {
+        let config = RegistryConfig::default();
+        assert!(config.allow_hash_fallback);
+        assert_eq!(config.timeout_ms, 5000);
+        assert!(config.preferred_fast.is_none());
+        assert!(config.preferred_quality.is_none());
+    }
+
+    #[test]
+    fn registry_config_serde_roundtrip() {
+        let config = RegistryConfig {
+            preferred_fast: Some("fast-model".to_string()),
+            preferred_quality: Some("quality-model".to_string()),
+            allow_hash_fallback: false,
+            timeout_ms: 1000,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let config2: RegistryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config2.preferred_fast, Some("fast-model".to_string()));
+        assert!(!config2.allow_hash_fallback);
+    }
+
+    #[test]
+    fn registry_config_debug() {
+        let config = RegistryConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("RegistryConfig"));
+    }
+
+    // ── ModelRegistry extended ──
+
+    #[test]
+    fn registry_deactivate_embedder() {
+        let mut registry = ModelRegistry::default();
+        let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new());
+        registry.activate_embedder(embedder);
+        // hash should be in embedders
+        registry.deactivate_embedder("hash");
+        // Model should still be registered but marked unavailable
+        let info = registry.get_model_info("hash").unwrap();
+        assert!(!info.available);
+    }
+
+    #[test]
+    fn registry_set_config() {
+        let mut registry = ModelRegistry::default();
+        let new_config = RegistryConfig {
+            timeout_ms: 999,
+            ..Default::default()
+        };
+        registry.set_config(new_config);
+        assert_eq!(registry.config().timeout_ms, 999);
+    }
+
+    #[test]
+    fn registry_list_available_only_hash() {
+        let registry = ModelRegistry::default();
+        let available = registry.list_available();
+        // Only hash is available by default
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].id, "hash");
+    }
+
+    #[test]
+    fn registry_hash_embedder_accessor() {
+        let registry = ModelRegistry::default();
+        let hash = registry.hash_embedder();
+        assert_eq!(hash.model_info().id, "hash");
+    }
+
+    #[test]
+    fn registry_quality_falls_back_to_fast_then_hash() {
+        let registry = ModelRegistry::default();
+        // No fast or quality model, should fallback to hash
+        let embedder = registry.get_embedder(ModelTier::Quality).unwrap();
+        assert_eq!(embedder.model_info().tier, ModelTier::Hash);
+    }
+
+    #[test]
+    fn registry_debug() {
+        let registry = ModelRegistry::default();
+        let debug = format!("{registry:?}");
+        assert!(debug.contains("ModelRegistry"));
+    }
+
+    // ── Cosine similarity extended ──
+
+    #[test]
+    fn cosine_similar_vectors() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![1.1, 2.1, 3.1];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim > 0.99); // Very similar vectors
+    }
+
+    #[test]
+    fn cosine_negative_values() {
+        let a = vec![-1.0, -2.0, -3.0];
+        let b = vec![-1.0, -2.0, -3.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    // ── normalize_l2 extended ──
+
+    #[test]
+    fn normalize_l2_idempotent() {
+        let v = vec![3.0, 4.0];
+        let n1 = normalize_l2(&v);
+        let n2 = normalize_l2(&n1);
+        for (a, b) in n1.iter().zip(n2.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn normalize_l2_single_element() {
+        let v = vec![5.0];
+        let n = normalize_l2(&v);
+        assert!((n[0] - 1.0).abs() < 1e-6);
+    }
+
+    // ── Well-known models completeness ──
+
+    #[test]
+    fn well_known_minilm_l12() {
+        let info = well_known::minilm_l12_v2();
+        assert_eq!(info.id, "all-minilm-l12-v2");
+        assert_eq!(info.tier, ModelTier::Fast);
+        assert_eq!(info.dimension, 384);
+    }
+
+    #[test]
+    fn well_known_e5_small() {
+        let info = well_known::e5_small_v2();
+        assert_eq!(info.id, "e5-small-v2");
+        assert_eq!(info.tier, ModelTier::Fast);
+    }
+
+    #[test]
+    fn well_known_e5_base() {
+        let info = well_known::e5_base_v2();
+        assert_eq!(info.id, "e5-base-v2");
+        assert_eq!(info.tier, ModelTier::Quality);
+        assert_eq!(info.dimension, 768);
+    }
+
+    #[test]
+    fn well_known_bge_small() {
+        let info = well_known::bge_small_en();
+        assert_eq!(info.id, "bge-small-en-v1.5");
+        assert_eq!(info.tier, ModelTier::Fast);
+    }
+
+    #[test]
+    fn well_known_bge_base() {
+        let info = well_known::bge_base_en();
+        assert_eq!(info.id, "bge-base-en-v1.5");
+        assert_eq!(info.tier, ModelTier::Quality);
+        assert_eq!(info.dimension, 768);
+    }
+
+    #[test]
+    fn well_known_openai_small() {
+        let info = well_known::openai_small();
+        assert_eq!(info.id, "text-embedding-3-small");
+        assert_eq!(info.tier, ModelTier::Fast);
+        assert_eq!(info.dimension, 1536);
+    }
+
+    // ── embed_document with different doc kinds ──
+
+    #[test]
+    fn embed_document_agent_kind() {
+        let embedder = HashEmbedder::new();
+        let result = embed_document(
+            &embedder,
+            DocKind::Agent,
+            "AgentName",
+            "Agent description",
+            CanonPolicy::Full,
+        )
+        .unwrap();
+        assert!(!result.content_hash.is_empty());
+    }
+
+    #[test]
+    fn embed_document_project_kind() {
+        let embedder = HashEmbedder::new();
+        let result = embed_document(
+            &embedder,
+            DocKind::Project,
+            "ProjectName",
+            "Project description",
+            CanonPolicy::Full,
+        )
+        .unwrap();
+        assert!(!result.content_hash.is_empty());
+    }
+
+    #[test]
+    fn embed_document_different_policies() {
+        let embedder = HashEmbedder::new();
+        let full = embed_document(
+            &embedder,
+            DocKind::Message,
+            "Title",
+            "Body **bold**",
+            CanonPolicy::Full,
+        )
+        .unwrap();
+        let title_only = embed_document(
+            &embedder,
+            DocKind::Message,
+            "Title",
+            "Body **bold**",
+            CanonPolicy::TitleOnly,
+        )
+        .unwrap();
+        // Different policies should produce different hashes
+        assert_ne!(full.content_hash, title_only.content_hash);
+    }
 }

@@ -566,6 +566,107 @@ mod tests {
         assert_eq!(snap_to_word_end("hello world", 3), 5);
     }
 
+    // ── Snippet edge cases ──
+
+    #[test]
+    fn snippet_at_end_of_text() {
+        let text = "beginning of the text with the match at end";
+        let snippet = generate_snippet(text, &["end".to_string()]).unwrap();
+        assert!(snippet.contains("end"));
+    }
+
+    #[test]
+    fn snippet_multiple_terms_first_match_wins() {
+        let text = "alpha comes before beta in the text";
+        let snippet = generate_snippet(text, &["beta".to_string(), "alpha".to_string()]).unwrap();
+        // "alpha" appears first in text, so it should be the anchor
+        assert!(snippet.contains("alpha"));
+    }
+
+    #[test]
+    fn snippet_ellipsis_at_start_when_match_far_in() {
+        let prefix = "word ".repeat(50);
+        let text = format!("{prefix}NEEDLE rest of text");
+        let snippet = generate_snippet(&text, &["needle".to_string()]).unwrap();
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.contains("NEEDLE"));
+    }
+
+    #[test]
+    fn snippet_short_text_no_ellipsis() {
+        let text = "short text with needle";
+        let snippet = generate_snippet(text, &["needle".to_string()]).unwrap();
+        assert!(!snippet.starts_with("..."));
+        assert!(!snippet.ends_with("..."));
+    }
+
+    // ── Highlight edge cases ──
+
+    #[test]
+    fn highlights_empty_terms_list() {
+        let ranges = find_highlights("hello world", "body", &[]);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn highlights_adjacent_matches() {
+        let ranges = find_highlights("foobar", "body", &["foo".to_string(), "bar".to_string()]);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges[0].end, 3);
+        assert_eq!(ranges[1].start, 3);
+        assert_eq!(ranges[1].end, 6);
+    }
+
+    #[test]
+    fn highlights_field_name_propagated() {
+        let ranges = find_highlights("test", "subject", &["test".to_string()]);
+        assert_eq!(ranges[0].field, "subject");
+    }
+
+    // ── Word boundary snapping edge cases ──
+
+    #[test]
+    fn snap_word_start_past_end() {
+        let text = "hello";
+        assert_eq!(snap_to_word_start(text, 100), text.len());
+    }
+
+    #[test]
+    fn snap_word_end_at_zero() {
+        let text = "hello world";
+        let end = snap_to_word_end(text, 0);
+        assert_eq!(end, 5); // snaps to end of "hello"
+    }
+
+    #[test]
+    fn snap_word_start_at_space() {
+        let text = "hello world";
+        // Position 5 is the space
+        assert_eq!(snap_to_word_start(text, 5), 0);
+    }
+
+    #[test]
+    fn snap_word_end_already_at_space() {
+        let text = "hello world";
+        // Position 5 is the space
+        assert_eq!(snap_to_word_end(text, 5), 5);
+    }
+
+    // ── Constants ──
+
+    #[test]
+    fn snippet_max_chars_reasonable() {
+        const { assert!(SNIPPET_MAX_CHARS > 50) };
+        const { assert!(SNIPPET_MAX_CHARS < 1000) };
+    }
+
+    #[test]
+    fn snippet_context_reasonable() {
+        const { assert!(SNIPPET_CONTEXT > 10) };
+        const { assert!(SNIPPET_CONTEXT < SNIPPET_MAX_CHARS) };
+    }
+
     // ── Tantivy integration tests ──
 
     #[cfg(feature = "tantivy-engine")]
