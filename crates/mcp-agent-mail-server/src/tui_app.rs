@@ -26,7 +26,7 @@ use ftui_runtime::program::{Cmd, Model};
 use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
-use crate::tui_bridge::{ServerControlMsg, TransportBase, TuiSharedState};
+use crate::tui_bridge::{RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
@@ -53,6 +53,7 @@ const PALETTE_DYNAMIC_EVENT_SCAN: usize = 1500;
 const PALETTE_DB_CACHE_TTL_MICROS: i64 = 5 * 1_000_000;
 const PALETTE_USAGE_HALF_LIFE_MICROS: i64 = 60 * 60 * 1_000_000;
 const SCREEN_TRANSITION_TICKS: u8 = 4;
+const REMOTE_EVENTS_PER_TICK: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScreenTransition {
@@ -193,6 +194,76 @@ fn parse_toast_position(value: &str) -> ToastPosition {
         "bottom-left" => ToastPosition::BottomLeft,
         "bottom-right" => ToastPosition::BottomRight,
         _ => ToastPosition::TopRight,
+    }
+}
+
+fn remote_modifiers_from_bits(modifiers: u8) -> Modifiers {
+    let mut out = Modifiers::empty();
+    // Browser payload bit layout (mcp-agent-mail-wasm/www/index.js):
+    // ctrl=1, shift=2, alt=4, meta=8.
+    if (modifiers & 0b0001) != 0 {
+        out |= Modifiers::CTRL;
+    }
+    if (modifiers & 0b0010) != 0 {
+        out |= Modifiers::SHIFT;
+    }
+    if (modifiers & 0b0100) != 0 {
+        out |= Modifiers::ALT;
+    }
+    if (modifiers & 0b1000) != 0 {
+        out |= Modifiers::SUPER;
+    }
+    out
+}
+
+fn remote_key_code_from_label(key: &str) -> Option<KeyCode> {
+    let trimmed = key.trim();
+    if trimmed.chars().count() == 1 {
+        return trimmed.chars().next().map(KeyCode::Char);
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    if let Some(rest) = normalized.strip_prefix('f')
+        && let Ok(function_num) = rest.parse::<u8>()
+        && (1..=24).contains(&function_num)
+    {
+        return Some(KeyCode::F(function_num));
+    }
+
+    match normalized.as_str() {
+        "enter" | "return" => Some(KeyCode::Enter),
+        "escape" | "esc" => Some(KeyCode::Escape),
+        "backspace" => Some(KeyCode::Backspace),
+        "tab" => Some(KeyCode::Tab),
+        "backtab" | "shift+tab" => Some(KeyCode::BackTab),
+        "delete" | "del" => Some(KeyCode::Delete),
+        "insert" | "ins" => Some(KeyCode::Insert),
+        "home" => Some(KeyCode::Home),
+        "end" => Some(KeyCode::End),
+        "pageup" | "page_up" | "pgup" => Some(KeyCode::PageUp),
+        "pagedown" | "page_down" | "pgdn" => Some(KeyCode::PageDown),
+        "up" | "arrowup" => Some(KeyCode::Up),
+        "down" | "arrowdown" => Some(KeyCode::Down),
+        "left" | "arrowleft" => Some(KeyCode::Left),
+        "right" | "arrowright" => Some(KeyCode::Right),
+        "space" | "spacebar" => Some(KeyCode::Char(' ')),
+        "null" => Some(KeyCode::Null),
+        _ => None,
+    }
+}
+
+fn remote_terminal_event_to_event(event: RemoteTerminalEvent) -> Option<Event> {
+    match event {
+        RemoteTerminalEvent::Key { key, modifiers } => {
+            let key_code = remote_key_code_from_label(&key)?;
+            let key_event =
+                ftui::KeyEvent::new(key_code).with_modifiers(remote_modifiers_from_bits(modifiers));
+            Some(Event::Key(key_event))
+        }
+        RemoteTerminalEvent::Resize { cols, rows } => Some(Event::Resize {
+            width: cols,
+            height: rows,
+        }),
     }
 }
 
@@ -442,10 +513,8 @@ impl ScreenManager {
 
     fn get_mut(&mut self, id: MailScreenId) -> Option<&mut (dyn MailScreen + '_)> {
         self.ensure_screen(id);
-        match self.screens.get_mut(&id) {
-            Some(screen) => Some(screen.as_mut()),
-            None => None,
-        }
+        let screen = self.screens.get_mut(&id)?;
+        Some(screen.as_mut())
     }
 
     fn active_screen_ref(&self) -> Option<&dyn MailScreen> {
@@ -1665,6 +1734,20 @@ impl Model for MailAppModel {
 
                 // Advance notification timers
                 self.notifications.tick(TICK_INTERVAL);
+
+                // Drain browser-ingress events and process them through the
+                // same terminal handling path as local input.
+                let remote_events = self
+                    .state
+                    .drain_remote_terminal_events(REMOTE_EVENTS_PER_TICK);
+                for remote_event in remote_events {
+                    if let Some(event) = remote_terminal_event_to_event(remote_event) {
+                        let cmd = self.update(MailMsg::Terminal(event));
+                        if matches!(cmd, Cmd::Quit) {
+                            return Cmd::quit();
+                        }
+                    }
+                }
 
                 Cmd::tick(TICK_INTERVAL)
             }
@@ -3471,6 +3554,49 @@ mod tests {
             rx.try_recv().ok(),
             Some(ServerControlMsg::ToggleTransportBase)
         );
+    }
+
+    #[test]
+    fn remote_modifiers_maps_browser_bit_layout() {
+        let mods = remote_modifiers_from_bits(0b1111);
+        assert!(mods.contains(Modifiers::CTRL));
+        assert!(mods.contains(Modifiers::SHIFT));
+        assert!(mods.contains(Modifiers::ALT));
+        assert!(mods.contains(Modifiers::SUPER));
+    }
+
+    #[test]
+    fn remote_key_code_maps_browser_aliases() {
+        assert_eq!(remote_key_code_from_label("ArrowUp"), Some(KeyCode::Up));
+        assert_eq!(remote_key_code_from_label("Esc"), Some(KeyCode::Escape));
+        assert_eq!(
+            remote_key_code_from_label("Space"),
+            Some(KeyCode::Char(' '))
+        );
+        assert_eq!(remote_key_code_from_label("f12"), Some(KeyCode::F(12)));
+    }
+
+    #[test]
+    fn tick_drains_remote_terminal_events() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+
+        let _ = state.push_remote_terminal_event(RemoteTerminalEvent::Key {
+            key: "2".to_string(),
+            modifiers: 0,
+        });
+        let _ = state.push_remote_terminal_event(RemoteTerminalEvent::Resize {
+            cols: 120,
+            rows: 40,
+        });
+        assert_eq!(state.remote_terminal_queue_len(), 2);
+
+        let cmd = model.update(MailMsg::Terminal(Event::Tick));
+        assert!(matches!(cmd, Cmd::Tick(_)));
+        assert_eq!(state.remote_terminal_queue_len(), 0);
+        assert_eq!(model.active_screen(), MailScreenId::Messages);
     }
 
     // ── Reducer edge-case tests ──────────────────────────────────
@@ -5709,8 +5835,8 @@ mod tests {
         let data: Vec<f64> = (0..100)
             .map(|i| {
                 let base = 50.0;
-                let wave = (i as f64 * 0.2).sin() * 30.0;
-                let noise = ((i * 7) % 13) as f64 - 6.0;
+                let wave = (f64::from(i) * 0.2).sin() * 30.0;
+                let noise = f64::from((i * 7) % 13) - 6.0;
                 (base + wave + noise).max(0.0)
             })
             .collect();
@@ -5817,7 +5943,7 @@ mod tests {
             palette.register_action(
                 ActionItem::new(
                     format!("action:{i}"),
-                    format!("Action Item Number {} Description", i),
+                    format!("Action Item Number {i} Description"),
                 )
                 .with_description(format!(
                     "This is action {i} which does something useful in category {category}",

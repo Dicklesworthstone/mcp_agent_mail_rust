@@ -1334,15 +1334,8 @@ impl TimelineRow {
             }
             MailEvent::MessageSent {
                 from, to, subject, ..
-            } => {
-                let recipients = if to.len() > 1 {
-                    format!("{} +{}", to[0], to.len() - 1)
-                } else {
-                    to.first().cloned().unwrap_or_default()
-                };
-                format!("{from} → {recipients}: {subject}")
             }
-            MailEvent::MessageReceived {
+            | MailEvent::MessageReceived {
                 from, to, subject, ..
             } => {
                 let recipients = if to.len() > 1 {
@@ -3776,15 +3769,15 @@ mod tests {
     // Performance benchmarks for virtualized rendering (br-2bbt.3)
     // ────────────────────────────────────────────────────────────────
 
-    /// Benchmark: TimelineDataProvider with 10,000 events.
+    /// Benchmark: `TimelineDataProvider` with 10,000 events.
     ///
     /// Acceptance criteria from br-2bbt.3:
     /// - Frame render at p95: <16ms with 10,000 items in data source
     /// - Scroll latency: <1 frame
     ///
-    /// This test measures the DataProvider.window() operation which is the
-    /// critical path for VirtualizedList frame rendering. The actual rendering
-    /// is handled by ftui_widgets::VirtualizedList which has O(1) complexity
+    /// This test measures the `DataProvider.window()` operation which is the
+    /// critical path for `VirtualizedList` frame rendering. The actual rendering
+    /// is handled by `ftui_widgets::VirtualizedList` which has O(1) complexity
     /// for visible rows only.
     #[test]
     #[allow(clippy::similar_names)]
@@ -3797,7 +3790,7 @@ mod tests {
             match i % 5 {
                 0 => {
                     let _ = ring.push(MailEvent::tool_call_start(
-                        &format!("tool_{}", i % 50),
+                        format!("tool_{}", i % 50),
                         serde_json::json!({"iter": i}),
                         Some("proj".to_string()),
                         Some(format!("Agent{}", i % 10)),
@@ -3805,7 +3798,7 @@ mod tests {
                 }
                 1 => {
                     let _ = ring.push(MailEvent::tool_call_end(
-                        &format!("tool_{}", i % 50),
+                        format!("tool_{}", i % 50),
                         i,
                         None,
                         5,
@@ -3816,19 +3809,20 @@ mod tests {
                     ));
                 }
                 2 => {
+                    #[allow(clippy::cast_possible_wrap)]
                     let _ = ring.push(MailEvent::message_sent(
                         i as i64,
-                        &format!("Agent{}", i % 10),
+                        format!("Agent{}", i % 10),
                         vec![format!("Agent{}", (i + 1) % 10)],
-                        &format!("Subject {}", i),
-                        &format!("thread-{}", i % 100),
+                        format!("Subject {i}"),
+                        format!("thread-{}", i % 100),
                         "proj",
                     ));
                 }
                 3 => {
                     let _ = ring.push(MailEvent::http_request(
                         "GET",
-                        &format!("/api/messages/{}", i),
+                        format!("/api/messages/{i}"),
                         200,
                         5,
                         "127.0.0.1",
@@ -3850,8 +3844,7 @@ mod tests {
         // Initial refresh converts all events - budget 50ms for 10K items
         assert!(
             refresh_elapsed.as_millis() < 50,
-            "Initial refresh took too long: {:?} (budget: 50ms)",
-            refresh_elapsed
+            "Initial refresh took too long: {refresh_elapsed:?} (budget: 50ms)",
         );
 
         // Benchmark: measure 100 window() calls at different positions
@@ -3883,24 +3876,20 @@ mod tests {
         // (window() is just one component of the render pipeline)
         assert!(
             p95_us < 1000,
-            "window() p95 exceeds 1ms: p50={}µs, p95={}µs, p99={}µs",
-            p50_us,
-            p95_us,
-            p99_us
+            "window() p95 exceeds 1ms: p50={p50_us}µs, p95={p95_us}µs, p99={p99_us}µs",
         );
 
         // Log percentiles for CI trend analysis (ignored by default, shown with --nocapture)
         eprintln!(
             "[perf] TimelineDataProvider.window() (10K events, 50 visible): \
-             p50={}µs p95={}µs p99={}µs",
-            p50_us, p95_us, p99_us
+             p50={p50_us}µs p95={p95_us}µs p99={p99_us}µs",
         );
     }
 
     /// Benchmark: rapid scrolling through 10K events.
     ///
     /// Simulates user holding down Page-Down key, which triggers
-    /// rapid window() calls at increasing offsets.
+    /// rapid `window()` calls at increasing offsets.
     #[test]
     fn perf_rapid_scroll_timeline_10k() {
         use std::time::Instant;
@@ -3908,7 +3897,8 @@ mod tests {
         // Setup ring buffer with 10,000 events
         let ring = Arc::new(EventRingBuffer::with_capacity(10_000));
         for i in 0..10_000u64 {
-            let _ = ring.push(sample_http(&format!("/scroll/{i}"), 200));
+            let path = format!("/scroll/{i}");
+            let _ = ring.push(sample_http(&path, 200));
         }
 
         let mut provider = TimelineDataProvider::new(Arc::clone(&ring));
@@ -3925,8 +3915,7 @@ mod tests {
         // 200 scrolls should complete in under 20ms (100µs per scroll average)
         assert!(
             total_elapsed.as_millis() < 20,
-            "Rapid scroll (200 pages) took {:?}, budget: 20ms",
-            total_elapsed
+            "Rapid scroll (200 pages) took {total_elapsed:?}, budget: 20ms",
         );
 
         eprintln!(

@@ -168,10 +168,11 @@ impl ContactsScreen {
 
         // Circle layout
         for (i, agent) in agents_vec.into_iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
             let angle = 2.0 * std::f64::consts::PI * (i as f64) / (count as f64);
             // Center at 0.5, 0.5; radius 0.4
-            let x = 0.5 + 0.4 * angle.cos();
-            let y = 0.5 + 0.4 * angle.sin();
+            let x = 0.4f64.mul_add(angle.cos(), 0.5);
+            let y = 0.4f64.mul_add(angle.sin(), 0.5);
             self.graph_nodes.push((agent, x, y));
         }
     }
@@ -376,6 +377,7 @@ impl MailScreen for ContactsScreen {
         let actions = contacts_actions(&contact.from_agent, &contact.to_agent, &contact.status);
 
         // Anchor row is the selected row + header offset
+        #[allow(clippy::cast_possible_truncation)]
         let anchor_row = (selected_idx as u16).saturating_add(2);
         let context_id = format!("{}:{}", contact.from_agent, contact.to_agent);
 
@@ -393,6 +395,11 @@ impl MailScreen for ContactsScreen {
 
 // Helper methods for ContactsScreen (not part of MailScreen trait)
 impl ContactsScreen {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     fn render_graph(&self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .title("Network Graph")
@@ -407,8 +414,8 @@ impl ContactsScreen {
         let mut painter = Painter::for_area(inner, Mode::Braille);
         painter.clear();
 
-        let w = inner.width as f64 * 2.0; // Braille resolution width (2 cols per cell)
-        let h = inner.height as f64 * 4.0; // Braille resolution height (4 rows per cell)
+        let w = f64::from(inner.width) * 2.0; // Braille resolution width (2 cols per cell)
+        let h = f64::from(inner.height) * 4.0; // Braille resolution height (4 rows per cell)
 
         // Draw edges
         for contact in &self.contacts {
@@ -448,8 +455,8 @@ impl ContactsScreen {
         // Draw labels (overlay on top of canvas)
         for (name, nx, ny) in &self.graph_nodes {
             // Map normalized coords back to cell coords
-            let cx = inner.x + (nx * inner.width as f64) as u16;
-            let cy = inner.y + (ny * inner.height as f64) as u16;
+            let cx = inner.x + (nx * f64::from(inner.width)) as u16;
+            let cy = inner.y + (ny * f64::from(inner.height)) as u16;
 
             // Simple centering logic
             let label: String = name.chars().take(8).collect();

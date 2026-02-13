@@ -328,6 +328,9 @@ impl SystemHealthScreen {
         state: &TuiSharedState,
         snap: &DiagnosticsSnapshot,
     ) {
+        const METRIC_TILE_COUNT: u16 = 4;
+        const MIN_TILE_WIDTH: u16 = 8;
+
         if area.is_empty() {
             return;
         }
@@ -340,9 +343,6 @@ impl SystemHealthScreen {
         let counters = state.request_counters();
         let requests_str = format!("{}", counters.total);
         let avg_latency_str = format!("{}ms", state.avg_latency_ms());
-
-        const METRIC_TILE_COUNT: u16 = 4;
-        const MIN_TILE_WIDTH: u16 = 8;
 
         // On narrow panes, render a compact summary instead of silently drawing nothing.
         if area.width < METRIC_TILE_COUNT * MIN_TILE_WIDTH {
@@ -421,6 +421,7 @@ impl SystemHealthScreen {
         }
 
         #[derive(Debug)]
+        #[allow(clippy::items_after_statements)]
         struct FindingCard {
             severity: AnomalySeverity,
             confidence: f64,
@@ -476,9 +477,10 @@ impl SystemHealthScreen {
                     if !rationale.is_empty() {
                         rationale.push(' ');
                     }
-                    rationale.push_str(&format!(
-                        "{hidden} more findings hidden; enlarge the panel."
-                    ));
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut rationale,
+                        format_args!("{hidden} more findings hidden; enlarge the panel."),
+                    );
                     first.rationale = Some(rationale);
                 }
                 vec![first]

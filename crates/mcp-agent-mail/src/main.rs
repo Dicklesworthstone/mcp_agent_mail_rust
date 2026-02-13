@@ -219,12 +219,7 @@ fn parse_reuse_running_env(raw: Option<&str>) -> bool {
         return true;
     };
     let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "" => true,
-        "1" | "true" | "yes" | "on" => true,
-        "0" | "false" | "no" | "off" => false,
-        _ => true,
-    }
+    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
 }
 
 fn unquote_env_value(raw: &str) -> &str {
@@ -317,6 +312,7 @@ fn decide_reuse_preflight(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     // Decide runtime mode before setting up logging or parsing the MCP CLI.
     // This ensures `--help` renders the correct surface and avoids polluting CLI-mode output.

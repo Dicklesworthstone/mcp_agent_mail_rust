@@ -316,7 +316,7 @@ struct ResultEntry {
     project_id: Option<i64>,
 }
 
-/// Wrapper for VirtualizedList rendering of search results.
+/// Wrapper for `VirtualizedList` rendering of search results.
 #[derive(Debug, Clone)]
 struct SearchResultRow {
     entry: ResultEntry,
@@ -688,6 +688,7 @@ impl FacetSlot {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Unified search cockpit with query bar, facet rail, and results.
+#[allow(clippy::struct_excessive_bools)]
 pub struct SearchCockpitScreen {
     // Query input
     query_input: TextInput,
@@ -731,7 +732,7 @@ pub struct SearchCockpitScreen {
     /// Synthetic event for the focused search result (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
 
-    /// VirtualizedList state for efficient rendering of search results.
+    /// `VirtualizedList` state for efficient rendering of search results.
     list_state: RefCell<VirtualizedListState>,
 }
 
@@ -773,7 +774,7 @@ impl SearchCockpitScreen {
         }
     }
 
-    /// Sync the VirtualizedListState with our cursor position.
+    /// Sync the `VirtualizedListState` with our cursor position.
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
         state.select(Some(self.cursor));
@@ -930,10 +931,9 @@ impl SearchCockpitScreen {
     /// Run a search for a single doc kind using sync queries.
     fn run_kind_search(&mut self, conn: &DbConn, kind: DocKind, raw: &str) -> Vec<ResultEntry> {
         match kind {
-            DocKind::Message => self.search_messages(conn, raw),
+            DocKind::Message | DocKind::Thread => self.search_messages(conn, raw),
             DocKind::Agent => Self::search_agents(conn, raw),
             DocKind::Project => Self::search_projects(conn, raw),
-            DocKind::Thread => self.search_messages(conn, raw),
         }
     }
 
@@ -2042,19 +2042,22 @@ fn render_query_bar(
         let w = inner.width as usize;
         let (hint, style) = screen.last_error.as_ref().map_or_else(
             || {
-                if let Some(line) = screen.assistance_hint_line() {
-                    (line, Style::default().fg(FACET_LABEL_FG))
-                } else if screen.focus == Focus::QueryBar {
-                    (
-                        "Syntax: \"phrase\" term* AND/OR/NOT (no leading *)".to_string(),
-                        Style::default().fg(FACET_LABEL_FG),
-                    )
-                } else {
-                    (
-                        format!("Route: {}", screen.route_string()),
-                        Style::default().fg(FACET_LABEL_FG),
-                    )
-                }
+                screen.assistance_hint_line().map_or_else(
+                    || {
+                        if screen.focus == Focus::QueryBar {
+                            (
+                                "Syntax: \"phrase\" term* AND/OR/NOT (no leading *)".to_string(),
+                                Style::default().fg(FACET_LABEL_FG),
+                            )
+                        } else {
+                            (
+                                format!("Route: {}", screen.route_string()),
+                                Style::default().fg(FACET_LABEL_FG),
+                            )
+                        }
+                    },
+                    |line| (line, Style::default().fg(FACET_LABEL_FG)),
+                )
             },
             |err| (format!("ERR: {err}"), Style::default().fg(ERROR_FG)),
         );
@@ -2329,7 +2332,7 @@ fn result_entry_line(entry: &ResultEntry, is_cursor: bool, cfg: &ResultListRende
     Line::from_spans(spans)
 }
 
-/// Render search results using VirtualizedList for O(1) scroll performance.
+/// Render search results using `VirtualizedList` for O(1) scroll performance.
 fn render_results(
     frame: &mut Frame<'_>,
     area: Rect,

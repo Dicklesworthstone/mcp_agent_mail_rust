@@ -296,6 +296,7 @@ impl MailScreen for ReservationsScreen {
 
         // Get actions for this reservation (reservation_id is not available,
         // so we use the path pattern as a pseudo-id)
+        #[allow(clippy::cast_possible_wrap)]
         let actions = reservations_actions(
             selected_idx as i64, // Use index as pseudo-id for now
             &reservation.agent,
@@ -303,6 +304,7 @@ impl MailScreen for ReservationsScreen {
         );
 
         // Anchor row is the selected row + header offset
+        #[allow(clippy::cast_possible_truncation)]
         let anchor_row = (selected_idx as u16).saturating_add(2);
         let context_id = key.clone();
 

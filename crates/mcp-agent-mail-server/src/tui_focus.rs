@@ -7,9 +7,9 @@
 //! # Focus Model
 //!
 //! Focus is organized hierarchically:
-//! - **FocusContext**: The current focus context (screen, modal, dialog)
-//! - **FocusTarget**: A specific focusable element within a context
-//! - **FocusRing**: The ordered list of focusable elements for Tab navigation
+//! - **`FocusContext`**: The current focus context (screen, modal, dialog)
+//! - **`FocusTarget`**: A specific focusable element within a context
+//! - **`FocusRing`**: The ordered list of focusable elements for Tab navigation
 //!
 //! # Usage
 //!
@@ -149,7 +149,7 @@ pub struct FocusManager {
     current: FocusTarget,
     /// Ordered list of focusable elements for Tab navigation
     focus_ring: Vec<FocusTarget>,
-    /// Index into focus_ring for current focus
+    /// Index into `focus_ring` for current focus
     ring_index: usize,
     /// Stack of context/target snapshots for nested focus traps.
     snapshot_stack: Vec<FocusSnapshot>,
@@ -166,7 +166,7 @@ impl Default for FocusManager {
 impl FocusManager {
     /// Create a new focus manager with default state.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             context: FocusContext::Screen,
             current: FocusTarget::None,
@@ -202,12 +202,11 @@ impl FocusManager {
         }
     }
 
-    fn default_target_for_context(context: FocusContext) -> Option<FocusTarget> {
+    const fn default_target_for_context(context: FocusContext) -> Option<FocusTarget> {
         match context {
             FocusContext::Modal => Some(FocusTarget::ModalContent),
             FocusContext::CommandPalette => Some(FocusTarget::TextInput(0)),
-            FocusContext::ActionMenu => Some(FocusTarget::List(0)),
-            FocusContext::ToastPanel => Some(FocusTarget::List(0)),
+            FocusContext::ActionMenu | FocusContext::ToastPanel => Some(FocusTarget::List(0)),
             FocusContext::Screen => None,
         }
     }
@@ -240,13 +239,13 @@ impl FocusManager {
 
     /// Check if the current focus target accepts text input.
     #[must_use]
-    pub fn consumes_text_input(&self) -> bool {
+    pub const fn consumes_text_input(&self) -> bool {
         self.current.accepts_text_input()
     }
 
     /// Check if focus is trapped (modal, palette, etc.).
     #[must_use]
-    pub fn is_trapped(&self) -> bool {
+    pub const fn is_trapped(&self) -> bool {
         self.context.traps_focus()
     }
 
@@ -310,17 +309,13 @@ impl FocusManager {
             return false;
         }
         let len = self.focus_ring.len();
-        self.ring_index = if let Some(idx) = self.ring_index_of(self.current) {
-            idx
-        } else {
-            len - 1
-        };
+        self.ring_index = self.ring_index_of(self.current).unwrap_or_else(|| len - 1);
         self.ring_index = (self.ring_index + 1) % len;
         let target = self.focus_ring[self.ring_index];
         self.focus(target)
     }
 
-    /// Move focus to the previous element in the focus ring (BackTab).
+    /// Move focus to the previous element in the focus ring (`BackTab`).
     ///
     /// Returns `true` if focus changed.
     pub fn focus_prev(&mut self) -> bool {
@@ -390,17 +385,17 @@ impl FocusManager {
     // ── Indicator Visibility ─────────────────────────────────────────
 
     /// Show the focus indicator.
-    pub fn show_indicator(&mut self) {
+    pub const fn show_indicator(&mut self) {
         self.indicator_visible = true;
     }
 
     /// Hide the focus indicator.
-    pub fn hide_indicator(&mut self) {
+    pub const fn hide_indicator(&mut self) {
         self.indicator_visible = false;
     }
 
     /// Toggle focus indicator visibility.
-    pub fn toggle_indicator(&mut self) {
+    pub const fn toggle_indicator(&mut self) {
         self.indicator_visible = !self.indicator_visible;
     }
 }
@@ -475,7 +470,7 @@ impl FocusRingBuilder {
         self
     }
 
-    /// Add the primary search bar (TextInput 0).
+    /// Add the primary search bar (`TextInput` 0).
     #[must_use]
     pub fn search_bar(self) -> Self {
         self.text_input(0)
@@ -528,7 +523,7 @@ impl FocusRingBuilder {
         self.targets
     }
 
-    /// Build and create a FocusManager with this ring.
+    /// Build and create a `FocusManager` with this ring.
     #[must_use]
     pub fn into_manager(self) -> FocusManager {
         FocusManager::with_ring(self.build())

@@ -5,6 +5,7 @@
 //! keyboard-first navigation.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use ftui::layout::Rect;
@@ -13,7 +14,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
@@ -40,11 +41,25 @@ const DEBOUNCE_TICKS: u8 = 2;
 
 /// Max results to cache.
 const MAX_RESULTS: usize = 1000;
+const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
 
 /// Max body preview length in the results list (used for future
 /// inline preview in narrow mode).
 #[allow(dead_code)]
 const BODY_PREVIEW_LEN: usize = 80;
+
+static MESSAGE_URGENT_PULSE_ON: AtomicBool = AtomicBool::new(true);
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn reduced_motion_enabled() -> bool {
+    env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Query presets — reusable filter shortcuts
@@ -145,10 +160,18 @@ impl RenderItem for MessageEntry {
         let cursor_style = Style::default().bold().reverse();
 
         // Importance badge
-        let badge = match self.importance.as_str() {
-            "high" => "!",
-            "urgent" => "!!",
-            _ => " ",
+        let pulse_on = MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed);
+        let (badge, badge_style) = match self.importance.as_str() {
+            "high" => ("!", Style::default().fg(PackedRgba::rgb(235, 176, 70)).bold()),
+            "urgent" => {
+                let fg = if pulse_on {
+                    PackedRgba::rgb(255, 86, 86)
+                } else {
+                    PackedRgba::rgb(164, 66, 66)
+                };
+                ("!!", Style::default().fg(fg).bold())
+            }
+            _ => (" ", Style::default()),
         };
 
         // ID or "LIVE" marker
@@ -182,7 +205,11 @@ impl RenderItem for MessageEntry {
         let remaining = inner_w.saturating_sub(prefix.len());
         let subj = truncate_str(&self.subject, remaining);
 
-        let mut line = Line::from_spans([Span::raw(format!("{prefix}{subj}"))]);
+        let mut line = Line::from_spans([
+            Span::raw(format!("{marker} ")),
+            Span::styled(format!("{badge:>2}"), badge_style),
+            Span::raw(format!(" {id_str:>6} {time_short} {project_badge}{subj}")),
+        ]);
         if selected {
             line.apply_base_style(cursor_style);
         }
@@ -221,7 +248,7 @@ impl InboxMode {
 
     /// True if in Global mode.
     #[must_use]
-    pub fn is_global(&self) -> bool {
+    pub const fn is_global(&self) -> bool {
         matches!(self, Self::Global)
     }
 }
@@ -247,7 +274,7 @@ pub struct MessageBrowserScreen {
     cursor: usize,
     detail_scroll: usize,
     focus: Focus,
-    /// VirtualizedList state for efficient rendering.
+    /// `VirtualizedList` state for efficient rendering.
     list_state: RefCell<VirtualizedListState>,
     /// Last search term that was actually executed.
     last_search: String,
@@ -274,6 +301,8 @@ pub struct MessageBrowserScreen {
     /// Last active project slug when switching from Local to Global
     /// (used to restore when switching back).
     last_local_project: Option<String>,
+    /// Reduced-motion mode forces static urgency badges.
+    reduced_motion: bool,
 }
 
 impl MessageBrowserScreen {
@@ -300,7 +329,17 @@ impl MessageBrowserScreen {
             focused_synthetic: None,
             inbox_mode: InboxMode::Global,
             last_local_project: None,
+            reduced_motion: reduced_motion_enabled(),
         }
+    }
+
+    fn update_urgent_pulse(&self, tick_count: u64) {
+        if self.reduced_motion {
+            MESSAGE_URGENT_PULSE_ON.store(true, Ordering::Relaxed);
+            return;
+        }
+        let pulse_on = (tick_count / URGENT_PULSE_HALF_PERIOD_TICKS).is_multiple_of(2);
+        MESSAGE_URGENT_PULSE_ON.store(pulse_on, Ordering::Relaxed);
     }
 
     /// Toggle between Local and Global inbox modes.
@@ -336,7 +375,7 @@ impl MessageBrowserScreen {
         self.debounce_remaining = 0;
     }
 
-    /// Sync the VirtualizedListState with our cursor position.
+    /// Sync the `VirtualizedListState` with our cursor position.
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
         state.select(Some(self.cursor));
@@ -598,7 +637,8 @@ impl MailScreen for MessageBrowserScreen {
         Cmd::None
     }
 
-    fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
+    fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        self.update_urgent_pulse(tick_count);
         // Debounce search execution
         if self.search_dirty {
             if self.debounce_remaining > 0 {
@@ -781,6 +821,7 @@ impl MailScreen for MessageBrowserScreen {
         let actions = messages_actions(message.id, thread_id, &message.from_agent);
 
         // Anchor row is cursor position + header offset
+        #[allow(clippy::cast_possible_truncation)]
         let anchor_row = (self.cursor as u16).saturating_add(3);
         let context_id = message.id.to_string();
 
@@ -810,12 +851,10 @@ fn fetch_recent_messages(
     project_filter: Option<&str>,
     show_project: bool,
 ) -> (Vec<MessageEntry>, usize) {
-    let where_clause = if let Some(slug) = project_filter {
+    let where_clause = project_filter.map_or_else(String::new, |slug| {
         let escaped_slug = slug.replace('\'', "''");
         format!("WHERE p.slug = '{escaped_slug}'")
-    } else {
-        String::new()
-    };
+    });
 
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
@@ -857,12 +896,10 @@ fn search_messages_fts(
     }
 
     // Build project filter for SQL
-    let project_condition = if let Some(slug) = project_filter {
+    let project_condition = project_filter.map_or_else(String::new, |slug| {
         let escaped_slug = slug.replace('\'', "''");
         format!("AND p.slug = '{escaped_slug}'")
-    } else {
-        String::new()
-    };
+    });
 
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
@@ -891,15 +928,16 @@ fn search_messages_fts(
 
     // LIKE fallback
     let escaped = query.replace('\'', "''");
-    let like_where = if let Some(slug) = project_filter {
-        let escaped_slug = slug.replace('\'', "''");
-        format!(
-            "WHERE (m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%') \
-             AND p.slug = '{escaped_slug}'"
-        )
-    } else {
-        format!("WHERE m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%'")
-    };
+    let like_where = project_filter.map_or_else(
+        || format!("WHERE m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%'"),
+        |slug| {
+            let escaped_slug = slug.replace('\'', "''");
+            format!(
+                "WHERE (m.subject LIKE '%{escaped}%' OR m.body_md LIKE '%{escaped}%') \
+                 AND p.slug = '{escaped_slug}'"
+            )
+        },
+    );
 
     let like_sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
@@ -968,16 +1006,17 @@ fn query_messages(conn: &DbConn, sql: &str, show_project: bool) -> Vec<MessageEn
 
 /// Count total messages, optionally filtered by project.
 fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
-    let sql = if let Some(slug) = project_filter {
-        let escaped_slug = slug.replace('\'', "''");
-        format!(
-            "SELECT COUNT(*) AS c FROM messages m \
-             JOIN projects p ON p.id = m.project_id \
-             WHERE p.slug = '{escaped_slug}'"
-        )
-    } else {
-        "SELECT COUNT(*) AS c FROM messages".to_string()
-    };
+    let sql = project_filter.map_or_else(
+        || "SELECT COUNT(*) AS c FROM messages".to_string(),
+        |slug| {
+            let escaped_slug = slug.replace('\'', "''");
+            format!(
+                "SELECT COUNT(*) AS c FROM messages m \
+                 JOIN projects p ON p.id = m.project_id \
+                 WHERE p.slug = '{escaped_slug}'"
+            )
+        },
+    );
 
     conn.query_sync(&sql, &[])
         .ok()
@@ -1015,6 +1054,7 @@ fn sanitize_fts_query(query: &str) -> String {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Render the search bar with explainability metadata and mode indicator.
+#[allow(clippy::too_many_arguments)]
 fn render_search_bar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1054,7 +1094,7 @@ fn render_search_bar(
     }
 }
 
-/// Render the results list using VirtualizedList.
+/// Render the results list using `VirtualizedList`.
 fn render_results_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1189,7 +1229,7 @@ fn render_detail_panel(
 // ──────────────────────────────────────────────────────────────────────
 
 /// Compute the viewport [start, end) to keep cursor visible.
-/// (Retained for test coverage; VirtualizedList handles this internally.)
+/// (Retained for test coverage; `VirtualizedList` handles this internally.)
 #[allow(dead_code)]
 fn viewport_range(total: usize, height: usize, cursor: usize) -> (usize, usize) {
     if total <= height {

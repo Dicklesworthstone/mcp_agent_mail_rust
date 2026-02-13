@@ -3555,10 +3555,10 @@ mod tests {
             "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta",
         ];
 
-        let colors: Vec<PackedRgba> = names.iter().map(|n| sender_color_hash(n)).collect();
+        let mut colors: Vec<PackedRgba> = names.iter().map(|n| sender_color_hash(n)).collect();
 
         // Count distinct colors.
-        let mut unique = colors.to_vec();
+        let unique = &mut colors;
         unique.sort_by_key(|c| (c.r(), c.g(), c.b()));
         unique.dedup();
 

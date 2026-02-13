@@ -66,6 +66,8 @@ pub mod tui_preset;
 pub mod tui_screens;
 pub mod tui_theme;
 pub mod tui_widgets;
+mod tui_ws_input;
+mod tui_ws_state;
 
 use asupersync::http::h1::HttpClient;
 use asupersync::http::h1::listener::Http1Listener;
@@ -2965,7 +2967,7 @@ impl HttpState {
             if let (Some(method), Some(path), Some(client_ip)) =
                 (method.as_ref(), path.as_ref(), client_ip.as_ref())
             {
-                if !path.ends_with("/healthz") {
+                if !should_suppress_tui_http_event(path) {
                     let _ = tui.push_event(tui_events::MailEvent::http_request(
                         method.as_str(),
                         path.as_str(),
@@ -3151,6 +3153,7 @@ impl HttpState {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_special_routes(&self, req: &Http1Request, path: &str) -> Option<Http1Response> {
         match path {
             "/healthz" | "/health/liveness" => {
@@ -3180,6 +3183,58 @@ impl HttpState {
                 ));
             }
             _ => {}
+        }
+
+        if path == "/mail/ws-input" {
+            if !matches!(req.method, Http1Method::Post) {
+                return Some(self.error_response(req, 405, "Method Not Allowed"));
+            }
+            let Some(state) = tui_state_handle() else {
+                return Some(self.error_response(req, 503, "TUI state is not active"));
+            };
+            let parsed = match tui_ws_input::parse_remote_terminal_events(&req.body) {
+                Ok(parsed) => parsed,
+                Err(err) => return Some(self.error_response(req, 400, &err)),
+            };
+            let mut dropped_oldest = 0_usize;
+            let accepted = parsed.events.len();
+            for event in parsed.events {
+                if state.push_remote_terminal_event(event) {
+                    dropped_oldest += 1;
+                }
+            }
+            let payload = serde_json::json!({
+                "status": "accepted",
+                "accepted": accepted,
+                "ignored": parsed.ignored,
+                "dropped_oldest": dropped_oldest,
+                "queue_depth": state.remote_terminal_queue_len(),
+            });
+            return Some(self.json_response(req, 202, &payload));
+        }
+
+        if path == "/mail/ws-state" {
+            if !matches!(req.method, Http1Method::Get) {
+                return Some(self.error_response(req, 405, "Method Not Allowed"));
+            }
+            if is_websocket_upgrade_request(req) {
+                return Some(self.error_response(
+                    req,
+                    501,
+                    "WebSocket upgrade is not supported on /mail/ws-state; use HTTP polling.",
+                ));
+            }
+
+            let (_path_part, query_part) = split_path_query(&req.uri);
+            let query = query_part.as_deref();
+            let payload = tui_state_handle().map_or_else(
+                || {
+                    let fallback = tui_bridge::TuiSharedState::new(&self.config);
+                    tui_ws_state::poll_payload(&fallback, query)
+                },
+                |state| tui_ws_state::poll_payload(&state, query),
+            );
+            return Some(self.json_response(req, 200, &payload));
         }
 
         if path == "/mail/api/locks" {
@@ -4662,6 +4717,22 @@ fn header_value<'a>(req: &'a Http1Request, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+fn header_has_token(req: &Http1Request, name: &str, token: &str) -> bool {
+    header_value(req, name).is_some_and(|value| {
+        value
+            .split(',')
+            .any(|segment| segment.trim().eq_ignore_ascii_case(token))
+    })
+}
+
+fn is_websocket_upgrade_request(req: &Http1Request) -> bool {
+    header_has_token(req, "connection", "upgrade") && header_has_token(req, "upgrade", "websocket")
+}
+
+fn should_suppress_tui_http_event(path: &str) -> bool {
+    path.ends_with("/healthz") || path == "/mail/ws-state" || path == "/mail/ws-input"
+}
+
 fn has_forwarded_headers(req: &Http1Request) -> bool {
     header_value(req, "x-forwarded-for").is_some()
         || header_value(req, "x-forwarded-proto").is_some()
@@ -4948,16 +5019,17 @@ mod tests {
     use std::sync::Mutex;
 
     static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    static TUI_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-    /// Regression test: Budget deadline must be relative to wall_now(), not absolute.
+    /// Regression test: Budget deadline must be relative to `wall_now()`, not absolute.
     ///
-    /// BUG HISTORY: Budget::with_deadline_secs(30) created a deadline of 30 seconds
-    /// since epoch (1970-01-01 00:00:30), but wall_now() returns time relative to
-    /// process start. Since wall_now() > 30 seconds, the deadline was always exceeded
+    /// BUG HISTORY: `Budget::with_deadline_secs(30)` created a deadline of 30 seconds
+    /// since epoch (1970-01-01 00:00:30), but `wall_now()` returns time relative to
+    /// process start. Since `wall_now()` > 30 seconds, the deadline was always exceeded
     /// immediately, causing all MCP requests to timeout.
     ///
-    /// FIX: Use wall_now() + Duration::from_secs(timeout) for a relative deadline.
+    /// FIX: Use `wall_now()` + `Duration::from_secs(timeout)` for a relative deadline.
     #[test]
     fn budget_deadline_is_relative_to_wall_now_not_absolute() {
         // Get current wall time
@@ -4974,11 +5046,8 @@ mod tests {
         assert!(
             !budget.is_past_deadline(check_time),
             "Budget deadline must be in the future! \
-             deadline={:?}, now={:?}, timeout={}s. \
+             deadline={deadline:?}, now={check_time:?}, timeout={timeout_secs}s. \
              This regression would cause all MCP requests to timeout immediately.",
-            deadline,
-            check_time,
-            timeout_secs
         );
 
         // The deadline should be approximately 30 seconds from now
@@ -4987,13 +5056,12 @@ mod tests {
         let now_nanos = check_time.as_nanos();
         let diff_secs = (deadline_nanos.saturating_sub(now_nanos)) / 1_000_000_000;
         assert!(
-            diff_secs >= 29 && diff_secs <= 31,
-            "Deadline should be ~30 seconds in the future, got {}s",
-            diff_secs
+            (29..=31).contains(&diff_secs),
+            "Deadline should be ~30 seconds in the future, got {diff_secs}s",
         );
     }
 
-    /// Verify that Budget::with_deadline_secs is NOT suitable for relative timeouts.
+    /// Verify that `Budget::with_deadline_secs` is NOT suitable for relative timeouts.
     /// This test documents the API misuse that caused the bug.
     #[test]
     fn budget_with_deadline_secs_is_absolute_not_relative() {
@@ -5009,9 +5077,8 @@ mod tests {
         assert!(
             budget.is_past_deadline(now),
             "with_deadline_secs(0) should always be expired. \
-             wall_now()={:?} is always > 0 (the absolute deadline). \
+             wall_now()={now:?} is always > 0 (the absolute deadline). \
              This demonstrates why with_deadline_secs is WRONG for relative timeouts.",
-            now
         );
     }
 
@@ -5560,6 +5627,108 @@ mod tests {
             payload.get("locks").and_then(|v| v.as_array()).is_some(),
             "locks missing or not array: {payload}"
         );
+    }
+
+    #[test]
+    fn mail_ws_state_poll_returns_snapshot_json() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/mail/ws-state?limit=5", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json")
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("ws-state response json");
+        assert_eq!(payload["schema_version"], "am_ws_state_poll.v1");
+        assert_eq!(payload["mode"], "snapshot");
+        assert_eq!(payload["transport"], "http-poll");
+        assert!(payload["next_seq"].as_u64().is_some());
+    }
+
+    #[test]
+    fn mail_ws_state_upgrade_request_returns_501_json_error() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/mail/ws-state",
+            &[("Connection", "Upgrade"), ("Upgrade", "websocket")],
+        );
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 501);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error json");
+        assert_eq!(
+            body["detail"],
+            "WebSocket upgrade is not supported on /mail/ws-state; use HTTP polling."
+        );
+    }
+
+    #[test]
+    fn mail_ws_input_rejects_get_with_405() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/mail/ws-input", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 405);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error json");
+        assert_eq!(body["detail"], "Method Not Allowed");
+    }
+
+    #[test]
+    fn mail_ws_input_enqueues_remote_terminal_events() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config.clone());
+        let shared = tui_bridge::TuiSharedState::new(&config);
+        set_tui_state_handle(None);
+        set_tui_state_handle(Some(Arc::clone(&shared)));
+
+        let mut req = make_request(Http1Method::Post, "/mail/ws-input", &[]);
+        req.body = br#"{
+            "events": [
+                {"type":"Input","data":{"kind":"Key","key":"k","modifiers":1}},
+                {"type":"Resize","data":{"cols":140,"rows":42}},
+                {"type":"Ping"}
+            ]
+        }"#
+        .to_vec();
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 202);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("accepted json");
+        assert_eq!(body["accepted"], 2);
+        assert_eq!(body["ignored"], 1);
+        assert_eq!(body["dropped_oldest"], 0);
+        assert_eq!(body["status"], "accepted");
+
+        let queued = shared.drain_remote_terminal_events(8);
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(
+            queued[0],
+            tui_bridge::RemoteTerminalEvent::Key {
+                ref key,
+                modifiers: 1
+            } if key == "k"
+        ));
+        assert!(matches!(
+            queued[1],
+            tui_bridge::RemoteTerminalEvent::Resize {
+                cols: 140,
+                rows: 42
+            }
+        ));
+
+        set_tui_state_handle(None);
     }
 
     #[test]
@@ -7439,6 +7608,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn rate_limiter_cleanup_removes_all_stale_entries() {
         let limiter = RateLimiter::new();
         let now = rate_limit_now();
@@ -11146,6 +11316,9 @@ mod tests {
 
     #[test]
     fn tui_state_global_roundtrip() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // When no TUI state is set, handle returns None
         assert!(tui_state_handle().is_none());
 
@@ -11173,6 +11346,9 @@ mod tests {
 
     #[test]
     fn emit_tui_event_noop_when_no_state() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Make sure no state is set
         set_tui_state_handle(None);
         // Should not panic

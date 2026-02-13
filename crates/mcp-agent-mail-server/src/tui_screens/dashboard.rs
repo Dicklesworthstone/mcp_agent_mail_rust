@@ -81,6 +81,17 @@ const ERROR_RATE_WARN: f64 = 0.05;
 const ERROR_RATE_HIGH: f64 = 0.15;
 const RING_FILL_WARN: u8 = 80;
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn reduced_motion_enabled() -> bool {
+    env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
+}
+
 // ── Detected anomaly ─────────────────────────────────────────────────
 
 /// A runtime-detected anomaly for the anomaly/action rail.
@@ -130,6 +141,8 @@ pub struct DashboardScreen {
     recent_message_preview: Option<RecentMessagePreview>,
     /// Animation phase for pulse effects.
     pulse_phase: f32,
+    /// Reduced-motion mode disables pulse animation.
+    reduced_motion: bool,
 }
 
 /// A pre-formatted event log entry.
@@ -240,6 +253,7 @@ impl DashboardScreen {
             show_trend_panel: true,
             recent_message_preview: None,
             pulse_phase: 0.0,
+            reduced_motion: reduced_motion_enabled(),
         }
     }
 
@@ -362,6 +376,8 @@ impl DashboardScreen {
             self.auto_follow,
             &self.type_filter,
             self.verbosity,
+            self.pulse_phase,
+            self.reduced_motion,
         );
     }
 
@@ -498,9 +514,13 @@ impl MailScreen for DashboardScreen {
     #[allow(clippy::cast_precision_loss)]
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         // Update animation phase
-        self.pulse_phase += 0.2;
-        if self.pulse_phase > std::f32::consts::PI * 2.0 {
-            self.pulse_phase -= std::f32::consts::PI * 2.0;
+        if self.reduced_motion {
+            self.pulse_phase = 0.0;
+        } else {
+            self.pulse_phase += 0.2;
+            if self.pulse_phase > std::f32::consts::PI * 2.0 {
+                self.pulse_phase -= std::f32::consts::PI * 2.0;
+            }
         }
 
         // Ingest new events every tick
@@ -837,6 +857,8 @@ fn summarize_recipients(recipients: &[String]) -> String {
 /// Adapts tile count to terminal density: 3 tiles at Minimal/Compact, up to 6 at Detailed.
 #[allow(
     clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
     clippy::many_single_char_names,
     clippy::too_many_lines
 )]
@@ -871,13 +893,13 @@ fn render_summary_band(
     };
 
     // Calculate pulse color for Requests
-    let pulse = (pulse_phase.sin() + 1.0) / 2.0; // 0.0 to 1.0
+    let pulse = f32::midpoint(pulse_phase.sin(), 1.0); // 0.0 to 1.0
     let base_req = PackedRgba::rgb(120, 200, 255);
     let glow_req = PackedRgba::rgb(200, 240, 255);
     // Simple lerp
-    let r = (base_req.r() as f32 * (1.0 - pulse) + glow_req.r() as f32 * pulse) as u8;
-    let g = (base_req.g() as f32 * (1.0 - pulse) + glow_req.g() as f32 * pulse) as u8;
-    let b = (base_req.b() as f32 * (1.0 - pulse) + glow_req.b() as f32 * pulse) as u8;
+    let r = f32::from(base_req.r()).mul_add(1.0 - pulse, f32::from(glow_req.r()) * pulse) as u8;
+    let g = f32::from(base_req.g()).mul_add(1.0 - pulse, f32::from(glow_req.g()) * pulse) as u8;
+    let b = f32::from(base_req.b()).mul_add(1.0 - pulse, f32::from(glow_req.b()) * pulse) as u8;
     let req_color = PackedRgba::rgb(r, g, b);
 
     // Build tiles based on density.
@@ -1130,6 +1152,35 @@ const fn trend_for(current: u64, previous: u64) -> MetricTrend {
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn pulsing_severity_badge(
+    severity: EventSeverity,
+    pulse_phase: f32,
+    reduced_motion: bool,
+) -> Span<'static> {
+    if reduced_motion || !matches!(severity, EventSeverity::Warn | EventSeverity::Error) {
+        return severity.styled_badge();
+    }
+
+    let pulse = pulse_phase.sin().abs();
+    let (base, highlight) = match severity {
+        EventSeverity::Warn => ((176_u8, 122_u8, 32_u8), (255_u8, 198_u8, 90_u8)),
+        EventSeverity::Error => ((148_u8, 54_u8, 54_u8), (255_u8, 96_u8, 96_u8)),
+        _ => return severity.styled_badge(),
+    };
+    let lerp = |start: u8, end: u8| -> u8 {
+        let start = f32::from(start);
+        let end = f32::from(end);
+        ((end - start).mul_add(pulse, start)).round() as u8
+    };
+    let color = PackedRgba::rgb(
+        lerp(base.0, highlight.0),
+        lerp(base.1, highlight.1),
+        lerp(base.2, highlight.2),
+    );
+    Span::styled(severity.badge().to_string(), Style::default().fg(color).bold())
+}
+
 /// Render the scrollable event log.
 fn render_event_log(
     frame: &mut Frame<'_>,
@@ -1139,6 +1190,8 @@ fn render_event_log(
     auto_follow: bool,
     type_filter: &HashSet<MailEventKind>,
     verbosity: VerbosityTier,
+    pulse_phase: f32,
+    reduced_motion: bool,
 ) {
     let visible_height = area.height.saturating_sub(2) as usize; // -2 for border
     if visible_height == 0 {
@@ -1172,7 +1225,7 @@ fn render_event_log(
         let sev = entry.severity;
         let mut line = Line::from_spans([
             Span::raw(format!("{:>6} {} ", entry.seq, entry.timestamp)),
-            sev.styled_badge(),
+            pulsing_severity_badge(sev, pulse_phase, reduced_motion),
             Span::raw(" "),
             Span::styled(format!("{}", entry.icon), sev.style()),
             Span::raw(format!(" {}", entry.summary)),
@@ -2334,7 +2387,7 @@ mod tests {
         assert_eq!(color, ACTIVITY_YELLOW, "just under 5m should be yellow");
     }
 
-    /// Test that render_sparkline uses Sparkline widget correctly (br-2bbt.4.1).
+    /// Test that `render_sparkline` uses `Sparkline` widget correctly (br-2bbt.4.1).
     #[test]
     fn render_sparkline_uses_sparkline_widget() {
         // Verify that the sparkline produces block characters from ftui_widgets::Sparkline.

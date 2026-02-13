@@ -1,6 +1,6 @@
 //! Agents screen — sortable/filterable roster of registered agents.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
@@ -25,6 +25,11 @@ const COL_LAST_ACTIVE: usize = 3;
 const COL_MESSAGES: usize = 4;
 
 const SORT_LABELS: &[&str] = &["Name", "Program", "Model", "Active", "Msgs"];
+const STATUS_FADE_TICKS: u8 = 5;
+const MESSAGE_FLASH_TICKS: u8 = 3;
+const STAGGER_MAX_TICKS: u8 = 10;
+const ACTIVE_WINDOW_MICROS: i64 = 2 * 60 * 1_000_000;
+const IDLE_WINDOW_MICROS: i64 = 15 * 60 * 1_000_000;
 
 /// An agent row with computed fields.
 #[derive(Debug, Clone)]
@@ -34,6 +39,89 @@ struct AgentRow {
     model: String,
     last_active_ts: i64,
     message_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentStatus {
+    Active,
+    Idle,
+    Inactive,
+}
+
+impl AgentStatus {
+    const fn from_last_active(last_active_ts: i64, now_ts: i64) -> Self {
+        if last_active_ts <= 0 {
+            return Self::Inactive;
+        }
+        let elapsed = now_ts.saturating_sub(last_active_ts);
+        if elapsed <= ACTIVE_WINDOW_MICROS {
+            Self::Active
+        } else if elapsed <= IDLE_WINDOW_MICROS {
+            Self::Idle
+        } else {
+            Self::Inactive
+        }
+    }
+
+    const fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            Self::Active => (170, 240, 195),
+            Self::Idle => (120, 170, 145),
+            Self::Inactive => (85, 100, 90),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatusFadeState {
+    from: AgentStatus,
+    to: AgentStatus,
+    ticks_remaining: u8,
+}
+
+impl StatusFadeState {
+    const fn new(from: AgentStatus, to: AgentStatus) -> Self {
+        Self {
+            from,
+            to,
+            ticks_remaining: STATUS_FADE_TICKS,
+        }
+    }
+
+    const fn step(&mut self) -> bool {
+        if self.ticks_remaining > 0 {
+            self.ticks_remaining -= 1;
+        }
+        self.ticks_remaining == 0
+    }
+}
+
+fn blend_rgb(from: (u8, u8, u8), to: (u8, u8, u8), progress: f32) -> (u8, u8, u8) {
+    let t = progress.clamp(0.0, 1.0);
+    let blend = |start: u8, end: u8| -> u8 {
+        let start = f32::from(start);
+        let end = f32::from(end);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            (end - start).mul_add(t, start).round() as u8
+        }
+    };
+    (
+        blend(from.0, to.0),
+        blend(from.1, to.1),
+        blend(from.2, to.2),
+    )
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn reduced_motion_enabled() -> bool {
+    env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
 }
 
 pub struct AgentsScreen {
@@ -48,6 +136,18 @@ pub struct AgentsScreen {
     msg_counts: HashMap<String, u64>,
     /// Per-agent model names from `AgentRegistered` events.
     model_names: HashMap<String, String>,
+    /// Last computed presence status for each known agent.
+    status_by_agent: HashMap<String, AgentStatus>,
+    /// Fade transition state when an agent status changes.
+    status_fades: HashMap<String, StatusFadeState>,
+    /// Brief row highlight when a message event is observed for an agent.
+    message_flash_ticks: HashMap<String, u8>,
+    /// New rows reveal with a staggered delay to avoid hard pop-in.
+    stagger_reveal_ticks: HashMap<String, u8>,
+    /// Last row set, used to detect newly appearing agents.
+    seen_agents: HashSet<String>,
+    /// Reduced-motion mode skips all per-tick visual interpolation.
+    reduced_motion: bool,
     /// Synthetic event for the focused agent (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
@@ -65,6 +165,12 @@ impl AgentsScreen {
             last_seq: 0,
             msg_counts: HashMap::new(),
             model_names: HashMap::new(),
+            status_by_agent: HashMap::new(),
+            status_fades: HashMap::new(),
+            message_flash_ticks: HashMap::new(),
+            stagger_reveal_ticks: HashMap::new(),
+            seen_agents: HashSet::new(),
+            reduced_motion: reduced_motion_enabled(),
             focused_synthetic: None,
         }
     }
@@ -122,6 +228,8 @@ impl AgentsScreen {
             if self.sort_asc { cmp } else { cmp.reverse() }
         });
 
+        self.track_stagger_reveals(&rows);
+        self.rebuild_status_transitions(&rows);
         self.agents = rows;
 
         // Clamp selection
@@ -143,6 +251,20 @@ impl AgentsScreen {
             match event {
                 MailEvent::MessageSent { from, .. } => {
                     *self.msg_counts.entry(from.clone()).or_insert(0) += 1;
+                    if !self.reduced_motion {
+                        self.message_flash_ticks
+                            .insert(from.clone(), MESSAGE_FLASH_TICKS);
+                    }
+                }
+                MailEvent::MessageReceived { from, to, .. } => {
+                    if !self.reduced_motion {
+                        self.message_flash_ticks
+                            .insert(from.clone(), MESSAGE_FLASH_TICKS);
+                        for recipient in to {
+                            self.message_flash_ticks
+                                .insert(recipient.clone(), MESSAGE_FLASH_TICKS);
+                        }
+                    }
                 }
                 MailEvent::AgentRegistered {
                     name, model_name, ..
@@ -166,6 +288,117 @@ impl AgentsScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.table_state.selected = Some(next);
+    }
+
+    fn rebuild_status_transitions(&mut self, rows: &[AgentRow]) {
+        let now_ts = chrono::Utc::now().timestamp_micros();
+        let mut next_statuses = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let next = AgentStatus::from_last_active(row.last_active_ts, now_ts);
+            if !self.reduced_motion
+                && let Some(prev) = self.status_by_agent.get(&row.name)
+                && *prev != next
+            {
+                self.status_fades
+                    .insert(row.name.clone(), StatusFadeState::new(*prev, next));
+            }
+            next_statuses.insert(row.name.clone(), next);
+        }
+        self.status_by_agent = next_statuses;
+        if self.reduced_motion {
+            self.status_fades.clear();
+            return;
+        }
+        self.status_fades.retain(|name, fade| {
+            self.status_by_agent
+                .get(name)
+                .is_some_and(|status| *status == fade.to)
+                && fade.ticks_remaining > 0
+        });
+    }
+
+    fn advance_status_fades(&mut self) {
+        self.status_fades.retain(|_, fade| !fade.step());
+    }
+
+    fn track_stagger_reveals(&mut self, rows: &[AgentRow]) {
+        let mut next_seen = HashSet::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            if !self.reduced_motion && !self.seen_agents.contains(&row.name) {
+                let capped = index.min(usize::from(STAGGER_MAX_TICKS - 1));
+                let delay = u8::try_from(capped).map_or(STAGGER_MAX_TICKS, |value| value + 1);
+                self.stagger_reveal_ticks.insert(row.name.clone(), delay);
+            }
+            next_seen.insert(row.name.clone());
+        }
+        self.seen_agents = next_seen;
+        if self.reduced_motion {
+            self.stagger_reveal_ticks.clear();
+            self.message_flash_ticks.clear();
+            return;
+        }
+        self.stagger_reveal_ticks
+            .retain(|name, ticks| self.seen_agents.contains(name) && *ticks > 0);
+        self.message_flash_ticks
+            .retain(|name, ticks| self.seen_agents.contains(name) && *ticks > 0);
+    }
+
+    fn advance_message_flashes(&mut self) {
+        self.message_flash_ticks.retain(|_, ticks| {
+            if *ticks > 0 {
+                *ticks -= 1;
+            }
+            *ticks > 0
+        });
+    }
+
+    fn advance_stagger_reveals(&mut self) {
+        self.stagger_reveal_ticks.retain(|_, ticks| {
+            if *ticks > 0 {
+                *ticks -= 1;
+            }
+            *ticks > 0
+        });
+    }
+
+    fn status_color(&self, agent: &AgentRow, now_ts: i64) -> PackedRgba {
+        let target = AgentStatus::from_last_active(agent.last_active_ts, now_ts);
+        if self.reduced_motion {
+            let (r, g, b) = target.rgb();
+            return PackedRgba::rgb(r, g, b);
+        }
+        if let Some(fade) = self.status_fades.get(&agent.name) {
+            let progress =
+                1.0 - (f32::from(fade.ticks_remaining) / f32::from(STATUS_FADE_TICKS.max(1)));
+            let (r, g, b) = blend_rgb(fade.from.rgb(), fade.to.rgb(), progress);
+            return PackedRgba::rgb(r, g, b);
+        }
+        let (r, g, b) = target.rgb();
+        PackedRgba::rgb(r, g, b)
+    }
+
+    fn row_style(&self, row_index: usize, agent: &AgentRow, now_ts: i64) -> Style {
+        if Some(row_index) == self.table_state.selected {
+            return Style::default()
+                .fg(PackedRgba::rgb(0, 0, 0))
+                .bg(PackedRgba::rgb(120, 220, 150));
+        }
+        if !self.reduced_motion && self.stagger_reveal_ticks.contains_key(&agent.name) {
+            return Style::default().fg(PackedRgba::rgb(55, 65, 60));
+        }
+
+        let status_color = self.status_color(agent, now_ts);
+        let mut style = Style::default().fg(status_color);
+        if !self.reduced_motion
+            && let Some(remaining) = self.message_flash_ticks.get(&agent.name)
+        {
+            let intensity = f32::from(*remaining) / f32::from(MESSAGE_FLASH_TICKS.max(1));
+            let (r, g, b) = blend_rgb((95, 145, 120), (190, 245, 210), intensity);
+            style = style
+                .bg(PackedRgba::rgb(r, g, b))
+                .fg(PackedRgba::rgb(0, 0, 0));
+        }
+        style
     }
 }
 
@@ -238,6 +471,11 @@ impl MailScreen for AgentsScreen {
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         self.ingest_events(state);
+        if !self.reduced_motion {
+            self.advance_status_fades();
+            self.advance_message_flashes();
+            self.advance_stagger_reveals();
+        }
         // Rebuild every second
         if tick_count % 10 == 0 {
             self.rebuild_from_state(state);
@@ -288,6 +526,7 @@ impl MailScreen for AgentsScreen {
         // Build table rows
         let header = Row::new(["Name", "Program", "Model", "Last Active", "Msgs"])
             .style(Style::default().bold());
+        let now_ts = chrono::Utc::now().timestamp_micros();
 
         let rows: Vec<Row> = self
             .agents
@@ -296,13 +535,7 @@ impl MailScreen for AgentsScreen {
             .map(|(i, agent)| {
                 let active_str = format_relative_time(agent.last_active_ts);
                 let msg_str = format!("{}", agent.message_count);
-                let style = if Some(i) == self.table_state.selected {
-                    Style::default()
-                        .fg(PackedRgba::rgb(0, 0, 0))
-                        .bg(PackedRgba::rgb(120, 220, 150))
-                } else {
-                    Style::default()
-                };
+                let style = self.row_style(i, agent, now_ts);
                 Row::new([
                     agent.name.as_str().to_string(),
                     agent.program.clone(),
@@ -554,6 +787,125 @@ mod tests {
         assert!(screen.agents.is_empty());
     }
 
+    #[test]
+    fn status_thresholds_are_classified() {
+        let now = chrono::Utc::now().timestamp_micros();
+        assert_eq!(AgentStatus::from_last_active(now, now), AgentStatus::Active);
+        assert_eq!(
+            AgentStatus::from_last_active(now - ACTIVE_WINDOW_MICROS - 1, now),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            AgentStatus::from_last_active(now - IDLE_WINDOW_MICROS - 1, now),
+            AgentStatus::Inactive
+        );
+        assert_eq!(AgentStatus::from_last_active(0, now), AgentStatus::Inactive);
+    }
+
+    #[test]
+    fn status_fade_records_transition_and_expires() {
+        let mut screen = AgentsScreen::new();
+        screen.reduced_motion = false;
+        let now = chrono::Utc::now().timestamp_micros();
+        let mut rows = vec![AgentRow {
+            name: "RedFox".to_string(),
+            program: "claude-code".to_string(),
+            model: "opus".to_string(),
+            last_active_ts: now,
+            message_count: 1,
+        }];
+
+        screen.rebuild_status_transitions(&rows);
+        assert!(screen.status_fades.is_empty());
+
+        rows[0].last_active_ts = now - IDLE_WINDOW_MICROS - 10_000_000;
+        screen.rebuild_status_transitions(&rows);
+        let fade = screen
+            .status_fades
+            .get("RedFox")
+            .expect("status transition should create fade");
+        assert_eq!(fade.from, AgentStatus::Active);
+        assert_eq!(fade.to, AgentStatus::Inactive);
+        assert_eq!(fade.ticks_remaining, STATUS_FADE_TICKS);
+
+        for _ in 0..STATUS_FADE_TICKS {
+            screen.advance_status_fades();
+        }
+        assert!(screen.status_fades.is_empty());
+    }
+
+    #[test]
+    fn reduced_motion_disables_status_fades() {
+        let mut screen = AgentsScreen::new();
+        screen.reduced_motion = true;
+        let now = chrono::Utc::now().timestamp_micros();
+        let mut rows = vec![AgentRow {
+            name: "BlueFox".to_string(),
+            program: "claude-code".to_string(),
+            model: "opus".to_string(),
+            last_active_ts: now,
+            message_count: 1,
+        }];
+
+        screen.rebuild_status_transitions(&rows);
+        rows[0].last_active_ts = now - IDLE_WINDOW_MICROS - 10_000_000;
+        screen.rebuild_status_transitions(&rows);
+        assert!(screen.status_fades.is_empty());
+    }
+
+    #[test]
+    fn message_flash_ticks_decay_to_zero() {
+        let mut screen = AgentsScreen::new();
+        screen.reduced_motion = false;
+        screen
+            .message_flash_ticks
+            .insert("RedFox".to_string(), MESSAGE_FLASH_TICKS);
+
+        for _ in 0..MESSAGE_FLASH_TICKS {
+            screen.advance_message_flashes();
+        }
+        assert!(!screen.message_flash_ticks.contains_key("RedFox"));
+    }
+
+    #[test]
+    fn stagger_reveal_assigns_cascading_delays() {
+        let mut screen = AgentsScreen::new();
+        screen.reduced_motion = false;
+        let now = chrono::Utc::now().timestamp_micros();
+        let rows = vec![
+            AgentRow {
+                name: "A".to_string(),
+                program: "p".to_string(),
+                model: "m".to_string(),
+                last_active_ts: now,
+                message_count: 0,
+            },
+            AgentRow {
+                name: "B".to_string(),
+                program: "p".to_string(),
+                model: "m".to_string(),
+                last_active_ts: now,
+                message_count: 0,
+            },
+            AgentRow {
+                name: "C".to_string(),
+                program: "p".to_string(),
+                model: "m".to_string(),
+                last_active_ts: now,
+                message_count: 0,
+            },
+        ];
+
+        screen.track_stagger_reveals(&rows);
+        assert_eq!(screen.stagger_reveal_ticks.get("A"), Some(&1));
+        assert_eq!(screen.stagger_reveal_ticks.get("B"), Some(&2));
+        assert_eq!(screen.stagger_reveal_ticks.get("C"), Some(&3));
+
+        screen.advance_stagger_reveals();
+        assert!(!screen.stagger_reveal_ticks.contains_key("A"));
+        assert_eq!(screen.stagger_reveal_ticks.get("B"), Some(&1));
+    }
+
     // ── focused_event tests ───────────────────────────────────────
 
     #[test]
@@ -575,13 +927,11 @@ mod tests {
         screen.table_state.selected = Some(0);
         screen.sync_focused_event();
 
-        let event = screen.focused_event().expect("should have synthetic event");
-        if let crate::tui_events::MailEvent::AgentRegistered { name, program, .. } = event {
-            assert_eq!(name, "RedFox");
-            assert_eq!(program, "claude-code");
-        } else {
-            panic!("expected AgentRegistered, got {event:?}");
-        }
+        assert!(matches!(
+            screen.focused_event(),
+            Some(crate::tui_events::MailEvent::AgentRegistered { name, program, .. })
+                if name == "RedFox" && program == "claude-code"
+        ));
     }
 
     #[test]

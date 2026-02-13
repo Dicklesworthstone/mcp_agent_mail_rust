@@ -386,7 +386,7 @@ impl MailExplorerScreen {
         }
     }
 
-    /// Sync the VirtualizedListState selection with the current cursor.
+    /// Sync the `VirtualizedListState` selection with the current cursor.
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
         state.select(Some(self.cursor));

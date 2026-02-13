@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const REQUEST_SPARKLINE_CAPACITY: usize = 60;
+const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportBase {
@@ -114,6 +115,12 @@ pub struct RequestCounters {
     pub latency_total_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteTerminalEvent {
+    Key { key: String, modifiers: u8 },
+    Resize { cols: u16, rows: u16 },
+}
+
 #[derive(Debug)]
 pub struct TuiSharedState {
     events: EventRingBuffer,
@@ -127,6 +134,7 @@ pub struct TuiSharedState {
     config_snapshot: Mutex<ConfigSnapshot>,
     db_stats: Mutex<DbStatSnapshot>,
     sparkline_data: Mutex<VecDeque<f64>>,
+    remote_terminal_events: Mutex<VecDeque<RemoteTerminalEvent>>,
     server_control_tx: Mutex<Option<Sender<ServerControlMsg>>>,
 }
 
@@ -150,6 +158,9 @@ impl TuiSharedState {
             config_snapshot: Mutex::new(ConfigSnapshot::from_config(config)),
             db_stats: Mutex::new(DbStatSnapshot::default()),
             sparkline_data: Mutex::new(VecDeque::with_capacity(REQUEST_SPARKLINE_CAPACITY)),
+            remote_terminal_events: Mutex::new(VecDeque::with_capacity(
+                REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY,
+            )),
             server_control_tx: Mutex::new(None),
         })
     }
@@ -238,6 +249,46 @@ impl TuiSharedState {
         if let Ok(mut guard) = self.server_control_tx.lock() {
             *guard = Some(tx);
         }
+    }
+
+    /// Queue a remote terminal event from browser ingress.
+    ///
+    /// Returns `true` when an older event had to be dropped to keep the queue bounded.
+    #[must_use]
+    pub fn push_remote_terminal_event(&self, event: RemoteTerminalEvent) -> bool {
+        let mut queue = self
+            .remote_terminal_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dropped_oldest = if queue.len() >= REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY {
+            let _ = queue.pop_front();
+            true
+        } else {
+            false
+        };
+        queue.push_back(event);
+        dropped_oldest
+    }
+
+    #[must_use]
+    pub fn drain_remote_terminal_events(&self, max_events: usize) -> Vec<RemoteTerminalEvent> {
+        if max_events == 0 {
+            return Vec::new();
+        }
+        let mut queue = self
+            .remote_terminal_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let drain_count = max_events.min(queue.len());
+        queue.drain(..drain_count).collect()
+    }
+
+    #[must_use]
+    pub fn remote_terminal_queue_len(&self) -> usize {
+        self.remote_terminal_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     #[must_use]
@@ -622,5 +673,64 @@ mod tests {
         let ring_stats = state.event_ring_stats();
         assert_eq!(ring_stats.capacity, 5);
         assert_eq!(ring_stats.len, 5);
+    }
+
+    #[test]
+    fn remote_terminal_event_queue_roundtrip() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert_eq!(state.remote_terminal_queue_len(), 0);
+
+        assert!(!state.push_remote_terminal_event(RemoteTerminalEvent::Key {
+            key: "j".to_string(),
+            modifiers: 1,
+        }));
+        assert!(
+            !state.push_remote_terminal_event(RemoteTerminalEvent::Resize {
+                cols: 120,
+                rows: 40,
+            })
+        );
+        assert_eq!(state.remote_terminal_queue_len(), 2);
+
+        let drained = state.drain_remote_terminal_events(8);
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(
+            drained[0],
+            RemoteTerminalEvent::Key {
+                ref key,
+                modifiers: 1
+            } if key == "j"
+        ));
+        assert!(matches!(
+            drained[1],
+            RemoteTerminalEvent::Resize {
+                cols: 120,
+                rows: 40
+            }
+        ));
+        assert_eq!(state.remote_terminal_queue_len(), 0);
+    }
+
+    #[test]
+    fn remote_terminal_event_queue_is_bounded() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        let mut dropped = 0_usize;
+        for i in 0..(REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY + 32) {
+            if state.push_remote_terminal_event(RemoteTerminalEvent::Key {
+                key: format!("k{i}"),
+                modifiers: 0,
+            }) {
+                dropped += 1;
+            }
+        }
+
+        assert_eq!(
+            state.remote_terminal_queue_len(),
+            REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY
+        );
+        assert_eq!(dropped, 32);
     }
 }

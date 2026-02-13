@@ -326,7 +326,7 @@ enum DockDragState {
 /// timeline with cursor-based selection and an inspector detail pane.
 pub struct TimelineScreen {
     pane: TimelinePane,
-    /// State for virtualized list rendering (RefCell for interior mutability in view()).
+    /// State for virtualized list rendering (`RefCell` for interior mutability in `view()`).
     list_state: RefCell<VirtualizedListState>,
     /// Dock layout controlling inspector panel position and size.
     dock: DockLayout,
@@ -367,7 +367,7 @@ impl TimelineScreen {
         }
     }
 
-    /// Sync VirtualizedListState with TimelinePane cursor.
+    /// Sync `VirtualizedListState` with `TimelinePane` cursor.
     fn sync_list_state(&self) {
         let total = self.pane.filtered_len();
         let cursor = self.pane.cursor().min(total.saturating_sub(1));
@@ -732,7 +732,7 @@ const fn source_badge(src: EventSource) -> &'static str {
     }
 }
 
-/// Render the timeline pane into the given area using VirtualizedList.
+/// Render the timeline pane into the given area using `VirtualizedList`.
 fn render_timeline(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -785,7 +785,7 @@ fn render_timeline(
 }
 
 /// Compute the viewport [start, end) to keep cursor visible.
-/// Note: VirtualizedList now handles this internally, but kept for tests.
+/// Note: `VirtualizedList` now handles this internally, but kept for tests.
 #[allow(dead_code)]
 fn viewport_range(total: usize, height: usize, cursor: usize) -> (usize, usize) {
     if total <= height {
