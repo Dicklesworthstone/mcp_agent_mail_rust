@@ -471,4 +471,208 @@ mod tests {
         assert_eq!(field2.name, "body");
         assert!(field2.indexed);
     }
+
+    // ── SchemaHash serde + traits ───────────────────────────────────────
+
+    #[test]
+    fn schema_hash_serde_roundtrip() {
+        let hash = SchemaHash::compute(&sample_fields());
+        let json = serde_json::to_string(&hash).unwrap();
+        let back: SchemaHash = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hash);
+    }
+
+    #[test]
+    fn schema_hash_in_hashset() {
+        use std::collections::HashSet;
+        let h1 = SchemaHash::compute(&sample_fields());
+        let h2 = SchemaHash("different".to_owned());
+        let mut set = HashSet::new();
+        set.insert(h1.clone());
+        set.insert(h2);
+        set.insert(h1); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn schema_hash_empty_fields() {
+        let hash = SchemaHash::compute(&[]);
+        assert_eq!(hash.0.len(), 64); // SHA-256 = 64 hex chars
+        assert_eq!(hash.short().len(), 12);
+    }
+
+    #[test]
+    fn schema_hash_is_hex() {
+        let hash = SchemaHash::compute(&sample_fields());
+        assert!(hash.0.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn schema_hash_debug() {
+        let hash = SchemaHash::compute(&sample_fields());
+        let debug = format!("{hash:?}");
+        assert!(debug.contains("SchemaHash"));
+    }
+
+    // ── IndexScope serde ────────────────────────────────────────────────
+
+    #[test]
+    fn index_scope_serde_all_variants() {
+        let scopes = vec![
+            IndexScope::Project { project_id: 42 },
+            IndexScope::Product { product_id: 7 },
+            IndexScope::Global,
+        ];
+        for scope in &scopes {
+            let json = serde_json::to_string(scope).unwrap();
+            let back: IndexScope = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, scope);
+        }
+    }
+
+    #[test]
+    fn index_scope_hash_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(IndexScope::Project { project_id: 1 });
+        set.insert(IndexScope::Product { product_id: 1 });
+        set.insert(IndexScope::Global);
+        assert_eq!(set.len(), 3);
+    }
+
+    // ── IndexLayout ─────────────────────────────────────────────────────
+
+    #[test]
+    fn layout_root_accessor() {
+        let layout = IndexLayout::new("/data/search");
+        assert_eq!(layout.root(), Path::new("/data/search"));
+    }
+
+    #[test]
+    fn layout_global_scope_paths() {
+        let layout = IndexLayout::new("/tmp/idx");
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abcdef123456xxxx".to_owned());
+        assert_eq!(
+            layout.scope_dir(&scope),
+            PathBuf::from("/tmp/idx/indexes/global")
+        );
+        assert_eq!(
+            layout.lexical_dir(&scope, &schema),
+            PathBuf::from("/tmp/idx/indexes/global/lexical/abcdef123456")
+        );
+    }
+
+    #[test]
+    fn layout_product_scope_paths() {
+        let layout = IndexLayout::new("/tmp/idx");
+        let scope = IndexScope::Product { product_id: 99 };
+        assert_eq!(
+            layout.scope_dir(&scope),
+            PathBuf::from("/tmp/idx/indexes/product-99")
+        );
+    }
+
+    #[test]
+    fn layout_debug_and_clone() {
+        let layout = IndexLayout::new("/tmp");
+        let debug = format!("{layout:?}");
+        assert!(debug.contains("IndexLayout"));
+        let cloned = layout.clone();
+        assert_eq!(cloned.root(), layout.root());
+    }
+
+    // ── IndexCheckpoint ─────────────────────────────────────────────────
+
+    #[test]
+    fn checkpoint_filename_constant() {
+        assert_eq!(IndexCheckpoint::FILENAME, "checkpoint.json");
+    }
+
+    #[test]
+    fn checkpoint_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp1 = IndexCheckpoint {
+            schema_hash: SchemaHash("v1".to_owned()),
+            docs_indexed: 100,
+            started_ts: 1_000_000,
+            completed_ts: Some(2_000_000),
+            max_version: 500_000,
+            success: true,
+        };
+        cp1.write_to(tmp.path()).unwrap();
+
+        let cp2 = IndexCheckpoint {
+            schema_hash: SchemaHash("v2".to_owned()),
+            docs_indexed: 200,
+            started_ts: 3_000_000,
+            completed_ts: None,
+            max_version: 1_500_000,
+            success: false,
+        };
+        cp2.write_to(tmp.path()).unwrap();
+
+        let loaded = IndexCheckpoint::read_from(tmp.path()).unwrap();
+        assert_eq!(loaded.schema_hash, SchemaHash("v2".to_owned()));
+        assert_eq!(loaded.docs_indexed, 200);
+        assert!(!loaded.success);
+    }
+
+    #[test]
+    fn checkpoint_file_is_pretty_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp = IndexCheckpoint {
+            schema_hash: SchemaHash("test".to_owned()),
+            docs_indexed: 1,
+            started_ts: 100,
+            completed_ts: None,
+            max_version: 0,
+            success: true,
+        };
+        cp.write_to(tmp.path()).unwrap();
+        let content = std::fs::read_to_string(tmp.path().join(IndexCheckpoint::FILENAME)).unwrap();
+        // Pretty-printed JSON has newlines
+        assert!(content.contains('\n'));
+    }
+
+    // ── activate semantic engine ────────────────────────────────────────
+
+    #[test]
+    fn activate_semantic_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash::compute(&sample_fields());
+
+        layout.ensure_dirs(&scope, &schema).unwrap();
+        layout.activate(&scope, "semantic", &schema).unwrap();
+
+        let active = layout.active_schema(&scope, "semantic");
+        assert!(active.is_some());
+        assert_eq!(active.unwrap(), schema.short());
+    }
+
+    // ── SchemaField not-indexed ─────────────────────────────────────────
+
+    #[test]
+    fn schema_field_not_indexed() {
+        let field = SchemaField {
+            name: "metadata".to_owned(),
+            field_type: "bytes".to_owned(),
+            indexed: false,
+        };
+        let json = serde_json::to_string(&field).unwrap();
+        let back: SchemaField = serde_json::from_str(&json).unwrap();
+        assert!(!back.indexed);
+        assert_eq!(back.field_type, "bytes");
+    }
+
+    // ── SchemaHash short on very short hash ─────────────────────────────
+
+    #[test]
+    fn schema_hash_short_on_short_input() {
+        let hash = SchemaHash("abc".to_owned());
+        // short() should return "abc" (min of 12 and 3 = 3)
+        assert_eq!(hash.short(), "abc");
+    }
 }
