@@ -1253,4 +1253,647 @@ mod tests {
         worker.run_startup_rebuild();
         assert_eq!(lifecycle.rebuild_calls.load(Ordering::Relaxed), 1);
     }
+
+    // ── New tests ────────────────────────────────────────────────────
+
+    // ── EmbeddingRequest ──
+
+    #[test]
+    fn request_new_sets_fields() {
+        let req = EmbeddingRequest::new(
+            42,
+            DocKind::Agent,
+            Some(7),
+            "Title",
+            "Body",
+            ModelTier::Quality,
+        );
+        assert_eq!(req.doc_id, 42);
+        assert_eq!(req.doc_kind, DocKind::Agent);
+        assert_eq!(req.project_id, Some(7));
+        assert_eq!(req.title, "Title");
+        assert_eq!(req.body, "Body");
+        assert_eq!(req.tier, ModelTier::Quality);
+        assert_eq!(req.retries, 0);
+    }
+
+    #[test]
+    fn request_dedup_key_uses_id_and_kind() {
+        let req1 = make_request(1);
+        let req2 = EmbeddingRequest::new(1, DocKind::Agent, None, "", "", ModelTier::Fast);
+        // Same id but different kind → different keys
+        assert_ne!(req1.dedup_key(), req2.dedup_key());
+        // Same id and same kind → same key
+        let req3 = make_request(1);
+        assert_eq!(req1.dedup_key(), req3.dedup_key());
+    }
+
+    #[test]
+    fn request_no_project_id() {
+        let req = EmbeddingRequest::new(1, DocKind::Project, None, "p", "b", ModelTier::Fast);
+        assert_eq!(req.project_id, None);
+    }
+
+    // ── EmbeddingQueue extended ──
+
+    #[test]
+    fn queue_default_trait() {
+        let queue = EmbeddingQueue::default();
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn queue_config_accessor() {
+        let config = EmbeddingJobConfig {
+            batch_size: 77,
+            ..Default::default()
+        };
+        let queue = EmbeddingQueue::with_config(config);
+        assert_eq!(queue.config().batch_size, 77);
+    }
+
+    #[test]
+    fn queue_is_empty_after_drain() {
+        let queue = EmbeddingQueue::new();
+        queue.enqueue(make_request(1));
+        assert!(!queue.is_empty());
+        queue.drain_batch(100);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn queue_drain_empty_returns_empty() {
+        let queue = EmbeddingQueue::new();
+        let batch = queue.drain_batch(10);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn queue_drain_larger_than_available() {
+        let queue = EmbeddingQueue::new();
+        queue.enqueue(make_request(1));
+        queue.enqueue(make_request(2));
+        let batch = queue.drain_batch(100);
+        assert_eq!(batch.len(), 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn queue_stats_accuracy() {
+        let queue = EmbeddingQueue::new();
+
+        let stats = queue.stats();
+        assert_eq!(stats.pending_count, 0);
+        assert_eq!(stats.retry_count, 0);
+        assert_eq!(stats.total_enqueued, 0);
+        assert_eq!(stats.total_dropped, 0);
+        assert_eq!(stats.total_deduped, 0);
+
+        queue.enqueue(make_request(1));
+        queue.enqueue(make_request(2));
+
+        let stats = queue.stats();
+        assert_eq!(stats.pending_count, 2);
+        assert_eq!(stats.total_enqueued, 2);
+    }
+
+    #[test]
+    fn queue_enqueue_retry_dedup_drops_duplicate() {
+        let config = EmbeddingJobConfig {
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
+        let queue = EmbeddingQueue::with_config(config);
+
+        queue.enqueue(make_request(1));
+        // Retry with same doc_id+kind should be deduped
+        queue.enqueue_retry(make_request(1));
+
+        let stats = queue.stats();
+        assert_eq!(stats.total_deduped, 1);
+        // Only the original in main queue, retry was dropped
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(stats.retry_count, 0);
+    }
+
+    #[test]
+    fn queue_backpressure_threshold_one() {
+        let config = EmbeddingJobConfig {
+            backpressure_threshold: 1,
+            ..Default::default()
+        };
+        let queue = EmbeddingQueue::with_config(config);
+
+        assert!(queue.enqueue(make_request(1)));
+        assert!(!queue.enqueue(make_request(2)));
+        assert_eq!(queue.stats().total_dropped, 1);
+    }
+
+    #[test]
+    fn queue_backpressure_includes_retry_queue() {
+        let config = EmbeddingJobConfig {
+            backpressure_threshold: 2,
+            retry_base_delay_ms: 1_000_000, // huge delay so retry stays
+            ..Default::default()
+        };
+        let queue = EmbeddingQueue::with_config(config);
+
+        queue.enqueue(make_request(1));
+        queue.enqueue_retry(make_request(2));
+        // Now total_pending = 1 (main) + 1 (retry) = 2 >= threshold
+        assert!(!queue.enqueue(make_request(3)));
+        assert_eq!(queue.stats().total_dropped, 1);
+    }
+
+    #[test]
+    fn queue_enqueue_after_drain_recovers() {
+        let queue = EmbeddingQueue::new();
+        queue.enqueue(make_request(1));
+        queue.drain_batch(100);
+        assert!(queue.is_empty());
+
+        // Can enqueue again
+        assert!(queue.enqueue(make_request(2)));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn queue_dedup_replaces_existing_in_main_queue() {
+        let queue = EmbeddingQueue::new();
+        let mut req1 = make_request(1);
+        req1.body = "old body".to_owned();
+        queue.enqueue(req1);
+
+        let mut req2 = make_request(1);
+        req2.body = "new body".to_owned();
+        queue.enqueue(req2);
+
+        let batch = queue.drain_batch(10);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].body, "new body");
+    }
+
+    // ── JobMetrics extended ──
+
+    #[test]
+    fn metrics_default_all_zero() {
+        let metrics = JobMetrics::default();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_succeeded, 0);
+        assert_eq!(snap.total_retryable, 0);
+        assert_eq!(snap.total_failed, 0);
+        assert_eq!(snap.total_skipped, 0);
+        assert_eq!(snap.total_batches, 0);
+        assert_eq!(snap.total_embed_time_us, 0);
+        assert_eq!(snap.total_docs_embedded, 0);
+    }
+
+    #[test]
+    fn metrics_multiple_batches_accumulate() {
+        let metrics = JobMetrics::new();
+
+        let r1 = BatchResult {
+            succeeded: 5,
+            retryable: 1,
+            failed: 0,
+            skipped: 2,
+            elapsed: Duration::from_millis(50),
+            details: Vec::new(),
+        };
+        let r2 = BatchResult {
+            succeeded: 3,
+            retryable: 0,
+            failed: 2,
+            skipped: 0,
+            elapsed: Duration::from_millis(30),
+            details: Vec::new(),
+        };
+
+        metrics.record_batch(&r1);
+        metrics.record_batch(&r2);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_succeeded, 8);
+        assert_eq!(snap.total_retryable, 1);
+        assert_eq!(snap.total_failed, 2);
+        assert_eq!(snap.total_skipped, 2);
+        assert_eq!(snap.total_batches, 2);
+        assert_eq!(snap.total_docs_embedded, 8);
+    }
+
+    #[test]
+    fn metrics_snapshot_avg_embed_time() {
+        let metrics = JobMetrics::new();
+        let result = BatchResult {
+            succeeded: 4,
+            elapsed: Duration::from_millis(100),
+            ..Default::default()
+        };
+        metrics.record_batch(&result);
+
+        let snap = metrics.snapshot();
+        // 100ms = 100_000us, 4 docs → 25_000us avg
+        assert_eq!(snap.avg_embed_time_us(), 25_000);
+    }
+
+    #[test]
+    fn metrics_snapshot_avg_embed_time_zero_docs() {
+        let snap = JobMetricsSnapshot::default();
+        // Division by zero should return 0
+        assert_eq!(snap.avg_embed_time_us(), 0);
+    }
+
+    // ── JobResult extended ──
+
+    #[test]
+    fn job_result_skipped_not_success_not_retry() {
+        let skipped = JobResult::Skipped {
+            doc_id: 1,
+            doc_kind: DocKind::Message,
+            reason: "already indexed".to_owned(),
+        };
+        assert!(!skipped.is_success());
+        assert!(!skipped.should_retry());
+    }
+
+    #[test]
+    fn job_result_retryable_not_success() {
+        let retryable = JobResult::Retryable {
+            doc_id: 1,
+            doc_kind: DocKind::Agent,
+            error: "timeout".to_owned(),
+            retries: 2,
+        };
+        assert!(!retryable.is_success());
+        assert!(retryable.should_retry());
+    }
+
+    // ── BatchResult extended ──
+
+    #[test]
+    fn batch_result_default_total_zero() {
+        let result = BatchResult::default();
+        assert_eq!(result.total(), 0);
+        assert_eq!(result.succeeded, 0);
+        assert_eq!(result.elapsed, Duration::ZERO);
+        assert!(result.details.is_empty());
+    }
+
+    #[test]
+    fn batch_result_serde_roundtrip() {
+        let result = BatchResult {
+            succeeded: 10,
+            retryable: 2,
+            failed: 1,
+            skipped: 3,
+            elapsed: Duration::from_millis(42),
+            details: Vec::new(), // skipped in serde
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: BatchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.succeeded, 10);
+        assert_eq!(restored.retryable, 2);
+        assert_eq!(restored.failed, 1);
+        assert_eq!(restored.skipped, 3);
+        assert_eq!(restored.total(), 16);
+    }
+
+    // ── QueueStats ──
+
+    #[test]
+    fn queue_stats_default() {
+        let stats = QueueStats::default();
+        assert_eq!(stats.pending_count, 0);
+        assert_eq!(stats.retry_count, 0);
+        assert_eq!(stats.total_enqueued, 0);
+        assert_eq!(stats.total_dropped, 0);
+        assert_eq!(stats.total_deduped, 0);
+    }
+
+    #[test]
+    fn queue_stats_serde_roundtrip() {
+        let stats = QueueStats {
+            pending_count: 5,
+            retry_count: 2,
+            total_enqueued: 100,
+            total_dropped: 3,
+            total_deduped: 7,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let restored: QueueStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.total_enqueued, 100);
+        assert_eq!(restored.total_deduped, 7);
+    }
+
+    // ── EmbeddingJobConfig ──
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = EmbeddingJobConfig {
+            batch_size: 64,
+            flush_interval_ms: 3000,
+            backpressure_threshold: 500,
+            max_retries: 5,
+            retry_base_delay_ms: 200,
+            timeout_ms: 60_000,
+            persist_to_db: false,
+            canon_policy: CanonPolicy::Full, // skipped in serde
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: EmbeddingJobConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.batch_size, 64);
+        assert_eq!(restored.max_retries, 5);
+        assert!(!restored.persist_to_db);
+        assert_eq!(restored.timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn config_defaults_full() {
+        let config = EmbeddingJobConfig::default();
+        assert_eq!(config.batch_size, 32);
+        assert_eq!(config.flush_interval_ms, 5000);
+        assert_eq!(config.backpressure_threshold, 1000);
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.retry_base_delay_ms, 100);
+        assert_eq!(config.timeout_ms, 30_000);
+        assert!(config.persist_to_db);
+    }
+
+    // ── RefreshWorkerConfig ──
+
+    #[test]
+    fn refresh_config_serde_roundtrip() {
+        let config = RefreshWorkerConfig {
+            refresh_interval_ms: 2000,
+            rebuild_on_startup: true,
+            max_docs_per_cycle: 500,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: RefreshWorkerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.refresh_interval_ms, 2000);
+        assert!(restored.rebuild_on_startup);
+        assert_eq!(restored.max_docs_per_cycle, 500);
+    }
+
+    // ── RebuildResult ──
+
+    #[test]
+    fn rebuild_result_default() {
+        let result = RebuildResult::default();
+        assert_eq!(result.total_processed, 0);
+        assert_eq!(result.succeeded, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn rebuild_result_serde_roundtrip() {
+        let result = RebuildResult {
+            total_processed: 100,
+            succeeded: 95,
+            failed: 5,
+            elapsed: Duration::from_secs(2),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: RebuildResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.total_processed, 100);
+        assert_eq!(restored.succeeded, 95);
+        assert_eq!(restored.failed, 5);
+    }
+
+    // ── JobMetricsSnapshot ──
+
+    #[test]
+    fn metrics_snapshot_serde_roundtrip() {
+        let snap = JobMetricsSnapshot {
+            total_succeeded: 50,
+            total_retryable: 5,
+            total_failed: 2,
+            total_skipped: 3,
+            total_batches: 10,
+            total_embed_time_us: 500_000,
+            total_docs_embedded: 50,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: JobMetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.total_succeeded, 50);
+        assert_eq!(restored.avg_embed_time_us(), 10_000);
+    }
+
+    // ── NoProgress ──
+
+    #[test]
+    fn no_progress_callable() {
+        let np = NoProgress;
+        np.on_progress(0, 100);
+        np.on_progress(50, 100);
+        np.on_progress(100, 100);
+        // No panic = success
+    }
+
+    // ── IndexRefreshWorker extended ──
+
+    #[test]
+    fn refresh_worker_last_refresh_initially_none() {
+        let config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(HashEmbedder::new());
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 0,
+            ..Default::default()
+        })));
+        let runner = Arc::new(EmbeddingJobRunner::new(config, queue, embedder, index));
+        let worker = IndexRefreshWorker::new(RefreshWorkerConfig::default(), runner);
+
+        assert!(worker.last_refresh().is_none());
+    }
+
+    #[test]
+    fn refresh_worker_shutdown_flag() {
+        let config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(HashEmbedder::new());
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 0,
+            ..Default::default()
+        })));
+        let runner = Arc::new(EmbeddingJobRunner::new(config, queue, embedder, index));
+        let worker = IndexRefreshWorker::new(RefreshWorkerConfig::default(), runner);
+
+        let flag = worker.shutdown_flag();
+        assert!(!flag.load(Ordering::Acquire));
+
+        worker.shutdown();
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn refresh_worker_cycle_empty_queue_returns_zero() {
+        let config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(HashEmbedder::new());
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 0,
+            ..Default::default()
+        })));
+        let runner = Arc::new(EmbeddingJobRunner::new(config, queue, embedder, index));
+        let worker = IndexRefreshWorker::new(RefreshWorkerConfig::default(), runner);
+
+        assert_eq!(worker.run_cycle(), 0);
+    }
+
+    #[test]
+    fn refresh_worker_no_rebuild_without_flag() {
+        let config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(HashEmbedder::new());
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 0,
+            ..Default::default()
+        })));
+        let runner = Arc::new(EmbeddingJobRunner::new(config, queue, embedder, index));
+        let lifecycle = Arc::new(MockLifecycle::default());
+        let worker = IndexRefreshWorker::new(
+            RefreshWorkerConfig {
+                rebuild_on_startup: false,
+                ..Default::default()
+            },
+            runner,
+        )
+        .with_rebuild_lifecycle(lifecycle.clone());
+
+        worker.run_startup_rebuild();
+        assert_eq!(lifecycle.rebuild_calls.load(Ordering::Relaxed), 0);
+    }
+
+    // ── EmbeddingJobRunner extended ──
+
+    #[test]
+    fn runner_has_work_empty_and_nonempty() {
+        let config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(HashEmbedder::new());
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 0,
+            ..Default::default()
+        })));
+        let runner = EmbeddingJobRunner::new(config, queue.clone(), embedder, index);
+
+        assert!(!runner.has_work());
+        queue.enqueue(make_request(1));
+        assert!(runner.has_work());
+    }
+
+    #[test]
+    fn runner_metrics_shared() {
+        let config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(HashEmbedder::new());
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 0,
+            ..Default::default()
+        })));
+        let runner = EmbeddingJobRunner::new(config, queue, embedder, index);
+
+        let m1 = runner.metrics();
+        let m2 = runner.metrics();
+        // Both point to same metrics
+        assert!(Arc::ptr_eq(&m1, &m2));
+    }
+
+    #[test]
+    fn runner_process_batch_with_fixed_embedder() {
+        let config = EmbeddingJobConfig {
+            batch_size: 10,
+            ..Default::default()
+        };
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(FixedEmbedder::new(4));
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 4,
+            ..Default::default()
+        })));
+
+        queue.enqueue(make_request(1));
+        queue.enqueue(make_request(2));
+        queue.enqueue(make_request(3));
+
+        let runner = EmbeddingJobRunner::new(config, queue, embedder, index);
+        let result = runner.process_batch().unwrap();
+
+        assert_eq!(result.succeeded, 3);
+        assert_eq!(result.total(), 3);
+        assert!(result.elapsed > Duration::ZERO);
+
+        let snap = runner.metrics().snapshot();
+        assert_eq!(snap.total_succeeded, 3);
+        assert_eq!(snap.total_batches, 1);
+    }
+
+    #[test]
+    fn runner_process_batch_limit_smaller_than_batch_size() {
+        let config = EmbeddingJobConfig {
+            batch_size: 10,
+            ..Default::default()
+        };
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(FixedEmbedder::new(4));
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 4,
+            ..Default::default()
+        })));
+
+        for id in 0..5 {
+            queue.enqueue(make_request(id));
+        }
+
+        let runner = EmbeddingJobRunner::new(config, queue.clone(), embedder, index);
+        let result = runner.process_batch_limit(3).unwrap();
+
+        assert_eq!(result.total(), 3);
+        assert_eq!(queue.len(), 2); // 2 remain
+    }
+
+    #[test]
+    fn runner_process_batch_limit_zero_processes_one() {
+        // process_batch_limit clamps to max(1, min(limit, batch_size))
+        let config = EmbeddingJobConfig {
+            batch_size: 10,
+            ..Default::default()
+        };
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(FixedEmbedder::new(4));
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 4,
+            ..Default::default()
+        })));
+
+        queue.enqueue(make_request(1));
+        queue.enqueue(make_request(2));
+
+        let runner = EmbeddingJobRunner::new(config, queue.clone(), embedder, index);
+        let result = runner.process_batch_limit(0).unwrap();
+
+        // Clamped to 1
+        assert_eq!(result.total(), 1);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn refresh_worker_metrics_returns_runner_metrics() {
+        let config = EmbeddingJobConfig::default();
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(HashEmbedder::new());
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 0,
+            ..Default::default()
+        })));
+        let runner = Arc::new(EmbeddingJobRunner::new(config, queue, embedder, index));
+        let runner_metrics = runner.metrics();
+        let worker = IndexRefreshWorker::new(RefreshWorkerConfig::default(), runner);
+
+        let worker_metrics = worker.metrics();
+        assert!(Arc::ptr_eq(&runner_metrics, &worker_metrics));
+    }
 }
