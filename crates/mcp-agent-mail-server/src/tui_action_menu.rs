@@ -197,6 +197,7 @@ impl<'a> ActionMenu<'a> {
     }
 
     /// Render the action menu as a floating overlay.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub fn render(&self, terminal_area: Rect, frame: &mut Frame) {
         if self.state.is_empty() {
             return;
@@ -210,7 +211,7 @@ impl<'a> ActionMenu<'a> {
             .map(|e| e.label.len() + e.keybinding.as_ref().map_or(0, |k| k.len() + 3))
             .max()
             .unwrap_or(10);
-        let width = (max_label_len + 4).min(40).max(20) as u16;
+        let width = (max_label_len + 4).clamp(20, 40) as u16;
         let height = (self.state.len() + 2).min(12) as u16;
 
         // Position near anchor row, biased to the right side
