@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 /// Application configuration for the WASM TUI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// WebSocket URL for server connection (e.g., "ws://localhost:8765/ws")
+    /// WebSocket URL for server connection (e.g., `ws://localhost:8765/ws`)
     pub websocket_url: String,
     /// Canvas element selector (e.g., "#terminal-canvas")
     pub canvas_selector: String,
@@ -160,7 +160,7 @@ pub enum InputEvent {
 pub mod native {
     //! Native utilities for testing WASM types.
 
-    use super::*;
+    use super::StateSnapshot;
 
     /// Create a test state snapshot.
     #[must_use]
