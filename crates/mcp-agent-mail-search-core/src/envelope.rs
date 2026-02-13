@@ -474,4 +474,153 @@ mod tests {
         let json = serde_json::to_string(&vis).unwrap();
         assert!(!json.contains("product_ids"));
     }
+
+    // ── DocVersion ──────────────────────────────────────────────────────
+
+    #[test]
+    fn doc_version_serde_roundtrip() {
+        let v = DocVersion::from_micros(1_700_000_000_000_000);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: DocVersion = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn doc_version_hash_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(DocVersion(100));
+        set.insert(DocVersion(200));
+        set.insert(DocVersion(100)); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn doc_version_clone_copy() {
+        let v = DocVersion(42);
+        let copied = v;
+        assert_eq!(copied, v);
+    }
+
+    // ── Provenance serde ────────────────────────────────────────────────
+
+    #[test]
+    fn provenance_serde_roundtrip() {
+        let p = Provenance {
+            source_kind: DocKind::Message,
+            source_id: 42,
+            author_agent_id: Some(7),
+            author_name: Some("TestAgent".to_owned()),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Provenance = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source_kind, DocKind::Message);
+        assert_eq!(back.source_id, 42);
+        assert_eq!(back.author_agent_id, Some(7));
+        assert_eq!(back.author_name.as_deref(), Some("TestAgent"));
+    }
+
+    #[test]
+    fn provenance_optional_fields_skipped() {
+        let p = Provenance {
+            source_kind: DocKind::Agent,
+            source_id: 1,
+            author_agent_id: None,
+            author_name: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("author_agent_id"));
+        assert!(!json.contains("author_name"));
+    }
+
+    // ── Visibility with products ────────────────────────────────────────
+
+    #[test]
+    fn visibility_with_products_serde() {
+        let vis = Visibility {
+            project_id: 5,
+            product_ids: vec![10, 20, 30],
+        };
+        let json = serde_json::to_string(&vis).unwrap();
+        let back: Visibility = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.project_id, 5);
+        assert_eq!(back.product_ids, vec![10, 20, 30]);
+    }
+
+    // ── Row Debug/Clone traits ──────────────────────────────────────────
+
+    #[test]
+    fn message_row_debug_and_clone() {
+        let row = sample_message_row();
+        let debug = format!("{row:?}");
+        assert!(debug.contains("MessageRow"));
+        let cloned = row.clone();
+        assert_eq!(cloned.id, row.id);
+    }
+
+    #[test]
+    fn agent_row_debug_and_clone() {
+        let row = sample_agent_row();
+        let debug = format!("{row:?}");
+        assert!(debug.contains("AgentRow"));
+        let cloned = row.clone();
+        assert_eq!(cloned.id, row.id);
+    }
+
+    #[test]
+    fn project_row_debug_and_clone() {
+        let row = sample_project_row();
+        let debug = format!("{row:?}");
+        assert!(debug.contains("ProjectRow"));
+        let cloned = row.clone();
+        assert_eq!(cloned.id, row.id);
+    }
+
+    // ── Agent body formatting ───────────────────────────────────────────
+
+    #[test]
+    fn agent_body_contains_all_fields() {
+        let row = sample_agent_row();
+        let env = agent_to_envelope(&row);
+        // Format: "{name} ({program}/{model})\n{task_description}"
+        assert!(
+            env.document
+                .body
+                .starts_with("BlueLake (claude-code/opus-4.6)")
+        );
+        assert!(env.document.body.contains("Working on search v3"));
+    }
+
+    // ── Envelope serde with agent ───────────────────────────────────────
+
+    #[test]
+    fn agent_envelope_serde_roundtrip() {
+        let row = sample_agent_row();
+        let env = agent_to_envelope(&row);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: SearchDocumentEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.document.kind, DocKind::Agent);
+        assert_eq!(back.document.title, "BlueLake");
+    }
+
+    #[test]
+    fn project_envelope_serde_roundtrip() {
+        let row = sample_project_row();
+        let env = project_to_envelope(&row);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: SearchDocumentEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.document.kind, DocKind::Project);
+        assert_eq!(back.document.title, "my-project");
+    }
+
+    // ── Project self-referencing project_id ──────────────────────────────
+
+    #[test]
+    fn project_envelope_self_referencing() {
+        let row = sample_project_row();
+        let env = project_to_envelope(&row);
+        // Project documents use their own ID as project_id
+        assert_eq!(env.document.project_id, Some(row.id));
+        assert_eq!(env.visibility.project_id, row.id);
+    }
 }

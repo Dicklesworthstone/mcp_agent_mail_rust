@@ -180,4 +180,94 @@ mod tests {
         assert_eq!(delete2.doc_id(), 7);
         assert_eq!(delete2.doc_kind(), DocKind::Thread);
     }
+
+    // ── DocKind Hash ────────────────────────────────────────────────────
+
+    #[test]
+    fn doc_kind_hash_distinct_variants() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(DocKind::Message);
+        set.insert(DocKind::Agent);
+        set.insert(DocKind::Project);
+        set.insert(DocKind::Thread);
+        assert_eq!(set.len(), 4);
+    }
+
+    // ── Document metadata ───────────────────────────────────────────────
+
+    #[test]
+    fn document_with_metadata_serde() {
+        let mut doc = sample_doc();
+        doc.metadata
+            .insert("sender".to_owned(), serde_json::json!("AgentX"));
+        doc.metadata
+            .insert("importance".to_owned(), serde_json::json!("high"));
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.metadata["sender"], "AgentX");
+        assert_eq!(back.metadata["importance"], "high");
+    }
+
+    #[test]
+    fn document_project_id_none() {
+        let mut doc = sample_doc();
+        doc.project_id = None;
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert!(back.project_id.is_none());
+    }
+
+    // ── Document Clone + Debug ──────────────────────────────────────────
+
+    #[test]
+    fn document_clone() {
+        let doc = sample_doc();
+        let cloned = doc.clone();
+        assert_eq!(cloned.id, doc.id);
+        assert_eq!(cloned.kind, doc.kind);
+        assert_eq!(cloned.body, doc.body);
+    }
+
+    #[test]
+    fn document_debug() {
+        let doc = sample_doc();
+        let debug = format!("{doc:?}");
+        assert!(debug.contains("Document"));
+    }
+
+    // ── DocChange Clone + Debug ─────────────────────────────────────────
+
+    #[test]
+    fn doc_change_clone() {
+        let change = DocChange::Upsert(sample_doc());
+        let cloned = change.clone();
+        assert_eq!(cloned.doc_id(), change.doc_id());
+    }
+
+    #[test]
+    fn doc_change_debug() {
+        let change = DocChange::Delete {
+            id: 5,
+            kind: DocKind::Agent,
+        };
+        let debug = format!("{change:?}");
+        assert!(debug.contains("Delete"));
+        assert!(debug.contains("Agent"));
+    }
+
+    // ── DocChange all kinds ─────────────────────────────────────────────
+
+    #[test]
+    fn doc_change_delete_all_kinds() {
+        for kind in [
+            DocKind::Message,
+            DocKind::Agent,
+            DocKind::Project,
+            DocKind::Thread,
+        ] {
+            let change = DocChange::Delete { id: 1, kind };
+            assert_eq!(change.doc_kind(), kind);
+        }
+    }
 }

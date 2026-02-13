@@ -166,4 +166,94 @@ mod tests {
         assert!(matches!(search_err, SearchError::Serialization(_)));
         assert_eq!(search_err.error_type(), "SERIALIZATION_ERROR");
     }
+
+    // ── Display includes inner message ──────────────────────────────────
+
+    #[test]
+    fn display_contains_inner_message() {
+        let err = SearchError::IndexNotReady("still building".into());
+        assert!(err.to_string().contains("still building"));
+    }
+
+    #[test]
+    fn display_corrupted_contains_detail() {
+        let err = SearchError::IndexCorrupted("segment 3 CRC mismatch".into());
+        assert!(err.to_string().contains("segment 3 CRC mismatch"));
+    }
+
+    #[test]
+    fn display_invalid_query_contains_detail() {
+        let err = SearchError::InvalidQuery("unbalanced parens".into());
+        assert!(err.to_string().contains("unbalanced parens"));
+    }
+
+    // ── Error type Serialization in mapping ─────────────────────────────
+
+    #[test]
+    fn error_type_serialization_variant() {
+        let err = SearchError::Serialization(serde_json::from_str::<i32>("bad").unwrap_err());
+        assert_eq!(err.error_type(), "SERIALIZATION_ERROR");
+    }
+
+    // ── Debug formatting ────────────────────────────────────────────────
+
+    #[test]
+    fn debug_all_variants() {
+        let errors: Vec<SearchError> = vec![
+            SearchError::IndexNotReady("a".into()),
+            SearchError::IndexCorrupted("b".into()),
+            SearchError::InvalidQuery("c".into()),
+            SearchError::ModeUnavailable("d".into()),
+            SearchError::DocumentNotFound("e".into()),
+            SearchError::Timeout("f".into()),
+            SearchError::Internal("g".into()),
+        ];
+        for err in &errors {
+            let debug = format!("{err:?}");
+            assert!(!debug.is_empty());
+        }
+    }
+
+    // ── Retryable: Serialization is not retryable ───────────────────────
+
+    #[test]
+    fn serialization_not_retryable() {
+        let err = SearchError::Serialization(serde_json::from_str::<i32>("x").unwrap_err());
+        assert!(!err.is_retryable());
+    }
+
+    // ── Error source chain ──────────────────────────────────────────────
+
+    #[test]
+    fn io_error_source_preserved() {
+        use std::error::Error;
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no access");
+        let search_err: SearchError = io_err.into();
+        let source = search_err.source();
+        assert!(source.is_some());
+    }
+
+    #[test]
+    fn serde_error_source_preserved() {
+        use std::error::Error;
+        let json_err = serde_json::from_str::<i32>("!!!").unwrap_err();
+        let search_err: SearchError = json_err.into();
+        let source = search_err.source();
+        assert!(source.is_some());
+    }
+
+    // ── SearchResult type alias ─────────────────────────────────────────
+
+    #[test]
+    fn search_result_type_alias_works() {
+        fn try_search(succeed: bool) -> SearchResult<i32> {
+            if succeed {
+                Ok(42)
+            } else {
+                Err(SearchError::Internal("oops".into()))
+            }
+        }
+        assert_eq!(try_search(true).unwrap(), 42);
+        assert!(try_search(false).is_err());
+    }
 }
