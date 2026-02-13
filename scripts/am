@@ -92,6 +92,13 @@ validate_port() {
   fi
 }
 
+trim_shell_value() {
+  local value="$1"
+  value="$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  value="$(printf '%s' "$value" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+  printf '%s' "$value"
+}
+
 warn_sync_skip() {
   local config_file="$1"
   local reason="$2"
@@ -389,9 +396,7 @@ extract_http_path_from_listener_cmd() {
     raw_path="${BASH_REMATCH[1]}"
   fi
 
-  if [[ -z "$raw_path" ]]; then
-    echo "/mcp/"
-  else
+  if [[ -n "$raw_path" ]]; then
     normalize_http_path "$raw_path"
   fi
 }
@@ -406,11 +411,21 @@ extract_http_host_from_listener_cmd() {
     raw_host="${BASH_REMATCH[1]}"
   fi
 
-  if [[ -z "$raw_host" ]]; then
-    echo "127.0.0.1"
-  else
+  if [[ -n "$raw_host" ]]; then
     echo "$raw_host"
   fi
+}
+
+extract_process_env_value() {
+  local pid="$1"
+  local key="$2"
+  local environ_file="/proc/${pid}/environ"
+
+  if [[ ! -r "$environ_file" ]]; then
+    return 1
+  fi
+
+  command tr '\0' '\n' < "$environ_file" | command grep -E "^${key}=" | tail -n1 | cut -d= -f2-
 }
 
 sync_agent_harness_mcp_url() {
@@ -647,6 +662,24 @@ if [[ "${AM_REUSE_RUNNING:-1}" == "1" ]]; then
   if [[ "$listener_is_agent" -eq 1 ]]; then
     listener_host="$(extract_http_host_from_listener_cmd "$listener_cmd")"
     listener_path="$(extract_http_path_from_listener_cmd "$listener_cmd")"
+    if [[ -z "$listener_host" ]]; then
+      if env_host="$(extract_process_env_value "$listener_pid" "HTTP_HOST" 2>/dev/null)"; then
+        env_host="$(trim_shell_value "$env_host")"
+        if [[ -n "$env_host" ]]; then
+          listener_host="$env_host"
+        fi
+      fi
+    fi
+    if [[ -z "$listener_path" ]]; then
+      if env_path="$(extract_process_env_value "$listener_pid" "HTTP_PATH" 2>/dev/null)"; then
+        env_path="$(trim_shell_value "$env_path")"
+        if [[ -n "$env_path" ]]; then
+          listener_path="$(normalize_http_path "$env_path")"
+        fi
+      fi
+    fi
+    listener_host="${listener_host:-127.0.0.1}"
+    listener_path="${listener_path:-/mcp/}"
     if [[ "$listener_host" != "$host" ]]; then
       echo "am: requested host ${host} differs from running server host ${listener_host}; reusing running server host." >&2
     fi
@@ -674,8 +707,7 @@ if [[ "$no_auth" -eq 1 ]]; then
 else
   if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
     if token="$(read_env_value "$env_file" "HTTP_BEARER_TOKEN" 2>/dev/null)"; then
-      token="$(printf '%s' "$token" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-      token="$(printf '%s' "$token" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+      token="$(trim_shell_value "$token")"
       if [[ -n "$token" ]]; then
         export HTTP_BEARER_TOKEN="$token"
       fi

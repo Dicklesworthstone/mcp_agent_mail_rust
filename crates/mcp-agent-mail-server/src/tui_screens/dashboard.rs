@@ -885,7 +885,7 @@ fn render_gradient_title(frame: &mut Frame<'_>, area: Rect) {
     ]);
     let title_text = "Agent Mail Dashboard";
     // Center the title horizontally within the area.
-    let text_len = title_text.len() as u16;
+    let text_len = u16::try_from(title_text.len()).unwrap_or(u16::MAX);
     let x_offset = area.width.saturating_sub(text_len) / 2;
     let title_widget = StyledText::new(title_text)
         .effect(TextEffect::HorizontalGradient { gradient })
