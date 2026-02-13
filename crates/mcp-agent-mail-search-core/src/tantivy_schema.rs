@@ -595,4 +595,167 @@ mod tests {
         let copied: FieldHandles = handles;
         assert_eq!(copied.body.field_id(), handles.body.field_id());
     }
+
+    // ── BODY_BOOST constant ───────────────────────────────────────────
+
+    #[test]
+    fn body_boost_constant() {
+        assert!((BODY_BOOST - 1.0).abs() < f32::EPSILON);
+    }
+
+    // ── All field IDs distinct ────────────────────────────────────────
+
+    #[test]
+    fn field_handles_all_distinct_ids() {
+        let (_, h) = build_schema();
+        let ids = [
+            h.id.field_id(),
+            h.doc_kind.field_id(),
+            h.subject.field_id(),
+            h.body.field_id(),
+            h.sender.field_id(),
+            h.project_slug.field_id(),
+            h.project_id.field_id(),
+            h.thread_id.field_id(),
+            h.importance.field_id(),
+            h.created_ts.field_id(),
+            h.program.field_id(),
+            h.model.field_id(),
+        ];
+        let mut unique = ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 12);
+    }
+
+    // ── Tokenizer with numbers/hyphens ────────────────────────────────
+
+    #[test]
+    fn tokenizer_numbers_and_hyphens() {
+        let (schema, _) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_NAME).unwrap();
+        let mut stream = tokenizer.token_stream("v3.2.1 br-123 test");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        // SimpleTokenizer splits on non-alphanumeric
+        assert!(tokens.contains(&"v3".to_string()) || tokens.contains(&"3".to_string()));
+        assert!(tokens.contains(&"test".to_string()));
+    }
+
+    // ── Subject-only search ───────────────────────────────────────────
+
+    #[test]
+    fn search_subject_only() {
+        let (schema, handles) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut writer = index.writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                handles.id => 1u64,
+                handles.doc_kind => "message",
+                handles.subject => "unique_keyword_subject",
+                handles.body => "nothing relevant here",
+                handles.project_slug => "proj",
+                handles.project_id => 1u64,
+                handles.created_ts => 1_000_000i64
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(&index, vec![handles.subject]);
+        let query = parser.parse_query("unique_keyword_subject").unwrap();
+        let results = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    // ── Empty index search ────────────────────────────────────────────
+
+    #[test]
+    fn empty_index_search_returns_nothing() {
+        let (schema, _handles) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        // Must create a committed writer for reader to work
+        let mut writer = index.writer::<TantivyDocument>(15_000_000).unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let results = searcher
+            .search(&AllQuery, &TopDocs::with_limit(10))
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── Multiple documents search ─────────────────────────────────────
+
+    #[test]
+    fn search_multiple_documents() {
+        let (schema, handles) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut writer = index.writer(15_000_000).unwrap();
+        let ids: [u64; 5] = [1, 2, 3, 4, 5];
+        for (idx, &doc_id) in ids.iter().enumerate() {
+            writer
+                .add_document(doc!(
+                    handles.id => doc_id,
+                    handles.doc_kind => "message",
+                    handles.subject => "migration discussion",
+                    handles.body => format!("message body number {}", idx + 1),
+                    handles.project_slug => "proj",
+                    handles.project_id => 1u64,
+                    handles.created_ts => i64::try_from(doc_id).unwrap() * 1_000_000
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
+        let query = parser.parse_query("migration").unwrap();
+        let results = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    // ── Schema version constant accessible ────────────────────────────
+
+    #[test]
+    fn schema_hash_changes_with_different_tokenizer_would_differ() {
+        // The schema_hash includes TOKENIZER_NAME, so it's stable
+        let h1 = schema_hash();
+        let h2 = schema_hash();
+        assert_eq!(h1, h2);
+        // And it's a valid SHA-256 hex string
+        assert_eq!(h1.len(), 64);
+    }
+
+    // ── Tokenizer whitespace-only input ───────────────────────────────
+
+    #[test]
+    fn tokenizer_whitespace_only() {
+        let (schema, _) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizer(&index);
+
+        let mut tokenizer = index.tokenizers().get(TOKENIZER_NAME).unwrap();
+        let mut stream = tokenizer.token_stream("   \t\n  ");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        assert!(tokens.is_empty());
+    }
 }

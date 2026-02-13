@@ -427,4 +427,179 @@ mod tests {
         let back: SearchFilter = serde_json::from_str(&json).unwrap();
         assert_eq!(back.doc_kind, Some(DocKind::Project));
     }
+
+    // ── SearchMode trait coverage ─────────────────────────────────────
+
+    #[test]
+    fn search_mode_debug() {
+        let debug = format!("{:?}", SearchMode::Lexical);
+        assert!(debug.contains("Lexical"));
+    }
+
+    #[test]
+    fn search_mode_clone_copy_eq() {
+        let a = SearchMode::Hybrid;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(a, SearchMode::Lexical);
+    }
+
+    // ── ImportanceFilter trait coverage ────────────────────────────────
+
+    #[test]
+    fn importance_filter_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ImportanceFilter::Urgent).unwrap(),
+            "\"urgent\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ImportanceFilter::Any).unwrap(),
+            "\"any\""
+        );
+    }
+
+    #[test]
+    fn importance_filter_debug_clone_copy() {
+        let a = ImportanceFilter::High;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let debug = format!("{a:?}");
+        assert!(debug.contains("High"));
+    }
+
+    #[test]
+    fn importance_filter_eq_ne() {
+        assert_eq!(ImportanceFilter::Low, ImportanceFilter::Low);
+        assert_ne!(ImportanceFilter::Low, ImportanceFilter::Normal);
+    }
+
+    // ── DateRange trait coverage ──────────────────────────────────────
+
+    #[test]
+    fn date_range_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let range = DateRange {
+            start: Some(100),
+            end: Some(200),
+        };
+        let debug = format!("{range:?}");
+        assert!(debug.contains("DateRange"));
+        assert_clone(&range);
+    }
+
+    // ── SearchFilter trait coverage ──────────────────────────────────
+
+    #[test]
+    fn search_filter_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let filter = SearchFilter::default();
+        let debug = format!("{filter:?}");
+        assert!(debug.contains("SearchFilter"));
+        assert_clone(&filter);
+    }
+
+    #[test]
+    fn search_filter_importance_field() {
+        let filter = SearchFilter {
+            importance: Some(ImportanceFilter::Low),
+            ..SearchFilter::default()
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        let back: SearchFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.importance, Some(ImportanceFilter::Low));
+    }
+
+    // ── SearchQuery trait coverage ───────────────────────────────────
+
+    #[test]
+    fn search_query_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let q = SearchQuery::new("test");
+        let debug = format!("{q:?}");
+        assert!(debug.contains("SearchQuery"));
+        assert_clone(&q);
+    }
+
+    #[test]
+    fn search_query_new_from_string() {
+        let q = SearchQuery::new(String::from("owned string"));
+        assert_eq!(q.raw_query, "owned string");
+    }
+
+    #[test]
+    fn search_query_default_limit_is_20() {
+        let q = SearchQuery::new("x");
+        assert_eq!(q.limit, 20);
+    }
+
+    #[test]
+    fn search_query_chained_all_builders() {
+        let filter = SearchFilter {
+            sender: Some("Agent".to_owned()),
+            ..SearchFilter::default()
+        };
+        let q = SearchQuery::new("hello")
+            .with_mode(SearchMode::Semantic)
+            .with_limit(10)
+            .with_offset(5)
+            .with_explain()
+            .with_filters(filter);
+        assert_eq!(q.mode, SearchMode::Semantic);
+        assert_eq!(q.limit, 10);
+        assert_eq!(q.offset, 5);
+        assert!(q.explain);
+        assert_eq!(q.filters.sender.as_deref(), Some("Agent"));
+    }
+
+    // ── SearchMode invalid deserialize ───────────────────────────────
+
+    #[test]
+    fn search_mode_invalid_deserialize() {
+        let result = serde_json::from_str::<SearchMode>("\"invalid\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn importance_filter_invalid_deserialize() {
+        let result = serde_json::from_str::<ImportanceFilter>("\"critical\"");
+        assert!(result.is_err());
+    }
+
+    // ── SearchFilter doc_kind thread variant ─────────────────────────
+
+    #[test]
+    fn search_filter_doc_kind_thread() {
+        let filter = SearchFilter {
+            doc_kind: Some(DocKind::Thread),
+            ..SearchFilter::default()
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        let back: SearchFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.doc_kind, Some(DocKind::Thread));
+    }
+
+    // ── SearchFilter thread_id field ─────────────────────────────────
+
+    #[test]
+    fn search_filter_thread_id_field() {
+        let filter = SearchFilter {
+            thread_id: Some("br-42".to_owned()),
+            ..SearchFilter::default()
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        assert!(json.contains("br-42"));
+        let back: SearchFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.thread_id.as_deref(), Some("br-42"));
+    }
+
+    // ── SearchQuery empty raw_query ──────────────────────────────────
+
+    #[test]
+    fn search_query_empty_raw_query() {
+        let q = SearchQuery::new("");
+        assert!(q.raw_query.is_empty());
+        let json = serde_json::to_string(&q).unwrap();
+        let back: SearchQuery = serde_json::from_str(&json).unwrap();
+        assert!(back.raw_query.is_empty());
+    }
 }

@@ -675,4 +675,173 @@ mod tests {
         // short() should return "abc" (min of 12 and 3 = 3)
         assert_eq!(hash.short(), "abc");
     }
+
+    // ── SchemaField trait coverage ────────────────────────────────────
+
+    #[test]
+    fn schema_field_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let field = SchemaField {
+            name: "test".to_owned(),
+            field_type: "text".to_owned(),
+            indexed: true,
+        };
+        let debug = format!("{field:?}");
+        assert!(debug.contains("SchemaField"));
+        assert_clone(&field);
+    }
+
+    // ── IndexCheckpoint trait coverage ────────────────────────────────
+
+    #[test]
+    fn checkpoint_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let cp = IndexCheckpoint {
+            schema_hash: SchemaHash("test".to_owned()),
+            docs_indexed: 0,
+            started_ts: 0,
+            completed_ts: None,
+            max_version: 0,
+            success: false,
+        };
+        let debug = format!("{cp:?}");
+        assert!(debug.contains("IndexCheckpoint"));
+        assert_clone(&cp);
+    }
+
+    // ── SchemaHash trait coverage ─────────────────────────────────────
+
+    #[test]
+    fn schema_hash_eq_ne() {
+        let h1 = SchemaHash("abc".to_owned());
+        let h2 = SchemaHash("abc".to_owned());
+        let h3 = SchemaHash("def".to_owned());
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn schema_hash_clone() {
+        let h1 = SchemaHash("abc".to_owned());
+        let h2 = h1.clone();
+        assert_eq!(h1, h2);
+    }
+
+    // ── IndexScope trait coverage ─────────────────────────────────────
+
+    #[test]
+    fn index_scope_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let scope = IndexScope::Project { project_id: 1 };
+        let debug = format!("{scope:?}");
+        assert!(debug.contains("Project"));
+        assert_clone(&scope);
+    }
+
+    #[test]
+    fn index_scope_negative_ids() {
+        let scope = IndexScope::Project { project_id: -1 };
+        assert_eq!(scope.dir_name(), "project--1");
+        let scope2 = IndexScope::Product { product_id: -99 };
+        assert_eq!(scope2.dir_name(), "product--99");
+    }
+
+    // ── ensure_dirs idempotent ────────────────────────────────────────
+
+    #[test]
+    fn ensure_dirs_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash::compute(&sample_fields());
+
+        // Call twice — should not fail
+        layout.ensure_dirs(&scope, &schema).unwrap();
+        layout.ensure_dirs(&scope, &schema).unwrap();
+        assert!(layout.lexical_dir(&scope, &schema).exists());
+    }
+
+    // ── activate replaces existing symlink ────────────────────────────
+
+    #[test]
+    fn activate_replaces_existing_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Project { project_id: 1 };
+
+        let schema1 = SchemaHash("schema111111111".to_owned());
+        let schema2 = SchemaHash("schema222222222".to_owned());
+
+        layout.ensure_dirs(&scope, &schema1).unwrap();
+        layout.ensure_dirs(&scope, &schema2).unwrap();
+
+        layout.activate(&scope, "lexical", &schema1).unwrap();
+        assert_eq!(
+            layout.active_schema(&scope, "lexical").unwrap(),
+            schema1.short()
+        );
+
+        layout.activate(&scope, "lexical", &schema2).unwrap();
+        assert_eq!(
+            layout.active_schema(&scope, "lexical").unwrap(),
+            schema2.short()
+        );
+    }
+
+    // ── SchemaField variations ────────────────────────────────────────
+
+    #[test]
+    fn schema_field_various_types() {
+        for ftype in ["text", "i64", "u64", "bytes", "f64", "bool"] {
+            let field = SchemaField {
+                name: "f".to_owned(),
+                field_type: ftype.to_owned(),
+                indexed: true,
+            };
+            let json = serde_json::to_string(&field).unwrap();
+            let back: SchemaField = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.field_type, ftype);
+        }
+    }
+
+    // ── SchemaHash compute single field ───────────────────────────────
+
+    #[test]
+    fn schema_hash_single_field() {
+        let fields = vec![SchemaField {
+            name: "id".to_owned(),
+            field_type: "i64".to_owned(),
+            indexed: true,
+        }];
+        let hash = SchemaHash::compute(&fields);
+        assert_eq!(hash.0.len(), 64);
+        assert!(hash.0.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── is_schema_compatible with no active ───────────────────────────
+
+    #[test]
+    fn is_schema_compatible_no_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash::compute(&sample_fields());
+        // No active link exists → compatible
+        assert!(layout.is_schema_compatible(&scope, "lexical", &schema));
+    }
+
+    // ── IndexScope eq + hash ──────────────────────────────────────────
+
+    #[test]
+    fn index_scope_eq() {
+        assert_eq!(
+            IndexScope::Project { project_id: 42 },
+            IndexScope::Project { project_id: 42 }
+        );
+        assert_ne!(
+            IndexScope::Project { project_id: 1 },
+            IndexScope::Project { project_id: 2 }
+        );
+        assert_ne!(IndexScope::Project { project_id: 1 }, IndexScope::Global);
+    }
 }

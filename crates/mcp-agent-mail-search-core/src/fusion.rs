@@ -758,4 +758,204 @@ mod tests {
         // Higher lexical score wins tiebreak
         assert_eq!(result.hits[0].doc_id, 2);
     }
+
+    // ── Trait coverage ────────────────────────────────────────────────
+
+    #[test]
+    fn rrf_config_debug_clone_copy() {
+        let cfg = RrfConfig::default();
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("RrfConfig"));
+        let copied = cfg; // Copy
+        assert_eq!(copied, cfg);
+    }
+
+    #[test]
+    fn source_contribution_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let sc = SourceContribution {
+            source: "lexical".to_string(),
+            contribution: 0.01,
+            rank: Some(1),
+        };
+        let debug = format!("{sc:?}");
+        assert!(debug.contains("SourceContribution"));
+        assert_clone(&sc);
+    }
+
+    #[test]
+    fn fusion_explain_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let fe = FusionExplain {
+            lexical_rank: None,
+            lexical_score: None,
+            semantic_rank: None,
+            semantic_score: None,
+            rrf_score: 0.0,
+            source_contributions: vec![],
+        };
+        let debug = format!("{fe:?}");
+        assert!(debug.contains("FusionExplain"));
+        assert_clone(&fe);
+    }
+
+    #[test]
+    fn fused_hit_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let hit = FusedHit {
+            doc_id: 1,
+            rrf_score: 0.01,
+            first_source: CandidateSource::Lexical,
+            explain: FusionExplain {
+                lexical_rank: Some(1),
+                lexical_score: Some(0.9),
+                semantic_rank: None,
+                semantic_score: None,
+                rrf_score: 0.01,
+                source_contributions: vec![],
+            },
+        };
+        let debug = format!("{hit:?}");
+        assert!(debug.contains("FusedHit"));
+        assert_clone(&hit);
+    }
+
+    #[test]
+    fn fusion_result_debug_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let result = FusionResult {
+            config: RrfConfig::default(),
+            input_count: 0,
+            total_fused: 0,
+            hits: vec![],
+            offset_applied: 0,
+            limit_applied: 100,
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("FusionResult"));
+        assert_clone(&result);
+    }
+
+    // ── Constants ─────────────────────────────────────────────────────
+
+    #[test]
+    fn default_rrf_k_value() {
+        assert!((DEFAULT_RRF_K - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rrf_k_env_var_name() {
+        assert_eq!(RRF_K_ENV_VAR, "AM_SEARCH_RRF_K");
+    }
+
+    // ── rrf_contribution edge cases ──────────────────────────────────
+
+    #[test]
+    fn rrf_contribution_large_rank() {
+        let k = 60.0;
+        let contrib = rrf_contribution(k, Some(1_000_000));
+        assert!(contrib > 0.0);
+        assert!(contrib < 1e-5);
+    }
+
+    // ── fused_hit_cmp tiebreaker paths ───────────────────────────────
+
+    #[test]
+    fn fused_hit_cmp_rrf_score_primary() {
+        let a = FusedHit {
+            doc_id: 1,
+            rrf_score: 0.5,
+            first_source: CandidateSource::Lexical,
+            explain: FusionExplain {
+                lexical_rank: None,
+                lexical_score: None,
+                semantic_rank: None,
+                semantic_score: None,
+                rrf_score: 0.5,
+                source_contributions: vec![],
+            },
+        };
+        let b = FusedHit {
+            doc_id: 2,
+            rrf_score: 0.9,
+            first_source: CandidateSource::Lexical,
+            explain: FusionExplain {
+                lexical_rank: None,
+                lexical_score: None,
+                semantic_rank: None,
+                semantic_score: None,
+                rrf_score: 0.9,
+                source_contributions: vec![],
+            },
+        };
+        // b has higher RRF, so a should be Greater (b comes first in descending order)
+        assert_eq!(fused_hit_cmp(&a, &b, 1e-9), Ordering::Greater);
+    }
+
+    #[test]
+    fn fused_hit_cmp_doc_id_fallback() {
+        let a = FusedHit {
+            doc_id: 10,
+            rrf_score: 0.5,
+            first_source: CandidateSource::Lexical,
+            explain: FusionExplain {
+                lexical_rank: None,
+                lexical_score: Some(0.5),
+                semantic_rank: None,
+                semantic_score: None,
+                rrf_score: 0.5,
+                source_contributions: vec![],
+            },
+        };
+        let b = FusedHit {
+            doc_id: 20,
+            rrf_score: 0.5,
+            first_source: CandidateSource::Lexical,
+            explain: FusionExplain {
+                lexical_rank: None,
+                lexical_score: Some(0.5),
+                semantic_rank: None,
+                semantic_score: None,
+                rrf_score: 0.5,
+                source_contributions: vec![],
+            },
+        };
+        // Same RRF, same lexical, doc_id ascending: 10 < 20
+        assert_eq!(fused_hit_cmp(&a, &b, 1e-9), Ordering::Less);
+    }
+
+    // ── Large candidate set ──────────────────────────────────────────
+
+    #[test]
+    fn fuse_rrf_large_set() {
+        let candidates: Vec<_> = (1..=100)
+            .map(|i| {
+                make_candidate(
+                    i,
+                    Some(i as usize),
+                    Some((101 - i) as usize),
+                    Some(1.0 / i as f64),
+                    Some(i as f64 / 100.0),
+                )
+            })
+            .collect();
+        let result = fuse_rrf_default(&candidates);
+        assert_eq!(result.total_fused, 100);
+        assert_eq!(result.input_count, 100);
+        // First hit should have highest RRF
+        for i in 0..result.hits.len() - 1 {
+            assert!(result.hits[i].rrf_score >= result.hits[i + 1].rrf_score - 1e-9);
+        }
+    }
+
+    // ── RrfConfig from_env defaults ──────────────────────────────────
+
+    #[test]
+    fn rrf_config_from_env_defaults() {
+        // With no env var set, should use defaults
+        let cfg = RrfConfig::from_env();
+        // k should be DEFAULT_RRF_K unless env var is set
+        assert!(cfg.k > 0.0);
+        assert!(cfg.epsilon > 0.0);
+    }
 }
