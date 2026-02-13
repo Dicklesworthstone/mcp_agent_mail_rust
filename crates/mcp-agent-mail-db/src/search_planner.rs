@@ -814,18 +814,13 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
 fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let limit = query.effective_limit();
     let scope_label = scope_policy_label(&query.scope);
-    let sanitized = if query.text.is_empty() {
-        None
-    } else {
-        sanitize_fts_query(&query.text)
-    };
 
-    let method = if sanitized.is_some() {
-        PlanMethod::Fts
-    } else if !query.text.is_empty() {
-        PlanMethod::Like
-    } else {
+    // Identity FTS tables (fts_agents) are dropped at runtime by
+    // enforce_runtime_identity_fts_cleanup, so always use LIKE fallback.
+    let method = if query.text.is_empty() {
         PlanMethod::Empty
+    } else {
+        PlanMethod::Like
     };
 
     if method == PlanMethod::Empty {
@@ -837,40 +832,24 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let mut facets_applied: Vec<String> = Vec::new();
     let mut scope_enforced = false;
 
-    let (select_cols, from_clause, order_clause) = match method {
-        PlanMethod::Fts => {
-            let fts_text = sanitized.as_ref().unwrap();
-            where_clauses.push("fts_agents MATCH ?".to_string());
-            params.push(PlanParam::Text(fts_text.clone()));
-            (
-                "a.id, a.name, a.task_description, a.project_id, \
-                 bm25(fts_agents, 10.0, 1.0) AS score"
-                    .to_string(),
-                "fts_agents JOIN agents a ON a.id = fts_agents.agent_id".to_string(),
-                "ORDER BY score ASC, a.id ASC".to_string(),
-            )
+    let (select_cols, from_clause, order_clause) = {
+        let terms = extract_like_terms(&query.text, 5);
+        let mut like_parts = Vec::new();
+        for term in &terms {
+            let escaped = term.replace('%', "\\%").replace('_', "\\_");
+            like_parts.push(
+                "(a.name LIKE ? ESCAPE '\\' OR a.task_description LIKE ? ESCAPE '\\')".to_string(),
+            );
+            let pattern = format!("%{escaped}%");
+            params.push(PlanParam::Text(pattern.clone()));
+            params.push(PlanParam::Text(pattern));
         }
-        PlanMethod::Like => {
-            let terms = extract_like_terms(&query.text, 5);
-            let mut like_parts = Vec::new();
-            for term in &terms {
-                let escaped = term.replace('%', "\\%").replace('_', "\\_");
-                like_parts.push(
-                    "(a.name LIKE ? ESCAPE '\\' OR a.task_description LIKE ? ESCAPE '\\')"
-                        .to_string(),
-                );
-                let pattern = format!("%{escaped}%");
-                params.push(PlanParam::Text(pattern.clone()));
-                params.push(PlanParam::Text(pattern));
-            }
-            where_clauses.push(like_parts.join(" AND "));
-            (
-                "a.id, a.name, a.task_description, a.project_id, 0.0 AS score".to_string(),
-                "agents a".to_string(),
-                "ORDER BY a.id ASC".to_string(),
-            )
-        }
-        _ => unreachable!(),
+        where_clauses.push(like_parts.join(" AND "));
+        (
+            "a.id, a.name, a.task_description, a.project_id, 0.0 AS score".to_string(),
+            "agents a".to_string(),
+            "ORDER BY a.id ASC".to_string(),
+        )
     };
 
     if let Some(pid) = query.project_id {
@@ -908,7 +887,7 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
         sql,
         params,
         method,
-        normalized_query: sanitized,
+        normalized_query: None,
         facets_applied,
         scope_enforced,
         scope_label,
@@ -918,18 +897,13 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
 fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     let limit = query.effective_limit();
     let scope_label = scope_policy_label(&query.scope);
-    let sanitized = if query.text.is_empty() {
-        None
-    } else {
-        sanitize_fts_query(&query.text)
-    };
 
-    let method = if sanitized.is_some() {
-        PlanMethod::Fts
-    } else if !query.text.is_empty() {
-        PlanMethod::Like
-    } else {
+    // Identity FTS tables (fts_projects) are dropped at runtime by
+    // enforce_runtime_identity_fts_cleanup, so always use LIKE fallback.
+    let method = if query.text.is_empty() {
         PlanMethod::Empty
+    } else {
+        PlanMethod::Like
     };
 
     if method == PlanMethod::Empty {
@@ -941,37 +915,23 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     let mut facets_applied: Vec<String> = Vec::new();
     let mut scope_enforced = false;
 
-    let (select_cols, from_clause, order_clause) = match method {
-        PlanMethod::Fts => {
-            let fts_text = sanitized.as_ref().unwrap();
-            where_clauses.push("fts_projects MATCH ?".to_string());
-            params.push(PlanParam::Text(fts_text.clone()));
-            (
-                "p.id, p.slug, p.human_key, bm25(fts_projects, 10.0, 1.0) AS score".to_string(),
-                "fts_projects JOIN projects p ON p.id = fts_projects.project_id".to_string(),
-                "ORDER BY score ASC, p.id ASC".to_string(),
-            )
+    let (select_cols, from_clause, order_clause) = {
+        let terms = extract_like_terms(&query.text, 5);
+        let mut like_parts = Vec::new();
+        for term in &terms {
+            let escaped = term.replace('%', "\\%").replace('_', "\\_");
+            like_parts
+                .push("(p.slug LIKE ? ESCAPE '\\' OR p.human_key LIKE ? ESCAPE '\\')".to_string());
+            let pattern = format!("%{escaped}%");
+            params.push(PlanParam::Text(pattern.clone()));
+            params.push(PlanParam::Text(pattern));
         }
-        PlanMethod::Like => {
-            let terms = extract_like_terms(&query.text, 5);
-            let mut like_parts = Vec::new();
-            for term in &terms {
-                let escaped = term.replace('%', "\\%").replace('_', "\\_");
-                like_parts.push(
-                    "(p.slug LIKE ? ESCAPE '\\' OR p.human_key LIKE ? ESCAPE '\\')".to_string(),
-                );
-                let pattern = format!("%{escaped}%");
-                params.push(PlanParam::Text(pattern.clone()));
-                params.push(PlanParam::Text(pattern));
-            }
-            where_clauses.push(like_parts.join(" AND "));
-            (
-                "p.id, p.slug, p.human_key, 0.0 AS score".to_string(),
-                "projects p".to_string(),
-                "ORDER BY p.id ASC".to_string(),
-            )
-        }
-        _ => unreachable!(),
+        where_clauses.push(like_parts.join(" AND "));
+        (
+            "p.id, p.slug, p.human_key, 0.0 AS score".to_string(),
+            "projects p".to_string(),
+            "ORDER BY p.id ASC".to_string(),
+        )
     };
 
     // Scope enforcement for ProjectSet
@@ -1003,7 +963,7 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
         sql,
         params,
         method,
-        normalized_query: sanitized,
+        normalized_query: None,
         facets_applied,
         scope_enforced,
         scope_label,
@@ -1448,11 +1408,13 @@ mod tests {
     // ── plan_search: agent search ──────────────────────────────────
 
     #[test]
-    fn plan_agent_fts() {
+    fn plan_agent_uses_like_fallback() {
+        // Identity FTS tables (fts_agents) are dropped at runtime, so agent
+        // searches must always use LIKE fallback.
         let q = SearchQuery::agents("blue", 1);
         let plan = plan_search(&q);
-        assert_eq!(plan.method, PlanMethod::Fts);
-        assert!(plan.sql.contains("fts_agents MATCH ?"));
+        assert_eq!(plan.method, PlanMethod::Like);
+        assert!(plan.sql.contains("a.name LIKE ?"));
         assert!(plan.sql.contains("a.project_id = ?"));
     }
 
@@ -1466,11 +1428,13 @@ mod tests {
     // ── plan_search: project search ────────────────────────────────
 
     #[test]
-    fn plan_project_fts() {
+    fn plan_project_uses_like_fallback() {
+        // Identity FTS tables (fts_projects) are dropped at runtime, so project
+        // searches must always use LIKE fallback.
         let q = SearchQuery::projects("my-proj");
         let plan = plan_search(&q);
-        assert_eq!(plan.method, PlanMethod::Fts);
-        assert!(plan.sql.contains("fts_projects MATCH ?"));
+        assert_eq!(plan.method, PlanMethod::Like);
+        assert!(plan.sql.contains("p.slug LIKE ?"));
     }
 
     #[test]

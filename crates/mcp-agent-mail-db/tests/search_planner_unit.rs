@@ -117,17 +117,19 @@ fn method_empty_for_project_no_text() {
 }
 
 #[test]
-fn method_fts_for_agent_with_text() {
+fn method_like_for_agent_with_text() {
+    // Identity FTS tables are dropped at runtime, so agent searches use LIKE.
     let plan = plan_search(&SearchQuery::agents("blue", 1));
-    assert_eq!(plan.method, PlanMethod::Fts);
-    assert!(plan.sql.contains("fts_agents MATCH"));
+    assert_eq!(plan.method, PlanMethod::Like);
+    assert!(plan.sql.contains("a.name LIKE ?"));
 }
 
 #[test]
-fn method_fts_for_project_with_text() {
+fn method_like_for_project_with_text() {
+    // Identity FTS tables are dropped at runtime, so project searches use LIKE.
     let plan = plan_search(&SearchQuery::projects("myproj"));
-    assert_eq!(plan.method, PlanMethod::Fts);
-    assert!(plan.sql.contains("fts_projects MATCH"));
+    assert_eq!(plan.method, PlanMethod::Like);
+    assert!(plan.sql.contains("p.slug LIKE ?"));
 }
 
 #[test]
@@ -516,21 +518,23 @@ fn ranking_filter_only_both_modes_use_recency() {
 }
 
 #[test]
-fn ranking_agent_search_orders_by_score_or_id() {
+fn ranking_agent_search_orders_by_id() {
+    // Agent search uses LIKE fallback (no FTS), so ordering is by id.
     let plan = plan_search(&SearchQuery::agents("blue", 1));
     assert!(
-        plan.sql.contains("ORDER BY score ASC, a.id ASC"),
-        "agent FTS should order by score: {}",
+        plan.sql.contains("ORDER BY a.id ASC"),
+        "agent LIKE should order by id: {}",
         plan.sql
     );
 }
 
 #[test]
-fn ranking_project_search_orders_by_score_or_id() {
+fn ranking_project_search_orders_by_id() {
+    // Project search uses LIKE fallback (no FTS), so ordering is by id.
     let plan = plan_search(&SearchQuery::projects("proj"));
     assert!(
-        plan.sql.contains("ORDER BY score ASC, p.id ASC"),
-        "project FTS should order by score: {}",
+        plan.sql.contains("ORDER BY p.id ASC"),
+        "project LIKE should order by id: {}",
         plan.sql
     );
 }
