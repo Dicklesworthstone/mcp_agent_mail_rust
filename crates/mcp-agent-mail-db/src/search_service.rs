@@ -411,10 +411,11 @@ pub struct SemanticIndexingSnapshot {
 
 #[cfg(feature = "hybrid")]
 fn get_or_init_semantic_bridge() -> Option<Arc<SemanticBridge>> {
-    if get_semantic_bridge().is_none() {
-        let _ = init_semantic_bridge_default();
-    }
-    get_semantic_bridge()
+    // Use OnceLock::get_or_init for atomic, race-free initialization.
+    // Only one SemanticBridge is created even under concurrent access.
+    SEMANTIC_BRIDGE
+        .get_or_init(|| Some(Arc::new(SemanticBridge::default_config())))
+        .clone()
 }
 
 /// Build a `VectorFilter` from a `SearchQuery`.
@@ -714,6 +715,7 @@ impl TwoTierBridge {
             .into_iter()
             .map(f16::from_f32)
             .collect::<Vec<_>>();
+        let has_quality = quality_embedding.is_some();
         let quality_embedding_f16 = quality_embedding
             .unwrap_or_else(|| vec![0.0; self.config.quality_dimension])
             .into_iter()
@@ -733,6 +735,7 @@ impl TwoTierBridge {
             project_id,
             fast_embedding: fast_embedding_f16,
             quality_embedding: quality_embedding_f16,
+            has_quality,
         };
 
         // Add to index
@@ -756,7 +759,18 @@ impl Default for TwoTierBridge {
 /// Initialize the global two-tier semantic bridge.
 ///
 /// This automatically detects available embedders. No configuration needed.
+///
+/// # Deprecation
+///
+/// Prefer using the atomic `get_or_init_two_tier_bridge()` function instead,
+/// which handles concurrent initialization safely. This function is retained
+/// for backward compatibility but may create duplicate bridges under concurrent
+/// access (the extras are silently dropped by `OnceLock::set`).
 #[cfg(feature = "hybrid")]
+#[deprecated(
+    since = "0.1.0",
+    note = "Use get_or_init_two_tier_bridge() for thread-safe initialization"
+)]
 pub fn init_two_tier_bridge() -> Result<(), String> {
     let bridge = TwoTierBridge::new();
     let _ = TWO_TIER_BRIDGE.set(Some(Arc::new(bridge)));
@@ -769,17 +783,26 @@ pub fn get_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
     TWO_TIER_BRIDGE.get().and_then(std::clone::Clone::clone)
 }
 
+/// Get or atomically initialize the global two-tier bridge.
+///
+/// This is safe for concurrent calls - only one `TwoTierBridge` will ever be created,
+/// avoiding the race condition where multiple threads could each create an expensive
+/// bridge instance before `OnceLock::set` silently drops the extras.
+#[cfg(feature = "hybrid")]
+fn get_or_init_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
+    TWO_TIER_BRIDGE
+        .get_or_init(|| Some(Arc::new(TwoTierBridge::new())))
+        .clone()
+}
+
 /// Try executing semantic candidate retrieval using two-tier system.
 ///
 /// Prefers the two-tier bridge if available, falls back to legacy `SemanticBridge`.
 #[cfg(feature = "hybrid")]
 fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchResult>> {
-    // Try two-tier bridge first (auto-initialized, no manual setup)
-    let bridge = get_two_tier_bridge().or_else(|| {
-        let _ = init_two_tier_bridge();
-        get_two_tier_bridge()
-    });
-    if let Some(bridge) = bridge {
+    // Use atomic get_or_init pattern to avoid race condition on initialization.
+    // Only one TwoTierBridge instance is ever created under concurrent access.
+    if let Some(bridge) = get_or_init_two_tier_bridge() {
         if bridge.is_available() {
             let results = bridge.search(query, limit);
             if !results.is_empty() {
@@ -1582,6 +1605,7 @@ mod tests {
             project_id: Some(42),
             fast_embedding: vec![half::f16::from_f32(0.01); config.fast_dimension],
             quality_embedding: vec![half::f16::from_f32(0.02); config.quality_dimension],
+            has_quality: true,
         };
 
         index
@@ -1625,5 +1649,41 @@ mod tests {
         let query = SearchQuery::messages("auto-init semantic bridge", 1);
         let _ = try_two_tier_search(&query, query.effective_limit());
         assert!(get_two_tier_bridge().is_some());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn get_or_init_two_tier_bridge_is_thread_safe() {
+        // Verify that concurrent calls to get_or_init_two_tier_bridge all return
+        // the same Arc instance (pointer equality), proving no duplicate bridges
+        // are created under concurrent access.
+        use std::thread;
+
+        let barrier = Arc::new(std::sync::Barrier::new(10));
+        let pointers: Vec<_> = (0..10)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    // All threads wait here, then race to initialize
+                    barrier.wait();
+                    get_or_init_two_tier_bridge().map(|arc| Arc::as_ptr(&arc) as usize)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = pointers.into_iter().filter_map(|h| h.join().ok()).collect();
+
+        // All threads should have gotten Some(bridge)
+        assert!(
+            results.iter().all(|r| r.is_some()),
+            "all threads should get a bridge"
+        );
+
+        // All pointers should be equal (same Arc instance)
+        let first_ptr = results[0].unwrap();
+        assert!(
+            results.iter().all(|r| r.unwrap() == first_ptr),
+            "all threads should get the same Arc<TwoTierBridge> instance"
+        );
     }
 }
