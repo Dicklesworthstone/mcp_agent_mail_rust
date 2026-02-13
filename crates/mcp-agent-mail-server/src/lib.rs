@@ -46,6 +46,7 @@ pub mod tui_app;
 pub mod tui_bridge;
 pub mod tui_chrome;
 pub mod tui_events;
+pub mod tui_focus;
 pub mod tui_keymap;
 pub mod tui_layout;
 #[allow(

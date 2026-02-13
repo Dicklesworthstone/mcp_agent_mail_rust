@@ -1134,9 +1134,9 @@ fn render_detail_panel(
     lines.push(String::new()); // Blank separator
     lines.push("--- Body ---".to_string());
 
-    // Render message body with GFM markdown support
-    let theme = ftui_extras::markdown::MarkdownTheme::default();
-    let body_text = crate::tui_markdown::render_body(&msg.body_md, &theme);
+    // Render message body with GFM markdown support using current TUI theme
+    let md_theme = crate::tui_theme::markdown_theme();
+    let body_text = crate::tui_markdown::render_body(&msg.body_md, &md_theme);
     let body_height = body_text.height();
 
     // Build header as plain text lines

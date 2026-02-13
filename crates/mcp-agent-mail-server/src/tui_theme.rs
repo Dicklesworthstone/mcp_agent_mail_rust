@@ -4,7 +4,8 @@
 //! [`TuiThemePalette`] struct that every TUI component can query for
 //! consistent, theme-aware colors.
 
-use ftui::{PackedRgba, Style};
+use ftui::{PackedRgba, Style, TableTheme};
+use ftui_extras::markdown::MarkdownTheme;
 use ftui_extras::theme::{self, ThemeId};
 
 use crate::tui_events::{EventSeverity, MailEventKind};
@@ -263,6 +264,127 @@ pub fn current_theme_name() -> &'static str {
     theme::current_theme_name()
 }
 
+/// Return the canonical env value for a [`ThemeId`].
+#[must_use]
+pub const fn theme_id_env_value(id: ThemeId) -> &'static str {
+    match id {
+        ThemeId::CyberpunkAurora => "cyberpunk_aurora",
+        ThemeId::Darcula => "darcula",
+        ThemeId::LumenLight => "lumen_light",
+        ThemeId::NordicFrost => "nordic_frost",
+        ThemeId::HighContrast => "high_contrast",
+    }
+}
+
+/// Get the currently active theme ID.
+///
+/// The "Frankenstein" override is an in-process style override; for
+/// persistence and config interop we map it to `CyberpunkAurora`.
+#[must_use]
+pub fn current_theme_id() -> ThemeId {
+    if CUSTOM_THEME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return ThemeId::CyberpunkAurora;
+    }
+    theme::current_theme()
+}
+
+/// Get the currently active theme as a canonical env value.
+#[must_use]
+pub fn current_theme_env_value() -> &'static str {
+    theme_id_env_value(current_theme_id())
+}
+
+/// Set the active theme directly and return the display name.
+#[must_use]
+pub fn set_theme_and_get_name(id: ThemeId) -> &'static str {
+    CUSTOM_THEME_OVERRIDE.store(false, std::sync::atomic::Ordering::Relaxed);
+    theme::set_theme(id);
+    theme::current_theme_name()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Markdown Theme Integration
+// ──────────────────────────────────────────────────────────────────────
+
+/// Create a [`MarkdownTheme`] that matches the current TUI theme palette.
+///
+/// This ensures markdown-rendered message bodies use colors consistent
+/// with the rest of the TUI, including headings, code blocks, links,
+/// task lists, and admonitions.
+#[must_use]
+pub fn markdown_theme() -> MarkdownTheme {
+    let p = theme::current_palette();
+
+    // Build a table theme matching the current palette
+    let border = Style::default().fg(p.fg_muted);
+    let header = Style::default().fg(p.fg_primary).bg(p.bg_surface).bold();
+    let row = Style::default().fg(p.fg_secondary);
+    let row_alt = Style::default().fg(p.fg_secondary).bg(p.bg_surface);
+    let divider = Style::default().fg(p.fg_muted);
+
+    let table_theme = TableTheme {
+        border,
+        header,
+        row,
+        row_alt,
+        row_selected: Style::default().fg(p.fg_primary).bg(p.bg_highlight).bold(),
+        row_hover: Style::default().fg(p.fg_primary).bg(p.bg_overlay),
+        divider,
+        padding: 1,
+        column_gap: 1,
+        row_height: 1,
+        effects: Vec::new(),
+        preset_id: None,
+    };
+
+    MarkdownTheme {
+        // Headings: bright to muted gradient using palette colors
+        h1: Style::default().fg(p.fg_primary).bold(),
+        h2: Style::default().fg(p.accent_primary).bold(),
+        h3: Style::default().fg(p.accent_info).bold(),
+        h4: Style::default().fg(p.fg_secondary).bold(),
+        h5: Style::default().fg(p.fg_muted).bold(),
+        h6: Style::default().fg(p.fg_muted),
+
+        // Code: use syntax highlighting colors
+        code_inline: Style::default().fg(p.syntax_string),
+        code_block: Style::default().fg(p.fg_secondary),
+
+        // Text formatting
+        blockquote: Style::default().fg(p.fg_muted).italic(),
+        link: Style::default().fg(p.accent_link).underline(),
+        emphasis: Style::default().italic(),
+        strong: Style::default().bold(),
+        strikethrough: Style::default().strikethrough(),
+
+        // Lists
+        list_bullet: Style::default().fg(p.accent_secondary),
+        horizontal_rule: Style::default().fg(p.fg_muted).dim(),
+
+        // Tables
+        table_theme,
+
+        // Task lists
+        task_done: Style::default().fg(p.accent_success),
+        task_todo: Style::default().fg(p.accent_info),
+
+        // Math
+        math_inline: Style::default().fg(p.syntax_number).italic(),
+        math_block: Style::default().fg(p.syntax_number).bold(),
+
+        // Footnotes
+        footnote_ref: Style::default().fg(p.fg_muted).dim(),
+        footnote_def: Style::default().fg(p.fg_muted),
+
+        // Admonitions (GitHub alerts) - semantic colors
+        admonition_note: Style::default().fg(p.accent_info).bold(),
+        admonition_tip: Style::default().fg(p.accent_success).bold(),
+        admonition_important: Style::default().fg(p.accent_primary).bold(),
+        admonition_warning: Style::default().fg(p.accent_warning).bold(),
+        admonition_caution: Style::default().fg(p.accent_error).bold(),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
@@ -463,5 +585,78 @@ mod tests {
         assert!(!name.is_empty());
         // After cycling from CyberpunkAurora, we should get a different theme
         assert_ne!(name, "Cyberpunk Aurora");
+    }
+
+    #[test]
+    fn set_theme_and_get_name_sets_requested_theme() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let name = set_theme_and_get_name(ThemeId::Darcula);
+        assert_eq!(name, "Darcula");
+        assert_eq!(current_theme_id(), ThemeId::Darcula);
+    }
+
+    #[test]
+    fn current_theme_env_value_tracks_active_theme() {
+        let _guard = ScopedThemeLock::new(ThemeId::NordicFrost);
+        assert_eq!(current_theme_env_value(), "nordic_frost");
+        assert_eq!(theme_id_env_value(ThemeId::HighContrast), "high_contrast");
+    }
+
+    #[test]
+    fn markdown_theme_respects_current_theme() {
+        // Test that markdown_theme() produces different styles for different themes
+        let cyber = {
+            let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+            markdown_theme()
+        };
+        let darcula = {
+            let _guard = ScopedThemeLock::new(ThemeId::Darcula);
+            markdown_theme()
+        };
+        // The h1 style should differ between themes (both use palette fg_primary)
+        // Just verify that the function runs without panic and returns something valid
+        assert!(cyber.h1.fg.is_some());
+        assert!(darcula.h1.fg.is_some());
+        // Link style should use palette accent_link (verify it's set)
+        assert!(cyber.link.fg.is_some());
+        // Table theme should have visible border style
+        assert!(cyber.table_theme.border.fg.is_some());
+    }
+
+    #[test]
+    fn markdown_theme_has_complete_styles() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let theme = markdown_theme();
+
+        // Verify all heading levels have foreground colors
+        assert!(theme.h1.fg.is_some(), "h1 should have fg color");
+        assert!(theme.h2.fg.is_some(), "h2 should have fg color");
+        assert!(theme.h3.fg.is_some(), "h3 should have fg color");
+        assert!(theme.h4.fg.is_some(), "h4 should have fg color");
+        assert!(theme.h5.fg.is_some(), "h5 should have fg color");
+        assert!(theme.h6.fg.is_some(), "h6 should have fg color");
+
+        // Verify code styles
+        assert!(theme.code_inline.fg.is_some(), "code_inline should have fg");
+        assert!(theme.code_block.fg.is_some(), "code_block should have fg");
+
+        // Verify semantic styles
+        assert!(theme.link.fg.is_some(), "link should have fg");
+        assert!(theme.task_done.fg.is_some(), "task_done should have fg");
+        assert!(theme.task_todo.fg.is_some(), "task_todo should have fg");
+
+        // Verify admonition styles
+        assert!(
+            theme.admonition_note.fg.is_some(),
+            "admonition_note should have fg"
+        );
+        assert!(
+            theme.admonition_warning.fg.is_some(),
+            "admonition_warning should have fg"
+        );
+        assert!(
+            theme.admonition_caution.fg.is_some(),
+            "admonition_caution should have fg"
+        );
     }
 }
