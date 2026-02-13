@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP Agent Mail - Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="description" content="Browser-based dashboard for MCP Agent Mail - monitor agents, messages, and reservations in real-time">
+    <meta name="theme-color" content="#1a1a2e">
+</head>
+<body>
+    <!-- Connection Status Banner -->
+    <header id="status-bar">
+        <div class="status-indicator" id="connection-status">
+            <span class="status-dot disconnected"></span>
+            <span class="status-text">Disconnected</span>
+        </div>
+        <div class="server-info" id="server-info">
+            <span>Server: <code id="server-url">--</code></span>
+        </div>
+        <div class="screen-info" id="screen-info">
+            <span>Screen: <code id="current-screen">--</code></span>
+        </div>
+    </header>
+
+    <!-- Main Terminal Container -->
+    <main id="terminal-container">
+        <canvas id="terminal" tabindex="0"></canvas>
+
+        <!-- Loading Overlay -->
+        <div id="loading-overlay" class="overlay">
+            <div class="spinner"></div>
+            <p>Loading Agent Mail Dashboard...</p>
+        </div>
+
+        <!-- Error Overlay -->
+        <div id="error-overlay" class="overlay hidden">
+            <div class="error-icon">!</div>
+            <p id="error-message">Connection failed</p>
+            <button id="retry-button">Retry</button>
+        </div>
+    </main>
+
+    <!-- Control Bar -->
+    <footer id="control-bar">
+        <div class="controls-left">
+            <button id="btn-connect" class="control-btn" title="Connect to server">
+                Connect
+            </button>
+            <button id="btn-disconnect" class="control-btn hidden" title="Disconnect from server">
+                Disconnect
+            </button>
+        </div>
+        <div class="controls-center">
+            <span class="help-hint">Press <kbd>?</kbd> for help | <kbd>Ctrl+P</kbd> command palette</span>
+        </div>
+        <div class="controls-right">
+            <button id="btn-fullscreen" class="control-btn" title="Toggle fullscreen">
+                Fullscreen
+            </button>
+            <button id="btn-settings" class="control-btn" title="Settings">
+                Settings
+            </button>
+        </div>
+    </footer>
+
+    <!-- Settings Modal -->
+    <dialog id="settings-modal">
+        <h2>Settings</h2>
+        <form id="settings-form">
+            <fieldset>
+                <legend>Connection</legend>
+                <label>
+                    <span>WebSocket URL:</span>
+                    <input type="url" id="setting-ws-url" placeholder="ws://127.0.0.1:8765/ws" />
+                </label>
+            </fieldset>
+            <fieldset>
+                <legend>Display</legend>
+                <label>
+                    <span>Font Size:</span>
+                    <input type="number" id="setting-font-size" min="8" max="32" value="14" />
+                </label>
+                <label>
+                    <input type="checkbox" id="setting-high-contrast" />
+                    <span>High Contrast Mode</span>
+                </label>
+                <label>
+                    <input type="checkbox" id="setting-debug" />
+                    <span>Show Debug Overlay</span>
+                </label>
+            </fieldset>
+            <div class="modal-actions">
+                <button type="button" id="settings-cancel">Cancel</button>
+                <button type="submit">Save</button>
+            </div>
+        </form>
+    </dialog>
+
+    <!-- Debug Overlay (hidden by default) -->
+    <div id="debug-overlay" class="hidden">
+        <div class="debug-stat">
+            <span class="debug-label">FPS:</span>
+            <span class="debug-value" id="debug-fps">--</span>
+        </div>
+        <div class="debug-stat">
+            <span class="debug-label">Latency:</span>
+            <span class="debug-value" id="debug-latency">--ms</span>
+        </div>
+        <div class="debug-stat">
+            <span class="debug-label">Messages:</span>
+            <span class="debug-value" id="debug-messages">0</span>
+        </div>
+    </div>
+
+    <!-- Load WASM module -->
+    <script type="module" src="index.js"></script>
+</body>
+</html>
