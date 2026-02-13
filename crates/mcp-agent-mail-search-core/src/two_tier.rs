@@ -1542,4 +1542,402 @@ mod tests {
         // With refinement capped to 1 candidate, doc 3 must not jump to rank 1.
         assert_eq!(refined_ids[0], 2);
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // TC8: Concurrent read/write (search while adding documents)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_concurrent_search_while_adding_documents() {
+        use std::sync::{Barrier, RwLock};
+        use std::thread;
+
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+        let index = Arc::new(RwLock::new(TwoTierIndex::new(&config)));
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Writer thread: adds 50 documents
+        let writer_index = Arc::clone(&index);
+        let writer_barrier = Arc::clone(&barrier);
+        let fast_dim = config.fast_dimension;
+        let quality_dim = config.quality_dimension;
+        let writer = thread::spawn(move || {
+            writer_barrier.wait();
+            let mut success_count = 0_u32;
+            for i in 0..50_u64 {
+                let value = 0.1 * (i + 1) as f32;
+                let entry = TwoTierEntry {
+                    doc_id: i,
+                    doc_kind: crate::document::DocKind::Message,
+                    project_id: Some(1),
+                    fast_embedding: vec![f16::from_f32(value); fast_dim],
+                    quality_embedding: vec![f16::from_f32(value); quality_dim],
+                    has_quality: true,
+                };
+                let mut guard = writer_index.write().expect("write lock");
+                if guard.add_entry(entry).is_ok() {
+                    success_count += 1;
+                }
+                drop(guard);
+                // Small yield to interleave with reader
+                thread::yield_now();
+            }
+            success_count
+        });
+
+        // Reader thread: searches repeatedly while writer adds docs
+        let reader_index = Arc::clone(&index);
+        let reader_barrier = Arc::clone(&barrier);
+        let reader = thread::spawn(move || {
+            reader_barrier.wait();
+            let query = vec![1.0, 0.0, 0.0, 0.0];
+            let mut search_count = 0_u32;
+            for _ in 0..100 {
+                let guard = reader_index.read().expect("read lock");
+                let _results = guard.search_fast(&query, 10);
+                search_count += 1;
+                drop(guard);
+                thread::yield_now();
+            }
+            search_count
+        });
+
+        let write_count = writer.join().expect("writer thread should not panic");
+        let read_count = reader.join().expect("reader thread should not panic");
+
+        assert_eq!(write_count, 50, "all 50 documents should be added");
+        assert_eq!(read_count, 100, "all 100 searches should complete");
+
+        // Verify final index state
+        let final_len = index.read().expect("read lock").len();
+        assert_eq!(final_len, 50, "index should contain all 50 documents");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // TC9: Multiple concurrent searches
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_concurrent_searches_return_deterministic_results() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+
+        // Build index with test data
+        let mut index = TwoTierIndex::new(&config);
+        for i in 0..100_u64 {
+            let value = 0.01 * (i + 1) as f32;
+            index
+                .add_entry(TwoTierEntry {
+                    doc_id: i,
+                    doc_kind: crate::document::DocKind::Message,
+                    project_id: Some(1),
+                    fast_embedding: vec![f16::from_f32(value); config.fast_dimension],
+                    quality_embedding: vec![f16::from_f32(value); config.quality_dimension],
+                    has_quality: true,
+                })
+                .expect("add_entry should succeed");
+        }
+
+        let index = Arc::new(index);
+        let thread_count = 10;
+        let barrier = Arc::new(Barrier::new(thread_count));
+
+        #[allow(clippy::needless_collect)] // collect required: barrier needs all threads spawned
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let idx = Arc::clone(&index);
+                let bar = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    bar.wait();
+                    let query = vec![1.0, 0.0, 0.0, 0.0];
+                    idx.search_fast(&query, 10)
+                })
+            })
+            .collect();
+
+        let all_results: Vec<Vec<ScoredResult>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("search thread should not panic"))
+            .collect();
+
+        // All threads should return results
+        for (i, results) in all_results.iter().enumerate() {
+            assert!(
+                !results.is_empty(),
+                "thread {i} should return search results"
+            );
+            assert_eq!(
+                results.len(),
+                10,
+                "thread {i} should return exactly 10 results"
+            );
+        }
+
+        // All threads should return identical results (deterministic)
+        let first_ids: Vec<u64> = all_results[0].iter().map(|r| r.doc_id).collect();
+        for (i, results) in all_results.iter().enumerate().skip(1) {
+            let ids: Vec<u64> = results.iter().map(|r| r.doc_id).collect();
+            assert_eq!(
+                ids, first_ids,
+                "thread {i} results should match thread 0 results"
+            );
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // TC6: Embedder failure handling during search
+    // ────────────────────────────────────────────────────────────────
+
+    struct FailingEmbedder;
+
+    impl TwoTierEmbedder for FailingEmbedder {
+        fn embed(&self, _text: &str) -> SearchResult<Vec<f32>> {
+            Err(SearchError::ModeUnavailable(
+                "simulated embedder failure".into(),
+            ))
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn id(&self) -> &str {
+            "failing-embedder"
+        }
+    }
+
+    #[test]
+    fn test_search_with_failing_fast_embedder_returns_none() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+
+        let index = TwoTierIndex::new(&config);
+        let fast_embedder: Arc<dyn TwoTierEmbedder> = Arc::new(FailingEmbedder);
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, None, config);
+
+        // With failing fast embedder in normal mode, iterator yields nothing
+        assert_eq!(
+            searcher.search("query", 10).count(),
+            0,
+            "failing fast embedder should yield no phases"
+        );
+    }
+
+    #[test]
+    fn test_search_with_failing_quality_embedder_returns_refinement_failed() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+
+        let fast_embedder: Arc<dyn TwoTierEmbedder> =
+            Arc::new(StubEmbedder::new("fast", vec![1.0, 0.0, 0.0, 0.0]));
+        let quality_embedder: Arc<dyn TwoTierEmbedder> = Arc::new(FailingEmbedder);
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
+        assert_eq!(phases.len(), 2, "should yield initial + refinement failed");
+        assert!(
+            matches!(phases[0], SearchPhase::Initial { .. }),
+            "first phase should be initial results"
+        );
+        assert!(
+            matches!(phases[1], SearchPhase::RefinementFailed { .. }),
+            "second phase should be refinement failed"
+        );
+    }
+
+    #[test]
+    fn test_quality_only_with_failing_fast_falls_back_to_quality() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            quality_only: true,
+            ..TwoTierConfig::default()
+        };
+
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+
+        let fast_embedder: Arc<dyn TwoTierEmbedder> = Arc::new(FailingEmbedder);
+        let quality_embedder: Arc<dyn TwoTierEmbedder> =
+            Arc::new(StubEmbedder::new("quality", vec![1.0, 0.0, 0.0, 0.0]));
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
+        // In quality_only mode with failing fast, should still try quality refinement
+        assert_eq!(phases.len(), 1, "quality_only should yield one phase");
+        assert!(
+            matches!(phases[0], SearchPhase::Refined { .. }),
+            "should get refined results even with failing fast embedder"
+        );
+    }
+
+    #[test]
+    fn test_no_quality_embedder_yields_refinement_failed() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+
+        let fast_embedder: Arc<dyn TwoTierEmbedder> =
+            Arc::new(StubEmbedder::new("fast", vec![1.0, 0.0, 0.0, 0.0]));
+        // No quality embedder provided
+        let searcher = TwoTierSearcher::new(&index, fast_embedder, None, config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
+        assert_eq!(phases.len(), 2);
+        assert!(matches!(phases[0], SearchPhase::Initial { .. }));
+        assert!(
+            matches!(&phases[1], SearchPhase::RefinementFailed { error } if error.contains("unavailable")),
+            "should report quality embedder unavailable"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // TC8b: High-contention concurrent read/write stress test
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_high_contention_concurrent_read_write() {
+        use std::sync::{Barrier, RwLock};
+        use std::thread;
+
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+        let index = Arc::new(RwLock::new(TwoTierIndex::new(&config)));
+
+        let writer_count = 3;
+        let reader_count = 7;
+        let total = writer_count + reader_count;
+        let barrier = Arc::new(Barrier::new(total));
+
+        let mut handles = Vec::with_capacity(total);
+
+        // Spawn writer threads
+        for w in 0..writer_count {
+            let idx = Arc::clone(&index);
+            let bar = Arc::clone(&barrier);
+            let cfg = config.clone();
+            handles.push(thread::spawn(move || {
+                bar.wait();
+                let mut count = 0_u32;
+                for i in 0..20_u64 {
+                    let doc_id = (w as u64) * 100 + i;
+                    let value = 0.01 * (doc_id + 1) as f32;
+                    let entry = TwoTierEntry {
+                        doc_id,
+                        doc_kind: crate::document::DocKind::Message,
+                        project_id: Some(1),
+                        fast_embedding: vec![f16::from_f32(value); cfg.fast_dimension],
+                        quality_embedding: vec![f16::from_f32(value); cfg.quality_dimension],
+                        has_quality: true,
+                    };
+                    let mut guard = idx.write().expect("write lock");
+                    if guard.add_entry(entry).is_ok() {
+                        count += 1;
+                    }
+                    drop(guard);
+                    thread::yield_now();
+                }
+                count
+            }));
+        }
+
+        // Spawn reader threads
+        for _ in 0..reader_count {
+            let idx = Arc::clone(&index);
+            let bar = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                bar.wait();
+                let query = vec![1.0, 0.0, 0.0, 0.0];
+                let mut count = 0_u32;
+                for _ in 0..50 {
+                    let guard = idx.read().expect("read lock");
+                    let _results = guard.search_fast(&query, 5);
+                    count += 1;
+                    drop(guard);
+                    thread::yield_now();
+                }
+                count
+            }));
+        }
+
+        let results: Vec<u32> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread should not panic"))
+            .collect();
+
+        // Verify writer results
+        for (i, &count) in results.iter().take(writer_count).enumerate() {
+            assert_eq!(count, 20, "writer {i} should add all 20 docs");
+        }
+
+        // Verify reader results
+        for (i, &count) in results.iter().skip(writer_count).enumerate() {
+            assert_eq!(count, 50, "reader {i} should complete all 50 searches");
+        }
+
+        // Verify final state
+        let final_len = index.read().expect("read lock").len();
+        assert_eq!(
+            final_len, 60,
+            "index should contain 60 docs (3 writers x 20)"
+        );
+    }
 }
