@@ -28,6 +28,9 @@ pub mod slo;
 pub mod test_harness;
 pub mod toon;
 
+#[cfg(test)]
+pub mod proptest_generators;
+
 // Re-export key types for convenience
 pub use agent_detect::{
     AgentDetectError, AgentDetectOptions, AgentDetectRootOverride, InstalledAgentDetectionEntry,

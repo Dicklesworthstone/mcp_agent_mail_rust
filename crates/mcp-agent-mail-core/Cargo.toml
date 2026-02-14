@@ -33,6 +33,7 @@ optional = true
 [dev-dependencies]
 criterion.workspace = true
 loom.workspace = true
+proptest.workspace = true
 tempfile.workspace = true
 
 [[bench]]

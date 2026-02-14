@@ -92,6 +92,7 @@ ed25519-dalek = { version = "2", features = ["std"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
+proptest = "1"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
 fs2 = "0.4"
 walkdir = "2"
