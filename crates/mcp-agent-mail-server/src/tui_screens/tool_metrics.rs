@@ -8,6 +8,7 @@
 //! - View mode toggle: table view (default) vs widget dashboard view
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
@@ -20,12 +21,16 @@ use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_extras::charts::{BarChart, BarDirection, BarGroup};
 use ftui_runtime::program::Cmd;
+use mcp_agent_mail_core::bocpd::BocpdDetector;
+use mcp_agent_mail_core::conformal::ConformalPredictor;
+use mcp_agent_mail_core::evidence_ledger::evidence_ledger;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::{
-    LeaderboardEntry, MetricTile, MetricTrend, PercentileSample, RankChange, WidgetState,
+    AnomalyCard, AnomalySeverity, ChartTransition, LeaderboardEntry, MetricTile, MetricTrend,
+    PercentileSample, RankChange, WidgetState,
 };
 
 const COL_NAME: usize = 0;
@@ -33,20 +38,56 @@ const COL_CALLS: usize = 1;
 const COL_ERRORS: usize = 2;
 const COL_ERR_PCT: usize = 3;
 const COL_AVG_MS: usize = 4;
+const COL_CP: usize = 5;
 
-const SORT_LABELS: &[&str] = &["Name", "Calls", "Errors", "Err%", "Avg(ms)"];
+const SORT_LABELS: &[&str] = &["Name", "Calls", "Errors", "Err%", "Avg(ms)", "CP"];
 
 /// Max latency samples kept per tool for sparkline rendering.
 const LATENCY_HISTORY: usize = 30;
 
 /// Max percentile samples kept for the global latency ribbon.
 const PERCENTILE_HISTORY: usize = 60;
+/// Chart transition duration for latency bars.
+const CHART_TRANSITION_DURATION: Duration = Duration::from_millis(200);
+
+/// BOCPD hazard rate: expect one change point every ~250 tool calls.
+const BOCPD_HAZARD: f64 = 1.0 / 250.0;
+/// BOCPD detection threshold for cumulative mass on short run lengths.
+const BOCPD_THRESHOLD: f64 = 0.5;
+/// BOCPD maximum run length to track per tool.
+const BOCPD_MAX_RUN: usize = 500;
+/// Conformal prediction window: 200 recent latencies for calibration.
+const CONFORMAL_WINDOW: usize = 200;
+/// Conformal coverage level (90%).
+const CONFORMAL_COVERAGE: f64 = 0.90;
+/// Max change-point events stored per tool.
+const MAX_CHANGE_POINTS_PER_TOOL: usize = 50;
+/// Max anomaly cards displayed in the dashboard.
+const MAX_ANOMALY_CARDS: usize = 5;
 
 /// Unicode block characters for inline sparkline.
 const SPARK_CHARS: &[char] = &[
     ' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
     '\u{2588}',
 ];
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn reduced_motion_enabled() -> bool {
+    env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
+}
+
+fn chart_animations_enabled() -> bool {
+    !std::env::var("AM_TUI_CHART_ANIMATIONS").is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+    })
+}
 
 /// View mode for the metrics screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +98,20 @@ enum ViewMode {
     Dashboard,
 }
 
-/// Accumulated stats for a single tool.
+/// A recorded change-point event for a specific tool.
 #[derive(Debug, Clone)]
+struct ToolChangePoint {
+    /// Tool call index at which the change was detected.
+    call_index: u64,
+    /// Posterior probability of the change point.
+    probability: f64,
+    /// Estimated latency mean before the change.
+    pre_mean_ms: f64,
+    /// Estimated latency mean after the change.
+    post_mean_ms: f64,
+}
+
+/// Accumulated stats for a single tool.
 struct ToolStats {
     name: String,
     calls: u64,
@@ -67,6 +120,12 @@ struct ToolStats {
     recent_latencies: VecDeque<u64>,
     /// Previous call count for leaderboard rank-change tracking.
     prev_calls: u64,
+    /// Per-tool BOCPD detector for latency change-point detection.
+    bocpd: BocpdDetector,
+    /// Per-tool conformal predictor for latency intervals.
+    conformal: ConformalPredictor,
+    /// Recorded change-point events (most recent last).
+    change_points: VecDeque<ToolChangePoint>,
 }
 
 impl ToolStats {
@@ -78,6 +137,9 @@ impl ToolStats {
             total_duration_ms: 0,
             recent_latencies: VecDeque::with_capacity(LATENCY_HISTORY),
             prev_calls: 0,
+            bocpd: BocpdDetector::new(BOCPD_HAZARD, BOCPD_THRESHOLD, BOCPD_MAX_RUN),
+            conformal: ConformalPredictor::new(CONFORMAL_WINDOW, CONFORMAL_COVERAGE),
+            change_points: VecDeque::with_capacity(MAX_CHANGE_POINTS_PER_TOOL),
         }
     }
 
@@ -123,7 +185,8 @@ impl ToolStats {
         self.recent_latencies.iter().map(|&v| v as f64).collect()
     }
 
-    fn record(&mut self, duration_ms: u64, is_error: bool) {
+    #[allow(clippy::cast_precision_loss)]
+    fn record(&mut self, duration_ms: u64, is_error: bool) -> Option<ToolChangePoint> {
         self.calls += 1;
         self.total_duration_ms += duration_ms;
         if is_error {
@@ -133,6 +196,31 @@ impl ToolStats {
             self.recent_latencies.pop_front();
         }
         self.recent_latencies.push_back(duration_ms);
+
+        // Feed latency to BOCPD and conformal predictor.
+        let latency_f = duration_ms as f64;
+        self.conformal.observe(latency_f);
+
+        // Check for change-point detection.
+        if let Some(cp) = self.bocpd.observe(latency_f) {
+            let tcp = ToolChangePoint {
+                call_index: self.calls,
+                probability: cp.probability,
+                pre_mean_ms: cp.pre_mean,
+                post_mean_ms: cp.post_mean,
+            };
+            if self.change_points.len() >= MAX_CHANGE_POINTS_PER_TOOL {
+                self.change_points.pop_front();
+            }
+            self.change_points.push_back(tcp.clone());
+            return Some(tcp);
+        }
+        None
+    }
+
+    /// Number of detected change points.
+    fn change_point_count(&self) -> usize {
+        self.change_points.len()
     }
 
     /// Compute percentile from recent latencies using nearest-rank method.
@@ -167,6 +255,29 @@ impl ToolStats {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LatencyRibbonRow {
+    name: String,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+}
+
+impl LatencyRibbonRow {
+    fn values(&self) -> [f64; 3] {
+        [self.p50, self.p95, self.p99]
+    }
+}
+
+/// An anomaly event for display in the dashboard.
+#[derive(Debug, Clone)]
+struct AnomalyEvent {
+    tool_name: String,
+    probability: f64,
+    pre_mean_ms: f64,
+    post_mean_ms: f64,
+}
+
 pub struct ToolMetricsScreen {
     table_state: TableState,
     tool_map: HashMap<String, ToolStats>,
@@ -182,6 +293,14 @@ pub struct ToolMetricsScreen {
     percentile_samples: VecDeque<PercentileSample>,
     /// Tick counter for periodic percentile snapshot.
     snapshot_tick: u64,
+    /// Animated latency rows consumed by the bar-chart ribbon.
+    latency_ribbon_rows: Vec<LatencyRibbonRow>,
+    /// Transition state for latency chart values.
+    latency_chart_transition: ChartTransition,
+    /// Whether chart transitions are enabled (`AM_TUI_CHART_ANIMATIONS`).
+    chart_animations_enabled: bool,
+    /// Recent anomaly events (change-point detections) for the dashboard.
+    anomaly_events: VecDeque<AnomalyEvent>,
 }
 
 impl ToolMetricsScreen {
@@ -198,6 +317,10 @@ impl ToolMetricsScreen {
             view_mode: ViewMode::Table,
             percentile_samples: VecDeque::with_capacity(PERCENTILE_HISTORY),
             snapshot_tick: 0,
+            latency_ribbon_rows: Vec::new(),
+            latency_chart_transition: ChartTransition::new(CHART_TRANSITION_DURATION),
+            chart_animations_enabled: chart_animations_enabled(),
+            anomaly_events: VecDeque::with_capacity(MAX_ANOMALY_CARDS),
         }
     }
 
@@ -236,10 +359,40 @@ impl ToolMetricsScreen {
                 let is_error = result_preview
                     .as_deref()
                     .is_some_and(|p| p.contains("error") || p.contains("Error"));
-                self.tool_map
+                let cp = self
+                    .tool_map
                     .entry(tool_name.clone())
                     .or_insert_with(|| ToolStats::new(tool_name.clone()))
                     .record(*duration_ms, is_error);
+
+                // Handle change-point detection.
+                if let Some(tcp) = cp {
+                    // Record to evidence ledger.
+                    evidence_ledger().record(
+                        "metrics.bocpd.change_point",
+                        serde_json::json!({
+                            "tool": tool_name,
+                            "call_index": tcp.call_index,
+                            "pre_mean_ms": tcp.pre_mean_ms,
+                            "post_mean_ms": tcp.post_mean_ms,
+                        }),
+                        "change_point_detected",
+                        None,
+                        tcp.probability,
+                        "bocpd",
+                    );
+
+                    // Push anomaly event for dashboard display.
+                    if self.anomaly_events.len() >= MAX_ANOMALY_CARDS {
+                        self.anomaly_events.pop_front();
+                    }
+                    self.anomaly_events.push_back(AnomalyEvent {
+                        tool_name: tool_name.clone(),
+                        probability: tcp.probability,
+                        pre_mean_ms: tcp.pre_mean_ms,
+                        post_mean_ms: tcp.post_mean_ms,
+                    });
+                }
             }
         }
     }
@@ -256,6 +409,7 @@ impl ToolMetricsScreen {
                     .partial_cmp(&b.err_pct())
                     .unwrap_or(std::cmp::Ordering::Equal),
                 COL_AVG_MS => a.avg_ms().cmp(&b.avg_ms()),
+                COL_CP => a.change_point_count().cmp(&b.change_point_count()),
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc { cmp } else { cmp.reverse() }
@@ -346,6 +500,62 @@ impl ToolMetricsScreen {
         }
     }
 
+    fn compute_latency_rows(&self) -> Vec<LatencyRibbonRow> {
+        let mut rows: Vec<LatencyRibbonRow> = self
+            .tool_map
+            .values()
+            .filter(|ts| !ts.recent_latencies.is_empty())
+            .map(|ts| LatencyRibbonRow {
+                name: ts.name.clone(),
+                p50: ts.percentile(50.0),
+                p95: ts.percentile(95.0),
+                p99: ts.percentile(99.0),
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .p99
+                .partial_cmp(&left.p99)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    }
+
+    fn refresh_latency_ribbon_animation(&mut self) {
+        let rows = self.compute_latency_rows();
+        if rows.is_empty() {
+            self.latency_ribbon_rows.clear();
+            self.latency_chart_transition.clear();
+            return;
+        }
+
+        let target_values: Vec<f64> = rows.iter().flat_map(LatencyRibbonRow::values).collect();
+        let now = Instant::now();
+        self.latency_chart_transition
+            .set_target(&target_values, now);
+        let sampled = self.latency_chart_transition.sample_values(
+            now,
+            reduced_motion_enabled() || !self.chart_animations_enabled,
+        );
+
+        self.latency_ribbon_rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let base = idx * 3;
+                let p50 = sampled.get(base).copied().unwrap_or(row.p50);
+                let p95 = sampled.get(base + 1).copied().unwrap_or(row.p95);
+                let p99 = sampled.get(base + 2).copied().unwrap_or(row.p99);
+                LatencyRibbonRow {
+                    name: row.name,
+                    p50,
+                    p95,
+                    p99,
+                }
+            })
+            .collect();
+    }
+
     /// Render the table view (original view).
     fn render_table_view(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
@@ -362,12 +572,14 @@ impl ToolMetricsScreen {
             "\u{25bc}"
         };
         let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
+        let total_cp: usize = self.tool_map.values().map(|ts| ts.change_point_count()).sum();
         let summary = format!(
-            " {} tools | {} calls | {} errors | avg {}ms | Sort: {}{} | v=dashboard",
+            " {} tools | {} calls | {} errors | avg {}ms | {} CP | Sort: {}{} | v=dashboard",
             self.tool_map.len(),
             total_calls,
             total_errors,
             avg_ms,
+            total_cp,
             sort_label,
             sort_indicator,
         );
@@ -375,8 +587,10 @@ impl ToolMetricsScreen {
         p.render(header_area, frame);
 
         // Table
-        let header = Row::new(["Tool Name", "Calls", "Errors", "Err%", "Avg(ms)", "Trend"])
-            .style(Style::default().bold());
+        let header = Row::new([
+            "Tool Name", "Calls", "Errors", "Err%", "Avg(ms)", "CP", "CI(90%)", "Trend",
+        ])
+        .style(Style::default().bold());
 
         let rows: Vec<Row> = self
             .sorted_tools
@@ -386,6 +600,16 @@ impl ToolMetricsScreen {
                 let stats = self.tool_map.get(name)?;
                 let err_pct = format!("{:.1}%", stats.err_pct());
                 let spark = stats.sparkline_str();
+                let cp_count = format!("{}", stats.change_point_count());
+                let ci_str = if let Some(interval) = stats.conformal.predict() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let lo = interval.lower.max(0.0) as u64;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let hi = interval.upper.max(0.0) as u64;
+                    format!("[{lo}-{hi}]")
+                } else {
+                    "—".to_string()
+                };
                 let style = if Some(i) == self.table_state.selected {
                     Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else if stats.err_pct() > 5.0 {
@@ -400,6 +624,8 @@ impl ToolMetricsScreen {
                         format!("{}", stats.errors),
                         err_pct,
                         format!("{}", stats.avg_ms()),
+                        cp_count,
+                        ci_str,
                         spark,
                     ])
                     .style(style),
@@ -408,12 +634,14 @@ impl ToolMetricsScreen {
             .collect();
 
         let widths = [
-            Constraint::Percentage(25.0),
-            Constraint::Percentage(12.0),
-            Constraint::Percentage(12.0),
+            Constraint::Percentage(22.0),
+            Constraint::Percentage(9.0),
+            Constraint::Percentage(9.0),
+            Constraint::Percentage(8.0),
             Constraint::Percentage(10.0),
+            Constraint::Percentage(6.0),
             Constraint::Percentage(12.0),
-            Constraint::Percentage(29.0),
+            Constraint::Percentage(24.0),
         ];
 
         let block = Block::default()
@@ -441,18 +669,37 @@ impl ToolMetricsScreen {
             return;
         }
 
-        // Layout: metric tiles (3h) + ribbon (8h) + leaderboard (rest)
+        // Layout: metric tiles (3h) + anomaly cards (if any, 4h) + ribbon (8h) + leaderboard (rest)
         let tiles_h = 3_u16.min(area.height);
         let remaining = area.height.saturating_sub(tiles_h);
-        let ribbon_h = if remaining > 12 { 8_u16 } else { remaining / 2 };
-        let leader_h = remaining.saturating_sub(ribbon_h);
+        let anomaly_h = if self.anomaly_events.is_empty() || remaining < 16 {
+            0_u16
+        } else {
+            4_u16.min(remaining / 4)
+        };
+        let after_anomaly = remaining.saturating_sub(anomaly_h);
+        let ribbon_h = if after_anomaly > 12 {
+            8_u16
+        } else {
+            after_anomaly / 2
+        };
+        let leader_h = after_anomaly.saturating_sub(ribbon_h);
 
         let tiles_area = Rect::new(area.x, area.y, area.width, tiles_h);
-        let ribbon_area = Rect::new(area.x, area.y + tiles_h, area.width, ribbon_h);
-        let leader_area = Rect::new(area.x, area.y + tiles_h + ribbon_h, area.width, leader_h);
+        let mut y_offset = area.y + tiles_h;
 
         // --- Metric Tiles ---
         self.render_metric_tiles(frame, tiles_area, state);
+
+        // --- Anomaly Cards ---
+        if anomaly_h >= 3 {
+            let anomaly_area = Rect::new(area.x, y_offset, area.width, anomaly_h);
+            self.render_anomaly_cards(frame, anomaly_area);
+            y_offset += anomaly_h;
+        }
+
+        let ribbon_area = Rect::new(area.x, y_offset, area.width, ribbon_h);
+        let leader_area = Rect::new(area.x, y_offset + ribbon_h, area.width, leader_h);
 
         // --- Percentile Ribbon ---
         if ribbon_h >= 3 {
@@ -531,12 +778,7 @@ impl ToolMetricsScreen {
     /// Each tool becomes a `BarGroup` with three bars: P50, P95, P99.
     /// Colors are taken from the theme palette's chart series.
     fn render_latency_ribbon(&self, frame: &mut Frame<'_>, area: Rect) {
-        if self.tool_map.is_empty()
-            || self
-                .tool_map
-                .values()
-                .all(|ts| ts.recent_latencies.is_empty())
-        {
+        if self.latency_ribbon_rows.is_empty() {
             let widget: WidgetState<'_, Paragraph<'_>> = WidgetState::Loading {
                 message: "Collecting latency samples...",
             };
@@ -557,40 +799,23 @@ impl ToolMetricsScreen {
             return;
         }
 
-        // Build bar groups sorted by P99 descending (worst latency first, br-333hh).
-        let mut sorted: Vec<&ToolStats> = self
-            .tool_map
-            .values()
-            .filter(|ts| !ts.recent_latencies.is_empty())
-            .collect();
-        sorted.sort_by(|a, b| {
-            b.percentile(99.0)
-                .partial_cmp(&a.percentile(99.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
         // Cap at 15 tools or available height, whichever is smaller (br-333hh).
         let max_groups = ((inner.height as usize) + 1) / 4;
-        let visible = sorted.len().min(max_groups.max(1)).min(15);
+        let visible = self
+            .latency_ribbon_rows
+            .len()
+            .min(max_groups.max(1))
+            .min(15);
 
-        let groups: Vec<BarGroup<'_>> = sorted[..visible]
+        let groups: Vec<BarGroup<'_>> = self.latency_ribbon_rows[..visible]
             .iter()
-            .map(|ts| {
-                BarGroup::new(
-                    &ts.name,
-                    vec![
-                        ts.percentile(50.0),
-                        ts.percentile(95.0),
-                        ts.percentile(99.0),
-                    ],
-                )
-            })
+            .map(|row| BarGroup::new(&row.name, vec![row.p50, row.p95, row.p99]))
             .collect();
 
         // Severity-based coloring (br-333hh): green < 100ms, yellow < 500ms, red >= 500ms.
-        let max_p99 = sorted[..visible]
+        let max_p99 = self.latency_ribbon_rows[..visible]
             .iter()
-            .map(|ts| ts.percentile(99.0))
+            .map(|row| row.p99)
             .fold(0.0_f64, f64::max);
         let severity_color = if max_p99 < 100.0 {
             PackedRgba::rgb(0, 200, 80) // green
@@ -647,6 +872,40 @@ impl ToolMetricsScreen {
             .value_suffix("calls")
             .max_visible(area.height.saturating_sub(2) as usize)
             .render(area, frame);
+    }
+
+    /// Render anomaly cards from BOCPD change-point detections.
+    fn render_anomaly_cards(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.anomaly_events.is_empty() || area.height < 3 {
+            return;
+        }
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = Block::default()
+            .title("Change Points (BOCPD)")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        if inner.is_empty() {
+            return;
+        }
+
+        // Show the most recent anomaly event as an AnomalyCard.
+        if let Some(evt) = self.anomaly_events.back() {
+            let headline_text = format!(
+                "{}: latency shift {:.0}ms -> {:.0}ms",
+                evt.tool_name, evt.pre_mean_ms, evt.post_mean_ms
+            );
+            let severity = if (evt.post_mean_ms - evt.pre_mean_ms).abs() > 100.0 {
+                AnomalySeverity::High
+            } else {
+                AnomalySeverity::Medium
+            };
+            let card = AnomalyCard::new(severity, evt.probability, &headline_text);
+            card.render(inner, frame);
+        }
     }
 }
 
@@ -705,6 +964,7 @@ impl MailScreen for ToolMetricsScreen {
         if tick_count % 50 == 0 {
             self.checkpoint_ranks();
         }
+        self.refresh_latency_ribbon_animation();
         self.sync_focused_event();
     }
 
@@ -1125,5 +1385,222 @@ mod tests {
             screen.snapshot_percentiles();
         }
         assert!(screen.percentile_samples.len() <= PERCENTILE_HISTORY);
+    }
+
+    // --- BOCPD + Conformal integration tests (br-h8xsy G.3) ---
+
+    /// 1. Simulate tool calls with a latency shift; verify change point detected.
+    #[test]
+    fn metrics_bocpd_integration() {
+        let mut stats = ToolStats::new("send_message".into());
+
+        // 200 calls at ~50ms (stable regime).
+        for _ in 0..200 {
+            let _ = stats.record(50, false);
+        }
+        assert_eq!(
+            stats.change_point_count(),
+            0,
+            "no change points during stable regime"
+        );
+
+        // 200 calls at ~500ms (10x latency shift).
+        let mut detected = false;
+        for _ in 0..200 {
+            if stats.record(500, false).is_some() {
+                detected = true;
+            }
+        }
+        assert!(
+            detected,
+            "BOCPD should detect the 50ms -> 500ms latency shift"
+        );
+        assert!(
+            stats.change_point_count() >= 1,
+            "at least one change point recorded"
+        );
+    }
+
+    /// 2. Verify conformal prediction intervals are displayed (predict returns Some
+    ///    after sufficient calibration).
+    #[test]
+    fn metrics_conformal_intervals_displayed() {
+        let mut stats = ToolStats::new("fetch_inbox".into());
+
+        // Less than MIN_CALIBRATION (30) — no interval yet.
+        for i in 0..29 {
+            let _ = stats.record(10 + i, false);
+        }
+        assert!(
+            stats.conformal.predict().is_none(),
+            "no interval with < 30 observations"
+        );
+
+        // One more observation crosses threshold.
+        let _ = stats.record(15, false);
+        let interval = stats
+            .conformal
+            .predict()
+            .expect("interval should be available at 30 observations");
+        assert!(
+            interval.lower < interval.upper,
+            "lower ({}) < upper ({})",
+            interval.lower,
+            interval.upper
+        );
+        assert!((interval.coverage - 0.90).abs() < 1e-10);
+    }
+
+    /// 3. Change point triggers anomaly event creation in the screen.
+    #[test]
+    fn metrics_anomaly_card_emitted() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        // Stable regime.
+        for _ in 0..200 {
+            let _ = state.push_event(MailEvent::tool_call_end(
+                "slow_tool",
+                50,
+                None,
+                1,
+                0.5,
+                vec![],
+                None,
+                None,
+            ));
+        }
+        screen.ingest_events(&state);
+        assert!(
+            screen.anomaly_events.is_empty(),
+            "no anomaly during stable regime"
+        );
+
+        // Shift regime.
+        for _ in 0..200 {
+            let _ = state.push_event(MailEvent::tool_call_end(
+                "slow_tool",
+                500,
+                None,
+                1,
+                0.5,
+                vec![],
+                None,
+                None,
+            ));
+        }
+        screen.ingest_events(&state);
+        assert!(
+            !screen.anomaly_events.is_empty(),
+            "anomaly event should be emitted after latency shift"
+        );
+
+        let evt = &screen.anomaly_events[0];
+        assert_eq!(evt.tool_name, "slow_tool");
+        assert!(evt.post_mean_ms > evt.pre_mean_ms);
+    }
+
+    /// 4. Change point detections are recorded to the evidence ledger.
+    #[test]
+    fn metrics_evidence_recorded() {
+        let ledger = evidence_ledger();
+        let before_count = ledger.query("metrics.bocpd.change_point", 1000).len();
+
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        // Stable then shift.
+        for _ in 0..200 {
+            let _ = state.push_event(MailEvent::tool_call_end(
+                "evidence_tool",
+                30,
+                None,
+                1,
+                0.5,
+                vec![],
+                None,
+                None,
+            ));
+        }
+        for _ in 0..200 {
+            let _ = state.push_event(MailEvent::tool_call_end(
+                "evidence_tool",
+                300,
+                None,
+                1,
+                0.5,
+                vec![],
+                None,
+                None,
+            ));
+        }
+        screen.ingest_events(&state);
+
+        let after_count = ledger.query("metrics.bocpd.change_point", 1000).len();
+        assert!(
+            after_count > before_count,
+            "evidence ledger should have new entries: before={before_count}, after={after_count}"
+        );
+    }
+
+    /// 5. Change point in tool A does not affect tool B's state.
+    #[test]
+    fn metrics_per_tool_isolation() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        // Tool A: stable, then shift.
+        for _ in 0..200 {
+            let _ = state.push_event(MailEvent::tool_call_end(
+                "tool_a",
+                50,
+                None,
+                1,
+                0.5,
+                vec![],
+                None,
+                None,
+            ));
+        }
+        for _ in 0..200 {
+            let _ = state.push_event(MailEvent::tool_call_end(
+                "tool_a",
+                500,
+                None,
+                1,
+                0.5,
+                vec![],
+                None,
+                None,
+            ));
+        }
+
+        // Tool B: stable throughout.
+        for _ in 0..400 {
+            let _ = state.push_event(MailEvent::tool_call_end(
+                "tool_b",
+                50,
+                None,
+                1,
+                0.5,
+                vec![],
+                None,
+                None,
+            ));
+        }
+
+        screen.ingest_events(&state);
+
+        let a_cp = screen.tool_map["tool_a"].change_point_count();
+        let b_cp = screen.tool_map["tool_b"].change_point_count();
+
+        assert!(
+            a_cp >= 1,
+            "tool_a should have change points, got {a_cp}"
+        );
+        assert_eq!(
+            b_cp, 0,
+            "tool_b should have no change points (stable), got {b_cp}"
+        );
     }
 }
