@@ -557,18 +557,21 @@ impl ToolMetricsScreen {
             return;
         }
 
-        // Build bar groups from tools sorted by call count (descending).
+        // Build bar groups sorted by P99 descending (worst latency first, br-333hh).
         let mut sorted: Vec<&ToolStats> = self
             .tool_map
             .values()
             .filter(|ts| !ts.recent_latencies.is_empty())
             .collect();
-        sorted.sort_by_key(|ts| std::cmp::Reverse(ts.calls));
+        sorted.sort_by(|a, b| {
+            b.percentile(99.0)
+                .partial_cmp(&a.percentile(99.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        // Limit to the number of tools that can fit in the available height.
-        // Each group occupies 3 rows (p50, p95, p99) + 1 gap row between groups.
+        // Cap at 15 tools or available height, whichever is smaller (br-333hh).
         let max_groups = ((inner.height as usize) + 1) / 4;
-        let visible = sorted.len().min(max_groups.max(1));
+        let visible = sorted.len().min(max_groups.max(1)).min(15);
 
         let groups: Vec<BarGroup<'_>> = sorted[..visible]
             .iter()
@@ -584,10 +587,22 @@ impl ToolMetricsScreen {
             })
             .collect();
 
+        // Severity-based coloring (br-333hh): green < 100ms, yellow < 500ms, red >= 500ms.
+        let max_p99 = sorted[..visible]
+            .iter()
+            .map(|ts| ts.percentile(99.0))
+            .fold(0.0_f64, f64::max);
+        let severity_color = if max_p99 < 100.0 {
+            PackedRgba::rgb(0, 200, 80) // green
+        } else if max_p99 < 500.0 {
+            PackedRgba::rgb(240, 180, 0) // yellow
+        } else {
+            PackedRgba::rgb(240, 60, 60) // red
+        };
         let colors: Vec<PackedRgba> = vec![
-            tp.chart_series[0], // P50
-            tp.chart_series[1], // P95
-            tp.chart_series[2], // P99
+            tp.chart_series[0], // P50 — theme default
+            tp.chart_series[1], // P95 — theme default
+            severity_color,     // P99 — severity-coded
         ];
 
         let chart = BarChart::new(groups)
