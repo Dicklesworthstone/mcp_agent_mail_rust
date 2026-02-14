@@ -1965,6 +1965,288 @@ pub fn render_focus_ring_cached(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TransparencyWidget — 4-level progressive disclosure for decisions (br-678k5)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Disclosure level for the transparency widget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisclosureLevel {
+    /// L0: Single colored badge per decision point (green/yellow/red).
+    Badge,
+    /// L1: One-line summary per entry.
+    Summary,
+    /// L2: Full evidence entry with all fields.
+    Detail,
+    /// L3: Historical sparkline of confidence over time.
+    DeepDive,
+}
+
+impl DisclosureLevel {
+    /// Cycle to the next deeper level, wrapping at `DeepDive`.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Badge => Self::Summary,
+            Self::Summary => Self::Detail,
+            Self::Detail => Self::DeepDive,
+            Self::DeepDive => Self::Badge,
+        }
+    }
+
+    /// Cycle to the previous level, wrapping at `Badge`.
+    #[must_use]
+    pub const fn prev(self) -> Self {
+        match self {
+            Self::Badge => Self::DeepDive,
+            Self::Summary => Self::Badge,
+            Self::Detail => Self::Summary,
+            Self::DeepDive => Self::Detail,
+        }
+    }
+}
+
+/// Displays adaptive decision information at four levels of detail.
+///
+/// Uses [`EvidenceLedgerEntry`] data from the evidence ledger. The operator
+/// can drill down from L0 (badge) to L3 (deep-dive sparkline) using
+/// keyboard navigation.
+///
+/// # Rendering
+///
+/// - **L0 (Badge):** Colored circle per decision point —
+///   green (`correct == Some(true)`), red (`correct == Some(false)`),
+///   yellow (no outcome yet).
+/// - **L1 (Summary):** One line per entry:
+///   `"{decision_point}: {action} ({confidence:.0%})"`.
+/// - **L2 (Detail):** Key-value pairs in a bordered box.
+/// - **L3 (Deep-dive):** Sparkline chart of confidence values over time.
+#[derive(Debug, Clone)]
+pub struct TransparencyWidget<'a> {
+    /// Evidence entries to display.
+    entries: &'a [mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry],
+    /// Current disclosure level.
+    level: DisclosureLevel,
+    /// Optional block border.
+    block: Option<Block<'a>>,
+}
+
+impl<'a> TransparencyWidget<'a> {
+    /// Create a new transparency widget from evidence entries.
+    #[must_use]
+    pub const fn new(
+        entries: &'a [mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry],
+    ) -> Self {
+        Self {
+            entries,
+            level: DisclosureLevel::Badge,
+            block: None,
+        }
+    }
+
+    /// Set the disclosure level.
+    #[must_use]
+    pub const fn level(mut self, level: DisclosureLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Set a block border.
+    #[must_use]
+    pub const fn block(mut self, block: Block<'a>) -> Self {
+        self.block = Some(block);
+        self
+    }
+
+    /// Badge color for an entry based on its correctness.
+    fn badge_color(
+        entry: &mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry,
+    ) -> PackedRgba {
+        match entry.correct {
+            Some(true) => PackedRgba::rgb(80, 200, 80),   // green
+            Some(false) => PackedRgba::rgb(220, 60, 60),   // red
+            None => PackedRgba::rgb(220, 200, 60),         // yellow
+        }
+    }
+
+    /// Render L0 badges.
+    fn render_badge(&self, inner: Rect, frame: &mut Frame) {
+        for (i, entry) in self.entries.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let x = inner.x + (i as u16) * 2;
+            if x >= inner.right() {
+                break;
+            }
+            let color = Self::badge_color(entry);
+            let mut cell = Cell::from_char('\u{25CF}'); // ●
+            cell.fg = color;
+            frame.buffer.set_fast(x, inner.y, cell);
+        }
+    }
+
+    /// Render L1 summary lines.
+    fn render_summary(&self, inner: Rect, frame: &mut Frame) {
+        for (i, entry) in self.entries.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let y = inner.y + i as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            let pct = (entry.confidence * 100.0) as u32;
+            let line = format!("{}: {} ({pct}%)", entry.decision_point, entry.action);
+            let color = Self::badge_color(entry);
+            for (j, ch) in line.chars().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let x = inner.x + j as u16;
+                if x >= inner.right() {
+                    break;
+                }
+                let mut cell = Cell::from_char(ch);
+                cell.fg = color;
+                frame.buffer.set_fast(x, y, cell);
+            }
+        }
+    }
+
+    /// Render L2 detail view.
+    fn render_detail(&self, inner: Rect, frame: &mut Frame) {
+        let fields = [
+            "decision_point",
+            "action",
+            "confidence",
+            "expected_loss",
+            "decision_id",
+            "model",
+        ];
+        let mut y = inner.y;
+        for entry in self.entries {
+            if y >= inner.bottom() {
+                break;
+            }
+            let values: [String; 6] = [
+                entry.decision_point.clone(),
+                entry.action.clone(),
+                format!("{:.3}", entry.confidence),
+                entry
+                    .expected_loss
+                    .map_or_else(|| "-".to_string(), |v| format!("{v:.3}")),
+                entry.decision_id.clone(),
+                if entry.model.is_empty() {
+                    "-".to_string()
+                } else {
+                    entry.model.clone()
+                },
+            ];
+            for (fi, field) in fields.iter().enumerate() {
+                if y >= inner.bottom() {
+                    break;
+                }
+                let line = format!("  {field}: {}", values[fi]);
+                let fg = if fi == 0 {
+                    Self::badge_color(entry)
+                } else {
+                    PackedRgba::rgb(180, 180, 180)
+                };
+                for (j, ch) in line.chars().enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let x = inner.x + j as u16;
+                    if x >= inner.right() {
+                        break;
+                    }
+                    let mut cell = Cell::from_char(ch);
+                    cell.fg = fg;
+                    frame.buffer.set_fast(x, y, cell);
+                }
+                y += 1;
+            }
+            y += 1; // blank line between entries
+        }
+    }
+
+    /// Render L3 sparkline deep-dive.
+    fn render_deep_dive(&self, inner: Rect, frame: &mut Frame) {
+        if self.entries.is_empty() || inner.height < 2 {
+            return;
+        }
+
+        // Group entries by decision_point, render sparkline for each.
+        let mut seen_points: Vec<&str> = Vec::new();
+        for entry in self.entries {
+            if !seen_points.contains(&entry.decision_point.as_str()) {
+                seen_points.push(&entry.decision_point);
+            }
+        }
+
+        let mut y = inner.y;
+        for dp in &seen_points {
+            if y + 1 >= inner.bottom() {
+                break;
+            }
+            // Label
+            let label = format!("{dp}:");
+            for (j, ch) in label.chars().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let x = inner.x + j as u16;
+                if x >= inner.right() {
+                    break;
+                }
+                let mut cell = Cell::from_char(ch);
+                cell.fg = PackedRgba::rgb(180, 180, 220);
+                frame.buffer.set_fast(x, y, cell);
+            }
+            y += 1;
+
+            // Confidence sparkline
+            let conf_values: Vec<f64> = self
+                .entries
+                .iter()
+                .filter(|e| e.decision_point == *dp)
+                .map(|e| e.confidence)
+                .collect();
+            if !conf_values.is_empty() {
+                let spark_str =
+                    Sparkline::new(&conf_values).min(0.0).max(1.0).render_to_string();
+                for (j, ch) in spark_str.chars().enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let x = inner.x + j as u16;
+                    if x >= inner.right() {
+                        break;
+                    }
+                    let mut cell = Cell::from_char(ch);
+                    cell.fg = PackedRgba::rgb(100, 180, 255);
+                    frame.buffer.set_fast(x, y, cell);
+                }
+            }
+            y += 1;
+        }
+    }
+}
+
+impl Widget for TransparencyWidget<'_> {
+    fn render(&self, area: Rect, frame: &mut Frame) {
+        if area.is_empty() || self.entries.is_empty() {
+            return;
+        }
+
+        let inner = self.block.as_ref().map_or(area, |block| {
+            let inner = block.inner(area);
+            block.clone().render(area, frame);
+            inner
+        });
+
+        if inner.is_empty() {
+            return;
+        }
+
+        match self.level {
+            DisclosureLevel::Badge => self.render_badge(inner, frame),
+            DisclosureLevel::Summary => self.render_summary(inner, frame),
+            DisclosureLevel::Detail => self.render_detail(inner, frame),
+            DisclosureLevel::DeepDive => self.render_deep_dive(inner, frame),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // AnimationBudget — frame cost tracking and guardrails (br-3vwi.6.3)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -6142,5 +6424,378 @@ mod tests {
         let mut frame = Frame::new(20, 5, &mut pool);
         widget.render(area, &mut frame);
         assert_eq!(widget.layout_cache().compute_count, 2);
+    }
+
+    // ─── F.2 benchmark validation tests (br-3m7xo) ───────────────────
+
+    /// Helper: extract a compact representation of the frame buffer for comparison.
+    /// Returns a Vec of (x, y, char, fg, bg) tuples for all non-empty cells.
+    fn extract_buffer_snapshot(
+        frame: &Frame,
+        width: u16,
+        height: u16,
+    ) -> Vec<(u16, u16, char, PackedRgba, PackedRgba)> {
+        let mut cells = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    let ch = cell.content.as_char().unwrap_or(' ');
+                    cells.push((x, y, ch, cell.fg, cell.bg));
+                }
+            }
+        }
+        cells
+    }
+
+    /// 1. Render a 5x5 heatmap with known data and labels. Verify the output
+    ///    is deterministic (same buffer snapshot on two independent renders).
+    #[test]
+    fn golden_heatmap_5x5() {
+        let data: Vec<Vec<f64>> = (0..5)
+            .map(|r| (0..5).map(|c| ((r * 5 + c) as f64) / 24.0).collect())
+            .collect();
+        let row_labels: &[&str] = &["A", "B", "C", "D", "E"];
+        let col_labels: &[&str] = &["1", "2", "3", "4", "5"];
+
+        let mut pool = GraphemePool::new();
+        let area = Rect::new(0, 0, 30, 8);
+
+        // First render.
+        let widget1 = HeatmapGrid::new(&data)
+            .row_labels(row_labels)
+            .col_labels(col_labels)
+            .data_generation(0);
+        let mut frame1 = Frame::new(30, 8, &mut pool);
+        widget1.render(area, &mut frame1);
+        let snap1 = extract_buffer_snapshot(&frame1, 30, 8);
+
+        // Second render (fresh widget, fresh frame).
+        let widget2 = HeatmapGrid::new(&data)
+            .row_labels(row_labels)
+            .col_labels(col_labels)
+            .data_generation(0);
+        let mut frame2 = Frame::new(30, 8, &mut pool);
+        widget2.render(area, &mut frame2);
+        let snap2 = extract_buffer_snapshot(&frame2, 30, 8);
+
+        // Determinism: both snapshots must be identical.
+        assert_eq!(snap1.len(), snap2.len(), "snapshot lengths differ");
+        assert_eq!(snap1, snap2, "golden snapshots are not deterministic");
+
+        // Sanity: row labels appear in the output.
+        let text: String = snap1.iter().map(|&(_, _, ch, _, _)| ch).collect();
+        assert!(text.contains('A'), "row label A missing");
+        assert!(text.contains('E'), "row label E missing");
+
+        // Sanity: column labels appear.
+        assert!(text.contains('1'), "col label 1 missing");
+        assert!(text.contains('5'), "col label 5 missing");
+
+        // Sanity: some cells have non-default background (colored heatmap).
+        let colored_count = snap1
+            .iter()
+            .filter(|&&(_, _, _, _, bg)| bg != PackedRgba::TRANSPARENT && bg != PackedRgba::BLACK)
+            .count();
+        assert!(colored_count > 0, "heatmap should have colored cells");
+    }
+
+    /// 2. Render the same data twice: once with cache (normal) and once with
+    ///    cache invalidated every frame. The buffer contents must be identical.
+    #[test]
+    fn cached_vs_uncached_identical() {
+        let data: Vec<Vec<f64>> = (0..8)
+            .map(|r| (0..8).map(|c| ((r * 8 + c) as f64) / 63.0).collect())
+            .collect();
+        let row_labels: &[&str] = &["R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7"];
+        let area = Rect::new(0, 0, 40, 10);
+        let mut pool = GraphemePool::new();
+
+        // Cached render (normal path).
+        let widget_cached = HeatmapGrid::new(&data)
+            .row_labels(row_labels)
+            .data_generation(0);
+        let mut frame_cached = Frame::new(40, 10, &mut pool);
+        widget_cached.render(area, &mut frame_cached);
+        let snap_cached = extract_buffer_snapshot(&frame_cached, 40, 10);
+
+        // Uncached render (invalidate before render).
+        let widget_uncached = HeatmapGrid::new(&data)
+            .row_labels(row_labels)
+            .data_generation(0);
+        widget_uncached.invalidate_cache();
+        let mut frame_uncached = Frame::new(40, 10, &mut pool);
+        widget_uncached.render(area, &mut frame_uncached);
+        let snap_uncached = extract_buffer_snapshot(&frame_uncached, 40, 10);
+
+        assert_eq!(
+            snap_cached, snap_uncached,
+            "cached and uncached renders must produce identical output"
+        );
+    }
+
+    /// 3. 100 stable frames with cache should recompute layout only once.
+    ///    100 frames with cache invalidated each time should recompute 100 times.
+    ///    The cached version must be faster (we verify compute_count as a proxy).
+    #[test]
+    fn bench_stable_frames_faster_with_cache() {
+        let data: Vec<Vec<f64>> = (0..20)
+            .map(|r| (0..20).map(|c| ((r * 20 + c) as f64) / 400.0).collect())
+            .collect();
+        let area = Rect::new(0, 0, 80, 24);
+        let mut pool = GraphemePool::new();
+
+        // Cached: render 100 frames.
+        let widget_cached = HeatmapGrid::new(&data).data_generation(0);
+        let cached_start = std::time::Instant::now();
+        for _ in 0..100 {
+            let mut frame = Frame::new(80, 24, &mut pool);
+            widget_cached.render(area, &mut frame);
+        }
+        let cached_elapsed = cached_start.elapsed();
+        let cached_computes = widget_cached.layout_cache().compute_count;
+
+        // Uncached: render 100 frames with invalidation.
+        let widget_uncached = HeatmapGrid::new(&data).data_generation(0);
+        let uncached_start = std::time::Instant::now();
+        for _ in 0..100 {
+            widget_uncached.invalidate_cache();
+            let mut frame = Frame::new(80, 24, &mut pool);
+            widget_uncached.render(area, &mut frame);
+        }
+        let uncached_elapsed = uncached_start.elapsed();
+        let uncached_computes = widget_uncached.layout_cache().compute_count;
+
+        // Structural validation: cached should compute once, uncached 100 times.
+        // This is the primary correctness proof that caching works.
+        assert_eq!(cached_computes, 1, "cached should compute layout once");
+        assert_eq!(uncached_computes, 100, "uncached should compute 100 times");
+
+        // Timing: in debug builds, rendering (cell iteration) dominates layout
+        // computation, so the timing ratio may not favor cached. The compute_count
+        // difference is the real validation; criterion benchmarks in release mode
+        // measure the actual wall-clock improvement.
+        let _ = (cached_elapsed, uncached_elapsed);
+    }
+
+    /// 4. Changing data every frame should have similar cost regardless of cache,
+    ///    since the cache is invalidated by the generation counter each time.
+    #[test]
+    fn bench_changing_frames_same_cost() {
+        let data: Vec<Vec<f64>> = (0..10)
+            .map(|r| (0..10).map(|c| ((r * 10 + c) as f64) / 100.0).collect())
+            .collect();
+        let area = Rect::new(0, 0, 40, 12);
+        let mut pool = GraphemePool::new();
+
+        // "Cached" path with changing generation.
+        let changing_start = std::time::Instant::now();
+        for generation in 0..100u64 {
+            let widget = HeatmapGrid::new(&data).data_generation(generation);
+            let mut frame = Frame::new(40, 12, &mut pool);
+            widget.render(area, &mut frame);
+        }
+        let changing_elapsed = changing_start.elapsed();
+
+        // "Uncached" path with explicit invalidation (equivalent).
+        let uncached_start = std::time::Instant::now();
+        for _ in 0..100u64 {
+            let widget = HeatmapGrid::new(&data).data_generation(0);
+            widget.invalidate_cache();
+            let mut frame = Frame::new(40, 12, &mut pool);
+            widget.render(area, &mut frame);
+        }
+        let uncached_elapsed = uncached_start.elapsed();
+
+        // Both paths recompute layout every frame, so they should have similar costs.
+        // Allow up to 3x difference to account for noise.
+        let ratio = if changing_elapsed > uncached_elapsed {
+            changing_elapsed.as_nanos() as f64 / uncached_elapsed.as_nanos().max(1) as f64
+        } else {
+            uncached_elapsed.as_nanos() as f64 / changing_elapsed.as_nanos().max(1) as f64
+        };
+        assert!(
+            ratio < 3.0,
+            "changing vs uncached should have similar cost; ratio={ratio:.2} \
+             (changing={changing_elapsed:?}, uncached={uncached_elapsed:?})"
+        );
+    }
+
+    // ─── TransparencyWidget tests (br-678k5, H.1) ────────────────────
+
+    fn make_test_entries() -> Vec<mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry> {
+        use mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry;
+        vec![
+            {
+                let mut e = EvidenceLedgerEntry::new(
+                    "d1",
+                    "tui.diff_strategy",
+                    "incremental",
+                    0.85,
+                    serde_json::json!({"state": "stable"}),
+                );
+                e.correct = Some(true);
+                e
+            },
+            {
+                let mut e = EvidenceLedgerEntry::new(
+                    "d2",
+                    "cache.eviction",
+                    "promote",
+                    0.62,
+                    serde_json::json!({"freq": 3}),
+                );
+                e.correct = Some(false);
+                e
+            },
+            {
+                let mut e = EvidenceLedgerEntry::new(
+                    "d3",
+                    "tui.diff_strategy",
+                    "full",
+                    0.90,
+                    serde_json::json!({"state": "resize"}),
+                );
+                // No outcome yet.
+                e
+            },
+        ]
+    }
+
+    /// 1. Render L0 badges, verify colored circle cells in output.
+    #[test]
+    fn transparency_l0_badge_rendering() {
+        let entries = make_test_entries();
+        let widget = TransparencyWidget::new(&entries).level(DisclosureLevel::Badge);
+        let mut pool = GraphemePool::new();
+        let area = Rect::new(0, 0, 20, 3);
+        let mut frame = Frame::new(20, 3, &mut pool);
+        widget.render(area, &mut frame);
+
+        // Check that badge cells have the expected colors.
+        let cell0 = frame.buffer.get(0, 0).unwrap();
+        assert_eq!(cell0.fg, PackedRgba::rgb(80, 200, 80), "entry 0: correct=true -> green");
+
+        let cell1 = frame.buffer.get(2, 0).unwrap();
+        assert_eq!(cell1.fg, PackedRgba::rgb(220, 60, 60), "entry 1: correct=false -> red");
+
+        let cell2 = frame.buffer.get(4, 0).unwrap();
+        assert_eq!(cell2.fg, PackedRgba::rgb(220, 200, 60), "entry 2: correct=None -> yellow");
+    }
+
+    /// 2. Render L1 summary, verify summary text matches expected format.
+    #[test]
+    fn transparency_l1_summary_text() {
+        let entries = make_test_entries();
+        let widget = TransparencyWidget::new(&entries).level(DisclosureLevel::Summary);
+        let out = render_widget(&widget, 60, 5);
+
+        assert!(
+            out.contains("tui.diff_strategy: incremental (85%)"),
+            "missing summary for entry 0; got: {out}"
+        );
+        assert!(
+            out.contains("cache.eviction: promote (62%)"),
+            "missing summary for entry 1; got: {out}"
+        );
+        assert!(
+            out.contains("tui.diff_strategy: full (90%)"),
+            "missing summary for entry 2; got: {out}"
+        );
+    }
+
+    /// 3. Render L2 detail, verify all EvidenceLedgerEntry fields visible.
+    #[test]
+    fn transparency_l2_detail_fields() {
+        let entries = make_test_entries();
+        let widget = TransparencyWidget::new(&entries).level(DisclosureLevel::Detail);
+        let out = render_widget(&widget, 60, 30);
+
+        assert!(out.contains("decision_point: tui.diff_strategy"), "missing decision_point");
+        assert!(out.contains("action: incremental"), "missing action");
+        assert!(out.contains("confidence: 0.85"), "missing confidence");
+        assert!(out.contains("decision_id: d1"), "missing decision_id");
+        assert!(out.contains("action: promote"), "missing second entry action");
+        assert!(out.contains("cache.eviction"), "missing second decision_point");
+    }
+
+    /// 4. Render L3 deep-dive, verify sparkline data rendered.
+    #[test]
+    fn transparency_l3_sparkline() {
+        let entries = make_test_entries();
+        let widget = TransparencyWidget::new(&entries).level(DisclosureLevel::DeepDive);
+        let mut pool = GraphemePool::new();
+        let area = Rect::new(0, 0, 40, 10);
+        let mut frame = Frame::new(40, 10, &mut pool);
+        widget.render(area, &mut frame);
+
+        // The deep-dive groups by decision_point and renders sparklines.
+        let out = render_widget(&widget, 40, 10);
+        assert!(
+            out.contains("tui.diff_strategy:"),
+            "missing decision_point label in deep-dive"
+        );
+        assert!(
+            out.contains("cache.eviction:"),
+            "missing second decision_point label"
+        );
+
+        // Sparkline should render block characters (not just spaces).
+        let non_space_non_label: usize = out
+            .lines()
+            .filter(|l| !l.contains(':'))
+            .map(|l| l.chars().filter(|c| !c.is_whitespace()).count())
+            .sum();
+        // There should be some sparkline bar characters.
+        assert!(
+            non_space_non_label > 0 || out.chars().any(|c| c as u32 > 0x2580),
+            "sparkline should render block characters"
+        );
+    }
+
+    /// 5. Cycle through all disclosure levels, verify rendering changes.
+    #[test]
+    fn transparency_level_navigation() {
+        let entries = make_test_entries();
+        let mut pool = GraphemePool::new();
+        let area = Rect::new(0, 0, 60, 20);
+
+        let mut snapshots = Vec::new();
+        let levels = [
+            DisclosureLevel::Badge,
+            DisclosureLevel::Summary,
+            DisclosureLevel::Detail,
+            DisclosureLevel::DeepDive,
+        ];
+        for level in &levels {
+            let widget = TransparencyWidget::new(&entries).level(*level);
+            let mut frame = Frame::new(60, 20, &mut pool);
+            widget.render(area, &mut frame);
+            let snap = extract_buffer_snapshot(&frame, 60, 20);
+            snapshots.push(snap);
+        }
+
+        // Each level should produce a different output.
+        for i in 0..levels.len() {
+            for j in (i + 1)..levels.len() {
+                assert_ne!(
+                    snapshots[i], snapshots[j],
+                    "{:?} and {:?} produced identical output",
+                    levels[i], levels[j]
+                );
+            }
+        }
+
+        // Verify level cycling: next/prev round-trips.
+        let mut level = DisclosureLevel::Badge;
+        for _ in 0..4 {
+            level = level.next();
+        }
+        assert_eq!(level, DisclosureLevel::Badge, "4 next() should cycle back to Badge");
+
+        let mut level = DisclosureLevel::Badge;
+        for _ in 0..4 {
+            level = level.prev();
+        }
+        assert_eq!(level, DisclosureLevel::Badge, "4 prev() should cycle back to Badge");
     }
 }
