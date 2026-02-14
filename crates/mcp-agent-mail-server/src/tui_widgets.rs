@@ -2498,6 +2498,675 @@ impl DrillDownWidget for MessageCard<'_> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ChartDataProvider — trait + aggregation infrastructure for chart widgets
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::tui_events::{EventRingBuffer, MailEvent, MailEventKind};
+
+/// Convert a [`Duration`] to microseconds as `i64`, saturating at `i64::MAX`.
+#[allow(clippy::cast_possible_truncation)]
+const fn duration_to_micros_i64(d: Duration) -> i64 {
+    let micros = d.as_micros();
+    if micros > i64::MAX as u128 {
+        i64::MAX
+    } else {
+        micros as i64
+    }
+}
+
+/// Convert microsecond delta to seconds as `f64`.
+///
+/// Intentional precision loss: chart-resolution data does not require 64-bit integer precision.
+#[allow(clippy::cast_precision_loss)]
+fn micros_to_seconds_f64(micros: i64) -> f64 {
+    micros as f64 / 1_000_000.0
+}
+
+/// Helper: compute `(reference, cutoff)` for windowed `data_points` queries.
+fn window_reference_and_cutoff(
+    buckets: &[(i64, Vec<f64>)],
+    bucket_micros: i64,
+    window: Duration,
+) -> (i64, i64) {
+    let reference = buckets.last().map_or(0, |b| b.0 + bucket_micros);
+    let cutoff = reference - duration_to_micros_i64(window);
+    (reference, cutoff)
+}
+
+/// Helper: filter buckets by cutoff and map to `(f64, f64)` for a series index.
+fn windowed_xy(
+    buckets: &[(i64, Vec<f64>)],
+    idx: usize,
+    reference: i64,
+    cutoff: i64,
+) -> Vec<(f64, f64)> {
+    buckets
+        .iter()
+        .filter(|(ts, _)| *ts >= cutoff)
+        .filter_map(|(ts, vals)| {
+            vals.get(idx).map(|&v| {
+                let x = micros_to_seconds_f64(*ts - reference);
+                (x, v)
+            })
+        })
+        .collect()
+}
+
+/// Rolling window granularity for time-series aggregation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Granularity {
+    /// 1 second buckets.
+    OneSecond,
+    /// 5 second buckets.
+    FiveSeconds,
+    /// 30 second buckets.
+    ThirtySeconds,
+    /// 1 minute buckets.
+    OneMinute,
+    /// 5 minute buckets.
+    FiveMinutes,
+}
+
+impl Granularity {
+    /// Bucket width in microseconds.
+    #[must_use]
+    pub const fn bucket_micros(self) -> i64 {
+        match self {
+            Self::OneSecond => 1_000_000,
+            Self::FiveSeconds => 5_000_000,
+            Self::ThirtySeconds => 30_000_000,
+            Self::OneMinute => 60_000_000,
+            Self::FiveMinutes => 300_000_000,
+        }
+    }
+
+    /// Bucket width as a [`Duration`].
+    #[must_use]
+    pub const fn as_duration(self) -> Duration {
+        Duration::from_micros(self.bucket_micros().unsigned_abs())
+    }
+}
+
+/// Cached time-series data at a single granularity.
+///
+/// Each bucket stores `(timestamp_micros, values_per_series)`.
+#[derive(Debug, Clone)]
+pub struct AggregatedTimeSeries {
+    /// Granularity of these buckets.
+    pub granularity: Granularity,
+    /// Number of series.
+    pub series_count: usize,
+    /// Bucket data: `(bucket_start_micros, values)` where `values.len() == series_count`.
+    pub buckets: Vec<(i64, Vec<f64>)>,
+    /// Last event sequence number incorporated.
+    pub last_seq: u64,
+}
+
+impl AggregatedTimeSeries {
+    /// Create empty aggregated series.
+    #[must_use]
+    pub const fn new(granularity: Granularity, series_count: usize) -> Self {
+        Self {
+            granularity,
+            series_count,
+            buckets: Vec::new(),
+            last_seq: 0,
+        }
+    }
+
+    /// Trim buckets outside the given window (keeps only recent data).
+    pub fn trim_to_window(&mut self, window: Duration) {
+        if self.buckets.is_empty() {
+            return;
+        }
+        let latest = self.buckets.last().map_or(0, |b| b.0);
+        let cutoff = latest - duration_to_micros_i64(window);
+        self.buckets.retain(|b| b.0 >= cutoff);
+    }
+
+    /// Convert buckets to `(f64, f64)` pairs for a specific series index.
+    /// The x-axis is seconds relative to `reference_micros`.
+    #[must_use]
+    pub fn series_as_xy(&self, series_idx: usize, reference_micros: i64) -> Vec<(f64, f64)> {
+        self.buckets
+            .iter()
+            .filter_map(|(ts, vals)| {
+                vals.get(series_idx).map(|&v| {
+                    let x = micros_to_seconds_f64(*ts - reference_micros);
+                    (x, v)
+                })
+            })
+            .collect()
+    }
+
+    /// Compute the (min, max) y range across all series.
+    #[must_use]
+    pub fn y_range(&self) -> (f64, f64) {
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+        for (_, vals) in &self.buckets {
+            for &v in vals {
+                if v < min_val {
+                    min_val = v;
+                }
+                if v > max_val {
+                    max_val = v;
+                }
+            }
+        }
+        if min_val > max_val {
+            (0.0, 1.0)
+        } else {
+            (min_val, max_val)
+        }
+    }
+}
+
+/// Trait for providing chart-ready time-series data from the event ring buffer.
+///
+/// Concrete implementations convert raw [`MailEvent`]s into chart-ready data
+/// at multiple granularities. Each provider is incrementally updated via
+/// [`EventRingBuffer::events_since_seq`].
+pub trait ChartDataProvider {
+    /// Number of data series this provider exposes.
+    fn series_count(&self) -> usize;
+
+    /// Human-readable label for series at `idx`.
+    fn series_label(&self, idx: usize) -> &'static str;
+
+    /// Data points for a series within a time window, as `(timestamp_seconds_relative, value)`.
+    ///
+    /// The returned slice is suitable for passing to `LineChart::Series`.
+    fn data_points(&self, idx: usize, window: Duration) -> Vec<(f64, f64)>;
+
+    /// The (min, max) y-axis range across all series for the current window.
+    fn y_range(&self) -> (f64, f64);
+
+    /// Refresh by ingesting new events from the ring buffer.
+    fn refresh(&mut self);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ThroughputProvider — messages/sec from ToolCallEnd events
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tracks tool call throughput (calls/sec) from `ToolCallEnd` events.
+///
+/// Produces a single series: "calls/sec" bucketed at the configured granularity.
+pub struct ThroughputProvider {
+    ring: Arc<EventRingBuffer>,
+    granularity: Granularity,
+    series: AggregatedTimeSeries,
+    max_window: Duration,
+}
+
+impl ThroughputProvider {
+    /// Create a new throughput provider.
+    #[must_use]
+    pub const fn new(
+        ring: Arc<EventRingBuffer>,
+        granularity: Granularity,
+        max_window: Duration,
+    ) -> Self {
+        Self {
+            ring,
+            granularity,
+            series: AggregatedTimeSeries::new(granularity, 1),
+            max_window,
+        }
+    }
+}
+
+impl ChartDataProvider for ThroughputProvider {
+    fn series_count(&self) -> usize {
+        1
+    }
+
+    fn series_label(&self, _idx: usize) -> &'static str {
+        "calls/sec"
+    }
+
+    fn data_points(&self, idx: usize, window: Duration) -> Vec<(f64, f64)> {
+        let (reference, cutoff) = window_reference_and_cutoff(
+            &self.series.buckets,
+            self.granularity.bucket_micros(),
+            window,
+        );
+        windowed_xy(&self.series.buckets, idx, reference, cutoff)
+    }
+
+    fn y_range(&self) -> (f64, f64) {
+        self.series.y_range()
+    }
+
+    fn refresh(&mut self) {
+        let events = self.ring.events_since_seq(self.series.last_seq);
+        let bucket_w = self.granularity.bucket_micros();
+
+        for event in &events {
+            if event.seq() <= self.series.last_seq {
+                continue;
+            }
+            self.series.last_seq = event.seq();
+
+            if event.kind() != MailEventKind::ToolCallEnd {
+                continue;
+            }
+
+            let ts = event.timestamp_micros();
+            let bucket_start = (ts / bucket_w) * bucket_w;
+
+            if let Some(last) = self.series.buckets.last_mut() {
+                if last.0 == bucket_start {
+                    last.1[0] += 1.0;
+                    continue;
+                }
+            }
+
+            // Fill gaps with zero buckets.
+            if let Some(&(prev_start, _)) = self.series.buckets.last() {
+                let mut gap = prev_start + bucket_w;
+                while gap < bucket_start {
+                    self.series.buckets.push((gap, vec![0.0]));
+                    gap += bucket_w;
+                }
+            }
+            self.series.buckets.push((bucket_start, vec![1.0]));
+        }
+
+        self.series.trim_to_window(self.max_window);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LatencyProvider — per-tool P50/P95/P99 from ToolCallEnd events
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tracks tool call latency percentiles (P50/P95/P99) from `ToolCallEnd` events.
+///
+/// Produces three series: "P50", "P95", "P99", each bucketed at the configured granularity.
+/// Within each bucket, latency samples are collected and percentiles computed.
+pub struct LatencyProvider {
+    ring: Arc<EventRingBuffer>,
+    granularity: Granularity,
+    series: AggregatedTimeSeries,
+    /// Raw samples per bucket for percentile computation: `(bucket_start, samples)`.
+    raw_samples: Vec<(i64, Vec<f64>)>,
+    last_seq: u64,
+    max_window: Duration,
+}
+
+impl LatencyProvider {
+    /// Create a new latency provider.
+    #[must_use]
+    pub const fn new(
+        ring: Arc<EventRingBuffer>,
+        granularity: Granularity,
+        max_window: Duration,
+    ) -> Self {
+        Self {
+            ring,
+            granularity,
+            series: AggregatedTimeSeries::new(granularity, 3),
+            raw_samples: Vec::new(),
+            last_seq: 0,
+            max_window,
+        }
+    }
+
+    /// Compute the value at a given percentile (0.0–1.0) from sorted samples.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn percentile(sorted: &[f64], p: f64) -> f64 {
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        if sorted.len() == 1 {
+            return sorted[0];
+        }
+        let rank = p * (sorted.len() - 1) as f64;
+        let lo = rank.floor() as usize;
+        let hi = rank.ceil() as usize;
+        let frac = rank - lo as f64;
+        sorted[lo].mul_add(1.0 - frac, sorted[hi.min(sorted.len() - 1)] * frac)
+    }
+}
+
+impl ChartDataProvider for LatencyProvider {
+    fn series_count(&self) -> usize {
+        3
+    }
+
+    fn series_label(&self, idx: usize) -> &'static str {
+        match idx {
+            0 => "P50",
+            1 => "P95",
+            2 => "P99",
+            _ => "???",
+        }
+    }
+
+    fn data_points(&self, idx: usize, window: Duration) -> Vec<(f64, f64)> {
+        let (reference, cutoff) = window_reference_and_cutoff(
+            &self.series.buckets,
+            self.granularity.bucket_micros(),
+            window,
+        );
+        windowed_xy(&self.series.buckets, idx, reference, cutoff)
+    }
+
+    fn y_range(&self) -> (f64, f64) {
+        self.series.y_range()
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn refresh(&mut self) {
+        let events = self.ring.events_since_seq(self.last_seq);
+        let bucket_w = self.granularity.bucket_micros();
+
+        for event in &events {
+            if event.seq() <= self.last_seq {
+                continue;
+            }
+            self.last_seq = event.seq();
+
+            if let MailEvent::ToolCallEnd {
+                duration_ms,
+                timestamp_micros,
+                ..
+            } = event
+            {
+                let bucket_start = (timestamp_micros / bucket_w) * bucket_w;
+                let dur = *duration_ms as f64;
+
+                if let Some(last) = self.raw_samples.last_mut() {
+                    if last.0 == bucket_start {
+                        last.1.push(dur);
+                        continue;
+                    }
+                }
+
+                self.raw_samples.push((bucket_start, vec![dur]));
+            }
+        }
+
+        // Recompute percentiles for all buckets.
+        self.series.buckets.clear();
+        self.series.buckets.reserve(self.raw_samples.len());
+        for (bucket_start, samples) in &mut self.raw_samples {
+            samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p50 = Self::percentile(samples, 0.50);
+            let p95 = Self::percentile(samples, 0.95);
+            let p99 = Self::percentile(samples, 0.99);
+            self.series
+                .buckets
+                .push((*bucket_start, vec![p50, p95, p99]));
+        }
+
+        self.series.last_seq = self.last_seq;
+
+        // Trim old data.
+        let cutoff_micros =
+            self.raw_samples.last().map_or(0, |b| b.0) - duration_to_micros_i64(self.max_window);
+        self.raw_samples.retain(|b| b.0 >= cutoff_micros);
+        self.series.trim_to_window(self.max_window);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ResourceProvider — DB stats from HealthPulse events
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tracks resource utilization from `HealthPulse` events.
+///
+/// Produces four series: "projects", "agents", "messages", "reservations".
+pub struct ResourceProvider {
+    ring: Arc<EventRingBuffer>,
+    granularity: Granularity,
+    series: AggregatedTimeSeries,
+    max_window: Duration,
+}
+
+impl ResourceProvider {
+    /// Create a new resource provider.
+    #[must_use]
+    pub const fn new(
+        ring: Arc<EventRingBuffer>,
+        granularity: Granularity,
+        max_window: Duration,
+    ) -> Self {
+        Self {
+            ring,
+            granularity,
+            series: AggregatedTimeSeries::new(granularity, 4),
+            max_window,
+        }
+    }
+}
+
+impl ChartDataProvider for ResourceProvider {
+    fn series_count(&self) -> usize {
+        4
+    }
+
+    fn series_label(&self, idx: usize) -> &'static str {
+        match idx {
+            0 => "projects",
+            1 => "agents",
+            2 => "messages",
+            3 => "reservations",
+            _ => "???",
+        }
+    }
+
+    fn data_points(&self, idx: usize, window: Duration) -> Vec<(f64, f64)> {
+        let (reference, cutoff) = window_reference_and_cutoff(
+            &self.series.buckets,
+            self.granularity.bucket_micros(),
+            window,
+        );
+        windowed_xy(&self.series.buckets, idx, reference, cutoff)
+    }
+
+    fn y_range(&self) -> (f64, f64) {
+        self.series.y_range()
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn refresh(&mut self) {
+        let events = self.ring.events_since_seq(self.series.last_seq);
+        let bucket_w = self.granularity.bucket_micros();
+
+        for event in &events {
+            if event.seq() <= self.series.last_seq {
+                continue;
+            }
+            self.series.last_seq = event.seq();
+
+            if let MailEvent::HealthPulse {
+                timestamp_micros,
+                db_stats,
+                ..
+            } = event
+            {
+                let bucket_start = (timestamp_micros / bucket_w) * bucket_w;
+                let vals = vec![
+                    db_stats.projects as f64,
+                    db_stats.agents as f64,
+                    db_stats.messages as f64,
+                    db_stats.file_reservations as f64,
+                ];
+
+                // HealthPulse is a snapshot — replace the bucket value (last wins).
+                if let Some(last) = self.series.buckets.last_mut() {
+                    if last.0 == bucket_start {
+                        last.1 = vals;
+                        continue;
+                    }
+                }
+                self.series.buckets.push((bucket_start, vals));
+            }
+        }
+
+        self.series.trim_to_window(self.max_window);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EventHeatmapProvider — event-type counts per time bucket for Canvas rendering
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Number of distinct [`MailEventKind`] variants.
+const EVENT_KIND_COUNT: usize = 11;
+
+/// All event kinds in a fixed order for consistent heatmap row assignment.
+const EVENT_KINDS: [MailEventKind; EVENT_KIND_COUNT] = [
+    MailEventKind::ToolCallStart,
+    MailEventKind::ToolCallEnd,
+    MailEventKind::MessageSent,
+    MailEventKind::MessageReceived,
+    MailEventKind::ReservationGranted,
+    MailEventKind::ReservationReleased,
+    MailEventKind::AgentRegistered,
+    MailEventKind::HttpRequest,
+    MailEventKind::HealthPulse,
+    MailEventKind::ServerStarted,
+    MailEventKind::ServerShutdown,
+];
+
+/// Event kind labels for heatmap rows.
+const EVENT_KIND_LABELS: [&str; EVENT_KIND_COUNT] = [
+    "ToolStart",
+    "ToolEnd",
+    "MsgSent",
+    "MsgRecv",
+    "ResGrant",
+    "ResRelease",
+    "AgentReg",
+    "HTTP",
+    "Health",
+    "SrvStart",
+    "SrvStop",
+];
+
+/// Tracks event-type counts per time bucket for heatmap/Canvas rendering.
+///
+/// Produces `EVENT_KIND_COUNT` series, one per `MailEventKind`.
+/// Each bucket contains the count of events of that kind within the bucket window.
+pub struct EventHeatmapProvider {
+    ring: Arc<EventRingBuffer>,
+    granularity: Granularity,
+    series: AggregatedTimeSeries,
+    max_window: Duration,
+}
+
+impl EventHeatmapProvider {
+    /// Create a new event heatmap provider.
+    #[must_use]
+    pub const fn new(
+        ring: Arc<EventRingBuffer>,
+        granularity: Granularity,
+        max_window: Duration,
+    ) -> Self {
+        Self {
+            ring,
+            granularity,
+            series: AggregatedTimeSeries::new(granularity, EVENT_KIND_COUNT),
+            max_window,
+        }
+    }
+
+    /// Get the kind index for heatmap row mapping.
+    fn kind_index(kind: MailEventKind) -> usize {
+        EVENT_KINDS.iter().position(|k| *k == kind).unwrap_or(0)
+    }
+
+    /// Return the heatmap grid data: `(columns, rows, values)` where
+    /// columns = time buckets, rows = event kinds, values = counts.
+    #[must_use]
+    pub fn heatmap_grid(&self) -> (usize, usize, Vec<Vec<f64>>) {
+        let cols = self.series.buckets.len();
+        let rows = EVENT_KIND_COUNT;
+        let mut grid = vec![vec![0.0; cols]; rows];
+        for (col, (_, vals)) in self.series.buckets.iter().enumerate() {
+            for (row, &v) in vals.iter().enumerate() {
+                if row < rows {
+                    grid[row][col] = v;
+                }
+            }
+        }
+        (cols, rows, grid)
+    }
+}
+
+impl ChartDataProvider for EventHeatmapProvider {
+    fn series_count(&self) -> usize {
+        EVENT_KIND_COUNT
+    }
+
+    fn series_label(&self, idx: usize) -> &'static str {
+        EVENT_KIND_LABELS.get(idx).copied().unwrap_or("???")
+    }
+
+    fn data_points(&self, idx: usize, window: Duration) -> Vec<(f64, f64)> {
+        let (reference, cutoff) = window_reference_and_cutoff(
+            &self.series.buckets,
+            self.granularity.bucket_micros(),
+            window,
+        );
+        windowed_xy(&self.series.buckets, idx, reference, cutoff)
+    }
+
+    fn y_range(&self) -> (f64, f64) {
+        self.series.y_range()
+    }
+
+    fn refresh(&mut self) {
+        let events = self.ring.events_since_seq(self.series.last_seq);
+        let bucket_w = self.granularity.bucket_micros();
+
+        for event in &events {
+            if event.seq() <= self.series.last_seq {
+                continue;
+            }
+            self.series.last_seq = event.seq();
+
+            let ts = event.timestamp_micros();
+            let bucket_start = (ts / bucket_w) * bucket_w;
+            let kind_idx = Self::kind_index(event.kind());
+
+            if let Some(last) = self.series.buckets.last_mut() {
+                if last.0 == bucket_start {
+                    last.1[kind_idx] += 1.0;
+                    continue;
+                }
+            }
+
+            // Fill gaps with zero buckets.
+            if let Some(&(prev_start, _)) = self.series.buckets.last() {
+                let mut gap = prev_start + bucket_w;
+                while gap < bucket_start {
+                    self.series.buckets.push((gap, vec![0.0; EVENT_KIND_COUNT]));
+                    gap += bucket_w;
+                }
+            }
+
+            let mut vals = vec![0.0; EVENT_KIND_COUNT];
+            vals[kind_idx] = 1.0;
+            self.series.buckets.push((bucket_start, vals));
+        }
+
+        self.series.trim_to_window(self.max_window);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
