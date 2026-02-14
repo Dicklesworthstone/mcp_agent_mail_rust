@@ -38,11 +38,20 @@ mcp-agent-mail-storage = { path = "../mcp-agent-mail-storage" }
 mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools" }
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 ftui-harness.workspace = true
 ftui-render.workspace = true
 sqlmodel-sqlite.workspace = true
+
+[[bench]]
+name = "widget_bench"
+harness = false
+
+[[bench]]
+name = "frame_bench"
+harness = false
 
 [lints]
 workspace = true
