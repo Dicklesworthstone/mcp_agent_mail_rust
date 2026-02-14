@@ -61,7 +61,7 @@ pub type CliResult<T> = Result<T, CliError>;
 #[command(name = "am", version, about = "MCP Agent Mail CLI (Rust)")]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1639,6 +1639,16 @@ pub enum ToolingCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Drop legacy SQLite FTS message triggers after Search V3 rollout validation.
+    #[command(name = "decommission-fts")]
+    DecommissionFts {
+        /// Proceed even if preflight checks fail.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 pub fn run() -> i32 {
@@ -1708,7 +1718,11 @@ fn emit_error(err: &CliError) {
 }
 
 fn execute(cli: Cli) -> CliResult<()> {
-    match cli.command {
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => return handle_default_launch(),
+    };
+    match command {
         Commands::Share { action } => handle_share(action),
         Commands::Doctor { action } => handle_doctor(action),
         Commands::Guard { action } => handle_guard(action),
@@ -1794,6 +1808,36 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::FlakeTriage { action } => handle_flake_triage(action),
         Commands::Robot(args) => robot::handle_robot(args),
     }
+}
+
+/// Default behavior when `am` is invoked with no subcommand:
+/// 1. Auto-detect installed coding agents and configure their MCP connections
+/// 2. Start the HTTP server with the TUI
+fn handle_default_launch() -> CliResult<()> {
+    // Step 1: Run setup (auto-detect agents, configure connections)
+    // Non-fatal: if setup fails we still start the server
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let setup_result = handle_setup(SetupCommand::Run {
+        agent: None,
+        dry_run: false,
+        yes: true,
+        token: None,
+        port: 8765,
+        host: "127.0.0.1".to_string(),
+        path: "/mcp/".to_string(),
+        project_dir: Some(cwd),
+        json: false,
+        no_user_config: false,
+        no_hooks: false,
+    });
+    if let Err(e) = &setup_result {
+        output::warn(&format!(
+            "Agent setup encountered an issue (non-fatal): {e}"
+        ));
+    }
+
+    // Step 2: Start HTTP server with TUI (default settings)
+    handle_serve_http(None, None, None, false)
 }
 
 #[cfg(test)]
@@ -8595,7 +8639,7 @@ mod tests {
             "/api/x/",
         ])
         .expect("failed to parse serve-http flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ServeHttp {
                 host,
                 port,
@@ -8615,7 +8659,7 @@ mod tests {
     fn clap_parses_serve_http_no_auth() {
         let cli = Cli::try_parse_from(["am", "serve-http", "--no-auth"])
             .expect("failed to parse serve-http --no-auth");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ServeHttp { no_auth, .. } => {
                 assert!(no_auth, "--no-auth flag should be true");
             }
@@ -8627,7 +8671,7 @@ mod tests {
     fn clap_parses_check_inbox_defaults() {
         let cli = Cli::try_parse_from(["am", "check-inbox"])
             .expect("failed to parse check-inbox defaults");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::CheckInbox {
                 agent,
                 rate_limit,
@@ -8670,7 +8714,7 @@ mod tests {
             "/tmp/proj",
         ])
         .expect("failed to parse check-inbox with flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::CheckInbox {
                 agent,
                 rate_limit,
@@ -8698,7 +8742,7 @@ mod tests {
     fn clap_parses_check_inbox_format_toon() {
         let cli = Cli::try_parse_from(["am", "check-inbox", "--format", "toon"])
             .expect("failed to parse check-inbox with format");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::CheckInbox { format, json, .. } => {
                 assert_eq!(format, Some(output::CliOutputFormat::Toon));
                 assert!(!json);
@@ -8711,7 +8755,7 @@ mod tests {
     fn clap_parses_ci_format_toon() {
         let cli = Cli::try_parse_from(["am", "ci", "--format", "toon"])
             .expect("failed to parse ci with format");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Ci {
                 format,
                 json,
@@ -8748,7 +8792,7 @@ mod tests {
             "5",
         ])
         .expect("failed to parse bench flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Bench {
                 quick,
                 json,
@@ -8776,7 +8820,7 @@ mod tests {
     fn clap_parses_bench_list_mode() {
         let cli = Cli::try_parse_from(["am", "bench", "--list"])
             .expect("failed to parse bench list mode");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Bench {
                 quick,
                 json,
@@ -8880,7 +8924,7 @@ mod tests {
     fn clap_parses_clear_and_reset_defaults() {
         let cli = Cli::try_parse_from(["am", "clear-and-reset-everything"])
             .expect("failed to parse clear-and-reset-everything");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ClearAndResetEverything {
                 force,
                 archive,
@@ -8903,7 +8947,7 @@ mod tests {
             "--no-archive",
         ])
         .expect("failed to parse clear-and-reset-everything flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ClearAndResetEverything {
                 force,
                 archive,
@@ -8936,7 +8980,7 @@ mod tests {
     #[test]
     fn clap_parses_amctl_env_defaults() {
         let cli = Cli::try_parse_from(["am", "amctl", "env"]).expect("failed to parse amctl env");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Amctl {
                 action: AmctlCommand::Env { path, agent },
             } => {
@@ -8959,7 +9003,7 @@ mod tests {
             "BlueLake",
         ])
         .expect("failed to parse amctl env flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Amctl {
                 action: AmctlCommand::Env { path, agent },
             } => {
@@ -9022,7 +9066,7 @@ mod tests {
     fn clap_parses_am_run_defaults() {
         let cli = Cli::try_parse_from(["am", "am-run", "frontend-build", "echo", "hi"])
             .expect("failed to parse am-run defaults");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::AmRun(args) => {
                 assert_eq!(args.slot, "frontend-build");
                 assert_eq!(args.cmd, vec!["echo".to_string(), "hi".to_string()]);
@@ -9280,7 +9324,7 @@ mod tests {
             "age1def",
         ])
         .expect("failed to parse share export");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Export(args),
             } => {
@@ -9304,7 +9348,7 @@ mod tests {
     fn clap_share_export_defaults() {
         let cli = Cli::try_parse_from(["am", "share", "export", "-o", "/tmp/out"])
             .expect("failed to parse share export defaults");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Export(args),
             } => {
@@ -9345,7 +9389,7 @@ mod tests {
             "500",
         ])
         .expect("failed to parse share update");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Update(args),
             } => {
@@ -9371,7 +9415,7 @@ mod tests {
             "base64pubkey",
         ])
         .expect("failed to parse share verify");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Verify(args),
             } => {
@@ -9395,7 +9439,7 @@ mod tests {
             "/tmp/out.zip",
         ])
         .expect("failed to parse share decrypt");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Decrypt(args),
             } => {
@@ -9412,7 +9456,7 @@ mod tests {
     fn clap_parses_share_decrypt_passphrase() {
         let cli = Cli::try_parse_from(["am", "share", "decrypt", "/tmp/bundle.age", "-p"])
             .expect("failed to parse share decrypt with passphrase");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Decrypt(args),
             } => {
@@ -9438,7 +9482,7 @@ mod tests {
             "--open-browser",
         ])
         .expect("failed to parse share preview");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Preview(args),
             } => {
@@ -9462,7 +9506,7 @@ mod tests {
         ])
         .expect("failed to parse deploy verify-live defaults");
 
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action:
                     ShareCommand::Deploy {
@@ -9506,7 +9550,7 @@ mod tests {
         ])
         .expect("failed to parse deploy verify-live with all flags");
 
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action:
                     ShareCommand::Deploy {
@@ -9618,7 +9662,7 @@ mod tests {
     fn clap_share_preview_defaults() {
         let cli = Cli::try_parse_from(["am", "share", "preview", "/tmp/bundle"])
             .expect("failed to parse share preview defaults");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Preview(args),
             } => {
@@ -9856,9 +9900,9 @@ mod tests {
             Cli::try_parse_from(["am", "share", "wizard"]).expect("failed to parse share wizard");
         assert!(matches!(
             cli.command,
-            Commands::Share {
+            Some(Commands::Share {
                 action: ShareCommand::Wizard(_)
-            }
+            })
         ));
     }
 
@@ -9888,7 +9932,7 @@ mod tests {
             "--json",
         ])
         .expect("failed to parse share wizard flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Share {
                 action: ShareCommand::Wizard(args),
             } => {
@@ -10090,7 +10134,7 @@ mod tests {
     fn clap_parses_archive_save_defaults() {
         let cli =
             Cli::try_parse_from(["am", "archive", "save"]).expect("failed to parse archive save");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Archive {
                 action:
                     ArchiveCommand::Save {
@@ -10123,7 +10167,7 @@ mod tests {
             "nightly",
         ])
         .expect("failed to parse archive save flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Archive {
                 action:
                     ArchiveCommand::Save {
@@ -10144,7 +10188,7 @@ mod tests {
     fn clap_parses_archive_list_defaults() {
         let cli =
             Cli::try_parse_from(["am", "archive", "list"]).expect("failed to parse archive list");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Archive {
                 action: ArchiveCommand::List { limit, json },
             } => {
@@ -10159,7 +10203,7 @@ mod tests {
     fn clap_parses_archive_list_flags() {
         let cli = Cli::try_parse_from(["am", "archive", "list", "-n", "5", "--json"])
             .expect("failed to parse archive list flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Archive {
                 action: ArchiveCommand::List { limit, json },
             } => {
@@ -10181,7 +10225,7 @@ mod tests {
             "--dry-run",
         ])
         .expect("failed to parse archive restore flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Archive {
                 action:
                     ArchiveCommand::Restore {
@@ -10206,7 +10250,7 @@ mod tests {
     fn clap_parses_products_search_defaults() {
         let cli = Cli::try_parse_from(["am", "products", "search", "prod-1", "query"])
             .expect("failed to parse products search defaults");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Products {
                 action:
                     ProductsCommand::Search {
@@ -10242,7 +10286,7 @@ mod tests {
             "--json",
         ])
         .expect("failed to parse products inbox");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Products {
                 action:
                     ProductsCommand::Inbox {
@@ -10338,7 +10382,7 @@ mod tests {
     #[test]
     fn clap_parses_migrate() {
         let m = Cli::try_parse_from(["am", "migrate"]).unwrap();
-        assert!(matches!(m.command, Commands::Migrate));
+        assert!(matches!(m.command, Some(Commands::Migrate)));
     }
 
     #[test]
@@ -11569,7 +11613,7 @@ mod tests {
     fn clap_parses_docs_insert_blurbs_defaults() {
         let cli = Cli::try_parse_from(["am", "docs", "insert-blurbs"])
             .expect("failed to parse docs insert-blurbs");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Docs { action } => match action {
                 DocsCommand::InsertBlurbs {
                     scan_dir,
@@ -11603,7 +11647,7 @@ mod tests {
             "5",
         ])
         .expect("failed to parse docs insert-blurbs flags");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Docs { action } => match action {
                 DocsCommand::InsertBlurbs {
                     scan_dir,
@@ -11792,7 +11836,7 @@ mod tests {
     #[test]
     fn clap_parses_doctor_check_defaults() {
         let cli = Cli::try_parse_from(["am", "doctor", "check"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Doctor {
                 action:
                     DoctorCommand::Check {
@@ -11813,7 +11857,7 @@ mod tests {
     fn clap_parses_doctor_check_all_flags() {
         let cli =
             Cli::try_parse_from(["am", "doctor", "check", "my-proj", "-v", "--json"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Doctor {
                 action:
                     DoctorCommand::Check {
@@ -11833,7 +11877,7 @@ mod tests {
     #[test]
     fn clap_parses_doctor_repair_defaults() {
         let cli = Cli::try_parse_from(["am", "doctor", "repair"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Doctor {
                 action:
                     DoctorCommand::Repair {
@@ -11865,7 +11909,7 @@ mod tests {
             "/tmp/bak",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Doctor {
                 action:
                     DoctorCommand::Repair {
@@ -11887,7 +11931,7 @@ mod tests {
     #[test]
     fn clap_parses_doctor_backups_defaults() {
         let cli = Cli::try_parse_from(["am", "doctor", "backups"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Doctor {
                 action: DoctorCommand::Backups { json },
             } => assert!(!json),
@@ -11898,7 +11942,7 @@ mod tests {
     #[test]
     fn clap_parses_doctor_backups_json() {
         let cli = Cli::try_parse_from(["am", "doctor", "backups", "--json"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Doctor {
                 action: DoctorCommand::Backups { json },
             } => assert!(json),
@@ -11909,7 +11953,7 @@ mod tests {
     #[test]
     fn clap_parses_doctor_restore_required_path() {
         let cli = Cli::try_parse_from(["am", "doctor", "restore", "/tmp/backup.sqlite3"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Doctor {
                 action:
                     DoctorCommand::Restore {
@@ -11937,7 +11981,7 @@ mod tests {
             "-y",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Doctor {
                 action:
                     DoctorCommand::Restore {
@@ -12061,25 +12105,25 @@ mod tests {
     #[test]
     fn clap_parses_serve_stdio() {
         let cli = Cli::try_parse_from(["am", "serve-stdio"]).unwrap();
-        assert!(matches!(cli.command, Commands::ServeStdio));
+        assert!(matches!(cli.command, Some(Commands::ServeStdio)));
     }
 
     #[test]
     fn clap_parses_lint() {
         let cli = Cli::try_parse_from(["am", "lint"]).unwrap();
-        assert!(matches!(cli.command, Commands::Lint));
+        assert!(matches!(cli.command, Some(Commands::Lint)));
     }
 
     #[test]
     fn clap_parses_typecheck() {
         let cli = Cli::try_parse_from(["am", "typecheck"]).unwrap();
-        assert!(matches!(cli.command, Commands::Typecheck));
+        assert!(matches!(cli.command, Some(Commands::Typecheck)));
     }
 
     #[test]
     fn clap_parses_list_projects_defaults() {
         let cli = Cli::try_parse_from(["am", "list-projects"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ListProjects {
                 include_agents,
                 format,
@@ -12097,7 +12141,7 @@ mod tests {
     fn clap_parses_list_projects_flags() {
         let cli =
             Cli::try_parse_from(["am", "list-projects", "--include-agents", "--json"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ListProjects {
                 include_agents,
                 format,
@@ -12114,7 +12158,7 @@ mod tests {
     #[test]
     fn clap_parses_list_projects_format_toon() {
         let cli = Cli::try_parse_from(["am", "list-projects", "--format", "toon"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ListProjects {
                 include_agents,
                 format,
@@ -12139,7 +12183,7 @@ mod tests {
             "BlueLake",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ListAcks {
                 project_key,
                 agent_name,
@@ -12166,7 +12210,7 @@ mod tests {
             "5",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::ListAcks { limit, .. } => assert_eq!(limit, 5),
             other => panic!("expected ListAcks, got {other:?}"),
         }
@@ -12176,7 +12220,7 @@ mod tests {
     fn clap_parses_guard_install() {
         let cli =
             Cli::try_parse_from(["am", "guard", "install", "my-project", "/tmp/repo"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Guard {
                 action:
                     GuardCommand::Install {
@@ -12199,7 +12243,7 @@ mod tests {
     fn clap_parses_guard_install_prepush() {
         let cli = Cli::try_parse_from(["am", "guard", "install", "proj", "/tmp/repo", "--prepush"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Guard {
                 action: GuardCommand::Install { prepush, .. },
             } => assert!(prepush),
@@ -12210,7 +12254,7 @@ mod tests {
     #[test]
     fn clap_parses_guard_uninstall() {
         let cli = Cli::try_parse_from(["am", "guard", "uninstall", "/tmp/repo"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Guard {
                 action: GuardCommand::Uninstall { repo },
             } => assert_eq!(repo, PathBuf::from("/tmp/repo")),
@@ -12221,7 +12265,7 @@ mod tests {
     #[test]
     fn clap_parses_guard_status() {
         let cli = Cli::try_parse_from(["am", "guard", "status", "/tmp/repo"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Guard {
                 action: GuardCommand::Status { repo },
             } => assert_eq!(repo, PathBuf::from("/tmp/repo")),
@@ -12232,7 +12276,7 @@ mod tests {
     #[test]
     fn clap_parses_guard_check_defaults() {
         let cli = Cli::try_parse_from(["am", "guard", "check"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Guard {
                 action:
                     GuardCommand::Check {
@@ -12261,7 +12305,7 @@ mod tests {
             "/tmp/repo",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Guard {
                 action:
                     GuardCommand::Check {
@@ -12281,7 +12325,7 @@ mod tests {
     #[test]
     fn clap_parses_file_reservations_list() {
         let cli = Cli::try_parse_from(["am", "file_reservations", "list", "my-project"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action:
                     FileReservationsCommand::List {
@@ -12309,7 +12353,7 @@ mod tests {
             "--all",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action:
                     FileReservationsCommand::List {
@@ -12326,7 +12370,7 @@ mod tests {
     #[test]
     fn clap_parses_file_reservations_active() {
         let cli = Cli::try_parse_from(["am", "file_reservations", "active", "proj"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action: FileReservationsCommand::Active { project, limit },
             } => {
@@ -12342,7 +12386,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["am", "file_reservations", "soon", "proj", "--minutes", "15"])
                 .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action: FileReservationsCommand::Soon { project, minutes },
             } => {
@@ -12366,7 +12410,7 @@ mod tests {
             "src/main.rs",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action:
                     FileReservationsCommand::Reserve {
@@ -12408,7 +12452,7 @@ mod tests {
             "br-123 work",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action:
                     FileReservationsCommand::Reserve {
@@ -12436,7 +12480,7 @@ mod tests {
     fn clap_parses_file_reservations_renew_minimal() {
         let cli =
             Cli::try_parse_from(["am", "file_reservations", "renew", "proj", "BlueLake"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action:
                     FileReservationsCommand::Renew {
@@ -12475,7 +12519,7 @@ mod tests {
             "99",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action:
                     FileReservationsCommand::Renew {
@@ -12497,7 +12541,7 @@ mod tests {
     fn clap_parses_file_reservations_release_all() {
         let cli = Cli::try_parse_from(["am", "file_reservations", "release", "proj", "BlueLake"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action:
                     FileReservationsCommand::Release {
@@ -12528,7 +12572,7 @@ mod tests {
             "src/main.rs",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action: FileReservationsCommand::Release { paths, .. },
             } => {
@@ -12552,7 +12596,7 @@ mod tests {
             "20",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action: FileReservationsCommand::Release { ids, .. },
             } => {
@@ -12573,7 +12617,7 @@ mod tests {
             "Cargo.toml",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::FileReservations {
                 action: FileReservationsCommand::Conflicts { project, paths },
             } => {
@@ -12600,7 +12644,7 @@ mod tests {
     #[test]
     fn clap_parses_acks_pending() {
         let cli = Cli::try_parse_from(["am", "acks", "pending", "proj", "BlueLake"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Acks {
                 action:
                     AcksCommand::Pending {
@@ -12620,7 +12664,7 @@ mod tests {
     #[test]
     fn clap_parses_acks_remind() {
         let cli = Cli::try_parse_from(["am", "acks", "remind", "proj", "BlueLake"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Acks {
                 action:
                     AcksCommand::Remind {
@@ -12653,7 +12697,7 @@ mod tests {
             "10",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Acks {
                 action:
                     AcksCommand::Overdue {
@@ -12675,7 +12719,7 @@ mod tests {
     #[test]
     fn clap_parses_config_set_port() {
         let cli = Cli::try_parse_from(["am", "config", "set-port", "9999"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Config {
                 action: ConfigCommand::SetPort { port, env_file },
             } => {
@@ -12697,7 +12741,7 @@ mod tests {
             "/tmp/.env",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Config {
                 action: ConfigCommand::SetPort { port, env_file },
             } => {
@@ -12713,16 +12757,16 @@ mod tests {
         let cli = Cli::try_parse_from(["am", "config", "show-port"]).unwrap();
         assert!(matches!(
             cli.command,
-            Commands::Config {
+            Some(Commands::Config {
                 action: ConfigCommand::ShowPort
-            }
+            })
         ));
     }
 
     #[test]
     fn clap_parses_projects_mark_identity() {
         let cli = Cli::try_parse_from(["am", "projects", "mark-identity", "/tmp/proj"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Projects {
                 action:
                     ProjectsCommand::MarkIdentity {
@@ -12749,7 +12793,7 @@ mod tests {
             "--no-commit",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Projects {
                 action: ProjectsCommand::MarkIdentity { no_commit, .. },
             } => assert!(no_commit),
@@ -12760,7 +12804,7 @@ mod tests {
     #[test]
     fn clap_parses_projects_discovery_init() {
         let cli = Cli::try_parse_from(["am", "projects", "discovery-init", "/tmp/proj"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Projects {
                 action:
                     ProjectsCommand::DiscoveryInit {
@@ -12786,7 +12830,7 @@ mod tests {
             "my-product",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Projects {
                 action: ProjectsCommand::DiscoveryInit { product, .. },
             } => assert_eq!(product, Some("my-product".to_string())),
@@ -12797,7 +12841,7 @@ mod tests {
     #[test]
     fn clap_parses_projects_adopt_defaults() {
         let cli = Cli::try_parse_from(["am", "projects", "adopt", "/tmp/src", "/tmp/dst"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Projects {
                 action:
                     ProjectsCommand::Adopt {
@@ -12821,7 +12865,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["am", "projects", "adopt", "/tmp/src", "/tmp/dst", "--apply"])
                 .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Projects {
                 action: ProjectsCommand::Adopt { apply, .. },
             } => assert!(apply),
@@ -12832,7 +12876,7 @@ mod tests {
     #[test]
     fn clap_parses_mail_status() {
         let cli = Cli::try_parse_from(["am", "mail", "status", "/tmp/proj"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Mail {
                 action: MailCommand::Status { project_path },
             } => assert_eq!(project_path, PathBuf::from("/tmp/proj")),
@@ -12851,7 +12895,7 @@ mod tests {
             "thread-42",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Mail {
                 action:
                     MailCommand::SummarizeThread {
@@ -12887,7 +12931,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Mail {
                 action:
                     MailCommand::SummarizeThread {
@@ -12919,7 +12963,7 @@ mod tests {
             "--verbose",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Golden {
                 action:
                     GoldenCommand::Capture {
@@ -12941,7 +12985,7 @@ mod tests {
     #[test]
     fn clap_parses_golden_verify_defaults() {
         let cli = Cli::try_parse_from(["am", "golden", "verify"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Golden {
                 action:
                     GoldenCommand::Verify {
@@ -12973,7 +13017,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Golden {
                 action: GoldenCommand::List { dir, filter, json },
             } => {
@@ -12988,7 +13032,7 @@ mod tests {
     #[test]
     fn clap_parses_products_ensure_defaults() {
         let cli = Cli::try_parse_from(["am", "products", "ensure"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Products {
                 action:
                     ProductsCommand::Ensure {
@@ -13017,7 +13061,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Products {
                 action:
                     ProductsCommand::Ensure {
@@ -13038,7 +13082,7 @@ mod tests {
     fn clap_parses_products_link() {
         let cli =
             Cli::try_parse_from(["am", "products", "link", "pk-1", "proj-1", "--json"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Products {
                 action:
                     ProductsCommand::Link {
@@ -13058,7 +13102,7 @@ mod tests {
     #[test]
     fn clap_parses_products_status() {
         let cli = Cli::try_parse_from(["am", "products", "status", "pk-1"]).unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Products {
                 action: ProductsCommand::Status { product_key, json },
             } => {
@@ -13073,7 +13117,7 @@ mod tests {
     fn clap_parses_products_summarize_thread() {
         let cli = Cli::try_parse_from(["am", "products", "summarize-thread", "pk-1", "thread-abc"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Products {
                 action:
                     ProductsCommand::SummarizeThread {
@@ -13108,7 +13152,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Products {
                 action:
                     ProductsCommand::SummarizeThread {
@@ -13728,7 +13772,7 @@ mod tests {
     fn clap_parses_beads_status_flags() {
         let cli = Cli::try_parse_from(["am", "beads", "status", "--json"])
             .expect("failed to parse beads status");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Beads {
                 action: BeadsCommand::Status { json, .. },
             } => assert!(json),
@@ -13740,7 +13784,7 @@ mod tests {
     fn clap_parses_beads_ready_with_limit() {
         let cli = Cli::try_parse_from(["am", "beads", "ready", "--limit", "5", "--json"])
             .expect("failed to parse beads ready");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Beads {
                 action: BeadsCommand::Ready { limit, json, .. },
             } => {
@@ -13756,7 +13800,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["am", "beads", "list", "--status", "open", "--priority", "2"])
                 .expect("failed to parse beads list");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Beads {
                 action:
                     BeadsCommand::List {
@@ -13774,7 +13818,7 @@ mod tests {
     fn clap_parses_beads_show_with_id() {
         let cli = Cli::try_parse_from(["am", "beads", "show", "br-123", "--json"])
             .expect("failed to parse beads show");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Beads {
                 action: BeadsCommand::Show { id, json, .. },
             } => {
@@ -13796,7 +13840,7 @@ mod tests {
             "--include-undetected",
         ])
         .expect("failed to parse agents detect");
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Agents {
                 action:
                     AgentsCommand::Detect {
@@ -14937,7 +14981,7 @@ mod tests {
             "opus-4.6",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Macros {
                 action:
                     MacroCommand::StartSession {
@@ -14994,7 +15038,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Macros {
                 action:
                     MacroCommand::StartSession {
@@ -15041,7 +15085,7 @@ mod tests {
             "opus-4.6",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Macros {
                 action:
                     MacroCommand::PrepareThread {
@@ -15093,7 +15137,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Macros {
                 action:
                     MacroCommand::PrepareThread {
@@ -15141,7 +15185,7 @@ mod tests {
             "src/**",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Macros {
                 action:
                     MacroCommand::FileReservationCycle {
@@ -15188,7 +15232,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Macros {
                 action:
                     MacroCommand::FileReservationCycle {
@@ -15230,7 +15274,7 @@ mod tests {
             "RedFox",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Macros {
                 action:
                     MacroCommand::ContactHandshake {
@@ -15291,7 +15335,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Macros {
                 action:
                     MacroCommand::ContactHandshake {
@@ -15412,7 +15456,7 @@ mod tests {
             "need to coordinate",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Contacts {
                 action:
                     ContactsCommand::Request {
@@ -15449,7 +15493,7 @@ mod tests {
             "86400",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Contacts {
                 action:
                     ContactsCommand::Request {
@@ -15471,7 +15515,7 @@ mod tests {
             "am", "contacts", "respond", "-p", "proj", "-a", "RedFox", "--from", "BlueLake",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Contacts {
                 action:
                     ContactsCommand::Respond {
@@ -15500,7 +15544,7 @@ mod tests {
             "--reject",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Contacts {
                 action:
                     ContactsCommand::Respond {
@@ -15519,7 +15563,7 @@ mod tests {
             "am", "contacts", "list", "-p", "proj", "-a", "BlueLake", "--json",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Contacts {
                 action:
                     ContactsCommand::ListContacts {
@@ -15540,7 +15584,7 @@ mod tests {
     fn clap_parses_contacts_list_no_json() {
         let cli = Cli::try_parse_from(["am", "contacts", "list", "-p", "proj", "-a", "BlueLake"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Contacts {
                 action: ContactsCommand::ListContacts { json, .. },
             } => {
@@ -15563,7 +15607,7 @@ mod tests {
             "contacts_only",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("expected command") {
             Commands::Contacts {
                 action:
                     ContactsCommand::Policy {
@@ -20628,6 +20672,246 @@ fn run_share_preview_with_control(
 
 // ── Tooling + Diagnostics CLI handlers ────────────────────────────────
 
+const SEARCH_FTS_TRIGGER_NAMES: [&str; 6] = [
+    "fts_messages_ai",
+    "fts_messages_ad",
+    "fts_messages_au",
+    "messages_ai",
+    "messages_ad",
+    "messages_au",
+];
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct FtsDecommissionCheck {
+    name: String,
+    required: bool,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct FtsDecommissionReport {
+    schema_version: String,
+    generated_at: String,
+    force: bool,
+    engine: String,
+    shadow_mode: String,
+    fallback_on_error: bool,
+    checks: Vec<FtsDecommissionCheck>,
+    preflight_ok: bool,
+    blocked: bool,
+    warnings: Vec<String>,
+    storage_root: String,
+    search_index_path: String,
+    triggers_before: Vec<String>,
+    dropped_triggers: Vec<String>,
+    triggers_after: Vec<String>,
+    action: String,
+}
+
+fn search_index_has_content(index_root: &std::path::Path) -> bool {
+    if !index_root.exists() || !index_root.is_dir() {
+        return false;
+    }
+    walkdir::WalkDir::new(index_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_type().is_file())
+}
+
+fn query_existing_search_fts_triggers(
+    conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection,
+) -> CliResult<Vec<String>> {
+    let sql = "\
+        SELECT name \
+          FROM sqlite_master \
+         WHERE type = 'trigger' \
+           AND name IN (\
+               'fts_messages_ai', 'fts_messages_ad', 'fts_messages_au', \
+               'messages_ai', 'messages_ad', 'messages_au'\
+           ) \
+         ORDER BY name";
+    let rows = conn
+        .query_sync(sql, &[])
+        .map_err(|e| CliError::Other(format!("failed to query FTS trigger state: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get_named::<String>("name").unwrap_or_default())
+        .filter(|name| !name.is_empty())
+        .collect())
+}
+
+fn handle_tooling_decommission_fts(force: bool, json_mode: bool) -> CliResult<()> {
+    let config = Config::from_env();
+    let search_index_path = std::path::Path::new(&config.storage_root).join("search_index");
+    let engine = config.search_rollout.engine.to_string();
+    let shadow_mode = config.search_rollout.shadow_mode.to_string();
+    let fallback_on_error = config.search_rollout.fallback_on_error;
+
+    let mut checks = Vec::new();
+    checks.push(FtsDecommissionCheck {
+        name: "search_engine_not_legacy".to_string(),
+        required: true,
+        ok: !matches!(
+            config.search_rollout.engine,
+            mcp_agent_mail_core::config::SearchEngine::Legacy
+        ),
+        detail: format!("engine={engine}"),
+    });
+    checks.push(FtsDecommissionCheck {
+        name: "fallback_on_error_disabled".to_string(),
+        required: true,
+        ok: !fallback_on_error,
+        detail: format!("fallback_on_error={fallback_on_error}"),
+    });
+    checks.push(FtsDecommissionCheck {
+        name: "tantivy_index_present".to_string(),
+        required: true,
+        ok: search_index_has_content(&search_index_path),
+        detail: search_index_path.display().to_string(),
+    });
+    checks.push(FtsDecommissionCheck {
+        name: "shadow_mode_active".to_string(),
+        required: false,
+        ok: config.search_rollout.shadow_mode.is_active(),
+        detail: format!("shadow_mode={shadow_mode}"),
+    });
+
+    let preflight_ok = checks.iter().filter(|check| check.required).all(|c| c.ok);
+    let mut warnings = Vec::new();
+    if checks
+        .iter()
+        .any(|check| check.name == "shadow_mode_active" && !check.ok)
+    {
+        warnings.push(
+            "shadow mode is off; ensure historical parity evidence exists before decommission"
+                .to_string(),
+        );
+    }
+
+    let conn = open_db_sync_with_database_url(&config.database_url)?;
+    let triggers_before = query_existing_search_fts_triggers(&conn)?;
+
+    let mut dropped_triggers = Vec::new();
+    let blocked = !preflight_ok && !force;
+    if !blocked {
+        for trigger in SEARCH_FTS_TRIGGER_NAMES {
+            let sql = format!("DROP TRIGGER IF EXISTS {trigger}");
+            conn.execute_raw(&sql)
+                .map_err(|e| CliError::Other(format!("failed dropping trigger {trigger}: {e}")))?;
+            if triggers_before.iter().any(|name| name == trigger) {
+                dropped_triggers.push(trigger.to_string());
+            }
+        }
+    } else {
+        warnings.push("preflight failed; rerun with --force to override".to_string());
+    }
+
+    let triggers_after = if blocked {
+        triggers_before.clone()
+    } else {
+        query_existing_search_fts_triggers(&conn)?
+    };
+
+    let action = if blocked {
+        "blocked_preflight"
+    } else if dropped_triggers.is_empty() {
+        "noop_already_clean"
+    } else {
+        "decommissioned"
+    };
+
+    let report = FtsDecommissionReport {
+        schema_version: "am_search_fts_decommission.v1".to_string(),
+        generated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        force,
+        engine,
+        shadow_mode,
+        fallback_on_error,
+        checks,
+        preflight_ok,
+        blocked,
+        warnings,
+        storage_root: config.storage_root.display().to_string(),
+        search_index_path: search_index_path.display().to_string(),
+        triggers_before,
+        dropped_triggers,
+        triggers_after,
+        action: action.to_string(),
+    };
+
+    if json_mode {
+        let payload = serde_json::to_string_pretty(&report)
+            .map_err(|e| CliError::Other(format!("failed to serialize report: {e}")))?;
+        ftui_runtime::ftui_println!("{payload}");
+    } else {
+        output::section("FTS Decommission Report:");
+        output::kv("Action", &report.action);
+        output::kv(
+            "Preflight",
+            if report.preflight_ok { "PASS" } else { "FAIL" },
+        );
+        output::kv("Engine", &report.engine);
+        output::kv("Shadow mode", &report.shadow_mode);
+        output::kv(
+            "Fallback on error",
+            if report.fallback_on_error {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        );
+        output::kv("Search index path", &report.search_index_path);
+        ftui_runtime::ftui_println!("");
+
+        let mut check_table = output::CliTable::new(vec!["CHECK", "REQUIRED", "STATUS", "DETAIL"]);
+        for check in &report.checks {
+            check_table.add_row(vec![
+                check.name.clone(),
+                if check.required {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                },
+                if check.ok {
+                    "ok".to_string()
+                } else {
+                    "fail".to_string()
+                },
+                check.detail.clone(),
+            ]);
+        }
+        check_table.render();
+
+        ftui_runtime::ftui_println!("");
+        output::kv(
+            "Triggers before",
+            &format!("{}", report.triggers_before.join(", ")),
+        );
+        output::kv(
+            "Dropped triggers",
+            &format!("{}", report.dropped_triggers.join(", ")),
+        );
+        output::kv(
+            "Triggers after",
+            &format!("{}", report.triggers_after.join(", ")),
+        );
+
+        if !report.warnings.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::section("Warnings:");
+            for warning in &report.warnings {
+                ftui_runtime::ftui_println!("  - {warning}");
+            }
+        }
+    }
+
+    if report.blocked {
+        return Err(CliError::ExitCode(2));
+    }
+    Ok(())
+}
+
 fn handle_tooling(action: ToolingCommand) -> CliResult<()> {
     match action {
         ToolingCommand::Directory { json } => handle_tooling_directory(json),
@@ -20636,6 +20920,9 @@ fn handle_tooling(action: ToolingCommand) -> CliResult<()> {
         ToolingCommand::MetricsCore { json } => handle_tooling_metrics_core(json),
         ToolingCommand::Diagnostics { json } => handle_tooling_diagnostics(json),
         ToolingCommand::Locks { json } => handle_tooling_locks(json),
+        ToolingCommand::DecommissionFts { force, json } => {
+            handle_tooling_decommission_fts(force, json)
+        }
     }
 }
 

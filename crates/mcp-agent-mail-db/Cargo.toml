@@ -37,16 +37,27 @@ indexmap.workspace = true
 asupersync.workspace = true
 
 [features]
-default = ["hybrid"]
+default = ["hybrid", "s3fifo"]
 # Enable hybrid search (lexical + semantic)
 hybrid = ["mcp-agent-mail-search-core/hybrid", "dep:half"]
 # Enable loom model-checking tests (run with `cargo test --features loom-tests`)
 loom-tests = []
+# Use S3-FIFO eviction in ReadCache (replaces IndexMap LRU)
+s3fifo = []
 
 [dev-dependencies]
+criterion.workspace = true
 loom.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+[[bench]]
+name = "coalesce_bench"
+harness = false
 
 [lints]
 workspace = true

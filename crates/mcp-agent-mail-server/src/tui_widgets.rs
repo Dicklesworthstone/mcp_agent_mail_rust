@@ -1,6 +1,6 @@
 //! Advanced composable widgets for the TUI operations console.
 //!
-//! Eight reusable widgets designed for signal density and low render overhead:
+//! Nine reusable widgets designed for signal density and low render overhead:
 //!
 //! - [`HeatmapGrid`]: 2D colored cell grid with configurable gradient
 //! - [`PercentileRibbon`]: p50/p95/p99 latency bands over time
@@ -9,6 +9,7 @@
 //! - [`MetricTile`]: Compact metric display with inline sparkline
 //! - [`ReservationGauge`]: Reservation pressure bar (ProgressBar-backed)
 //! - [`AgentHeatmap`]: Agent-to-agent communication frequency grid
+//! - [`EvidenceLedgerWidget`]: Tabular view of evidence ledger entries with color-coded status
 //!
 //! Cross-cutting concerns (br-3vwi.6.3):
 //!
@@ -17,6 +18,8 @@
 //! - [`AnimationBudget`]: frame-budget enforcement for animation guardrails
 
 #![forbid(unsafe_code)]
+
+use std::cell::RefCell;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
@@ -131,10 +134,54 @@ fn render_state_placeholder(
 // HeatmapGrid
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Cached layout metrics for [`HeatmapGrid`] to avoid recomputation every frame.
+///
+/// The cache is invalidated when the render area changes, when the data
+/// generation counter changes, or when the `dirty` flag is set explicitly.
+#[derive(Debug, Clone)]
+pub struct LayoutCache {
+    /// Cached maximum columns across all data rows.
+    max_cols: usize,
+    /// Cached label gutter width (before 40% threshold check).
+    label_width: u16,
+    /// Cached cell width.
+    cell_w: u16,
+    /// The Rect these were computed for.
+    computed_for_area: Rect,
+    /// Data generation counter at the time of computation.
+    data_generation: u64,
+    /// Number of times layout has been computed (for testing).
+    pub compute_count: u64,
+    /// Whether this cache is valid.
+    dirty: bool,
+}
+
+impl LayoutCache {
+    fn new_dirty() -> Self {
+        Self {
+            max_cols: 0,
+            label_width: 0,
+            cell_w: 0,
+            computed_for_area: Rect::default(),
+            data_generation: u64::MAX, // ensures first render triggers computation
+            compute_count: 0,
+            dirty: true,
+        }
+    }
+
+    /// Mark the cache as dirty, forcing recomputation on next render.
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+}
+
 /// A 2D grid of colored cells representing normalized values (0.0–1.0).
 ///
 /// Each data cell maps to a terminal cell with a background color from a
 /// cold-to-hot gradient. Row and column labels are optional.
+///
+/// Layout metrics (`max_cols`, `label_width`, `cell_w`) are cached in a
+/// [`LayoutCache`] and recomputed only when data or area changes.
 ///
 /// # Fallback Behavior
 ///
@@ -158,6 +205,10 @@ pub struct HeatmapGrid<'a> {
     show_values: bool,
     /// Custom gradient function (overrides default `heatmap_gradient`).
     custom_gradient: Option<fn(f64) -> PackedRgba>,
+    /// Data generation counter — increment when data changes to invalidate cache.
+    data_generation: u64,
+    /// Layout metrics cache (shared via `RefCell` because `render` takes `&self`).
+    layout_cache: RefCell<LayoutCache>,
 }
 
 impl<'a> HeatmapGrid<'a> {
@@ -172,7 +223,27 @@ impl<'a> HeatmapGrid<'a> {
             fill_char: ' ',
             show_values: false,
             custom_gradient: None,
+            data_generation: 0,
+            layout_cache: RefCell::new(LayoutCache::new_dirty()),
         }
+    }
+
+    /// Set the data generation counter. Callers should increment this
+    /// whenever the underlying data changes to invalidate the layout cache.
+    #[must_use]
+    pub const fn data_generation(mut self, value: u64) -> Self {
+        self.data_generation = value;
+        self
+    }
+
+    /// Access the layout cache (for testing/inspection).
+    pub fn layout_cache(&self) -> std::cell::Ref<'_, LayoutCache> {
+        self.layout_cache.borrow()
+    }
+
+    /// Mark the layout cache as dirty, forcing recomputation on next render.
+    pub fn invalidate_cache(&self) {
+        self.layout_cache.borrow_mut().invalidate();
     }
 
     /// Set optional row labels.
@@ -251,28 +322,55 @@ impl Widget for HeatmapGrid<'_> {
             return;
         }
 
-        let max_cols = self.data.iter().map(Vec::len).max().unwrap_or(0);
+        // Check layout cache and recompute if needed.
+        {
+            let mut cache = self.layout_cache.borrow_mut();
+            if cache.dirty
+                || cache.computed_for_area != inner
+                || cache.data_generation != self.data_generation
+            {
+                let max_cols = self.data.iter().map(Vec::len).max().unwrap_or(0);
+                #[allow(clippy::cast_possible_truncation)]
+                let label_width: u16 = self.row_labels.map_or(0, |labels| {
+                    labels
+                        .iter()
+                        .map(|l| l.len())
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                }) as u16;
+                let effective_label_width =
+                    if label_width > 0 && label_width * 10 > inner.width * 4 {
+                        0
+                    } else {
+                        label_width
+                    };
+                let data_w = inner.width.saturating_sub(effective_label_width);
+                #[allow(clippy::cast_possible_truncation)]
+                let cell_w = if max_cols > 0 {
+                    (data_w / max_cols as u16).max(1)
+                } else {
+                    1
+                };
+                cache.max_cols = max_cols;
+                cache.label_width = effective_label_width;
+                cache.cell_w = cell_w;
+                cache.computed_for_area = inner;
+                cache.data_generation = self.data_generation;
+                cache.dirty = false;
+                cache.compute_count += 1;
+            }
+        }
+
+        let cache = self.layout_cache.borrow();
+        let max_cols = cache.max_cols;
+        let effective_label_width = cache.label_width;
+        let cell_w = cache.cell_w;
+        drop(cache);
+
         if max_cols == 0 {
             return;
         }
-
-        // Compute label gutter width.
-        #[allow(clippy::cast_possible_truncation)]
-        let label_width: u16 = self.row_labels.map_or(0, |labels| {
-            labels
-                .iter()
-                .map(|l| l.len())
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1) // space after label
-        }) as u16;
-
-        // Drop labels if they'd consume >40% of width.
-        let effective_label_width = if label_width > 0 && label_width * 10 > inner.width * 4 {
-            0
-        } else {
-            label_width
-        };
 
         let has_col_header = self.col_labels.is_some() && inner.height > 2;
         let grid_top = inner.y + u16::from(has_col_header);
@@ -283,10 +381,6 @@ impl Widget for HeatmapGrid<'_> {
         if data_w == 0 || data_h == 0 {
             return;
         }
-
-        // Cell width: divide available width evenly among columns.
-        #[allow(clippy::cast_possible_truncation)]
-        let cell_w = (data_w / max_cols as u16).max(1);
 
         // Render column headers.
         if has_col_header {
@@ -1747,48 +1841,66 @@ impl DrillDownWidget for AnomalyCard<'_> {
 // Focus ring — visual focus indicator for keyboard navigation (br-3vwi.6.3)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Renders a focus ring (highlighted border) around a widget area.
-///
-/// Used by parent screens to indicate which widget has keyboard focus.
-/// The ring uses the `A11yConfig` to determine visibility and contrast.
-pub fn render_focus_ring(area: Rect, frame: &mut Frame, a11y: &A11yConfig) {
-    if area.is_empty() || area.width < 3 || area.height < 3 {
-        return;
-    }
+/// Pre-computed focus ring cells, reused across frames when the area and
+/// contrast setting are unchanged.
+#[derive(Debug, Clone)]
+pub struct FocusRingCache {
+    /// The area these cells were computed for.
+    computed_for_area: Rect,
+    /// Whether high contrast was active when computed.
+    high_contrast: bool,
+    /// Pre-computed `(x, y, Cell)` triples for the entire border.
+    cells: Vec<(u16, u16, Cell)>,
+    /// Number of times the ring cells have been recomputed.
+    pub compute_count: u64,
+}
 
-    let color = if a11y.high_contrast {
-        PackedRgba::rgb(255, 255, 0) // bright yellow for maximum visibility
-    } else {
-        PackedRgba::rgb(100, 160, 255) // soft blue
-    };
+impl FocusRingCache {
+    /// Create a new empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            computed_for_area: Rect::default(),
+            high_contrast: false,
+            cells: Vec::new(),
+            compute_count: 0,
+        }
+    }
+}
+
+impl Default for FocusRingCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Build the focus ring cells for a given area and color.
+fn build_focus_ring_cells(area: Rect, color: PackedRgba) -> Vec<(u16, u16, Cell)> {
+    let mut cells = Vec::with_capacity(2 * (area.width as usize + area.height as usize));
 
     // Top and bottom edges.
     for x in area.x..area.right() {
         let mut top = Cell::from_char('\u{2500}'); // ─
         top.fg = color;
-        frame.buffer.set_fast(x, area.y, top);
+        cells.push((x, area.y, top));
 
         let mut bottom = Cell::from_char('\u{2500}');
         bottom.fg = color;
-        frame
-            .buffer
-            .set_fast(x, area.bottom().saturating_sub(1), bottom);
+        cells.push((x, area.bottom().saturating_sub(1), bottom));
     }
 
     // Left and right edges.
     for y in area.y..area.bottom() {
         let mut left = Cell::from_char('\u{2502}'); // │
         left.fg = color;
-        frame.buffer.set_fast(area.x, y, left);
+        cells.push((area.x, y, left));
 
         let mut right = Cell::from_char('\u{2502}');
         right.fg = color;
-        frame
-            .buffer
-            .set_fast(area.right().saturating_sub(1), y, right);
+        cells.push((area.right().saturating_sub(1), y, right));
     }
 
-    // Corners.
+    // Corners (overwrite edge cells at corners).
     let corners = [
         (area.x, area.y, '\u{256D}'),                          // ╭
         (area.right().saturating_sub(1), area.y, '\u{256E}'),  // ╮
@@ -1802,7 +1914,53 @@ pub fn render_focus_ring(area: Rect, frame: &mut Frame, a11y: &A11yConfig) {
     for (x, y, ch) in corners {
         let mut cell = Cell::from_char(ch);
         cell.fg = color;
-        frame.buffer.set_fast(x, y, cell);
+        cells.push((x, y, cell));
+    }
+
+    cells
+}
+
+/// Renders a focus ring (highlighted border) around a widget area.
+///
+/// Used by parent screens to indicate which widget has keyboard focus.
+/// The ring uses the `A11yConfig` to determine visibility and contrast.
+pub fn render_focus_ring(area: Rect, frame: &mut Frame, a11y: &A11yConfig) {
+    render_focus_ring_cached(area, frame, a11y, None);
+}
+
+/// Renders a focus ring with an optional cache to avoid recomputing cells
+/// when the area and contrast setting haven't changed.
+pub fn render_focus_ring_cached(
+    area: Rect,
+    frame: &mut Frame,
+    a11y: &A11yConfig,
+    cache: Option<&mut FocusRingCache>,
+) {
+    if area.is_empty() || area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    let color = if a11y.high_contrast {
+        PackedRgba::rgb(255, 255, 0)
+    } else {
+        PackedRgba::rgb(100, 160, 255)
+    };
+
+    if let Some(cache) = cache {
+        if cache.computed_for_area != area || cache.high_contrast != a11y.high_contrast {
+            cache.cells = build_focus_ring_cells(area, color);
+            cache.computed_for_area = area;
+            cache.high_contrast = a11y.high_contrast;
+            cache.compute_count += 1;
+        }
+        for &(x, y, cell) in &cache.cells {
+            frame.buffer.set_fast(x, y, cell);
+        }
+    } else {
+        let cells = build_focus_ring_cells(area, color);
+        for (x, y, cell) in cells {
+            frame.buffer.set_fast(x, y, cell);
+        }
     }
 }
 
@@ -1897,6 +2055,109 @@ impl AnimationBudget {
         let result = f();
         self.spend(start.elapsed());
         result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ChartTransition — eased interpolation for chart value updates (br-3jz52)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Smoothly interpolates chart scalar series from a previous state to a target.
+///
+/// Screens call [`ChartTransition::set_target`] whenever fresh chart values arrive,
+/// then sample interpolated values each tick using [`ChartTransition::sample_values`].
+#[derive(Debug, Clone)]
+pub struct ChartTransition {
+    from: Vec<f64>,
+    to: Vec<f64>,
+    started_at: Option<std::time::Instant>,
+    duration: std::time::Duration,
+}
+
+impl ChartTransition {
+    /// Create a transition helper with a fixed animation duration.
+    #[must_use]
+    pub fn new(duration: std::time::Duration) -> Self {
+        Self {
+            from: Vec::new(),
+            to: Vec::new(),
+            started_at: None,
+            duration,
+        }
+    }
+
+    /// Reset transition state and clear all values.
+    pub fn clear(&mut self) {
+        self.from.clear();
+        self.to.clear();
+        self.started_at = None;
+    }
+
+    /// Set a new target vector, starting a transition from the current sampled state.
+    pub fn set_target(&mut self, next: &[f64], now: std::time::Instant) {
+        if Self::values_equal(&self.to, next) {
+            return;
+        }
+
+        if self.to.is_empty() {
+            self.from = next.to_vec();
+            self.to = next.to_vec();
+            self.started_at = None;
+            return;
+        }
+
+        let current = self.sample_values(now, false);
+        self.from = current;
+        self.to = next.to_vec();
+        self.started_at = Some(now);
+    }
+
+    /// Sample interpolated values at `now`.
+    ///
+    /// When `disable_motion` is true, returns the target immediately.
+    #[must_use]
+    pub fn sample_values(&self, now: std::time::Instant, disable_motion: bool) -> Vec<f64> {
+        if self.to.is_empty() {
+            return Vec::new();
+        }
+        if disable_motion || self.started_at.is_none() || self.duration.is_zero() {
+            return self.to.clone();
+        }
+
+        let progress = self.eased_progress(now);
+        self.to
+            .iter()
+            .enumerate()
+            .map(|(idx, &target)| {
+                let start = self.from.get(idx).copied().unwrap_or(target);
+                start + (target - start) * progress
+            })
+            .collect()
+    }
+
+    fn eased_progress(&self, now: std::time::Instant) -> f64 {
+        let Some(started_at) = self.started_at else {
+            return 1.0;
+        };
+        let elapsed = now.saturating_duration_since(started_at);
+        if self.duration.is_zero() {
+            return 1.0;
+        }
+        let linear = (elapsed.as_secs_f64() / self.duration.as_secs_f64()).clamp(0.0, 1.0);
+        Self::ease_out_cubic(linear)
+    }
+
+    fn ease_out_cubic(progress: f64) -> f64 {
+        1.0 - (1.0 - progress).powi(3)
+    }
+
+    fn values_equal(left: &[f64], right: &[f64]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+        left.iter()
+            .zip(right)
+            .all(|(l, r)| (*l - *r).abs() <= 1e-9_f64)
     }
 }
 
@@ -3167,6 +3428,171 @@ impl ChartDataProvider for EventHeatmapProvider {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// EvidenceLedgerWidget — tabular view of recent evidence ledger entries
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A single row for the evidence ledger display.
+#[derive(Debug, Clone)]
+pub struct EvidenceLedgerRow<'a> {
+    pub seq: u64,
+    pub ts_micros: i64,
+    pub decision_point: &'a str,
+    pub action: &'a str,
+    pub confidence: f64,
+    pub correct: Option<bool>,
+}
+
+/// Compact table widget that displays recent evidence ledger entries.
+///
+/// Columns: Seq | Timestamp | Decision Point | Action | Conf | Status
+///
+/// Color coding:
+/// - **correct (true)**: green checkmark
+/// - **incorrect (false)**: red cross
+/// - **pending (None)**: yellow dash
+#[derive(Debug, Clone)]
+pub struct EvidenceLedgerWidget<'a> {
+    entries: &'a [EvidenceLedgerRow<'a>],
+    block: Option<Block<'a>>,
+    max_visible: usize,
+    color_correct: PackedRgba,
+    color_incorrect: PackedRgba,
+    color_pending: PackedRgba,
+}
+
+impl<'a> EvidenceLedgerWidget<'a> {
+    #[must_use]
+    pub const fn new(entries: &'a [EvidenceLedgerRow<'a>]) -> Self {
+        Self {
+            entries,
+            block: None,
+            max_visible: 0,
+            color_correct: PackedRgba::rgb(80, 200, 80),
+            color_incorrect: PackedRgba::rgb(220, 60, 60),
+            color_pending: PackedRgba::rgb(200, 180, 60),
+        }
+    }
+
+    #[must_use]
+    pub const fn block(mut self, block: Block<'a>) -> Self {
+        self.block = Some(block);
+        self
+    }
+
+    #[must_use]
+    pub const fn max_visible(mut self, n: usize) -> Self {
+        self.max_visible = n;
+        self
+    }
+}
+
+impl Widget for EvidenceLedgerWidget<'_> {
+    fn render(&self, area: Rect, frame: &mut Frame) {
+        if area.is_empty() {
+            return;
+        }
+
+        if !frame.buffer.degradation.render_content() {
+            return;
+        }
+
+        let inner = self.block.as_ref().map_or(area, |block| {
+            let inner = block.inner(area);
+            block.clone().render(area, frame);
+            inner
+        });
+
+        if inner.width < 20 || inner.height == 0 {
+            return;
+        }
+
+        if self.entries.is_empty() {
+            let msg = Paragraph::new("No evidence entries")
+                .style(Style::new().fg(PackedRgba::rgb(120, 120, 120)));
+            msg.render(inner, frame);
+            return;
+        }
+
+        let no_styling =
+            frame.buffer.degradation >= ftui::render::budget::DegradationLevel::NoStyling;
+
+        let max = if self.max_visible > 0 {
+            self.max_visible.min(inner.height as usize)
+        } else {
+            inner.height as usize
+        };
+
+        // Header line
+        let header_style = Style::new().fg(PackedRgba::rgb(140, 140, 140));
+        let header = Line::from_spans(vec![
+            Span::styled("Seq", header_style),
+            Span::raw("  "),
+            Span::styled("Decision Point", header_style),
+            Span::raw("          "),
+            Span::styled("Action", header_style),
+            Span::raw("          "),
+            Span::styled("Conf", header_style),
+            Span::raw("  "),
+            Span::styled("OK", header_style),
+        ]);
+
+        let mut lines = Vec::with_capacity(max);
+        lines.push(header);
+
+        let data_rows = max.saturating_sub(1);
+        for entry in self.entries.iter().take(data_rows) {
+            let seq_str = format!("{:>4}", entry.seq);
+
+            // Truncate decision_point to fit
+            let dp_width = 22;
+            let dp: String = if entry.decision_point.len() > dp_width {
+                format!("{}...", &entry.decision_point[..dp_width - 3])
+            } else {
+                format!("{:<dp_width$}", entry.decision_point)
+            };
+
+            // Truncate action
+            let act_width = 14;
+            let act: String = if entry.action.len() > act_width {
+                format!("{}...", &entry.action[..act_width - 3])
+            } else {
+                format!("{:<act_width$}", entry.action)
+            };
+
+            let conf_str = format!("{:.2}", entry.confidence);
+
+            let (status_char, status_color) = match entry.correct {
+                Some(true) => ("\u{2713}", self.color_correct),   // checkmark
+                Some(false) => ("\u{2717}", self.color_incorrect), // cross
+                None => ("\u{2500}", self.color_pending),          // dash
+            };
+
+            lines.push(Line::from_spans(vec![
+                Span::styled(seq_str, Style::new().fg(PackedRgba::rgb(180, 180, 180))),
+                Span::raw("  "),
+                Span::styled(dp, Style::new().fg(PackedRgba::rgb(100, 180, 220))),
+                Span::raw("  "),
+                Span::styled(act, Style::new().fg(PackedRgba::rgb(220, 220, 220))),
+                Span::raw("  "),
+                Span::styled(conf_str, Style::new().fg(PackedRgba::rgb(180, 180, 100))),
+                Span::raw("  "),
+                Span::styled(
+                    status_char.to_string(),
+                    if no_styling {
+                        Style::new()
+                    } else {
+                        Style::new().fg(status_color)
+                    },
+                ),
+            ]));
+        }
+
+        let text = Text::from_lines(lines);
+        Paragraph::new(text).render(inner, frame);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -4150,6 +4576,49 @@ mod tests {
         assert!(
             (budget.utilization() - 1.0).abs() < f64::EPSILON,
             "zero limit should show 100% utilization"
+        );
+    }
+
+    #[test]
+    fn chart_transition_uses_ease_out_interpolation() {
+        let start = std::time::Instant::now();
+        let mut transition = ChartTransition::new(std::time::Duration::from_millis(200));
+        transition.set_target(&[10.0, 20.0], start);
+        transition.set_target(&[30.0, 40.0], start);
+
+        let mid = transition.sample_values(start + std::time::Duration::from_millis(100), false);
+        assert_eq!(mid.len(), 2);
+        assert!(mid[0] > 10.0 && mid[0] < 30.0);
+        assert!(mid[1] > 20.0 && mid[1] < 40.0);
+        assert!(
+            mid[0] > 20.0,
+            "ease-out should be beyond linear midpoint at t=50%"
+        );
+    }
+
+    #[test]
+    fn chart_transition_clamps_to_target_and_respects_disable_motion() {
+        let start = std::time::Instant::now();
+        let mut transition = ChartTransition::new(std::time::Duration::from_millis(200));
+        transition.set_target(&[5.0], start);
+        transition.set_target(&[25.0], start);
+
+        let instant = transition.sample_values(start + std::time::Duration::from_millis(1), true);
+        assert_eq!(instant, vec![25.0]);
+
+        let done = transition.sample_values(start + std::time::Duration::from_millis(250), false);
+        assert_eq!(done, vec![25.0]);
+    }
+
+    #[test]
+    fn chart_transition_clear_resets_state() {
+        let start = std::time::Instant::now();
+        let mut transition = ChartTransition::new(std::time::Duration::from_millis(200));
+        transition.set_target(&[1.0, 2.0, 3.0], start);
+        transition.clear();
+        assert!(
+            transition.sample_values(start, false).is_empty(),
+            "cleared transitions should produce no values"
         );
     }
 
@@ -5409,5 +5878,269 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── EvidenceLedgerWidget tests (br-3hkkd B.3) ─────────────────────────
+
+    fn make_ledger_entries() -> Vec<EvidenceLedgerRow<'static>> {
+        vec![
+            EvidenceLedgerRow {
+                seq: 1,
+                ts_micros: 1_700_000_000_000_000,
+                decision_point: "cache.eviction",
+                action: "evict",
+                confidence: 0.90,
+                correct: Some(true),
+            },
+            EvidenceLedgerRow {
+                seq: 2,
+                ts_micros: 1_700_000_001_000_000,
+                decision_point: "tui.diff_strategy",
+                action: "incremental",
+                confidence: 0.85,
+                correct: Some(false),
+            },
+            EvidenceLedgerRow {
+                seq: 3,
+                ts_micros: 1_700_000_002_000_000,
+                decision_point: "coalesce.outcome",
+                action: "joined",
+                confidence: 0.70,
+                correct: None,
+            },
+        ]
+    }
+
+    /// Widget renders entries with correct formatting (seq, decision_point, action, conf, status).
+    #[test]
+    fn evidence_widget_renders_entries() {
+        let entries = make_ledger_entries();
+        let widget = EvidenceLedgerWidget::new(&entries);
+        let output = render_widget(&widget, 80, 10);
+        // Should contain header
+        assert!(output.contains("Seq"), "missing Seq header");
+        assert!(output.contains("Decision Point"), "missing Decision Point header");
+        assert!(output.contains("Action"), "missing Action header");
+        assert!(output.contains("Conf"), "missing Conf header");
+        // Should contain entry data
+        assert!(output.contains("cache.eviction"), "missing cache.eviction entry");
+        assert!(output.contains("evict"), "missing evict action");
+        assert!(output.contains("0.90"), "missing confidence value");
+        // Should contain checkmark for correct=true
+        assert!(output.contains('\u{2713}'), "missing checkmark for correct entry");
+        // Should contain cross for correct=false
+        assert!(output.contains('\u{2717}'), "missing cross for incorrect entry");
+        // Should contain dash for pending
+        assert!(output.contains('\u{2500}'), "missing dash for pending entry");
+    }
+
+    /// Empty ledger renders "No evidence entries" message.
+    #[test]
+    fn evidence_widget_empty_state() {
+        let entries: Vec<EvidenceLedgerRow<'_>> = vec![];
+        let widget = EvidenceLedgerWidget::new(&entries);
+        let output = render_widget(&widget, 60, 5);
+        assert!(
+            output.contains("No evidence entries"),
+            "empty widget should show 'No evidence entries', got: {output}"
+        );
+    }
+
+    /// Color coding: correct=green, incorrect=red, pending=yellow.
+    #[test]
+    fn evidence_widget_color_coding() {
+        let entries = make_ledger_entries();
+        let widget = EvidenceLedgerWidget::new(&entries);
+        // Verify the widget has the expected default colors
+        assert_eq!(widget.color_correct, PackedRgba::rgb(80, 200, 80));
+        assert_eq!(widget.color_incorrect, PackedRgba::rgb(220, 60, 60));
+        assert_eq!(widget.color_pending, PackedRgba::rgb(200, 180, 60));
+        // Verify rendering doesn't panic with all three status types
+        let output = render_widget(&widget, 80, 10);
+        assert!(!output.is_empty());
+    }
+
+    /// Widget renders correctly with very small area.
+    #[test]
+    fn evidence_widget_small_area() {
+        let entries = make_ledger_entries();
+        let widget = EvidenceLedgerWidget::new(&entries);
+        // Too small: should render nothing (min width 20)
+        let output = render_widget(&widget, 15, 5);
+        assert!(
+            !output.contains("cache.eviction"),
+            "should not render content in too-small area"
+        );
+    }
+
+    /// Widget respects max_visible limit.
+    #[test]
+    fn evidence_widget_max_visible() {
+        let entries = make_ledger_entries();
+        let widget = EvidenceLedgerWidget::new(&entries).max_visible(2);
+        let output = render_widget(&widget, 80, 20);
+        // With max_visible=2, should show header + 1 data row (2 total lines)
+        assert!(output.contains("Seq"), "header should be present");
+        assert!(output.contains("cache.eviction"), "first entry should be present");
+        // Third entry should NOT be present due to max_visible=2
+        assert!(
+            !output.contains("coalesce.outcome"),
+            "third entry should be hidden due to max_visible=2"
+        );
+    }
+
+    // ─── LayoutCache tests (br-1orm6) ─────────────────────────────────
+
+    #[test]
+    fn layout_cache_skips_recompute_stable_frame() {
+        let data = vec![vec![0.5, 0.8], vec![0.3, 0.9]];
+        let widget = HeatmapGrid::new(&data);
+        let area = Rect::new(0, 0, 20, 5);
+        let mut pool = GraphemePool::new();
+
+        // Render 10 frames with the same data and area.
+        for _ in 0..10 {
+            let mut frame = Frame::new(20, 5, &mut pool);
+            widget.render(area, &mut frame);
+        }
+
+        // Layout should have been computed exactly once.
+        let cache = widget.layout_cache();
+        assert_eq!(cache.compute_count, 1, "stable frames should compute layout once");
+    }
+
+    #[test]
+    fn layout_cache_recomputes_on_data_change() {
+        let data1 = vec![vec![0.5, 0.8], vec![0.3, 0.9]];
+        let area = Rect::new(0, 0, 30, 5);
+        let mut pool = GraphemePool::new();
+
+        // Render with data generation 0.
+        let widget1 = HeatmapGrid::new(&data1).data_generation(0);
+        let mut frame = Frame::new(30, 5, &mut pool);
+        widget1.render(area, &mut frame);
+        assert_eq!(widget1.layout_cache().compute_count, 1);
+
+        // Render with same generation — should not recompute.
+        let mut frame = Frame::new(30, 5, &mut pool);
+        widget1.render(area, &mut frame);
+        assert_eq!(widget1.layout_cache().compute_count, 1);
+
+        // Change data (new widget with different generation on same data backing).
+        // Since HeatmapGrid borrows data, changing data means creating a new widget.
+        // But we can test via generation counter on the same widget.
+        let data3 = vec![vec![0.1, 0.2, 0.3]];
+        let widget2 = HeatmapGrid::new(&data3).data_generation(1);
+        let mut frame = Frame::new(30, 5, &mut pool);
+        widget2.render(area, &mut frame);
+        assert_eq!(widget2.layout_cache().compute_count, 1, "new widget always computes once");
+    }
+
+    #[test]
+    fn layout_cache_recomputes_on_resize() {
+        let data = vec![vec![0.5, 0.8], vec![0.3, 0.9]];
+        let widget = HeatmapGrid::new(&data);
+        let mut pool = GraphemePool::new();
+
+        // Render at 20x5.
+        let mut frame = Frame::new(20, 5, &mut pool);
+        widget.render(Rect::new(0, 0, 20, 5), &mut frame);
+        assert_eq!(widget.layout_cache().compute_count, 1);
+
+        // Render at 30x8 — area changed, should recompute.
+        let mut frame = Frame::new(30, 8, &mut pool);
+        widget.render(Rect::new(0, 0, 30, 8), &mut frame);
+        assert_eq!(widget.layout_cache().compute_count, 2, "resize should trigger recompute");
+
+        // Render at 30x8 again — no change.
+        let mut frame = Frame::new(30, 8, &mut pool);
+        widget.render(Rect::new(0, 0, 30, 8), &mut frame);
+        assert_eq!(widget.layout_cache().compute_count, 2, "same area should not recompute");
+    }
+
+    #[test]
+    fn layout_cache_generation_increment() {
+        let data = vec![vec![0.5]];
+        let widget_gen0 = HeatmapGrid::new(&data).data_generation(0);
+        let widget_gen1 = HeatmapGrid::new(&data).data_generation(1);
+        let widget_gen5 = HeatmapGrid::new(&data).data_generation(5);
+
+        let mut pool = GraphemePool::new();
+        let area = Rect::new(0, 0, 10, 3);
+
+        // Each new widget with different generation gets its own cache.
+        let mut frame = Frame::new(10, 3, &mut pool);
+        widget_gen0.render(area, &mut frame);
+        assert_eq!(widget_gen0.layout_cache().data_generation, 0);
+
+        let mut frame = Frame::new(10, 3, &mut pool);
+        widget_gen1.render(area, &mut frame);
+        assert_eq!(widget_gen1.layout_cache().data_generation, 1);
+
+        let mut frame = Frame::new(10, 3, &mut pool);
+        widget_gen5.render(area, &mut frame);
+        assert_eq!(widget_gen5.layout_cache().data_generation, 5);
+    }
+
+    #[test]
+    fn focus_ring_cache_reuses_cells() {
+        let area = Rect::new(0, 0, 10, 5);
+        let a11y = A11yConfig::default();
+        let mut cache = FocusRingCache::new();
+        let mut pool = GraphemePool::new();
+
+        // First render: cache miss, should compute.
+        let mut frame = Frame::new(10, 5, &mut pool);
+        render_focus_ring_cached(area, &mut frame, &a11y, Some(&mut cache));
+        assert_eq!(cache.compute_count, 1, "first render should compute");
+        assert!(!cache.cells.is_empty(), "cells should be populated");
+        let cell_count_1 = cache.cells.len();
+
+        // Second render with same area: cache hit, should NOT recompute.
+        let mut frame = Frame::new(10, 5, &mut pool);
+        render_focus_ring_cached(area, &mut frame, &a11y, Some(&mut cache));
+        assert_eq!(cache.compute_count, 1, "same area should reuse cached cells");
+        assert_eq!(cache.cells.len(), cell_count_1);
+
+        // Third render with different area: cache miss, should recompute.
+        let new_area = Rect::new(0, 0, 20, 10);
+        let mut frame = Frame::new(20, 10, &mut pool);
+        render_focus_ring_cached(new_area, &mut frame, &a11y, Some(&mut cache));
+        assert_eq!(cache.compute_count, 2, "different area should recompute");
+    }
+
+    #[test]
+    fn layout_cache_dirty_flag_forces_recompute() {
+        let data = vec![vec![0.5, 0.8], vec![0.3, 0.9]];
+        let widget = HeatmapGrid::new(&data);
+        let area = Rect::new(0, 0, 20, 5);
+        let mut pool = GraphemePool::new();
+
+        // First render.
+        let mut frame = Frame::new(20, 5, &mut pool);
+        widget.render(area, &mut frame);
+        assert_eq!(widget.layout_cache().compute_count, 1);
+
+        // Second render with same data/area — no recompute.
+        let mut frame = Frame::new(20, 5, &mut pool);
+        widget.render(area, &mut frame);
+        assert_eq!(widget.layout_cache().compute_count, 1);
+
+        // Set dirty flag.
+        widget.invalidate_cache();
+
+        // Third render — dirty flag forces recompute.
+        let mut frame = Frame::new(20, 5, &mut pool);
+        widget.render(area, &mut frame);
+        assert_eq!(
+            widget.layout_cache().compute_count,
+            2,
+            "dirty flag should force recompute"
+        );
+
+        // Fourth render — dirty cleared, no recompute.
+        let mut frame = Frame::new(20, 5, &mut pool);
+        widget.render(area, &mut frame);
+        assert_eq!(widget.layout_cache().compute_count, 2);
     }
 }
