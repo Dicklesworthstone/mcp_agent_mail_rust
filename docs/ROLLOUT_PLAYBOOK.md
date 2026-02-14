@@ -23,7 +23,7 @@ switch (see ADR-001).
 |---------|--------------------|---------------------|-------------|
 | MCP server interface mode | Phase 0 → 1 → 2 → 3 | Default `mcp`; CLI opt-in via `AM_INTERFACE_MODE=cli` only when explicitly needed | Remove/clear `AM_INTERFACE_MODE`, restart server |
 | Operator CLI (`am`) workflows | Phase 0 → 1 → 2 → 3 | Operator binary path + command allowlist | Roll back `am` binary to last known good |
-| TUI operations console | Phase 0 → 1 → 2 → 3 | `TUI_ENABLED=true` and `scripts/am` profile | Start headless with `--no-tui` |
+| TUI operations console | Phase 0 → 1 → 2 → 3 | `TUI_ENABLED=true` and `am serve-http` profile | Start headless with `--no-tui` |
 | Web parity surfaces (`/mail/*`) | Phase 0 → 1 → 2 → 3 | Deployment cohort (host/project ring), no hidden compatibility shim | Roll back server binary and redeploy previous release |
 | Static export (GH Pages / Cloudflare Pages) | Phase 0 → 1 → 2 → 3 | Publish workflow gating + `am share export` + `am share deploy verify-live` validation | Disable publish jobs and hold new exports |
 | Build slots / worktree behavior | Phase 0 → 1 → 2 → 3 | `WORKTREES_ENABLED=true` only after canary evidence | Set `WORKTREES_ENABLED=false`, restart |
@@ -103,7 +103,7 @@ bash scripts/e2e_mode_matrix.sh
 ### 2.6 Golden Snapshot Validation
 
 ```bash
-bash scripts/bench_golden.sh validate
+am golden validate
 # Expected: all golden outputs match stored checksums
 ```
 
@@ -128,7 +128,7 @@ shows green across all jobs: `build`, `test`, `clippy`, `conformance`, `e2e`.
 
 ```bash
 gh run list --branch main --limit 1
-bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json
+am ci --report tests/artifacts/ci/gate_report.json
 jq '.decision, .release_eligible, .summary.fail' tests/artifacts/ci/gate_report.json
 # Expected: "go", true, 0
 ```
@@ -202,7 +202,7 @@ Promotion from each phase requires all of:
 | All unit tests pass | `cargo test` output |
 | Dual-mode E2E passes | `tests/artifacts/dual_mode/*/run_summary.json` |
 | Machine-readable gate decision is promotable | `tests/artifacts/ci/gate_report.json` (`decision="go"`, `release_eligible=true`) |
-| Golden snapshots stable | `bench_golden.sh validate` |
+| Golden snapshots stable | `am golden validate` |
 | Denial messages match contract | `tests/fixtures/golden_snapshots/mcp_deny_*.txt` |
 
 **Exit criteria:** All 2.1-2.9 gates green. Proceed to Phase 1.
@@ -215,7 +215,7 @@ Promotion from each phase requires all of:
 
 **Activation steps:**
 1. Deploy the new binaries to the canary host.
-2. Restart the MCP server: `scripts/am`
+2. Restart the MCP server: `am serve-http`
 3. Verify the server starts without probe failures.
 4. Run a smoke test:
    ```bash
@@ -314,7 +314,7 @@ Initiate kill-switch if ANY of:
    # Send SIGTERM, wait for clean exit, then restart
    pkill -TERM -f "mcp-agent-mail serve"
    sleep 5
-   scripts/am
+   am serve-http
    ```
 
 4. **Verify rollback:**
@@ -435,7 +435,7 @@ rollback path.
 cargo build -p mcp-agent-mail -p mcp-agent-mail-cli
 
 # Start server
-scripts/am &
+am serve-http &
 SERVER_PID=$!
 sleep 3
 
@@ -456,7 +456,7 @@ kill -9 $SERVER_PID
 curl -sf http://127.0.0.1:8765/mcp/ && echo "STILL UP" || echo "DOWN - OK"
 
 # Restart (simulating rollback to same version)
-scripts/am &
+am serve-http &
 sleep 3
 
 # Verify recovery
@@ -550,7 +550,7 @@ Run this before each phase-promotion decision and record the artifact path in th
 
 ```bash
 run_ts="$(date -u +%Y%m%d_%H%M%S)"
-bash scripts/ci.sh --report "tests/artifacts/ci/${run_ts}/case_02_report.json"
+am ci --report "tests/artifacts/ci/${run_ts}/case_02_report.json"
 jq '.decision, .release_eligible, .summary' "tests/artifacts/ci/${run_ts}/case_02_report.json"
 ```
 

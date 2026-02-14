@@ -65,7 +65,7 @@ Use `docs/RELEASE_CHECKLIST.md` as the canonical sign-off ledger.
 
 - [ ] All CI gates pass (unit, integration, conformance, perf/security, E2E)
   ```bash
-  bash scripts/ci.sh    # or: gh workflow run ci.yml
+  am ci    # or: gh workflow run ci.yml
   ```
 - [ ] Mode matrix harness: 22 CLI-allow + 16 MCP-deny + 2 MCP-allow pass
   ```bash
@@ -228,7 +228,7 @@ mcp-agent-mail share 2>&1
 
 2. Run the CI suite against the broken state to capture reproduction:
    ```bash
-   bash scripts/ci.sh 2>&1 | tee ci_failure_$(date +%Y%m%d).log
+   am ci 2>&1 | tee ci_failure_$(date +%Y%m%d).log
    ```
 
 3. File a bead with the reproduction command and artifact paths

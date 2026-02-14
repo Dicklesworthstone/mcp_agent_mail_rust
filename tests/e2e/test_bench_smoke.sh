@@ -28,7 +28,7 @@ e2e_case_banner "Golden output validation"
 GOLDEN_DIR="${E2E_PROJECT_ROOT}/benches/golden"
 if [ -f "${GOLDEN_DIR}/checksums.sha256" ]; then
     set +e
-    golden_result=$(bash "${E2E_PROJECT_ROOT}/scripts/bench_golden.sh" validate 2>&1)
+    golden_result=$("$AM" golden validate 2>&1)
     golden_rc=$?
     set -e
 
@@ -41,7 +41,7 @@ if [ -f "${GOLDEN_DIR}/checksums.sha256" ]; then
 
     e2e_save_artifact "golden_validation.txt" "$golden_result"
 else
-    e2e_skip "No golden checksums found (run bench_golden.sh capture first)"
+    e2e_skip "No golden checksums found (run 'am golden capture' first)"
 fi
 
 # ---------------------------------------------------------------------------

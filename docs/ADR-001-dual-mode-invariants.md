@@ -18,8 +18,8 @@ MCP Agent Mail serves two distinct audiences:
    ergonomics: `--flags`, exit codes, `stderr` for errors, `stdout` for data.
 
 The current codebase has *two separate binaries* — `mcp-agent-mail` (MCP
-server) and `mcp-agent-mail-cli` (operator CLI) — plus the `scripts/am`
-launcher. This separation already partially enforces the dual-mode boundary,
+server) and `mcp-agent-mail-cli` (operator CLI, invoked as `am`).
+This separation already partially enforces the dual-mode boundary,
 but the lack of an explicit, documented contract creates three risks:
 
 - Accidental CLI invocation in MCP mode (e.g., running `mcp-agent-mail
@@ -81,11 +81,12 @@ If the MCP binary receives a subcommand it does not recognize (e.g.,
 2. Exit with code **2** (usage error, distinct from 1 = runtime error).
 3. Never emit JSON-RPC responses for invalid subcommands.
 
-### Invariant 5: `scripts/am` wraps the MCP binary for HTTP mode only
+### Invariant 5: `am serve-http` is the native CLI command for HTTP mode
 
-The `am` launcher is a convenience wrapper for `mcp-agent-mail serve`. It
-must never route to the CLI crate. Operator tasks should use
-`mcp-agent-mail-cli` directly.
+The `am serve-http` command starts the MCP server in HTTP mode with TUI.
+It is a native subcommand of the `am` CLI binary, not a wrapper script.
+Operator tasks use other `am` subcommands directly (e.g., `am share`,
+`am doctor`).
 
 ### Invariant 6: Mode controls scope, not capability
 
@@ -136,8 +137,8 @@ differs.
 - **Two binaries to build.** CI must compile and test both. (Mitigated:
   they share workspace crates, so incremental build cost is minimal.)
 - **No single entry point.** Operators must know to use
-  `mcp-agent-mail-cli` for admin tasks. (Mitigated: the `am` wrapper and
-  clear error messages in the MCP binary guide users.)
+  `mcp-agent-mail-cli` (`am`) for admin tasks. (Mitigated: the `am`
+  binary and clear error messages in the MCP binary guide users.)
 
 ## Implementation Notes
 

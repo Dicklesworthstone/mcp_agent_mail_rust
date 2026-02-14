@@ -364,7 +364,7 @@ with concrete benchmark/replay evidence once `br-2tnl.7.15` and `br-2tnl.7.16` a
 
 1. Execute quick CI gates and archive report:
    ```bash
-   scripts/am ci --quick --json --report tests/artifacts/ci/search_v3_weekly.json
+   am ci --quick --json --report tests/artifacts/ci/search_v3_weekly.json
    ```
 2. Run Search V3-focused E2E/parity suites when available:
    - `tests/e2e/test_search_v3_shadow_parity.sh`
@@ -390,7 +390,7 @@ with concrete benchmark/replay evidence once `br-2tnl.7.15` and `br-2tnl.7.16` a
 mv "${STORAGE_ROOT}/search_index" "${STORAGE_ROOT}/search_index.corrupt.$(date +%Y%m%d_%H%M%S)"
 
 # 3) Restart server to trigger rebuild
-scripts/am --no-tui
+mcp-agent-mail serve --no-tui
 ```
 
 Post-check: `health_check` must report Search V3 index status `ready` and non-zero docs.
@@ -401,7 +401,7 @@ Post-check: `health_check` must report Search V3 index status `ready` and non-ze
 # Temporarily force lexical-only service while repairing semantic assets
 export AM_SEARCH_ENGINE=lexical
 export AM_SEARCH_SEMANTIC_ENABLED=false
-scripts/am --no-tui
+mcp-agent-mail serve --no-tui
 ```
 
 Then clear/rebuild vector artifacts per deployment layout and re-enable semantic mode only after

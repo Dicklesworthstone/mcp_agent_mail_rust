@@ -36,7 +36,7 @@ perf.data
 perf.data.*
 flamegraph.svg
 
-# Benchmark results (generated per-run by scripts/bench_cli.sh)
+# Benchmark results (generated per-run by `am bench`)
 benches/results/
 
 # Conformance scratch runs (legacy python reference generator)

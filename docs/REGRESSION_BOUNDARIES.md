@@ -19,7 +19,7 @@ remain accessible through the TUI, headless logging, or both.
 | Console capabilities detection          | Startup banner       | Implicit (ftui probes)      | N/A                         |
 | Startup probe results                   | Probe failures exit  | Probe failures exit         | Same behavior               |
 
-**Regression gate:** `scripts/am` and `scripts/am --no-tui` must both report
+**Regression gate:** `am serve-http` and `mcp-agent-mail serve --no-tui` must both report
 endpoint, database, storage, and auth status within the first 2 seconds.
 
 ## 2. Tool Call Observability
@@ -96,8 +96,8 @@ These must hold in both TUI and headless modes:
 
 | Mode                    | Output target                    | Active when                      |
 |-------------------------|----------------------------------|----------------------------------|
-| TUI (default)           | ftui terminal + event ring       | `scripts/am` (TUI_ENABLED=true)  |
-| Headless                | Structured log (stdout/file)     | `scripts/am --no-tui`            |
+| TUI (default)           | ftui terminal + event ring       | `am serve-http` (TUI_ENABLED=true)  |
+| Headless                | Structured log (stdout/file)     | `mcp-agent-mail serve --no-tui`    |
 | JSON logs               | JSON-formatted log lines         | `LOG_JSON_ENABLED=true`          |
 | Pipe/redirect           | Plain text (no ANSI)             | stdout is not a TTY              |
 
@@ -139,7 +139,7 @@ Run these checks before declaring TUI parity complete:
 
 ```bash
 # 1. TUI mode: all screens render
-scripts/am
+am serve-http
 # Press 1-8, verify each screen loads
 # Press ?, verify help overlay
 # Press Ctrl+P, verify command palette
@@ -147,7 +147,7 @@ scripts/am
 # Press q to quit
 
 # 2. Headless mode: structured output
-scripts/am --no-tui &
+mcp-agent-mail serve --no-tui &
 SERVER_PID=$!
 curl -s http://127.0.0.1:8765/mcp/ \
   -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
@@ -156,12 +156,12 @@ curl -s http://127.0.0.1:8765/mcp/ \
 kill $SERVER_PID
 
 # 3. Sensitive value masking
-LOG_TOOL_CALLS_ENABLED=true scripts/am --no-tui &
+LOG_TOOL_CALLS_ENABLED=true mcp-agent-mail serve --no-tui &
 # Send a message with "token" in params
 # Verify logs show <redacted> for token values
 
 # 4. Pipe mode: no ANSI
-scripts/am --no-tui 2>&1 | cat > /tmp/output.txt
+mcp-agent-mail serve --no-tui 2>&1 | cat > /tmp/output.txt
 # Verify no ANSI escape sequences in output
 
 # 5. Automated tests

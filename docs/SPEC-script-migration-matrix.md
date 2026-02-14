@@ -28,15 +28,15 @@ workflows to native Rust commands.
 
 | Script | Native Equivalent | Status | Notes |
 |--------|-------------------|--------|-------|
-| `am` | `mcp-agent-mail serve` | **Retained** | Convenience wrapper with defaults (auth discovery, port reuse). Keep for operator UX. |
+| `am` | `am serve-http` | **Migrated** | All functionality is now in the native `am serve-http` command. The `scripts/am` wrapper has been removed. |
 
 ### CI & Quality Gates
 
 | Script | Native Equivalent | Status | Notes |
 |--------|-------------------|--------|-------|
-| `ci.sh` | -- | **Gap** | Add `am ci` command with `--quick`, `--report` flags |
+| `ci.sh` | `am ci` | **Migrated** | Native `am ci` command with `--quick`, `--report` flags |
 | `bench_cli.sh` | `am bench` | **Migrated** | Native bench command is authoritative; script retained as compatibility shim with deprecation warning |
-| `bench_golden.sh` | -- | **Gap** | Add `am bench golden` subcommand |
+| `bench_golden.sh` | `am golden validate` | **Migrated** | Native `am golden validate` command |
 
 ### Flake Triage
 
@@ -181,24 +181,24 @@ workflows to native Rust commands.
 
 ## Gap Analysis & Implementation Priority
 
-### High Priority Gaps
+All previously identified gaps have been closed. The following native commands
+are now available:
 
-| Gap | Proposed Command | Rationale | Owner | Risk |
-|-----|------------------|-----------|-------|------|
-| CI runner | `am ci --quick --report <path>` | Frequently used in dev workflow | TBD | Low |
-| Golden benchmarks | `am bench golden` | Performance regression tracking | TBD | Low |
+| Former Gap | Native Command | Status |
+|------------|----------------|--------|
+| CI runner | `am ci --quick --report <path>` | **Migrated** |
+| Golden benchmarks | `am golden validate` | **Migrated** |
 
-### Design Considerations
+### Native Command Reference
 
 **`am ci` command:**
-- Run all quality gates (fmt, clippy, test, E2E)
+- Runs all quality gates (fmt, clippy, test, E2E)
 - `--quick` flag to skip long-running E2E
 - `--report <path>` to emit machine-readable JSON
-- Should invoke existing Rust tooling, not shell out to cargo
 
 **`am bench` cluster:**
 - `am bench` — CLI operation latency benchmarks (`--quick`, `--json`, `--baseline`, `--save-baseline`)
-- `am bench golden` — Regression tests against golden outputs
+- `am golden validate` — Regression tests against golden outputs
 - `am bench stress` — Load testing (future)
 
 ---
@@ -287,27 +287,28 @@ If rollback is triggered:
 
 | Category | Migrated | Partial | Gap | Retained |
 |----------|----------|---------|-----|----------|
-| Server/Wrappers | 0 | 0 | 0 | 1 |
-| CI/Quality | 1 | 0 | 2 | 0 |
+| Server/Wrappers | 1 | 0 | 0 | 0 |
+| CI/Quality | 3 | 0 | 0 | 0 |
 | Flake Triage | 1 | 0 | 0 | 0 |
 | Legacy Hooks | 1 | 0 | 0 | 0 |
 | E2E Harnesses | 0 | 0 | 0 | 15 |
 | TUI Tests | 0 | 0 | 0 | 5 |
 | Utility | 0 | 0 | 0 | 2 |
 | tests/e2e/ | 0 | 0 | 0 | 30 |
-| **Total** | **3** | **0** | **2** | **53** |
+| **Total** | **6** | **0** | **0** | **52** |
 
 ### Key Insights
 
 1. **Most scripts are intentionally retained** as test harnesses — they exercise the
    native commands and should remain as bash scripts.
 
-2. **The `scripts/am` wrapper is retained** for operator convenience — it handles
-   auth token discovery and port reuse logic that would be awkward in the binary.
+2. **The `scripts/am` wrapper has been removed.** All functionality is now in the
+   native `am serve-http` command, which handles auth token discovery, port reuse,
+   and all server startup options.
 
-3. **Only 2 gaps identified:**
-   - `ci.sh` → `am ci`
-   - `bench_golden.sh` → `am bench golden`
+3. **All gaps are now closed:**
+   - `ci.sh` is migrated to `am ci`
+   - `bench_golden.sh` is migrated to `am golden validate`
 
 4. **`flake_triage.sh` is fully migrated** to `am flake-triage` with subcommands
    `scan`, `reproduce`, and `detect`.

@@ -1,7 +1,7 @@
 # Performance Budgets
 
 Baseline performance targets for mcp-agent-mail Rust port.
-Updated via native `am bench` and `cargo bench` (`scripts/bench_cli.sh` is compatibility-only/deprecated).
+Updated via native `am bench` and `cargo bench`.
 
 ## Optimization Workflow
 
@@ -199,7 +199,7 @@ Collected via `strace -c -f` on `mcp_agent_mail_tools/health_check` benchmark (r
 
 ## Golden Outputs
 
-Stable surfaces validated via `scripts/bench_golden.sh validate`:
+Stable surfaces validated via `am golden validate`:
 
 - `am --help` text
 - `am <subcommand> --help` text (7 subcommands)
