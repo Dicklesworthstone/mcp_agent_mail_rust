@@ -151,7 +151,7 @@ fn default_normalization_rules() -> &'static [NormalizationRule] {
 
 /// Normalize unstable output fragments to deterministic placeholders.
 ///
-/// Rules intentionally match existing `scripts/bench_golden.sh` behavior:
+/// Rules intentionally match the legacy `bench_golden.sh` behavior:
 /// 1) strip ANSI escapes, 2) normalize timestamps, 3) normalize `pid=...`.
 #[must_use]
 pub fn normalize_output(raw: &str) -> String {

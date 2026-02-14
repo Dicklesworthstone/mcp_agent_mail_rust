@@ -1,7 +1,7 @@
 //! CI gate configuration data model for `am ci` command.
 //!
 //! This module defines the canonical data contracts for the native CI command path,
-//! replacing the implicit schema encoded in `scripts/ci.sh`.
+//! replacing the implicit schema previously encoded in the legacy `ci.sh` script.
 //!
 //! Schema version: `am_ci_gate_report.v1`
 
@@ -851,7 +851,7 @@ impl GateReport {
 // Default Gates
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Returns the default set of 13 CI gates matching `scripts/ci.sh`.
+/// Returns the default set of 13 CI gates.
 #[must_use]
 pub fn default_gates() -> Vec<GateConfig> {
     vec![

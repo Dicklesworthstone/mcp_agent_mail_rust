@@ -19,8 +19,8 @@
 //! # From CI output or artifact:
 //! HARNESS_SEED=42 cargo test --test my_suite -- my_test
 //!
-//! # Or use the flake-triage script:
-//! scripts/flake_triage.sh tests/artifacts/flake_triage/20260210_*/failure_context.json
+//! # Or use the native CLI:
+//! am flake-triage tests/artifacts/flake_triage/20260210_*/failure_context.json
 //! ```
 
 #![allow(clippy::missing_const_for_fn)]
