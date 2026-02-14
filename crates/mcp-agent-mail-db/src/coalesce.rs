@@ -1674,4 +1674,124 @@ mod tests {
             .unwrap();
         assert_eq!(r.into_inner(), expected);
     }
+
+    // ─── Property tests ───────────────────────────────────────────────────────
+
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    mod proptest_coalesce {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn pt_config() -> ProptestConfig {
+            ProptestConfig {
+                cases: 500, // lower for thread-based tests
+                max_shrink_iters: 2000,
+                ..ProptestConfig::default()
+            }
+        }
+
+        proptest! {
+            #![proptest_config(pt_config())]
+
+            /// All N callers with the same key get a valid result.
+            #[test]
+            #[allow(clippy::needless_collect)]
+            fn prop_coalesce_all_callers_get_result(n in 2..=8usize) {
+                let map = Arc::new(CoalesceMap::<String, i32>::new(
+                    100,
+                    Duration::from_secs(5),
+                ));
+                let barrier = Arc::new(Barrier::new(n));
+
+                let handles: Vec<_> = (0..n)
+                    .map(|_| {
+                        let map = Arc::clone(&map);
+                        let barrier = Arc::clone(&barrier);
+                        thread::spawn(move || {
+                            barrier.wait();
+                            map.execute_or_join("shared".to_string(), || {
+                                thread::sleep(Duration::from_millis(20));
+                                Ok::<_, String>(99)
+                            })
+                        })
+                    })
+                    .collect();
+
+                for h in handles {
+                    let r = h.join().unwrap();
+                    prop_assert!(r.is_ok(), "all callers must get Ok");
+                    prop_assert_eq!(r.unwrap().into_inner(), 99);
+                }
+            }
+
+            /// After all threads complete, inflight is zero.
+            #[test]
+            fn prop_coalesce_inflight_zero_after_completion(n in 1..=10usize) {
+                let map = Arc::new(CoalesceMap::<String, i32>::new(
+                    100,
+                    Duration::from_secs(5),
+                ));
+                let barrier = Arc::new(Barrier::new(n));
+
+                let handles: Vec<_> = (0..n)
+                    .map(|i| {
+                        let map = Arc::clone(&map);
+                        let barrier = Arc::clone(&barrier);
+                        thread::spawn(move || {
+                            barrier.wait();
+                            let _ = map.execute_or_join(
+                                format!("k-{}", i % 3),
+                                || Ok::<_, String>(i as i32),
+                            );
+                        })
+                    })
+                    .collect();
+
+                for h in handles {
+                    h.join().unwrap();
+                }
+                prop_assert_eq!(
+                    map.inflight_count(),
+                    0,
+                    "inflight must be 0 after all threads complete"
+                );
+            }
+
+            /// leader + joined + timeout >= total calls.
+            #[test]
+            fn prop_coalesce_metrics_sum_consistent(n in 1..=20usize) {
+                let map: CoalesceMap<&str, i32> =
+                    CoalesceMap::new(100, Duration::from_millis(100));
+                for i in 0..n {
+                    let _ = map.execute_or_join("seq", || Ok::<_, String>(i as i32));
+                }
+                let m = map.metrics();
+                let sum = m.leader_count + m.joined_count + m.timeout_count;
+                prop_assert!(
+                    sum >= n as u64,
+                    "metrics sum {sum} < total calls {n}"
+                );
+            }
+
+            /// N distinct keys each produce a leader execution.
+            #[test]
+            fn prop_coalesce_different_keys_independent(n in 1..=20usize) {
+                let map: CoalesceMap<String, i32> =
+                    CoalesceMap::new(100, Duration::from_millis(100));
+                for i in 0..n {
+                    let r = map
+                        .execute_or_join(format!("unique-{i}"), || Ok::<_, String>(i as i32))
+                        .unwrap();
+                    prop_assert!(!r.was_joined(), "distinct key should not join");
+                }
+                let m = map.metrics();
+                prop_assert!(
+                    m.leader_count >= n as u64,
+                    "expected {} leaders, got {}",
+                    n,
+                    m.leader_count
+                );
+            }
+        }
+    }
 }

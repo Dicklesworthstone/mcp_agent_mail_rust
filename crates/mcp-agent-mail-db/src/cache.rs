@@ -1094,6 +1094,183 @@ mod tests {
         }
     }
 
+    // ─── Property tests ───────────────────────────────────────────────────────
+
+    #[allow(clippy::cast_possible_wrap)]
+    mod proptest_cache {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn pt_config() -> ProptestConfig {
+            ProptestConfig {
+                cases: 1000,
+                max_shrink_iters: 5000,
+                ..ProptestConfig::default()
+            }
+        }
+
+        /// Strategy producing random alphanumeric slugs for cache tests.
+        fn arb_slug() -> impl Strategy<Value = String> {
+            proptest::string::string_regex("[a-z0-9]{1,12}").expect("valid regex")
+        }
+
+        proptest! {
+            #![proptest_config(pt_config())]
+
+            /// entry_counts() never exceeds capacity after any number of puts.
+            #[test]
+            #[allow(clippy::cast_possible_wrap)]
+            fn prop_cache_capacity_never_exceeded(
+                slugs in proptest::collection::vec(arb_slug(), 1..=200)
+            ) {
+                let capacity = 50;
+                let cache = ReadCache::new_for_testing_with_capacity(capacity);
+                for (i, slug) in slugs.iter().enumerate() {
+                    let unique = format!("{slug}-{i}");
+                    cache.put_project(&ProjectRow {
+                        id: Some(i as i64),
+                        slug: unique.clone(),
+                        human_key: format!("/data/{unique}"),
+                        created_at: 0,
+                    });
+                }
+                let counts = cache.entry_counts();
+                prop_assert!(
+                    counts.projects_by_slug <= capacity,
+                    "slug count {} > capacity {capacity}",
+                    counts.projects_by_slug
+                );
+                prop_assert!(
+                    counts.projects_by_human_key <= capacity,
+                    "human_key count {} > capacity {capacity}",
+                    counts.projects_by_human_key
+                );
+            }
+
+            /// put then immediate get always returns the same value.
+            #[test]
+            fn prop_cache_get_after_put_hits(slug in arb_slug()) {
+                let cache = ReadCache::new();
+                let project = ProjectRow {
+                    id: Some(1),
+                    slug: slug.clone(),
+                    human_key: format!("/data/{slug}"),
+                    created_at: 42,
+                };
+                cache.put_project(&project);
+                let got = cache.get_project(&slug);
+                prop_assert!(got.is_some(), "get after put must hit");
+                prop_assert_eq!(got.unwrap().slug, slug);
+            }
+
+            /// put + invalidate + get returns None.
+            #[test]
+            fn prop_cache_invalidate_removes(
+                name_idx in 0..100usize,
+                project_id in 1..=50i64,
+            ) {
+                let cache = ReadCache::new();
+                let name = format!("Agent{name_idx}");
+                let agent = make_agent_with_id(&name, project_id, name_idx as i64);
+                cache.put_agent(&agent);
+                prop_assert!(
+                    cache.get_agent(project_id, &name).is_some(),
+                    "agent should be cached after put"
+                );
+                cache.invalidate_agent(project_id, &name);
+                prop_assert!(
+                    cache.get_agent(project_id, &name).is_none(),
+                    "agent should be evicted after invalidate"
+                );
+            }
+
+            /// warm_agents inserts all agents retrievably.
+            #[test]
+            fn prop_cache_warm_preserves_all(count in 1..=100usize) {
+                let cache = ReadCache::new();
+                let agents: Vec<AgentRow> = (0..count)
+                    .map(|i| make_agent_with_id(&format!("W{i}"), 1, i as i64))
+                    .collect();
+                cache.warm_agents(&agents);
+                for i in 0..count {
+                    prop_assert!(
+                        cache.get_agent(1, &format!("W{i}")).is_some(),
+                        "warm agent W{i} missing"
+                    );
+                }
+            }
+
+            /// deferred touches coalesce: drain returns at most one entry per
+            /// agent_id with the latest timestamp.
+            #[test]
+            fn prop_cache_deferred_touch_coalesces(
+                ops in proptest::collection::vec(
+                    (1..=20i64, 0..=1_000_000i64),
+                    1..=200
+                )
+            ) {
+                let cache = ReadCache::new();
+                // Compute expected max timestamp per agent
+                let mut expected: std::collections::HashMap<i64, i64> =
+                    std::collections::HashMap::new();
+                for &(aid, ts) in &ops {
+                    expected
+                        .entry(aid)
+                        .and_modify(|v| {
+                            if ts > *v {
+                                *v = ts;
+                            }
+                        })
+                        .or_insert(ts);
+                    let _ = cache.enqueue_touch(aid, ts);
+                }
+                let drained = cache.drain_touches();
+                // One entry per unique agent
+                prop_assert_eq!(
+                    drained.len(),
+                    expected.len(),
+                    "drain should have one entry per unique agent_id"
+                );
+                for (aid, max_ts) in &expected {
+                    let got = drained.get(aid);
+                    prop_assert!(got.is_some());
+                    prop_assert_eq!(*got.unwrap(), *max_ts);
+                }
+            }
+        }
+
+        #[test]
+        fn prop_cache_metrics_consistent() {
+            // Run a mixed sequence of puts and gets; verify hits + misses is
+            // non-decreasing and consistent.
+            let cache = ReadCache::new();
+            let before = CACHE_METRICS.snapshot();
+
+            let mut ops_count = 0u64;
+            for i in 0..100 {
+                let slug = format!("m-{}", i % 20);
+                if i % 3 == 0 {
+                    cache.put_project(&ProjectRow {
+                        id: Some(i),
+                        slug: slug.clone(),
+                        human_key: format!("/data/{slug}"),
+                        created_at: 0,
+                    });
+                }
+                let _ = cache.get_project(&slug);
+                ops_count += 1;
+            }
+
+            let after = CACHE_METRICS.snapshot();
+            let delta_hits = after.project_hits - before.project_hits;
+            let delta_misses = after.project_misses - before.project_misses;
+            assert!(
+                delta_hits + delta_misses >= ops_count,
+                "hits({delta_hits}) + misses({delta_misses}) < ops({ops_count})"
+            );
+        }
+    }
+
     #[test]
     fn inbox_stats_scope_isolation_prevents_cross_db_collisions() {
         let cache = ReadCache::new();

@@ -20,6 +20,7 @@ use sqlmodel::prelude::*;
 use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
 use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
 use sqlmodel_query::{raw_execute, raw_query};
+use std::sync::OnceLock;
 
 // =============================================================================
 // Tracked query wrappers
@@ -476,11 +477,82 @@ pub(crate) fn row_first_i64(row: &SqlRow) -> Option<i64> {
 /// SQL strings and parameter arrays from untrusted input.
 const MAX_IN_CLAUSE_ITEMS: usize = 500;
 
-fn placeholders(count: usize) -> String {
-    let capped = count.min(MAX_IN_CLAUSE_ITEMS);
+static PLACEHOLDER_CACHE: OnceLock<Vec<String>> = OnceLock::new();
+static APPROVED_CONTACT_SQL_CACHE: OnceLock<Vec<String>> = OnceLock::new();
+static RECENT_CONTACT_SQL_CACHE: OnceLock<Vec<String>> = OnceLock::new();
+
+fn build_placeholders(capped: usize) -> String {
     std::iter::repeat_n("?", capped)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn placeholders(count: usize) -> String {
+    let capped = count.min(MAX_IN_CLAUSE_ITEMS);
+    if capped == 0 {
+        return String::new();
+    }
+
+    let cache = PLACEHOLDER_CACHE.get_or_init(|| {
+        (1..=MAX_IN_CLAUSE_ITEMS)
+            .map(build_placeholders)
+            .collect::<Vec<_>>()
+    });
+    cache[capped - 1].clone()
+}
+
+fn build_approved_contact_sql_with_placeholders(placeholders: &str) -> String {
+    format!(
+        "SELECT b_agent_id FROM agent_links \
+         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? \
+           AND status = 'approved' AND b_agent_id IN ({placeholders})"
+    )
+}
+
+fn approved_contact_sql(item_count: usize) -> String {
+    let capped = item_count.min(MAX_IN_CLAUSE_ITEMS);
+    if capped == 0 {
+        return build_approved_contact_sql_with_placeholders("");
+    }
+
+    let cache = APPROVED_CONTACT_SQL_CACHE.get_or_init(|| {
+        (1..=MAX_IN_CLAUSE_ITEMS)
+            .map(|count| build_approved_contact_sql_with_placeholders(&placeholders(count)))
+            .collect::<Vec<_>>()
+    });
+    cache[capped - 1].clone()
+}
+
+fn build_recent_contact_union_sql_with_placeholders(placeholders: &str) -> String {
+    format!(
+        "SELECT agent_id FROM ( \
+           SELECT r.agent_id AS agent_id \
+           FROM message_recipients r \
+           JOIN messages m ON m.id = r.message_id \
+           WHERE m.project_id = ? AND m.sender_id = ? AND m.created_ts > ? \
+             AND r.agent_id IN ({placeholders}) \
+           UNION \
+           SELECT m.sender_id AS agent_id \
+           FROM messages m \
+           JOIN message_recipients r ON r.message_id = m.id \
+           WHERE m.project_id = ? AND r.agent_id = ? AND m.created_ts > ? \
+             AND m.sender_id IN ({placeholders}) \
+        ) ORDER BY agent_id"
+    )
+}
+
+fn recent_contact_union_sql(item_count: usize) -> String {
+    let capped = item_count.min(MAX_IN_CLAUSE_ITEMS);
+    if capped == 0 {
+        return build_recent_contact_union_sql_with_placeholders("");
+    }
+
+    let cache = RECENT_CONTACT_SQL_CACHE.get_or_init(|| {
+        (1..=MAX_IN_CLAUSE_ITEMS)
+            .map(|count| build_recent_contact_union_sql_with_placeholders(&placeholders(count)))
+            .collect::<Vec<_>>()
+    });
+    cache[capped - 1].clone()
 }
 
 async fn acquire_conn(
@@ -3836,12 +3908,7 @@ pub async fn list_approved_contact_ids(
     let tracked = tracked(&*conn);
 
     let capped_ids = &candidate_ids[..candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let placeholders = placeholders(capped_ids.len());
-    let sql = format!(
-        "SELECT b_agent_id FROM agent_links \
-         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? \
-           AND status = 'approved' AND b_agent_id IN ({placeholders})"
-    );
+    let sql = approved_contact_sql(capped_ids.len());
 
     let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
     params.push(Value::BigInt(project_id));
@@ -3893,52 +3960,27 @@ pub async fn list_recent_contact_agent_ids(
     let tracked = tracked(&*conn);
 
     let capped_ids = &candidate_ids[..candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
-    let placeholders = placeholders(capped_ids.len());
-    let sql_sent = format!(
-        "SELECT DISTINCT r.agent_id \
-         FROM message_recipients r \
-         JOIN messages m ON m.id = r.message_id \
-         WHERE m.project_id = ? AND m.sender_id = ? AND m.created_ts > ? \
-           AND r.agent_id IN ({placeholders})"
-    );
-    let mut params_sent: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
-    params_sent.push(Value::BigInt(project_id));
-    params_sent.push(Value::BigInt(sender_id));
-    params_sent.push(Value::BigInt(since_ts));
+    let sql = recent_contact_union_sql(capped_ids.len());
+    let mut params: Vec<Value> = Vec::with_capacity((capped_ids.len() * 2) + 6);
+    params.push(Value::BigInt(project_id));
+    params.push(Value::BigInt(sender_id));
+    params.push(Value::BigInt(since_ts));
     for id in capped_ids {
-        params_sent.push(Value::BigInt(*id));
+        params.push(Value::BigInt(*id));
+    }
+    params.push(Value::BigInt(project_id));
+    params.push(Value::BigInt(sender_id));
+    params.push(Value::BigInt(since_ts));
+    for id in capped_ids {
+        params.push(Value::BigInt(*id));
     }
 
-    let sql_recv = format!(
-        "SELECT DISTINCT m.sender_id \
-         FROM messages m \
-         JOIN message_recipients r ON r.message_id = m.id \
-         WHERE m.project_id = ? AND r.agent_id = ? AND m.created_ts > ? \
-           AND m.sender_id IN ({placeholders})"
-    );
-    let mut params_recv: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
-    params_recv.push(Value::BigInt(project_id));
-    params_recv.push(Value::BigInt(sender_id));
-    params_recv.push(Value::BigInt(since_ts));
-    for id in capped_ids {
-        params_recv.push(Value::BigInt(*id));
-    }
-
-    let sent_rows = map_sql_outcome(traw_query(cx, &tracked, &sql_sent, &params_sent).await);
-    let recv_rows = map_sql_outcome(traw_query(cx, &tracked, &sql_recv, &params_recv).await);
-
-    match (sent_rows, recv_rows) {
-        (Outcome::Ok(sent), Outcome::Ok(recv)) => {
-            let mut out = Vec::new();
-            for row in sent {
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
                 let id: i64 = match row.get_named("agent_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                out.push(id);
-            }
-            for row in recv {
-                let id: i64 = match row.get_named("sender_id") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -3948,9 +3990,9 @@ pub async fn list_recent_contact_agent_ids(
             out.dedup();
             Outcome::Ok(out)
         }
-        (Outcome::Err(e), _) | (_, Outcome::Err(e)) => Outcome::Err(e),
-        (Outcome::Cancelled(r), _) | (_, Outcome::Cancelled(r)) => Outcome::Cancelled(r),
-        (Outcome::Panicked(p), _) | (_, Outcome::Panicked(p)) => Outcome::Panicked(p),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
     }
 }
 
@@ -4830,6 +4872,171 @@ pub async fn insert_system_agent(
 mod tests {
     use super::*;
 
+    fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+
+        let init_conn =
+            crate::sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+                .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+        (cx, pool, dir)
+    }
+
+    async fn legacy_list_recent_contact_agent_ids(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        sender_id: i64,
+        candidate_ids: &[i64],
+        since_ts: i64,
+    ) -> Outcome<Vec<i64>, DbError> {
+        if candidate_ids.is_empty() {
+            return Outcome::Ok(vec![]);
+        }
+
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let tracked = tracked(&*conn);
+        let capped_ids = &candidate_ids[..candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
+        let placeholders = placeholders(capped_ids.len());
+
+        let sql_sent = format!(
+            "SELECT DISTINCT r.agent_id \
+             FROM message_recipients r \
+             JOIN messages m ON m.id = r.message_id \
+             WHERE m.project_id = ? AND m.sender_id = ? AND m.created_ts > ? \
+               AND r.agent_id IN ({placeholders})"
+        );
+        let mut params_sent: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
+        params_sent.push(Value::BigInt(project_id));
+        params_sent.push(Value::BigInt(sender_id));
+        params_sent.push(Value::BigInt(since_ts));
+        for id in capped_ids {
+            params_sent.push(Value::BigInt(*id));
+        }
+
+        let sql_recv = format!(
+            "SELECT DISTINCT m.sender_id \
+             FROM messages m \
+             JOIN message_recipients r ON r.message_id = m.id \
+             WHERE m.project_id = ? AND r.agent_id = ? AND m.created_ts > ? \
+               AND m.sender_id IN ({placeholders})"
+        );
+        let mut params_recv: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
+        params_recv.push(Value::BigInt(project_id));
+        params_recv.push(Value::BigInt(sender_id));
+        params_recv.push(Value::BigInt(since_ts));
+        for id in capped_ids {
+            params_recv.push(Value::BigInt(*id));
+        }
+
+        let sent_rows = map_sql_outcome(traw_query(cx, &tracked, &sql_sent, &params_sent).await);
+        let recv_rows = map_sql_outcome(traw_query(cx, &tracked, &sql_recv, &params_recv).await);
+
+        match (sent_rows, recv_rows) {
+            (Outcome::Ok(sent), Outcome::Ok(recv)) => {
+                let mut out = Vec::with_capacity(sent.len() + recv.len());
+                for row in sent {
+                    let id: i64 = match row.get_named("agent_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.push(id);
+                }
+                for row in recv {
+                    let id: i64 = match row.get_named("sender_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.push(id);
+                }
+                out.sort_unstable();
+                out.dedup();
+                Outcome::Ok(out)
+            }
+            (Outcome::Err(e), _) | (_, Outcome::Err(e)) => Outcome::Err(e),
+            (Outcome::Cancelled(r), _) | (_, Outcome::Cancelled(r)) => Outcome::Cancelled(r),
+            (Outcome::Panicked(p), _) | (_, Outcome::Panicked(p)) => Outcome::Panicked(p),
+        }
+    }
+
+    #[test]
+    fn placeholder_cache_matches_dynamic_for_common_arities() {
+        for n in 1..=64 {
+            assert_eq!(placeholders(n), build_placeholders(n), "arity={n}");
+        }
+    }
+
+    #[test]
+    fn placeholder_cache_caps_at_max_items() {
+        let max = placeholders(MAX_IN_CLAUSE_ITEMS);
+        let overflow = placeholders(MAX_IN_CLAUSE_ITEMS + 100);
+        assert_eq!(overflow, max);
+    }
+
+    #[test]
+    fn approved_contact_sql_cache_matches_dynamic_template() {
+        for n in [1, 2, 8, 64, MAX_IN_CLAUSE_ITEMS, MAX_IN_CLAUSE_ITEMS + 25] {
+            let capped = n.min(MAX_IN_CLAUSE_ITEMS);
+            let expected =
+                build_approved_contact_sql_with_placeholders(&build_placeholders(capped));
+            assert_eq!(approved_contact_sql(n), expected, "arity={n}");
+        }
+    }
+
+    #[test]
+    fn recent_contact_union_sql_cache_matches_dynamic_template() {
+        for n in [1, 2, 8, 64, MAX_IN_CLAUSE_ITEMS, MAX_IN_CLAUSE_ITEMS + 25] {
+            let capped = n.min(MAX_IN_CLAUSE_ITEMS);
+            let expected =
+                build_recent_contact_union_sql_with_placeholders(&build_placeholders(capped));
+            assert_eq!(recent_contact_union_sql(n), expected, "arity={n}");
+        }
+    }
+
+    #[test]
+    fn sql_template_caches_are_thread_safe() {
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            handles.push(std::thread::spawn(|| {
+                for n in [1, 3, 7, 64, MAX_IN_CLAUSE_ITEMS, MAX_IN_CLAUSE_ITEMS + 10] {
+                    let _ = placeholders(n);
+                    let _ = approved_contact_sql(n);
+                    let _ = recent_contact_union_sql(n);
+                }
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("template cache access across threads should not panic");
+        }
+    }
+
     #[test]
     fn sanitize_empty_returns_none() {
         assert!(sanitize_fts_query("").is_none());
@@ -5417,6 +5624,555 @@ mod tests {
                 .get_agent(project_id, "BlueLake")
                 .expect("cache entry should be refreshed");
             assert_eq!(cached.contact_policy, "contacts_only");
+        });
+    }
+
+    #[test]
+    fn list_recent_contact_agent_ids_union_matches_legacy_queries() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recent_contact_union_matches_legacy.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-union-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("union sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            let peer_sent = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenCastle",
+                "e2e-test",
+                "test-model",
+                Some("union peer sent"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sent peer");
+            let peer_sent_id = peer_sent.id.expect("peer_sent id");
+
+            let peer_recv = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedBear",
+                "e2e-test",
+                "test-model",
+                Some("union peer recv"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create recv peer");
+            let peer_recv_id = peer_recv.id.expect("peer_recv id");
+
+            let peer_extra = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "OrangeFinch",
+                "e2e-test",
+                "test-model",
+                Some("union peer extra"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create extra peer");
+            let peer_extra_id = peer_extra.id.expect("peer_extra id");
+
+            // Older message should be filtered out by since_ts.
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "old sent message",
+                "old body",
+                Some("THREAD-OLD"),
+                "normal",
+                false,
+                "[]",
+                &[(peer_sent_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create old sent message");
+
+            let since_ts = now_micros().saturating_sub(1_000);
+
+            // Sent branch hit.
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "new sent message",
+                "new body",
+                Some("THREAD-SENT"),
+                "normal",
+                false,
+                "[]",
+                &[(peer_sent_id, "to"), (peer_extra_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create recent sent message");
+
+            // Received branch hit.
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                peer_recv_id,
+                "new recv message",
+                "new body",
+                Some("THREAD-RECV"),
+                "normal",
+                false,
+                "[]",
+                &[(sender_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create recent received message");
+
+            let candidate_ids = vec![peer_sent_id, peer_recv_id, peer_extra_id];
+            let union_ids = list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+                since_ts,
+            )
+            .await
+            .into_result()
+            .expect("run union implementation");
+            let legacy_ids = legacy_list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+                since_ts,
+            )
+            .await
+            .into_result()
+            .expect("run legacy baseline");
+
+            assert_eq!(union_ids, legacy_ids, "union must match legacy baseline");
+            let mut expected = vec![peer_sent_id, peer_recv_id, peer_extra_id];
+            expected.sort_unstable();
+            assert_eq!(union_ids, expected);
+        });
+    }
+
+    #[test]
+    fn list_recent_contact_agent_ids_empty_candidates_returns_empty() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recent_contact_empty_candidates.db");
+
+        rt.block_on(async {
+            let rows = list_recent_contact_agent_ids(&cx, &pool, 1, 1, &[], now_micros())
+                .await
+                .into_result()
+                .expect("empty candidates should short-circuit");
+            assert!(rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn list_recent_contact_agent_ids_no_results_returns_empty() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recent_contact_no_results.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-empty-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("no-result sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            let peer = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenCastle",
+                "e2e-test",
+                "test-model",
+                Some("no-result peer"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create peer");
+            let peer_id = peer.id.expect("peer id");
+
+            let rows = list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &[peer_id],
+                now_micros(),
+            )
+            .await
+            .into_result()
+            .expect("no-result query");
+            assert!(rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn list_recent_contact_agent_ids_dedups_bidirectional_contacts() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recent_contact_bidirectional_dedup.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-dedup-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("dedup sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            let peer = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenCastle",
+                "e2e-test",
+                "test-model",
+                Some("dedup peer"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create peer");
+            let peer_id = peer.id.expect("peer id");
+
+            let since_ts = now_micros().saturating_sub(1_000);
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "sender to peer",
+                "body",
+                Some("THREAD-DEDUPE-1"),
+                "normal",
+                false,
+                "[]",
+                &[(peer_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create sender->peer");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                peer_id,
+                "peer to sender",
+                "body",
+                Some("THREAD-DEDUPE-2"),
+                "normal",
+                false,
+                "[]",
+                &[(sender_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create peer->sender");
+
+            let union_ids = list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &[peer_id],
+                since_ts,
+            )
+            .await
+            .into_result()
+            .expect("run union implementation");
+            let legacy_ids = legacy_list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &[peer_id],
+                since_ts,
+            )
+            .await
+            .into_result()
+            .expect("run legacy baseline");
+
+            assert_eq!(union_ids, vec![peer_id]);
+            assert_eq!(legacy_ids, vec![peer_id]);
+        });
+    }
+
+    #[test]
+    fn list_recent_contact_agent_ids_received_only_uses_agent_id_alias() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recent_contact_received_alias.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-alias-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("alias sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            let peer = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenCastle",
+                "e2e-test",
+                "test-model",
+                Some("alias peer"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create peer");
+            let peer_id = peer.id.expect("peer id");
+
+            let since_ts = now_micros().saturating_sub(1_000);
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                peer_id,
+                "received only",
+                "body",
+                Some("THREAD-ALIAS"),
+                "normal",
+                false,
+                "[]",
+                &[(sender_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create peer->sender");
+
+            let union_ids = list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &[peer_id],
+                since_ts,
+            )
+            .await
+            .into_result()
+            .expect("run union implementation");
+            let legacy_ids = legacy_list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &[peer_id],
+                since_ts,
+            )
+            .await
+            .into_result()
+            .expect("run legacy baseline");
+
+            assert_eq!(union_ids, vec![peer_id]);
+            assert_eq!(union_ids, legacy_ids);
+        });
+    }
+
+    #[test]
+    fn list_recent_contact_agent_ids_caps_candidate_list_at_max_items() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recent_contact_candidate_cap.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-cap-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("cap sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            let target = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenCastle",
+                "e2e-test",
+                "test-model",
+                Some("cap target"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create target");
+            let target_id = target.id.expect("target id");
+
+            let since_ts = now_micros();
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                target_id,
+                "target sent message",
+                "body",
+                Some("THREAD-CAP"),
+                "normal",
+                false,
+                "[]",
+                &[(sender_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create target->sender");
+
+            let mut candidate_ids: Vec<i64> = (0..MAX_IN_CLAUSE_ITEMS as i64)
+                .map(|idx| 10_000 + idx)
+                .collect();
+            // This valid target is beyond the cap, so it must not participate.
+            candidate_ids.push(target_id);
+
+            let union_ids = list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+                since_ts,
+            )
+            .await
+            .into_result()
+            .expect("run union implementation");
+            let legacy_ids = legacy_list_recent_contact_agent_ids(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+                since_ts,
+            )
+            .await
+            .into_result()
+            .expect("run legacy baseline");
+
+            assert!(union_ids.is_empty(), "target beyond cap should not match");
+            assert_eq!(union_ids, legacy_ids);
         });
     }
 
@@ -6126,5 +6882,77 @@ mod tests {
 
             assert!(rows.is_empty());
         });
+    }
+
+    // ─── Property tests ───────────────────────────────────────────────────────
+
+    mod proptest_queries {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn pt_config() -> ProptestConfig {
+            ProptestConfig {
+                cases: 1000,
+                max_shrink_iters: 5000,
+                ..ProptestConfig::default()
+            }
+        }
+
+        proptest! {
+            #![proptest_config(pt_config())]
+
+            /// `placeholders(n)` produces exactly `min(n, 500)` question marks.
+            #[test]
+            fn prop_placeholders_count_matches(n in 0..=600usize) {
+                let result = placeholders(n);
+                let capped = n.min(MAX_IN_CLAUSE_ITEMS);
+                if capped == 0 {
+                    prop_assert!(result.is_empty());
+                } else {
+                    let question_marks = result.matches('?').count();
+                    prop_assert_eq!(question_marks, capped);
+                    // Verify comma-separated format
+                    let parts: Vec<&str> = result.split(", ").collect();
+                    prop_assert_eq!(parts.len(), capped);
+                    for part in &parts {
+                        prop_assert_eq!(*part, "?");
+                    }
+                }
+            }
+
+            /// `like_escape` escapes all `%`, `_`, `\` chars; never double-escapes.
+            #[test]
+            fn prop_like_escape_no_unescaped_wildcards(term in ".*") {
+                let escaped = like_escape(&term);
+                // Walk the escaped string: every `%` and `_` must be preceded by `\`
+                let chars: Vec<char> = escaped.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    if chars[i] == '\\' {
+                        // Skip the escaped char
+                        i += 2;
+                    } else {
+                        prop_assert!(chars[i] != '%' && chars[i] != '_');
+                        i += 1;
+                    }
+                }
+                // Round-trip: un-escape and compare to original.
+                let unescaped = escaped
+                    .replace("\\%", "%")
+                    .replace("\\_", "_")
+                    .replace("\\\\", "\\");
+                prop_assert_eq!(unescaped, term);
+            }
+
+            /// `sanitize_fts_query` never returns SQL injection markers.
+            #[test]
+            fn prop_fts_sanitize_no_sqlite_injection(query in ".*") {
+                if let Some(sanitized) = sanitize_fts_query(&query) {
+                    prop_assert!(!sanitized.contains("; DROP"));
+                    prop_assert!(!sanitized.contains("--"));
+                    prop_assert!(!sanitized.is_empty());
+                }
+            }
+        }
     }
 }
