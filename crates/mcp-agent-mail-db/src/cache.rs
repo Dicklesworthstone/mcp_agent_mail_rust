@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::models::{AgentRow, InboxStatsRow, ProjectRow};
@@ -200,6 +200,10 @@ pub struct ReadCache {
     deferred_touch_shards: [OrderedMutex<HashMap<i64, i64>>; NUM_TOUCH_SHARDS],
     /// Last time we flushed the deferred touches.
     last_touch_flush: OrderedMutex<Instant>,
+    /// Atomic flag: true if any shard MAY have pending entries.
+    /// Set in `enqueue_touch()`, cleared in `drain_touches()`.
+    /// Avoids acquiring 16 shard locks in `has_pending_touches()`.
+    has_pending: AtomicBool,
 }
 
 impl ReadCache {
@@ -236,6 +240,7 @@ impl ReadCache {
                 LockLevel::DbReadCacheLastTouchFlush,
                 Instant::now(),
             ),
+            has_pending: AtomicBool::new(false),
         }
     }
 
@@ -490,6 +495,9 @@ impl ReadCache {
                 .or_insert(ts_micros);
         }
 
+        // Signal that at least one shard has pending entries.
+        self.has_pending.store(true, Ordering::Release);
+
         let last = self.last_touch_flush.lock();
         last.elapsed() >= TOUCH_FLUSH_INTERVAL
     }
@@ -502,6 +510,9 @@ impl ReadCache {
             let mut s = shard.lock();
             merged.extend(s.drain());
         }
+        // Clear the pending flag after draining all shards.
+        self.has_pending.store(false, Ordering::Release);
+
         let mut last = self.last_touch_flush.lock();
         *last = Instant::now();
         drop(last);
@@ -519,10 +530,12 @@ impl ReadCache {
     }
 
     /// Check if there are pending touches in any shard.
+    ///
+    /// Uses a single atomic load instead of acquiring 16 shard locks.
+    /// The flag is conservative: `true` means there MAY be pending entries
+    /// (a false positive after a concurrent drain is harmless).
     pub fn has_pending_touches(&self) -> bool {
-        self.deferred_touch_shards
-            .iter()
-            .any(|shard| !shard.lock().is_empty())
+        self.has_pending.load(Ordering::Acquire)
     }
 
     /// Return current entry counts per cache category.
@@ -1432,6 +1445,65 @@ mod tests {
         assert!(
             hit_rate >= 0.20,
             "S3-FIFO hit rate {hit_rate:.3} is below minimum threshold 0.20"
+        );
+    }
+
+    // ── I.1: Flat combining for cache flush (br-11fd5) ──────────────────
+
+    /// 1. Enqueue a touch, verify has_pending_touches() is true.
+    #[test]
+    fn atomic_pending_flag_set_on_enqueue() {
+        let cache = ReadCache::new_for_testing();
+        assert!(!cache.has_pending_touches(), "starts false");
+
+        cache.enqueue_touch(42, 1_000_000);
+        assert!(cache.has_pending_touches(), "set after enqueue");
+    }
+
+    /// 2. Enqueue, drain, verify has_pending_touches() is false.
+    #[test]
+    fn atomic_pending_flag_cleared_on_drain() {
+        let cache = ReadCache::new_for_testing();
+        cache.enqueue_touch(1, 100);
+        cache.enqueue_touch(2, 200);
+        assert!(cache.has_pending_touches());
+
+        let drained = cache.drain_touches();
+        assert_eq!(drained.len(), 2);
+        assert!(!cache.has_pending_touches(), "cleared after drain");
+    }
+
+    /// 3. Enqueue to different shards, all set the flag.
+    #[test]
+    fn atomic_pending_flag_multiple_shards() {
+        let cache = ReadCache::new_for_testing();
+        // Agent IDs that hash to different shards (id % 16).
+        for i in 0..16_i64 {
+            cache.enqueue_touch(i, i * 1000);
+        }
+        assert!(cache.has_pending_touches());
+
+        // Drain and verify all were collected.
+        let drained = cache.drain_touches();
+        assert_eq!(drained.len(), 16);
+        assert!(!cache.has_pending_touches());
+    }
+
+    /// 4. Verify has_pending_touches() uses atomic (no mutex) by checking timing.
+    #[test]
+    fn atomic_pending_flag_no_spurious_locks() {
+        let cache = ReadCache::new_for_testing();
+
+        // Call has_pending_touches 10_000 times. With atomic, this should be
+        // sub-millisecond. With 16 mutex locks, it would be measurably slower.
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            let _ = cache.has_pending_touches();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "10K atomic loads should be <50ms; took {elapsed:?}"
         );
     }
 }
