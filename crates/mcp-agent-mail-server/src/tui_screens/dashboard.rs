@@ -13,6 +13,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
+use ftui_extras::charts::{LineChart, Series};
 use ftui_extras::markdown::MarkdownTheme;
 use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
@@ -1052,46 +1053,42 @@ fn render_trend_panel(
             .render(ribbon_area, frame);
     }
 
-    // Throughput activity sparkline (br-2bbt.4.1: now using ftui_widgets::Sparkline)
+    // Throughput LineChart (br-3q8v0: replaced Sparkline with ftui_extras LineChart)
     if throughput_history.len() >= 2 {
         let block = Block::default()
-            .title("Req/interval")
+            .title("Throughput (req/interval)")
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
         let inner = block.inner(activity_area);
         block.render(activity_area, frame);
 
-        // Label row.
-        if inner.height > 1 && inner.width > 0 {
-            let tp = crate::tui_theme::TuiThemePalette::current();
-            let label = Paragraph::new("Throughput").style(Style::new().fg(tp.text_muted));
-            label.render(
-                Rect {
-                    x: inner.x,
-                    y: inner.y,
-                    width: inner.width,
-                    height: 1,
-                },
-                frame,
-            );
+        if inner.width > 4 && inner.height > 2 {
+            // Take the most recent 60 samples (or fewer if not available yet).
+            let window = 60.min(throughput_history.len());
+            let start_idx = throughput_history.len().saturating_sub(window);
+            let slice = &throughput_history[start_idx..];
 
-            // Sparkline below label — take most recent values that fit.
-            let spark_area = Rect {
-                x: inner.x,
-                y: inner.y + 1,
-                width: inner.width,
-                height: inner.height.saturating_sub(1),
-            };
-            if spark_area.width > 0 && spark_area.height > 0 {
-                let start_idx = throughput_history
-                    .len()
-                    .saturating_sub(spark_area.width as usize);
-                let slice = &throughput_history[start_idx..];
-                let sparkline = Sparkline::new(slice)
-                    .min(0.0)
-                    .style(Style::new().fg(tp.metric_requests));
-                sparkline.render(spark_area, frame);
-            }
+            // Build (x, y) data: x = seconds ago (negative = past, 0 = now).
+            #[allow(clippy::cast_precision_loss)]
+            let data: Vec<(f64, f64)> = slice
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let x = i as f64 - (slice.len() as f64 - 1.0);
+                    (x, v)
+                })
+                .collect();
+
+            let max_val = slice.iter().copied().fold(1.0_f64, f64::max).max(1.0);
+
+            let series = Series::new("calls/sec", &data, tp.metric_requests);
+            #[allow(clippy::cast_precision_loss)]
+            let x_min = -(window as f64 - 1.0);
+            let chart = LineChart::new(vec![series])
+                .x_bounds(x_min, 0.0)
+                .y_bounds(0.0, max_val)
+                .legend(true);
+            chart.render(inner, frame);
         }
     } else {
         let block = Block::default()
