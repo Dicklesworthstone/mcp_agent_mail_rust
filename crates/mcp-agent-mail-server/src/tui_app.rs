@@ -177,13 +177,23 @@ const SLOW_TOOL_THRESHOLD_MS: u64 = 5000;
 /// How far ahead (in microseconds) to warn about expiring reservations (5 min).
 const RESERVATION_EXPIRY_WARN_MICROS: i64 = 5 * 60 * 1_000_000;
 
-/// Toast border/icon colors by severity, matching `tui_events` severity palette.
-const TOAST_COLOR_ERROR: PackedRgba = PackedRgba::rgb(255, 100, 100);
-const TOAST_COLOR_WARNING: PackedRgba = PackedRgba::rgb(255, 184, 108);
-const TOAST_COLOR_INFO: PackedRgba = PackedRgba::rgb(120, 220, 150);
-const TOAST_COLOR_SUCCESS: PackedRgba = PackedRgba::rgb(100, 220, 170);
-/// Bright cyan highlight for the focused toast border.
-const TOAST_FOCUS_HIGHLIGHT: PackedRgba = PackedRgba::rgb(80, 220, 255);
+/// Toast border/icon colors resolved from the active theme palette.
+fn toast_color_error() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().toast_error
+}
+fn toast_color_warning() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().toast_warning
+}
+fn toast_color_info() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().toast_info
+}
+fn toast_color_success() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().toast_success
+}
+/// Bright highlight for the focused toast border, theme-aware.
+fn toast_focus_highlight() -> PackedRgba {
+    crate::tui_theme::TuiThemePalette::current().toast_focus
+}
 
 /// Current time as microseconds since Unix epoch.
 fn now_micros() -> i64 {
@@ -448,9 +458,9 @@ impl ModalManager {
         if let Some(ref modal) = self.active {
             // Severity-based border color (reserved for future use when Dialog supports it)
             let _border_color = match modal.severity {
-                ModalSeverity::Info => TOAST_COLOR_INFO,
-                ModalSeverity::Warning => TOAST_COLOR_WARNING,
-                ModalSeverity::Error => TOAST_COLOR_ERROR,
+                ModalSeverity::Info => toast_color_info(),
+                ModalSeverity::Warning => toast_color_warning(),
+                ModalSeverity::Error => toast_color_error(),
             };
             // Render using StatefulWidget with a cloned state (read-only render)
             let mut render_state = modal.state.clone();
@@ -1937,7 +1947,7 @@ impl Model for MailAppModel {
                                         self.apply_toast_policy(
                                             Toast::new(msg)
                                                 .icon(ToastIcon::Info)
-                                                .style(Style::default().fg(TOAST_COLOR_INFO)),
+                                                .style(Style::default().fg(toast_color_info())),
                                         ),
                                     );
                                     return Cmd::none();
@@ -3127,7 +3137,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
                 ToastIcon::Info,
                 Toast::new(format!("{from} → {recipients}"))
                     .icon(ToastIcon::Info)
-                    .style(Style::default().fg(TOAST_COLOR_INFO))
+                    .style(Style::default().fg(toast_color_info()))
                     .duration(Duration::from_secs(4)),
             )
         }
@@ -3141,7 +3151,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
                 ToastIcon::Info,
                 Toast::new(format!("{from}: {truncated}"))
                     .icon(ToastIcon::Info)
-                    .style(Style::default().fg(TOAST_COLOR_INFO))
+                    .style(Style::default().fg(toast_color_info()))
                     .duration(Duration::from_secs(5)),
             )
         }
@@ -3151,7 +3161,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Success,
             Toast::new(format!("{name} ({program})"))
                 .icon(ToastIcon::Success)
-                .style(Style::default().fg(TOAST_COLOR_SUCCESS))
+                .style(Style::default().fg(toast_color_success()))
                 .duration(Duration::from_secs(4)),
         ),
 
@@ -3164,7 +3174,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Error,
             Toast::new(format!("{tool_name} error"))
                 .icon(ToastIcon::Error)
-                .style(Style::default().fg(TOAST_COLOR_ERROR))
+                .style(Style::default().fg(toast_color_error()))
                 .duration(Duration::from_secs(15)),
         ),
         MailEvent::ToolCallEnd {
@@ -3175,7 +3185,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Warning,
             Toast::new(format!("{tool_name}: {duration_ms}ms"))
                 .icon(ToastIcon::Warning)
-                .style(Style::default().fg(TOAST_COLOR_WARNING))
+                .style(Style::default().fg(toast_color_warning()))
                 .duration(Duration::from_secs(8)),
         ),
 
@@ -3191,7 +3201,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
                 ToastIcon::Info,
                 Toast::new(format!("{agent} locked {path_display}"))
                     .icon(ToastIcon::Info)
-                    .style(Style::default().fg(TOAST_COLOR_INFO))
+                    .style(Style::default().fg(toast_color_info()))
                     .duration(Duration::from_secs(4)),
             )
         }
@@ -3201,7 +3211,7 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Error,
             Toast::new(format!("HTTP {status} on {path}"))
                 .icon(ToastIcon::Error)
-                .style(Style::default().fg(TOAST_COLOR_ERROR))
+                .style(Style::default().fg(toast_color_error()))
                 .duration(Duration::from_secs(6)),
         ),
 
@@ -3210,14 +3220,14 @@ fn toast_for_event(event: &MailEvent, severity: ToastSeverityThreshold) -> Optio
             ToastIcon::Warning,
             Toast::new("Server shutting down")
                 .icon(ToastIcon::Warning)
-                .style(Style::default().fg(TOAST_COLOR_WARNING))
+                .style(Style::default().fg(toast_color_warning()))
                 .duration(Duration::from_secs(8)),
         ),
         MailEvent::ServerStarted { endpoint, .. } => (
             ToastIcon::Success,
             Toast::new(format!("Server started at {endpoint}"))
                 .icon(ToastIcon::Success)
-                .style(Style::default().fg(TOAST_COLOR_SUCCESS))
+                .style(Style::default().fg(toast_color_success()))
                 .duration(Duration::from_secs(5)),
         ),
 
@@ -3402,7 +3412,7 @@ fn highlight_toast_border(x: u16, y: u16, tw: u16, th: u16, frame: &mut Frame) {
     for bx in x..x.saturating_add(tw) {
         for &by in &[y, y.saturating_add(th).saturating_sub(1)] {
             if let Some(cell) = frame.buffer.get_mut(bx, by) {
-                cell.fg = TOAST_FOCUS_HIGHLIGHT;
+                cell.fg = toast_focus_highlight();
             }
         }
     }
@@ -3411,7 +3421,7 @@ fn highlight_toast_border(x: u16, y: u16, tw: u16, th: u16, frame: &mut Frame) {
     for by in y..=bottom {
         for &bx in &[x, x.saturating_add(tw).saturating_sub(1)] {
             if let Some(cell) = frame.buffer.get_mut(bx, by) {
-                cell.fg = TOAST_FOCUS_HIGHLIGHT;
+                cell.fg = toast_focus_highlight();
             }
         }
     }
@@ -3444,7 +3454,7 @@ fn render_focus_hint(
         }
         if let Some(cell) = frame.buffer.get_mut(hx, hint_y) {
             *cell = ftui::Cell::from_char(ch);
-            cell.fg = TOAST_FOCUS_HIGHLIGHT;
+            cell.fg = toast_focus_highlight();
         }
     }
 }
@@ -5918,7 +5928,7 @@ mod tests {
         let event = MailEvent::http_request("GET", "/mcp/", 500, 5, "127.0.0.1");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
         let fg = render_toast_border_fg(&toast);
-        assert_eq!(fg, TOAST_COLOR_ERROR);
+        assert_eq!(fg, toast_color_error());
     }
 
     #[test]
@@ -5926,7 +5936,7 @@ mod tests {
         let event = MailEvent::tool_call_end("slow_tool", 6000, None, 0, 0.0, vec![], None, None);
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
         let fg = render_toast_border_fg(&toast);
-        assert_eq!(fg, TOAST_COLOR_WARNING);
+        assert_eq!(fg, toast_color_warning());
     }
 
     #[test]
@@ -5934,7 +5944,7 @@ mod tests {
         let event = MailEvent::message_sent(1, "A", vec!["B".into()], "Hi", "t1", "proj");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
         let fg = render_toast_border_fg(&toast);
-        assert_eq!(fg, TOAST_COLOR_INFO);
+        assert_eq!(fg, toast_color_info());
     }
 
     #[test]
@@ -5942,7 +5952,7 @@ mod tests {
         let event = MailEvent::agent_registered("RedFox", "claude-code", "opus-4.6", "proj");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
         let fg = render_toast_border_fg(&toast);
-        assert_eq!(fg, TOAST_COLOR_SUCCESS);
+        assert_eq!(fg, toast_color_success());
     }
 
     // ── render_toast_focus_highlight tests ───────────────────────
@@ -5990,11 +6000,11 @@ mod tests {
         let (_, th) = queue.visible()[0].calculate_dimensions();
         let hint_y = py + th;
 
-        // At least one cell in the hint row should have TOAST_FOCUS_HIGHLIGHT fg.
+        // At least one cell in the hint row should have toast_focus_highlight() fg.
         let mut found = false;
         for x in 0..80 {
             if let Some(cell) = frame.buffer.get(x, hint_y) {
-                if cell.fg == TOAST_FOCUS_HIGHLIGHT {
+                if cell.fg == toast_focus_highlight() {
                     found = true;
                     break;
                 }

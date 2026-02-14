@@ -136,6 +136,13 @@ pub struct TuiThemePalette {
     pub bg_surface: PackedRgba,
     pub bg_overlay: PackedRgba,
 
+    // ── Toast notifications ───────────────────────────────────────
+    pub toast_error: PackedRgba,
+    pub toast_warning: PackedRgba,
+    pub toast_info: PackedRgba,
+    pub toast_success: PackedRgba,
+    pub toast_focus: PackedRgba,
+
     // ── JSON token styles ────────────────────────────────────────
     pub json_key: PackedRgba,
     pub json_string: PackedRgba,
@@ -261,6 +268,12 @@ impl TuiThemePalette {
             bg_surface,
             bg_overlay: PackedRgba::rgb(30, 55, 30),
 
+            toast_error: PackedRgba::rgb(255, 100, 100),
+            toast_warning: PackedRgba::rgb(255, 184, 108),
+            toast_info: PackedRgba::rgb(120, 220, 150),
+            toast_success: PackedRgba::rgb(100, 220, 170),
+            toast_focus: PackedRgba::rgb(80, 220, 255),
+
             json_key: accent,
             json_string: PackedRgba::rgb(80, 220, 100),
             json_number: PackedRgba::rgb(255, 184, 108),
@@ -373,6 +386,12 @@ impl TuiThemePalette {
             bg_deep: p.bg_deep,
             bg_surface: p.bg_surface,
             bg_overlay: p.bg_overlay,
+
+            toast_error: p.accent_error,
+            toast_warning: p.accent_warning,
+            toast_info: p.accent_info,
+            toast_success: p.accent_success,
+            toast_focus: p.accent_info,
 
             json_key: p.syntax_keyword,
             json_string: p.syntax_string,

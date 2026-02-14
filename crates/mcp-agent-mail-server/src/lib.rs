@@ -2063,7 +2063,7 @@ impl StartupDashboard {
             let mut pane = lock_mutex(&self.log_pane);
             // Split on newlines so each line is a separate entry in the viewer.
             for l in line.trim_end().split('\n') {
-                pane.push(l.to_string());
+                pane.push(console::ansi_to_line(l));
             }
         } else {
             let mut writer = lock_mutex(&self.writer);
@@ -2818,6 +2818,9 @@ fn dashboard_write_log(text: &str) -> bool {
 
 fn emit_operator_panel_line(mode: RuntimeOutputMode, text: &str) {
     if mode.is_tui() {
+        if let Some(state) = tui_state_handle() {
+            state.push_console_log(text.to_string());
+        }
         return;
     }
     if !dashboard_write_log(text) {

@@ -3,6 +3,7 @@
 //! All rendering functions produce ANSI-colored strings suitable for
 //! `TerminalWriter::write_log()` or `dashboard_write_log()`.
 
+use ftui::PackedRgba;
 use ftui::widgets::sparkline::Sparkline;
 use serde_json::Value;
 use std::sync::Mutex;
@@ -356,7 +357,9 @@ pub fn render_tool_call_end(
     // Title
     let title =
         format!(" {color}{icon} {text}{tool_name}{RESET} {color}completed in {label}{RESET} ",);
-    let title_vis = 3 + tool_name.len() + 15 + label.len(); // leading space + icon + spaces + "completed in " + label
+    let icon_w = ftui::text::display_width(icon);
+    // " " + icon + " " + tool_name + " " + "completed in " + label + " "
+    let title_vis = 1 + icon_w + 1 + tool_name.len() + 1 + 13 + label.len() + 1;
     let pad = w.saturating_sub(title_vis);
     lines.push(format!(
         "{color}\u{2502}{title}{}{color}\u{2502}{RESET}",
@@ -439,7 +442,7 @@ pub fn render_tool_call_end(
             ));
         }
         for rline in truncated.lines().take(8) {
-            let vis_len = rline.len();
+            let vis_len = strip_ansi_len(rline);
             let padded = format!("  {rline}");
             let pad = w.saturating_sub(vis_len + 2);
             lines.push(format!(
@@ -810,6 +813,252 @@ fn strip_ansi_len(s: &str) -> usize {
         }
     }
     count
+}
+
+/// Strip ANSI escape sequences and return the cleaned string.
+pub fn strip_ansi_content(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if c == '\x1b' {
+            in_escape = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ANSI → styled ftui Text conversion
+// ──────────────────────────────────────────────────────────────────────
+
+/// Standard 8-color ANSI palette (SGR codes 30–37 / 40–47).
+const ANSI_PALETTE: [PackedRgba; 8] = [
+    PackedRgba::rgb(0, 0, 0),       // black
+    PackedRgba::rgb(205, 49, 49),    // red
+    PackedRgba::rgb(13, 188, 121),   // green
+    PackedRgba::rgb(229, 229, 16),   // yellow
+    PackedRgba::rgb(36, 114, 200),   // blue
+    PackedRgba::rgb(188, 63, 188),   // magenta
+    PackedRgba::rgb(17, 168, 205),   // cyan
+    PackedRgba::rgb(229, 229, 229),  // white
+];
+
+/// Bright 8-color ANSI palette (SGR codes 90–97 / 100–107).
+const ANSI_BRIGHT_PALETTE: [PackedRgba; 8] = [
+    PackedRgba::rgb(102, 102, 102),  // bright black
+    PackedRgba::rgb(241, 76, 76),    // bright red
+    PackedRgba::rgb(35, 209, 139),   // bright green
+    PackedRgba::rgb(245, 245, 67),   // bright yellow
+    PackedRgba::rgb(59, 142, 234),   // bright blue
+    PackedRgba::rgb(214, 112, 214),  // bright magenta
+    PackedRgba::rgb(41, 184, 219),   // bright cyan
+    PackedRgba::rgb(255, 255, 255),  // bright white
+];
+
+/// Convert an ANSI 256-color index to RGB.
+fn ansi_256_to_rgb(idx: u8) -> PackedRgba {
+    if idx < 8 {
+        ANSI_PALETTE[idx as usize]
+    } else if idx < 16 {
+        ANSI_BRIGHT_PALETTE[(idx - 8) as usize]
+    } else if idx < 232 {
+        // 6×6×6 color cube: xterm standard [0, 95, 135, 175, 215, 255]
+        let n = idx - 16;
+        let ri = n / 36;
+        let gi = (n / 6) % 6;
+        let bi = n % 6;
+        let to_rgb = |v: u8| -> u8 {
+            if v == 0 { 0 } else { 55 + 40 * v }
+        };
+        PackedRgba::rgb(to_rgb(ri), to_rgb(gi), to_rgb(bi))
+    } else {
+        // Grayscale ramp 232..=255
+        let v = 8 + (idx - 232) * 10;
+        PackedRgba::rgb(v, v, v)
+    }
+}
+
+/// Apply a single SGR parameter to a mutable `Style`.
+fn apply_sgr_to_style(style: &mut ftui::Style, code: u8, params: &[u8], param_idx: &mut usize) {
+    match code {
+        0 => *style = ftui::Style::default(),
+        1 => *style = style.bold(),
+        2 => *style = style.dim(),
+        3 => *style = style.italic(),
+        4 => *style = style.underline(),
+        7 => {
+            // Reverse: swap fg/bg
+            let fg = style.fg;
+            style.fg = style.bg;
+            style.bg = fg;
+        }
+        9 => {
+            if let Some(ref mut a) = style.attrs {
+                *a |= ftui::StyleFlags::STRIKETHROUGH;
+            } else {
+                style.attrs = Some(ftui::StyleFlags::STRIKETHROUGH);
+            }
+        }
+        22 => {
+            // Normal intensity (reset bold+dim)
+            if let Some(ref mut a) = style.attrs {
+                a.remove(ftui::StyleFlags::BOLD);
+                a.remove(ftui::StyleFlags::DIM);
+            }
+        }
+        23 => {
+            if let Some(ref mut a) = style.attrs {
+                a.remove(ftui::StyleFlags::ITALIC);
+            }
+        }
+        24 => {
+            if let Some(ref mut a) = style.attrs {
+                a.remove(ftui::StyleFlags::UNDERLINE);
+            }
+        }
+        27 => {
+            // Reset reverse — just clear any swapped state; no-op for simplicity
+        }
+        29 => {
+            if let Some(ref mut a) = style.attrs {
+                a.remove(ftui::StyleFlags::STRIKETHROUGH);
+            }
+        }
+        // Standard foreground colors
+        c @ 30..=37 => style.fg = Some(ANSI_PALETTE[(c - 30) as usize]),
+        38 => {
+            // Extended foreground
+            if let Some(&mode) = params.get(*param_idx) {
+                *param_idx += 1;
+                if mode == 5 {
+                    // 256-color
+                    if let Some(&idx) = params.get(*param_idx) {
+                        *param_idx += 1;
+                        style.fg = Some(ansi_256_to_rgb(idx));
+                    }
+                } else if mode == 2 {
+                    // 24-bit RGB
+                    if params.len() >= *param_idx + 3 {
+                        let r = params[*param_idx];
+                        let g = params[*param_idx + 1];
+                        let b = params[*param_idx + 2];
+                        *param_idx += 3;
+                        style.fg = Some(PackedRgba::rgb(r, g, b));
+                    }
+                }
+            }
+        }
+        39 => style.fg = None,
+        // Standard background colors
+        c @ 40..=47 => style.bg = Some(ANSI_PALETTE[(c - 40) as usize]),
+        48 => {
+            // Extended background
+            if let Some(&mode) = params.get(*param_idx) {
+                *param_idx += 1;
+                if mode == 5 {
+                    if let Some(&idx) = params.get(*param_idx) {
+                        *param_idx += 1;
+                        style.bg = Some(ansi_256_to_rgb(idx));
+                    }
+                } else if mode == 2 {
+                    if params.len() >= *param_idx + 3 {
+                        let r = params[*param_idx];
+                        let g = params[*param_idx + 1];
+                        let b = params[*param_idx + 2];
+                        *param_idx += 3;
+                        style.bg = Some(PackedRgba::rgb(r, g, b));
+                    }
+                }
+            }
+        }
+        49 => style.bg = None,
+        // Bright foreground colors
+        c @ 90..=97 => style.fg = Some(ANSI_BRIGHT_PALETTE[(c - 90) as usize]),
+        // Bright background colors
+        c @ 100..=107 => style.bg = Some(ANSI_BRIGHT_PALETTE[(c - 100) as usize]),
+        _ => {} // Ignore unsupported SGR codes
+    }
+}
+
+/// Parse an ANSI-escaped string into a styled `ftui::text::Line`.
+///
+/// Converts SGR (Select Graphic Rendition) sequences into properly styled
+/// `Span` objects, preserving colors, bold, italic, etc. Non-SGR escape
+/// sequences are silently ignored.
+pub fn ansi_to_line(input: &str) -> ftui::text::Line {
+    use ftui::text::{Line, Span};
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut current_style = ftui::Style::default();
+    let mut buf = String::new();
+
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == 0x1b && i + 1 < len && bytes[i + 1] == b'[' {
+            // Flush accumulated text
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), current_style));
+            }
+            // Parse CSI sequence: ESC [ <params> <final byte>
+            i += 2; // skip ESC [
+            let mut params_raw = Vec::new();
+            while i < len && !(bytes[i] >= 0x40 && bytes[i] <= 0x7e) {
+                params_raw.push(bytes[i]);
+                i += 1;
+            }
+            if i < len {
+                let final_byte = bytes[i];
+                i += 1;
+                if final_byte == b'm' {
+                    // SGR sequence — parse semicolon-separated params
+                    let params_str = String::from_utf8_lossy(&params_raw);
+                    let params: Vec<u8> = if params_str.is_empty() {
+                        vec![0] // ESC[m = reset
+                    } else {
+                        params_str
+                            .split(';')
+                            .filter_map(|s| s.parse::<u8>().ok())
+                            .collect()
+                    };
+                    let mut pi = 0;
+                    while pi < params.len() {
+                        let code = params[pi];
+                        pi += 1;
+                        apply_sgr_to_style(&mut current_style, code, &params, &mut pi);
+                    }
+                }
+                // Non-SGR CSI sequences silently ignored
+            }
+        } else {
+            // Regular character — accumulate into buffer
+            // Handle multi-byte UTF-8 properly
+            let c = input[i..].chars().next().unwrap_or('?');
+            buf.push(c);
+            i += c.len_utf8();
+        }
+    }
+
+    // Flush remaining text
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, current_style));
+    }
+
+    Line::from_spans(spans)
+}
+
+/// Parse an ANSI-escaped multi-line string into a styled `ftui::text::Text`.
+pub fn ansi_to_text(input: &str) -> ftui::text::Text {
+    let lines: Vec<ftui::text::Line> = input.split('\n').map(ansi_to_line).collect();
+    ftui::text::Text::from_lines(lines)
 }
 
 /// Colorize a JSON line with key/number highlights.

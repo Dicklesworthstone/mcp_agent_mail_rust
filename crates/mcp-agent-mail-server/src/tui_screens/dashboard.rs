@@ -3,6 +3,7 @@
 //! Displays real-time stats, a live event log, and health alarms in a
 //! responsive layout that adapts from 80×24 to 200×50+.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -171,6 +172,12 @@ pub struct DashboardScreen {
     reduced_motion: bool,
     /// Whether chart transitions are enabled (`AM_TUI_CHART_ANIMATIONS`).
     chart_animations_enabled: bool,
+    /// Whether the console log panel is visible (toggled with `l`).
+    show_log_panel: bool,
+    /// Console log pane for tool call cards / HTTP requests.
+    console_log: RefCell<crate::console::LogPane>,
+    /// Last consumed console log sequence number.
+    console_log_last_seq: u64,
 }
 
 /// A pre-formatted event log entry.
@@ -285,6 +292,9 @@ impl DashboardScreen {
             pulse_phase: 0.0,
             reduced_motion: reduced_motion_enabled(),
             chart_animations_enabled: chart_animations_enabled(),
+            show_log_panel: false,
+            console_log: RefCell::new(crate::console::LogPane::new()),
+            console_log_last_seq: 0,
         }
     }
 
@@ -412,13 +422,26 @@ impl DashboardScreen {
         );
     }
 
+    /// Render the console log panel in the sidebar area.
+    fn render_console_log_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(" Console Log ")
+            .style(Style::default().fg(tp.panel_border));
+        let inner = block.inner(area);
+        block.render(area, frame);
+        self.console_log.borrow_mut().render(inner, frame);
+    }
+
     /// Build the `ReactiveLayout` for the main content area.
     ///
     /// Layout contains:
     /// - Primary event log
     /// - Optional trend panel (right rail)
     /// - Recent message markdown preview (bottom rail on wide terminals)
-    fn main_content_layout(show_trend_panel: bool) -> ReactiveLayout {
+    /// - Optional console log panel (bottom sidebar)
+    fn main_content_layout(show_trend_panel: bool, show_log_panel: bool) -> ReactiveLayout {
         let mut layout = ReactiveLayout::new()
             // Primary anchor for horizontal splitting (footer rail).
             .panel(PanelPolicy::new(
@@ -446,6 +469,15 @@ impl DashboardScreen {
                 .at(TerminalClass::Wide, PanelConstraint::visible(0.35, 30))
                 .at(TerminalClass::UltraWide, PanelConstraint::visible(0.40, 40)),
             );
+        }
+
+        if show_log_panel {
+            layout = layout.panel(PanelPolicy::new(
+                PanelSlot::Sidebar,
+                3,
+                SplitAxis::Horizontal,
+                PanelConstraint::visible(0.45, 10),
+            ));
         }
 
         layout.panel(
@@ -519,6 +551,10 @@ impl MailScreen for DashboardScreen {
                     KeyCode::Char('p') => {
                         self.show_trend_panel = !self.show_trend_panel;
                     }
+                    // Toggle console log panel
+                    KeyCode::Char('l') => {
+                        self.show_log_panel = !self.show_log_panel;
+                    }
                     // Toggle type filter
                     KeyCode::Char('t') => {
                         // Cycle through filter states:
@@ -556,6 +592,20 @@ impl MailScreen for DashboardScreen {
 
         // Ingest new events every tick
         self.ingest_events(state);
+
+        // Ingest console log entries when panel is visible
+        if self.show_log_panel {
+            let new_entries = state.console_log_since(self.console_log_last_seq);
+            if !new_entries.is_empty() {
+                let mut pane = self.console_log.borrow_mut();
+                for (seq, line) in &new_entries {
+                    self.console_log_last_seq = *seq;
+                    for l in line.split('\n') {
+                        pane.push(crate::console::ansi_to_line(l));
+                    }
+                }
+            }
+        }
 
         // Refresh sparkline from per-request latency samples
         self.sparkline_data = state.sparkline_snapshot();
@@ -641,8 +691,8 @@ impl MailScreen for DashboardScreen {
             render_anomaly_rail(frame, anomaly_area, &self.anomalies);
         }
 
-        // Main: event log + optional trend panel + recent message markdown preview.
-        let layout = Self::main_content_layout(self.show_trend_panel);
+        // Main: event log + optional trend panel + recent message markdown preview + console log.
+        let layout = Self::main_content_layout(self.show_trend_panel, self.show_log_panel);
         let comp = layout.compute(main_area);
         self.render_event_log_panel(frame, comp.primary(), state);
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
@@ -660,6 +710,9 @@ impl MailScreen for DashboardScreen {
                 preview_rect,
                 self.recent_message_preview.as_ref(),
             );
+        }
+        if let Some(log_rect) = comp.rect(PanelSlot::Sidebar) {
+            self.render_console_log_panel(frame, log_rect);
         }
 
         if footer_h > 0 {
@@ -700,6 +753,10 @@ impl MailScreen for DashboardScreen {
             HelpEntry {
                 key: "p",
                 action: "Toggle trend panel",
+            },
+            HelpEntry {
+                key: "l",
+                action: "Toggle console log",
             },
         ]
     }
@@ -1821,8 +1878,8 @@ mod tests {
 
     #[test]
     fn main_layout_ultrawide_exposes_double_surface_vs_standard() {
-        let standard = DashboardScreen::main_content_layout(true).compute(Rect::new(0, 0, 100, 30));
-        let ultra = DashboardScreen::main_content_layout(true).compute(Rect::new(0, 0, 200, 50));
+        let standard = DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 100, 30));
+        let ultra = DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 200, 50));
 
         let standard_visible = standard
             .panels
@@ -1848,7 +1905,7 @@ mod tests {
     #[test]
     fn main_layout_ultrawide_panels_fit_bounds_without_overlap() {
         let area = Rect::new(0, 0, 200, 50);
-        let composition = DashboardScreen::main_content_layout(true).compute(area);
+        let composition = DashboardScreen::main_content_layout(true, false).compute(area);
         let visible_rects: Vec<Rect> = [
             composition.rect(PanelSlot::Primary),
             composition.rect(PanelSlot::Inspector),
@@ -1885,7 +1942,7 @@ mod tests {
     #[test]
     fn main_layout_hides_trend_panel_when_disabled() {
         let composition =
-            DashboardScreen::main_content_layout(false).compute(Rect::new(0, 0, 200, 50));
+            DashboardScreen::main_content_layout(false, false).compute(Rect::new(0, 0, 200, 50));
         assert!(composition.rect(PanelSlot::Inspector).is_none());
         assert!(composition.rect(PanelSlot::Footer).is_some());
     }

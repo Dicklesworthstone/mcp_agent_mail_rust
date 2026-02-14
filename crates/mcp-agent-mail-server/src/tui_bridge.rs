@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 const REQUEST_SPARKLINE_CAPACITY: usize = 60;
 const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 1024;
+/// Max console log entries in the ring buffer.
+const CONSOLE_LOG_CAPACITY: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportBase {
@@ -136,6 +138,9 @@ pub struct TuiSharedState {
     sparkline_data: Mutex<VecDeque<f64>>,
     remote_terminal_events: Mutex<VecDeque<RemoteTerminalEvent>>,
     server_control_tx: Mutex<Option<Sender<ServerControlMsg>>>,
+    /// Console log ring buffer: `(seq, text)` pairs for tool call cards etc.
+    console_log: Mutex<VecDeque<(u64, String)>>,
+    console_log_seq: AtomicU64,
 }
 
 impl TuiSharedState {
@@ -162,6 +167,8 @@ impl TuiSharedState {
                 REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY,
             )),
             server_control_tx: Mutex::new(None),
+            console_log: Mutex::new(VecDeque::with_capacity(CONSOLE_LOG_CAPACITY)),
+            console_log_seq: AtomicU64::new(0),
         })
     }
 
@@ -332,6 +339,32 @@ impl TuiSharedState {
             .latency_total_ms
             .checked_div(counters.total)
             .unwrap_or(0)
+    }
+
+    /// Push a console log line (tool call card, HTTP request, etc.).
+    pub fn push_console_log(&self, text: String) {
+        let seq = self.console_log_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut log) = self.console_log.try_lock() {
+            if log.len() >= CONSOLE_LOG_CAPACITY {
+                let _ = log.pop_front();
+            }
+            log.push_back((seq, text));
+        }
+    }
+
+    /// Return console log entries with sequence > `since_seq`.
+    #[must_use]
+    pub fn console_log_since(&self, since_seq: u64) -> Vec<(u64, String)> {
+        self.console_log
+            .try_lock()
+            .ok()
+            .map(|log| {
+                log.iter()
+                    .filter(|(seq, _)| *seq > since_seq)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
