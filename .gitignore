@@ -58,3 +58,13 @@ legacy/
 # Temporary directories
 tmp/
 test_logs/
+
+# bv graph output
+--graph-root.svg
+--graph-format.svg
+
+# Agent coordination config
+.agent-mail.yaml
+
+# Beads history snapshots
+.beads/.br_history/
