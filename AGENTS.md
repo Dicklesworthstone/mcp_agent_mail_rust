@@ -116,7 +116,6 @@ This project exposes two interfaces with different output conventions:
 Dual-mode behavior:
 - **MCP mode (default):** CLI-only commands produce a deterministic denial on stderr with exit code `2`
 - **CLI mode (`AM_INTERFACE_MODE=cli`):** MCP-only commands denied with guidance pointing back to MCP mode
-- **`scripts/am`:** Dev convenience wrapper around `mcp-agent-mail serve` (HTTP + TUI)
 
 ---
 
@@ -222,7 +221,7 @@ export CARGO_TARGET_DIR="/tmp/target-$(whoami)-am"
 #### E2E Failure
 1. Run the specific E2E script with bash `-x` for tracing
 2. Check that `mcp-agent-mail` binary builds: `cargo build -p mcp-agent-mail`
-3. Verify server starts on expected port: `scripts/am --no-tui`
+3. Verify server starts on expected port: `mcp-agent-mail serve --no-tui`
 
 #### Stress Test Failure
 1. Run with `--nocapture --test-threads=1` for isolation
@@ -303,7 +302,7 @@ mcp-agent-mail-core          (config, models, errors, metrics)
 | `crates/mcp-agent-mail-tools/src/` | 34 MCP tool implementations |
 | `crates/mcp-agent-mail-server/src/lib.rs` | Server dispatch, HTTP handler |
 | `crates/mcp-agent-mail-server/src/tui_*.rs` | TUI operations console (11 screens) |
-| `scripts/am` | Dev convenience wrapper (HTTP + TUI) |
+| `am serve-http` | Start HTTP server with TUI |
 | `tests/e2e/` | 37 E2E test scripts |
 | `rust-toolchain.toml` | Nightly toolchain requirement |
 
@@ -350,7 +349,7 @@ Before editing, agents should reserve file paths to avoid conflicts:
 | Git archive | `crates/mcp-agent-mail-storage/src/**` |
 | Tool implementations | `crates/mcp-agent-mail-tools/src/**` |
 | TUI | `crates/mcp-agent-mail-server/src/tui_*.rs` |
-| CLI/launcher | `crates/mcp-agent-mail-cli/src/**`, `scripts/am` |
+| CLI/launcher | `crates/mcp-agent-mail-cli/src/**`                |
 
 ### Exit Codes
 
@@ -381,12 +380,12 @@ For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.r
 ### Quick Start
 
 ```bash
-scripts/am                  # HTTP server with TUI on 127.0.0.1:8765
-scripts/am --api            # Use /api/ transport instead of /mcp/
-scripts/am --no-tui         # Headless server (no interactive TUI)
-scripts/am --no-auth        # Skip authentication (local dev)
-cargo run -p mcp-agent-mail # stdio transport (for MCP client integration)
-cargo run -p mcp-agent-mail-cli -- --help  # CLI tool
+am serve-http                             # HTTP server with TUI on 127.0.0.1:8765
+am serve-http --path api                  # Use /api/ transport instead of /mcp/
+am serve-http --no-auth                   # Skip authentication (local dev)
+mcp-agent-mail serve --no-tui             # Headless server (no interactive TUI)
+mcp-agent-mail                            # stdio transport (for MCP client integration)
+am --help                                 # Full operator CLI
 ```
 
 ---
@@ -410,8 +409,6 @@ This project intentionally keeps **MCP server** and **CLI** command surfaces sep
 
 If you accidentally run a CLI-only command via the MCP binary (e.g. `mcp-agent-mail share ...`),
 it should deny with a deterministic message and exit code `2` telling you to use the CLI.
-
-Note: `scripts/am` is a dev wrapper around `mcp-agent-mail serve` (HTTP + TUI). It is not the `am` CLI binary.
 
 ### Port Discipline During Migration (Critical)
 

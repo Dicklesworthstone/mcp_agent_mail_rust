@@ -9,31 +9,24 @@ the AgentMailTUI interactive operations console.
 
 ```bash
 # Default: MCP transport, localhost:8765, TUI enabled
-scripts/am
+am serve-http
 
 # API transport mode
-scripts/am --api
+am serve-http --path api
 
 # Custom host/port
-scripts/am --host 0.0.0.0 --port 9000
+am serve-http --host 0.0.0.0 --port 9000
 
 # Headless (server only, no TUI)
-scripts/am --no-tui
+mcp-agent-mail serve --no-tui
 
 # Skip authentication
-scripts/am --no-auth
+am serve-http --no-auth
 ```
 
-The `am` wrapper sets `LOG_RICH_ENABLED=true` and auto-discovers
+The `am serve-http` command sets `LOG_RICH_ENABLED=true` and auto-discovers
 `HTTP_BEARER_TOKEN` from `~/.mcp_agent_mail/.env` (fallback:
 `~/mcp_agent_mail/.env`).
-
-Without the wrapper, invoke the binary directly:
-
-```bash
-cargo run -p mcp-agent-mail -- serve \
-  --host 127.0.0.1 --port 8765 --path /mcp/
-```
 
 ### CLI vs Server Binaries (Dual-Mode)
 
@@ -55,7 +48,7 @@ cargo run -p mcp-agent-mail -- share deploy verify-live https://example.github.i
 cargo run -p mcp-agent-mail-cli -- --help   # runs `am`
 ```
 
-Note: `scripts/am` is a dev wrapper around `mcp-agent-mail serve` (HTTP + TUI). It is not the `am` CLI binary.
+Note: `am serve-http` is the native CLI command for starting the HTTP server with TUI. It is distinct from the `am` CLI subcommands used for operator tasks.
 
 ## 2. Pre-Flight Checklist
 
@@ -152,7 +145,7 @@ The server exposes identical tools and resources under two base paths:
 new base path. Active connections are dropped and reconnect
 automatically.
 
-**Switch at startup:** `scripts/am --api` or `HTTP_PATH=/api/`.
+**Switch at startup:** `am serve-http --path api` or `HTTP_PATH=/api/`.
 
 ## 6. Configuration Reference
 
@@ -245,7 +238,7 @@ lsof -i :8765
 
 # If it is already Agent Mail, reuse that server.
 # Otherwise, start on a different port.
-scripts/am --port 9000
+am serve-http --port 9000
 ```
 
 ### Database locked
@@ -263,7 +256,7 @@ scripts/am --port 9000
 pgrep -f mcp-agent-mail
 
 # Increase pool size
-DATABASE_POOL_SIZE=50 DATABASE_MAX_OVERFLOW=150 scripts/am
+DATABASE_POOL_SIZE=50 DATABASE_MAX_OVERFLOW=150 am serve-http
 
 # Check for stuck WAL
 sqlite3 "$DATABASE_URL" "PRAGMA wal_checkpoint(TRUNCATE);"
@@ -295,7 +288,7 @@ cp storage.sqlite3 storage.sqlite3.corrupt
 mv storage.sqlite3 "storage.sqlite3.corrupt.$(date +%Y%m%d_%H%M%S)"
 
 # 3. Restart — the server will create a fresh database
-scripts/am
+am serve-http
 ```
 
 See also: [RECOVERY_RUNBOOK.md](../RECOVERY_RUNBOOK.md)
@@ -322,7 +315,7 @@ See also: [RECOVERY_RUNBOOK.md](../RECOVERY_RUNBOOK.md)
 1. Check logs for bind errors
 2. The old port/path is released and the new one is bound. If the new path
    is invalid, the server falls back to the previous path.
-3. Restart with the desired path: `scripts/am --api`
+3. Restart with the desired path: `am serve-http --path api`
 
 ### High memory usage
 
@@ -334,7 +327,7 @@ See also: [RECOVERY_RUNBOOK.md](../RECOVERY_RUNBOOK.md)
 grep VmRSS /proc/$(pgrep -f mcp-agent-mail)/status
 
 # Reduce pool sizes
-DATABASE_POOL_SIZE=10 DATABASE_MAX_OVERFLOW=20 scripts/am
+DATABASE_POOL_SIZE=10 DATABASE_MAX_OVERFLOW=20 am serve-http
 
 # Reduce event buffer capacity (in-memory event ring)
 # Check memory pressure on System Health screen (8)
@@ -370,7 +363,7 @@ du -sh ~/.mcp_agent_mail/
 # (retention system handles this automatically if enabled)
 
 # Adjust thresholds
-DISK_SPACE_WARNING_MB=200 DISK_SPACE_CRITICAL_MB=50 scripts/am
+DISK_SPACE_WARNING_MB=200 DISK_SPACE_CRITICAL_MB=50 am serve-http
 ```
 
 ### Deployment Validation (`verify-live`)
@@ -613,12 +606,12 @@ operations. Check the System Health screen for specifics.
 # The commit coalescer flushes on shutdown
 # Just stop and start again
 q  # or Ctrl+C
-scripts/am
+am serve-http
 ```
 
 ### Change database location
 ```bash
-DATABASE_URL=sqlite:///path/to/new.sqlite3 scripts/am
+DATABASE_URL=sqlite:///path/to/new.sqlite3 am serve-http
 ```
 
 ### Run in production mode
@@ -627,7 +620,7 @@ APP_ENVIRONMENT=production \
   LOG_LEVEL=warn \
   LOG_JSON_ENABLED=true \
   HTTP_HOST=0.0.0.0 \
-  scripts/am --no-tui
+  mcp-agent-mail serve --no-tui
 ```
 
 ### Enable rate limiting
@@ -635,12 +628,12 @@ APP_ENVIRONMENT=production \
 HTTP_RATE_LIMIT_ENABLED=true \
   HTTP_RATE_LIMIT_PER_MINUTE=1000 \
   HTTP_RATE_LIMIT_TOOLS_PER_MINUTE=500 \
-  scripts/am
+  am serve-http
 ```
 
 ### Enable periodic integrity checks
 ```bash
 INTEGRITY_CHECK_ON_STARTUP=true \
   INTEGRITY_CHECK_INTERVAL_HOURS=12 \
-  scripts/am
+  am serve-http
 ```

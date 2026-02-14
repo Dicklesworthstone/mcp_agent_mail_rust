@@ -26,8 +26,8 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 | Security/privacy | Pass rate = `100%` (`fail=0`) for `E2E security/privacy` | `bash tests/e2e/test_security_privacy.sh` and CI gate report | `tests/artifacts/security_privacy/*/*` |
 | Accessibility | Pass rate = `100%` (`fail=0`) for `E2E TUI accessibility` | `bash scripts/e2e_tui_a11y.sh` and CI gate report | `tests/artifacts/tui_a11y/*/*` |
 | Performance budgets | `perf_security_regressions=status:pass` and no p95 regression > `2.0x` baseline | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture` and CI gate report | perf/security test logs + benchmark artifacts |
-| Determinism | Golden/export checks report zero mismatches | `bash scripts/bench_golden.sh validate` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
-| Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, and sign-off row completed | `bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json` | `tests/artifacts/ci/gate_report.json`, sign-off ledger row |
+| Determinism | Golden/export checks report zero mismatches | `am golden validate` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
+| Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, and sign-off row completed | `am ci --report tests/artifacts/ci/gate_report.json` | `tests/artifacts/ci/gate_report.json`, sign-off ledger row |
 
 ### Gate-to-Bead Evidence Map
 
@@ -160,7 +160,7 @@ ls tests/artifacts/dual_mode/*/steps/step_*.json | wc -l
 # Should be >= 42 (one per test step)
 
 # 4. Golden snapshot checksums are current
-bash scripts/bench_golden.sh validate
+am golden validate
 # All checksums must match
 
 # 4b. Legacy shim emits deprecation and forwards to native command
@@ -178,7 +178,7 @@ ls tests/fixtures/golden_snapshots/mcp_deny_*.txt
 # At least 5 files (share, guard, doctor, archive, migrate)
 
 # 7. Machine-readable gate report exists and is release-eligible
-bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json
+am ci --report tests/artifacts/ci/gate_report.json
 jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifacts/ci/gate_report.json
 # decision must be "go", release_eligible must be true, thresholds must have zero failed_gates
 ```
@@ -189,7 +189,7 @@ jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifact
 
 1. Run the full CI suite (includes all dual-mode gates):
    ```bash
-   bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json
+   am ci --report tests/artifacts/ci/gate_report.json
    ```
 
    Confirm gate report decision:
@@ -244,7 +244,7 @@ jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifact
 
 5. Test headless mode:
    ```bash
-   scripts/am --no-tui &
+   mcp-agent-mail serve --no-tui &
    curl -s http://127.0.0.1:8765/mcp/ \
      -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
@@ -329,7 +329,7 @@ Fill one row per phase promotion decision.
 
 ### Sign-Off Workflow (Required For Every Promotion)
 
-1. Run full gates and emit report: `bash scripts/ci.sh --report tests/artifacts/ci/gate_report.json`.
+1. Run full gates and emit report: `am ci --report tests/artifacts/ci/gate_report.json`.
 2. Confirm report fields: `decision == "go"` and `release_eligible == true`.
 3. Attach at least one artifact link per gate family (correctness, security/privacy, accessibility, performance, determinism).
 4. Record owner, UTC timestamp, and rationale in the ledger row for the phase transition.
@@ -341,7 +341,7 @@ Run a **non-quick** gate report at least once every 24 hours during active rollo
 
 ```bash
 run_ts="$(date -u +%Y%m%d_%H%M%S)"
-bash scripts/ci.sh --report "tests/artifacts/ci/${run_ts}/case_02_report.json"
+am ci --report "tests/artifacts/ci/${run_ts}/case_02_report.json"
 jq '.decision, .release_eligible, .summary' "tests/artifacts/ci/${run_ts}/case_02_report.json"
 ```
 

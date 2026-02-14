@@ -7,34 +7,41 @@ interactive TUI operations console.
 ## Quick Start
 
 ```bash
-scripts/am
+am serve-http
 ```
 
-That's it. The `am` command starts the HTTP server on `127.0.0.1:8765` with
-the interactive TUI. It auto-discovers your auth token from
-`~/.mcp_agent_mail/.env` and defaults to the `/mcp/` transport path.
+That's it. Starts the HTTP server on `127.0.0.1:8765` with the interactive TUI.
+Auto-discovers your auth token from `~/.mcp_agent_mail/.env` and defaults to
+the `/mcp/` transport path.
 
 Common variations:
 
 ```bash
-scripts/am --api              # Use /api/ transport instead of /mcp/
-scripts/am --port 9000        # Different port
-scripts/am --host 0.0.0.0     # Bind to all interfaces
-scripts/am --no-tui           # Headless server (no interactive TUI)
-scripts/am --no-auth          # Skip authentication (local dev)
+am serve-http --path api       # Use /api/ transport instead of /mcp/
+am serve-http --port 9000      # Different port
+am serve-http --host 0.0.0.0   # Bind to all interfaces
+am serve-http --no-auth        # Skip authentication (local dev)
 ```
 
-### Alternative: Direct Binary
+### Full server control via `mcp-agent-mail serve`
 
 ```bash
-# HTTP server (same as am, but no convenience defaults)
-cargo run -p mcp-agent-mail -- serve --host 127.0.0.1 --port 8765
+mcp-agent-mail serve                    # HTTP server with TUI (default 127.0.0.1:8765)
+mcp-agent-mail serve --no-tui           # Headless server (CI/daemon mode)
+mcp-agent-mail serve --reuse-running    # Reuse existing server on same port
+mcp-agent-mail serve --transport api    # Use /api/ transport
+mcp-agent-mail                          # stdio transport (for MCP client integration)
+```
 
-# stdio transport (for MCP client integration)
-cargo run -p mcp-agent-mail
+### CLI tool
 
-# CLI tool (runs the `am` binary)
-cargo run -p mcp-agent-mail-cli -- --help
+```bash
+am --help                               # Full operator CLI
+am ci                                   # Run CI quality gates
+am flake-triage                         # Analyze flaky tests
+am bench                                # Run benchmarks
+am golden                               # Golden output validation
+am check-inbox                          # Check agent inbox
 ```
 
 ### Dual-Mode Interface (MCP Server vs CLI)
@@ -73,10 +80,9 @@ AM_INTERFACE_MODE=cli mcp-agent-mail mail send \
 In CLI mode, MCP-only commands (`serve`, `config`) are denied with an equally
 deterministic message pointing back to MCP mode.
 
-The `am` binary remains unchanged and is the recommended CLI entry point.
-
-Note: `scripts/am` is a dev convenience wrapper around `mcp-agent-mail serve`.
-It is not the `am` CLI binary.
+The `am` binary is the recommended CLI entry point. It includes `serve-http`
+and `serve-stdio` for server startup, plus all operator commands (`ci`,
+`bench`, `flake-triage`, `golden`, `check-inbox`, etc.).
 
 For the canonical contract/specs:
 - `docs/ADR-001-dual-mode-invariants.md`
@@ -182,7 +188,7 @@ Before editing, agents should reserve file paths to avoid conflicts:
 | Git archive        | `crates/mcp-agent-mail-storage/src/**`       |
 | Tool implementations | `crates/mcp-agent-mail-tools/src/**`       |
 | TUI                | `crates/mcp-agent-mail-server/src/tui_*.rs`  |
-| CLI/launcher       | `crates/mcp-agent-mail-cli/src/**`, `scripts/am` |
+| CLI/launcher       | `crates/mcp-agent-mail-cli/src/**`                |
 
 ## Development
 
@@ -205,6 +211,6 @@ export CARGO_TARGET_DIR="/tmp/target-$(whoami)-am"
 ## Notes
 
 - Rust nightly required (see `rust-toolchain.toml`)
-- Uses local crates: `/dp/fastmcp_rust`, `/dp/sqlmodel_rust`,
-  `/dp/asupersync`, `/dp/frankentui`, `/dp/beads_rust`,
-  `/dp/coding_agent_session_search`
+- Uses local workspace crates from sibling directories: `fastmcp_rust`,
+  `sqlmodel_rust`, `asupersync`, `frankentui`, `beads_rust`,
+  `coding_agent_session_search`

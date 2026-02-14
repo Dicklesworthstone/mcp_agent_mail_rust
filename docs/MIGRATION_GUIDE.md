@@ -33,8 +33,8 @@ mcp-agent-mail serve --host 0.0.0.0 --port 8765
 # After (unchanged — server commands stay in the MCP binary):
 mcp-agent-mail serve --host 0.0.0.0 --port 8765
 
-# Or use the wrapper:
-scripts/am
+# Or use the native HTTP server command:
+am serve-http
 ```
 
 ### Operator commands
@@ -149,7 +149,7 @@ Update your CI to build and test both binaries:
     cargo build -p mcp-agent-mail-cli  # Operator CLI
 
 - name: Test dual-mode
-  run: bash scripts/ci.sh
+  run: am ci
 ```
 
 ### MCP client configuration
@@ -250,10 +250,10 @@ mcp-agent-mail config
 
 ```bash
 # Full CI suite (all gates):
-bash scripts/ci.sh
+am ci
 
 # Quick (skip E2E):
-bash scripts/ci.sh --quick
+am ci --quick
 
 # Individual suites:
 cargo test -p mcp-agent-mail-cli --test mode_matrix_harness
@@ -295,10 +295,9 @@ A: Yes. Both binaries read/write the same SQLite database specified by
 A: `serve` (HTTP mode), `config` (show configuration), and no subcommand
 (stdio MCP mode). Everything else is denied.
 
-**Q: Is the `scripts/am` wrapper affected?**
-A: The `scripts/am` wrapper launches `mcp-agent-mail serve` (HTTP + TUI).
-It is not affected by the dual-mode change. For CLI commands, use the `am`
-binary directly.
+**Q: How do I start the HTTP server?**
+A: Use `am serve-http` to start the HTTP server with TUI. For CLI operator
+commands, use the `am` subcommands directly (e.g., `am share`, `am doctor`).
 
 ---
 
