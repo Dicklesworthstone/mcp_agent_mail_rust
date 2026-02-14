@@ -42,10 +42,10 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 
 ## Functional Readiness
 
-- [x] `am` starts server + TUI with one command
-- [x] `am --no-tui` runs headless server
-- [x] `am --api` / `am --mcp` switches transport modes
-- [x] `am --no-auth` disables authentication for local dev
+- [x] `am serve-http` starts server + TUI with one command
+- [x] `mcp-agent-mail serve --no-tui` runs headless server
+- [x] `am serve-http --path api` / `am serve-http --path mcp` switches transport modes
+- [x] `am serve-http --no-auth` disables authentication for local dev
 - [x] Auth token auto-discovered from `~/.mcp_agent_mail/.env`
 - [x] All 34 MCP tools respond correctly
 - [x] All 20+ MCP resources return correct data

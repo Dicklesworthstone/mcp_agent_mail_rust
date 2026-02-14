@@ -136,6 +136,11 @@ fn test_report_schema_has_required_fields() {
         "total_elapsed_seconds required"
     );
     assert!(parsed["summary"].is_object(), "summary required");
+    assert!(
+        parsed["category_breakdown"].is_object(),
+        "category_breakdown required"
+    );
+    assert!(parsed["execution_log"].is_array(), "execution_log required");
     assert!(parsed["gates"].is_array(), "gates required");
 
     // Check summary sub-fields
@@ -156,6 +161,25 @@ fn test_report_schema_has_required_fields() {
             "gate.elapsed_seconds required"
         );
         assert!(gate["command"].is_string(), "gate.command required");
+    }
+
+    let execution_log = parsed["execution_log"]
+        .as_array()
+        .expect("execution_log is array");
+    for entry in execution_log {
+        assert!(entry["gate"].is_string(), "execution_log.gate required");
+        assert!(
+            entry["normalized_exit_code"].is_number(),
+            "execution_log.normalized_exit_code required"
+        );
+        assert!(
+            entry["elapsed_seconds"].is_number(),
+            "execution_log.elapsed_seconds required"
+        );
+        assert!(
+            entry["command"].is_string(),
+            "execution_log.command required"
+        );
     }
 }
 
@@ -237,7 +261,7 @@ fn test_default_gates_count() {
     use mcp_agent_mail_cli::ci::default_gates;
 
     let gates = default_gates();
-    assert_eq!(gates.len(), 13, "should have 13 default gates");
+    assert_eq!(gates.len(), 15, "should have 15 default gates");
 }
 
 #[test]
@@ -247,9 +271,11 @@ fn test_default_gates_skip_in_quick() {
     let gates = default_gates();
     let quick_skip: Vec<_> = gates.iter().filter(|g| g.skip_in_quick).collect();
 
-    assert_eq!(quick_skip.len(), 4, "4 gates should skip in quick mode");
+    assert_eq!(quick_skip.len(), 6, "6 gates should skip in quick mode");
 
     let names: Vec<_> = quick_skip.iter().map(|g| g.name.as_str()).collect();
+    assert!(names.contains(&"DB stress suite"));
+    assert!(names.contains(&"E2E full matrix"));
     assert!(names.contains(&"E2E dual-mode"));
     assert!(names.contains(&"E2E mode matrix"));
     assert!(names.contains(&"E2E security/privacy"));
@@ -311,6 +337,8 @@ fn test_ci_quick_mode_skips_e2e_gates() {
 
     let gates = parsed["gates"].as_array().expect("gates is array");
     let e2e_names = [
+        "DB stress suite",
+        "E2E full matrix",
         "E2E dual-mode",
         "E2E mode matrix",
         "E2E security/privacy",
@@ -350,5 +378,5 @@ fn test_ci_parallel_produces_valid_report() {
     let parsed: serde_json::Value = serde_json::from_str(&content).expect("parse JSON");
 
     assert_eq!(parsed["schema_version"], "am_ci_gate_report.v1");
-    assert_eq!(parsed["gates"].as_array().unwrap().len(), 13);
+    assert_eq!(parsed["gates"].as_array().unwrap().len(), 15);
 }

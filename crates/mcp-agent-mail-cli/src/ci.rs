@@ -152,6 +152,9 @@ pub struct GateConfig {
     /// Optional parallel group: gates in same group can run concurrently.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_group: Option<String>,
+    /// Expected artifact paths/globs produced by this gate.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub expected_artifacts: Vec<String>,
 }
 
 impl GateConfig {
@@ -168,6 +171,7 @@ impl GateConfig {
             command: command.into_iter().map(Into::into).collect(),
             skip_in_quick: false,
             parallel_group: None,
+            expected_artifacts: Vec::new(),
         }
     }
 
@@ -182,6 +186,24 @@ impl GateConfig {
     #[must_use]
     pub fn parallel_group(mut self, group: impl Into<String>) -> Self {
         self.parallel_group = Some(group.into());
+        self
+    }
+
+    /// Builder: attach one expected artifact path or glob.
+    #[must_use]
+    pub fn expected_artifact(mut self, artifact: impl Into<String>) -> Self {
+        self.expected_artifacts.push(artifact.into());
+        self
+    }
+
+    /// Builder: attach multiple expected artifact paths/globs.
+    #[must_use]
+    pub fn expected_artifacts(
+        mut self,
+        artifacts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.expected_artifacts
+            .extend(artifacts.into_iter().map(Into::into));
         self
     }
 
@@ -249,11 +271,50 @@ impl GateError {
     /// Creates a simple GateError with just a message (no classification).
     #[must_use]
     pub fn simple(message: impl Into<String>) -> Self {
+        Self::simple_with_category(message, None::<String>)
+    }
+
+    /// Creates a simple GateError with an optional explicit category.
+    #[must_use]
+    pub fn simple_with_category(
+        message: impl Into<String>,
+        category: Option<impl Into<String>>,
+    ) -> Self {
         let msg = message.into();
         Self {
             stderr_tail: msg.clone(),
             error_summary: Some(msg),
+            error_category: category.map(Into::into),
             ..Default::default()
+        }
+    }
+
+    /// Creates an artifact verification error for missing or partial outputs.
+    #[must_use]
+    pub fn artifact_validation(found: &[String], missing: &[String]) -> Self {
+        let category = if found.is_empty() {
+            "artifact_missing"
+        } else {
+            "artifact_partial"
+        };
+        let missing_list = missing.join(", ");
+        let summary = if found.is_empty() {
+            format!("required artifact(s) missing: {missing_list}")
+        } else {
+            format!("partial artifact output: missing {}", missing_list)
+        };
+        let mut stderr_tail = summary.clone();
+        if !found.is_empty() {
+            stderr_tail.push_str("\nfound artifacts: ");
+            stderr_tail.push_str(&found.join(", "));
+        }
+
+        Self {
+            stderr_tail,
+            error_count: u32::try_from(missing.len()).ok(),
+            error_summary: Some(summary),
+            affected_files: missing.to_vec(),
+            error_category: Some(category.to_string()),
         }
     }
 }
@@ -403,6 +464,53 @@ fn extract_affected_files(stderr: &str) -> Vec<String> {
     result
 }
 
+fn has_glob_tokens(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+fn normalize_artifact_path(path: &std::path::Path, base: &std::path::Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn resolve_expected_artifacts(
+    working_dir: &std::path::Path,
+    expected_artifacts: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut found = std::collections::BTreeSet::new();
+    let mut missing = Vec::new();
+
+    for pattern in expected_artifacts {
+        if has_glob_tokens(pattern) {
+            let abs_pattern = working_dir.join(pattern);
+            let abs_pattern = abs_pattern.to_string_lossy().to_string();
+            let mut matched = false;
+
+            if let Ok(paths) = glob::glob(&abs_pattern) {
+                for path in paths.flatten() {
+                    matched = true;
+                    found.insert(normalize_artifact_path(&path, working_dir));
+                }
+            }
+
+            if !matched {
+                missing.push(pattern.clone());
+            }
+        } else {
+            let candidate = working_dir.join(pattern);
+            if candidate.exists() {
+                found.insert(normalize_artifact_path(&candidate, working_dir));
+            } else {
+                missing.push(pattern.clone());
+            }
+        }
+    }
+
+    (found.into_iter().collect(), missing)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Gate Result
 // ──────────────────────────────────────────────────────────────────────────────
@@ -470,9 +578,34 @@ impl GateResult {
         }
     }
 
+    /// Creates a fail result with a pre-built structured error.
+    #[must_use]
+    pub fn fail_with_error(config: &GateConfig, elapsed: Duration, error: GateError) -> Self {
+        Self {
+            name: config.name.clone(),
+            category: config.category,
+            status: GateStatus::Fail,
+            elapsed_seconds: elapsed.as_secs(),
+            command: config.command_display(),
+            stderr_tail: Some(error.stderr_tail.clone()),
+            error: Some(error),
+        }
+    }
+
     /// Creates a fail result with a simple error message (no stderr parsing).
     #[must_use]
     pub fn fail_simple(config: &GateConfig, elapsed: Duration, message: impl Into<String>) -> Self {
+        Self::fail_simple_with_category(config, elapsed, message, None::<String>)
+    }
+
+    /// Creates a fail result with a simple error message and optional category.
+    #[must_use]
+    pub fn fail_simple_with_category(
+        config: &GateConfig,
+        elapsed: Duration,
+        message: impl Into<String>,
+        category: Option<impl Into<String>>,
+    ) -> Self {
         let msg = message.into();
         Self {
             name: config.name.clone(),
@@ -481,7 +614,7 @@ impl GateResult {
             elapsed_seconds: elapsed.as_secs(),
             command: config.command_display(),
             stderr_tail: Some(msg.clone()),
-            error: Some(GateError::simple(msg)),
+            error: Some(GateError::simple_with_category(msg, category)),
         }
     }
 
@@ -653,6 +786,26 @@ pub const GATE_REPORT_SCHEMA_VERSION: &str = "am_ci_gate_report.v1";
 /// Default checklist reference path.
 pub const DEFAULT_CHECKLIST_REFERENCE: &str = "docs/RELEASE_CHECKLIST.md";
 
+/// Canonical execution log entry for one gate run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateExecutionLogEntry {
+    /// Gate name.
+    pub gate: String,
+    /// Command line that was executed (or skip reason).
+    pub command: String,
+    /// Duration in seconds.
+    pub elapsed_seconds: u64,
+    /// Normalized exit code for reporting:
+    /// 0 = pass, 1 = fail, 124 = timeout, -1 = skipped.
+    pub normalized_exit_code: i32,
+    /// Normalized error category (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<String>,
+    /// Artifact/log bundle paths associated with this gate.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub artifact_links: Vec<String>,
+}
+
 /// The full gate report (schema: am_ci_gate_report.v1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateReport {
@@ -674,10 +827,17 @@ pub struct GateReport {
     pub total_elapsed_seconds: u64,
     /// Summary counts (total/pass/fail/skip).
     pub summary: GateSummary,
+    /// Per-category pass/fail/skip breakdown.
+    pub category_breakdown: HashMap<GateCategory, GateSummary>,
     /// Per-category threshold information.
     pub thresholds: HashMap<GateCategory, ThresholdInfo>,
     /// Key gate logic entries.
     pub gate_logic: GateLogicInfo,
+    /// Artifact/log bundle links keyed by gate name.
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub artifact_links: HashMap<String, Vec<String>>,
+    /// Canonical execution logs for each gate.
+    pub execution_log: Vec<GateExecutionLogEntry>,
     /// Individual gate results.
     pub gates: Vec<GateResult>,
 }
@@ -686,7 +846,57 @@ impl GateReport {
     /// Creates a new gate report from results.
     #[must_use]
     pub fn new(mode: RunMode, results: Vec<GateResult>) -> Self {
+        Self::new_with_gate_configs(mode, results, &[])
+    }
+
+    fn category_breakdown(results: &[GateResult]) -> HashMap<GateCategory, GateSummary> {
+        let mut breakdown = HashMap::new();
+        for category in [
+            GateCategory::Quality,
+            GateCategory::Performance,
+            GateCategory::Security,
+            GateCategory::Docs,
+        ] {
+            let category_results: Vec<_> = results
+                .iter()
+                .filter(|result| result.category == category)
+                .cloned()
+                .collect();
+            if !category_results.is_empty() {
+                breakdown.insert(category, GateSummary::from_results(&category_results));
+            }
+        }
+        breakdown
+    }
+
+    fn normalized_exit_code(result: &GateResult) -> i32 {
+        match result.status {
+            GateStatus::Pass => 0,
+            GateStatus::Skip => -1,
+            GateStatus::Fail => {
+                if result
+                    .error
+                    .as_ref()
+                    .and_then(|err| err.error_category.as_deref())
+                    == Some("timeout")
+                {
+                    124
+                } else {
+                    1
+                }
+            }
+        }
+    }
+
+    /// Creates a new gate report from results with gate config metadata.
+    #[must_use]
+    pub fn new_with_gate_configs(
+        mode: RunMode,
+        results: Vec<GateResult>,
+        gate_configs: &[GateConfig],
+    ) -> Self {
         let summary = GateSummary::from_results(&results);
+        let category_breakdown = Self::category_breakdown(&results);
         let gate_logic = GateLogicInfo::from_results(&results);
 
         // Compute thresholds for each category
@@ -723,6 +933,28 @@ impl GateReport {
 
         let generated_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let total_elapsed_seconds = results.iter().map(|r| r.elapsed_seconds).sum();
+        let artifact_links: HashMap<_, _> = gate_configs
+            .iter()
+            .filter(|gate| !gate.expected_artifacts.is_empty())
+            .map(|gate| (gate.name.clone(), gate.expected_artifacts.clone()))
+            .collect();
+        let execution_log = results
+            .iter()
+            .map(|result| GateExecutionLogEntry {
+                gate: result.name.clone(),
+                command: result.command.clone(),
+                elapsed_seconds: result.elapsed_seconds,
+                normalized_exit_code: Self::normalized_exit_code(result),
+                error_category: result
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.error_category.clone()),
+                artifact_links: artifact_links
+                    .get(&result.name)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
 
         Self {
             schema_version: GATE_REPORT_SCHEMA_VERSION.to_string(),
@@ -734,8 +966,11 @@ impl GateReport {
             checklist_reference: DEFAULT_CHECKLIST_REFERENCE.to_string(),
             total_elapsed_seconds,
             summary,
+            category_breakdown,
             thresholds,
             gate_logic,
+            artifact_links,
+            execution_log,
             gates: results,
         }
     }
@@ -851,7 +1086,7 @@ impl GateReport {
 // Default Gates
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Returns the default set of 13 CI gates.
+/// Returns the default set of 15 CI gates.
 #[must_use]
 pub fn default_gates() -> Vec<GateConfig> {
     vec![
@@ -884,6 +1119,28 @@ pub fn default_gates() -> Vec<GateConfig> {
             GateCategory::Quality,
             ["cargo", "test", "--workspace"],
         ),
+        GateConfig::new(
+            "DB stress suite",
+            GateCategory::Quality,
+            [
+                "cargo",
+                "test",
+                "-p",
+                "mcp-agent-mail-db",
+                "--test",
+                "stress",
+                "--",
+                "--nocapture",
+            ],
+        )
+        .skip_in_quick(),
+        GateConfig::new(
+            "E2E full matrix",
+            GateCategory::Quality,
+            ["bash", "scripts/e2e_test.sh"],
+        )
+        .expected_artifact("tests/artifacts_native")
+        .skip_in_quick(),
         GateConfig::new(
             "Mode matrix harness",
             GateCategory::Quality,
@@ -931,12 +1188,14 @@ pub fn default_gates() -> Vec<GateConfig> {
             GateCategory::Quality,
             ["bash", "scripts/e2e_dual_mode.sh"],
         )
+        .expected_artifact("tests/artifacts/dual_mode/*")
         .skip_in_quick(),
         GateConfig::new(
             "E2E mode matrix",
             GateCategory::Quality,
             ["bash", "scripts/e2e_mode_matrix.sh"],
         )
+        .expected_artifact("tests/artifacts/mode_matrix/*")
         .skip_in_quick(),
         // Performance gate (1)
         GateConfig::new(
@@ -959,6 +1218,7 @@ pub fn default_gates() -> Vec<GateConfig> {
             GateCategory::Security,
             ["bash", "tests/e2e/test_security_privacy.sh"],
         )
+        .expected_artifact("tests/artifacts/security_privacy/*")
         .skip_in_quick(),
         // Docs gate (1)
         GateConfig::new(
@@ -976,6 +1236,7 @@ pub fn default_gates() -> Vec<GateConfig> {
             GateCategory::Quality,
             ["bash", "scripts/e2e_tui_a11y.sh"],
         )
+        .expected_artifact("tests/artifacts/tui_a11y/*")
         .skip_in_quick(),
     ]
 }
@@ -1234,7 +1495,19 @@ pub fn run_gate(config: &GateConfig, runner_config: &GateRunnerConfig) -> GateRe
     }
 
     match status {
-        Ok(exit_status) if exit_status.success() => GateResult::pass(config, elapsed),
+        Ok(exit_status) if exit_status.success() => {
+            let (found, missing) =
+                resolve_expected_artifacts(&runner_config.working_dir, &config.expected_artifacts);
+            if missing.is_empty() {
+                GateResult::pass(config, elapsed)
+            } else {
+                GateResult::fail_with_error(
+                    config,
+                    elapsed,
+                    GateError::artifact_validation(&found, &missing),
+                )
+            }
+        }
         Ok(_exit_status) => {
             // Capture last N lines of stderr for diagnostics
             let tail: Vec<_> = stderr_lines
@@ -1251,10 +1524,11 @@ pub fn run_gate(config: &GateConfig, runner_config: &GateRunnerConfig) -> GateRe
             };
             GateResult::fail(config, elapsed, stderr_tail)
         }
-        Err(GateRunnerError::Timeout { elapsed_secs }) => GateResult::fail_simple(
+        Err(GateRunnerError::Timeout { elapsed_secs }) => GateResult::fail_simple_with_category(
             config,
             Duration::from_secs(elapsed_secs),
             format!("timeout after {}s", elapsed_secs),
+            Some("timeout"),
         ),
         Err(e) => GateResult::fail_simple(config, elapsed, format!("{e}")),
     }
@@ -1289,7 +1563,7 @@ pub fn run_gates(gates: &[GateConfig], runner_config: &GateRunnerConfig) -> Gate
         results.push(result);
     }
 
-    GateReport::new(runner_config.mode, results)
+    GateReport::new_with_gate_configs(runner_config.mode, results, gates)
 }
 
 /// Runs all default gates and returns a report.
@@ -1460,7 +1734,7 @@ pub fn run_gates_parallel(gates: &[GateConfig], runner_config: &GateRunnerConfig
         "parallel run must produce same number of results"
     );
 
-    GateReport::new(runner_config.mode, results)
+    GateReport::new_with_gate_configs(runner_config.mode, results, gates)
 }
 
 /// Prints a human-readable summary of gate results to stdout.
@@ -1574,7 +1848,7 @@ mod tests {
     #[test]
     fn test_default_gates_count() {
         let gates = default_gates();
-        assert_eq!(gates.len(), 13, "Expected 13 default gates");
+        assert_eq!(gates.len(), 15, "Expected 15 default gates");
     }
 
     #[test]
@@ -1583,11 +1857,13 @@ mod tests {
         let quick_skip: Vec<_> = gates.iter().filter(|g| g.skip_in_quick).collect();
         assert_eq!(
             quick_skip.len(),
-            4,
-            "Expected 4 gates to skip in quick mode"
+            6,
+            "Expected 6 gates to skip in quick mode"
         );
 
         let names: Vec<_> = quick_skip.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"DB stress suite"));
+        assert!(names.contains(&"E2E full matrix"));
         assert!(names.contains(&"E2E dual-mode"));
         assert!(names.contains(&"E2E mode matrix"));
         assert!(names.contains(&"E2E security/privacy"));
@@ -1598,11 +1874,13 @@ mod tests {
     fn test_gate_config_builder() {
         let gate = GateConfig::new("Test gate", GateCategory::Quality, ["cargo", "test"])
             .skip_in_quick()
-            .parallel_group("group-a");
+            .parallel_group("group-a")
+            .expected_artifacts(["tests/artifacts/test/*", "tests/artifacts/test_logs/*"]);
 
         assert_eq!(gate.name, "Test gate");
         assert!(gate.skip_in_quick);
         assert_eq!(gate.parallel_group, Some("group-a".to_string()));
+        assert_eq!(gate.expected_artifacts.len(), 2);
     }
 
     #[test]
@@ -1758,6 +2036,67 @@ mod tests {
     }
 
     #[test]
+    fn test_gate_report_includes_execution_log_and_artifact_links() {
+        let gate_configs = vec![
+            GateConfig::new(
+                "E2E dual-mode",
+                GateCategory::Quality,
+                ["bash", "scripts/e2e_dual_mode.sh"],
+            )
+            .expected_artifact("tests/artifacts/dual_mode/*"),
+            GateConfig::new("Clippy", GateCategory::Quality, ["cargo", "clippy"]),
+        ];
+        let results = vec![
+            GateResult {
+                name: "E2E dual-mode".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Pass,
+                elapsed_seconds: 14,
+                command: "bash scripts/e2e_dual_mode.sh".to_string(),
+                stderr_tail: None,
+                error: None,
+            },
+            GateResult {
+                name: "Clippy".to_string(),
+                category: GateCategory::Quality,
+                status: GateStatus::Fail,
+                elapsed_seconds: 5,
+                command: "cargo clippy".to_string(),
+                stderr_tail: Some("timeout after 600s".to_string()),
+                error: Some(GateError::simple_with_category(
+                    "timeout after 600s",
+                    Some("timeout"),
+                )),
+            },
+        ];
+
+        let report = GateReport::new_with_gate_configs(RunMode::Full, results, &gate_configs);
+
+        let quality = report
+            .category_breakdown
+            .get(&GateCategory::Quality)
+            .expect("quality breakdown");
+        assert_eq!(quality.total, 2);
+        assert_eq!(quality.pass, 1);
+        assert_eq!(quality.fail, 1);
+        assert_eq!(quality.skip, 0);
+
+        let e2e_links = report
+            .artifact_links
+            .get("E2E dual-mode")
+            .expect("dual-mode artifact links");
+        assert_eq!(e2e_links, &vec!["tests/artifacts/dual_mode/*".to_string()]);
+
+        assert_eq!(report.execution_log.len(), 2);
+        assert_eq!(report.execution_log[0].normalized_exit_code, 0);
+        assert_eq!(report.execution_log[1].normalized_exit_code, 124);
+        assert_eq!(
+            report.execution_log[1].error_category.as_deref(),
+            Some("timeout")
+        );
+    }
+
+    #[test]
     fn test_gate_environment_defaults() {
         let env = GateEnvironment::default();
         assert_eq!(env.database_url, "sqlite:///tmp/ci_local.sqlite3");
@@ -1867,6 +2206,56 @@ mod tests {
             "expected timeout diagnostic, got {:?}",
             result.stderr_tail
         );
+        assert_eq!(
+            result
+                .error
+                .as_ref()
+                .and_then(|error| error.error_category.as_deref()),
+            Some("timeout")
+        );
+    }
+
+    #[test]
+    fn test_run_gate_fails_when_expected_artifact_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let gate = GateConfig::new("Artifact gate", GateCategory::Quality, ["true"])
+            .expected_artifact("artifacts/missing.json");
+        let config = GateRunnerConfig::new(temp_dir.path());
+
+        let result = run_gate(&gate, &config);
+
+        assert_eq!(result.status, GateStatus::Fail);
+        let error = result.error.expect("artifact failure should include error");
+        assert_eq!(error.error_category.as_deref(), Some("artifact_missing"));
+        assert!(
+            error
+                .affected_files
+                .iter()
+                .any(|path| path == "artifacts/missing.json")
+        );
+    }
+
+    #[test]
+    fn test_run_gate_reports_partial_artifact_outputs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(temp_dir.path().join("artifacts")).expect("create artifact dir");
+        std::fs::write(temp_dir.path().join("artifacts/found.json"), "{}").expect("write artifact");
+
+        let gate = GateConfig::new("Artifact partial gate", GateCategory::Quality, ["true"])
+            .expected_artifacts(["artifacts/found.json", "artifacts/missing.json"]);
+        let config = GateRunnerConfig::new(temp_dir.path());
+
+        let result = run_gate(&gate, &config);
+
+        assert_eq!(result.status, GateStatus::Fail);
+        let error = result
+            .error
+            .expect("partial artifact failure should include error");
+        assert_eq!(error.error_category.as_deref(), Some("artifact_partial"));
+        assert!(
+            error.stderr_tail.contains("found artifacts"),
+            "partial failure should include found artifact diagnostics"
+        );
     }
 
     #[test]
@@ -1877,6 +2266,7 @@ mod tests {
             command: vec![],
             skip_in_quick: false,
             parallel_group: None,
+            expected_artifacts: Vec::new(),
         };
         let config = GateRunnerConfig::default();
 

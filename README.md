@@ -7,12 +7,12 @@ interactive TUI operations console.
 ## Quick Start
 
 ```bash
-am serve-http
+am
 ```
 
-That's it. Starts the HTTP server on `127.0.0.1:8765` with the interactive TUI.
-Auto-discovers your auth token from `~/.mcp_agent_mail/.env` and defaults to
-the `/mcp/` transport path.
+That's it. Auto-detects all installed coding agents (Claude Code, Codex CLI,
+Gemini CLI, etc.), configures their MCP connections, and starts the HTTP server
+on `127.0.0.1:8765` with the interactive TUI.
 
 Common variations:
 

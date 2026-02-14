@@ -1810,10 +1810,36 @@ fn execute(cli: Cli) -> CliResult<()> {
     }
 }
 
-/// Default behavior when `am` is invoked with no subcommand:
+/// Default behavior when `am` is invoked with no subcommand.
+///
+/// **Interactive terminal (human operator):**
 /// 1. Auto-detect installed coding agents and configure their MCP connections
-/// 2. Start the HTTP server with the TUI
+/// 2. Clear the port if something is already listening
+/// 3. Start the HTTP server with the TUI
+///
+/// **Non-interactive (coding agent, pipe, CI):**
+/// Automatically switches to `am robot status` for a JSON/TOON dashboard
+/// so agents get useful output without launching a TUI that blocks them.
 fn handle_default_launch() -> CliResult<()> {
+    // Detect calling context: if stdin/stdout are not a TTY, this is a coding agent
+    use std::io::IsTerminal;
+    let is_interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+
+    if !is_interactive {
+        // Non-interactive: emit robot status as JSON so coding agents get useful output
+        return robot::handle_robot(robot::RobotArgs {
+            format: Some(robot::OutputFormat::Json),
+            project: None,
+            agent: None,
+            command: robot::RobotSubcommand::Status,
+        });
+    }
+
+    // Interactive: full server launch experience
+    let config = Config::from_env();
+    let host = &config.http_host;
+    let port = config.http_port;
+
     // Step 1: Run setup (auto-detect agents, configure connections)
     // Non-fatal: if setup fails we still start the server
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -1822,8 +1848,8 @@ fn handle_default_launch() -> CliResult<()> {
         dry_run: false,
         yes: true,
         token: None,
-        port: 8765,
-        host: "127.0.0.1".to_string(),
+        port,
+        host: host.clone(),
         path: "/mcp/".to_string(),
         project_dir: Some(cwd),
         json: false,
@@ -1836,8 +1862,73 @@ fn handle_default_launch() -> CliResult<()> {
         ));
     }
 
-    // Step 2: Start HTTP server with TUI (default settings)
+    // Step 2: Clear the port if something is already listening
+    auto_clear_port(host, port);
+
+    // Step 3: Start HTTP server with TUI (default settings)
     handle_serve_http(None, None, None, false)
+}
+
+/// If something is already listening on `host:port`, kill it so we can start fresh.
+fn auto_clear_port(host: &str, port: u16) {
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+
+    let status = check_port_status(host, port);
+    match status {
+        PortStatus::Free => {}
+        PortStatus::AgentMailServer => {
+            eprintln!(
+                "[info] Existing Agent Mail server on {host}:{port} — stopping it to start fresh"
+            );
+            kill_port_holder(port);
+        }
+        PortStatus::OtherProcess { ref description } => {
+            eprintln!(
+                "[info] Port {port} in use by: {description} — killing to free it for Agent Mail"
+            );
+            kill_port_holder(port);
+        }
+        PortStatus::Error { ref message, .. } => {
+            eprintln!("[warn] Could not check port {port}: {message} — proceeding anyway");
+        }
+    }
+}
+
+/// Kill whatever process is holding `port` using `fuser` (Linux) or `lsof` (macOS).
+fn kill_port_holder(port: u16) {
+    // Try fuser first (Linux, fastest)
+    let result = std::process::Command::new("fuser")
+        .args(["-k", &format!("{port}/tcp")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if let Ok(s) = result {
+        if s.success() {
+            // Give the OS a moment to release the port
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            return;
+        }
+    }
+
+    // Fallback: lsof + kill (macOS / if fuser not available)
+    let lsof_output = std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}")])
+        .output();
+
+    if let Ok(out) = lsof_output {
+        let pids = String::from_utf8_lossy(&out.stdout);
+        for pid_str in pids.split_whitespace() {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+        }
+        if !pids.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
 }
 
 #[cfg(test)]

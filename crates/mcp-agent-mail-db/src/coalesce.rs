@@ -18,11 +18,20 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+/// Number of independent shards for the coalesce map.
+///
+/// Each shard has its own mutex, so operations on keys that hash to
+/// different shards never contend. 16 is a good default: it is small
+/// enough that `inflight_count()` (which sums all shards) stays fast,
+/// and large enough that contention is negligible for typical workloads.
+const NUM_SHARDS: usize = 16;
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
@@ -169,7 +178,8 @@ pub struct CoalesceMetrics {
 // CoalesceMap
 // ---------------------------------------------------------------------------
 
-/// A concurrent map that deduplicates in-flight read operations.
+/// A concurrent map that deduplicates in-flight read operations using 16
+/// independent shards to minimise lock contention.
 ///
 /// When [`execute_or_join`](Self::execute_or_join) is called:
 /// - If no other thread is executing the same key: this thread becomes the
@@ -177,14 +187,17 @@ pub struct CoalesceMetrics {
 /// - If another thread is already executing the same key: this thread "joins"
 ///   and blocks (with timeout) until the leader finishes, then clones the result.
 ///
+/// Keys are routed to shards via `DefaultHasher` (FNV-quality distribution).
+/// Operations on keys in different shards never contend on the same mutex.
+///
 /// # Type Parameters
 ///
 /// - `K`: The cache key (typically a tuple of query parameters). Must be
 ///   `Hash + Eq + Clone + Send + Sync`.
 /// - `V`: The result value. Must be `Clone + Send + Sync` (cloned to joiners).
-pub struct CoalesceMap<K, V> {
-    inflight: Mutex<HashMap<K, Arc<Slot<V>>>>,
-    max_entries: usize,
+pub struct ShardedCoalesceMap<K, V> {
+    shards: [Mutex<HashMap<K, Arc<Slot<V>>>>; NUM_SHARDS],
+    max_entries_per_shard: usize,
     join_timeout: Duration,
     // Metrics (lock-free atomics).
     leader_count: AtomicU64,
@@ -193,25 +206,39 @@ pub struct CoalesceMap<K, V> {
     leader_failed_count: AtomicU64,
 }
 
-impl<K: Hash + Eq + Clone, V: Clone> CoalesceMap<K, V> {
-    /// Create a new `CoalesceMap`.
+/// Backward-compatible alias. All existing code continues to use `CoalesceMap`.
+pub type CoalesceMap<K, V> = ShardedCoalesceMap<K, V>;
+
+impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
+    /// Create a new `ShardedCoalesceMap`.
     ///
-    /// - `max_entries`: maximum number of concurrent in-flight operations.
-    ///   When exceeded, one arbitrary entry is evicted (best-effort).
+    /// - `max_entries`: maximum number of concurrent in-flight operations
+    ///   (divided equally across shards). When a shard exceeds its share,
+    ///   one arbitrary entry is evicted (best-effort).
     /// - `join_timeout`: maximum time a joiner will wait for the leader.
     ///   On timeout, the joiner falls through and the closure is called
     ///   independently.
     #[must_use]
     pub fn new(max_entries: usize, join_timeout: Duration) -> Self {
+        let per_shard = max_entries.saturating_add(NUM_SHARDS - 1) / NUM_SHARDS;
+        let cap = per_shard.min(8);
         Self {
-            inflight: Mutex::new(HashMap::with_capacity(max_entries.min(64))),
-            max_entries,
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::with_capacity(cap))),
+            max_entries_per_shard: per_shard,
             join_timeout,
             leader_count: AtomicU64::new(0),
             joined_count: AtomicU64::new(0),
             timeout_count: AtomicU64::new(0),
             leader_failed_count: AtomicU64::new(0),
         }
+    }
+
+    /// Compute the shard index for a key using `DefaultHasher`.
+    #[allow(clippy::cast_possible_truncation)] // modulo 16 fits in any pointer width
+    fn shard_index(key: &K) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % NUM_SHARDS
     }
 
     /// Execute `f` or join an existing in-flight operation for the same key.
@@ -232,9 +259,10 @@ impl<K: Hash + Eq + Clone, V: Clone> CoalesceMap<K, V> {
             Joiner(Arc<Slot<V>>),
         }
 
+        let shard_idx = Self::shard_index(&key);
+
         let role = {
-            let mut map = self
-                .inflight
+            let mut map = self.shards[shard_idx]
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             #[allow(clippy::option_if_let_else)] // map_or_else can't work: else branch mutates map
@@ -243,7 +271,7 @@ impl<K: Hash + Eq + Clone, V: Clone> CoalesceMap<K, V> {
             } else {
                 // We are the leader. Insert our slot.
                 let slot = Arc::new(Slot::new());
-                if map.len() >= self.max_entries {
+                if map.len() >= self.max_entries_per_shard {
                     // Best-effort eviction: remove one arbitrary entry.
                     if let Some(k) = map.keys().next().cloned() {
                         map.remove(&k);
@@ -254,30 +282,53 @@ impl<K: Hash + Eq + Clone, V: Clone> CoalesceMap<K, V> {
             }
         };
 
+        let inflight_count = self.shards[shard_idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+
         match role {
-            Role::Joiner(slot) => match slot.wait(self.join_timeout) {
-                Ok(v) => {
-                    self.joined_count.fetch_add(1, Ordering::Relaxed);
-                    Ok(CoalesceOutcome::Joined(v))
+            Role::Joiner(slot) => {
+                mcp_agent_mail_core::evidence_ledger().record(
+                    "coalesce.outcome",
+                    serde_json::json!({ "inflight_count": inflight_count }),
+                    "joined",
+                    Some("join_rate >= 0.3".into()),
+                    0.8,
+                    "coalesce_v1",
+                );
+                match slot.wait(self.join_timeout) {
+                    Ok(v) => {
+                        self.joined_count.fetch_add(1, Ordering::Relaxed);
+                        Ok(CoalesceOutcome::Joined(v))
+                    }
+                    Err(CoalesceJoinError::Timeout) => {
+                        self.timeout_count.fetch_add(1, Ordering::Relaxed);
+                        // Fallback: execute independently.
+                        self.leader_count.fetch_add(1, Ordering::Relaxed);
+                        f().map(CoalesceOutcome::Executed)
+                    }
+                    Err(CoalesceJoinError::LeaderFailed(_)) => {
+                        self.leader_failed_count.fetch_add(1, Ordering::Relaxed);
+                        // Fallback: execute independently.
+                        self.leader_count.fetch_add(1, Ordering::Relaxed);
+                        f().map(CoalesceOutcome::Executed)
+                    }
                 }
-                Err(CoalesceJoinError::Timeout) => {
-                    self.timeout_count.fetch_add(1, Ordering::Relaxed);
-                    // Fallback: execute independently.
-                    self.leader_count.fetch_add(1, Ordering::Relaxed);
-                    f().map(CoalesceOutcome::Executed)
-                }
-                Err(CoalesceJoinError::LeaderFailed(_)) => {
-                    self.leader_failed_count.fetch_add(1, Ordering::Relaxed);
-                    // Fallback: execute independently.
-                    self.leader_count.fetch_add(1, Ordering::Relaxed);
-                    f().map(CoalesceOutcome::Executed)
-                }
-            },
+            }
             Role::Leader => {
+                mcp_agent_mail_core::evidence_ledger().record(
+                    "coalesce.outcome",
+                    serde_json::json!({ "inflight_count": inflight_count }),
+                    "executed",
+                    Some("join_rate >= 0.3".into()),
+                    0.8,
+                    "coalesce_v1",
+                );
                 self.leader_count.fetch_add(1, Ordering::Relaxed);
                 // Retrieve our slot (we just inserted it).
                 let slot = {
-                    self.inflight
+                    self.shards[shard_idx]
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(&key)
@@ -297,7 +348,7 @@ impl<K: Hash + Eq + Clone, V: Clone> CoalesceMap<K, V> {
                         }
 
                         // Remove from in-flight map.
-                        self.inflight
+                        self.shards[shard_idx]
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .remove(&key);
@@ -308,7 +359,7 @@ impl<K: Hash + Eq + Clone, V: Clone> CoalesceMap<K, V> {
                         if let Some(slot) = slot {
                             slot.complete_err(panic_payload_message(payload.as_ref()));
                         }
-                        self.inflight
+                        self.shards[shard_idx]
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .remove(&key);
@@ -319,13 +370,17 @@ impl<K: Hash + Eq + Clone, V: Clone> CoalesceMap<K, V> {
         }
     }
 
-    /// Number of currently in-flight operations.
+    /// Number of currently in-flight operations (sum across all shards).
     #[must_use]
     pub fn inflight_count(&self) -> usize {
-        self.inflight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.shards
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
+            .sum()
     }
 
     /// Returns a snapshot of coalescing metrics.
@@ -1673,6 +1728,169 @@ mod tests {
             .execute_or_join("complex", || Ok::<_, String>(expected.clone()))
             .unwrap();
         assert_eq!(r.into_inner(), expected);
+    }
+
+    // ─── Sharded coalescer tests (br-2fttz) ────────────────────────────────────
+
+    #[test]
+    fn sharded_single_thread_executes() {
+        // Basic smoke test: single-threaded execution uses the shard correctly.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+        let result = map.execute_or_join("shard-key-1", || Ok::<_, String>(42)).unwrap();
+        assert!(!result.was_joined());
+        assert_eq!(result.into_inner(), 42);
+        assert_eq!(map.inflight_count(), 0);
+
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 1);
+        assert_eq!(m.joined_count, 0);
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn sharded_joiners_receive_result() {
+        // Multiple threads on the same key: joiners should share the leader's result.
+        let map = Arc::new(CoalesceMap::<String, i32>::new(100, Duration::from_secs(5)));
+        let exec_count = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(5));
+
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                let exec_count = Arc::clone(&exec_count);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let result = map
+                        .execute_or_join("shard-shared".to_string(), || {
+                            exec_count.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(50));
+                            Ok::<_, String>(99)
+                        })
+                        .unwrap();
+                    result.into_inner()
+                })
+            })
+            .collect();
+
+        let results: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(results.iter().all(|&v| v == 99));
+
+        let actual_execs = exec_count.load(Ordering::SeqCst);
+        assert!(
+            actual_execs < 5,
+            "expected fewer than 5 executions, got {actual_execs}"
+        );
+
+        let m = map.metrics();
+        assert!(m.joined_count > 0, "at least one thread should have joined");
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn sharded_different_keys_no_contention() {
+        // Keys that hash to different shards should execute independently
+        // without contention.
+        let map = Arc::new(CoalesceMap::<String, usize>::new(
+            100,
+            Duration::from_millis(100),
+        ));
+        let exec_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let map = Arc::clone(&map);
+                let exec_count = Arc::clone(&exec_count);
+                thread::spawn(move || {
+                    let key = format!("independent-shard-key-{i}");
+                    let result = map
+                        .execute_or_join(key, || {
+                            exec_count.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, String>(i)
+                        })
+                        .unwrap();
+                    result.into_inner()
+                })
+            })
+            .collect();
+
+        let results: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.len(), 16);
+
+        // All 16 distinct keys should have executed independently.
+        assert_eq!(exec_count.load(Ordering::SeqCst), 16);
+        assert_eq!(map.inflight_count(), 0);
+    }
+
+    #[test]
+    fn sharded_hash_distribution() {
+        // Verify that hashing distributes keys across multiple shards.
+        // With 100 distinct keys, we expect most of the 16 shards to be hit.
+        let mut shard_hits = [0u32; NUM_SHARDS];
+        for i in 0..100 {
+            let key = format!("distribution-test-key-{i}");
+            let idx = ShardedCoalesceMap::<String, ()>::shard_index(&key);
+            shard_hits[idx] += 1;
+        }
+
+        let shards_used = shard_hits.iter().filter(|&&c| c > 0).count();
+        assert!(
+            shards_used >= 10,
+            "expected at least 10 of 16 shards used, got {shards_used} (distribution: {shard_hits:?})"
+        );
+
+        // No single shard should have more than 25% of keys (extreme imbalance).
+        let max_per_shard = *shard_hits.iter().max().unwrap();
+        assert!(
+            max_per_shard <= 25,
+            "expected no shard with >25 of 100 keys, got {max_per_shard} (distribution: {shard_hits:?})"
+        );
+    }
+
+    #[test]
+    fn sharded_inflight_count_accurate() {
+        // Verify `inflight_count()` correctly sums across all shards.
+        let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        // After a completed operation, inflight count is 0.
+        let _ = map.execute_or_join("a", || Ok::<_, String>(1));
+        let _ = map.execute_or_join("b", || Ok::<_, String>(2));
+        let _ = map.execute_or_join("c", || Ok::<_, String>(3));
+        assert_eq!(map.inflight_count(), 0);
+
+        // Metrics should reflect 3 leader executions.
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 3);
+    }
+
+    #[test]
+    fn sharded_metrics_consistent() {
+        // Run a batch of operations and verify metrics are internally consistent.
+        let map: CoalesceMap<String, i32> = CoalesceMap::new(100, Duration::from_millis(100));
+
+        for i in 0..50 {
+            let _ = map.execute_or_join(format!("metric-key-{i}"), || Ok::<_, String>(i));
+        }
+
+        let m = map.metrics();
+        // All sequential single-threaded calls should be leaders.
+        assert_eq!(m.leader_count, 50);
+        assert_eq!(m.joined_count, 0);
+        assert_eq!(m.timeout_count, 0);
+        assert_eq!(m.leader_failed_count, 0);
+        assert_eq!(map.inflight_count(), 0);
+
+        // Reset and verify.
+        map.reset_metrics();
+        let m = map.metrics();
+        assert_eq!(m.leader_count, 0);
+        assert_eq!(m.joined_count, 0);
+
+        // Map still works after reset.
+        let r = map.execute_or_join("post-reset".to_string(), || Ok::<_, String>(7)).unwrap();
+        assert_eq!(r.into_inner(), 7);
+        assert_eq!(map.metrics().leader_count, 1);
     }
 
     // ─── Property tests ───────────────────────────────────────────────────────

@@ -1,11 +1,20 @@
-//! Minimal evidence-ledger primitives for explainable runtime decisions.
+//! Evidence-ledger primitives for explainable runtime decisions.
 //!
-//! This module provides append-only JSONL emission with an opt-in path
-//! configured through `AM_EVIDENCE_LEDGER_PATH`.
+//! Two layers:
+//!
+//! 1. **Stateless emission** — `append_evidence_entry_if_configured()` writes
+//!    JSONL entries to a path from `AM_EVIDENCE_LEDGER_PATH`. Zero overhead
+//!    when disabled.
+//!
+//! 2. **Stateful ledger** — [`EvidenceLedger`] maintains an in-memory ring
+//!    buffer of recent entries with monotonic sequence numbers, optional JSONL
+//!    file output, outcome backfill, and hit-rate queries.
 
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::Utc;
@@ -23,6 +32,9 @@ static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 /// A single decision record in the evidence ledger.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceLedgerEntry {
+    /// Monotonic sequence number (assigned by [`EvidenceLedger`]).
+    #[serde(default)]
+    pub seq: u64,
     /// Wall-clock timestamp in microseconds since Unix epoch.
     pub ts_micros: i64,
     /// Stable decision identifier for correlation across traces.
@@ -50,6 +62,9 @@ pub struct EvidenceLedgerEntry {
     /// Optional request/trace correlation id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// The model/strategy that made the decision.
+    #[serde(default)]
+    pub model: String,
 }
 
 impl EvidenceLedgerEntry {
@@ -63,6 +78,7 @@ impl EvidenceLedgerEntry {
         evidence: Value,
     ) -> Self {
         Self {
+            seq: 0,
             ts_micros: Utc::now().timestamp_micros(),
             decision_id: decision_id.into(),
             decision_point: decision_point.into(),
@@ -74,6 +90,7 @@ impl EvidenceLedgerEntry {
             actual: None,
             correct: None,
             trace_id: None,
+            model: String::new(),
         }
     }
 }
@@ -133,6 +150,227 @@ pub fn append_evidence_entry_to_path(path: &Path, entry: &EvidenceLedgerEntry) -
         writer.flush()?;
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Global evidence ledger singleton
+// ---------------------------------------------------------------------------
+
+static GLOBAL_LEDGER: OnceLock<EvidenceLedger> = OnceLock::new();
+
+/// Get the global evidence ledger singleton.
+///
+/// Lazily initialised with a 1000-entry in-memory ring buffer. If
+/// `AM_EVIDENCE_LEDGER_PATH` is set, JSONL output goes to that path too.
+pub fn evidence_ledger() -> &'static EvidenceLedger {
+    GLOBAL_LEDGER.get_or_init(|| {
+        configured_path().map_or_else(
+            || EvidenceLedger::new(1000),
+            |path| {
+                EvidenceLedger::with_file(&path, 1000).unwrap_or_else(|_| EvidenceLedger::new(1000))
+            },
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stateful evidence ledger (ring buffer + JSONL + queries)
+// ---------------------------------------------------------------------------
+
+/// Append-only evidence ledger with in-memory ring buffer and optional JSONL output.
+///
+/// Thread-safe: all methods take `&self` and synchronise internally.
+pub struct EvidenceLedger {
+    /// In-memory ring buffer of recent entries.
+    entries: Mutex<VecDeque<EvidenceLedgerEntry>>,
+    /// Atomic monotonic sequence counter.
+    seq: AtomicU64,
+    /// Optional JSONL file writer.
+    writer: Mutex<Option<BufWriter<std::fs::File>>>,
+    /// Maximum entries retained in memory.
+    max_entries: usize,
+}
+
+impl EvidenceLedger {
+    /// Create a new in-memory-only ledger with the given ring buffer capacity.
+    #[must_use]
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::with_capacity(max_entries.min(4096))),
+            seq: AtomicU64::new(0),
+            writer: Mutex::new(None),
+            max_entries,
+        }
+    }
+
+    /// Create a ledger that also writes JSONL to the given path.
+    ///
+    /// Parent directories are created automatically.
+    pub fn with_file(path: &Path, max_entries: usize) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            entries: Mutex::new(VecDeque::with_capacity(max_entries.min(4096))),
+            seq: AtomicU64::new(0),
+            writer: Mutex::new(Some(BufWriter::new(file))),
+            max_entries,
+        })
+    }
+
+    /// Record a decision. Returns the monotonically increasing sequence number.
+    pub fn record(
+        &self,
+        decision_point: impl Into<String>,
+        evidence: Value,
+        action: impl Into<String>,
+        expected: Option<String>,
+        confidence: f64,
+        model: impl Into<String>,
+    ) -> u64 {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let dp: String = decision_point.into();
+        let entry = EvidenceLedgerEntry {
+            seq,
+            ts_micros: Utc::now().timestamp_micros(),
+            decision_id: format!("{dp}-{seq}"),
+            decision_point: dp,
+            action: action.into(),
+            confidence,
+            evidence,
+            expected_loss: None,
+            expected,
+            actual: None,
+            correct: None,
+            trace_id: None,
+            model: model.into(),
+        };
+
+        // Write to JSONL if configured
+        if let Ok(mut guard) = self.writer.lock() {
+            if let Some(ref mut w) = *guard {
+                let _ = serde_json::to_writer(&mut *w, &entry);
+                let _ = w.write_all(b"\n");
+                let _ = w.flush();
+            }
+        }
+
+        // Push to ring buffer
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= self.max_entries {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+
+        seq
+    }
+
+    /// Backfill the outcome for a previously recorded decision.
+    pub fn record_outcome(&self, seq: u64, actual: impl Into<String>, correct: bool) {
+        let actual_str = actual.into();
+        {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = entries.iter_mut().find(|e| e.seq == seq) {
+                entry.actual = Some(actual_str.clone());
+                entry.correct = Some(correct);
+            }
+        }
+
+        // Also write an outcome line to JSONL
+        if let Ok(mut guard) = self.writer.lock() {
+            if let Some(ref mut w) = *guard {
+                let line = serde_json::json!({
+                    "type": "outcome",
+                    "seq": seq,
+                    "actual": actual_str,
+                    "correct": correct,
+                });
+                let _ = serde_json::to_writer(&mut *w, &line);
+                let _ = w.write_all(b"\n");
+                let _ = w.flush();
+            }
+        }
+    }
+
+    /// Return the last `n` entries, ordered newest-first.
+    #[must_use]
+    pub fn recent(&self, n: usize) -> Vec<EvidenceLedgerEntry> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.iter().rev().take(n).cloned().collect()
+    }
+
+    /// Filter entries by decision point, returning the last `last_n` matches
+    /// (newest-first).
+    #[must_use]
+    pub fn query(&self, decision_point: &str, last_n: usize) -> Vec<EvidenceLedgerEntry> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries
+            .iter()
+            .rev()
+            .filter(|e| e.decision_point == decision_point)
+            .take(last_n)
+            .cloned()
+            .collect()
+    }
+
+    /// Fraction of `correct == true` among the last `window` entries that
+    /// match `decision_point` and have a non-`None` `correct` field.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn hit_rate(&self, decision_point: &str, window: usize) -> f64 {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut total = 0usize;
+        let mut correct_count = 0usize;
+        for e in entries
+            .iter()
+            .rev()
+            .filter(|e| e.decision_point == decision_point && e.correct.is_some())
+            .take(window)
+        {
+            total += 1;
+            if e.correct == Some(true) {
+                correct_count += 1;
+            }
+        }
+        drop(entries);
+        if total == 0 {
+            return 0.0;
+        }
+        correct_count as f64 / total as f64
+    }
+
+    /// Number of entries currently in the ring buffer.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether the ring buffer is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +461,181 @@ mod tests {
             .lines()
             .count();
         assert_eq!(line_count, 200);
+    }
+
+    // =======================================================================
+    // EvidenceLedger tests (7 required for br-35pui)
+    // =======================================================================
+
+    fn ev(dp: &str) -> Value {
+        serde_json::json!({"dp": dp})
+    }
+
+    /// 1. Record 5 entries, recent(3) returns last 3 (newest-first).
+    #[test]
+    fn evidence_record_and_recent() {
+        let ledger = EvidenceLedger::new(1000);
+        for i in 0..5 {
+            ledger.record(
+                format!("dp.{i}"),
+                ev(&format!("{i}")),
+                format!("action-{i}"),
+                None,
+                0.8,
+                "test",
+            );
+        }
+        let recent = ledger.recent(3);
+        assert_eq!(recent.len(), 3);
+        // Newest-first: seq 5, 4, 3
+        assert_eq!(recent[0].seq, 5);
+        assert_eq!(recent[1].seq, 4);
+        assert_eq!(recent[2].seq, 3);
+    }
+
+    /// 2. Record 2000 entries with max_entries=1000, verify len <= 1000.
+    #[test]
+    fn evidence_ring_buffer_bounded() {
+        let ledger = EvidenceLedger::new(1000);
+        for i in 0..2000 {
+            ledger.record(
+                "cache.eviction",
+                ev("bounded"),
+                format!("a-{i}"),
+                None,
+                0.5,
+                "test",
+            );
+        }
+        assert!(
+            ledger.len() <= 1000,
+            "ledger len {} exceeded max_entries 1000",
+            ledger.len()
+        );
+    }
+
+    /// 3. Record, then backfill outcome, verify fields.
+    #[test]
+    fn evidence_record_outcome_backfill() {
+        let ledger = EvidenceLedger::new(1000);
+        let seq = ledger.record(
+            "tui.diff_strategy",
+            ev("render"),
+            "incremental",
+            None,
+            0.9,
+            "bayesian_tui_v1",
+        );
+
+        ledger.record_outcome(seq, "frame_time=12ms", true);
+
+        let entries = ledger.recent(1);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.seq, seq);
+        assert_eq!(entry.actual.as_deref(), Some("frame_time=12ms"));
+        assert_eq!(entry.correct, Some(true));
+    }
+
+    /// 4. 10 entries with 7 correct, hit_rate returns 0.7.
+    #[test]
+    fn evidence_hit_rate_computation() {
+        let ledger = EvidenceLedger::new(1000);
+        for i in 0..10 {
+            let seq = ledger.record(
+                "cache.eviction",
+                ev("hr"),
+                format!("a-{i}"),
+                None,
+                0.5,
+                "test",
+            );
+            ledger.record_outcome(seq, "done", i < 7); // first 7 are correct
+        }
+        let rate = ledger.hit_rate("cache.eviction", 100);
+        assert!(
+            (rate - 0.7).abs() < 1e-9,
+            "expected hit_rate ~0.7, got {rate}"
+        );
+    }
+
+    /// 5. Filter entries by decision_point string.
+    #[test]
+    fn evidence_query_by_decision_point() {
+        let ledger = EvidenceLedger::new(1000);
+        ledger.record("cache.eviction", ev("q1"), "evict", None, 0.5, "test");
+        ledger.record("tui.diff", ev("q2"), "full_redraw", None, 0.5, "test");
+        ledger.record("cache.eviction", ev("q3"), "promote", None, 0.5, "test");
+        ledger.record("tui.diff", ev("q4"), "incremental", None, 0.5, "test");
+        ledger.record("cache.eviction", ev("q5"), "evict", None, 0.5, "test");
+
+        let cache_entries = ledger.query("cache.eviction", 10);
+        assert_eq!(cache_entries.len(), 3);
+        for e in &cache_entries {
+            assert_eq!(e.decision_point, "cache.eviction");
+        }
+
+        let tui_entries = ledger.query("tui.diff", 10);
+        assert_eq!(tui_entries.len(), 2);
+
+        let limited = ledger.query("cache.eviction", 2);
+        assert_eq!(limited.len(), 2);
+    }
+
+    /// 6. Write to tempfile, read back, verify valid JSONL.
+    #[test]
+    fn evidence_jsonl_file_output() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("evidence.jsonl");
+
+        let ledger = EvidenceLedger::with_file(&path, 1000).unwrap();
+        let seq = ledger.record(
+            "search.budget",
+            ev("file"),
+            "semantic",
+            Some("good".into()),
+            0.85,
+            "model_v1",
+        );
+        ledger.record_outcome(seq, "success", true);
+
+        // Read back and verify
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines (record + outcome)");
+
+        // First line: the decision record
+        let record: EvidenceLedgerEntry = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record.decision_point, "search.budget");
+        assert_eq!(record.action, "semantic");
+        assert_eq!(record.seq, seq);
+
+        // Second line: the outcome
+        let outcome: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(outcome["type"], "outcome");
+        assert_eq!(outcome["seq"], seq);
+        assert_eq!(outcome["correct"], true);
+    }
+
+    /// 7. Record 100 entries, all seq values are strictly increasing.
+    #[test]
+    fn evidence_seq_monotonic() {
+        let ledger = EvidenceLedger::new(1000);
+        let mut seqs = Vec::new();
+        for i in 0..100 {
+            let seq = ledger.record("mono.test", ev("seq"), format!("a-{i}"), None, 0.5, "test");
+            seqs.push(seq);
+        }
+        for window in seqs.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "seq {} is not greater than {}",
+                window[1],
+                window[0]
+            );
+        }
+        // First seq should be 1
+        assert_eq!(seqs[0], 1);
+        assert_eq!(seqs[99], 100);
     }
 }

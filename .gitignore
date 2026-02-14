@@ -68,3 +68,4 @@ test_logs/
 
 # Beads history snapshots
 .beads/.br_history/
+.claude/settings.local.json

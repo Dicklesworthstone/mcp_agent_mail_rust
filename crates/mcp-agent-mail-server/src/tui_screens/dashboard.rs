@@ -4,6 +4,7 @@
 //! responsive layout that adapts from 80×24 to 200×50+.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use ftui::Style;
 use ftui::layout::Rect;
@@ -26,7 +27,8 @@ use crate::tui_layout::{
 };
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::{
-    AnomalyCard, AnomalySeverity, MetricTile, MetricTrend, PercentileRibbon, PercentileSample,
+    AnomalyCard, AnomalySeverity, ChartTransition, MetricTile, MetricTrend, PercentileRibbon,
+    PercentileSample,
 };
 use ftui_widgets::sparkline::Sparkline;
 
@@ -84,6 +86,8 @@ const PERCENTILE_HISTORY_CAP: usize = 120;
 
 /// Max throughput samples to retain.
 const THROUGHPUT_HISTORY_CAP: usize = 120;
+/// Chart transition duration for throughput updates.
+const CHART_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 
 /// Anomaly thresholds.
 const ACK_PENDING_WARN: u64 = 3;
@@ -101,6 +105,13 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn reduced_motion_enabled() -> bool {
     env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
+}
+
+fn chart_animations_enabled() -> bool {
+    !std::env::var("AM_TUI_CHART_ANIMATIONS").is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+    })
 }
 
 // ── Detected anomaly ─────────────────────────────────────────────────
@@ -144,6 +155,10 @@ pub struct DashboardScreen {
     percentile_history: Vec<PercentileSample>,
     /// Rolling throughput samples (requests per stat interval).
     throughput_history: Vec<f64>,
+    /// Interpolated throughput samples rendered by the chart.
+    animated_throughput_history: Vec<f64>,
+    /// Transition state for throughput chart updates.
+    throughput_transition: ChartTransition,
     /// Previous request total for delta/trend computation.
     prev_req_total: u64,
     /// Whether the trend panel is visible (toggled by user).
@@ -154,6 +169,8 @@ pub struct DashboardScreen {
     pulse_phase: f32,
     /// Reduced-motion mode disables pulse animation.
     reduced_motion: bool,
+    /// Whether chart transitions are enabled (`AM_TUI_CHART_ANIMATIONS`).
+    chart_animations_enabled: bool,
 }
 
 /// A pre-formatted event log entry.
@@ -260,11 +277,14 @@ impl DashboardScreen {
             anomalies: Vec::new(),
             percentile_history: Vec::with_capacity(PERCENTILE_HISTORY_CAP),
             throughput_history: Vec::with_capacity(THROUGHPUT_HISTORY_CAP),
+            animated_throughput_history: Vec::with_capacity(THROUGHPUT_HISTORY_CAP),
+            throughput_transition: ChartTransition::new(CHART_TRANSITION_DURATION),
             prev_req_total: 0,
             show_trend_panel: true,
             recent_message_preview: None,
             pulse_phase: 0.0,
             reduced_motion: reduced_motion_enabled(),
+            chart_animations_enabled: chart_animations_enabled(),
         }
     }
 
@@ -569,6 +589,13 @@ impl MailScreen for DashboardScreen {
             }
             self.prev_req_total = counters.total;
         }
+
+        let now = Instant::now();
+        self.throughput_transition
+            .set_target(&self.throughput_history, now);
+        self.animated_throughput_history = self
+            .throughput_transition
+            .sample_values(now, self.reduced_motion || !self.chart_animations_enabled);
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
@@ -623,7 +650,7 @@ impl MailScreen for DashboardScreen {
                 frame,
                 trend_rect,
                 &self.percentile_history,
-                &self.throughput_history,
+                &self.animated_throughput_history,
                 &self.event_log,
             );
         }

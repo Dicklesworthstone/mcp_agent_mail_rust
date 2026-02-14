@@ -4968,6 +4968,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "chrono",
+ "criterion",
  "half",
  "indexmap",
  "loom",
@@ -5039,6 +5040,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "comrak",
+ "criterion",
  "fastmcp-core",
  "fastmcp-protocol",
  "fastmcp-rust",

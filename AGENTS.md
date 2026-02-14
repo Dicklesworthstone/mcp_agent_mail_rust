@@ -20,8 +20,6 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ## Irreversible Git & Filesystem Actions — DO NOT EVER BREAK GLASS
 
-> **Note:** Multi-agent coordination depends on clean, predictable state. Destructive commands can destroy the work of many agents simultaneously.
-
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
 2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval. "I think it's safe" is never acceptable.
 3. **Safer alternatives first:** When cleanup or rollbacks are needed, request permission to use non-destructive options (`git status`, `git diff`, `git stash`, copying to backups) before ever considering a destructive command.
@@ -41,8 +39,6 @@ If I tell you to do something, even if it goes against what follows below, YOU M
   git push origin main:master
   ```
 
-**Why this matters:** Some references and install URLs historically referenced `master`. If `master` falls behind `main`, users get stale code.
-
 **If you see `master` referenced anywhere:**
 1. Update it to `main`
 2. Ensure `master` is synchronized: `git push origin main:master`
@@ -55,21 +51,51 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
-- **Configuration:** Cargo.toml only
+- **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
+
+### Async Runtime: asupersync (MANDATORY — NO TOKIO)
+
+**This project uses [asupersync](/dp/asupersync) exclusively for all async/concurrent operations. Tokio and the entire tokio ecosystem are FORBIDDEN.**
+
+- **Structured concurrency**: `Cx`, `Scope`, `region()` — no orphan tasks
+- **Cancel-correct channels**: Two-phase `reserve()/send()` — no data loss on cancellation
+- **Sync primitives**: `asupersync::sync::Mutex`, `RwLock`, `OnceCell`, `Pool` — cancel-aware
+- **Deterministic testing**: `LabRuntime` with virtual time, DPOR, oracles
+- **Native HTTP**: `asupersync::http::h1` for HTTP client (replaces reqwest)
+- **Rayon is allowed**: For CPU-bound data parallelism. Rayon is not an async runtime.
+
+**Forbidden crates**: `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, or any crate that transitively depends on tokio.
+
+**Pattern**: All async functions take `&Cx` as first parameter. The `Cx` flows down from the consumer's runtime — the server does NOT create its own runtime.
 
 ### Key Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| `fastmcp_rust` (`/dp/fastmcp_rust`) | MCP protocol implementation (MUST use, not tokio) |
-| `sqlmodel_rust` (`/dp/sqlmodel_rust`) | SQLite ORM (MUST use, not rusqlite) |
-| `asupersync` (`/dp/asupersync`) | Async runtime (MUST use, not tokio) |
+| `asupersync` | Structured async runtime (channels, sync, regions, HTTP, testing) |
+| `fastmcp_rust` (`/dp/fastmcp_rust`) | MCP protocol implementation (JSON-RPC, stdio, HTTP transport) |
+| `sqlmodel_rust` (`/dp/sqlmodel_rust`) | SQLite ORM (schema, queries, migrations, pool) |
 | `frankentui` (`/dp/frankentui`) | TUI rendering for operations console |
 | `beads_rust` (`/dp/beads_rust`) | Issue tracking integration |
 | `coding_agent_session_search` (`/dp/coding_agent_session_search`) | Agent detection |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |
 | `chrono` | Timestamp handling (i64 microseconds since epoch) |
+| `thiserror` | Ergonomic error type derivation |
+| `tracing` | Structured logging and diagnostics |
+| `fnmatch-regex` | Glob pattern matching for file reservations |
+
+### Release Profile
+
+The release build optimizes for performance:
+
+```toml
+[profile.release]
+opt-level = 3       # Maximum performance optimization
+lto = true          # Link-time optimization
+codegen-units = 1   # Single codegen unit for better optimization
+strip = true        # Remove debug symbols
+```
 
 ---
 
@@ -106,29 +132,16 @@ We do not care about backwards compatibility—we're in early development with n
 
 ---
 
-## Output Style
-
-This project exposes two interfaces with different output conventions:
-
-- **MCP server (`mcp-agent-mail`):** JSON-RPC responses over stdio or HTTP. Tool results are JSON objects.
-- **CLI (`am`):** TTY-aware tables for humans, `--json` flag for machine-readable output.
-
-Dual-mode behavior:
-- **MCP mode (default):** CLI-only commands produce a deterministic denial on stderr with exit code `2`
-- **CLI mode (`AM_INTERFACE_MODE=cli`):** MCP-only commands denied with guidance pointing back to MCP mode
-
----
-
 ## Compiler Checks (CRITICAL)
 
 **After any substantive code changes, you MUST verify no errors were introduced:**
 
 ```bash
-# Check for compiler errors and warnings
-cargo check --all-targets
+# Check for compiler errors and warnings (workspace-wide)
+cargo check --workspace --all-targets
 
 # Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
 cargo fmt --check
@@ -140,33 +153,43 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ## Testing
 
+### Testing Policy
+
+Every component crate includes inline `#[cfg(test)]` unit tests alongside the implementation. Tests must cover:
+- Happy path
+- Edge cases (empty input, max values, boundary conditions)
+- Error conditions
+
+Cross-component integration tests live in the workspace `tests/` directory. E2E tests live in `tests/e2e/`.
+
 ### Unit Tests
 
-The workspace includes 1000+ tests across all crates:
-
 ```bash
-# Run all tests
-cargo test
+# Run all tests across the workspace
+cargo test --workspace
 
 # Run with output
-cargo test -- --nocapture
+cargo test --workspace -- --nocapture
 
-# Run specific crate
+# Run tests for a specific crate
 cargo test -p mcp-agent-mail-db
 cargo test -p mcp-agent-mail-tools
 cargo test -p mcp-agent-mail-server
+cargo test -p mcp-agent-mail-core
+cargo test -p mcp-agent-mail-storage
+cargo test -p mcp-agent-mail-guard
+cargo test -p mcp-agent-mail-share
 
 # Conformance tests (parity with Python reference)
 cargo test -p mcp-agent-mail-conformance
 
-# Benchmarks
-cargo bench -p mcp-agent-mail
+# Run with all features enabled
+cargo test --workspace --all-features
 ```
 
-### End-to-End Testing
+### End-to-End Tests
 
 ```bash
-# E2E test suites (37 scripts in tests/e2e/)
 tests/e2e/test_stdio.sh       # MCP stdio transport (17 assertions)
 tests/e2e/test_http.sh        # HTTP transport (47 assertions)
 tests/e2e/test_guard.sh       # Pre-commit guard (32 assertions)
@@ -179,86 +202,22 @@ scripts/e2e_cli.sh            # CLI integration (99 assertions)
 
 ### Test Categories
 
-| Area | Tests | Purpose |
-|------|-------|---------|
-| DB queries + pool | 38+ | Storage layer correctness |
-| Stress tests | 9 | Concurrent ops, pool exhaustion, cache coherency |
-| Tool implementations | 34 | All MCP tools via conformance fixtures |
-| Resources | 33+ | All MCP resources vs Python parity |
-| CLI commands | 123+ | All 40+ CLI commands |
-| Guard | 34 unit + 8 E2E | Pre-commit reservation enforcement |
-| Share/export | 62 | Snapshot, scrub, bundle, crypto pipeline |
-| FTS sanitization | 20 | Full-text search edge cases |
-| LLM integration | 20 | Model selection, completion, merge logic |
-| Dual-mode | 42+ | Mode matrix (CLI-allow + MCP-deny) |
+| Crate / Area | Focus Areas |
+|--------------|-------------|
+| `mcp-agent-mail-core` | Config parsing, models, agent name validation, metrics, error types, timestamps |
+| `mcp-agent-mail-db` | SQL queries, pool, cache coherency, FTS sanitization, stress tests (concurrent ops, pool exhaustion) |
+| `mcp-agent-mail-storage` | Git archive, commit coalescer, notification signals |
+| `mcp-agent-mail-guard` | Pre-commit reservation enforcement, symmetric fnmatch, archive reading, rename handling |
+| `mcp-agent-mail-tools` | 34 MCP tool implementations via conformance fixtures |
+| `mcp-agent-mail-share` | Snapshot, scrub, bundle, crypto pipeline |
+| `mcp-agent-mail-server` | HTTP handler, dispatch, TUI widgets, property tests |
+| `mcp-agent-mail-cli` | 40+ CLI commands, dual-mode matrix |
+| `mcp-agent-mail-conformance` | Parity with Python reference (23 tools, 23+ resources) |
+| `tests/e2e/` | Cross-component E2E via stdio/HTTP transport |
 
----
+### Test Fixtures
 
-## Quality Gates
-
-Before committing, run these checks:
-
-```bash
-# Format, lint, test — the mandatory trifecta
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-
-# Conformance against Python reference (optional but recommended)
-cargo test -p mcp-agent-mail-conformance
-
-# Multi-agent builds: isolate target dir to avoid lock contention
-export CARGO_TARGET_DIR="/tmp/target-$(whoami)-am"
-```
-
-### Debugging Test Failures
-
-#### Conformance Failure
-1. Run `cargo test -p mcp-agent-mail-conformance -- --nocapture`
-2. Compare Rust output against Python fixtures in `tests/conformance/fixtures/`
-3. Regenerate fixtures with `python_reference/generate_fixtures.py` if Python behavior changed
-
-#### E2E Failure
-1. Run the specific E2E script with bash `-x` for tracing
-2. Check that `mcp-agent-mail` binary builds: `cargo build -p mcp-agent-mail`
-3. Verify server starts on expected port: `mcp-agent-mail serve --no-tui`
-
-#### Stress Test Failure
-1. Run with `--nocapture --test-threads=1` for isolation
-2. Check for SQLite lock contention (increase pool size or use WAL checkpoint)
-3. Review circuit breaker state in test output
-
----
-
-## Commit Process
-
-When changes are ready, follow this process:
-
-### 1. Verify Quality Gates Locally
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
-
-### 2. Commit Changes
-
-```bash
-git add <specific-files>
-git commit -m "fix: description of fixes
-
-- List specific fixes
-- Include any breaking changes
-
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
-```
-
-### 3. Push
-
-```bash
-git push origin main
-```
+Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to ensure output format parity with the reference Python implementation across all 23 tools and 23+ resources.
 
 ---
 
@@ -272,39 +231,71 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 **This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 34 tools and 20+ resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
 
+### What It Does
+
+Provides asynchronous multi-agent coordination via a mail metaphor: identities, inbox/outbox, searchable threads, advisory file reservations (leases), and build slots — all backed by Git for human-auditable artifacts and SQLite for fast indexing.
+
 ### Architecture
 
-Cargo workspace with strict dependency layering:
-
-```text
-mcp-agent-mail-core          (config, models, errors, metrics)
-  ├─ mcp-agent-mail-db       (SQLite schema, queries, pool)
-  ├─ mcp-agent-mail-storage  (Git archive, commit coalescer)
-  ├─ mcp-agent-mail-guard    (pre-commit guard, reservation enforcement)
-  ├─ mcp-agent-mail-share    (snapshot, bundle, export)
-  └─ mcp-agent-mail-tools    (34 MCP tool implementations)
-       └─ mcp-agent-mail-server  (HTTP/MCP runtime, TUI, web UI)
-            ├─ mcp-agent-mail        (server binary)
-            ├─ mcp-agent-mail-cli    (am CLI binary)
-            └─ mcp-agent-mail-conformance  (parity tests)
+```
+MCP Client (agent) ──── stdio/HTTP ────► mcp-agent-mail-server
+                                              │
+                                    ┌─────────┼─────────┐
+                                    ▼         ▼         ▼
+                               34 Tools   20+ Resources  TUI
+                                    │         │
+                              mcp-agent-mail-tools
+                                    │
+                         ┌──────────┼──────────┐
+                         ▼          ▼          ▼
+                    mcp-agent-mail-db   mcp-agent-mail-storage
+                    (SQLite index)      (Git archive)
+                         │
+                    mcp-agent-mail-core
+                    (config, models, errors, metrics)
 ```
 
-### Key Files
+### Workspace Structure
 
-| Path | Purpose |
-|------|---------|
-| `Cargo.toml` | Workspace manifest with all 10 crates |
-| `crates/mcp-agent-mail/src/main.rs` | Server binary entry point (dual-mode) |
-| `crates/mcp-agent-mail-cli/src/main.rs` | CLI binary (`am`) entry point |
-| `crates/mcp-agent-mail-core/src/config.rs` | 100+ environment variables |
-| `crates/mcp-agent-mail-core/src/models.rs` | Core data models (Project, Agent, Message, etc.) |
-| `crates/mcp-agent-mail-db/src/queries.rs` | All SQL queries (instrumented) |
-| `crates/mcp-agent-mail-tools/src/` | 34 MCP tool implementations |
-| `crates/mcp-agent-mail-server/src/lib.rs` | Server dispatch, HTTP handler |
-| `crates/mcp-agent-mail-server/src/tui_*.rs` | TUI operations console (11 screens) |
-| `am serve-http` | Start HTTP server with TUI |
-| `tests/e2e/` | 37 E2E test scripts |
-| `rust-toolchain.toml` | Nightly toolchain requirement |
+```
+mcp_agent_mail_rust/
+├── Cargo.toml                              # Workspace root
+├── crates/
+│   ├── mcp-agent-mail-core/                # Zero-dep: config, models, errors, metrics
+│   ├── mcp-agent-mail-db/                  # SQLite schema, queries, pool, cache, FTS
+│   ├── mcp-agent-mail-storage/             # Git archive, commit coalescer
+│   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
+│   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
+│   ├── mcp-agent-mail-tools/               # 34 MCP tool implementations
+│   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI
+│   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
+│   ├── mcp-agent-mail-cli/                 # CLI binary (am)
+│   └── mcp-agent-mail-conformance/         # Python parity tests
+├── tests/e2e/                              # End-to-end test scripts
+├── scripts/                                # CLI integration tests, utilities
+└── rust-toolchain.toml                     # Nightly toolchain requirement
+```
+
+### Key Files by Crate
+
+| Crate | Key Files | Purpose |
+|-------|-----------|---------|
+| `mcp-agent-mail-core` | `src/config.rs` | 100+ environment variables |
+| `mcp-agent-mail-core` | `src/models.rs` | Core data models (Project, Agent, Message, Thread, etc.) |
+| `mcp-agent-mail-core` | `src/timestamps.rs` | i64 microsecond conversion helpers |
+| `mcp-agent-mail-core` | `src/evidence_ledger.rs` | Structured event logging |
+| `mcp-agent-mail-db` | `src/queries.rs` | All SQL queries (instrumented with query tracking) |
+| `mcp-agent-mail-db` | `src/cache.rs` | Write-behind read cache with dual indexing |
+| `mcp-agent-mail-db` | `src/pool.rs` | SQLite connection pool with WAL hardening |
+| `mcp-agent-mail-storage` | `src/archive.rs` | Git-backed message archive |
+| `mcp-agent-mail-storage` | `src/coalesce.rs` | Async git commit coalescer (WBQ) |
+| `mcp-agent-mail-guard` | `src/lib.rs` | Pre-commit hook, reservation conflict detection |
+| `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
+| `mcp-agent-mail-tools` | `src/` | 34 MCP tool implementations across 9 clusters |
+| `mcp-agent-mail-server` | `src/lib.rs` | Server dispatch, HTTP handler |
+| `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (11 screens) |
+| `mcp-agent-mail` | `src/main.rs` | Server binary entry point (dual-mode) |
+| `mcp-agent-mail-cli` | `src/main.rs` | CLI binary (`am`) entry point |
 
 ### 34 MCP Tools (9 Clusters)
 
@@ -324,7 +315,7 @@ mcp-agent-mail-core          (config, models, errors, metrics)
 
 | # | Screen | Shows |
 |---|--------|-------|
-| 1 | Dashboard | Real-time event stream with sparkline |
+| 1 | Dashboard | Real-time event stream with sparkline and Braille heatmap |
 | 2 | Messages | Message browser with search and filtering |
 | 3 | Threads | Thread view with correlation |
 | 4 | Agents | Registered agents with activity indicators |
@@ -338,26 +329,30 @@ mcp-agent-mail-core          (config, models, errors, metrics)
 
 Key bindings: `?` help, `Ctrl+P` command palette, `m` toggle MCP/API, `Shift+T` cycle theme, `q` quit.
 
-### File Reservations for Multi-Agent Editing
+### Dual-Mode Interface
 
-Before editing, agents should reserve file paths to avoid conflicts:
+This project intentionally keeps **MCP server** and **CLI** command surfaces separate:
 
-| Area | Reserve glob |
-|------|-------------|
-| Core types/config | `crates/mcp-agent-mail-core/src/**` |
-| SQLite layer | `crates/mcp-agent-mail-db/src/**` |
-| Git archive | `crates/mcp-agent-mail-storage/src/**` |
-| Tool implementations | `crates/mcp-agent-mail-tools/src/**` |
-| TUI | `crates/mcp-agent-mail-server/src/tui_*.rs` |
-| CLI/launcher | `crates/mcp-agent-mail-cli/src/**`                |
+- **MCP server binary:** `mcp-agent-mail` (default: MCP stdio; `serve` for HTTP; `config` for debugging)
+- **CLI binary:** `am` (built by the `mcp-agent-mail-cli` crate)
 
-### Exit Codes
+| Mode | Behavior |
+|------|----------|
+| MCP (default) | CLI-only commands produce deterministic denial on stderr, exit code `2` |
+| CLI (`AM_INTERFACE_MODE=cli`) | MCP-only commands denied with guidance pointing to MCP mode |
 
-| Code | Meaning |
+### Core Types Quick Reference
+
+| Type | Purpose |
 |------|---------|
-| `0` | Success |
-| `1` | Runtime error (DB unreachable, tool failure, etc.) |
-| `2` | Usage error (wrong interface mode, invalid flags) |
+| `Project` | Project identity (slug, path, created_at) |
+| `Agent` | Agent registration (name, program, model, capabilities) |
+| `Message` | Envelope (from, to, cc, bcc, subject, thread_id, ack_required) |
+| `Thread` | Thread metadata (digest, message count, participants) |
+| `FileReservation` | Advisory file lock (paths, ttl, exclusive flag) |
+| `BuildSlot` | Worktree build slot lease (slot, agent, expires_ts) |
+| `ToolMetrics` | Per-tool latency percentiles and call counts |
+| `McpError` | Unified MCP error type across all crates |
 
 ### Configuration
 
@@ -377,16 +372,53 @@ All configuration via environment variables. Key variables:
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
 
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | Runtime error (DB unreachable, tool failure, etc.) |
+| `2` | Usage error (wrong interface mode, invalid flags) |
+
+### Key Design Decisions
+
+- **Git-backed archive** — all messages stored as files in Git for human auditability
+- **SQLite indexing** — WAL mode, PRAGMA tuning, connection pooling for fast queries
+- **Write-behind cache** — dual-indexed ReadCache with deferred touch batching (30s flush)
+- **Async git commit coalescer** — batches writes to avoid commit storms
+- **i64 microseconds** for all timestamps — no chrono NaiveDateTime in storage layer
+- **FTS5 full-text search** with sanitized queries, LIKE fallback for edge cases
+- **Conformance testing** against Python reference — ensures format parity
+- **Dual-mode interface** — MCP server and CLI share tools but enforce surface separation
+- **Advisory file reservations** — symmetric fnmatch with archive reading and rename handling
+- **Pre-commit guard** — enforces reservation compliance at `git commit` time
+- **asupersync exclusively** — NO tokio/reqwest/hyper. All async via `Cx` + structured concurrency
+- **Structured tracing** throughout — every tool call emits spans with latency
+- **Port discipline** — `127.0.0.1:8765` is canonical, must maintain Python parity
+
 ### Quick Start
 
 ```bash
-am serve-http                             # HTTP server with TUI on 127.0.0.1:8765
+am                                        # Auto-detect agents, configure MCP, start server + TUI
 am serve-http --path api                  # Use /api/ transport instead of /mcp/
 am serve-http --no-auth                   # Skip authentication (local dev)
 mcp-agent-mail serve --no-tui             # Headless server (no interactive TUI)
 mcp-agent-mail                            # stdio transport (for MCP client integration)
 am --help                                 # Full operator CLI
 ```
+
+### File Reservations for Multi-Agent Editing
+
+Before editing, agents should reserve file paths to avoid conflicts:
+
+| Area | Reserve glob |
+|------|-------------|
+| Core types/config | `crates/mcp-agent-mail-core/src/**` |
+| SQLite layer | `crates/mcp-agent-mail-db/src/**` |
+| Git archive | `crates/mcp-agent-mail-storage/src/**` |
+| Tool implementations | `crates/mcp-agent-mail-tools/src/**` |
+| TUI | `crates/mcp-agent-mail-server/src/tui_*.rs` |
+| CLI/launcher | `crates/mcp-agent-mail-cli/src/**` |
 
 ---
 
@@ -399,24 +431,6 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 - **Prevents conflicts:** Explicit file reservations (leases) for files/globs
 - **Token-efficient:** Messages stored in per-project archive, not in context
 - **Quick reads:** `resource://inbox/...`, `resource://thread/...`
-
-### Dual-Mode Reminder (MCP Server vs CLI)
-
-This project intentionally keeps **MCP server** and **CLI** command surfaces separate:
-
-- MCP server binary: `mcp-agent-mail` (default: MCP stdio; `serve` for HTTP; `config` for debugging)
-- CLI binary: `am` (built by the `mcp-agent-mail-cli` crate)
-
-If you accidentally run a CLI-only command via the MCP binary (e.g. `mcp-agent-mail share ...`),
-it should deny with a deterministic message and exit code `2` telling you to use the CLI.
-
-### Port Discipline During Migration (Critical)
-
-`127.0.0.1:8765` is the canonical Agent Mail endpoint used by local coding agents. Keep behavior stable on this port.
-
-- Do not run port-kill commands targeting `8765` (for example `fuser -k 8765/tcp`) unless the user explicitly requests it in this session.
-- If an Agent Mail server is already running on `8765`, reuse it instead of replacing it.
-- Any Rust-side change that affects externally observed behavior on `8765` must maintain Python parity or be treated as a bug.
 
 ### Same Repository Workflow
 
@@ -640,6 +654,33 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ---
 
+## RCH — Remote Compilation Helper
+
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
+
+To manually offload a build:
+```bash
+rch exec -- cargo build --release
+rch exec -- cargo test
+rch exec -- cargo clippy
+```
+
+Quick commands:
+```bash
+rch doctor                    # Health check
+rch workers probe --all       # Test connectivity to all 8 workers
+rch status                    # Overview of current state
+rch queue                     # See active/waiting builds
+```
+
+If rch or its workers are unavailable, it fails open — builds run locally as normal.
+
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+
+---
+
 ## ast-grep vs ripgrep
 
 **Use `ast-grep` when structure matters.** It parses code and matches AST nodes, ignoring comments/strings, and can **safely rewrite** code.
@@ -663,7 +704,7 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ```bash
 # Find structured code (ignores comments)
-ast-grep run -l Rust -p 'fn $NAME($$$ARGS) -> $RET { $$$BODY }'
+ast-grep run -l Rust -p 'fn $NAME($$ARGS) -> $RET { $$BODY }'
 
 # Find all unwrap() calls
 ast-grep run -l Rust -p '$EXPR.unwrap()'
@@ -689,8 +730,8 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 | Scenario | Tool | Why |
 |----------|------|-----|
-| "How is pattern matching implemented?" | `warp_grep` | Exploratory; don't know where to start |
-| "Where is the quick reject filter?" | `warp_grep` | Need to understand architecture |
+| "How does the file reservation system work?" | `warp_grep` | Exploratory; don't know where to start |
+| "Where is the commit coalescer implemented?" | `warp_grep` | Need to understand architecture |
 | "Find all uses of `Regex::new`" | `ripgrep` | Targeted literal search |
 | "Find files with `println!`" | `ripgrep` | Simple pattern |
 | "Replace all `unwrap()` with `expect()`" | `ast-grep` | Structural refactor |
@@ -779,32 +820,15 @@ git push                # Push to remote
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below.
 
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   br sync --flush-only    # Export beads to JSONL (no git ops)
-   git add .beads/         # Stage beads changes
-   git add <other files>   # Stage code changes
-   git commit -m "..."     # Commit everything
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+4. **Sync beads** - `br sync --flush-only` to export to JSONL
+5. **Hand off** - Provide context for next session
 
 
 ---

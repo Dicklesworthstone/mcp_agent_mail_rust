@@ -23,6 +23,7 @@ pub mod models;
 pub mod pool;
 pub mod queries;
 pub mod retry;
+pub mod s3fifo;
 pub mod schema;
 pub mod search_planner;
 pub mod search_recipes;

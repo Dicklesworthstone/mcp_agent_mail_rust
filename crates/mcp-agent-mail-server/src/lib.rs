@@ -45,10 +45,6 @@ pub mod tui_action_menu;
 pub mod tui_app;
 pub mod tui_bridge;
 pub mod tui_chrome;
-pub mod tui_events;
-pub mod tui_focus;
-pub mod tui_keymap;
-pub mod tui_layout;
 #[allow(
     clippy::doc_markdown,
     clippy::map_unwrap_or,
@@ -58,6 +54,11 @@ pub mod tui_layout;
     clippy::too_many_lines,
     clippy::cast_possible_truncation
 )]
+pub mod tui_decision;
+pub mod tui_events;
+pub mod tui_focus;
+pub mod tui_keymap;
+pub mod tui_layout;
 pub mod tui_macro;
 pub mod tui_markdown;
 pub mod tui_persist;

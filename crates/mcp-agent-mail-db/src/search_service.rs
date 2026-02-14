@@ -796,10 +796,19 @@ pub fn get_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
 /// avoiding the race condition where multiple threads could each create an expensive
 /// bridge instance before `OnceLock::set` silently drops the extras.
 #[cfg(feature = "hybrid")]
+fn get_or_init_two_tier_bridge_with<F>(
+    slot: &OnceLock<Option<Arc<TwoTierBridge>>>,
+    init: F,
+) -> Option<Arc<TwoTierBridge>>
+where
+    F: FnOnce() -> Option<Arc<TwoTierBridge>>,
+{
+    slot.get_or_init(init).clone()
+}
+
+#[cfg(feature = "hybrid")]
 fn get_or_init_two_tier_bridge() -> Option<Arc<TwoTierBridge>> {
-    TWO_TIER_BRIDGE
-        .get_or_init(|| Some(Arc::new(TwoTierBridge::new())))
-        .clone()
+    get_or_init_two_tier_bridge_with(&TWO_TIER_BRIDGE, || Some(Arc::new(TwoTierBridge::new())))
 }
 
 /// Try executing semantic candidate retrieval using two-tier system.
@@ -1732,6 +1741,99 @@ mod tests {
         let query = SearchQuery::messages("auto-init semantic bridge", 1);
         let _ = try_two_tier_search(&query, query.effective_limit());
         assert!(get_two_tier_bridge().is_some());
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn two_tier_test_bridge() -> Arc<TwoTierBridge> {
+        let config = mcp_agent_mail_search_core::TwoTierConfig::default();
+        Arc::new(TwoTierBridge {
+            index: std::sync::RwLock::new(mcp_agent_mail_search_core::TwoTierIndex::new(&config)),
+            config,
+        })
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn get_or_init_two_tier_bridge_initializes_once_under_contention() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let slot = Arc::new(OnceLock::<Option<Arc<TwoTierBridge>>>::new());
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let init_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let slot = Arc::clone(&slot);
+                let barrier = Arc::clone(&barrier);
+                let init_count = Arc::clone(&init_count);
+                thread::spawn(move || {
+                    barrier.wait();
+                    get_or_init_two_tier_bridge_with(slot.as_ref(), || {
+                        init_count.fetch_add(1, Ordering::Relaxed);
+                        Some(two_tier_test_bridge())
+                    })
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread should not panic"))
+            .collect();
+
+        assert!(
+            results.iter().all(Option::is_some),
+            "all threads should observe initialized bridge"
+        );
+
+        let first = results[0]
+            .as_ref()
+            .expect("first result should contain the shared bridge");
+        for maybe_bridge in &results[1..] {
+            let bridge = maybe_bridge
+                .as_ref()
+                .expect("every thread should see the shared bridge");
+            assert!(
+                Arc::ptr_eq(first, bridge),
+                "all threads should share one Arc"
+            );
+        }
+
+        assert_eq!(
+            init_count.load(Ordering::Relaxed),
+            1,
+            "initializer path (and init log) must run exactly once"
+        );
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn get_or_init_two_tier_bridge_caches_init_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let slot = OnceLock::<Option<Arc<TwoTierBridge>>>::new();
+        let init_count = AtomicUsize::new(0);
+
+        let first = get_or_init_two_tier_bridge_with(&slot, || {
+            init_count.fetch_add(1, Ordering::Relaxed);
+            None
+        });
+        let second = get_or_init_two_tier_bridge_with(&slot, || {
+            init_count.fetch_add(1, Ordering::Relaxed);
+            Some(two_tier_test_bridge())
+        });
+
+        assert!(first.is_none(), "first init failure should return None");
+        assert!(
+            second.is_none(),
+            "cached failure should remain None without rerunning initialization"
+        );
+        assert_eq!(
+            init_count.load(Ordering::Relaxed),
+            1,
+            "failure initializer should be executed once"
+        );
     }
 
     #[cfg(feature = "hybrid")]

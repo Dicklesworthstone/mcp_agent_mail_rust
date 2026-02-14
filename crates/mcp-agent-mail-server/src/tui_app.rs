@@ -4,10 +4,11 @@
 //! orchestrating screen switching, global keybindings, tick dispatch,
 //! and shared-state access.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ftui::Frame;
 use ftui::layout::Rect;
@@ -607,6 +608,12 @@ pub struct MailAppModel {
     /// Last non-high-contrast theme to restore after toggling HC off.
     last_non_hc_theme: ThemeId,
     screen_transition: Option<ScreenTransition>,
+    /// Bayesian diff strategy for frame rendering decisions.
+    diff_strategy: RefCell<crate::tui_decision::BayesianDiffStrategy>,
+    /// Whether a resize event was observed since the last view().
+    resize_detected: Cell<bool>,
+    /// Timestamp of last view() call for frame budget tracking.
+    last_view_instant: Cell<Option<Instant>>,
 }
 
 impl MailAppModel {
@@ -663,6 +670,9 @@ impl MailAppModel {
             action_menu: ActionMenuManager::new(),
             last_non_hc_theme,
             screen_transition: None,
+            diff_strategy: RefCell::new(crate::tui_decision::BayesianDiffStrategy::new()),
+            resize_detected: Cell::new(false),
+            last_view_instant: Cell::new(None),
         }
     }
 
@@ -1798,6 +1808,11 @@ impl Model for MailAppModel {
 
             // ── Terminal events (key, mouse, resize, etc.) ─────────
             MailMsg::Terminal(ref event) => {
+                // Track resize events for the Bayesian diff strategy.
+                if matches!(event, Event::Resize { .. }) {
+                    self.resize_detected.set(true);
+                }
+
                 // When the command palette is visible, route all events to it first.
                 if self.command_palette.is_visible() {
                     if let Some(action) = self.command_palette.handle_event(event) {
@@ -2061,6 +2076,45 @@ impl Model for MailAppModel {
 
     fn view(&self, frame: &mut Frame) {
         use crate::tui_chrome;
+        use crate::tui_decision::{DiffAction, FrameState};
+
+        // Compute frame budget from last view call.
+        let now = Instant::now();
+        let budget_remaining_ms = self
+            .last_view_instant
+            .get()
+            .map_or(16.0, |prev| {
+                let elapsed = now.duration_since(prev);
+                // Target: 16ms per frame (60 fps). Budget is what's left.
+                16.0_f64 - elapsed.as_secs_f64() * 1000.0
+            })
+            .max(0.0);
+        self.last_view_instant.set(Some(now));
+
+        // Bayesian diff strategy: observe frame state and decide action.
+        // change_ratio is 0.0 for stable frames; ftui does not expose
+        // per-frame cell diff counts, so we default to "stable" and let
+        // the resize flag and budget drive the posterior.
+        let frame_state = FrameState {
+            change_ratio: 0.0,
+            is_resize: self.resize_detected.get(),
+            budget_remaining_ms,
+            error_count: 0,
+        };
+        let diff_action = self.diff_strategy.borrow_mut().observe(&frame_state);
+        self.resize_detected.set(false);
+
+        // Act on the diff decision.
+        match diff_action {
+            DiffAction::Deferred => {
+                // Skip this frame entirely to allow recovery.
+                return;
+            }
+            DiffAction::Full | DiffAction::Incremental => {
+                // Both render fully; incremental is advisory for future
+                // differential rendering support in ftui.
+            }
+        }
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let chrome = tui_chrome::chrome_layout(area);
