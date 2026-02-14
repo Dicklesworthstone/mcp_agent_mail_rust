@@ -13,6 +13,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
+use ftui_extras::canvas::{Canvas, Mode, Painter};
 use ftui_extras::charts::{LineChart, Series};
 use ftui_extras::markdown::MarkdownTheme;
 use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
@@ -623,6 +624,7 @@ impl MailScreen for DashboardScreen {
                 trend_rect,
                 &self.percentile_history,
                 &self.throughput_history,
+                &self.event_log,
             );
         }
         if let Some(preview_rect) = comp.rect(PanelSlot::Footer) {
@@ -1015,22 +1017,32 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
     }
 }
 
-/// Render the trend/insight panel with percentile ribbon and throughput activity.
+/// Render the trend/insight panel with percentile ribbon, throughput chart, and activity heatmap.
 fn render_trend_panel(
     frame: &mut Frame<'_>,
     area: Rect,
     percentile_history: &[PercentileSample],
     throughput_history: &[f64],
+    event_log: &[EventEntry],
 ) {
     if area.width < 10 || area.height < 6 {
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    // Split vertically: top half = percentile ribbon, bottom half = throughput
-    let ribbon_h = area.height / 2;
-    let activity_h = area.height.saturating_sub(ribbon_h);
+
+    // Allocate vertical space: ribbon, throughput chart, and optional heatmap (br-18wct).
+    let heatmap_h = if area.height >= 18 { 6 } else { 0 };
+    let remaining = area.height.saturating_sub(heatmap_h);
+    let ribbon_h = remaining / 2;
+    let activity_h = remaining.saturating_sub(ribbon_h);
     let ribbon_area = Rect::new(area.x, area.y, area.width, ribbon_h);
     let activity_area = Rect::new(area.x, area.y + ribbon_h, area.width, activity_h);
+    let heatmap_area = Rect::new(
+        area.x,
+        area.y + ribbon_h + activity_h,
+        area.width,
+        heatmap_h,
+    );
 
     // Percentile ribbon
     if percentile_history.len() >= 2 {
@@ -1098,6 +1110,166 @@ fn render_trend_panel(
         Paragraph::new("Awaiting data...")
             .block(block)
             .render(activity_area, frame);
+    }
+
+    // Activity heatmap (br-18wct): Braille Canvas showing event density over time.
+    if heatmap_h > 0 {
+        render_activity_heatmap(frame, heatmap_area, event_log);
+    }
+}
+
+/// Number of distinct event kinds tracked for heatmap rows.
+const HEATMAP_EVENT_KINDS: usize = 11;
+
+/// Event kind labels for heatmap Y-axis (abbreviated).
+const HEATMAP_KIND_LABELS: [&str; HEATMAP_EVENT_KINDS] = [
+    "TlSt", "TlEn", "Send", "Recv", "RGnt", "RRel", "AReg", "HTTP", "Hlth", "SvUp", "SvDn",
+];
+
+/// Map a `MailEventKind` to its heatmap row index (0..10).
+const fn heatmap_kind_index(kind: MailEventKind) -> usize {
+    match kind {
+        MailEventKind::ToolCallStart => 0,
+        MailEventKind::ToolCallEnd => 1,
+        MailEventKind::MessageSent => 2,
+        MailEventKind::MessageReceived => 3,
+        MailEventKind::ReservationGranted => 4,
+        MailEventKind::ReservationReleased => 5,
+        MailEventKind::AgentRegistered => 6,
+        MailEventKind::HttpRequest => 7,
+        MailEventKind::HealthPulse => 8,
+        MailEventKind::ServerStarted => 9,
+        MailEventKind::ServerShutdown => 10,
+    }
+}
+
+/// Render a Braille-mode Canvas heatmap of event activity density.
+///
+/// X = time (bucketed into columns), Y = event kind, intensity = event count.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn render_activity_heatmap(frame: &mut Frame<'_>, area: Rect, event_log: &[EventEntry]) {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Activity Heatmap")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    if inner.width < 6 || inner.height < 2 || event_log.is_empty() {
+        return;
+    }
+
+    // Reserve 5 columns for Y-axis labels.
+    let label_w: u16 = 5;
+    let chart_area = Rect {
+        x: inner.x + label_w,
+        y: inner.y,
+        width: inner.width.saturating_sub(label_w),
+        height: inner.height,
+    };
+    if chart_area.width == 0 || chart_area.height == 0 {
+        return;
+    }
+
+    // Sub-pixel dimensions in Braille mode.
+    let px_w = chart_area.width as usize * Mode::Braille.cols_per_cell() as usize;
+    let px_h = chart_area.height as usize * Mode::Braille.rows_per_cell() as usize;
+
+    // Determine time range from events.
+    let ts_min = event_log
+        .iter()
+        .map(|e| e.timestamp_micros)
+        .min()
+        .unwrap_or(0);
+    let ts_max = event_log
+        .iter()
+        .map(|e| e.timestamp_micros)
+        .max()
+        .unwrap_or(0);
+    let ts_span = (ts_max - ts_min).max(1);
+
+    // Bucket events into a grid: columns = time buckets, rows = event kinds.
+    let num_cols = px_w;
+    let mut grid = vec![vec![0u32; num_cols]; HEATMAP_EVENT_KINDS];
+
+    for entry in event_log {
+        let col = ((entry.timestamp_micros - ts_min) as f64 / ts_span as f64
+            * (num_cols as f64 - 1.0)) as usize;
+        let col = col.min(num_cols - 1);
+        let row = heatmap_kind_index(entry.kind);
+        grid[row][col] += 1;
+    }
+
+    // Find max count for intensity normalization.
+    let max_count = grid
+        .iter()
+        .flat_map(|row| row.iter())
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    // Paint onto Braille Canvas.
+    let mut painter = Painter::for_area(chart_area, Mode::Braille);
+
+    // Map each kind to a vertical band of sub-pixels.
+    let row_height = px_h / HEATMAP_EVENT_KINDS;
+    if row_height == 0 {
+        return;
+    }
+
+    for (kind_idx, kind_row) in grid.iter().enumerate() {
+        let y_base = kind_idx * row_height;
+        for (col, &count) in kind_row.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let intensity = (f64::from(count) / f64::from(max_count)).sqrt();
+            let r = (50.0 + intensity * 205.0) as u8;
+            let g = (180.0 * (1.0 - intensity * 0.7)) as u8;
+            let b = (50.0 + intensity * 50.0) as u8;
+            let color = PackedRgba::rgb(r, g, b);
+
+            // Fill sub-pixel rows for this kind at this time column.
+            for dy in 0..row_height.min(3) {
+                painter.point_colored(col as i32, (y_base + dy) as i32, color);
+            }
+        }
+    }
+
+    let canvas = Canvas::from_painter(&painter);
+    canvas.render(chart_area, frame);
+
+    // Render Y-axis labels.
+    let label_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: label_w,
+        height: inner.height,
+    };
+    let lines_per_kind = inner.height as usize / HEATMAP_EVENT_KINDS;
+    if lines_per_kind > 0 {
+        for (i, &label) in HEATMAP_KIND_LABELS.iter().enumerate() {
+            let y_pos = label_area.y + (i * lines_per_kind) as u16;
+            if y_pos < label_area.y + label_area.height {
+                let text = Paragraph::new(label).style(Style::new().fg(tp.text_muted));
+                text.render(
+                    Rect {
+                        x: label_area.x,
+                        y: y_pos,
+                        width: label_w,
+                        height: 1,
+                    },
+                    frame,
+                );
+            }
+        }
     }
 }
 
