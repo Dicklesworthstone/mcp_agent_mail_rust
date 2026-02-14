@@ -4499,4 +4499,693 @@ mod tests {
         .state(MessageCardState::Expanded);
         render_perf(&widget, 80, 20, 500, 500);
     }
+
+    // ─── ChartDataProvider tests ──────────────────────────────────────
+
+    use crate::tui_events::{DbStatSnapshot, EventRingBuffer, EventSource, MailEvent};
+
+    /// Helper: create a `ToolCallEnd` event with an explicit timestamp.
+    fn tool_call_end_at(timestamp_micros: i64, duration_ms: u64) -> MailEvent {
+        MailEvent::ToolCallEnd {
+            seq: 0,
+            timestamp_micros,
+            source: EventSource::Tooling,
+            redacted: false,
+            tool_name: "test_tool".into(),
+            duration_ms,
+            result_preview: None,
+            queries: 0,
+            query_time_ms: 0.0,
+            per_table: vec![],
+            project: None,
+            agent: None,
+        }
+    }
+
+    /// Helper: create a `HealthPulse` event with an explicit timestamp.
+    fn health_pulse_at(
+        timestamp_micros: i64,
+        projects: u64,
+        agents: u64,
+        messages: u64,
+        reservations: u64,
+    ) -> MailEvent {
+        MailEvent::HealthPulse {
+            seq: 0,
+            timestamp_micros,
+            source: EventSource::Database,
+            redacted: false,
+            db_stats: DbStatSnapshot {
+                projects,
+                agents,
+                messages,
+                file_reservations: reservations,
+                contact_links: 0,
+                ack_pending: 0,
+                agents_list: vec![],
+                projects_list: vec![],
+                contacts_list: vec![],
+                timestamp_micros: 0,
+            },
+        }
+    }
+
+    /// Helper: create a `MessageSent` event with an explicit timestamp.
+    fn message_sent_at(timestamp_micros: i64) -> MailEvent {
+        MailEvent::MessageSent {
+            seq: 0,
+            timestamp_micros,
+            source: EventSource::Mail,
+            redacted: false,
+            id: 1,
+            from: "A".into(),
+            to: vec!["B".into()],
+            subject: "test".into(),
+            thread_id: "t1".into(),
+            project: "p1".into(),
+        }
+    }
+
+    /// Helper: create an `AgentRegistered` event with an explicit timestamp.
+    fn agent_registered_at(timestamp_micros: i64) -> MailEvent {
+        MailEvent::AgentRegistered {
+            seq: 0,
+            timestamp_micros,
+            source: EventSource::Lifecycle,
+            redacted: false,
+            name: "TestAgent".into(),
+            program: "test".into(),
+            model_name: "test".into(),
+            project: "p1".into(),
+        }
+    }
+
+    // ─── Granularity tests ────────────────────────────────────────────
+
+    #[test]
+    fn granularity_bucket_micros_values() {
+        assert_eq!(Granularity::OneSecond.bucket_micros(), 1_000_000);
+        assert_eq!(Granularity::FiveSeconds.bucket_micros(), 5_000_000);
+        assert_eq!(Granularity::ThirtySeconds.bucket_micros(), 30_000_000);
+        assert_eq!(Granularity::OneMinute.bucket_micros(), 60_000_000);
+        assert_eq!(Granularity::FiveMinutes.bucket_micros(), 300_000_000);
+    }
+
+    #[test]
+    fn granularity_as_duration_roundtrips() {
+        for g in [
+            Granularity::OneSecond,
+            Granularity::FiveSeconds,
+            Granularity::ThirtySeconds,
+            Granularity::OneMinute,
+            Granularity::FiveMinutes,
+        ] {
+            let d = g.as_duration();
+            let micros = duration_to_micros_i64(d);
+            assert_eq!(micros, g.bucket_micros(), "roundtrip for {g:?}");
+        }
+    }
+
+    // ─── AggregatedTimeSeries tests ───────────────────────────────────
+
+    #[test]
+    fn aggregated_series_empty_y_range() {
+        let series = AggregatedTimeSeries::new(Granularity::OneSecond, 1);
+        let (lo, hi) = series.y_range();
+        assert_eq!(lo, 0.0);
+        assert_eq!(hi, 1.0);
+    }
+
+    #[test]
+    fn aggregated_series_y_range_with_data() {
+        let mut series = AggregatedTimeSeries::new(Granularity::OneSecond, 2);
+        series.buckets.push((1_000_000, vec![3.0, 7.0]));
+        series.buckets.push((2_000_000, vec![1.0, 10.0]));
+        let (lo, hi) = series.y_range();
+        assert!((lo - 1.0).abs() < f64::EPSILON);
+        assert!((hi - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn aggregated_series_trim_to_window() {
+        let mut series = AggregatedTimeSeries::new(Granularity::OneSecond, 1);
+        // 5 buckets at 1s intervals
+        for i in 0..5 {
+            let ts = (i + 1) * 1_000_000;
+            series.buckets.push((ts, vec![1.0]));
+        }
+        assert_eq!(series.buckets.len(), 5);
+        // Trim to 3s window: cutoff = 5M - 3M = 2M, keeps buckets >= 2M
+        series.trim_to_window(Duration::from_secs(3));
+        assert_eq!(
+            series.buckets.len(),
+            4,
+            "should keep 4 buckets (2M..5M), got {}",
+            series.buckets.len()
+        );
+        assert_eq!(
+            series.buckets[0].0, 2_000_000,
+            "earliest bucket should be 2M, got {}",
+            series.buckets[0].0
+        );
+    }
+
+    #[test]
+    fn aggregated_series_trim_empty_is_noop() {
+        let mut series = AggregatedTimeSeries::new(Granularity::OneSecond, 1);
+        series.trim_to_window(Duration::from_secs(10));
+        assert!(series.buckets.is_empty());
+    }
+
+    #[test]
+    fn aggregated_series_as_xy_maps_correctly() {
+        let mut series = AggregatedTimeSeries::new(Granularity::OneSecond, 2);
+        series.buckets.push((10_000_000, vec![5.0, 8.0]));
+        series.buckets.push((11_000_000, vec![6.0, 9.0]));
+        let reference = 12_000_000;
+        let xy0 = series.series_as_xy(0, reference);
+        let xy1 = series.series_as_xy(1, reference);
+        assert_eq!(xy0.len(), 2);
+        assert_eq!(xy1.len(), 2);
+        // First point: (10M - 12M) / 1M = -2.0 seconds
+        assert!((xy0[0].0 - (-2.0)).abs() < 0.01);
+        assert!((xy0[0].1 - 5.0).abs() < f64::EPSILON);
+        // Second point: (11M - 12M) / 1M = -1.0 seconds
+        assert!((xy0[1].0 - (-1.0)).abs() < 0.01);
+        assert!((xy0[1].1 - 6.0).abs() < f64::EPSILON);
+    }
+
+    // ─── ThroughputProvider tests ─────────────────────────────────────
+
+    #[test]
+    fn throughput_empty_buffer_returns_no_data() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        let mut provider =
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        assert_eq!(provider.series_count(), 1);
+        assert_eq!(provider.series_label(0), "calls/sec");
+        let points = provider.data_points(0, Duration::from_secs(60));
+        assert!(points.is_empty());
+        let (lo, hi) = provider.y_range();
+        assert_eq!(lo, 0.0);
+        assert_eq!(hi, 1.0);
+    }
+
+    #[test]
+    fn throughput_single_event() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(tool_call_end_at(5_000_000, 10));
+        let mut provider =
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let points = provider.data_points(0, Duration::from_secs(60));
+        assert_eq!(points.len(), 1);
+        assert!(
+            (points[0].1 - 1.0).abs() < f64::EPSILON,
+            "single event = 1 call"
+        );
+    }
+
+    #[test]
+    fn throughput_multiple_events_same_bucket() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        // Three events in the same 1-second bucket (5s - 5.999s)
+        ring.push(tool_call_end_at(5_000_000, 10));
+        ring.push(tool_call_end_at(5_200_000, 20));
+        ring.push(tool_call_end_at(5_800_000, 30));
+        let mut provider =
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let points = provider.data_points(0, Duration::from_secs(60));
+        assert_eq!(points.len(), 1);
+        assert!(
+            (points[0].1 - 3.0).abs() < f64::EPSILON,
+            "3 events in same bucket = 3.0"
+        );
+    }
+
+    #[test]
+    fn throughput_multiple_buckets() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        // Events in two different 1-second buckets
+        ring.push(tool_call_end_at(1_000_000, 10));
+        ring.push(tool_call_end_at(1_500_000, 10));
+        ring.push(tool_call_end_at(3_000_000, 10));
+        let mut provider =
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let points = provider.data_points(0, Duration::from_secs(60));
+        // Should have bucket at 1M (count=2), gap at 2M (count=0), bucket at 3M (count=1)
+        assert!(
+            points.len() >= 2,
+            "should have multiple buckets, got {}",
+            points.len()
+        );
+    }
+
+    #[test]
+    fn throughput_ignores_non_toolcallend_events() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(message_sent_at(1_000_000));
+        ring.push(agent_registered_at(2_000_000));
+        let mut provider =
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let points = provider.data_points(0, Duration::from_secs(60));
+        assert!(
+            points.is_empty(),
+            "non-ToolCallEnd events should be ignored"
+        );
+    }
+
+    #[test]
+    fn throughput_incremental_refresh() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(tool_call_end_at(1_000_000, 10));
+        let mut provider = ThroughputProvider::new(
+            ring.clone(),
+            Granularity::OneSecond,
+            Duration::from_secs(60),
+        );
+        provider.refresh();
+        let points1 = provider.data_points(0, Duration::from_secs(60));
+        assert_eq!(points1.len(), 1);
+
+        // Push more events and refresh again
+        ring.push(tool_call_end_at(5_000_000, 20));
+        provider.refresh();
+        let points2 = provider.data_points(0, Duration::from_secs(60));
+        assert!(
+            points2.len() > points1.len(),
+            "incremental refresh should add new data"
+        );
+    }
+
+    #[test]
+    fn throughput_gap_filling() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        // Events 3 seconds apart should create gap-filled zero buckets
+        ring.push(tool_call_end_at(1_000_000, 10));
+        ring.push(tool_call_end_at(4_000_000, 10));
+        let mut provider =
+            ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        // Should have buckets at 1M, 2M (gap=0), 3M (gap=0), 4M
+        let points = provider.data_points(0, Duration::from_secs(60));
+        assert!(
+            points.len() >= 4,
+            "should have gap-filled buckets, got {}",
+            points.len()
+        );
+        // Verify gap buckets have value 0.0
+        let zero_count = points.iter().filter(|(_, v)| *v == 0.0).count();
+        assert!(zero_count >= 2, "should have at least 2 zero-gap buckets");
+    }
+
+    // ─── LatencyProvider tests ────────────────────────────────────────
+
+    #[test]
+    fn latency_empty_buffer() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        let mut provider =
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        assert_eq!(provider.series_count(), 3);
+        assert_eq!(provider.series_label(0), "P50");
+        assert_eq!(provider.series_label(1), "P95");
+        assert_eq!(provider.series_label(2), "P99");
+        let points = provider.data_points(0, Duration::from_secs(60));
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn latency_single_sample_all_percentiles_equal() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(tool_call_end_at(1_000_000, 42));
+        let mut provider =
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let p50 = provider.data_points(0, Duration::from_secs(60));
+        let p95 = provider.data_points(1, Duration::from_secs(60));
+        let p99 = provider.data_points(2, Duration::from_secs(60));
+        assert_eq!(p50.len(), 1);
+        assert!((p50[0].1 - 42.0).abs() < f64::EPSILON);
+        assert!((p95[0].1 - 42.0).abs() < f64::EPSILON);
+        assert!((p99[0].1 - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn latency_percentile_computation_known_distribution() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(200));
+        // Push 100 events in same bucket: durations 1ms through 100ms
+        for i in 1..=100 {
+            ring.push(tool_call_end_at(1_000_000, i));
+        }
+        let mut provider =
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let p50 = provider.data_points(0, Duration::from_secs(60));
+        let p95 = provider.data_points(1, Duration::from_secs(60));
+        let p99 = provider.data_points(2, Duration::from_secs(60));
+        assert_eq!(p50.len(), 1);
+        // P50 should be ~50, P95 ~95, P99 ~99
+        assert!(
+            (p50[0].1 - 50.5).abs() < 1.5,
+            "P50 should be ~50.5, got {}",
+            p50[0].1
+        );
+        assert!(
+            (p95[0].1 - 95.0).abs() < 2.0,
+            "P95 should be ~95, got {}",
+            p95[0].1
+        );
+        assert!(
+            (p99[0].1 - 99.0).abs() < 2.0,
+            "P99 should be ~99, got {}",
+            p99[0].1
+        );
+    }
+
+    #[test]
+    fn latency_zero_duration_handled() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(tool_call_end_at(1_000_000, 0));
+        let mut provider =
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let p50 = provider.data_points(0, Duration::from_secs(60));
+        assert_eq!(p50.len(), 1);
+        assert!((p50[0].1).abs() < f64::EPSILON, "zero duration = P50 of 0");
+    }
+
+    #[test]
+    fn latency_large_variance() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        // Mix of very fast and very slow calls
+        ring.push(tool_call_end_at(1_000_000, 1));
+        ring.push(tool_call_end_at(1_100_000, 1));
+        ring.push(tool_call_end_at(1_200_000, 10_000));
+        let mut provider =
+            LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let p50 = provider.data_points(0, Duration::from_secs(60));
+        let p99 = provider.data_points(2, Duration::from_secs(60));
+        assert!(p50[0].1 < p99[0].1, "P50 should be less than P99");
+    }
+
+    #[test]
+    fn latency_percentile_helper_edge_cases() {
+        // Empty
+        assert!((LatencyProvider::percentile(&[], 0.5)).abs() < f64::EPSILON);
+        // Single element
+        assert!((LatencyProvider::percentile(&[7.0], 0.5) - 7.0).abs() < f64::EPSILON);
+        assert!((LatencyProvider::percentile(&[7.0], 0.99) - 7.0).abs() < f64::EPSILON);
+        // Two elements
+        let p50 = LatencyProvider::percentile(&[10.0, 20.0], 0.5);
+        assert!(
+            (p50 - 15.0).abs() < f64::EPSILON,
+            "P50 of [10,20] should be 15, got {p50}"
+        );
+    }
+
+    // ─── ResourceProvider tests ───────────────────────────────────────
+
+    #[test]
+    fn resource_empty_buffer() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        let mut provider =
+            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        assert_eq!(provider.series_count(), 4);
+        assert_eq!(provider.series_label(0), "projects");
+        assert_eq!(provider.series_label(1), "agents");
+        assert_eq!(provider.series_label(2), "messages");
+        assert_eq!(provider.series_label(3), "reservations");
+        for i in 0..4 {
+            assert!(provider.data_points(i, Duration::from_secs(60)).is_empty());
+        }
+    }
+
+    #[test]
+    fn resource_single_pulse() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(health_pulse_at(1_000_000, 3, 5, 100, 2));
+        let mut provider =
+            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let projects = provider.data_points(0, Duration::from_secs(60));
+        let agents = provider.data_points(1, Duration::from_secs(60));
+        let messages = provider.data_points(2, Duration::from_secs(60));
+        let reservations = provider.data_points(3, Duration::from_secs(60));
+        assert_eq!(projects.len(), 1);
+        assert!((projects[0].1 - 3.0).abs() < f64::EPSILON);
+        assert!((agents[0].1 - 5.0).abs() < f64::EPSILON);
+        assert!((messages[0].1 - 100.0).abs() < f64::EPSILON);
+        assert!((reservations[0].1 - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resource_last_pulse_wins_in_bucket() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        // Two pulses in same bucket — last should win
+        ring.push(health_pulse_at(1_000_000, 1, 1, 1, 1));
+        ring.push(health_pulse_at(1_500_000, 10, 20, 30, 40));
+        let mut provider =
+            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let projects = provider.data_points(0, Duration::from_secs(60));
+        assert_eq!(projects.len(), 1);
+        assert!(
+            (projects[0].1 - 10.0).abs() < f64::EPSILON,
+            "last pulse should overwrite, got {}",
+            projects[0].1
+        );
+    }
+
+    #[test]
+    fn resource_ignores_non_health_events() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(tool_call_end_at(1_000_000, 10));
+        ring.push(message_sent_at(2_000_000));
+        let mut provider =
+            ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        for i in 0..4 {
+            assert!(
+                provider.data_points(i, Duration::from_secs(60)).is_empty(),
+                "series {i} should be empty for non-health events"
+            );
+        }
+    }
+
+    // ─── EventHeatmapProvider tests ───────────────────────────────────
+
+    #[test]
+    fn heatmap_provider_empty_buffer() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        let mut provider =
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        assert_eq!(provider.series_count(), EVENT_KIND_COUNT);
+        let (cols, rows, grid) = provider.heatmap_grid();
+        assert_eq!(cols, 0);
+        assert_eq!(rows, EVENT_KIND_COUNT);
+        assert_eq!(grid.len(), EVENT_KIND_COUNT);
+    }
+
+    #[test]
+    fn heatmap_provider_event_kind_labels() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        let provider =
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        assert_eq!(provider.series_label(0), "ToolStart");
+        assert_eq!(provider.series_label(1), "ToolEnd");
+        assert_eq!(provider.series_label(2), "MsgSent");
+        assert_eq!(provider.series_label(3), "MsgRecv");
+        assert_eq!(provider.series_label(EVENT_KIND_COUNT), "???");
+    }
+
+    #[test]
+    fn heatmap_provider_counts_by_kind() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        // Push events of different kinds in the same bucket
+        ring.push(tool_call_end_at(1_000_000, 10));
+        ring.push(tool_call_end_at(1_100_000, 20));
+        ring.push(message_sent_at(1_200_000));
+        let mut provider =
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let (cols, rows, grid) = provider.heatmap_grid();
+        assert_eq!(cols, 1);
+        assert_eq!(rows, EVENT_KIND_COUNT);
+        // ToolCallEnd is kind index 1, should have count 2
+        assert!(
+            (grid[1][0] - 2.0).abs() < f64::EPSILON,
+            "ToolEnd should have 2 events, got {}",
+            grid[1][0]
+        );
+        // MessageSent is kind index 2, should have count 1
+        assert!(
+            (grid[2][0] - 1.0).abs() < f64::EPSILON,
+            "MsgSent should have 1 event, got {}",
+            grid[2][0]
+        );
+        // Other kinds should be 0
+        assert!((grid[0][0]).abs() < f64::EPSILON, "ToolStart should be 0");
+    }
+
+    #[test]
+    fn heatmap_provider_multiple_buckets() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(tool_call_end_at(1_000_000, 10));
+        ring.push(message_sent_at(3_000_000));
+        let mut provider =
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let (cols, _rows, grid) = provider.heatmap_grid();
+        // Should have buckets at 1M, 2M (gap), 3M = 3 columns
+        assert!(
+            cols >= 2,
+            "should have multiple columns for different timestamps, got {cols}"
+        );
+        // Check that events land in correct columns
+        let tool_end_total: f64 = grid[1].iter().sum();
+        let msg_sent_total: f64 = grid[2].iter().sum();
+        assert!((tool_end_total - 1.0).abs() < f64::EPSILON);
+        assert!((msg_sent_total - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn heatmap_provider_gap_filling() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        // Events 3 seconds apart
+        ring.push(agent_registered_at(1_000_000));
+        ring.push(agent_registered_at(4_000_000));
+        let mut provider =
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+        provider.refresh();
+        let (cols, _rows, grid) = provider.heatmap_grid();
+        // Should have 4 columns: 1M, 2M (gap), 3M (gap), 4M
+        assert!(cols >= 4, "should gap-fill between timestamps, got {cols}");
+        // AgentRegistered is kind index 6
+        let total: f64 = grid[6].iter().sum();
+        assert!(
+            (total - 2.0).abs() < f64::EPSILON,
+            "should have exactly 2 AgentRegistered events total"
+        );
+    }
+
+    #[test]
+    fn heatmap_provider_all_11_event_kinds_mapped() {
+        // Verify EVENT_KINDS has all 11 variants
+        assert_eq!(EVENT_KINDS.len(), 11);
+        assert_eq!(EVENT_KIND_LABELS.len(), 11);
+        // Verify each kind maps to a unique index
+        for (i, kind) in EVENT_KINDS.iter().enumerate() {
+            assert_eq!(
+                EventHeatmapProvider::kind_index(*kind),
+                i,
+                "kind {kind:?} should map to index {i}"
+            );
+        }
+    }
+
+    // ─── Cross-provider tests ─────────────────────────────────────────
+
+    #[test]
+    fn providers_share_ring_buffer() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        ring.push(tool_call_end_at(1_000_000, 50));
+        ring.push(health_pulse_at(1_000_000, 2, 4, 10, 1));
+
+        let mut throughput = ThroughputProvider::new(
+            ring.clone(),
+            Granularity::OneSecond,
+            Duration::from_secs(60),
+        );
+        let mut latency = LatencyProvider::new(
+            ring.clone(),
+            Granularity::OneSecond,
+            Duration::from_secs(60),
+        );
+        let mut resource = ResourceProvider::new(
+            ring.clone(),
+            Granularity::OneSecond,
+            Duration::from_secs(60),
+        );
+        let mut heatmap =
+            EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
+
+        throughput.refresh();
+        latency.refresh();
+        resource.refresh();
+        heatmap.refresh();
+
+        // Each provider should have processed its relevant events
+        assert_eq!(throughput.data_points(0, Duration::from_secs(60)).len(), 1);
+        assert_eq!(latency.data_points(0, Duration::from_secs(60)).len(), 1);
+        assert_eq!(resource.data_points(0, Duration::from_secs(60)).len(), 1);
+        // Heatmap has a bucket for the timestamp, so all series return 1 point.
+        // ToolStart (idx 0) should have value 0.0, ToolEnd (idx 1) should have value 1.0.
+        let ts_points = heatmap.data_points(0, Duration::from_secs(60));
+        assert_eq!(ts_points.len(), 1);
+        assert!(
+            (ts_points[0].1).abs() < f64::EPSILON,
+            "ToolStart count should be 0"
+        );
+        let te_points = heatmap.data_points(1, Duration::from_secs(60));
+        assert_eq!(te_points.len(), 1);
+        assert!(
+            (te_points[0].1 - 1.0).abs() < f64::EPSILON,
+            "ToolEnd count should be 1"
+        );
+    }
+
+    #[test]
+    fn windowed_xy_filters_by_cutoff() {
+        let buckets = vec![
+            (1_000_000i64, vec![10.0]),
+            (2_000_000, vec![20.0]),
+            (3_000_000, vec![30.0]),
+            (4_000_000, vec![40.0]),
+        ];
+        let reference = 5_000_000;
+        let cutoff = 3_000_000; // only keep buckets >= 3M
+        let result = windowed_xy(&buckets, 0, reference, cutoff);
+        assert_eq!(result.len(), 2);
+        assert!((result[0].1 - 30.0).abs() < f64::EPSILON);
+        assert!((result[1].1 - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn duration_to_micros_saturates_at_max() {
+        let huge = Duration::from_secs(u64::MAX);
+        let micros = duration_to_micros_i64(huge);
+        assert_eq!(micros, i64::MAX);
+    }
+
+    #[test]
+    fn five_second_granularity_bucketing() {
+        let ring = Arc::new(EventRingBuffer::with_capacity(100));
+        // Events within the same 5-second bucket
+        ring.push(tool_call_end_at(5_000_000, 10));
+        ring.push(tool_call_end_at(7_000_000, 20));
+        ring.push(tool_call_end_at(9_999_999, 30));
+        // Event in next 5-second bucket
+        ring.push(tool_call_end_at(10_000_000, 40));
+        let mut provider =
+            ThroughputProvider::new(ring, Granularity::FiveSeconds, Duration::from_secs(300));
+        provider.refresh();
+        let points = provider.data_points(0, Duration::from_secs(300));
+        assert_eq!(points.len(), 2, "should have 2 five-second buckets");
+        assert!(
+            (points[0].1 - 3.0).abs() < f64::EPSILON,
+            "first bucket should have 3 events"
+        );
+        assert!(
+            (points[1].1 - 1.0).abs() < f64::EPSILON,
+            "second bucket should have 1 event"
+        );
+    }
 }
