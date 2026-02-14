@@ -261,7 +261,7 @@ impl MailScreen for ProjectsScreen {
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .highlight_style({ Style::default().fg(tp.selection_fg).bg(tp.selection_bg) });
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, table_area, frame, &mut ts);

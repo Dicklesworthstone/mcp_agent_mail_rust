@@ -90,8 +90,10 @@ pub use fusion::{
     SourceContribution, fuse_rrf, fuse_rrf_default,
 };
 pub use hybrid_candidates::{
-    CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, CandidatePreparation,
-    CandidateSource, CandidateStageCounts, PreparedCandidate, QueryClass, prepare_candidates,
+    CandidateActionLoss, CandidateBudget, CandidateBudgetAction, CandidateBudgetConfig,
+    CandidateBudgetDecision, CandidateBudgetDerivation, CandidateHit, CandidateMode,
+    CandidatePreparation, CandidateSource, CandidateStageCounts, CandidateStatePosterior,
+    PreparedCandidate, QueryClass, prepare_candidates,
 };
 pub use lexical_parser::{
     AppliedFilterHint, DidYouMeanHint, QueryAssistance, SanitizedQuery, extract_terms,

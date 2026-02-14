@@ -137,6 +137,88 @@ pub struct CandidateBudget {
     pub combined_limit: usize,
 }
 
+/// Action chosen by the decision-theoretic budget controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateBudgetAction {
+    /// Favor lexical recall/precision and limit semantic spend.
+    LexicalDominant,
+    /// Keep lexical and semantic pools close to parity.
+    Balanced,
+    /// Favor semantic retrieval for natural-language intent.
+    SemanticDominant,
+    /// Disable semantic candidate retrieval.
+    LexicalOnly,
+}
+
+/// Posterior belief over coarse query-intent states.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CandidateStatePosterior {
+    /// Probability query intent is identifier-driven.
+    pub identifier: f64,
+    /// Probability query intent is short keyword-driven.
+    pub short_keyword: f64,
+    /// Probability query intent is natural-language driven.
+    pub natural_language: f64,
+    /// Probability query intent is effectively empty.
+    pub empty: f64,
+}
+
+impl CandidateStatePosterior {
+    fn normalized(identifier: f64, short_keyword: f64, natural_language: f64, empty: f64) -> Self {
+        let total = identifier + short_keyword + natural_language + empty;
+        if total <= f64::EPSILON {
+            return Self {
+                identifier: 0.25,
+                short_keyword: 0.25,
+                natural_language: 0.25,
+                empty: 0.25,
+            };
+        }
+        Self {
+            identifier: identifier / total,
+            short_keyword: short_keyword / total,
+            natural_language: natural_language / total,
+            empty: empty / total,
+        }
+    }
+}
+
+/// Expected loss for one candidate-budget action.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CandidateActionLoss {
+    /// Action being evaluated.
+    pub action: CandidateBudgetAction,
+    /// Expected loss under the current posterior.
+    pub expected_loss: f64,
+}
+
+/// Explainable decision payload for budget derivation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateBudgetDecision {
+    /// Retrieval mode requested by caller.
+    pub mode: CandidateMode,
+    /// Query class used by orchestration.
+    pub query_class: QueryClass,
+    /// Posterior over intent states used for expected-loss minimization.
+    pub posterior: CandidateStatePosterior,
+    /// Expected loss for each candidate action.
+    pub action_losses: [CandidateActionLoss; 4],
+    /// Action with minimum expected loss.
+    pub chosen_action: CandidateBudgetAction,
+    /// Minimum expected loss achieved by `chosen_action`.
+    pub chosen_expected_loss: f64,
+}
+
+/// Full derivation payload: budget plus decision explanation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateBudgetDerivation {
+    /// Derived budget used by orchestration.
+    pub budget: CandidateBudget,
+    /// Decision evidence that explains why this budget was chosen.
+    pub decision: CandidateBudgetDecision,
+}
+
 impl CandidateBudget {
     /// Derive stage budgets from request limit, mode, query class, and config.
     #[must_use]
@@ -146,8 +228,20 @@ impl CandidateBudget {
         query_class: QueryClass,
         config: CandidateBudgetConfig,
     ) -> Self {
+        Self::derive_with_decision(requested_limit, mode, query_class, config).budget
+    }
+
+    /// Derive stage budgets and an explainable decision payload.
+    #[must_use]
+    pub fn derive_with_decision(
+        requested_limit: usize,
+        mode: CandidateMode,
+        query_class: QueryClass,
+        config: CandidateBudgetConfig,
+    ) -> CandidateBudgetDerivation {
         const SCALE: u64 = 100;
         let requested_limit = requested_limit.clamp(1, 1_000);
+        let decision = derive_budget_decision(mode, query_class);
 
         let (base_lexical_bps, base_semantic_bps) = match mode {
             CandidateMode::Hybrid => (config.hybrid_lexical_bps, config.hybrid_semantic_bps),
@@ -183,11 +277,146 @@ impl CandidateBudget {
             .max(lexical_limit.saturating_add(semantic_limit))
             .min(config.max_combined);
 
-        Self {
-            lexical_limit,
-            semantic_limit,
-            combined_limit,
+        CandidateBudgetDerivation {
+            budget: Self {
+                lexical_limit,
+                semantic_limit,
+                combined_limit,
+            },
+            decision,
         }
+    }
+}
+
+fn derive_budget_decision(mode: CandidateMode, query_class: QueryClass) -> CandidateBudgetDecision {
+    let posterior = derive_state_posterior(mode, query_class);
+    let action_losses = evaluate_action_losses(posterior);
+    let chosen = action_losses
+        .iter()
+        .copied()
+        .min_by(|left, right| {
+            left.expected_loss
+                .partial_cmp(&right.expected_loss)
+                .unwrap_or(Ordering::Equal)
+        })
+        .unwrap_or(action_losses[0]);
+
+    CandidateBudgetDecision {
+        mode,
+        query_class,
+        posterior,
+        action_losses,
+        chosen_action: chosen.action,
+        chosen_expected_loss: chosen.expected_loss,
+    }
+}
+
+fn derive_state_posterior(mode: CandidateMode, query_class: QueryClass) -> CandidateStatePosterior {
+    let mut identifier = 1.0;
+    let mut short_keyword = 1.0;
+    let mut natural_language = 1.0;
+    let mut empty = 1.0;
+
+    match query_class {
+        QueryClass::Identifier => {
+            identifier += 8.0;
+            short_keyword += 1.0;
+            natural_language += 0.2;
+        }
+        QueryClass::ShortKeyword => {
+            short_keyword += 7.0;
+            identifier += 1.2;
+            natural_language += 0.6;
+        }
+        QueryClass::NaturalLanguage => {
+            natural_language += 8.0;
+            short_keyword += 0.8;
+            identifier += 0.4;
+        }
+        QueryClass::Empty => {
+            empty += 9.0;
+        }
+    }
+
+    match mode {
+        CandidateMode::Hybrid => {
+            natural_language += 0.8;
+            short_keyword += 0.2;
+        }
+        CandidateMode::Auto => {
+            short_keyword += 0.4;
+            natural_language += 0.4;
+            identifier += 0.2;
+        }
+        CandidateMode::LexicalFallback => {
+            identifier += 0.8;
+            short_keyword += 0.6;
+            empty += 0.4;
+        }
+    }
+
+    CandidateStatePosterior::normalized(identifier, short_keyword, natural_language, empty)
+}
+
+fn evaluate_action_losses(posterior: CandidateStatePosterior) -> [CandidateActionLoss; 4] {
+    [
+        CandidateActionLoss {
+            action: CandidateBudgetAction::LexicalDominant,
+            expected_loss: expected_loss(CandidateBudgetAction::LexicalDominant, posterior),
+        },
+        CandidateActionLoss {
+            action: CandidateBudgetAction::Balanced,
+            expected_loss: expected_loss(CandidateBudgetAction::Balanced, posterior),
+        },
+        CandidateActionLoss {
+            action: CandidateBudgetAction::SemanticDominant,
+            expected_loss: expected_loss(CandidateBudgetAction::SemanticDominant, posterior),
+        },
+        CandidateActionLoss {
+            action: CandidateBudgetAction::LexicalOnly,
+            expected_loss: expected_loss(CandidateBudgetAction::LexicalOnly, posterior),
+        },
+    ]
+}
+
+fn expected_loss(action: CandidateBudgetAction, posterior: CandidateStatePosterior) -> f64 {
+    match action {
+        CandidateBudgetAction::LexicalDominant => posterior.empty.mul_add(
+            2.0,
+            posterior.natural_language.mul_add(
+                7.0,
+                posterior
+                    .identifier
+                    .mul_add(1.0, posterior.short_keyword * 2.0),
+            ),
+        ),
+        CandidateBudgetAction::Balanced => posterior.empty.mul_add(
+            5.0,
+            posterior.natural_language.mul_add(
+                2.0,
+                posterior
+                    .identifier
+                    .mul_add(3.0, posterior.short_keyword * 1.0),
+            ),
+        ),
+        CandidateBudgetAction::SemanticDominant => posterior.empty.mul_add(
+            8.0,
+            posterior.natural_language.mul_add(
+                1.0,
+                posterior
+                    .identifier
+                    .mul_add(10.0, posterior.short_keyword * 4.0),
+            ),
+        ),
+        CandidateBudgetAction::LexicalOnly => posterior.empty.mul_add(
+            1.0,
+            posterior.natural_language.mul_add(
+                9.0,
+                posterior
+                    .identifier
+                    .mul_add(2.0, posterior.short_keyword * 5.0),
+            ),
+        ),
     }
 }
 
@@ -431,6 +660,68 @@ mod tests {
         assert!(hybrid.semantic_limit > auto.semantic_limit);
         assert!(fallback.lexical_limit >= auto.lexical_limit);
         assert_eq!(fallback.semantic_limit, 0);
+    }
+
+    #[test]
+    fn derive_with_decision_keeps_derive_isomorphic() {
+        let config = CandidateBudgetConfig::default();
+        for mode in [
+            CandidateMode::Hybrid,
+            CandidateMode::Auto,
+            CandidateMode::LexicalFallback,
+        ] {
+            for class in [
+                QueryClass::Identifier,
+                QueryClass::ShortKeyword,
+                QueryClass::NaturalLanguage,
+                QueryClass::Empty,
+            ] {
+                let direct = CandidateBudget::derive(64, mode, class, config);
+                let explained = CandidateBudget::derive_with_decision(64, mode, class, config);
+                assert_eq!(direct, explained.budget);
+            }
+        }
+    }
+
+    #[test]
+    fn derive_with_decision_posterior_is_normalized() {
+        let config = CandidateBudgetConfig::default();
+        let derivation = CandidateBudget::derive_with_decision(
+            50,
+            CandidateMode::Hybrid,
+            QueryClass::NaturalLanguage,
+            config,
+        );
+        let posterior = derivation.decision.posterior;
+        let sum = posterior.identifier
+            + posterior.short_keyword
+            + posterior.natural_language
+            + posterior.empty;
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "posterior should sum to 1.0, got {sum}"
+        );
+    }
+
+    #[test]
+    fn derive_with_decision_reports_minimum_expected_loss() {
+        let config = CandidateBudgetConfig::default();
+        let derivation = CandidateBudget::derive_with_decision(
+            100,
+            CandidateMode::Auto,
+            QueryClass::ShortKeyword,
+            config,
+        );
+        let min_loss = derivation
+            .decision
+            .action_losses
+            .iter()
+            .map(|entry| entry.expected_loss)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            (derivation.decision.chosen_expected_loss - min_loss).abs() < 1e-9,
+            "chosen expected loss should match minimum candidate loss"
+        );
     }
 
     #[test]
@@ -967,6 +1258,48 @@ mod tests {
         let json = serde_json::to_string(&budget).unwrap();
         let budget2: CandidateBudget = serde_json::from_str(&json).unwrap();
         assert_eq!(budget, budget2);
+    }
+
+    #[test]
+    fn budget_decision_serde_roundtrip() {
+        let config = CandidateBudgetConfig::default();
+        let derivation = CandidateBudget::derive_with_decision(
+            40,
+            CandidateMode::Hybrid,
+            QueryClass::Identifier,
+            config,
+        );
+        let json = serde_json::to_string(&derivation.decision).unwrap();
+        let decision2: CandidateBudgetDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(derivation.decision, decision2);
+    }
+
+    #[test]
+    fn budget_derivation_serde_roundtrip() {
+        let config = CandidateBudgetConfig::default();
+        let derivation = CandidateBudget::derive_with_decision(
+            25,
+            CandidateMode::Auto,
+            QueryClass::NaturalLanguage,
+            config,
+        );
+        let json = serde_json::to_string(&derivation).unwrap();
+        let derivation2: CandidateBudgetDerivation = serde_json::from_str(&json).unwrap();
+        assert_eq!(derivation.budget, derivation2.budget);
+        assert_eq!(derivation.decision.mode, derivation2.decision.mode);
+        assert_eq!(
+            derivation.decision.query_class,
+            derivation2.decision.query_class
+        );
+        assert_eq!(
+            derivation.decision.chosen_action,
+            derivation2.decision.chosen_action
+        );
+        assert!(
+            (derivation.decision.chosen_expected_loss - derivation2.decision.chosen_expected_loss)
+                .abs()
+                < 1e-12
+        );
     }
 
     // ── Trait coverage ──────────────────────────────────────────────

@@ -594,10 +594,9 @@ fn lru_evict_if_full<T>(map: &mut IndexMap<String, CacheEntry<T>>, ttl: Duration
     }
     // Phase 1: evict expired
     map.retain(|_, entry| !entry.is_expired(ttl));
-    // Phase 2: LRU eviction from the front if still at capacity
-    while map.len() >= capacity {
-        map.shift_remove_index(0);
-    }
+    // Phase 2: LRU eviction from the front if still at capacity.
+    // Use one range-drain to avoid repeated O(n) shifts.
+    evict_front_for_insert(map, capacity);
 }
 
 /// LRU eviction for `IndexMap<(i64, InternedStr), CacheEntry<T>>`.
@@ -610,9 +609,7 @@ fn lru_evict_if_full_tuple<T>(
         return;
     }
     map.retain(|_, entry| !entry.is_expired(ttl));
-    while map.len() >= capacity {
-        map.shift_remove_index(0);
-    }
+    evict_front_for_insert(map, capacity);
 }
 
 /// LRU eviction for `IndexMap<(u64, i64), CacheEntry<T>>`.
@@ -625,9 +622,7 @@ fn lru_evict_if_full_u64_i64<T>(
         return;
     }
     map.retain(|_, entry| !entry.is_expired(ttl));
-    while map.len() >= capacity {
-        map.shift_remove_index(0);
-    }
+    evict_front_for_insert(map, capacity);
 }
 
 /// LRU eviction for `IndexMap<i64, CacheEntry<T>>`.
@@ -640,9 +635,16 @@ fn lru_evict_if_full_i64<T>(
         return;
     }
     map.retain(|_, entry| !entry.is_expired(ttl));
-    while map.len() >= capacity {
-        map.shift_remove_index(0);
+    evict_front_for_insert(map, capacity);
+}
+
+fn evict_front_for_insert<K, V>(map: &mut IndexMap<K, V>, capacity: usize) {
+    let target_len = capacity.saturating_sub(1);
+    if map.len() <= target_len {
+        return;
     }
+    let to_evict = map.len().saturating_sub(target_len);
+    for _ in map.drain(..to_evict) {}
 }
 
 static READ_CACHE: OnceLock<ReadCache> = OnceLock::new();
@@ -763,6 +765,31 @@ mod tests {
 
         let map_len = cache.projects_by_slug.read().len();
         assert!(map_len <= MAX_ENTRIES_PER_CATEGORY);
+    }
+
+    #[test]
+    fn lru_bulk_front_eviction_preserves_newest_entries() {
+        let mut map: IndexMap<String, CacheEntry<i32>> = IndexMap::new();
+        for i in 0..6 {
+            map.insert(format!("k{i}"), CacheEntry::new(i));
+        }
+
+        lru_evict_if_full(&mut map, Duration::MAX, 3);
+
+        let keys = map.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys, vec!["k4".to_string(), "k5".to_string()]);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn evict_front_for_insert_handles_zero_capacity() {
+        let mut map: IndexMap<String, i32> = IndexMap::new();
+        for i in 0..4 {
+            map.insert(format!("k{i}"), i);
+        }
+
+        evict_front_for_insert(&mut map, 0);
+        assert!(map.is_empty());
     }
 
     #[test]

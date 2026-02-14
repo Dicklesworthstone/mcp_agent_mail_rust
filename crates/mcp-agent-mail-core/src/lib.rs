@@ -14,6 +14,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod disk;
 pub mod error;
+pub mod evidence_ledger;
 pub mod flake_triage;
 pub mod identity;
 pub mod intern;
@@ -42,6 +43,10 @@ pub use diagnostics::{
     DiagnosticReport, HealthInfo, Recommendation, SystemInfo, init_process_start,
 };
 pub use error::{Error as MailError, Result as MailResult};
+pub use evidence_ledger::{
+    EVIDENCE_LEDGER_PATH_ENV, EvidenceLedgerEntry, append_evidence_entry_if_configured,
+    append_evidence_entry_to_path,
+};
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};
 pub use kpi::{

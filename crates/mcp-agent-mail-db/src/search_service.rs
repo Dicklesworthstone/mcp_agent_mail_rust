@@ -21,13 +21,15 @@ use crate::search_scope::{
 use crate::tracking::record_query;
 use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
+use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
 
 use asupersync::{Cx, Outcome};
 #[cfg(feature = "hybrid")]
 use half::f16;
 use mcp_agent_mail_search_core::{
-    CandidateBudget, CandidateBudgetConfig, CandidateHit, CandidateMode, QueryAssistance,
-    QueryClass, parse_query_assistance, prepare_candidates,
+    CandidateBudget, CandidateBudgetConfig, CandidateBudgetDecision, CandidateBudgetDerivation,
+    CandidateHit, CandidateMode, CandidateStageCounts, QueryAssistance, QueryClass,
+    parse_query_assistance, prepare_candidates,
 };
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
@@ -831,12 +833,13 @@ fn orchestrate_hybrid_results(
         _ => CandidateMode::LexicalFallback,
     };
     let query_class = QueryClass::classify(&query.text);
-    let budget = CandidateBudget::derive(
+    let derivation = CandidateBudget::derive_with_decision(
         requested_limit,
         mode,
         query_class,
         CandidateBudgetConfig::default(),
     );
+    let budget = derivation.budget;
 
     let lexical_hits = lexical_results
         .iter()
@@ -878,6 +881,9 @@ fn orchestrate_hybrid_results(
         query = %query.text,
         mode = ?mode,
         query_class = ?query_class,
+        decision_action = ?derivation.decision.chosen_action,
+        decision_expected_loss = derivation.decision.chosen_expected_loss,
+        decision_confidence = decision_confidence(&derivation.decision),
         lexical_considered = prepared.counts.lexical_considered,
         semantic_considered = prepared.counts.semantic_considered,
         lexical_selected = prepared.counts.lexical_selected,
@@ -886,8 +892,82 @@ fn orchestrate_hybrid_results(
         duplicates_removed = prepared.counts.duplicates_removed,
         "hybrid candidate orchestration completed"
     );
+    emit_hybrid_budget_evidence(query, mode, &derivation, &prepared.counts);
 
     merged
+}
+
+fn decision_confidence(decision: &CandidateBudgetDecision) -> f64 {
+    let mut losses = decision
+        .action_losses
+        .iter()
+        .map(|entry| entry.expected_loss)
+        .collect::<Vec<_>>();
+    losses.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let Some(best) = losses.first().copied() else {
+        return 0.0;
+    };
+    let Some(second_best) = losses.get(1).copied() else {
+        return 1.0;
+    };
+    let denom = (best + second_best).max(f64::EPSILON);
+    ((second_best - best) / denom).clamp(0.0, 1.0)
+}
+
+const fn mode_label(mode: CandidateMode) -> &'static str {
+    match mode {
+        CandidateMode::Hybrid => "hybrid",
+        CandidateMode::Auto => "auto",
+        CandidateMode::LexicalFallback => "lexical_fallback",
+    }
+}
+
+fn emit_hybrid_budget_evidence(
+    query: &SearchQuery,
+    mode: CandidateMode,
+    derivation: &CandidateBudgetDerivation,
+    counts: &CandidateStageCounts,
+) {
+    let confidence = decision_confidence(&derivation.decision);
+    let action_label = match derivation.decision.chosen_action {
+        mcp_agent_mail_search_core::CandidateBudgetAction::LexicalDominant => "lexical_dominant",
+        mcp_agent_mail_search_core::CandidateBudgetAction::Balanced => "balanced",
+        mcp_agent_mail_search_core::CandidateBudgetAction::SemanticDominant => "semantic_dominant",
+        mcp_agent_mail_search_core::CandidateBudgetAction::LexicalOnly => "lexical_only",
+    };
+    let decision_id = format!(
+        "search.hybrid_budget:{}:{}:{}",
+        chrono::Utc::now().timestamp_micros(),
+        mode_label(mode),
+        query.effective_limit()
+    );
+    let mut entry = EvidenceLedgerEntry::new(
+        decision_id,
+        "search.hybrid_budget",
+        action_label,
+        confidence,
+        serde_json::json!({
+            "query_text": query.text,
+            "query_class": derivation.decision.query_class,
+            "mode": mode_label(mode),
+            "requested_limit": query.effective_limit(),
+            "budget": derivation.budget,
+            "posterior": derivation.decision.posterior,
+            "action_losses": derivation.decision.action_losses,
+            "counts": counts,
+        }),
+    );
+    entry.expected_loss = Some(derivation.decision.chosen_expected_loss);
+    entry.expected = Some("budgeted hybrid retrieval with deterministic fusion input".to_string());
+    entry.trace_id.clone_from(&query.thread_id);
+
+    if let Err(error) = append_evidence_entry_if_configured(&entry) {
+        tracing::debug!(
+            target: "search.metrics",
+            error = %error,
+            "failed to append hybrid budget evidence entry"
+        );
+    }
 }
 
 /// Log a comparison between FTS5 and Tantivy results in shadow mode.
