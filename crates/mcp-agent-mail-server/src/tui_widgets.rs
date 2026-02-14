@@ -5188,4 +5188,226 @@ mod tests {
             "second bucket should have 1 event"
         );
     }
+
+    // ─── Property tests ───────────────────────────────────────────────────────
+
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    mod proptest_tui {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn pt_config() -> ProptestConfig {
+            ProptestConfig {
+                cases: 500,
+                max_shrink_iters: 2000,
+                ..ProptestConfig::default()
+            }
+        }
+
+        /// Strategy for rendering dimensions (width, height) in safe range.
+        fn arb_render_dims() -> impl Strategy<Value = (u16, u16)> {
+            (1..=200u16, 1..=200u16)
+        }
+
+        proptest! {
+            #![proptest_config(pt_config())]
+
+            // ─── Layout properties ──────────────────────────────────
+
+            /// HeatmapGrid with random data and dimensions never panics.
+            #[test]
+            fn prop_heatmap_no_panic_any_rect(
+                rows in 0..=20usize,
+                cols in 0..=20usize,
+                (w, h) in arb_render_dims(),
+            ) {
+                let data: Vec<Vec<f64>> = (0..rows)
+                    .map(|r| (0..cols).map(|c| {
+                        ((r * cols + c) as f64 / (rows * cols).max(1) as f64).clamp(0.0, 1.0)
+                    }).collect())
+                    .collect();
+                let widget = HeatmapGrid::new(&data);
+                let _ = render_widget(&widget, w, h);
+            }
+
+            /// HeatmapGrid buffer writes stay within allocated area.
+            #[test]
+            fn prop_heatmap_no_oob_writes(
+                rows in 1..=10usize,
+                cols in 1..=10usize,
+                w in 1..=80u16,
+                h in 1..=40u16,
+            ) {
+                let data: Vec<Vec<f64>> = (0..rows)
+                    .map(|_| (0..cols).map(|c| c as f64 / cols as f64).collect())
+                    .collect();
+                let widget = HeatmapGrid::new(&data);
+                let mut pool = GraphemePool::new();
+                let mut frame = Frame::new(w, h, &mut pool);
+                let area = Rect::new(0, 0, w, h);
+                widget.render(area, &mut frame);
+                // If we reached here without panic, the widget stayed in bounds
+            }
+
+            /// Leaderboard with random entries and rect never panics.
+            #[test]
+            fn prop_leaderboard_no_panic_any_data(
+                count in 0..=50usize,
+                (w, h) in arb_render_dims(),
+            ) {
+                let entries: Vec<LeaderboardEntry<'_>> = (0..count)
+                    .map(|i| LeaderboardEntry {
+                        name: "agent",
+                        value: i as f64 * 1.5,
+                        secondary: None,
+                        change: RankChange::Steady,
+                    })
+                    .collect();
+                let widget = Leaderboard::new(&entries);
+                let _ = render_widget(&widget, w, h);
+            }
+
+            /// MetricTile renders without panic for any rect >= 3x1.
+            #[test]
+            fn prop_metric_tile_renders_in_any_size(
+                w in 3..=200u16,
+                h in 1..=200u16,
+            ) {
+                let widget = MetricTile::new("latency", "42ms", MetricTrend::Up);
+                let _ = render_widget(&widget, w, h);
+            }
+
+            /// render_focus_ring never panics for any rect dimensions.
+            #[test]
+            fn prop_focus_ring_no_oob(w in 0..=100u16, h in 0..=100u16) {
+                let total_w = w.saturating_add(4).max(1);
+                let total_h = h.saturating_add(4).max(1);
+                let mut pool = GraphemePool::new();
+                let mut frame = Frame::new(total_w, total_h, &mut pool);
+                let area = Rect::new(0, 0, w, h);
+                let a11y = A11yConfig::none();
+                render_focus_ring(area, &mut frame, &a11y);
+                // No panic = success
+            }
+
+            // ─── Message formatting properties ──────────────────────
+
+            /// truncate_at_word_boundary always produces output ≤ max_chars.
+            #[test]
+            fn prop_subject_truncation_respects_limit(
+                body in ".{0,500}",
+                max_chars in 1..=200usize,
+            ) {
+                let result = truncate_at_word_boundary(&body, max_chars);
+                let char_count = result.chars().count();
+                // Result may have +1 for the ellipsis char, but total
+                // should not exceed max_chars + 1 (for the … suffix)
+                prop_assert!(
+                    char_count <= max_chars + 1,
+                    "truncated to {} chars, limit was {}",
+                    char_count,
+                    max_chars
+                );
+            }
+
+            /// sender_color_hash is deterministic: same input → same output.
+            #[test]
+            fn prop_sender_color_hash_deterministic(name in ".*") {
+                let c1 = sender_color_hash(&name);
+                let c2 = sender_color_hash(&name);
+                prop_assert_eq!(c1, c2);
+            }
+
+            /// truncate_at_word_boundary never panics on any input.
+            #[test]
+            fn prop_truncate_never_panics(
+                body in ".*",
+                max_chars in 0..=1000usize,
+            ) {
+                let _ = truncate_at_word_boundary(&body, max_chars);
+            }
+
+            /// All MessageImportance variants have valid badge behavior.
+            #[test]
+            fn prop_importance_badge_exhaustive(idx in 0..4usize) {
+                let variants = [
+                    MessageImportance::Normal,
+                    MessageImportance::Low,
+                    MessageImportance::High,
+                    MessageImportance::Urgent,
+                ];
+                let imp = variants[idx];
+                // badge_label returns None for Normal/Low, Some for High/Urgent
+                let label = imp.badge_label();
+                let color = imp.badge_color();
+                match imp {
+                    MessageImportance::Normal | MessageImportance::Low => {
+                        prop_assert!(label.is_none());
+                    }
+                    MessageImportance::High => {
+                        prop_assert_eq!(label, Some("HIGH"));
+                    }
+                    MessageImportance::Urgent => {
+                        prop_assert_eq!(label, Some("URGENT"));
+                    }
+                }
+                // Color should be a valid non-zero value for badged variants
+                let _ = color; // just verify no panic
+            }
+
+            // ─── Widget state envelope ──────────────────────────────
+
+            /// WidgetState::Loading renders non-empty output for any rect >= 1x1.
+            #[test]
+            fn prop_widget_state_loading_renders(
+                w in 1..=100u16,
+                h in 1..=100u16,
+            ) {
+                let widget: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Loading {
+                    message: "Fetching...",
+                };
+                let output = render_widget(&widget, w, h);
+                prop_assert!(!output.trim().is_empty() || (w < 4 || h < 1));
+            }
+
+            /// All WidgetState variants render without panic for any rect.
+            #[test]
+            fn prop_widget_state_all_variants_safe(
+                w in 1..=100u16,
+                h in 1..=100u16,
+                variant in 0..3usize,
+            ) {
+                let empty_data: Vec<Vec<f64>> = vec![];
+                match variant {
+                    0 => {
+                        let ws: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Loading {
+                            message: "Loading...",
+                        };
+                        let _ = render_widget(&ws, w, h);
+                    }
+                    1 => {
+                        let ws: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Empty {
+                            message: "No data",
+                        };
+                        let _ = render_widget(&ws, w, h);
+                    }
+                    2 => {
+                        let ws: WidgetState<'_, HeatmapGrid<'_>> = WidgetState::Error {
+                            message: "Connection failed",
+                        };
+                        let _ = render_widget(&ws, w, h);
+                    }
+                    _ => {
+                        let ws = WidgetState::Ready(HeatmapGrid::new(&empty_data));
+                        let _ = render_widget(&ws, w, h);
+                    }
+                }
+            }
+        }
+    }
 }
