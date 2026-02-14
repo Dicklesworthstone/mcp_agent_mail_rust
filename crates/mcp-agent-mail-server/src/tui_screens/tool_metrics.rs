@@ -28,9 +28,11 @@ use mcp_agent_mail_core::evidence_ledger::evidence_ledger;
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry;
+
 use crate::tui_widgets::{
-    AnomalyCard, AnomalySeverity, ChartTransition, LeaderboardEntry, MetricTile, MetricTrend,
-    PercentileSample, RankChange, WidgetState,
+    AnomalyCard, AnomalySeverity, ChartTransition, DisclosureLevel, LeaderboardEntry, MetricTile,
+    MetricTrend, PercentileSample, RankChange, TransparencyWidget, WidgetState,
 };
 
 const COL_NAME: usize = 0;
@@ -301,6 +303,14 @@ pub struct ToolMetricsScreen {
     chart_animations_enabled: bool,
     /// Recent anomaly events (change-point detections) for the dashboard.
     anomaly_events: VecDeque<AnomalyEvent>,
+    /// Recent evidence ledger entries for the transparency panel.
+    evidence_entries: Vec<EvidenceLedgerEntry>,
+    /// Current disclosure level for the transparency widget.
+    disclosure_level: DisclosureLevel,
+    /// Whether the evidence drill-down panel is active (shows selected entry at L2+).
+    drilldown_active: bool,
+    /// Selected evidence entry index for drill-down.
+    drilldown_index: usize,
 }
 
 impl ToolMetricsScreen {
@@ -321,6 +331,10 @@ impl ToolMetricsScreen {
             latency_chart_transition: ChartTransition::new(CHART_TRANSITION_DURATION),
             chart_animations_enabled: chart_animations_enabled(),
             anomaly_events: VecDeque::with_capacity(MAX_ANOMALY_CARDS),
+            evidence_entries: Vec::new(),
+            disclosure_level: DisclosureLevel::Badge,
+            drilldown_active: false,
+            drilldown_index: 0,
         }
     }
 
@@ -669,7 +683,7 @@ impl ToolMetricsScreen {
             return;
         }
 
-        // Layout: metric tiles (3h) + anomaly cards (if any, 4h) + ribbon (8h) + leaderboard (rest)
+        // Layout: tiles (3h) + anomaly (4h) + transparency (3h) + ribbon (8h) + leaderboard (rest)
         let tiles_h = 3_u16.min(area.height);
         let remaining = area.height.saturating_sub(tiles_h);
         let anomaly_h = if self.anomaly_events.is_empty() || remaining < 16 {
@@ -678,13 +692,17 @@ impl ToolMetricsScreen {
             4_u16.min(remaining / 4)
         };
         let after_anomaly = remaining.saturating_sub(anomaly_h);
-        let ribbon_h = if after_anomaly > 12 {
-            8_u16
+        let evidence_h = if self.evidence_entries.is_empty() || after_anomaly < 10 {
+            0_u16
         } else {
-            after_anomaly / 2
+            match self.disclosure_level {
+                DisclosureLevel::Badge => 1,
+                DisclosureLevel::Summary => 3_u16.min(after_anomaly / 4),
+                DisclosureLevel::Detail | DisclosureLevel::DeepDive => {
+                    5_u16.min(after_anomaly / 3)
+                }
+            }
         };
-        let leader_h = after_anomaly.saturating_sub(ribbon_h);
-
         let tiles_area = Rect::new(area.x, area.y, area.width, tiles_h);
         let mut y_offset = area.y + tiles_h;
 
@@ -698,16 +716,55 @@ impl ToolMetricsScreen {
             y_offset += anomaly_h;
         }
 
-        let ribbon_area = Rect::new(area.x, y_offset, area.width, ribbon_h);
-        let leader_area = Rect::new(area.x, y_offset + ribbon_h, area.width, leader_h);
+        // --- Evidence Transparency Panel ---
+        if evidence_h > 0 {
+            let evidence_area = Rect::new(area.x, y_offset, area.width, evidence_h);
+            if self.drilldown_active && self.drilldown_index < self.evidence_entries.len() {
+                // Drill-down: show only the selected entry at the current level.
+                let single = &self.evidence_entries[self.drilldown_index..=self.drilldown_index];
+                TransparencyWidget::new(single)
+                    .level(self.disclosure_level)
+                    .render(evidence_area, frame);
+            } else {
+                // Normal: show all entries.
+                TransparencyWidget::new(&self.evidence_entries)
+                    .level(self.disclosure_level)
+                    .render(evidence_area, frame);
+            }
+            y_offset += evidence_h;
+        }
+
+        // --- Cache Eviction Transparency ---
+        let cache_entries: Vec<EvidenceLedgerEntry> = self
+            .evidence_entries
+            .iter()
+            .filter(|e| e.decision_point.starts_with("cache"))
+            .cloned()
+            .collect();
+        if !cache_entries.is_empty() && y_offset + 2 < area.y + area.height {
+            let cache_h = 2_u16.min(area.height.saturating_sub(y_offset - area.y));
+            let cache_area = Rect::new(area.x, y_offset, area.width, cache_h);
+            TransparencyWidget::new(&cache_entries)
+                .level(DisclosureLevel::Summary)
+                .render(cache_area, frame);
+            y_offset += cache_h;
+        }
+
+        // Recalculate remaining space after dynamic sections.
+        let used = y_offset.saturating_sub(area.y);
+        let after_all = area.height.saturating_sub(used);
+        let final_ribbon_h = if after_all > 12 { 8_u16 } else { after_all / 2 };
+        let final_leader_h = after_all.saturating_sub(final_ribbon_h);
+        let ribbon_area = Rect::new(area.x, y_offset, area.width, final_ribbon_h);
+        let leader_area = Rect::new(area.x, y_offset + final_ribbon_h, area.width, final_leader_h);
 
         // --- Percentile Ribbon ---
-        if ribbon_h >= 3 {
+        if final_ribbon_h >= 3 {
             self.render_latency_ribbon(frame, ribbon_area);
         }
 
         // --- Leaderboard ---
-        if leader_h >= 3 {
+        if final_leader_h >= 3 {
             self.render_leaderboard(frame, leader_area);
         }
     }
@@ -946,6 +1003,43 @@ impl MailScreen for ToolMetricsScreen {
                             ViewMode::Dashboard => ViewMode::Table,
                         };
                     }
+                    KeyCode::Char('l') => {
+                        self.disclosure_level = self.disclosure_level.next();
+                    }
+                    KeyCode::Char('L') => {
+                        self.disclosure_level = self.disclosure_level.prev();
+                    }
+                    KeyCode::Enter => {
+                        // Drill down: activate evidence panel or step deeper.
+                        if self.drilldown_active {
+                            self.disclosure_level = self.disclosure_level.next();
+                        } else if !self.evidence_entries.is_empty() {
+                            self.drilldown_active = true;
+                            self.disclosure_level = DisclosureLevel::Detail;
+                        }
+                    }
+                    KeyCode::Escape => {
+                        // Step up one level or deactivate drill-down.
+                        if self.drilldown_active {
+                            if self.disclosure_level == DisclosureLevel::Badge {
+                                self.drilldown_active = false;
+                            } else {
+                                self.disclosure_level = self.disclosure_level.prev();
+                            }
+                        }
+                    }
+                    KeyCode::Char('1') => {
+                        self.disclosure_level = DisclosureLevel::Badge;
+                    }
+                    KeyCode::Char('2') => {
+                        self.disclosure_level = DisclosureLevel::Summary;
+                    }
+                    KeyCode::Char('3') => {
+                        self.disclosure_level = DisclosureLevel::Detail;
+                    }
+                    KeyCode::Char('4') => {
+                        self.disclosure_level = DisclosureLevel::DeepDive;
+                    }
                     _ => {}
                 }
             }
@@ -959,6 +1053,8 @@ impl MailScreen for ToolMetricsScreen {
             self.rebuild_sorted();
             self.snapshot_percentiles();
             self.snapshot_tick += 1;
+            // Refresh evidence entries for the transparency panel.
+            self.evidence_entries = evidence_ledger().recent(20);
         }
         // Checkpoint ranks every ~50 ticks for change tracking.
         if tick_count % 50 == 0 {
@@ -1602,5 +1698,245 @@ mod tests {
             b_cp, 0,
             "tool_b should have no change points (stable), got {b_cp}"
         );
+    }
+
+    // --- TransparencyWidget integration tests (br-272c2, H.2) ---
+
+    /// 1. Verify dashboard renders the transparency panel when evidence entries exist.
+    #[test]
+    fn transparency_metrics_screen_integration() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        // Populate tools so dashboard renders content (not empty state).
+        let _ = state.push_event(MailEvent::tool_call_end(
+            "tool_x", 25, None, 1, 0.5, vec![], None, None,
+        ));
+        screen.ingest_events(&state);
+
+        // Inject evidence entries manually (simulates tick ingestion).
+        screen.evidence_entries = vec![
+            mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry::new(
+                "test-d1",
+                "tui.diff_strategy",
+                "incremental",
+                0.85,
+                serde_json::json!({}),
+            ),
+        ];
+        screen.view_mode = ViewMode::Dashboard;
+
+        // Render should not panic and should include evidence panel.
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 40, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 40), &state);
+    }
+
+    /// 2. Verify `l`/`L` keys cycle disclosure level forward and backward.
+    #[test]
+    fn transparency_keyboard_navigation() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Badge);
+
+        let l_key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('l')));
+        screen.update(&l_key, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Summary);
+
+        screen.update(&l_key, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Detail);
+
+        screen.update(&l_key, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::DeepDive);
+
+        // Wraps back to Badge.
+        screen.update(&l_key, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Badge);
+
+        // `L` goes backward.
+        let shift_l = Event::Key(ftui::KeyEvent::new(KeyCode::Char('L')));
+        screen.update(&shift_l, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::DeepDive);
+
+        screen.update(&shift_l, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Detail);
+    }
+
+    /// 3. Verify tick ingests evidence entries from the global ledger.
+    #[test]
+    fn transparency_evidence_ingestion_via_tick() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+        assert!(screen.evidence_entries.is_empty());
+
+        // Record an entry to the global evidence ledger.
+        evidence_ledger().record(
+            "test.transparency.tick",
+            serde_json::json!({"key": "value"}),
+            "test_action",
+            None,
+            0.75,
+            "test_model",
+        );
+
+        // tick at a multiple of 10 triggers evidence refresh.
+        screen.tick(10, &state);
+        assert!(
+            !screen.evidence_entries.is_empty(),
+            "tick should populate evidence_entries from global ledger"
+        );
+    }
+
+    /// 4. Verify dashboard renders different layouts at each disclosure level.
+    #[test]
+    fn transparency_disclosure_levels_affect_dashboard() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        // Populate data.
+        let _ = state.push_event(MailEvent::tool_call_end(
+            "t1", 30, None, 1, 0.5, vec![], None, None,
+        ));
+        screen.ingest_events(&state);
+
+        screen.evidence_entries = vec![
+            mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry::new(
+                "dd1", "cache.eviction", "promote", 0.65, serde_json::json!({}),
+            ),
+            mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry::new(
+                "dd2", "tui.diff", "full", 0.9, serde_json::json!({}),
+            ),
+        ];
+        screen.view_mode = ViewMode::Dashboard;
+
+        let levels = [
+            DisclosureLevel::Badge,
+            DisclosureLevel::Summary,
+            DisclosureLevel::Detail,
+            DisclosureLevel::DeepDive,
+        ];
+
+        for level in &levels {
+            screen.disclosure_level = *level;
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = Frame::new(120, 40, &mut pool);
+            // Should not panic at any level.
+            screen.render_dashboard_view(&mut frame, Rect::new(0, 0, 120, 40), &state);
+        }
+    }
+
+    /// 5. Verify cache eviction entries appear in the dashboard cache section (H.2).
+    #[test]
+    fn transparency_cache_screen_integration() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        // Populate tools so dashboard renders content.
+        let _ = state.push_event(MailEvent::tool_call_end(
+            "tool_y", 15, None, 1, 0.0, vec![], None, None,
+        ));
+        screen.ingest_events(&state);
+
+        // Add cache eviction entries.
+        screen.evidence_entries = vec![
+            mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry::new(
+                "cache-d1",
+                "cache.eviction",
+                "promote",
+                0.70,
+                serde_json::json!({"freq": 5}),
+            ),
+            mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry::new(
+                "cache-d2",
+                "cache.s3fifo",
+                "demote",
+                0.45,
+                serde_json::json!({"ghost": true}),
+            ),
+        ];
+        screen.view_mode = ViewMode::Dashboard;
+
+        // Render should not panic and should include cache transparency section.
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 40, &mut pool);
+        screen.render_dashboard_view(&mut frame, Rect::new(0, 0, 120, 40), &state);
+
+        // Verify cache entries are filtered (both start with "cache").
+        let cache_entries: Vec<_> = screen
+            .evidence_entries
+            .iter()
+            .filter(|e| e.decision_point.starts_with("cache"))
+            .collect();
+        assert_eq!(cache_entries.len(), 2, "should filter 2 cache entries");
+    }
+
+    /// 6. Verify Enter activates drill-down at L2, Escape steps back (H.2).
+    #[test]
+    fn transparency_drill_down_from_ledger() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        // Inject evidence entries.
+        screen.evidence_entries = vec![
+            mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry::new(
+                "drill-d1",
+                "tui.diff_strategy",
+                "incremental",
+                0.85,
+                serde_json::json!({}),
+            ),
+        ];
+
+        assert!(!screen.drilldown_active, "drill-down should start inactive");
+
+        // Press Enter to activate drill-down.
+        let enter_key = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        screen.update(&enter_key, &state);
+        assert!(screen.drilldown_active, "Enter should activate drill-down");
+        assert_eq!(
+            screen.disclosure_level,
+            DisclosureLevel::Detail,
+            "Enter should jump to Detail level"
+        );
+
+        // Press Enter again to step deeper.
+        screen.update(&enter_key, &state);
+        assert_eq!(
+            screen.disclosure_level,
+            DisclosureLevel::DeepDive,
+            "Enter in drill-down should step to next level"
+        );
+
+        // Press Escape to step back.
+        let esc_key = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        screen.update(&esc_key, &state);
+        assert_eq!(
+            screen.disclosure_level,
+            DisclosureLevel::Detail,
+            "Escape should step back one level"
+        );
+
+        // Continue pressing Escape until drill-down deactivates.
+        screen.update(&esc_key, &state); // Detail -> Summary
+        screen.update(&esc_key, &state); // Summary -> Badge
+        screen.update(&esc_key, &state); // Badge -> deactivate
+        assert!(!screen.drilldown_active, "Escape at Badge should deactivate drill-down");
+
+        // Numeric shortcuts: 1-4 jump directly.
+        let key3 = Event::Key(ftui::KeyEvent::new(KeyCode::Char('3')));
+        screen.update(&key3, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Detail, "3 -> Detail");
+
+        let key1 = Event::Key(ftui::KeyEvent::new(KeyCode::Char('1')));
+        screen.update(&key1, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Badge, "1 -> Badge");
+
+        let key4 = Event::Key(ftui::KeyEvent::new(KeyCode::Char('4')));
+        screen.update(&key4, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::DeepDive, "4 -> DeepDive");
+
+        let key2 = Event::Key(ftui::KeyEvent::new(KeyCode::Char('2')));
+        screen.update(&key2, &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Summary, "2 -> Summary");
     }
 }
