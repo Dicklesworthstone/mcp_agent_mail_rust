@@ -30,7 +30,7 @@ use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_action_menu::{ActionEntry, messages_actions};
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_events::MailEventKind;
+use crate::tui_events::MailEvent;
 use crate::tui_layout::DockLayout;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
@@ -142,8 +142,7 @@ struct MessageEntry {
     project_slug: String,
     thread_id: String,
     timestamp_iso: String,
-    /// Raw timestamp for sorting/comparison (pre-wired for br-10wc.6.3).
-    #[allow(dead_code)]
+    /// Raw timestamp for sorting/merging with live events.
     timestamp_micros: i64,
     body_md: String,
     importance: String,
@@ -523,7 +522,7 @@ impl MessageBrowserScreen {
         }
     }
 
-    /// Execute a search query against the database.
+    /// Execute a search query against the database, merging live event results.
     fn execute_search(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let Some(conn) = &self.db_conn else {
@@ -542,7 +541,7 @@ impl MessageBrowserScreen {
             InboxMode::Global => None,
         };
 
-        let (results, total, method) = if query.is_empty() {
+        let (mut results, total, method) = if query.is_empty() {
             self.last_search.clear();
             let (r, t) = fetch_recent_messages(conn, PAGE_SIZE, project_filter, show_project);
             (r, t, SearchMethod::Recent)
@@ -553,6 +552,30 @@ impl MessageBrowserScreen {
             (r, t, m)
         };
         self.search_method = method;
+
+        // Merge live events from the event ring buffer.
+        // Live events may contain messages not yet committed to the DB.
+        let live = Self::search_live_events(state, &query, show_project);
+        if !live.is_empty() {
+            // Collect DB result IDs for dedup (live events with a positive ID
+            // that already appears in DB results are skipped).
+            let db_ids: std::collections::HashSet<i64> =
+                results.iter().map(|r| r.id).collect();
+            for entry in live {
+                if entry.id > 0 && db_ids.contains(&entry.id) {
+                    continue;
+                }
+                // Apply project filter for Local mode
+                if let Some(slug) = project_filter {
+                    if entry.project_slug != slug {
+                        continue;
+                    }
+                }
+                results.push(entry);
+            }
+            // Re-sort by timestamp descending (newest first)
+            results.sort_by(|a, b| b.timestamp_micros.cmp(&a.timestamp_micros));
+        }
 
         self.results = results;
         self.total_results = total;
@@ -567,42 +590,65 @@ impl MessageBrowserScreen {
         self.search_dirty = false;
     }
 
-    /// Also search the live event ring buffer for `MessageSent`/`MessageReceived` events.
-    fn search_live_events(state: &TuiSharedState, query: &str) -> Vec<MessageEntry> {
-        if query.is_empty() {
-            return Vec::new();
-        }
+    /// Search the live event ring buffer for `MessageSent`/`MessageReceived` events.
+    ///
+    /// When `query` is empty, returns all recent message events (for merging
+    /// with the "recent messages" default view).  When non-empty, filters by
+    /// substring match against subject, sender, and recipients.
+    fn search_live_events(
+        state: &TuiSharedState,
+        query: &str,
+        show_project: bool,
+    ) -> Vec<MessageEntry> {
         let query_lower = query.to_lowercase();
         let events = state.recent_events(500);
         events
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind(),
-                    MailEventKind::MessageSent | MailEventKind::MessageReceived
-                )
-            })
             .filter_map(|e| {
-                let summary = format!("{e:?}");
-                if summary.to_lowercase().contains(&query_lower) {
-                    // Extract what we can from the MailEvent
-                    Some(MessageEntry {
-                        id: -1, // Live events don't have DB IDs
-                        subject: format!("[LIVE] {:?}", e.kind()),
-                        from_agent: String::new(),
-                        to_agents: String::new(),
-                        project_slug: String::new(),
-                        thread_id: String::new(),
-                        timestamp_iso: micros_to_iso(e.timestamp_micros()),
-                        timestamp_micros: e.timestamp_micros(),
-                        body_md: summary,
-                        importance: "normal".to_string(),
-                        ack_required: false,
-                        show_project: false,
-                    })
-                } else {
-                    None
+                let (id, from, to, subject, thread_id, project) = match e {
+                    MailEvent::MessageSent {
+                        id,
+                        from,
+                        to,
+                        subject,
+                        thread_id,
+                        project,
+                        ..
+                    }
+                    | MailEvent::MessageReceived {
+                        id,
+                        from,
+                        to,
+                        subject,
+                        thread_id,
+                        project,
+                        ..
+                    } => (*id, from.as_str(), to, subject.as_str(), thread_id.as_str(), project.as_str()),
+                    _ => return None,
+                };
+
+                // If there's a query, filter by it
+                if !query_lower.is_empty() {
+                    let haystack = format!("{from} {subject} {}", to.join(" ")).to_lowercase();
+                    if !haystack.contains(&query_lower) {
+                        return None;
+                    }
                 }
+
+                Some(MessageEntry {
+                    id: if id > 0 { id } else { -1 },
+                    subject: subject.to_string(),
+                    from_agent: from.to_string(),
+                    to_agents: to.join(", "),
+                    project_slug: project.to_string(),
+                    thread_id: thread_id.to_string(),
+                    timestamp_iso: micros_to_iso(e.timestamp_micros()),
+                    timestamp_micros: e.timestamp_micros(),
+                    body_md: String::new(),
+                    importance: "normal".to_string(),
+                    ack_required: false,
+                    show_project,
+                })
             })
             .collect()
     }
@@ -949,10 +995,6 @@ impl MailScreen for MessageBrowserScreen {
             );
         }
 
-        // Also merge live events into display if searching
-        let _live_results = Self::search_live_events(state, self.search_input.value());
-        // Live results displayed as annotations in the results list
-        // (full integration deferred to br-10wc.6.3)
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -2921,5 +2963,68 @@ mod tests {
 
         screen.update_urgent_pulse(URGENT_PULSE_HALF_PERIOD_TICKS);
         assert!(MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn search_live_events_extracts_structured_fields() {
+        use crate::tui_events::{EventSource, MailEvent};
+
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::with_event_capacity(&config, 16);
+
+        // Push a MessageSent event
+        let _ = state.push_event(MailEvent::MessageSent {
+            seq: 0,
+            timestamp_micros: 1_700_000_000_000_000,
+            source: EventSource::Mail,
+            redacted: false,
+            id: 42,
+            from: "GoldHawk".to_string(),
+            to: vec!["SilverFox".to_string()],
+            subject: "hello world".to_string(),
+            thread_id: "t-1".to_string(),
+            project: "myproj".to_string(),
+        });
+        // Push a MessageReceived event
+        let _ = state.push_event(MailEvent::MessageReceived {
+            seq: 0,
+            timestamp_micros: 1_700_000_001_000_000,
+            source: EventSource::Mail,
+            redacted: false,
+            id: 43,
+            from: "SilverFox".to_string(),
+            to: vec!["GoldHawk".to_string()],
+            subject: "re: hello world".to_string(),
+            thread_id: "t-1".to_string(),
+            project: "myproj".to_string(),
+        });
+        // Push a non-message event (should be filtered out)
+        let _ = state.push_event(MailEvent::http_request("GET", "/foo", 200, 1, "127.0.0.1"));
+
+        // Empty query returns all message events
+        let results = MessageBrowserScreen::search_live_events(&state, "", false);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].from_agent, "GoldHawk");
+        assert_eq!(results[0].subject, "hello world");
+        assert_eq!(results[0].id, 42);
+        assert_eq!(results[1].from_agent, "SilverFox");
+
+        // Query filters by subject
+        let filtered = MessageBrowserScreen::search_live_events(&state, "re: hello", false);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, 43);
+
+        // Query matches against sender + recipients + subject
+        // "goldhawk" appears in both events (sender of #42, recipient of #43)
+        let by_agent = MessageBrowserScreen::search_live_events(&state, "goldhawk", false);
+        assert_eq!(by_agent.len(), 2);
+
+        // Non-matching query returns empty
+        let empty = MessageBrowserScreen::search_live_events(&state, "nonexistent", false);
+        assert!(empty.is_empty());
+
+        // show_project flag propagates
+        let with_proj = MessageBrowserScreen::search_live_events(&state, "", true);
+        assert!(with_proj.iter().all(|r| r.show_project));
     }
 }
