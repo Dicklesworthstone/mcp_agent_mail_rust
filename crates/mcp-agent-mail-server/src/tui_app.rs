@@ -6,6 +6,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -555,8 +556,8 @@ impl ScreenManager {
         self.get_mut(self.active_screen)
     }
 
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut Box<dyn MailScreen>> {
-        self.screens.values_mut()
+    fn iter_mut(&mut self) -> impl Iterator<Item = (MailScreenId, &mut Box<dyn MailScreen>)> {
+        self.screens.iter_mut().map(|(&id, screen)| (id, screen))
     }
 
     fn apply_deep_link(&mut self, target: &DeepLinkTarget) {
@@ -625,6 +626,10 @@ pub struct MailAppModel {
     resize_detected: Cell<bool>,
     /// Timestamp of last `view()` call for frame budget tracking.
     last_view_instant: Cell<Option<Instant>>,
+    /// Screens that have panicked. Key: screen id, Value: error message.
+    /// When a screen is in this map, a fallback error UI is shown instead.
+    /// Uses `RefCell` so that `view(&self)` can record panics.
+    screen_panics: RefCell<HashMap<MailScreenId, String>>,
 }
 
 impl MailAppModel {
@@ -684,6 +689,7 @@ impl MailAppModel {
             diff_strategy: RefCell::new(crate::tui_decision::BayesianDiffStrategy::new()),
             resize_detected: Cell::new(false),
             last_view_instant: Cell::new(None),
+            screen_panics: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1723,8 +1729,23 @@ impl Model for MailAppModel {
                         Some(transition)
                     };
                 }
-                for screen in self.screen_manager.values_mut() {
-                    screen.tick(self.tick_count, &self.state);
+                let tick_count = self.tick_count;
+                let tick_state = &self.state;
+                let panics = self.screen_panics.get_mut();
+                let mut tick_panics: Vec<(MailScreenId, String)> = Vec::new();
+                for (id, screen) in self.screen_manager.iter_mut() {
+                    if panics.contains_key(&id) {
+                        continue;
+                    }
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        screen.tick(tick_count, tick_state);
+                    }));
+                    if let Err(payload) = result {
+                        tick_panics.push((id, panic_payload_to_string(&payload)));
+                    }
+                }
+                for (id, msg) in tick_panics {
+                    panics.insert(id, msg);
                 }
 
                 // Generate toasts from new high-priority events and track reservations
@@ -2061,8 +2082,35 @@ impl Model for MailAppModel {
                 }
 
                 // Forward unhandled events to the active screen
-                if let Some(screen) = self.screen_manager.active_screen_mut() {
-                    map_screen_cmd(screen.update(event, &self.state))
+                let current = self.screen_manager.active_screen();
+                if self.screen_panics.borrow().contains_key(&current) {
+                    // Screen is in error state — 'r' resets it
+                    if matches!(
+                        event,
+                        Event::Key(k) if k.kind == KeyEventKind::Press
+                            && k.code == KeyCode::Char('r')
+                    ) {
+                        self.screen_panics.borrow_mut().remove(&current);
+                        let fresh = ScreenManager::create_screen(
+                            current,
+                            &self.screen_manager.state,
+                        );
+                        self.screen_manager.set_screen(current, fresh);
+                    }
+                    Cmd::none()
+                } else if let Some(screen) = self.screen_manager.active_screen_mut() {
+                    let state_ref = &self.state;
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        screen.update(event, state_ref)
+                    }));
+                    match result {
+                        Ok(cmd) => map_screen_cmd(cmd),
+                        Err(payload) => {
+                            let msg = panic_payload_to_string(&payload);
+                            self.screen_panics.borrow_mut().insert(current, msg);
+                            Cmd::none()
+                        }
+                    }
                 } else {
                     Cmd::none()
                 }
@@ -2147,8 +2195,18 @@ impl Model for MailAppModel {
         tui_chrome::render_tab_bar(active_screen, effects_enabled, frame, chrome.tab_bar);
 
         // 2. Screen content (z=2)
-        if let Some(screen) = self.screen_manager.active_screen_ref() {
-            screen.view(frame, chrome.content, &self.state);
+        if self.screen_panics.borrow().contains_key(&active_screen) {
+            let msg = self.screen_panics.borrow().get(&active_screen).cloned().unwrap_or_default();
+            render_screen_error_fallback(active_screen, &msg, chrome.content, frame);
+        } else if let Some(screen) = self.screen_manager.active_screen_ref() {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                screen.view(frame, chrome.content, &self.state);
+            }));
+            if let Err(payload) = result {
+                let msg = panic_payload_to_string(&payload);
+                render_screen_error_fallback(active_screen, &msg, chrome.content, frame);
+                self.screen_panics.borrow_mut().insert(active_screen, msg);
+            }
         }
         if let Some(transition) = self.screen_transition {
             render_screen_transition_overlay(transition, chrome.content, frame);
@@ -3562,6 +3620,70 @@ fn extract_reservation_agent(event: &MailEvent) -> Option<&str> {
         MailEvent::ReservationGranted { agent, .. }
         | MailEvent::ReservationReleased { agent, .. } => Some(agent),
         _ => None,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Error boundary helpers
+// ──────────────────────────────────────────────────────────────────────
+
+/// Extract a human-readable message from a `catch_unwind` panic payload.
+#[allow(clippy::option_if_let_else)]
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Render a fallback error UI when a screen has panicked.
+fn render_screen_error_fallback(
+    screen_id: MailScreenId,
+    error_msg: &str,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    use ftui::widgets::paragraph::Paragraph;
+
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let screen_name = format!("{screen_id:?}");
+
+    // Background
+    Paragraph::new("")
+        .style(Style::default().bg(tp.bg_deep))
+        .render(area, frame);
+
+    // Error icon + title
+    let title = format!(" Screen '{screen_name}' crashed ");
+    let title_area = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1);
+    Paragraph::new(title)
+        .style(Style::default().fg(tp.severity_error).bg(tp.bg_deep).bold())
+        .render(title_area, frame);
+
+    // Error message (truncated to available width)
+    if area.height > 3 {
+        let msg_width = area.width.saturating_sub(4) as usize;
+        let truncated: String = error_msg.chars().take(msg_width).collect();
+        let msg_area = Rect::new(area.x + 2, area.y + 3, area.width.saturating_sub(4), 1);
+        Paragraph::new(truncated)
+            .style(Style::default().fg(tp.text_muted).bg(tp.bg_deep))
+            .render(msg_area, frame);
+    }
+
+    // Recovery hint
+    if area.height > 5 {
+        let hint = "Press 'r' to retry or switch screens with number keys";
+        let hint_area = Rect::new(area.x + 2, area.y + 5, area.width.saturating_sub(4), 1);
+        Paragraph::new(hint)
+            .style(Style::default().fg(tp.status_accent).bg(tp.bg_deep))
+            .render(hint_area, frame);
     }
 }
 
@@ -6543,5 +6665,228 @@ mod tests {
             "[perf] Command palette fuzzy search (100 entries): \
              p50={p50_us}µs p95={p95_us}µs p99={p99_us}µs",
         );
+    }
+
+    // ── Error boundary tests ────────────────────────────────────────
+
+    /// A screen that panics on demand, for error boundary testing.
+    struct PanickingScreen {
+        panic_on_view: bool,
+        panic_on_update: bool,
+        panic_on_tick: bool,
+    }
+
+    impl PanickingScreen {
+        fn new() -> Self {
+            Self {
+                panic_on_view: false,
+                panic_on_update: false,
+                panic_on_tick: false,
+            }
+        }
+    }
+
+    impl MailScreen for PanickingScreen {
+        fn update(
+            &mut self,
+            _event: &Event,
+            _state: &TuiSharedState,
+        ) -> Cmd<MailScreenMsg> {
+            if self.panic_on_update {
+                panic!("update panic");
+            }
+            Cmd::none()
+        }
+
+        fn view(
+            &self,
+            _frame: &mut ftui::Frame<'_>,
+            _area: Rect,
+            _state: &TuiSharedState,
+        ) {
+            if self.panic_on_view {
+                panic!("view panic");
+            }
+        }
+
+        fn tick(&mut self, _tick_count: u64, _state: &TuiSharedState) {
+            if self.panic_on_tick {
+                panic!("tick panic");
+            }
+        }
+
+        fn title(&self) -> &'static str {
+            "Panicking"
+        }
+    }
+
+    #[test]
+    fn error_boundary_view_catches_panic() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_view = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        // The view should catch the panic and record it.
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+
+        // Screen should be recorded as panicked.
+        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+        let msg = model.screen_panics.borrow().get(&MailScreenId::Messages).cloned().unwrap();
+        assert_eq!(msg, "view panic");
+    }
+
+    #[test]
+    fn error_boundary_update_catches_panic() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_update = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        // Send a key event that gets forwarded to the screen.
+        let key_event = Event::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: Modifiers::NONE,
+            kind: KeyEventKind::Press,
+        });
+        let cmd = model.update(MailMsg::Terminal(key_event));
+
+        // Should not crash, returns Cmd::None.
+        assert!(matches!(cmd, Cmd::None));
+        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+    }
+
+    #[test]
+    fn error_boundary_tick_catches_panic() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_tick = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+
+        // Tick should catch the panic.
+        model.update(MailMsg::Terminal(Event::Tick));
+
+        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+    }
+
+    #[test]
+    fn error_boundary_panicked_screen_shows_fallback_not_rerender() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_view = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        // First view catches the panic.
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+
+        // Second view should render fallback without re-panicking.
+        let mut pool2 = ftui::GraphemePool::new();
+        let mut frame2 = Frame::new(80, 24, &mut pool2);
+        model.view(&mut frame2);
+        // Still panicked — no crash on second render.
+        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+    }
+
+    #[test]
+    fn error_boundary_r_key_resets_panicked_screen() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_view = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        // Trigger the panic.
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+
+        // Press 'r' to reset.
+        let r_key = Event::Key(KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: Modifiers::NONE,
+            kind: KeyEventKind::Press,
+        });
+        model.update(MailMsg::Terminal(r_key));
+
+        // Screen should be cleared from panics (fresh screen installed).
+        assert!(!model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+    }
+
+    #[test]
+    fn error_boundary_panicked_screen_swallows_non_r_keys() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_update = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        // Trigger the panic via update.
+        let x_key = Event::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: Modifiers::NONE,
+            kind: KeyEventKind::Press,
+        });
+        model.update(MailMsg::Terminal(x_key.clone()));
+        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+
+        // Send another key — should be swallowed, no crash.
+        let j_key = Event::Key(KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: Modifiers::NONE,
+            kind: KeyEventKind::Press,
+        });
+        let cmd = model.update(MailMsg::Terminal(j_key));
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn error_boundary_other_screens_unaffected() {
+        let mut model = test_model();
+        let mut screen = PanickingScreen::new();
+        screen.panic_on_view = true;
+        model.set_screen(MailScreenId::Messages, Box::new(screen));
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+
+        // Trigger panic on Messages screen.
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+        assert!(model.screen_panics.borrow().contains_key(&MailScreenId::Messages));
+
+        // Switch to Dashboard — should work fine.
+        model.update(MailMsg::SwitchScreen(MailScreenId::Dashboard));
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        let mut pool2 = ftui::GraphemePool::new();
+        let mut frame2 = Frame::new(80, 24, &mut pool2);
+        model.view(&mut frame2);
+        // Dashboard is not panicked.
+        assert!(!model.screen_panics.borrow().contains_key(&MailScreenId::Dashboard));
+    }
+
+    #[test]
+    fn panic_payload_to_string_extracts_str() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("hello");
+        assert_eq!(panic_payload_to_string(&payload), "hello");
+    }
+
+    #[test]
+    fn panic_payload_to_string_extracts_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("world"));
+        assert_eq!(panic_payload_to_string(&payload), "world");
+    }
+
+    #[test]
+    fn panic_payload_to_string_unknown_type() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(panic_payload_to_string(&payload), "unknown panic");
     }
 }
