@@ -3235,14 +3235,14 @@ mod tests {
         let now = unix_epoch_micros_now().expect("system clock should provide unix micros");
         let entries: Vec<MessageEntry> = (0..8)
             .map(|idx| MessageEntry {
-                id: idx as i64 + 1,
+                id: i64::from(idx) + 1,
                 subject: format!("msg-{idx}"),
                 from_agent: "GoldFox".to_string(),
                 to_agents: "SilverWolf".to_string(),
                 project_slug: "proj".to_string(),
                 thread_id: "thread".to_string(),
-                timestamp_iso: micros_to_iso(now - (idx as i64 * 10_000)),
-                timestamp_micros: now - (idx as i64 * 10_000),
+                timestamp_iso: micros_to_iso(now - (i64::from(idx) * 10_000)),
+                timestamp_micros: now - (i64::from(idx) * 10_000),
                 body_md: String::new(),
                 importance: "normal".to_string(),
                 ack_required: false,

@@ -5399,6 +5399,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mermaid_message_count_label_handles_singular_and_plural() {
+        assert_eq!(message_count_label(0), "0 msgs");
+        assert_eq!(message_count_label(1), "1 msg");
+        assert_eq!(message_count_label(2), "2 msgs");
+    }
+
+    #[test]
+    fn mermaid_label_normalizes_control_chars_and_fallbacks_empty() {
+        let cleaned = mermaid_label("  hello\n\"world\"\t|  ", 64);
+        assert_eq!(cleaned, "hello 'world' /");
+
+        let empty = mermaid_label("\n\r\t", 64);
+        assert_eq!(empty, "n/a");
+    }
+
+    #[test]
+    fn mermaid_thread_flow_deduplicates_participants() {
+        let thread_messages = vec![
+            MermaidThreadMessage {
+                from_agent: "Alpha".to_string(),
+                to_agents: vec!["Beta".to_string(), "Beta".to_string(), "Gamma".to_string()],
+                subject: "start".to_string(),
+            },
+            MermaidThreadMessage {
+                from_agent: "Gamma".to_string(),
+                to_agents: vec!["Alpha".to_string()],
+                subject: "ack".to_string(),
+            },
+        ];
+
+        let diagram = generate_thread_flow_mermaid(&thread_messages);
+        assert_eq!(
+            diagram
+                .lines()
+                .filter(|line| line.trim_start().starts_with("participant "))
+                .count(),
+            3,
+            "participants should be unique:\n{diagram}"
+        );
+        assert!(diagram.contains("participant P0 as Alpha"), "{diagram}");
+        assert!(diagram.contains("participant P1 as Beta"), "{diagram}");
+        assert!(diagram.contains("participant P2 as Gamma"), "{diagram}");
+    }
+
+    #[test]
+    fn mermaid_contact_graph_builds_counts_without_explicit_contacts() {
+        let messages = vec![
+            MailEvent::message_sent(
+                1,
+                "Alpha",
+                vec!["Beta".to_string()],
+                "first",
+                "br-edpom",
+                "proj",
+            ),
+            MailEvent::message_sent(
+                2,
+                "Alpha",
+                vec!["Gamma".to_string()],
+                "second",
+                "br-edpom",
+                "proj",
+            ),
+            MailEvent::message_sent(
+                3,
+                "Alpha",
+                vec!["Gamma".to_string()],
+                "third",
+                "br-edpom",
+                "proj",
+            ),
+        ];
+
+        let diagram = generate_contact_graph_mermaid(&[], &messages);
+        assert!(diagram.starts_with("graph LR"), "{diagram}");
+        assert!(diagram.contains("|1 msg|"), "{diagram}");
+        assert!(diagram.contains("|2 msgs|"), "{diagram}");
+        assert!(
+            ftui_extras::mermaid::parse(&diagram).is_ok(),
+            "message-only graph should parse:\n{diagram}"
+        );
+    }
+
     // ─── HeatmapGrid tests ─────────────────────────────────────────────
 
     #[test]

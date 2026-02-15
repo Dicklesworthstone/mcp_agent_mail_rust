@@ -2444,4 +2444,53 @@ mod overseer_form_validation_tests {
         assert_eq!(status, 400);
         assert_eq!(msg, "Message body too long (maximum 50,000 characters)");
     }
+
+    #[test]
+    fn parse_overseer_body_requires_at_least_one_string_recipient() {
+        let body = json!({
+            "recipients": [null, 42, true],
+            "subject": "hello",
+            "body_md": "body",
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "At least one recipient is required");
+    }
+
+    #[test]
+    fn parse_overseer_body_missing_thread_id_defaults_to_none() {
+        let body = json!({
+            "recipients": ["BlueLake"],
+            "subject": "hello",
+            "body_md": "body",
+        })
+        .to_string();
+        let parsed = parse_overseer_body(&body).expect("valid payload");
+        assert_eq!(parsed.thread_id, None);
+    }
+
+    #[test]
+    fn parse_overseer_body_rejects_missing_subject_field() {
+        let body = json!({
+            "recipients": ["BlueLake"],
+            "body_md": "body",
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Subject is required");
+    }
+
+    #[test]
+    fn parse_overseer_body_rejects_missing_body_field() {
+        let body = json!({
+            "recipients": ["BlueLake"],
+            "subject": "hello",
+        })
+        .to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Message body is required");
+    }
 }
