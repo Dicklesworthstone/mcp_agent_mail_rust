@@ -344,10 +344,10 @@ impl MailScreen for ReservationsScreen {
             ""
         };
         let summary_base = format!(
-            " {active} active | {exclusive} exclusive | {shared} shared | Sort: {sort_label}{sort_indicator} {released_label}",
+            " {active} active  {exclusive} exclusive  {shared} shared   Sort: {sort_label}{sort_indicator} {released_label}",
         );
         let critical_alert = if expired > 0 {
-            format!(" | CRITICAL: {expired} expired")
+            format!("  CRITICAL: {expired} expired")
         } else {
             String::new()
         };

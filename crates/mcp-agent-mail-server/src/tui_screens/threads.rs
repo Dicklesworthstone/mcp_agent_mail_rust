@@ -1439,12 +1439,12 @@ fn render_thread_list(
     let focus_tag = if focused { "" } else { " (inactive)" };
     let escalated = threads.iter().filter(|t| t.has_escalation).count();
     let esc_tag = if escalated > 0 {
-        format!(" | {escalated} escalated")
+        format!("  {escalated} escalated")
     } else {
         String::new()
     };
     let title = format!(
-        "Threads ({} total){esc_tag} [Lens:{} Sort:{}]{focus_tag}",
+        "Threads ({} total){esc_tag}  Lens:{} Sort:{}{focus_tag}",
         threads.len(),
         view_lens.label(),
         sort_mode.label(),
@@ -1515,7 +1515,7 @@ fn render_thread_list(
                 } else {
                     "normal"
                 };
-                format!("{flag} | {:.1} msg/hr", thread.velocity_msg_per_hr)
+                format!("{flag}  {:.1} msg/hr", thread.velocity_msg_per_hr)
             }
         };
 

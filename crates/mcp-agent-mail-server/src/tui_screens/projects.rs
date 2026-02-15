@@ -204,7 +204,7 @@ impl MailScreen for ProjectsScreen {
             String::new()
         };
         let info = format!(
-            "{} projects | Sort: {}{} {}",
+            "{} projects   Sort: {}{} {}",
             self.projects.len(),
             sort_label,
             sort_indicator,

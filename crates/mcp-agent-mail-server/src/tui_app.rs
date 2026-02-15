@@ -3488,7 +3488,7 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
             last_active_ts,
         } = agent;
         let desc = if let Some((model, project_slug)) = agent_metadata.get(&name) {
-            format!("{program}/{model} • project {project_slug} • last_active_ts: {last_active_ts}")
+            format!("{program}/{model}  project: {project_slug}  active: {last_active_ts}")
         } else {
             format!("{program} (last_active_ts: {last_active_ts})")
         };
@@ -3509,7 +3509,7 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
         .take(PALETTE_DYNAMIC_PROJECT_CAP)
     {
         let desc = format!(
-            "{} — {} agents, {} msgs, {} active reservations",
+            "{}  {} agents  {} msgs  {} reservations",
             proj.human_key, proj.agent_count, proj.message_count, proj.reservation_count
         );
         out.push(

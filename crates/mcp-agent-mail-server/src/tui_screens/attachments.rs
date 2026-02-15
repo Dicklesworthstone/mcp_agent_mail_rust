@@ -488,13 +488,13 @@ impl AttachmentExplorerScreen {
         let filter_text = if self.text_filter.is_empty() {
             String::new()
         } else if self.text_filter_active {
-            format!(" | Search: {}|", self.text_filter)
+            format!("  Search: {}|", self.text_filter)
         } else {
-            format!(" | Search: {}", self.text_filter)
+            format!("  Search: {}", self.text_filter)
         };
 
         let summary = format!(
-            " {count} attachments ({}) | Filter: {filter_label} | Sort: {sort_label}{sort_indicator}{filter_text}",
+            " {count} attachments ({})  Filter: {filter_label}  Sort: {sort_label}{sort_indicator}{filter_text}",
             Self::format_total_size(total_bytes),
         );
 
