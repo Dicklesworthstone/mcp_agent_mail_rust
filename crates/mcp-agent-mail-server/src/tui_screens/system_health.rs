@@ -103,6 +103,29 @@ fn format_http_status(status: u16) -> String {
     }
 }
 
+/// Width classes for adaptive dashboard layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WidthClass {
+    /// >= 80 columns: full layout with tiles, gauge, and cards.
+    Wide,
+    /// 40-79 columns: tiles + cards, no gauge.
+    Medium,
+    /// < 40 columns: compact summary + cards only.
+    Narrow,
+}
+
+impl WidthClass {
+    const fn from_width(w: u16) -> Self {
+        if w >= 80 {
+            Self::Wide
+        } else if w >= 40 {
+            Self::Medium
+        } else {
+            Self::Narrow
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProbeLine {
     level: Level,
@@ -434,37 +457,81 @@ impl SystemHealthScreen {
             return;
         }
 
-        // Layout: metric tiles (3h) + gauge (3h) + anomaly cards (rest)
-        let tiles_h = 3_u16.min(content_area.height);
-        let remaining = content_area.height.saturating_sub(tiles_h);
-        let gauge_h = 3_u16.min(remaining);
-        let cards_h = remaining.saturating_sub(gauge_h);
+        // Adaptive width-class layout policy:
+        //   Wide  (>= 80 cols): tiles (3h) + gauge (3h) + anomaly cards (rest)
+        //   Medium (40-79 cols): tiles (3h) + anomaly cards (rest), gauge skipped
+        //   Narrow (< 40 cols):  anomaly cards only (tiles as compact summary)
+        let width_class = WidthClass::from_width(content_area.width);
 
-        let tiles_area = Rect::new(content_area.x, content_area.y, content_area.width, tiles_h);
-        let gauge_area = Rect::new(
-            content_area.x,
-            content_area.y + tiles_h,
-            content_area.width,
-            gauge_h,
-        );
-        let cards_area = Rect::new(
-            content_area.x,
-            content_area.y + tiles_h + gauge_h,
-            content_area.width,
-            cards_h,
-        );
+        match width_class {
+            WidthClass::Wide => {
+                let tiles_h = 3_u16.min(content_area.height);
+                let remaining = content_area.height.saturating_sub(tiles_h);
+                let gauge_h = 3_u16.min(remaining);
+                let cards_h = remaining.saturating_sub(gauge_h);
 
-        // --- Metric Tiles ---
-        self.render_metric_tiles(frame, tiles_area, state, &snap);
+                let tiles_area =
+                    Rect::new(content_area.x, content_area.y, content_area.width, tiles_h);
+                let gauge_area = Rect::new(
+                    content_area.x,
+                    content_area.y + tiles_h,
+                    content_area.width,
+                    gauge_h,
+                );
+                let cards_area = Rect::new(
+                    content_area.x,
+                    content_area.y + tiles_h + gauge_h,
+                    content_area.width,
+                    cards_h,
+                );
 
-        // --- Event Ring Gauge ---
-        if gauge_h >= 2 {
-            self.render_event_ring_gauge(frame, gauge_area, state);
-        }
+                self.render_metric_tiles(frame, tiles_area, state, &snap);
+                if gauge_h >= 2 {
+                    self.render_event_ring_gauge(frame, gauge_area, state);
+                }
+                if cards_h >= 3 {
+                    self.render_anomaly_cards(frame, cards_area, &snap);
+                }
+            }
+            WidthClass::Medium => {
+                // Skip gauge; give more vertical space to cards
+                let tiles_h = 3_u16.min(content_area.height);
+                let cards_h = content_area.height.saturating_sub(tiles_h);
 
-        // --- Anomaly Cards ---
-        if cards_h >= 3 {
-            self.render_anomaly_cards(frame, cards_area, &snap);
+                let tiles_area =
+                    Rect::new(content_area.x, content_area.y, content_area.width, tiles_h);
+                let cards_area = Rect::new(
+                    content_area.x,
+                    content_area.y + tiles_h,
+                    content_area.width,
+                    cards_h,
+                );
+
+                self.render_metric_tiles(frame, tiles_area, state, &snap);
+                if cards_h >= 3 {
+                    self.render_anomaly_cards(frame, cards_area, &snap);
+                }
+            }
+            WidthClass::Narrow => {
+                // Compact summary line for tiles; prioritize anomaly cards
+                let summary_h = 1_u16.min(content_area.height);
+                let cards_h = content_area.height.saturating_sub(summary_h);
+
+                let summary_area =
+                    Rect::new(content_area.x, content_area.y, content_area.width, summary_h);
+                let cards_area = Rect::new(
+                    content_area.x,
+                    content_area.y + summary_h,
+                    content_area.width,
+                    cards_h,
+                );
+
+                // Force narrow rendering path for metric tiles
+                self.render_metric_tiles(frame, summary_area, state, &snap);
+                if cards_h >= 3 {
+                    self.render_anomaly_cards(frame, cards_area, &snap);
+                }
+            }
         }
     }
 
@@ -2138,5 +2205,19 @@ mod tests {
         assert!(text.contains("[OK]"), "line text: {text}");
         assert!(text.contains("TCP check"), "line text: {text}");
         assert!(text.contains("5ms"), "line text: {text}");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // br-1xt0m.1.11.2: Adaptive width-class layout policy
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn width_class_boundaries() {
+        assert_eq!(WidthClass::from_width(120), WidthClass::Wide);
+        assert_eq!(WidthClass::from_width(80), WidthClass::Wide);
+        assert_eq!(WidthClass::from_width(79), WidthClass::Medium);
+        assert_eq!(WidthClass::from_width(40), WidthClass::Medium);
+        assert_eq!(WidthClass::from_width(39), WidthClass::Narrow);
+        assert_eq!(WidthClass::from_width(20), WidthClass::Narrow);
     }
 }
