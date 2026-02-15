@@ -287,7 +287,7 @@ pub fn render_tool_call_start(
 
     for (label, value) in &info_rows {
         let row = format!(" {DIM}{label}:{RESET} {text}{value}{RESET}");
-        let vis_len = label.len() + 2 + value.len();
+        let vis_len = 1 + label.len() + 2 + value.len(); // " label: value"
         let pad = w.saturating_sub(vis_len);
         lines.push(format!(
             "{secondary_b}\u{2551}{row}{}{secondary_b}\u{2551}{RESET}",
@@ -310,10 +310,12 @@ pub fn render_tool_call_start(
     // Masked + pretty-printed JSON
     let masked = mask_json_params(params);
     let json_str = serde_json::to_string_pretty(&masked).unwrap_or_else(|_| masked.to_string());
+    let content_max = w.saturating_sub(2); // 2-char indent
     for jline in json_str.lines() {
         let colored = colorize_json_line(jline);
-        let vis_len = strip_ansi_len(&colored);
-        let padded = format!("  {colored}");
+        let clamped = truncate_to_vis_width(&colored, content_max);
+        let vis_len = strip_ansi_len(&clamped);
+        let padded = format!("  {clamped}");
         let pad = w.saturating_sub(vis_len + 2);
         lines.push(format!(
             "{secondary_b}\u{2551}{padded}{}{secondary_b}\u{2551}{RESET}",
@@ -441,9 +443,11 @@ pub fn render_tool_call_end(
                 " ".repeat(pad)
             ));
         }
+        let result_content_max = w.saturating_sub(2);
         for rline in truncated.lines().take(8) {
-            let vis_len = strip_ansi_len(rline);
-            let padded = format!("  {rline}");
+            let clamped = truncate_to_vis_width(rline, result_content_max);
+            let vis_len = strip_ansi_len(&clamped);
+            let padded = format!("  {clamped}");
             let pad = w.saturating_sub(vis_len + 2);
             lines.push(format!(
                 "{color}\u{2502}{padded}{}{color}\u{2502}{RESET}",
@@ -813,6 +817,40 @@ fn strip_ansi_len(s: &str) -> usize {
         }
     }
     count
+}
+
+/// Truncate a string (possibly containing ANSI escapes) so that at most
+/// `max_vis` visible characters are retained.  Any active ANSI escape
+/// sequence at the truncation point is completed so the output remains valid.
+/// An ellipsis `…` is appended when truncation occurs.
+fn truncate_to_vis_width(s: &str, max_vis: usize) -> String {
+    let total_vis = strip_ansi_len(s);
+    if total_vis <= max_vis {
+        return s.to_string();
+    }
+    // Reserve 1 char for the ellipsis
+    let keep = max_vis.saturating_sub(1);
+    let mut out = String::with_capacity(s.len());
+    let mut vis = 0usize;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            out.push(c);
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if c == '\x1b' {
+            in_escape = true;
+            out.push(c);
+        } else if vis < keep {
+            out.push(c);
+            vis += 1;
+        } else {
+            out.push('…');
+            break;
+        }
+    }
+    out
 }
 
 /// Strip ANSI escape sequences and return the cleaned string.
@@ -2786,7 +2824,11 @@ mod tests {
         let long_result = "x".repeat(600);
         let lines = render_tool_call_end("test_tool", 100, Some(&long_result), 1, 5.0, &[], 500);
         let joined = lines.join("\n");
-        assert!(joined.contains("..."), "long result should be truncated");
+        // Line-level clamping uses `…` (unicode ellipsis); char-budget uses `...(truncated)`
+        assert!(
+            joined.contains('…') || joined.contains("..."),
+            "long result should be truncated"
+        );
         assert!(
             !joined.contains(&"x".repeat(600)),
             "full result should not appear"
@@ -2836,6 +2878,35 @@ mod tests {
         // No table/count headers when per_table is empty
         assert!(!joined.contains("Table"), "no table header when empty");
         assert!(!joined.contains("Count"), "no count header when empty");
+    }
+
+    #[test]
+    fn test_tool_call_lines_never_exceed_box_width() {
+        // Regression: long JSON values caused terminal line wrapping and garbled borders
+        let long_body = serde_json::json!({
+            "body_md": "x".repeat(500),
+            "subject": "y".repeat(200),
+        });
+        let start_lines =
+            render_tool_call_start("send_message", &long_body, None, None);
+        for (i, line) in start_lines.iter().enumerate() {
+            let vis = strip_ansi_len(line);
+            assert!(
+                vis <= 80, // w=78 + 2 for border chars
+                "start line {i} has visible width {vis}: {line}"
+            );
+        }
+
+        let long_result = serde_json::to_string_pretty(&long_body).unwrap();
+        let end_lines =
+            render_tool_call_end("send_message", 42, Some(&long_result), 5, 12.0, &[], 2000);
+        for (i, line) in end_lines.iter().enumerate() {
+            let vis = strip_ansi_len(line);
+            assert!(
+                vis <= 80,
+                "end line {i} has visible width {vis}: {line}"
+            );
+        }
     }
 
     // ── Sparkline tests ──
