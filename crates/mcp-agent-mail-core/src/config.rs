@@ -251,6 +251,8 @@ pub struct Config {
     pub tui_toast_info_dismiss_secs: u64,
     pub tui_toast_warn_dismiss_secs: u64,
     pub tui_toast_error_dismiss_secs: u64,
+    /// Enable one-shot contextual coach hints on first screen visit.
+    pub tui_coach_hints_enabled: bool,
 }
 
 /// Application environment
@@ -826,6 +828,7 @@ impl Default for Config {
             tui_toast_info_dismiss_secs: 5,
             tui_toast_warn_dismiss_secs: 8,
             tui_toast_error_dismiss_secs: 15,
+            tui_coach_hints_enabled: true,
         }
     }
 }
@@ -1495,6 +1498,8 @@ impl Config {
             config.tui_toast_error_dismiss_secs,
         )
         .max(1);
+        config.tui_coach_hints_enabled =
+            console_bool("AM_TUI_COACH_HINTS_ENABLED", config.tui_coach_hints_enabled);
 
         config
     }

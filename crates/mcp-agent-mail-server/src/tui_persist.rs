@@ -25,6 +25,8 @@ use crate::tui_layout::{DockLayout, DockPosition};
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// JSON filename for persisted command-palette usage stats.
 const PALETTE_USAGE_FILENAME: &str = "palette_usage.json";
+/// JSON filename for persisted dismissed coach-hint IDs.
+const DISMISSED_HINTS_FILENAME: &str = "dismissed_hints.json";
 
 /// Persisted command-palette usage map:
 /// `action_id` -> (`usage_count`, `last_used_micros`)
@@ -127,6 +129,66 @@ pub fn load_palette_usage_or_default(path: &Path) -> PaletteUsageMap {
                 path.display()
             );
             HashMap::new()
+        }
+    }
+}
+
+/// Compute the path used for persisted dismissed coach-hint IDs.
+#[must_use]
+pub fn dismissed_hints_path(envfile_path: &Path) -> PathBuf {
+    envfile_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(DISMISSED_HINTS_FILENAME)
+}
+
+/// Save dismissed coach-hint IDs to disk.
+///
+/// # Errors
+///
+/// Returns an error if parent directory creation, JSON serialization,
+/// or file writing fails.
+pub fn save_dismissed_hints(
+    path: &Path,
+    hints: &std::collections::HashSet<String>,
+) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let sorted: std::collections::BTreeSet<&String> = hints.iter().collect();
+    let json = serde_json::to_string_pretty(&sorted)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, json)
+}
+
+/// Load dismissed coach-hint IDs from disk.
+///
+/// # Errors
+///
+/// Returns an error if the file does not exist, cannot be read, or contains
+/// invalid JSON for the expected schema.
+pub fn load_dismissed_hints(
+    path: &Path,
+) -> Result<std::collections::HashSet<String>, std::io::Error> {
+    let json = std::fs::read_to_string(path)?;
+    serde_json::from_str::<std::collections::HashSet<String>>(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Load dismissed coach-hint IDs with graceful fallback.
+///
+/// Missing or malformed files return an empty set.
+#[must_use]
+pub fn load_dismissed_hints_or_default(path: &Path) -> std::collections::HashSet<String> {
+    match load_dismissed_hints(path) {
+        Ok(hints) => hints,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::collections::HashSet::new(),
+        Err(e) => {
+            eprintln!(
+                "tui_persist: failed to load dismissed hints from {}: {e}",
+                path.display()
+            );
+            std::collections::HashSet::new()
         }
     }
 }
@@ -1179,6 +1241,50 @@ mod tests {
         std::fs::write(&usage_path, "{ definitely-not-valid-json ]").unwrap();
 
         let loaded = load_palette_usage_or_default(&usage_path);
+        assert!(loaded.is_empty());
+    }
+
+    // ── Dismissed hints persistence tests ────────────────────────
+
+    #[test]
+    fn dismissed_hints_path_is_next_to_envfile() {
+        let env = std::path::Path::new("/tmp/mcp-agent-mail/config.env");
+        let path = dismissed_hints_path(env);
+        assert_eq!(
+            path,
+            std::path::Path::new("/tmp/mcp-agent-mail/dismissed_hints.json")
+        );
+    }
+
+    #[test]
+    fn dismissed_hints_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dismissed_hints.json");
+
+        let mut hints = std::collections::HashSet::new();
+        hints.insert("dashboard:welcome".to_string());
+        hints.insert("messages:search".to_string());
+
+        save_dismissed_hints(&path, &hints).expect("save dismissed hints");
+        let loaded = load_dismissed_hints(&path).expect("load dismissed hints");
+        assert_eq!(loaded, hints);
+    }
+
+    #[test]
+    fn dismissed_hints_missing_file_returns_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_dismissed_hints.json");
+        let loaded = load_dismissed_hints_or_default(&path);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn dismissed_hints_corrupt_file_returns_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dismissed_hints.json");
+        std::fs::write(&path, "{ definitely-not-valid-json ]").unwrap();
+
+        let loaded = load_dismissed_hints_or_default(&path);
         assert!(loaded.is_empty());
     }
 }

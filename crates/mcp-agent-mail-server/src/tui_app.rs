@@ -530,6 +530,101 @@ impl OverlayLayer {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Coach hints — lightweight, one-shot contextual tips
+// ──────────────────────────────────────────────────────────────────────
+
+/// One-shot contextual tip shown on first visit to a screen.
+struct CoachHint {
+    /// Stable identifier persisted across sessions.
+    id: &'static str,
+    /// Screen that triggers this hint.
+    screen: MailScreenId,
+    /// Short message shown as a toast.
+    message: &'static str,
+}
+
+/// Static hint catalog — one hint per screen for first-use friction.
+const COACH_HINTS: &[CoachHint] = &[
+    CoachHint { id: "dashboard:welcome", screen: MailScreenId::Dashboard, message: "Tip: Press ? for help, Ctrl+P for command palette" },
+    CoachHint { id: "messages:search", screen: MailScreenId::Messages, message: "Tip: Press / to filter messages, Enter to view body" },
+    CoachHint { id: "threads:expand", screen: MailScreenId::Threads, message: "Tip: Enter expands a thread, h collapses it" },
+    CoachHint { id: "agents:inbox", screen: MailScreenId::Agents, message: "Tip: Enter views an agent\u{2019}s inbox, / filters by name" },
+    CoachHint { id: "search:syntax", screen: MailScreenId::Search, message: "Tip: Use quoted phrases and AND/OR operators in search" },
+    CoachHint { id: "reservations:force", screen: MailScreenId::Reservations, message: "Tip: Press f to force-release a stale reservation" },
+    CoachHint { id: "tool_metrics:sort", screen: MailScreenId::ToolMetrics, message: "Tip: Sort columns with Tab, slow calls are highlighted" },
+    CoachHint { id: "system_health:diag", screen: MailScreenId::SystemHealth, message: "Tip: WAL size and pool stats refresh every tick" },
+    CoachHint { id: "timeline:expand", screen: MailScreenId::Timeline, message: "Tip: Enter expands an event, use correlation links to trace" },
+    CoachHint { id: "projects:browse", screen: MailScreenId::Projects, message: "Tip: Enter drills into a project\u{2019}s agents and messages" },
+    CoachHint { id: "contacts:approve", screen: MailScreenId::Contacts, message: "Tip: Accept or deny pending contact requests inline" },
+    CoachHint { id: "explorer:filter", screen: MailScreenId::Explorer, message: "Tip: Filter by agent, project, or date range" },
+    CoachHint { id: "analytics:volume", screen: MailScreenId::Analytics, message: "Tip: Message volume charts update in real time" },
+    CoachHint { id: "attachments:preview", screen: MailScreenId::Attachments, message: "Tip: Enter previews an attachment, / filters by name" },
+];
+
+/// Manages one-shot dismissible coach hints, persisted across sessions.
+struct CoachHintManager {
+    /// IDs of permanently dismissed hints.
+    dismissed: HashSet<String>,
+    /// Screens already visited this session (prevents re-showing).
+    visited: HashSet<MailScreenId>,
+    /// Path to the dismissed-hints JSON file.
+    persist_path: Option<PathBuf>,
+    /// Whether hints are enabled at all.
+    enabled: bool,
+    /// Dirty flag — set when `dismissed` changes and needs flushing.
+    dirty: bool,
+}
+
+impl CoachHintManager {
+    fn new() -> Self {
+        Self {
+            dismissed: HashSet::new(),
+            visited: HashSet::new(),
+            persist_path: None,
+            enabled: true,
+            dirty: false,
+        }
+    }
+
+    fn with_persist_path(mut self, path: PathBuf) -> Self {
+        self.dismissed = crate::tui_persist::load_dismissed_hints_or_default(&path);
+        self.persist_path = Some(path);
+        self
+    }
+
+    /// Check if a hint should be shown for the given screen.
+    /// Returns the hint message if eligible, `None` otherwise.
+    fn on_screen_visit(&mut self, screen: MailScreenId) -> Option<&'static str> {
+        if !self.enabled {
+            return None;
+        }
+        if !self.visited.insert(screen) {
+            return None; // Already visited this session
+        }
+        for hint in COACH_HINTS {
+            if hint.screen == screen && !self.dismissed.contains(hint.id) {
+                self.dismissed.insert(hint.id.to_string());
+                self.dirty = true;
+                return Some(hint.message);
+            }
+        }
+        None
+    }
+
+    /// Flush dismissed hints to disk if dirty.
+    fn flush_if_dirty(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        if let Some(ref path) = self.persist_path {
+            if crate::tui_persist::save_dismissed_hints(path, &self.dismissed).is_ok() {
+                self.dirty = false;
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // MailAppModel — implements ftui_runtime::Model
 // ──────────────────────────────────────────────────────────────────────
 
@@ -685,6 +780,8 @@ pub struct MailAppModel {
     screen_panics: RefCell<HashMap<MailScreenId, String>>,
     /// Central mouse dispatcher for shell-level interactions (tab clicks, etc.).
     mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher,
+    /// Coach hint manager for one-shot contextual tips.
+    coach_hints: CoachHintManager,
 }
 
 impl MailAppModel {
@@ -746,6 +843,7 @@ impl MailAppModel {
             last_view_instant: Cell::new(None),
             screen_panics: RefCell::new(HashMap::new()),
             mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher::new(),
+            coach_hints: CoachHintManager::new(),
         }
     }
 
@@ -761,6 +859,10 @@ impl MailAppModel {
         model.palette_usage_stats = crate::tui_persist::load_palette_usage_or_default(&usage_path);
         model.palette_usage_path = Some(usage_path);
         model.appearance_persist_path = Some(config.console_persist_path.clone());
+        let hints_path =
+            crate::tui_persist::dismissed_hints_path(&config.console_persist_path);
+        model.coach_hints = CoachHintManager::new().with_persist_path(hints_path);
+        model.coach_hints.enabled = config.tui_coach_hints_enabled;
         model.toast_severity = ToastSeverityThreshold::from_config(config);
         model.toast_muted = !config.tui_toast_enabled;
         model.toast_info_dismiss_secs = config.tui_toast_info_dismiss_secs.max(1);
@@ -810,6 +912,19 @@ impl MailAppModel {
         self.screen_manager.set_active_screen(id);
         let to = self.screen_manager.active_screen();
         self.start_screen_transition(from, to);
+        self.show_coach_hint_if_eligible(id);
+    }
+
+    /// Show a one-shot coach hint toast for the given screen if eligible.
+    fn show_coach_hint_if_eligible(&mut self, screen: MailScreenId) {
+        if let Some(msg) = self.coach_hints.on_screen_visit(screen) {
+            self.notifications.notify(
+                Toast::new(msg)
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(8)),
+            );
+            self.coach_hints.flush_if_dirty();
+        }
     }
 
     fn apply_deep_link_with_transition(&mut self, target: &DeepLinkTarget) {
@@ -7204,5 +7319,63 @@ mod tests {
         model.update(esc);
         assert!(model.toast_focus_index.is_none());
         assert!(model.help_visible, "help should still be visible");
+    }
+
+    // ── Coach hint tests ─────────────────────────────────────────
+
+    #[test]
+    fn coach_hint_first_visit_returns_message() {
+        let mut mgr = CoachHintManager::new();
+        let msg = mgr.on_screen_visit(MailScreenId::Dashboard);
+        assert!(msg.is_some(), "first visit should produce hint");
+        assert!(msg.unwrap().contains("Tip:"));
+    }
+
+    #[test]
+    fn coach_hint_second_visit_same_session_returns_none() {
+        let mut mgr = CoachHintManager::new();
+        let _ = mgr.on_screen_visit(MailScreenId::Messages);
+        let msg = mgr.on_screen_visit(MailScreenId::Messages);
+        assert!(msg.is_none(), "second visit in same session should not show hint");
+    }
+
+    #[test]
+    fn coach_hint_dismissed_persists_across_managers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dismissed_hints.json");
+
+        // First manager dismisses a hint
+        let mut mgr1 = CoachHintManager::new().with_persist_path(path.clone());
+        let _ = mgr1.on_screen_visit(MailScreenId::Search);
+        mgr1.flush_if_dirty();
+
+        // Second manager should not show the same hint
+        let mut mgr2 = CoachHintManager::new().with_persist_path(path);
+        let msg = mgr2.on_screen_visit(MailScreenId::Search);
+        assert!(msg.is_none(), "dismissed hint should not reappear");
+    }
+
+    #[test]
+    fn coach_hint_disabled_returns_none() {
+        let mut mgr = CoachHintManager::new();
+        mgr.enabled = false;
+        let msg = mgr.on_screen_visit(MailScreenId::Dashboard);
+        assert!(msg.is_none(), "disabled hints should not show");
+    }
+
+    #[test]
+    fn coach_hint_all_screens_have_hints() {
+        for &screen in ALL_SCREEN_IDS {
+            let found = COACH_HINTS.iter().any(|h| h.screen == screen);
+            assert!(found, "missing coach hint for {:?}", screen);
+        }
+    }
+
+    #[test]
+    fn coach_hint_ids_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for hint in COACH_HINTS {
+            assert!(seen.insert(hint.id), "duplicate coach hint id: {}", hint.id);
+        }
     }
 }
