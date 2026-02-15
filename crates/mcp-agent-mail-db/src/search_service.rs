@@ -12,32 +12,32 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    DocKind, PlanMethod, PlanParam, SearchCursor, SearchQuery, SearchResponse, SearchResult,
-    plan_search,
+    plan_search, DocKind, PlanMethod, PlanParam, SearchCursor, SearchQuery, SearchResponse,
+    SearchResult,
 };
 use crate::search_scope::{
-    RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
+    apply_scope, RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult,
 };
 use crate::tracking::record_query;
 use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
-use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
+use mcp_agent_mail_core::{append_evidence_entry_if_configured, EvidenceLedgerEntry};
 
 use asupersync::{Cx, Outcome};
 #[cfg(feature = "hybrid")]
 use half::f16;
-use mcp_agent_mail_search_core::{
-    CandidateBudget, CandidateBudgetConfig, CandidateBudgetDecision, CandidateBudgetDerivation,
-    CandidateHit, CandidateMode, CandidateStageCounts, QueryAssistance, QueryClass,
-    parse_query_assistance, prepare_candidates,
-};
 #[cfg(feature = "hybrid")]
 use mcp_agent_mail_search_core::{
-    DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
-    EmbeddingRequest, EmbeddingResult, HashEmbedder, JobMetricsSnapshot, ModelInfo, ModelRegistry,
-    ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult, SearchPhase,
-    TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex,
-    VectorIndexConfig, get_two_tier_context,
+    get_two_tier_context, DocKind as SearchDocKind, Embedder, EmbeddingJobConfig,
+    EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest, EmbeddingResult, HashEmbedder,
+    JobMetricsSnapshot, ModelInfo, ModelRegistry, ModelTier, QueueStats, RefreshWorkerConfig,
+    RegistryConfig, ScoredResult, SearchPhase, TwoTierAvailability, TwoTierConfig, TwoTierEntry,
+    TwoTierIndex, VectorFilter, VectorIndex, VectorIndexConfig,
+};
+use mcp_agent_mail_search_core::{
+    parse_query_assistance, prepare_candidates, CandidateBudget, CandidateBudgetConfig,
+    CandidateBudgetDecision, CandidateBudgetDerivation, CandidateHit, CandidateMode,
+    CandidateStageCounts, QueryAssistance, QueryClass,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
@@ -720,7 +720,8 @@ impl TwoTierBridge {
 
     /// Search for semantically similar documents using two-tier progressive search.
     ///
-    /// Returns fast results immediately; quality refinement happens in background.
+    /// This returns the best available phase: refined results when quality
+    /// refinement succeeds, otherwise the initial fast phase.
     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
         let ctx = get_two_tier_context();
 
@@ -733,7 +734,35 @@ impl TwoTierBridge {
             return Vec::new();
         }
 
-        // Embed the query using fast tier
+        let (best_results, had_searcher) = {
+            let index = self.index();
+            ctx.create_searcher(&index)
+                .map_or((None, false), |searcher| {
+                    (
+                        select_best_two_tier_results(searcher.search(&query.text, limit)),
+                        true,
+                    )
+                })
+        };
+
+        if let Some(results) = best_results {
+            return scored_results_to_search_results(results);
+        }
+
+        if had_searcher {
+            tracing::debug!(
+                target: "search.semantic",
+                "two-tier search yielded no phases; falling back to fast tier"
+            );
+        } else {
+            tracing::debug!(
+                target: "search.semantic",
+                "failed to create two-tier searcher; falling back to fast tier"
+            );
+        }
+
+        // Deterministic fallback: run plain fast-tier search if progressive path
+        // is unavailable or yields no phases.
         let embedding = match ctx.embed_fast(&query.text) {
             Ok(emb) => emb,
             Err(e) => {
@@ -750,12 +779,12 @@ impl TwoTierBridge {
         scored_results_to_search_results(hits)
     }
 
-    /// Search via the frankensearch probe seam and map phases back to planner results.
+    /// Search with the two-tier phase selector and map phases back to planner results.
     ///
-    /// Falls back to fast-only search when the probe path is unavailable or fails.
-    pub async fn search_with_frankensearch_probe(
+    /// Falls back to fast-only search when the progressive path is unavailable.
+    pub fn search_with_frankensearch_probe(
         &self,
-        cx: &Cx,
+        _cx: &Cx,
         query: &SearchQuery,
         limit: usize,
     ) -> Vec<SearchResult> {
@@ -768,6 +797,33 @@ impl TwoTierBridge {
                 "fast embedder unavailable, skipping two-tier search"
             );
             return Vec::new();
+        }
+
+        let (best_results, had_searcher) = {
+            let index = self.index();
+            ctx.create_searcher(&index)
+                .map_or((None, false), |searcher| {
+                    (
+                        select_best_two_tier_results(searcher.search(&query.text, limit)),
+                        true,
+                    )
+                })
+        };
+
+        if let Some(results) = best_results {
+            return scored_results_to_search_results(results);
+        }
+
+        if had_searcher {
+            tracing::debug!(
+                target: "search.semantic",
+                "progressive two-tier search yielded no phases; falling back to fast"
+            );
+        } else {
+            tracing::debug!(
+                target: "search.semantic",
+                "failed to create two-tier searcher; falling back to fast"
+            );
         }
 
         // Embed with fast tier for deterministic fallback behavior.
@@ -783,40 +839,7 @@ impl TwoTierBridge {
             }
         };
 
-        let index = self.index();
-
-        if ctx.is_full() {
-            if let Some(searcher) = ctx.create_searcher(&index) {
-                match searcher
-                    .search_with_frankensearch_probe(cx, &query.text, limit)
-                    .await
-                {
-                    Ok(phases) => {
-                        if let Some(results) = select_best_two_tier_results(phases) {
-                            return scored_results_to_search_results(results);
-                        }
-                        tracing::debug!(
-                            target: "search.semantic",
-                            "frankensearch probe returned no usable phases; falling back to fast"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "search.semantic",
-                            error = %e,
-                            "frankensearch probe search failed; falling back to fast"
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    target: "search.semantic",
-                    "failed to create two-tier searcher; falling back to fast"
-                );
-            }
-        }
-
-        let hits = index.search_fast(&embedding, limit);
+        let hits = self.index().search_fast(&embedding, limit);
         scored_results_to_search_results(hits)
     }
 
@@ -962,7 +985,7 @@ fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchRe
 }
 
 #[cfg(feature = "hybrid")]
-async fn try_two_tier_search_with_cx(
+fn try_two_tier_search_with_cx(
     cx: &Cx,
     query: &SearchQuery,
     limit: usize,
@@ -971,12 +994,12 @@ async fn try_two_tier_search_with_cx(
     // Only one TwoTierBridge instance is ever created under concurrent access.
     if let Some(bridge) = get_or_init_two_tier_bridge() {
         if bridge.is_available() {
-            return Some(bridge.search_with_frankensearch_probe(cx, query, limit).await);
+            return Some(bridge.search_with_frankensearch_probe(cx, query, limit));
         }
     }
 
-    // Fall back to legacy semantic bridge
-    try_semantic_search(query, limit)
+    // Fall back to sync two-tier/legacy path
+    try_two_tier_search(query, limit)
 }
 
 fn orchestrate_hybrid_results(
@@ -1248,9 +1271,8 @@ pub async fn execute_search(
         if let Some(lexical_results) = try_tantivy_search(query) {
             // Try two-tier semantic search first, then fall back to legacy
             #[cfg(feature = "hybrid")]
-            let semantic_results = try_two_tier_search_with_cx(cx, query, query.effective_limit())
-                .await
-                .unwrap_or_default();
+            let semantic_results =
+                try_two_tier_search_with_cx(cx, query, query.effective_limit()).unwrap_or_default();
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
 
