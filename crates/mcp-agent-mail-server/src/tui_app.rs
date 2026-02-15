@@ -31,6 +31,7 @@ use mcp_agent_mail_db::{DbConn, DbPoolConfig};
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
 use crate::tui_bridge::{RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_events::MailEvent;
+use crate::tui_focus::{FocusManager, FocusTarget, focus_graph_for_screen, focus_ring_for_screen};
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg, agents::AgentsScreen,
@@ -876,6 +877,12 @@ pub struct MailAppModel {
     modal_manager: ModalManager,
     /// Action menu for contextual per-item actions.
     action_menu: ActionMenuManager,
+    /// Global focus tracker used for cross-panel spatial navigation.
+    focus_manager: FocusManager,
+    /// Per-screen last-focused target used for focus memory across switches.
+    focus_memory: HashMap<MailScreenId, FocusTarget>,
+    /// Last rendered screen content area, used to map spatial focus to panel rects.
+    last_content_area: RefCell<Rect>,
     /// Last non-high-contrast theme to restore after toggling HC off.
     last_non_hc_theme: ThemeId,
     screen_transition: Option<ScreenTransition>,
@@ -920,6 +927,11 @@ impl MailAppModel {
         } else {
             initial_theme
         };
+        let focus_manager = FocusManager::with_ring(focus_ring_for_screen(MailScreenId::Dashboard));
+        let mut focus_memory = HashMap::new();
+        if focus_manager.current() != FocusTarget::None {
+            focus_memory.insert(MailScreenId::Dashboard, focus_manager.current());
+        }
         Self {
             state,
             screen_manager,
@@ -949,6 +961,9 @@ impl MailAppModel {
             toast_focus_index: None,
             modal_manager: ModalManager::new(),
             action_menu: ActionMenuManager::new(),
+            focus_manager,
+            focus_memory,
+            last_content_area: RefCell::new(Rect::new(0, 0, 1, 1)),
             last_non_hc_theme,
             screen_transition: None,
             diff_strategy: RefCell::new(crate::tui_decision::BayesianDiffStrategy::new()),
@@ -1020,10 +1035,72 @@ impl MailAppModel {
         self.screen_transition = Some(ScreenTransition::new(from, to));
     }
 
+    fn remember_focus_for_screen(&mut self, screen: MailScreenId) {
+        let current = self.focus_manager.current();
+        if current != FocusTarget::None {
+            self.focus_memory.insert(screen, current);
+        }
+    }
+
+    fn restore_focus_for_screen(&mut self, screen: MailScreenId) {
+        self.focus_manager
+            .set_focus_ring(focus_ring_for_screen(screen));
+        let remembered = self
+            .focus_memory
+            .get(&screen)
+            .copied()
+            .or_else(|| self.focus_manager.focus_ring().first().copied())
+            .unwrap_or(FocusTarget::None);
+        let _ = self.focus_manager.focus(remembered);
+        if remembered != FocusTarget::None {
+            self.focus_memory.insert(screen, remembered);
+        }
+    }
+
+    fn move_focus_spatial(&mut self, direction: KeyCode) -> bool {
+        let active_screen = self.screen_manager.active_screen();
+        self.restore_focus_for_screen(active_screen);
+
+        let content_area = *self.last_content_area.borrow();
+        let graph = focus_graph_for_screen(active_screen, content_area);
+        let current_target = self.focus_manager.current();
+        let Some(current_idx) = graph.node_index(current_target) else {
+            return false;
+        };
+        let current = graph.nodes()[current_idx];
+        let next_idx = match direction {
+            KeyCode::Up => current.neighbors.up,
+            KeyCode::Down => current.neighbors.down,
+            KeyCode::Left => current.neighbors.left,
+            KeyCode::Right => current.neighbors.right,
+            _ => None,
+        };
+        let Some(next_idx) = next_idx else {
+            return false;
+        };
+        let Some(next_node) = graph.nodes().get(next_idx) else {
+            return false;
+        };
+        if self.focus_manager.focus(next_node.target) {
+            self.focus_memory.insert(active_screen, next_node.target);
+        }
+        true
+    }
+
+    fn focused_panel_rect(&self, content_area: Rect) -> Option<Rect> {
+        let active_screen = self.screen_manager.active_screen();
+        let graph = focus_graph_for_screen(active_screen, content_area);
+        graph
+            .node(self.focus_manager.current())
+            .map(|node| node.rect)
+    }
+
     fn activate_screen(&mut self, id: MailScreenId) {
         let from = self.screen_manager.active_screen();
+        self.remember_focus_for_screen(from);
         self.screen_manager.set_active_screen(id);
         let to = self.screen_manager.active_screen();
+        self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
         self.show_coach_hint_if_eligible(id);
     }
@@ -1042,8 +1119,10 @@ impl MailAppModel {
 
     fn apply_deep_link_with_transition(&mut self, target: &DeepLinkTarget) {
         let from = self.screen_manager.active_screen();
+        self.remember_focus_for_screen(from);
         self.screen_manager.apply_deep_link(target);
         let to = self.screen_manager.active_screen();
+        self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
     }
 
@@ -2504,6 +2583,18 @@ impl Model for MailAppModel {
                             }
                             return Cmd::none();
                         }
+                        let is_ctrl_arrow = key.modifiers.contains(Modifiers::CTRL)
+                            && matches!(
+                                key.code,
+                                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                            );
+                        if is_ctrl_arrow
+                            && !text_mode
+                            && !self.focus_manager.is_trapped()
+                            && self.move_focus_spatial(key.code)
+                        {
+                            return Cmd::none();
+                        }
                         match key.code {
                             KeyCode::Char('q') if !text_mode => {
                                 self.flush_before_shutdown();
@@ -2644,17 +2735,27 @@ impl Model for MailAppModel {
         use crate::tui_chrome;
         use crate::tui_decision::{DiffAction, FrameState};
 
-        // Compute frame budget from last view call.
+        // Compute frame budget: how much slack we have relative to the tick
+        // interval. Normal frames arrive ~every TICK_INTERVAL; budget is
+        // positive when on schedule and drops toward 0 only when frames are
+        // arriving significantly late (2× the expected interval or more).
+        //
+        // BUG FIX: The original code used a 16ms (60fps) target, but the TUI
+        // ticks at 100ms (10fps). Every frame had budget=0, triggering the
+        // Bayesian "degraded" state and deferring (skipping) nearly every
+        // frame — producing blank/flashing screens.
+        let tick_budget_ms = TICK_INTERVAL.as_secs_f64() * 1000.0;
         let now = Instant::now();
         let budget_remaining_ms = self
             .last_view_instant
             .get()
-            .map_or(16.0, |prev| {
-                let elapsed = now.duration_since(prev);
-                // Target: 16ms per frame (60 fps). Budget is what's left.
-                elapsed.as_secs_f64().mul_add(-1000.0, 16.0_f64)
-            })
-            .max(0.0);
+            .map_or(tick_budget_ms, |prev| {
+                let elapsed_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
+                // Budget = tick_budget minus any overshoot beyond expected interval.
+                // On-schedule (elapsed ≈ tick): budget ≈ tick_budget (healthy).
+                // Behind (elapsed ≈ 2×tick): budget ≈ 0 (degraded).
+                (tick_budget_ms - (elapsed_ms - tick_budget_ms).max(0.0)).max(0.0)
+            });
         self.last_view_instant.set(Some(now));
 
         // Bayesian diff strategy: observe frame state and decide action.
@@ -2690,6 +2791,7 @@ impl Model for MailAppModel {
             .render(area, frame);
         let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();
+        *self.last_content_area.borrow_mut() = chrome.content;
 
         // Cache chrome areas for mouse dispatcher.
         self.mouse_dispatcher
@@ -2728,6 +2830,9 @@ impl Model for MailAppModel {
                 render_screen_error_fallback(active_screen, &msg, chrome.content, frame);
                 self.screen_panics.borrow_mut().insert(active_screen, msg);
             }
+        }
+        if let Some(focused_rect) = self.focused_panel_rect(chrome.content) {
+            render_panel_focus_outline(focused_rect, frame);
         }
 
         // Register pane hit region for the active screen's content area.
@@ -3954,6 +4059,44 @@ fn render_screen_transition_overlay(transition: ScreenTransition, area: Rect, fr
     }
 }
 
+fn set_focus_cell(frame: &mut Frame, x: u16, y: u16, symbol: char, color: PackedRgba) {
+    if let Some(cell) = frame.buffer.get_mut(x, y) {
+        *cell = (*cell).with_char(symbol).with_fg(color);
+    }
+}
+
+/// Draw a focused-panel outline using the theme's focused border color.
+fn render_panel_focus_outline(area: Rect, frame: &mut Frame) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+
+    let color = crate::tui_theme::TuiThemePalette::current().panel_border_focused;
+    let left = area.x;
+    let top = area.y;
+    let right = area.x.saturating_add(area.width).saturating_sub(1);
+    let bottom = area.y.saturating_add(area.height).saturating_sub(1);
+
+    set_focus_cell(frame, left, top, '┌', color);
+    set_focus_cell(frame, right, top, '┐', color);
+    set_focus_cell(frame, left, bottom, '└', color);
+    set_focus_cell(frame, right, bottom, '┘', color);
+
+    let mut x = left.saturating_add(1);
+    while x < right {
+        set_focus_cell(frame, x, top, '─', color);
+        set_focus_cell(frame, x, bottom, '─', color);
+        x = x.saturating_add(1);
+    }
+
+    let mut y = top.saturating_add(1);
+    while y < bottom {
+        set_focus_cell(frame, left, y, '│', color);
+        set_focus_cell(frame, right, y, '│', color);
+        y = y.saturating_add(1);
+    }
+}
+
 /// Draw a highlighted border around the focused toast in the notification stack.
 ///
 /// This is rendered as a post-processing overlay after `NotificationStack::render`,
@@ -4599,6 +4742,120 @@ mod tests {
                 "screen {id:?} not visited in reverse"
             );
         }
+    }
+
+    #[test]
+    fn ctrl_arrow_moves_focus_between_panels_spatially() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        *model.last_content_area.borrow_mut() = Rect::new(0, 0, 120, 40);
+        model.restore_focus_for_screen(MailScreenId::Messages);
+        let _ = model.focus_manager.focus(FocusTarget::List(0));
+
+        let ctrl_right = Event::Key(KeyEvent::new(KeyCode::Right).with_modifiers(Modifiers::CTRL));
+        model.update(MailMsg::Terminal(ctrl_right));
+        assert_eq!(model.focus_manager.current(), FocusTarget::DetailPanel);
+
+        let ctrl_left = Event::Key(KeyEvent::new(KeyCode::Left).with_modifiers(Modifiers::CTRL));
+        model.update(MailMsg::Terminal(ctrl_left));
+        assert_eq!(model.focus_manager.current(), FocusTarget::List(0));
+    }
+
+    #[test]
+    fn ctrl_arrow_on_boundary_panel_is_noop() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        *model.last_content_area.borrow_mut() = Rect::new(0, 0, 120, 40);
+        model.restore_focus_for_screen(MailScreenId::Messages);
+        let _ = model.focus_manager.focus(FocusTarget::DetailPanel);
+
+        let ctrl_right = Event::Key(KeyEvent::new(KeyCode::Right).with_modifiers(Modifiers::CTRL));
+        model.update(MailMsg::Terminal(ctrl_right));
+        assert_eq!(model.focus_manager.current(), FocusTarget::DetailPanel);
+    }
+
+    #[test]
+    fn ctrl_arrow_down_moves_from_search_to_preview_panel() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        *model.last_content_area.borrow_mut() = Rect::new(0, 0, 120, 40);
+        model.restore_focus_for_screen(MailScreenId::Messages);
+        let _ = model.focus_manager.focus(FocusTarget::TextInput(0));
+
+        let ctrl_down = Event::Key(KeyEvent::new(KeyCode::Down).with_modifiers(Modifiers::CTRL));
+        model.update(MailMsg::Terminal(ctrl_down));
+        assert_eq!(model.focus_manager.current(), FocusTarget::DetailPanel);
+    }
+
+    #[test]
+    fn ctrl_arrow_is_ignored_when_focus_is_trapped() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        *model.last_content_area.borrow_mut() = Rect::new(0, 0, 120, 40);
+        model.restore_focus_for_screen(MailScreenId::Messages);
+        let _ = model.focus_manager.focus(FocusTarget::List(0));
+        model
+            .focus_manager
+            .push_context(crate::tui_focus::FocusContext::Modal);
+        assert!(model.focus_manager.is_trapped());
+        assert_eq!(model.focus_manager.current(), FocusTarget::ModalContent);
+
+        let ctrl_right = Event::Key(KeyEvent::new(KeyCode::Right).with_modifiers(Modifiers::CTRL));
+        model.update(MailMsg::Terminal(ctrl_right));
+        assert_eq!(model.focus_manager.current(), FocusTarget::ModalContent);
+    }
+
+    #[test]
+    fn focus_memory_restores_saved_target_after_screen_switch() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        *model.last_content_area.borrow_mut() = Rect::new(0, 0, 120, 40);
+        model.restore_focus_for_screen(MailScreenId::Messages);
+        let _ = model.focus_manager.focus(FocusTarget::DetailPanel);
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Agents));
+        assert_eq!(model.focus_manager.current(), FocusTarget::List(0));
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        assert_eq!(model.focus_manager.current(), FocusTarget::DetailPanel);
+    }
+
+    #[test]
+    fn focus_memory_restores_previous_target_when_returning_to_screen() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        *model.last_content_area.borrow_mut() = Rect::new(0, 0, 120, 40);
+        model.restore_focus_for_screen(MailScreenId::Messages);
+        let _ = model.focus_manager.focus(FocusTarget::DetailPanel);
+        model
+            .focus_memory
+            .insert(MailScreenId::Messages, FocusTarget::DetailPanel);
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Agents));
+        assert_eq!(model.focus_manager.current(), FocusTarget::List(0));
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        assert_eq!(model.focus_manager.current(), FocusTarget::DetailPanel);
+    }
+
+    #[test]
+    fn restore_focus_defaults_to_first_target_when_screen_has_no_memory() {
+        let mut model = test_model();
+        model.focus_memory.clear();
+        model.restore_focus_for_screen(MailScreenId::Projects);
+        assert_eq!(model.focus_manager.current(), FocusTarget::List(0));
+    }
+
+    #[test]
+    fn plain_arrow_keys_do_not_trigger_global_spatial_focus_move() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        *model.last_content_area.borrow_mut() = Rect::new(0, 0, 120, 40);
+        model.restore_focus_for_screen(MailScreenId::Messages);
+        let _ = model.focus_manager.focus(FocusTarget::List(0));
+
+        model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Right))));
+        assert_eq!(model.focus_manager.current(), FocusTarget::List(0));
     }
 
     #[test]

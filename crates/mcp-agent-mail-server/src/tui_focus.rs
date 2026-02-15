@@ -633,12 +633,32 @@ fn rect_center(rect: Rect) -> (i32, i32) {
     (cx, cy)
 }
 
+fn axis_overlap(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> u16 {
+    let a_end = a_start.saturating_add(a_len);
+    let b_end = b_start.saturating_add(b_len);
+    let start = a_start.max(b_start);
+    let end = a_end.min(b_end);
+    end.saturating_sub(start)
+}
+
+fn orthogonal_overlap(source: Rect, candidate: Rect, direction: Direction) -> u16 {
+    match direction {
+        Direction::Up | Direction::Down => {
+            axis_overlap(source.x, source.width, candidate.x, candidate.width)
+        }
+        Direction::Left | Direction::Right => {
+            axis_overlap(source.y, source.height, candidate.y, candidate.height)
+        }
+    }
+}
+
 fn best_neighbor(rects: &[Rect], source_idx: usize, direction: Direction) -> Option<usize> {
     if source_idx >= rects.len() {
         return None;
     }
     let (sx, sy) = rect_center(rects[source_idx]);
-    let mut best: Option<(i64, usize)> = None;
+    let source = rects[source_idx];
+    let mut best: Option<((bool, u32, u32, u32), usize)> = None;
 
     for (idx, rect) in rects.iter().enumerate() {
         if idx == source_idx {
@@ -658,11 +678,19 @@ fn best_neighbor(rects: &[Rect], source_idx: usize, direction: Direction) -> Opt
             continue;
         }
 
+        let overlap = orthogonal_overlap(source, *rect, direction);
         let (primary, secondary) = match direction {
             Direction::Up | Direction::Down => (dy.unsigned_abs(), dx.unsigned_abs()),
             Direction::Left | Direction::Right => (dx.unsigned_abs(), dy.unsigned_abs()),
         };
-        let score = i64::from(primary) * 4_096 + i64::from(secondary);
+        // Prefer nodes that overlap on the orthogonal axis, then shortest
+        // primary distance, then shortest off-axis distance.
+        let score = (
+            overlap == 0,
+            primary,
+            secondary,
+            u32::MAX - u32::from(overlap),
+        );
 
         match best {
             None => best = Some((score, idx)),
@@ -1364,12 +1392,46 @@ mod tests {
         let list_idx = graph
             .node_index(FocusTarget::List(0))
             .expect("messages list node should exist");
+        let search_idx = graph
+            .node_index(FocusTarget::TextInput(0))
+            .expect("messages search node should exist");
         let detail_idx = graph
             .node_index(FocusTarget::DetailPanel)
             .expect("messages detail node should exist");
 
         assert_eq!(graph.nodes()[list_idx].neighbors.right, Some(detail_idx));
         assert_eq!(graph.nodes()[detail_idx].neighbors.left, Some(list_idx));
+        assert_eq!(graph.nodes()[list_idx].neighbors.up, Some(search_idx));
+        assert_eq!(graph.nodes()[detail_idx].neighbors.right, None);
+        assert_eq!(graph.nodes()[list_idx].neighbors.left, None);
+    }
+
+    #[test]
+    fn focus_graph_dashboard_node_count_matches_layout_templates() {
+        let graph = FocusGraph::for_screen(MailScreenId::Dashboard, Rect::new(0, 0, 160, 48));
+        assert_eq!(graph.nodes().len(), 5);
+    }
+
+    #[test]
+    fn best_neighbor_prefers_orthogonally_overlapping_candidate() {
+        let rects = vec![
+            Rect::new(50, 10, 20, 20), // source
+            Rect::new(20, 10, 20, 20), // overlap on Y axis (should win)
+            Rect::new(30, 0, 10, 5),   // closer primary distance, but no overlap
+        ];
+        let winner = best_neighbor(&rects, 0, Direction::Left);
+        assert_eq!(winner, Some(1));
+    }
+
+    #[test]
+    fn best_neighbor_falls_back_to_distance_when_no_overlap_exists() {
+        let rects = vec![
+            Rect::new(50, 30, 20, 10), // source
+            Rect::new(20, 0, 20, 5),   // left candidate A (farther)
+            Rect::new(30, 0, 10, 5),   // left candidate B (nearer)
+        ];
+        let winner = best_neighbor(&rects, 0, Direction::Left);
+        assert_eq!(winner, Some(2));
     }
 
     #[test]
