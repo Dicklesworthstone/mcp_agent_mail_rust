@@ -1861,7 +1861,7 @@ fn blit_buffer_to_frame(frame: &mut Frame<'_>, area: Rect, buffer: &Buffer) {
             let dst_x = area.x + x;
             let dst_y = area.y + y;
             if let Some(dst) = frame.buffer.get_mut(dst_x, dst_y) {
-                *dst = src.clone();
+                *dst = *src;
             }
         }
     }

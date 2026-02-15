@@ -1823,7 +1823,7 @@ impl Default for AmbientHealthInput {
 
 impl AmbientHealthInput {
     #[must_use]
-    pub fn normalized_buffer_utilization(self) -> f64 {
+    pub const fn normalized_buffer_utilization(self) -> f64 {
         self.event_buffer_utilization.clamp(0.0, 1.0)
     }
 
@@ -2155,7 +2155,7 @@ impl AmbientEffectRenderer {
         self.doom_fire_fx
             .render(ctx, &mut self.effect_buffer[..len]);
 
-        let tint_strength = 0.30 + severity.clamp(0.0, 1.0) * 0.70;
+        let tint_strength = severity.clamp(0.0, 1.0).mul_add(0.70, 0.30);
         for pixel in &mut self.effect_buffer[..len] {
             *pixel = blend_rgb(*pixel, theme_inputs.accent_primary, tint_strength);
         }
@@ -2231,7 +2231,7 @@ impl AmbientEffectRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn finish_telemetry(
+    const fn finish_telemetry(
         &mut self,
         state: AmbientHealthState,
         effect: AmbientEffectKind,
@@ -2326,17 +2326,17 @@ fn blend_rgb(left: PackedRgba, right: PackedRgba, mix: f32) -> PackedRgba {
     let t = mix.clamp(0.0, 1.0);
     let inv = 1.0 - t;
     PackedRgba::rgb(
-        (left.r() as f32 * inv + right.r() as f32 * t) as u8,
-        (left.g() as f32 * inv + right.g() as f32 * t) as u8,
-        (left.b() as f32 * inv + right.b() as f32 * t) as u8,
+        f32::from(left.r()).mul_add(inv, f32::from(right.r()) * t) as u8,
+        f32::from(left.g()).mul_add(inv, f32::from(right.g()) * t) as u8,
+        f32::from(left.b()).mul_add(inv, f32::from(right.b()) * t) as u8,
     )
 }
 
 fn average_rgb(top: PackedRgba, bottom: PackedRgba) -> PackedRgba {
     PackedRgba::rgb(
-        ((u16::from(top.r()) + u16::from(bottom.r())) / 2) as u8,
-        ((u16::from(top.g()) + u16::from(bottom.g())) / 2) as u8,
-        ((u16::from(top.b()) + u16::from(bottom.b())) / 2) as u8,
+        u16::midpoint(u16::from(top.r()), u16::from(bottom.r())) as u8,
+        u16::midpoint(u16::from(top.g()), u16::from(bottom.g())) as u8,
+        u16::midpoint(u16::from(top.b()), u16::from(bottom.b())) as u8,
     )
 }
 
