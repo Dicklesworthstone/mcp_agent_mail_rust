@@ -606,6 +606,178 @@ pub fn is_valid_agent_name(name: &str) -> bool {
     valid_names_set().contains(&name.to_lowercase())
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Agent name mistake detection (Python parity)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Known program names that should go in the `program` parameter, not `name`.
+///
+/// Case-insensitive exact match after trim.
+pub const KNOWN_PROGRAM_NAMES: &[&str] = &[
+    "claude-code",
+    "claude",
+    "codex-cli",
+    "codex",
+    "cursor",
+    "windsurf",
+    "cline",
+    "aider",
+    "copilot",
+    "github-copilot",
+    "gemini-cli",
+    "gemini",
+    "opencode",
+    "vscode",
+    "neovim",
+    "vim",
+    "emacs",
+    "zed",
+    "continue",
+];
+
+/// Model name patterns that should go in the `model` parameter, not `name`.
+///
+/// Case-insensitive substring match after trim.
+pub const MODEL_NAME_PATTERNS: &[&str] = &[
+    "gpt-",
+    "gpt4",
+    "gpt3",
+    "claude-",
+    "opus",
+    "sonnet",
+    "haiku",
+    "gemini-",
+    "llama",
+    "mistral",
+    "codestral",
+    "o1-",
+    "o3-",
+];
+
+/// Broadcast-like tokens that should not be used as agent names.
+pub const BROADCAST_TOKENS: &[&str] = &["all", "everyone", "broadcast", "*"];
+
+/// Keywords that indicate descriptive/role-style names rather than random adjective+noun names.
+pub const DESCRIPTIVE_NAME_KEYWORDS: &[&str] = &[
+    "dev",
+    "developer",
+    "agent",
+    "worker",
+    "assistant",
+    "helper",
+    "bot",
+    "admin",
+    "user",
+    "manager",
+    "lead",
+    "engineer",
+];
+
+/// Check if a value looks like a known program name.
+#[must_use]
+pub fn looks_like_program_name(value: &str) -> bool {
+    let v = value.to_lowercase();
+    let v = v.trim();
+    KNOWN_PROGRAM_NAMES.iter().any(|p| *p == v)
+}
+
+/// Check if a value looks like a model name.
+#[must_use]
+pub fn looks_like_model_name(value: &str) -> bool {
+    let v = value.to_lowercase();
+    let v = v.trim();
+    MODEL_NAME_PATTERNS.iter().any(|p| v.contains(p))
+}
+
+/// Check if a value looks like an email address.
+#[must_use]
+pub fn looks_like_email(value: &str) -> bool {
+    value.contains('@')
+        && value
+            .split('@')
+            .next_back()
+            .is_some_and(|s| s.contains('.'))
+}
+
+/// Check if a value looks like an attempt to broadcast to all agents.
+#[must_use]
+pub fn looks_like_broadcast(value: &str) -> bool {
+    let v = value.to_lowercase();
+    let v = v.trim();
+    BROADCAST_TOKENS.iter().any(|token| *token == v)
+}
+
+/// Check if a value looks like a descriptive role name.
+#[must_use]
+pub fn looks_like_descriptive_name(value: &str) -> bool {
+    let v = value.to_lowercase();
+    DESCRIPTIVE_NAME_KEYWORDS.iter().any(|kw| v.contains(kw))
+}
+
+/// Detect common mistakes when agents provide invalid agent names.
+///
+/// Returns `Some((mistake_type, helpful_message))` or `None` if no obvious
+/// mistake detected.  Only the first matching category is returned.
+///
+/// Categories checked (in order):
+/// 1. `PROGRAM_NAME_AS_AGENT` — value is a known program name
+/// 2. `MODEL_NAME_AS_AGENT`  — value contains a model name pattern
+/// 3. `EMAIL_AS_AGENT` — value looks like an email address
+/// 4. `BROADCAST_ATTEMPT` — value is a broadcast token
+/// 5. `DESCRIPTIVE_NAME` — value looks like a descriptive role name
+#[must_use]
+pub fn detect_agent_name_mistake(value: &str) -> Option<(&'static str, String)> {
+    if looks_like_program_name(value) {
+        return Some((
+            "PROGRAM_NAME_AS_AGENT",
+            format!(
+                "'{value}' looks like a program name, not an agent name. \
+                 Agent names must be adjective+noun combinations like 'BlueLake' or 'GreenCastle'. \
+                 Use the 'program' parameter for program names, and omit 'name' to auto-generate a valid agent name."
+            ),
+        ));
+    }
+    if looks_like_model_name(value) {
+        return Some((
+            "MODEL_NAME_AS_AGENT",
+            format!(
+                "'{value}' looks like a model name, not an agent name. \
+                 Agent names must be adjective+noun combinations like 'RedStone' or 'PurpleBear'. \
+                 Use the 'model' parameter for model names, and omit 'name' to auto-generate a valid agent name."
+            ),
+        ));
+    }
+    if looks_like_email(value) {
+        return Some((
+            "EMAIL_AS_AGENT",
+            format!(
+                "'{value}' looks like an email address. Agent names are simple identifiers like 'BlueDog', \
+                 not email addresses. Check the 'to' parameter format."
+            ),
+        ));
+    }
+    if looks_like_broadcast(value) {
+        return Some((
+            "BROADCAST_ATTEMPT",
+            format!(
+                "'{value}' looks like a broadcast attempt. Agent Mail doesn't support broadcasting to all agents. \
+                 List specific recipient agent names in the 'to' parameter."
+            ),
+        ));
+    }
+    if looks_like_descriptive_name(value) {
+        return Some((
+            "DESCRIPTIVE_NAME",
+            format!(
+                "'{value}' looks like a descriptive role name. Agent names must be randomly generated \
+                 adjective+noun combinations like 'WhiteMountain' or 'BrownCreek', NOT descriptive of the agent's task. \
+                 Omit the 'name' parameter to auto-generate a valid name."
+            ),
+        ));
+    }
+    None
+}
+
 fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
@@ -705,6 +877,285 @@ mod tests {
         );
         assert_eq!(sanitize_agent_name("$$$"), None);
         assert_eq!(sanitize_agent_name(""), None);
+    }
+
+    // =========================================================================
+    // Agent name mistake detection tests (br-2dp8f: T3.1)
+    // =========================================================================
+
+    #[test]
+    fn program_name_detection_all_19() {
+        // Exact match against Python's _KNOWN_PROGRAM_NAMES frozenset (19 entries)
+        let expected = [
+            "claude-code",
+            "claude",
+            "codex-cli",
+            "codex",
+            "cursor",
+            "windsurf",
+            "cline",
+            "aider",
+            "copilot",
+            "github-copilot",
+            "gemini-cli",
+            "gemini",
+            "opencode",
+            "vscode",
+            "neovim",
+            "vim",
+            "emacs",
+            "zed",
+            "continue",
+        ];
+        assert_eq!(
+            KNOWN_PROGRAM_NAMES.len(),
+            19,
+            "must have exactly 19 program names"
+        );
+        for name in &expected {
+            assert!(
+                looks_like_program_name(name),
+                "'{name}' should be detected as a program name"
+            );
+        }
+    }
+
+    #[test]
+    fn program_name_detection_case_insensitive() {
+        assert!(looks_like_program_name("Claude-Code"));
+        assert!(looks_like_program_name("CLAUDE-CODE"));
+        assert!(looks_like_program_name("Cursor"));
+        assert!(looks_like_program_name("CURSOR"));
+        assert!(looks_like_program_name("  claude-code  ")); // with whitespace
+    }
+
+    #[test]
+    fn program_name_detection_non_matches() {
+        assert!(!looks_like_program_name("BlueLake")); // valid agent name
+        assert!(!looks_like_program_name("my-tool")); // unknown tool
+        assert!(!looks_like_program_name(""));
+        assert!(!looks_like_program_name("claude-code-2")); // not exact match
+    }
+
+    #[test]
+    fn model_name_detection_all_13() {
+        // Exact match against Python's _MODEL_NAME_PATTERNS tuple (13 entries)
+        let expected = [
+            "gpt-",
+            "gpt4",
+            "gpt3",
+            "claude-",
+            "opus",
+            "sonnet",
+            "haiku",
+            "gemini-",
+            "llama",
+            "mistral",
+            "codestral",
+            "o1-",
+            "o3-",
+        ];
+        assert_eq!(
+            MODEL_NAME_PATTERNS.len(),
+            13,
+            "must have exactly 13 model patterns"
+        );
+        for pattern in &expected {
+            assert!(
+                MODEL_NAME_PATTERNS.contains(pattern),
+                "'{pattern}' must be in MODEL_NAME_PATTERNS"
+            );
+        }
+    }
+
+    #[test]
+    fn model_name_detection_substring_match() {
+        // These should all be detected as model names (substring match)
+        assert!(looks_like_model_name("gpt-4-turbo"));
+        assert!(looks_like_model_name("gpt4o"));
+        assert!(looks_like_model_name("gpt3.5"));
+        assert!(looks_like_model_name("claude-opus-4-6"));
+        assert!(looks_like_model_name("claude-sonnet-4-5"));
+        assert!(looks_like_model_name("claude-haiku-4-5"));
+        assert!(looks_like_model_name("opus"));
+        assert!(looks_like_model_name("sonnet"));
+        assert!(looks_like_model_name("haiku"));
+        assert!(looks_like_model_name("gemini-2.5-pro"));
+        assert!(looks_like_model_name("llama-3.1-70b"));
+        assert!(looks_like_model_name("mistral-large"));
+        assert!(looks_like_model_name("codestral"));
+        assert!(looks_like_model_name("o1-mini"));
+        assert!(looks_like_model_name("o3-mini"));
+    }
+
+    #[test]
+    fn model_name_detection_case_insensitive() {
+        assert!(looks_like_model_name("GPT-4"));
+        assert!(looks_like_model_name("Claude-Opus-4.6"));
+        assert!(looks_like_model_name("SONNET"));
+        assert!(looks_like_model_name("  opus  ")); // with whitespace
+    }
+
+    #[test]
+    fn model_name_detection_non_matches() {
+        assert!(!looks_like_model_name("BlueLake")); // valid agent name
+        assert!(!looks_like_model_name("my-model")); // unknown model
+        assert!(!looks_like_model_name(""));
+        assert!(!looks_like_model_name("cursor")); // program name, not model
+    }
+
+    #[test]
+    fn detect_mistake_program_name() {
+        let result = detect_agent_name_mistake("claude-code");
+        assert!(result.is_some());
+        let (kind, msg) = result.unwrap();
+        assert_eq!(kind, "PROGRAM_NAME_AS_AGENT");
+        assert!(msg.contains("looks like a program name"), "message: {msg}");
+        assert!(
+            msg.contains("'claude-code'"),
+            "message should contain the value: {msg}"
+        );
+        assert!(
+            msg.contains("BlueLake"),
+            "message should suggest valid name: {msg}"
+        );
+        assert!(
+            msg.contains("Use the 'program' parameter"),
+            "message should suggest fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_mistake_model_name() {
+        let result = detect_agent_name_mistake("gpt-4-turbo");
+        assert!(result.is_some());
+        let (kind, msg) = result.unwrap();
+        assert_eq!(kind, "MODEL_NAME_AS_AGENT");
+        assert!(msg.contains("looks like a model name"), "message: {msg}");
+        assert!(
+            msg.contains("'gpt-4-turbo'"),
+            "message should contain the value: {msg}"
+        );
+        assert!(
+            msg.contains("RedStone"),
+            "message should suggest valid name: {msg}"
+        );
+        assert!(
+            msg.contains("Use the 'model' parameter"),
+            "message should suggest fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn email_detection_matches_python_rule() {
+        assert!(looks_like_email("alice@example.com"));
+        assert!(looks_like_email("ops@alerts.dev"));
+        assert!(!looks_like_email("alice@localhost"));
+        assert!(!looks_like_email("BlueLake"));
+        assert!(!looks_like_email("not-an-email@"));
+    }
+
+    #[test]
+    fn broadcast_detection_exact_tokens() {
+        for token in BROADCAST_TOKENS {
+            assert!(looks_like_broadcast(token), "token {token:?} should match");
+            assert!(looks_like_broadcast(&token.to_uppercase()));
+            assert!(looks_like_broadcast(&format!("  {token}  ")));
+        }
+        assert!(!looks_like_broadcast("@all"));
+        assert!(!looks_like_broadcast("@everyone"));
+        assert!(!looks_like_broadcast("BlueLake"));
+    }
+
+    #[test]
+    fn descriptive_name_detection_keyword_contains() {
+        assert!(looks_like_descriptive_name("BackendDeveloper"));
+        assert!(looks_like_descriptive_name("agent_worker"));
+        assert!(looks_like_descriptive_name("LeadCoordinator"));
+        assert!(!looks_like_descriptive_name("BlueLake"));
+    }
+
+    #[test]
+    fn detect_mistake_email() {
+        let (kind, msg) = detect_agent_name_mistake("alice@example.com")
+            .expect("email-shaped value should be detected");
+        assert_eq!(kind, "EMAIL_AS_AGENT");
+        assert_eq!(
+            msg,
+            "'alice@example.com' looks like an email address. Agent names are simple identifiers like 'BlueDog', \
+             not email addresses. Check the 'to' parameter format."
+        );
+    }
+
+    #[test]
+    fn detect_mistake_broadcast() {
+        let (kind, msg) =
+            detect_agent_name_mistake("everyone").expect("broadcast token should be detected");
+        assert_eq!(kind, "BROADCAST_ATTEMPT");
+        assert_eq!(
+            msg,
+            "'everyone' looks like a broadcast attempt. Agent Mail doesn't support broadcasting to all agents. \
+             List specific recipient agent names in the 'to' parameter."
+        );
+    }
+
+    #[test]
+    fn detect_mistake_descriptive_name() {
+        let (kind, msg) = detect_agent_name_mistake("BackendEngineer")
+            .expect("descriptive role names should be detected");
+        assert_eq!(kind, "DESCRIPTIVE_NAME");
+        assert_eq!(
+            msg,
+            "'BackendEngineer' looks like a descriptive role name. Agent names must be randomly generated \
+             adjective+noun combinations like 'WhiteMountain' or 'BrownCreek', NOT descriptive of the agent's task. \
+             Omit the 'name' parameter to auto-generate a valid name."
+        );
+    }
+
+    #[test]
+    fn detect_mistake_valid_name_returns_none() {
+        assert!(detect_agent_name_mistake("BlueLake").is_none());
+        assert!(detect_agent_name_mistake("RedFox").is_none());
+    }
+
+    #[test]
+    fn detect_mistake_unknown_invalid_returns_none() {
+        // Not a known program, model, or valid name — detect returns None
+        assert!(detect_agent_name_mistake("my-random-thing").is_none());
+        assert!(detect_agent_name_mistake("foobar123").is_none());
+    }
+
+    #[test]
+    fn program_takes_priority_over_model() {
+        // "claude" is both a program name and contains "claude" which looks model-like.
+        // Program detection should fire first (exact match).
+        let result = detect_agent_name_mistake("claude");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "PROGRAM_NAME_AS_AGENT");
+    }
+
+    #[test]
+    fn detect_message_exact_format_program() {
+        // Verify exact message format matches Python
+        let (_, msg) = detect_agent_name_mistake("cursor").unwrap();
+        assert_eq!(
+            msg,
+            "'cursor' looks like a program name, not an agent name. \
+             Agent names must be adjective+noun combinations like 'BlueLake' or 'GreenCastle'. \
+             Use the 'program' parameter for program names, and omit 'name' to auto-generate a valid agent name."
+        );
+    }
+
+    #[test]
+    fn detect_message_exact_format_model() {
+        // Verify exact message format matches Python
+        let (_, msg) = detect_agent_name_mistake("opus").unwrap();
+        assert_eq!(
+            msg,
+            "'opus' looks like a model name, not an agent name. \
+             Agent names must be adjective+noun combinations like 'RedStone' or 'PurpleBear'. \
+             Use the 'model' parameter for model names, and omit 'name' to auto-generate a valid agent name."
+        );
     }
 
     // =========================================================================

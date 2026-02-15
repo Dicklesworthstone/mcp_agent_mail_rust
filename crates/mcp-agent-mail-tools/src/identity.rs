@@ -478,7 +478,9 @@ pub async fn register_agent(
     task_description: Option<String>,
     attachments_policy: Option<String>,
 ) -> McpResult<String> {
-    use mcp_agent_mail_core::models::{generate_agent_name, is_valid_agent_name};
+    use mcp_agent_mail_core::models::{
+        detect_agent_name_mistake, generate_agent_name, is_valid_agent_name,
+    };
 
     // Validate program and model are non-empty
     let program = program.trim().to_string();
@@ -512,17 +514,30 @@ pub async fn register_agent(
     let agent_name = match name {
         Some(n) => {
             if !is_valid_agent_name(&n) {
+                // Check for specific mistake types before generic error
+                if let Some((mistake_type, message)) = detect_agent_name_mistake(&n) {
+                    return Err(legacy_tool_error(
+                        mistake_type,
+                        &message,
+                        true,
+                        json!({
+                            "provided_name": n,
+                            "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
+                        }),
+                    ));
+                }
                 return Err(legacy_tool_error(
-                    "INVALID_ARGUMENT",
+                    "INVALID_AGENT_NAME",
                     format!(
-                        "Invalid argument value: Invalid agent name '{n}'. \
-Names must be adjective+noun format (e.g., BlueLake). \
-Check that all parameters have valid values."
+                        "Invalid agent name format: '{n}'. \
+Agent names MUST be randomly generated adjective+noun combinations \
+(e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. \
+Omit the 'name' parameter to auto-generate a valid name."
                     ),
                     true,
                     json!({
-                        "field": "name",
-                        "error_detail": n,
+                        "provided_name": n,
+                        "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
                     }),
                 ));
             }

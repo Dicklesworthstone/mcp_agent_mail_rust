@@ -11,8 +11,8 @@
 pub mod agent_detect;
 pub mod backpressure;
 pub mod bocpd;
-pub mod conformal;
 pub mod config;
+pub mod conformal;
 pub mod diagnostics;
 pub mod disk;
 pub mod error;
@@ -77,6 +77,8 @@ pub use metrics::{
 pub use models::{
     Agent, AgentLink, ConsistencyMessageRef, ConsistencyReport, FileReservation, Message,
     MessageRecipient, Product, ProductProjectLink, Project, ProjectSiblingSuggestion,
-    VALID_ADJECTIVES, VALID_NOUNS, generate_agent_name, is_valid_agent_name,
+    KNOWN_PROGRAM_NAMES, MODEL_NAME_PATTERNS, VALID_ADJECTIVES, VALID_NOUNS,
+    detect_agent_name_mistake, generate_agent_name, is_valid_agent_name, looks_like_model_name,
+    looks_like_program_name,
 };
 pub use slo::{OpClass, PoolHealth};
