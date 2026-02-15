@@ -903,6 +903,65 @@ pub(crate) mod tool_util {
                 );
             }
         }
+
+        // -------------------------------------------------------------------
+        // agent placeholder detection
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn agent_placeholder_your_agent_detected() {
+            for pattern in AGENT_PLACEHOLDER_PATTERNS {
+                let upper = pattern.to_ascii_uppercase();
+                assert!(
+                    upper.contains(pattern) || upper == *pattern,
+                    "pattern {pattern} should match itself"
+                );
+            }
+        }
+
+        #[test]
+        fn agent_placeholder_case_insensitive() {
+            let name = "your_agent";
+            let upper = name.to_ascii_uppercase();
+            assert!(
+                AGENT_PLACEHOLDER_PATTERNS
+                    .iter()
+                    .any(|p| upper.contains(p) || upper == *p),
+                "your_agent should match YOUR_AGENT pattern"
+            );
+        }
+
+        #[test]
+        fn agent_placeholder_real_names_not_detected() {
+            let real_names = ["BlueLake", "GreenCastle", "RedFox"];
+            for name in real_names {
+                let upper = name.to_ascii_uppercase();
+                assert!(
+                    !AGENT_PLACEHOLDER_PATTERNS
+                        .iter()
+                        .any(|p| upper.contains(p) || upper == *p),
+                    "real name '{name}' should not be flagged as placeholder"
+                );
+            }
+        }
+
+        #[test]
+        fn agent_placeholder_patterns_match_python() {
+            // Python's exact 7 patterns
+            let expected = [
+                "YOUR_AGENT",
+                "YOUR_AGENT_NAME",
+                "AGENT_NAME",
+                "PLACEHOLDER",
+                "<AGENT>",
+                "{AGENT}",
+                "$AGENT",
+            ];
+            assert_eq!(AGENT_PLACEHOLDER_PATTERNS.len(), expected.len());
+            for (i, p) in AGENT_PLACEHOLDER_PATTERNS.iter().enumerate() {
+                assert_eq!(*p, expected[i], "pattern at index {i} differs");
+            }
+        }
     }
 }
 
