@@ -477,6 +477,10 @@ impl MailScreen for ReservationsScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("File reservations held by agents. Force-release stale locks with f.")
+    }
+
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         if let DeepLinkTarget::ReservationByAgent(agent) = target {
             // Find the first reservation for this agent and select it

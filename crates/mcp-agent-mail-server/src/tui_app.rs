@@ -2413,7 +2413,13 @@ impl Model for MailAppModel {
         // 6. Help overlay (z=6, topmost)
         if self.help_visible {
             let screen_label = crate::tui_screens::screen_meta(active_screen).title;
-            let sections = self.keymap.contextual_help(&screen_bindings, screen_label);
+            let screen_tip = self
+                .screen_manager
+                .active_screen_ref()
+                .and_then(|s| s.context_help_tip());
+            let sections =
+                self.keymap
+                    .contextual_help(&screen_bindings, screen_label, screen_tip);
             tui_chrome::render_help_overlay_sections(&sections, self.help_scroll, frame, area);
         }
     }

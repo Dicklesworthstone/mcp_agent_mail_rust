@@ -623,6 +623,10 @@ impl MailScreen for SystemHealthScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Server status, connection pool, and WAL/cache diagnostics.")
+    }
+
     fn title(&self) -> &'static str {
         "System Health"
     }

@@ -393,24 +393,28 @@ fn navigation_sections() -> Vec<HelpSection> {
     if !overview.is_empty() {
         sections.push(HelpSection {
             title: "Navigate • Overview".to_string(),
+            description: None,
             entries: overview,
         });
     }
     if !communication.is_empty() {
         sections.push(HelpSection {
             title: "Navigate • Communication".to_string(),
+            description: None,
             entries: communication,
         });
     }
     if !operations.is_empty() {
         sections.push(HelpSection {
             title: "Navigate • Operations".to_string(),
+            description: None,
             entries: operations,
         });
     }
     if !system.is_empty() {
         sections.push(HelpSection {
             title: "Navigate • System".to_string(),
+            description: None,
             entries: system,
         });
     }
@@ -558,28 +562,31 @@ impl KeymapRegistry {
         &self,
         screen_bindings: &[crate::tui_screens::HelpEntry],
         screen_label: &str,
+        screen_tip: Option<&str>,
     ) -> Vec<HelpSection> {
         let mut sections = Vec::new();
 
-        // Global section
-        let global_entries = self.help_entries();
-        sections.push(HelpSection {
-            title: format!("Global ({})", self.profile.label()),
-            entries: global_entries,
-        });
-
-        sections.extend(navigation_sections());
-
-        // Screen section
+        // Screen section first — context should be most prominent.
         if !screen_bindings.is_empty() {
             sections.push(HelpSection {
                 title: screen_label.to_string(),
+                description: screen_tip.map(str::to_string),
                 entries: screen_bindings
                     .iter()
                     .map(|e| (e.key.to_string(), e.action.to_string()))
                     .collect(),
             });
         }
+
+        // Global section
+        let global_entries = self.help_entries();
+        sections.push(HelpSection {
+            title: format!("Global ({})", self.profile.label()),
+            description: None,
+            entries: global_entries,
+        });
+
+        sections.extend(navigation_sections());
 
         sections
     }
@@ -645,15 +652,18 @@ impl Default for KeymapRegistry {
 pub struct HelpSection {
     /// Section title (e.g. "Global (Vim)", "Dashboard").
     pub title: String,
+    /// Optional context description shown below the title.
+    pub description: Option<String>,
     /// `(key_label, action_description)` pairs.
     pub entries: Vec<(String, String)>,
 }
 
 impl HelpSection {
-    /// Total number of display lines (title + entries).
+    /// Total number of display lines (title + description + entries).
     #[must_use]
     pub fn line_count(&self) -> usize {
-        1 + self.entries.len()
+        let desc_lines = self.description.as_ref().map_or(0, |_| 1);
+        1 + desc_lines + self.entries.len()
     }
 }
 
@@ -1045,7 +1055,7 @@ mod tests {
     #[test]
     fn registry_contextual_help_has_global_section() {
         let reg = KeymapRegistry::default();
-        let sections = reg.contextual_help(&[], "Dashboard");
+        let sections = reg.contextual_help(&[], "Dashboard", None);
         assert!(sections[0].title.contains("Global"));
         assert!(sections[0].title.contains("Default"));
         assert!(
@@ -1061,7 +1071,7 @@ mod tests {
             key: "r",
             action: "Refresh",
         }];
-        let sections = reg.contextual_help(&screen, "Messages");
+        let sections = reg.contextual_help(&screen, "Messages", None);
         let screen_section = sections
             .iter()
             .find(|s| s.title == "Messages")
@@ -1083,7 +1093,7 @@ mod tests {
     #[test]
     fn contextual_help_navigation_sections_cover_all_screens() {
         let reg = KeymapRegistry::default();
-        let sections = reg.contextual_help(&[], "Dashboard");
+        let sections = reg.contextual_help(&[], "Dashboard", None);
         let nav_entries = sections
             .iter()
             .filter(|s| s.title.starts_with("Navigate •"))
@@ -1119,12 +1129,20 @@ mod tests {
     fn help_section_line_count() {
         let section = HelpSection {
             title: "Test".to_string(),
+            description: None,
             entries: vec![
                 ("a".to_string(), "Action A".to_string()),
                 ("b".to_string(), "Action B".to_string()),
             ],
         };
         assert_eq!(section.line_count(), 3); // title + 2 entries
+
+        let with_desc = HelpSection {
+            title: "Test".to_string(),
+            description: Some("Quick tip here".to_string()),
+            entries: vec![("x".to_string(), "Do X".to_string())],
+        };
+        assert_eq!(with_desc.line_count(), 3); // title + description + 1 entry
     }
 
     #[test]

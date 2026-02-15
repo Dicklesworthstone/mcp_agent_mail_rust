@@ -1008,6 +1008,10 @@ impl MailScreen for MessageBrowserScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Browse and triage messages. Use / to filter, Enter to view body.")
+    }
+
     fn consumes_text_input(&self) -> bool {
         matches!(self.focus, Focus::SearchBar)
     }

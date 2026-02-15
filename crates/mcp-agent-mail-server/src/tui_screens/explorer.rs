@@ -1092,6 +1092,10 @@ impl MailScreen for MailExplorerScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Explore mailbox structure. Filter by agent, project, or date range.")
+    }
+
     fn consumes_text_input(&self) -> bool {
         matches!(self.focus, Focus::SearchBar)
     }

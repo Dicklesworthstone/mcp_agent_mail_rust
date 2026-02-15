@@ -385,6 +385,10 @@ impl MailScreen for ContactsScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Agent contact links and approval status. Accept/deny pending requests.")
+    }
+
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         if let DeepLinkTarget::ContactByPair(from, to) = target {
             if let Some(pos) = self

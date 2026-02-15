@@ -756,6 +756,10 @@ impl MailScreen for DashboardScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Overview of projects, agents, and live request counters.")
+    }
+
     fn title(&self) -> &'static str {
         "Dashboard"
     }

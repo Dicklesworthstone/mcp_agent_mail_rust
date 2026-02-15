@@ -292,6 +292,10 @@ impl MailScreen for ProjectsScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Project registry with agent counts and message totals.")
+    }
+
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         if let DeepLinkTarget::ProjectBySlug(slug) = target {
             if let Some(pos) = self.projects.iter().position(|p| p.slug == *slug) {

@@ -599,6 +599,10 @@ impl MailScreen for AgentsScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Registered agents and their status. Enter to view inbox, / to filter.")
+    }
+
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         if let DeepLinkTarget::AgentByName(name) = target {
             if let Some(pos) = self.agents.iter().position(|a| a.name == *name) {

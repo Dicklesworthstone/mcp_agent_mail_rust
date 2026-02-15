@@ -756,6 +756,21 @@ pub fn render_help_overlay_sections(
         }
         line_idx += 1;
 
+        // Optional context description.
+        if let Some(ref desc) = section.description {
+            if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
+                let desc_para = Paragraph::new(desc.as_str()).style(
+                    Style::default().fg(tp.status_fg).bg(tp.help_bg).italic(),
+                );
+                desc_para.render(
+                    Rect::new(inner.x + 2, inner.y + y_pos, col_width.saturating_sub(1), 1),
+                    frame,
+                );
+                y_pos += 1;
+            }
+            line_idx += 1;
+        }
+
         // Entries.
         for (key, action) in &section.entries {
             if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {

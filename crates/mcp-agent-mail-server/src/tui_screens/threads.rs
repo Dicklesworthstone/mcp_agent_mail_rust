@@ -1190,6 +1190,10 @@ impl MailScreen for ThreadExplorerScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Thread conversations grouped by topic. Enter to expand, h to collapse.")
+    }
+
     fn consumes_text_input(&self) -> bool {
         self.filter_editing
     }

@@ -782,6 +782,10 @@ impl MailScreen for AttachmentExplorerScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Message attachments with preview. Enter to view, / to filter by name.")
+    }
+
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         if let DeepLinkTarget::MessageById(msg_id) = target {
             // Find the first attachment from this message

@@ -454,6 +454,10 @@ impl MailScreen for AnalyticsScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Message volume, response times, and agent activity analytics.")
+    }
+
     fn title(&self) -> &'static str {
         "Analytics"
     }

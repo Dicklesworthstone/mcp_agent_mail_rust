@@ -2051,6 +2051,10 @@ impl MailScreen for SearchCockpitScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Full-text search across messages. Supports AND, OR, NOT operators.")
+    }
+
     fn consumes_text_input(&self) -> bool {
         matches!(self.focus, Focus::QueryBar)
     }

@@ -217,6 +217,15 @@ pub trait MailScreen {
         vec![]
     }
 
+    /// Return a brief context-sensitive tip for the help overlay.
+    ///
+    /// Displayed at the top of the screen-specific section to orient the
+    /// user about what the current screen does and how to use it.
+    /// Returning `None` (the default) omits the description line.
+    fn context_help_tip(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Handle an incoming deep-link navigation request.
     ///
     /// Screens that support deep-linking should override this to jump

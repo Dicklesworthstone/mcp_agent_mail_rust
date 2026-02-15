@@ -603,6 +603,10 @@ impl MailScreen for TimelineScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Chronological event log. Expand entries for detail, use correlation links.")
+    }
+
     fn title(&self) -> &'static str {
         "Event Timeline"
     }

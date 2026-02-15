@@ -1116,6 +1116,10 @@ impl MailScreen for ToolMetricsScreen {
         ]
     }
 
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("MCP tool call counts, latency, and error rates. Sort by any column.")
+    }
+
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         if let DeepLinkTarget::ToolByName(name) = target {
             if let Some(pos) = self.sorted_tools.iter().position(|t| t == name) {
