@@ -5,8 +5,10 @@
 //! and a conversation detail panel on the right showing chronological messages
 //! within the selected thread.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
@@ -14,7 +16,9 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui::{Buffer, Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPolicy};
+use ftui_extras::{mermaid_layout, mermaid_render};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::tree::{Tree, TreeGuides, TreeNode};
 
@@ -24,6 +28,7 @@ use mcp_agent_mail_db::timestamps::micros_to_iso;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::{MermaidThreadMessage, generate_thread_flow_mermaid};
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -42,6 +47,7 @@ const DEFAULT_THREAD_PAGE_SIZE: usize = 20;
 /// Number of older messages to load when clicking "Load older".
 const LOAD_OLDER_BATCH_SIZE: usize = 15;
 const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
+const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Color palette for deterministic per-agent coloring in thread cards.
 fn agent_color_palette() -> [PackedRgba; 8] {
@@ -253,6 +259,14 @@ struct ThreadTreeRow {
     is_expanded: bool,
 }
 
+#[derive(Debug, Clone)]
+struct MermaidPanelCache {
+    source_hash: u64,
+    width: u16,
+    height: u16,
+    buffer: Buffer,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Focus state
 // ──────────────────────────────────────────────────────────────────────
@@ -320,6 +334,12 @@ pub struct ThreadExplorerScreen {
     urgent_pulse_on: bool,
     /// Reduced-motion mode disables pulse animation.
     reduced_motion: bool,
+    /// Mermaid thread-flow panel toggle.
+    show_mermaid_panel: bool,
+    /// Rendered Mermaid panel cache (source hash + dimensions).
+    mermaid_cache: RefCell<Option<MermaidPanelCache>>,
+    /// Last Mermaid re-render timestamp for debounce.
+    mermaid_last_render_at: RefCell<Option<Instant>>,
 }
 
 impl ThreadExplorerScreen {
@@ -351,6 +371,9 @@ impl ThreadExplorerScreen {
             load_older_selected: false,
             urgent_pulse_on: true,
             reduced_motion: reduced_motion_enabled(),
+            show_mermaid_panel: false,
+            mermaid_cache: RefCell::new(None),
+            mermaid_last_render_at: RefCell::new(None),
         }
     }
 
@@ -616,6 +639,81 @@ impl ThreadExplorerScreen {
     fn collapse_all(&mut self) {
         self.expanded_message_ids.clear();
     }
+
+    fn thread_mermaid_messages(&self) -> Vec<MermaidThreadMessage> {
+        self.detail_messages
+            .iter()
+            .map(|message| {
+                let to_agents = message
+                    .to_agents
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|agent| !agent.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                MermaidThreadMessage {
+                    from_agent: message.from_agent.clone(),
+                    to_agents,
+                    subject: message.subject.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn render_mermaid_panel(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let title = if focused {
+            "Mermaid Thread Flow * [g]"
+        } else {
+            "Mermaid Thread Flow [g]"
+        };
+        let block = Block::default()
+            .title(title)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        if inner.width < 4 || inner.height < 4 {
+            return;
+        }
+
+        let mermaid_messages = self.thread_mermaid_messages();
+        let source = generate_thread_flow_mermaid(&mermaid_messages);
+        let source_hash = stable_hash(source.as_bytes());
+
+        let cache_is_fresh = {
+            let cache = self.mermaid_cache.borrow();
+            cache.as_ref().is_some_and(|cached| {
+                cached.source_hash == source_hash
+                    && cached.width == inner.width
+                    && cached.height == inner.height
+            })
+        };
+        let has_cache = self.mermaid_cache.borrow().is_some();
+        let can_refresh = self
+            .mermaid_last_render_at
+            .borrow()
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= MERMAID_RENDER_DEBOUNCE);
+
+        if !cache_is_fresh && (can_refresh || !has_cache) {
+            let buffer = render_mermaid_source_to_buffer(&source, inner.width, inner.height);
+            *self.mermaid_cache.borrow_mut() = Some(MermaidPanelCache {
+                source_hash,
+                width: inner.width,
+                height: inner.height,
+                buffer,
+            });
+            *self.mermaid_last_render_at.borrow_mut() = Some(Instant::now());
+        }
+
+        if let Some(cache) = self.mermaid_cache.borrow().as_ref() {
+            blit_buffer_to_frame(frame, inner, &cache.buffer);
+        } else {
+            Paragraph::new("Preparing Mermaid thread diagram...").render(inner, frame);
+        }
+    }
 }
 
 impl Default for ThreadExplorerScreen {
@@ -676,10 +774,13 @@ impl MailScreen for ThreadExplorerScreen {
                                     self.refresh_detail_if_needed();
                                 }
                             }
-                            KeyCode::Char('g') | KeyCode::Home => {
+                            KeyCode::Home => {
                                 self.cursor = 0;
                                 self.detail_scroll = 0;
                                 self.refresh_detail_if_needed();
+                            }
+                            KeyCode::Char('g') => {
+                                self.show_mermaid_panel = !self.show_mermaid_panel;
                             }
                             // Page navigation
                             KeyCode::Char('d') | KeyCode::PageDown => {
@@ -726,6 +827,11 @@ impl MailScreen for ThreadExplorerScreen {
                                 self.filter_text.clear();
                                 self.list_dirty = true;
                             }
+                            KeyCode::Escape => {
+                                if self.show_mermaid_panel {
+                                    self.show_mermaid_panel = false;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -735,8 +841,15 @@ impl MailScreen for ThreadExplorerScreen {
                         match key.code {
                             // Back to thread list
                             KeyCode::Escape => {
-                                self.focus = Focus::ThreadList;
-                                self.load_older_selected = false;
+                                if self.show_mermaid_panel {
+                                    self.show_mermaid_panel = false;
+                                } else {
+                                    self.focus = Focus::ThreadList;
+                                    self.load_older_selected = false;
+                                }
+                            }
+                            KeyCode::Char('g') => {
+                                self.show_mermaid_panel = !self.show_mermaid_panel;
                             }
                             // Toggle focus between hierarchy tree and preview pane.
                             KeyCode::Tab => {
@@ -768,7 +881,7 @@ impl MailScreen for ThreadExplorerScreen {
                                 KeyCode::Char('G') | KeyCode::End => {
                                     self.detail_cursor = tree_rows.len().saturating_sub(1);
                                 }
-                                KeyCode::Char('g') | KeyCode::Home => {
+                                KeyCode::Home => {
                                     self.detail_cursor = 0;
                                 }
                                 // Tree expansion controls
@@ -939,54 +1052,70 @@ impl MailScreen for ThreadExplorerScreen {
                 self.sort_mode,
                 self.urgent_pulse_on,
             );
-            render_thread_detail(
-                frame,
-                detail_area,
-                &self.detail_messages,
-                self.threads.get(self.cursor),
-                self.detail_scroll,
-                self.detail_cursor,
-                &self.expanded_message_ids,
-                &self.collapsed_tree_ids,
-                self.has_older_messages(),
-                self.remaining_older_count(),
-                self.loaded_message_count,
-                self.total_thread_messages,
-                matches!(self.focus, Focus::DetailPanel),
-                self.detail_tree_focus,
-            );
+            if self.show_mermaid_panel {
+                self.render_mermaid_panel(
+                    frame,
+                    detail_area,
+                    matches!(self.focus, Focus::DetailPanel),
+                );
+            } else {
+                render_thread_detail(
+                    frame,
+                    detail_area,
+                    &self.detail_messages,
+                    self.threads.get(self.cursor),
+                    self.detail_scroll,
+                    self.detail_cursor,
+                    &self.expanded_message_ids,
+                    &self.collapsed_tree_ids,
+                    self.has_older_messages(),
+                    self.remaining_older_count(),
+                    self.loaded_message_count,
+                    self.total_thread_messages,
+                    matches!(self.focus, Focus::DetailPanel),
+                    self.detail_tree_focus,
+                );
+            }
         } else {
-            // Narrow: show only the active pane
-            match self.focus {
-                Focus::ThreadList => {
-                    render_thread_list(
-                        frame,
-                        content_area,
-                        &self.threads,
-                        self.cursor,
-                        true,
-                        self.view_lens,
-                        self.sort_mode,
-                        self.urgent_pulse_on,
-                    );
-                }
-                Focus::DetailPanel => {
-                    render_thread_detail(
-                        frame,
-                        content_area,
-                        &self.detail_messages,
-                        self.threads.get(self.cursor),
-                        self.detail_scroll,
-                        self.detail_cursor,
-                        &self.expanded_message_ids,
-                        &self.collapsed_tree_ids,
-                        self.has_older_messages(),
-                        self.remaining_older_count(),
-                        self.loaded_message_count,
-                        self.total_thread_messages,
-                        true,
-                        self.detail_tree_focus,
-                    );
+            // Narrow: show active pane unless Mermaid panel is toggled.
+            if self.show_mermaid_panel {
+                self.render_mermaid_panel(
+                    frame,
+                    content_area,
+                    matches!(self.focus, Focus::DetailPanel),
+                );
+            } else {
+                match self.focus {
+                    Focus::ThreadList => {
+                        render_thread_list(
+                            frame,
+                            content_area,
+                            &self.threads,
+                            self.cursor,
+                            true,
+                            self.view_lens,
+                            self.sort_mode,
+                            self.urgent_pulse_on,
+                        );
+                    }
+                    Focus::DetailPanel => {
+                        render_thread_detail(
+                            frame,
+                            content_area,
+                            &self.detail_messages,
+                            self.threads.get(self.cursor),
+                            self.detail_scroll,
+                            self.detail_cursor,
+                            &self.expanded_message_ids,
+                            &self.collapsed_tree_ids,
+                            self.has_older_messages(),
+                            self.remaining_older_count(),
+                            self.loaded_message_count,
+                            self.total_thread_messages,
+                            true,
+                            self.detail_tree_focus,
+                        );
+                    }
                 }
             }
         }
@@ -1003,8 +1132,12 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Page down/up",
             },
             HelpEntry {
-                key: "G/g",
+                key: "G/Home",
                 action: "End / Home",
+            },
+            HelpEntry {
+                key: "g",
+                action: "Toggle Mermaid panel",
             },
             HelpEntry {
                 key: "Enter/l",
@@ -1036,7 +1169,7 @@ impl MailScreen for ThreadExplorerScreen {
             },
             HelpEntry {
                 key: "Esc/h",
-                action: "Back to thread list",
+                action: "Close Mermaid / back to thread list",
             },
             HelpEntry {
                 key: "/",
@@ -1650,6 +1783,90 @@ fn render_thread_detail(
     Paragraph::new(Text::from_lines(visible_preview)).render(preview_inner, frame);
 }
 
+fn stable_hash<T: Hash>(value: T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn render_mermaid_source_to_buffer(source: &str, width: u16, height: u16) -> Buffer {
+    let mut buffer = Buffer::new(width, height);
+    let config = mermaid::MermaidConfig::from_env();
+    if !config.enabled {
+        for (idx, ch) in "Mermaid disabled via env".chars().enumerate() {
+            if let Ok(x) = u16::try_from(idx) {
+                if x >= width {
+                    break;
+                }
+                buffer.set(x, 0, ftui::Cell::from_char(ch));
+            } else {
+                break;
+            }
+        }
+        return buffer;
+    }
+
+    let matrix = MermaidCompatibilityMatrix::default();
+    let policy = MermaidFallbackPolicy::default();
+    let parsed = mermaid::parse_with_diagnostics(source);
+    let ir_parse = mermaid::normalize_ast_to_ir(&parsed.ast, &config, &matrix, &policy);
+    let mut errors = parsed.errors;
+    errors.extend(ir_parse.errors);
+
+    let render_area = Rect::from_size(width, height);
+    let layout = mermaid_layout::layout_diagram(&ir_parse.ir, &config);
+    let _plan = mermaid_render::render_diagram_adaptive(
+        &layout,
+        &ir_parse.ir,
+        &config,
+        render_area,
+        &mut buffer,
+    );
+
+    if !errors.is_empty() {
+        let has_content = !ir_parse.ir.nodes.is_empty()
+            || !ir_parse.ir.edges.is_empty()
+            || !ir_parse.ir.labels.is_empty()
+            || !ir_parse.ir.clusters.is_empty();
+        if has_content {
+            mermaid_render::render_mermaid_error_overlay(
+                &errors,
+                source,
+                &config,
+                render_area,
+                &mut buffer,
+            );
+        } else {
+            mermaid_render::render_mermaid_error_panel(
+                &errors,
+                source,
+                &config,
+                render_area,
+                &mut buffer,
+            );
+        }
+    }
+
+    buffer
+}
+
+fn blit_buffer_to_frame(frame: &mut Frame<'_>, area: Rect, buffer: &Buffer) {
+    let width = area.width.min(buffer.width());
+    let height = area.height.min(buffer.height());
+    for y in 0..height {
+        for x in 0..width {
+            let Some(src) = buffer.get(x, y) else {
+                continue;
+            };
+            let dst_x = area.x + x;
+            let dst_y = area.y + y;
+            if let Some(dst) = frame.buffer.get_mut(dst_x, dst_y) {
+                *dst = src.clone();
+            }
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Utility helpers
 // ──────────────────────────────────────────────────────────────────────
@@ -1930,10 +2147,41 @@ mod tests {
         screen.update(&g_upper, &state);
         assert_eq!(screen.cursor, 9);
 
-        // g jumps to start
-        let g_lower = Event::Key(ftui::KeyEvent::new(KeyCode::Char('g')));
-        screen.update(&g_lower, &state);
+        // Home jumps to start
+        let home = Event::Key(ftui::KeyEvent::new(KeyCode::Home));
+        screen.update(&home, &state);
         assert_eq!(screen.cursor, 0);
+    }
+
+    #[test]
+    fn g_toggles_mermaid_panel_in_list_and_detail() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 2, 2));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let g = Event::Key(ftui::KeyEvent::new(KeyCode::Char('g')));
+
+        screen.update(&g, &state);
+        assert!(screen.show_mermaid_panel);
+        screen.update(&g, &state);
+        assert!(!screen.show_mermaid_panel);
+
+        screen.focus = Focus::DetailPanel;
+        screen.update(&g, &state);
+        assert!(screen.show_mermaid_panel);
+    }
+
+    #[test]
+    fn escape_closes_mermaid_panel_before_leaving_detail() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.focus = Focus::DetailPanel;
+        screen.show_mermaid_panel = true;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        screen.update(&esc, &state);
+
+        assert!(!screen.show_mermaid_panel);
+        assert_eq!(screen.focus, Focus::DetailPanel);
     }
 
     #[test]
@@ -2248,6 +2496,21 @@ mod tests {
             screen.detail_messages.push(make_message(i));
         }
         screen.loaded_thread_id = "test-thread".to_string();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+    }
+
+    #[test]
+    fn render_with_mermaid_panel_no_panic() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("test-thread", 3, 2));
+        for i in 0..3 {
+            screen.detail_messages.push(make_message(i));
+        }
+        screen.loaded_thread_id = "test-thread".to_string();
+        screen.show_mermaid_panel = true;
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(120, 30, &mut pool);
@@ -2762,6 +3025,7 @@ mod tests {
         assert!(bindings.iter().any(|b| b.key == "s"));
         assert!(bindings.iter().any(|b| b.key == "v"));
         assert!(bindings.iter().any(|b| b.key == "t"));
+        assert!(bindings.iter().any(|b| b.key == "g"));
         assert!(bindings.iter().any(|b| b.key == "Enter/Space"));
         assert!(bindings.iter().any(|b| b.key == "e / c"));
     }

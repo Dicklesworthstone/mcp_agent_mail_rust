@@ -645,6 +645,7 @@ impl MailScreen for DashboardScreen {
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         let tc = TerminalClass::from_rect(area);
         let density = DensityHint::from_terminal_class(tc);
+        let effects_enabled = state.config_snapshot().tui_effects;
 
         // ── Panel budgets (explicit per terminal class) ──────────
         let title_h = title_band_height(tc);
@@ -668,7 +669,7 @@ impl MailScreen for DashboardScreen {
 
         // ── Gradient title ───────────────────────────────────────
         if title_h > 0 {
-            render_gradient_title(frame, title_area);
+            render_gradient_title(frame, title_area, effects_enabled);
         }
 
         // ── Render bands ─────────────────────────────────────────
@@ -817,26 +818,39 @@ fn summarize_recipients(recipients: &[String]) -> String {
 // Rendering
 // ──────────────────────────────────────────────────────────────────────
 
-/// Render the gradient-colored "Agent Mail Dashboard" title.
+/// Render the dashboard title with optional gradient effect.
 ///
 /// Uses [`StyledText`] with [`TextEffect::HorizontalGradient`] to produce
 /// a smooth color transition from `status_accent` to `severity_ok` across
-/// the title text.  The title is centered within the given area.
-fn render_gradient_title(frame: &mut Frame<'_>, area: Rect) {
+/// the title text when effects are enabled. The title is centered within
+/// the given area.
+fn render_gradient_title(frame: &mut Frame<'_>, area: Rect, effects_enabled: bool) {
+    use ftui::text::{Line, Span};
+
     if area.width == 0 || area.height == 0 {
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let gradient = ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.severity_ok)]);
     let title_text = "Agent Mail Dashboard";
-    // Center the title horizontally within the area.
     let text_len = u16::try_from(title_text.len()).unwrap_or(u16::MAX);
     let x_offset = area.width.saturating_sub(text_len) / 2;
-    let title_widget = StyledText::new(title_text)
-        .effect(TextEffect::HorizontalGradient { gradient })
-        .base_color(tp.status_accent)
-        .bold();
-    title_widget.render(Rect::new(area.x + x_offset, area.y, text_len, 1), frame);
+    let title_area = Rect::new(area.x + x_offset, area.y, text_len, 1);
+
+    if effects_enabled {
+        let gradient = ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.severity_ok)]);
+        StyledText::new(title_text)
+            .effect(TextEffect::HorizontalGradient { gradient })
+            .base_color(tp.status_accent)
+            .bold()
+            .render(title_area, frame);
+        return;
+    }
+
+    let line = Line::from_spans([Span::styled(
+        title_text,
+        Style::default().fg(tp.status_accent).bold(),
+    )]);
+    Paragraph::new(line).render(title_area, frame);
 }
 
 /// Render the summary band using `MetricTile` widgets.
@@ -2461,6 +2475,20 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 1, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 80, 1), &state);
+    }
+
+    #[test]
+    fn gradient_title_renders_when_effects_enabled() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 1, &mut pool);
+        render_gradient_title(&mut frame, Rect::new(0, 0, 80, 1), true);
+    }
+
+    #[test]
+    fn gradient_title_falls_back_when_effects_disabled() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 1, &mut pool);
+        render_gradient_title(&mut frame, Rect::new(0, 0, 80, 1), false);
     }
 
     // ── Activity indicator tests ──────────────────────────────────

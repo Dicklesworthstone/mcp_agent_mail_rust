@@ -73,8 +73,9 @@ pub struct ChromeAreas {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Render the tab bar into a 1-row area.
-pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
+pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut Frame, area: Rect) {
     use ftui::text::{Line, Span, Text};
+    use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
 
     let tp = crate::tui_theme::TuiThemePalette::current();
 
@@ -125,23 +126,44 @@ pub fn render_tab_bar(active: MailScreenId, frame: &mut Frame, area: Rect) {
             x += 1;
         }
 
+        let tab_area = Rect::new(x, area.y, tab_width, 1);
+
+        let use_gradient = is_active && effects_enabled;
         let label_style = if is_active {
             Style::default().fg(fg).bg(bg).bold()
         } else {
             Style::default().fg(fg).bg(bg)
         };
 
-        let spans = vec![
-            Span::styled(" ", Style::default().bg(bg)),
-            Span::styled(key_str, Style::default().fg(tp.tab_key_fg).bg(bg)),
-            Span::styled(":", Style::default().fg(tp.tab_inactive_fg).bg(bg)),
-            Span::styled(label, label_style),
-            Span::styled(" ", Style::default().bg(bg)),
-        ];
+        let label_span = if use_gradient {
+            // Reserve label width in the base tab row; overlay gradient text below.
+            Span::styled(" ".repeat(label.len()), Style::default().bg(bg))
+        } else {
+            Span::styled(label, label_style)
+        };
 
-        let line = Line::from_spans(spans);
-        let tab_area = Rect::new(x, area.y, tab_width, 1);
+        let line = Line::from_spans(vec![
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(key_str.as_str(), Style::default().fg(tp.tab_key_fg).bg(bg)),
+            Span::styled(":", Style::default().fg(tp.tab_inactive_fg).bg(bg)),
+            label_span,
+            Span::styled(" ", Style::default().bg(bg)),
+        ]);
+
         Paragraph::new(Text::from_lines([line])).render(tab_area, frame);
+
+        if use_gradient {
+            let gradient =
+                ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.text_secondary)]);
+            let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX);
+            let key_width = u16::try_from(key_str.len()).unwrap_or(u16::MAX);
+            let label_x = x + 1 + key_width + 1;
+            StyledText::new(label)
+                .effect(TextEffect::HorizontalGradient { gradient })
+                .base_color(tp.status_accent)
+                .bold()
+                .render(Rect::new(label_x, area.y, label_width, 1), frame);
+        }
 
         x += tab_width;
     }
@@ -971,6 +993,30 @@ mod tests {
     fn tab_count_matches_screens() {
         assert_eq!(MAIL_SCREEN_REGISTRY.len(), ALL_SCREEN_IDS.len());
         assert_eq!(MAIL_SCREEN_REGISTRY.len(), 14);
+    }
+
+    #[test]
+    fn render_tab_bar_with_effects_enabled() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 1, &mut pool);
+        render_tab_bar(
+            MailScreenId::Dashboard,
+            true,
+            &mut frame,
+            Rect::new(0, 0, 120, 1),
+        );
+    }
+
+    #[test]
+    fn render_tab_bar_with_effects_disabled() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 1, &mut pool);
+        render_tab_bar(
+            MailScreenId::Dashboard,
+            false,
+            &mut frame,
+            Rect::new(0, 0, 120, 1),
+        );
     }
 
     #[test]

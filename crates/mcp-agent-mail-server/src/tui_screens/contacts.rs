@@ -1,5 +1,9 @@
 //! Contacts screen — cross-agent contact links and policy display.
 
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
+
 use ftui::layout::Constraint;
 use ftui::layout::Rect;
 use ftui::widgets::StatefulWidget;
@@ -8,14 +12,17 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
+use ftui::{Buffer, Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_extras::canvas::{CanvasRef, Mode, Painter};
+use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPolicy};
+use ftui_extras::{mermaid_layout, mermaid_render};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_action_menu::{ActionEntry, contacts_actions};
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_events::ContactSummary;
+use crate::tui_events::{ContactSummary, MailEvent};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::generate_contact_graph_mermaid;
 
 /// Column indices for sorting.
 const COL_FROM: usize = 0;
@@ -25,6 +32,15 @@ const COL_REASON: usize = 3;
 const COL_UPDATED: usize = 4;
 
 const SORT_LABELS: &[&str] = &["From", "To", "Status", "Reason", "Updated"];
+const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone)]
+struct MermaidPanelCache {
+    source_hash: u64,
+    width: u16,
+    height: u16,
+    buffer: Buffer,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -81,6 +97,9 @@ pub struct ContactsScreen {
     view_mode: ViewMode,
     /// (Agent Name, x, y) normalized 0.0-1.0
     graph_nodes: Vec<(String, f64, f64)>,
+    show_mermaid_panel: bool,
+    mermaid_cache: RefCell<Option<MermaidPanelCache>>,
+    mermaid_last_render_at: RefCell<Option<Instant>>,
 }
 
 impl ContactsScreen {
@@ -96,6 +115,9 @@ impl ContactsScreen {
             status_filter: StatusFilter::All,
             view_mode: ViewMode::Table,
             graph_nodes: Vec::new(),
+            show_mermaid_panel: false,
+            mermaid_cache: RefCell::new(None),
+            mermaid_last_render_at: RefCell::new(None),
         }
     }
 
@@ -229,10 +251,13 @@ impl MailScreen for ContactsScreen {
                             self.table_state.selected = Some(self.contacts.len() - 1);
                         }
                     }
-                    KeyCode::Char('g') | KeyCode::Home => {
+                    KeyCode::Home => {
                         if !self.contacts.is_empty() {
                             self.table_state.selected = Some(0);
                         }
+                    }
+                    KeyCode::Char('g') => {
+                        self.show_mermaid_panel = !self.show_mermaid_panel;
                     }
                     KeyCode::Char('/') => {
                         self.filter_active = true;
@@ -257,7 +282,9 @@ impl MailScreen for ContactsScreen {
                         self.rebuild_from_state(state);
                     }
                     KeyCode::Escape => {
-                        if !self.filter.is_empty() {
+                        if self.show_mermaid_panel {
+                            self.show_mermaid_panel = false;
+                        } else if !self.filter.is_empty() {
                             self.filter.clear();
                             self.rebuild_from_state(state);
                         }
@@ -312,7 +339,9 @@ impl MailScreen for ContactsScreen {
         let p = Paragraph::new(info);
         p.render(header_area, frame);
 
-        if self.view_mode == ViewMode::Graph {
+        if self.show_mermaid_panel {
+            self.render_mermaid_panel(frame, table_area);
+        } else if self.view_mode == ViewMode::Graph {
             self.render_graph(frame, table_area);
         } else {
             self.render_table(frame, table_area);
@@ -324,6 +353,10 @@ impl MailScreen for ContactsScreen {
             HelpEntry {
                 key: "j/k",
                 action: "Select contact",
+            },
+            HelpEntry {
+                key: "g",
+                action: "Toggle Mermaid graph panel",
             },
             HelpEntry {
                 key: "/",
@@ -347,7 +380,7 @@ impl MailScreen for ContactsScreen {
             },
             HelpEntry {
                 key: "Esc",
-                action: "Clear filter",
+                action: "Close Mermaid / clear filter",
             },
         ]
     }
@@ -482,6 +515,57 @@ impl ContactsScreen {
         }
     }
 
+    fn render_mermaid_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = Block::default()
+            .title("Mermaid Contact Graph [g]")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        if inner.width < 4 || inner.height < 4 {
+            return;
+        }
+
+        let events: [MailEvent; 0] = [];
+        let source = generate_contact_graph_mermaid(&self.contacts, &events);
+        let source_hash = stable_hash(source.as_bytes());
+
+        let cache_is_fresh = {
+            let cache = self.mermaid_cache.borrow();
+            cache.as_ref().is_some_and(|cached| {
+                cached.source_hash == source_hash
+                    && cached.width == inner.width
+                    && cached.height == inner.height
+            })
+        };
+
+        let has_cache = self.mermaid_cache.borrow().is_some();
+        let can_refresh = self
+            .mermaid_last_render_at
+            .borrow()
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= MERMAID_RENDER_DEBOUNCE);
+
+        if !cache_is_fresh && (can_refresh || !has_cache) {
+            let buffer = render_mermaid_source_to_buffer(&source, inner.width, inner.height);
+            *self.mermaid_cache.borrow_mut() = Some(MermaidPanelCache {
+                source_hash,
+                width: inner.width,
+                height: inner.height,
+                buffer,
+            });
+            *self.mermaid_last_render_at.borrow_mut() = Some(Instant::now());
+        }
+
+        if let Some(cache) = self.mermaid_cache.borrow().as_ref() {
+            blit_buffer_to_frame(frame, inner, &cache.buffer);
+        } else {
+            Paragraph::new("Preparing Mermaid graph...").render(inner, frame);
+        }
+    }
+
     fn find_node(&self, name: &str) -> Option<&(String, f64, f64)> {
         self.graph_nodes.iter().find(|n| n.0 == name)
     }
@@ -540,6 +624,90 @@ impl ContactsScreen {
 
         let mut ts = self.table_state.clone();
         StatefulWidget::render(&table, area, frame, &mut ts);
+    }
+}
+
+fn stable_hash<T: Hash>(value: T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn render_mermaid_source_to_buffer(source: &str, width: u16, height: u16) -> Buffer {
+    let mut buffer = Buffer::new(width, height);
+    let config = mermaid::MermaidConfig::from_env();
+    if !config.enabled {
+        for (idx, ch) in "Mermaid disabled via env".chars().enumerate() {
+            if let Ok(x) = u16::try_from(idx) {
+                if x >= width {
+                    break;
+                }
+                buffer.set(x, 0, ftui::Cell::from_char(ch));
+            } else {
+                break;
+            }
+        }
+        return buffer;
+    }
+
+    let matrix = MermaidCompatibilityMatrix::default();
+    let policy = MermaidFallbackPolicy::default();
+    let parsed = mermaid::parse_with_diagnostics(source);
+    let ir_parse = mermaid::normalize_ast_to_ir(&parsed.ast, &config, &matrix, &policy);
+    let mut errors = parsed.errors;
+    errors.extend(ir_parse.errors);
+
+    let render_area = Rect::from_size(width, height);
+    let layout = mermaid_layout::layout_diagram(&ir_parse.ir, &config);
+    let _plan = mermaid_render::render_diagram_adaptive(
+        &layout,
+        &ir_parse.ir,
+        &config,
+        render_area,
+        &mut buffer,
+    );
+
+    if !errors.is_empty() {
+        let has_content = !ir_parse.ir.nodes.is_empty()
+            || !ir_parse.ir.edges.is_empty()
+            || !ir_parse.ir.labels.is_empty()
+            || !ir_parse.ir.clusters.is_empty();
+        if has_content {
+            mermaid_render::render_mermaid_error_overlay(
+                &errors,
+                source,
+                &config,
+                render_area,
+                &mut buffer,
+            );
+        } else {
+            mermaid_render::render_mermaid_error_panel(
+                &errors,
+                source,
+                &config,
+                render_area,
+                &mut buffer,
+            );
+        }
+    }
+
+    buffer
+}
+
+fn blit_buffer_to_frame(frame: &mut Frame<'_>, area: Rect, buffer: &Buffer) {
+    let width = area.width.min(buffer.width());
+    let height = area.height.min(buffer.height());
+    for y in 0..height {
+        for x in 0..width {
+            let Some(src) = buffer.get(x, y) else {
+                continue;
+            };
+            let dst_x = area.x + x;
+            let dst_y = area.y + y;
+            if let Some(dst) = frame.buffer.get_mut(dst_x, dst_y) {
+                *dst = src.clone();
+            }
+        }
     }
 }
 
@@ -648,6 +816,7 @@ mod tests {
         let bindings = screen.keybindings();
         assert!(bindings.len() >= 5);
         assert!(bindings.iter().any(|b| b.key == "j/k"));
+        assert!(bindings.iter().any(|b| b.key == "g"));
         assert!(bindings.iter().any(|b| b.key == "f"));
     }
 
@@ -771,6 +940,55 @@ mod tests {
 
         screen.move_selection(-1);
         assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    #[test]
+    fn g_toggles_mermaid_panel_and_home_keeps_jump_to_start() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.contacts = vec![ContactSummary::default(), ContactSummary::default()];
+        screen.table_state.selected = Some(1);
+
+        let g = Event::Key(ftui::KeyEvent::new(KeyCode::Char('g')));
+        screen.update(&g, &state);
+        assert!(screen.show_mermaid_panel);
+        screen.update(&g, &state);
+        assert!(!screen.show_mermaid_panel);
+
+        let home = Event::Key(ftui::KeyEvent::new(KeyCode::Home));
+        screen.update(&home, &state);
+        assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    #[test]
+    fn escape_closes_mermaid_panel_before_clearing_filter() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.filter = "fox".to_string();
+        screen.show_mermaid_panel = true;
+
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        screen.update(&esc, &state);
+
+        assert!(!screen.show_mermaid_panel);
+        assert_eq!(screen.filter, "fox");
+    }
+
+    #[test]
+    fn mermaid_panel_render_no_panic() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.contacts.push(ContactSummary {
+            from_agent: "Alpha".to_string(),
+            to_agent: "Beta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        });
+        screen.show_mermaid_panel = true;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
     }
 
     // ── truncate_str UTF-8 safety ────────────────────────────────────

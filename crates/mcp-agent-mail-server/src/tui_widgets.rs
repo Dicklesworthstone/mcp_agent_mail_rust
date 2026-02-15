@@ -3160,7 +3160,7 @@ impl DrillDownWidget for MessageCard<'_> {
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::tui_events::{EventRingBuffer, MailEvent, MailEventKind};
+use crate::tui_events::{ContactSummary, EventRingBuffer, MailEvent, MailEventKind};
 
 /// Convert a [`Duration`] to microseconds as `i64`, saturating at `i64::MAX`.
 #[allow(clippy::cast_possible_truncation)]
@@ -3988,12 +3988,348 @@ impl Widget for EvidenceLedgerWidget<'_> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Mermaid Generation — graph text emitters for contacts/threads/overview
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+const AGENT_STYLE_PALETTE: [&str; 10] = [
+    "#7AA2F7", "#9ECE6A", "#E0AF68", "#F7768E", "#BB9AF7", "#7DCFFF", "#73DACA", "#C0CAF5",
+    "#FF9E64", "#B4F9F8",
+];
+
+const MERMAID_STROKE: &str = "#2F3542";
+
+/// Minimal sequence-message payload used to generate Mermaid thread flow diagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MermaidThreadMessage {
+    pub from_agent: String,
+    pub to_agents: Vec<String>,
+    pub subject: String,
+}
+
+/// Minimal project payload used to generate Mermaid system-overview diagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MermaidProjectNode {
+    pub slug: String,
+}
+
+/// Minimal agent payload used to generate Mermaid system-overview diagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MermaidAgentNode {
+    pub name: String,
+    pub project_slug: String,
+}
+
+/// Minimal reservation payload used to generate Mermaid system-overview diagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MermaidReservationNode {
+    pub agent_name: String,
+    /// Optional disambiguator when identical agent names exist in multiple projects.
+    pub project_slug: Option<String>,
+    pub path_pattern: String,
+    pub exclusive: bool,
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a offset basis
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0001_0000_01b3_u64);
+    }
+    hash
+}
+
+fn agent_style_color(agent: &str) -> &'static str {
+    let idx = (stable_hash(agent.as_bytes()) as usize) % AGENT_STYLE_PALETTE.len();
+    AGENT_STYLE_PALETTE[idx]
+}
+
+fn mermaid_label(raw: &str, max_chars: usize) -> String {
+    let mut cleaned = String::with_capacity(raw.len().min(max_chars));
+    let mut chars_written = 0usize;
+    let mut prev_space = false;
+
+    for ch in raw.chars() {
+        if chars_written >= max_chars {
+            break;
+        }
+        let mapped = match ch {
+            '\n' | '\r' | '\t' => ' ',
+            '"' => '\'',
+            '|' => '/',
+            _ => ch,
+        };
+        if mapped.is_control() {
+            continue;
+        }
+        if mapped == ' ' {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        cleaned.push(mapped);
+        chars_written += 1;
+    }
+
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "n/a".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn next_sequence_id(prefix: &str, idx: usize, used: &mut HashSet<String>) -> String {
+    let mut candidate = format!("{prefix}{idx}");
+    if used.insert(candidate.clone()) {
+        return candidate;
+    }
+    let mut suffix = 1usize;
+    loop {
+        candidate = format!("{prefix}{idx}_{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn message_count_label(count: u64) -> String {
+    if count == 1 {
+        "1 msg".to_string()
+    } else {
+        format!("{count} msgs")
+    }
+}
+
+/// Build a Mermaid contact graph from contact links and message events.
+///
+/// Contact links define graph topology; `MessageSent` events contribute
+/// directed edge labels (`N msgs`) between sender/recipient pairs.
+#[must_use]
+pub fn generate_contact_graph_mermaid(
+    contacts: &[ContactSummary],
+    messages: &[MailEvent],
+) -> String {
+    let mut agents = BTreeSet::new();
+    let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+
+    for contact in contacts {
+        agents.insert(contact.from_agent.clone());
+        agents.insert(contact.to_agent.clone());
+        counts
+            .entry((contact.from_agent.clone(), contact.to_agent.clone()))
+            .or_default();
+    }
+
+    for event in messages {
+        if let MailEvent::MessageSent { from, to, .. } = event {
+            agents.insert(from.clone());
+            for recipient in to {
+                agents.insert(recipient.clone());
+                *counts.entry((from.clone(), recipient.clone())).or_default() += 1;
+            }
+        }
+    }
+
+    let ordered_agents: Vec<String> = agents.into_iter().collect();
+    let mut ids = BTreeMap::new();
+    for (idx, agent) in ordered_agents.iter().enumerate() {
+        ids.insert(agent.clone(), format!("A{idx}"));
+    }
+
+    let mut out = String::from("graph LR\n");
+    for agent in &ordered_agents {
+        let id = ids.get(agent).expect("agent id should exist");
+        out.push_str(&format!("    {id}[\"{}\"]\n", mermaid_label(agent, 64)));
+    }
+    for ((from, to), count) in counts {
+        if let (Some(from_id), Some(to_id)) = (ids.get(&from), ids.get(&to)) {
+            out.push_str(&format!(
+                "    {from_id} -->|{}| {to_id}\n",
+                message_count_label(count)
+            ));
+        }
+    }
+    for agent in &ordered_agents {
+        let id = ids.get(agent).expect("agent id should exist");
+        out.push_str(&format!(
+            "    style {id} fill:{},stroke:{MERMAID_STROKE},stroke-width:1px\n",
+            agent_style_color(agent)
+        ));
+    }
+    out
+}
+
+/// Build a Mermaid sequence diagram for thread message flow.
+#[must_use]
+pub fn generate_thread_flow_mermaid(thread_messages: &[MermaidThreadMessage]) -> String {
+    let mut participants = Vec::new();
+    for message in thread_messages {
+        if !participants.iter().any(|p| p == &message.from_agent) {
+            participants.push(message.from_agent.clone());
+        }
+        for recipient in &message.to_agents {
+            if !participants.iter().any(|p| p == recipient) {
+                participants.push(recipient.clone());
+            }
+        }
+    }
+
+    let mut used_ids = HashSet::new();
+    let mut participant_ids = BTreeMap::new();
+    for (idx, participant) in participants.iter().enumerate() {
+        let id = next_sequence_id("P", idx, &mut used_ids);
+        participant_ids.insert(participant.clone(), id);
+    }
+
+    let mut out = String::from("sequenceDiagram\n");
+    for participant in &participants {
+        let id = participant_ids
+            .get(participant)
+            .expect("participant id should exist");
+        out.push_str(&format!(
+            "    participant {id} as {}\n",
+            mermaid_label(participant, 64)
+        ));
+    }
+
+    for message in thread_messages {
+        let from_id = match participant_ids.get(&message.from_agent) {
+            Some(id) => id,
+            None => continue,
+        };
+        let subject = mermaid_label(&message.subject, 80);
+        for recipient in &message.to_agents {
+            if let Some(to_id) = participant_ids.get(recipient) {
+                out.push_str(&format!("    {from_id}->>{to_id}: {subject}\n"));
+            }
+        }
+    }
+
+    out
+}
+
+/// Build a Mermaid overview graph linking projects, agents, and reservations.
+#[must_use]
+pub fn generate_system_overview_mermaid(
+    projects: &[MermaidProjectNode],
+    agents: &[MermaidAgentNode],
+    reservations: &[MermaidReservationNode],
+) -> String {
+    let mut ordered_projects: Vec<&MermaidProjectNode> = projects.iter().collect();
+    ordered_projects.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+    let mut ordered_agents: Vec<&MermaidAgentNode> = agents.iter().collect();
+    ordered_agents.sort_by(|a, b| {
+        a.project_slug
+            .cmp(&b.project_slug)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut ordered_reservations: Vec<&MermaidReservationNode> = reservations.iter().collect();
+    ordered_reservations.sort_by(|a, b| {
+        a.project_slug
+            .as_deref()
+            .unwrap_or_default()
+            .cmp(b.project_slug.as_deref().unwrap_or_default())
+            .then_with(|| a.agent_name.cmp(&b.agent_name))
+            .then_with(|| a.path_pattern.cmp(&b.path_pattern))
+    });
+
+    let mut project_ids = BTreeMap::new();
+    for (idx, project) in ordered_projects.iter().enumerate() {
+        project_ids.insert(project.slug.clone(), format!("PR{idx}"));
+    }
+
+    let mut agent_ids = BTreeMap::new();
+    let mut agent_ids_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (idx, agent) in ordered_agents.iter().enumerate() {
+        let id = format!("AG{idx}");
+        agent_ids.insert((agent.project_slug.clone(), agent.name.clone()), id.clone());
+        agent_ids_by_name
+            .entry(agent.name.clone())
+            .or_default()
+            .push(id);
+    }
+
+    let mut out = String::from("graph LR\n");
+    for project in &ordered_projects {
+        let id = project_ids
+            .get(&project.slug)
+            .expect("project id should exist");
+        out.push_str(&format!(
+            "    {id}[\"Project: {}\"]\n",
+            mermaid_label(&project.slug, 64)
+        ));
+    }
+    for agent in &ordered_agents {
+        let id = agent_ids
+            .get(&(agent.project_slug.clone(), agent.name.clone()))
+            .expect("agent id should exist");
+        out.push_str(&format!(
+            "    {id}[\"Agent: {}\"]\n",
+            mermaid_label(&agent.name, 64)
+        ));
+    }
+    for (idx, reservation) in ordered_reservations.iter().enumerate() {
+        let reservation_id = format!("RS{idx}");
+        let suffix = if reservation.exclusive {
+            " (exclusive)"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "    {reservation_id}[\"Res: {}{}\"]\n",
+            mermaid_label(&reservation.path_pattern, 48),
+            suffix
+        ));
+        if let Some(project_slug) = reservation.project_slug.as_deref() {
+            if let Some(agent_id) =
+                agent_ids.get(&(project_slug.to_string(), reservation.agent_name.clone()))
+            {
+                out.push_str(&format!("    {agent_id} --> {reservation_id}\n"));
+            }
+        } else if let Some(ids) = agent_ids_by_name.get(&reservation.agent_name) {
+            for agent_id in ids {
+                out.push_str(&format!("    {agent_id} --> {reservation_id}\n"));
+            }
+        }
+    }
+
+    for agent in &ordered_agents {
+        let agent_id = agent_ids
+            .get(&(agent.project_slug.clone(), agent.name.clone()))
+            .expect("agent id should exist");
+        if let Some(project_id) = project_ids.get(&agent.project_slug) {
+            out.push_str(&format!("    {project_id} --> {agent_id}\n"));
+        }
+    }
+    for agent in &ordered_agents {
+        let agent_id = agent_ids
+            .get(&(agent.project_slug.clone(), agent.name.clone()))
+            .expect("agent id should exist");
+        out.push_str(&format!(
+            "    style {agent_id} fill:{},stroke:{MERMAID_STROKE},stroke-width:1px\n",
+            agent_style_color(&agent.name)
+        ));
+    }
+    out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
     use ftui::GraphemePool;
     use ftui::layout::Rect;
 
@@ -4013,6 +4349,279 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    // ─── Mermaid generation tests (br-14tc9) ───────────────────────────
+
+    fn contact(from: &str, to: &str, status: &str) -> ContactSummary {
+        ContactSummary {
+            from_agent: from.to_string(),
+            to_agent: to.to_string(),
+            status: status.to_string(),
+            ..ContactSummary::default()
+        }
+    }
+
+    #[test]
+    fn mermaid_contact_graph_counts_styles_and_parses() {
+        let contacts = vec![
+            contact("GoldHawk", "SilverFox", "approved"),
+            contact("GoldHawk", "CoralBadger", "approved"),
+            contact("SilverFox", "CoralBadger", "approved"),
+        ];
+        let messages = vec![
+            MailEvent::message_sent(
+                1,
+                "GoldHawk",
+                vec!["SilverFox".to_string()],
+                "[br-123] Start implementation",
+                "br-123",
+                "proj-a",
+            ),
+            MailEvent::message_sent(
+                2,
+                "GoldHawk",
+                vec!["SilverFox".to_string(), "CoralBadger".to_string()],
+                "Re: [br-123] Progress",
+                "br-123",
+                "proj-a",
+            ),
+            MailEvent::message_sent(
+                3,
+                "SilverFox",
+                vec!["CoralBadger".to_string()],
+                "Ack",
+                "br-123",
+                "proj-a",
+            ),
+        ];
+
+        let diagram = generate_contact_graph_mermaid(&contacts, &messages);
+        assert!(diagram.starts_with("graph LR"), "{diagram}");
+        assert!(diagram.contains("|2 msgs|"), "{diagram}");
+        assert!(
+            diagram
+                .lines()
+                .any(|line| line.trim_start().starts_with("style A")),
+            "{diagram}"
+        );
+        assert!(
+            ftui_extras::mermaid::parse(&diagram).is_ok(),
+            "contact graph failed Mermaid parse:\n{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_thread_flow_builds_sequence_and_parses() {
+        let thread_messages = vec![
+            MermaidThreadMessage {
+                from_agent: "GoldHawk".to_string(),
+                to_agents: vec!["SilverFox".to_string()],
+                subject: "[br-123] Start implementation".to_string(),
+            },
+            MermaidThreadMessage {
+                from_agent: "SilverFox".to_string(),
+                to_agents: vec!["GoldHawk".to_string()],
+                subject: "Re: [br-123] Progress update".to_string(),
+            },
+        ];
+
+        let diagram = generate_thread_flow_mermaid(&thread_messages);
+        assert!(diagram.starts_with("sequenceDiagram"), "{diagram}");
+        assert!(diagram.contains("participant P0 as GoldHawk"), "{diagram}");
+        assert!(diagram.contains("participant P1 as SilverFox"), "{diagram}");
+        assert!(diagram.contains("P0->>P1:"), "{diagram}");
+        assert!(diagram.contains("P1->>P0:"), "{diagram}");
+        assert!(
+            ftui_extras::mermaid::parse(&diagram).is_ok(),
+            "thread flow failed Mermaid parse:\n{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_system_overview_links_projects_agents_and_reservations() {
+        let projects = vec![
+            MermaidProjectNode {
+                slug: "proj-alpha".to_string(),
+            },
+            MermaidProjectNode {
+                slug: "proj-beta".to_string(),
+            },
+        ];
+        let agents = vec![
+            MermaidAgentNode {
+                name: "GoldHawk".to_string(),
+                project_slug: "proj-alpha".to_string(),
+            },
+            MermaidAgentNode {
+                name: "SilverFox".to_string(),
+                project_slug: "proj-beta".to_string(),
+            },
+        ];
+        let reservations = vec![
+            MermaidReservationNode {
+                agent_name: "GoldHawk".to_string(),
+                project_slug: Some("proj-alpha".to_string()),
+                path_pattern: "src/**/*.rs".to_string(),
+                exclusive: true,
+            },
+            MermaidReservationNode {
+                agent_name: "SilverFox".to_string(),
+                project_slug: Some("proj-beta".to_string()),
+                path_pattern: "tests/**/*.rs".to_string(),
+                exclusive: false,
+            },
+        ];
+
+        let diagram = generate_system_overview_mermaid(&projects, &agents, &reservations);
+        assert!(diagram.starts_with("graph LR"), "{diagram}");
+        assert!(diagram.contains("Project: proj-alpha"), "{diagram}");
+        assert!(diagram.contains("Agent: GoldHawk"), "{diagram}");
+        assert!(
+            diagram.contains("Res: src/**/*.rs (exclusive)"),
+            "{diagram}"
+        );
+        assert!(diagram.contains("PR0 --> AG0"), "{diagram}");
+        assert!(diagram.contains("AG0 --> RS0"), "{diagram}");
+        assert!(
+            ftui_extras::mermaid::parse(&diagram).is_ok(),
+            "system overview failed Mermaid parse:\n{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_system_overview_handles_duplicate_agent_names_across_projects() {
+        let projects = vec![
+            MermaidProjectNode {
+                slug: "proj-alpha".to_string(),
+            },
+            MermaidProjectNode {
+                slug: "proj-beta".to_string(),
+            },
+        ];
+        let agents = vec![
+            MermaidAgentNode {
+                name: "GoldHawk".to_string(),
+                project_slug: "proj-alpha".to_string(),
+            },
+            MermaidAgentNode {
+                name: "GoldHawk".to_string(),
+                project_slug: "proj-beta".to_string(),
+            },
+        ];
+        let reservations = vec![MermaidReservationNode {
+            agent_name: "GoldHawk".to_string(),
+            project_slug: Some("proj-alpha".to_string()),
+            path_pattern: "src/**/*.rs".to_string(),
+            exclusive: true,
+        }];
+
+        let diagram = generate_system_overview_mermaid(&projects, &agents, &reservations);
+        assert!(diagram.contains("PR0 --> AG0"), "{diagram}");
+        assert!(diagram.contains("PR1 --> AG1"), "{diagram}");
+        assert_eq!(
+            diagram
+                .lines()
+                .filter(|line| line.contains("--> RS0"))
+                .count(),
+            1,
+            "reservation with project slug should resolve to one matching agent:\n{diagram}"
+        );
+        assert!(diagram.contains("AG0 --> RS0"), "{diagram}");
+        assert!(
+            ftui_extras::mermaid::parse(&diagram).is_ok(),
+            "duplicate-name overview failed Mermaid parse:\n{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_system_overview_fallback_links_all_when_project_unknown() {
+        let projects = vec![
+            MermaidProjectNode {
+                slug: "proj-alpha".to_string(),
+            },
+            MermaidProjectNode {
+                slug: "proj-beta".to_string(),
+            },
+        ];
+        let agents = vec![
+            MermaidAgentNode {
+                name: "GoldHawk".to_string(),
+                project_slug: "proj-alpha".to_string(),
+            },
+            MermaidAgentNode {
+                name: "GoldHawk".to_string(),
+                project_slug: "proj-beta".to_string(),
+            },
+        ];
+        let reservations = vec![MermaidReservationNode {
+            agent_name: "GoldHawk".to_string(),
+            project_slug: None,
+            path_pattern: "src/**/*.rs".to_string(),
+            exclusive: true,
+        }];
+
+        let diagram = generate_system_overview_mermaid(&projects, &agents, &reservations);
+        assert_eq!(
+            diagram
+                .lines()
+                .filter(|line| line.contains("--> RS0"))
+                .count(),
+            2,
+            "without project slug, reservation should link to all matching names:\n{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_generators_emit_parseable_diagnostics() {
+        let contacts = vec![contact("Alpha", "Beta", "approved")];
+        let events = vec![MailEvent::message_sent(
+            10,
+            "Alpha",
+            vec!["Beta".to_string()],
+            "diag \"quoted\" line\nnext | part",
+            "br-14tc9",
+            "diag-proj",
+        )];
+        let thread_messages = vec![MermaidThreadMessage {
+            from_agent: "Alpha".to_string(),
+            to_agents: vec!["Beta".to_string()],
+            subject: "diag \"quoted\" line\nnext | part".to_string(),
+        }];
+        let projects = vec![MermaidProjectNode {
+            slug: "diag-proj".to_string(),
+        }];
+        let agents = vec![MermaidAgentNode {
+            name: "Alpha".to_string(),
+            project_slug: "diag-proj".to_string(),
+        }];
+        let reservations = vec![MermaidReservationNode {
+            agent_name: "Alpha".to_string(),
+            project_slug: Some("diag-proj".to_string()),
+            path_pattern: "src/lib.rs".to_string(),
+            exclusive: true,
+        }];
+
+        let start = Instant::now();
+        let contact_diagram = generate_contact_graph_mermaid(&contacts, &events);
+        let thread_diagram = generate_thread_flow_mermaid(&thread_messages);
+        let overview_diagram = generate_system_overview_mermaid(&projects, &agents, &reservations);
+        let elapsed_us = start.elapsed().as_micros();
+
+        let contact_ok = ftui_extras::mermaid::parse(&contact_diagram).is_ok();
+        let thread_ok = ftui_extras::mermaid::parse(&thread_diagram).is_ok();
+        let overview_ok = ftui_extras::mermaid::parse(&overview_diagram).is_ok();
+        eprintln!(
+            "scenario=br-14tc9_mermaid_generators elapsed_us={elapsed_us} contact_ok={contact_ok} thread_ok={thread_ok} overview_ok={overview_ok}"
+        );
+
+        assert!(contact_ok, "{contact_diagram}");
+        assert!(thread_ok, "{thread_diagram}");
+        assert!(overview_ok, "{overview_diagram}");
+        assert!(
+            !thread_diagram.contains("next | part"),
+            "subject sanitization should normalize pipe/newline:\n{thread_diagram}"
+        );
     }
 
     // ─── HeatmapGrid tests ─────────────────────────────────────────────

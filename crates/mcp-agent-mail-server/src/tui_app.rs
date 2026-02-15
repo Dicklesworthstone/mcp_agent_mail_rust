@@ -35,7 +35,7 @@ use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg, agents::AgentsScreen,
     analytics::AnalyticsScreen, attachments::AttachmentExplorerScreen, contacts::ContactsScreen,
     dashboard::DashboardScreen, explorer::MailExplorerScreen, messages::MessageBrowserScreen,
-    projects::ProjectsScreen, reservations::ReservationsScreen, screen_meta,
+    projects::ProjectsScreen, reservations::ReservationsScreen, screen_from_jump_key, screen_meta,
     search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
     timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
@@ -2049,9 +2049,8 @@ impl Model for MailAppModel {
                                 self.help_scroll = self.help_scroll.saturating_sub(1);
                                 return Cmd::none();
                             }
-                            KeyCode::Char(c) if c.is_ascii_digit() && !text_mode => {
-                                let n = c.to_digit(10).unwrap_or(0) as usize;
-                                if let Some(id) = MailScreenId::from_number(n) {
+                            KeyCode::Char(c) if !text_mode => {
+                                if let Some(id) = screen_from_jump_key(c) {
                                     self.activate_screen(id);
                                     return Cmd::none();
                                 }
@@ -2144,7 +2143,8 @@ impl Model for MailAppModel {
         let active_screen = self.screen_manager.active_screen();
 
         // 1. Tab bar (z=1)
-        tui_chrome::render_tab_bar(active_screen, frame, chrome.tab_bar);
+        let effects_enabled = self.state.config_snapshot().tui_effects;
+        tui_chrome::render_tab_bar(active_screen, effects_enabled, frame, chrome.tab_bar);
 
         // 2. Screen content (z=2)
         if let Some(screen) = self.screen_manager.active_screen_ref() {
@@ -3927,8 +3927,7 @@ mod tests {
     #[test]
     fn number_keys_switch_screens() {
         let mut model = test_model();
-        // Keys 1..9 map to screens 1..9; key 0 maps to screen 10.
-        // Only iterate the first 9 screens with digit keys 1-9.
+        // Digit keys map to direct jump slots: 1..9 => screens 1..9, 0 => screen 10.
         for (i, &expected_id) in ALL_SCREEN_IDS.iter().enumerate().take(9) {
             let n = u32::try_from(i + 1).expect("screen index should fit in u32");
             let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char(
@@ -3941,7 +3940,7 @@ mod tests {
                 "key {n} -> {expected_id:?}"
             );
         }
-        // Key 0 maps to the 10th screen (Contacts).
+        // Key 0 maps to the 10th screen.
         if ALL_SCREEN_IDS.len() >= 10 {
             let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('0')));
             model.update(MailMsg::Terminal(key));
@@ -3958,7 +3957,7 @@ mod tests {
         let mut model = test_model();
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('0')));
         model.update(MailMsg::Terminal(key));
-        // 0 maps to screen 10 (Projects) — 11th screen (Contacts) needs command palette
+        // 0 maps to screen 10 (Projects).
         assert_eq!(model.active_screen(), MailScreenId::Projects);
     }
 
@@ -3968,6 +3967,27 @@ mod tests {
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('9')));
         model.update(MailMsg::Terminal(key));
         assert_eq!(model.active_screen(), MailScreenId::Timeline);
+    }
+
+    #[test]
+    fn shifted_number_symbols_switch_screens_above_ten() {
+        let mut model = test_model();
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('!')));
+        model.update(MailMsg::Terminal(key));
+        assert_eq!(model.active_screen(), MailScreenId::Contacts);
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('@')));
+        model.update(MailMsg::Terminal(key));
+        assert_eq!(model.active_screen(), MailScreenId::Explorer);
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('#')));
+        model.update(MailMsg::Terminal(key));
+        assert_eq!(model.active_screen(), MailScreenId::Analytics);
+
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('$')));
+        model.update(MailMsg::Terminal(key));
+        assert_eq!(model.active_screen(), MailScreenId::Attachments);
     }
 
     #[test]
