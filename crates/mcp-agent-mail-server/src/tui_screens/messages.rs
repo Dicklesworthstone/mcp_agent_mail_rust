@@ -10,22 +10,22 @@ use std::time::Instant;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::Widget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
 use ftui_extras::syntax::{JsonTokenizer, LineState, TokenKind, Tokenizer};
 use ftui_runtime::program::Cmd;
-use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
+use ftui_widgets::StatefulWidget;
 
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
+use mcp_agent_mail_db::DbConn;
 
-use crate::tui_action_menu::{ActionEntry, messages_actions};
+use crate::tui_action_menu::{messages_actions, ActionEntry};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEventKind;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -1208,7 +1208,11 @@ fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Tex
                         }
                         break;
                     }
-                    if is_key { key_style } else { string_style }
+                    if is_key {
+                        key_style
+                    } else {
+                        string_style
+                    }
                 }
                 TokenKind::Number => number_style,
                 TokenKind::Boolean | TokenKind::Constant => literal_style,
@@ -2173,11 +2177,9 @@ mod tests {
     fn keybindings_include_inbox_mode() {
         let screen = MessageBrowserScreen::new();
         let bindings = screen.keybindings();
-        assert!(
-            bindings
-                .iter()
-                .any(|b| b.key == "g" && b.action.contains("Local/Global"))
-        );
+        assert!(bindings
+            .iter()
+            .any(|b| b.key == "g" && b.action.contains("Local/Global")));
     }
 
     #[test]

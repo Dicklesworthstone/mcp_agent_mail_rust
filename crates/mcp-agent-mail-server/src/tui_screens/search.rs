@@ -6,28 +6,28 @@
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::Widget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
-use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
+use ftui_widgets::StatefulWidget;
 use std::cell::RefCell;
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
-    DocKind, Importance, RankingMode, SearchQuery, plan_search,
+    plan_search, DocKind, Importance, RankingMode, SearchQuery,
 };
 use mcp_agent_mail_db::search_recipes::{
-    MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
-    list_recent_history, list_recipes, touch_recipe,
+    insert_history, insert_recipe, list_recent_history, list_recipes, touch_recipe,
+    QueryHistoryEntry, ScopeMode, SearchRecipe, MAX_RECIPES,
 };
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
-use mcp_agent_mail_db::{DbConn, QueryAssistance, parse_query_assistance};
+use mcp_agent_mail_db::{parse_query_assistance, DbConn, QueryAssistance};
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_markdown;
@@ -3317,16 +3317,12 @@ mod tests {
 
         let plain: String = spans.iter().map(Span::as_str).collect();
         assert_eq!(plain, "xxNEEDLEyy");
-        assert!(
-            spans
-                .iter()
-                .any(|s| s.as_str() == "NEEDLE" && s.style == Some(highlight))
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|s| s.as_str() == "xx" && s.style == Some(base))
-        );
+        assert!(spans
+            .iter()
+            .any(|s| s.as_str() == "NEEDLE" && s.style == Some(highlight)));
+        assert!(spans
+            .iter()
+            .any(|s| s.as_str() == "xx" && s.style == Some(base)));
     }
 
     // ──────────────────────────────────────────────────────────────────
