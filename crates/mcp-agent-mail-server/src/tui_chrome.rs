@@ -406,17 +406,45 @@ fn plan_status_segments(
         });
     }
 
-    // Accessibility indicators (Medium priority)
-    let a11y = match (accessibility.reduced_motion, accessibility.screen_reader) {
-        (false, false) => None,
-        (true, false) => Some("[rm]"),
-        (false, true) => Some("[sr]"),
-        (true, true) => Some("[rm,sr]"),
-    };
-    if let Some(hint) = a11y {
+    // Effects-off indicator (High priority — user-activated toggle)
+    if !state.config_snapshot().tui_effects {
         right.push(StatusSegment {
-            priority: StatusPriority::Medium,
-            text: format!("{hint} "),
+            priority: StatusPriority::High,
+            text: "[fx off] ".to_string(),
+            fg: tp.status_warn,
+            bold: false,
+        });
+    }
+
+    // Accessibility indicators (Medium priority)
+    {
+        let mut tags: Vec<&str> = Vec::new();
+        if accessibility.high_contrast {
+            tags.push("hc");
+        }
+        if accessibility.reduced_motion {
+            tags.push("rm");
+        }
+        if accessibility.screen_reader {
+            tags.push("sr");
+        }
+        if !tags.is_empty() {
+            let label = format!("[{}] ", tags.join(","));
+            right.push(StatusSegment {
+                priority: StatusPriority::Medium,
+                text: label,
+                fg: tp.status_fg,
+                bold: false,
+            });
+        }
+    }
+
+    // Theme name (Low priority — informational)
+    {
+        let theme = crate::tui_theme::current_theme_name();
+        right.push(StatusSegment {
+            priority: StatusPriority::Low,
+            text: format!("{theme} "),
             fg: tp.status_fg,
             bold: false,
         });
@@ -1443,5 +1471,78 @@ mod tests {
                 prev_end = x_end;
             }
         }
+    }
+
+    // ── Status segment discoverability tests (br-1xt0m.1.12.1) ──
+
+    #[test]
+    fn status_segments_high_contrast_shown() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings {
+            high_contrast: true,
+            key_hints: true,
+            reduced_motion: false,
+            screen_reader: false,
+        };
+        let (_, _, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            120,
+        );
+        let tags: String = right.iter().map(|s| s.text.as_str()).collect();
+        assert!(tags.contains("[hc]"), "high_contrast should produce [hc] tag, got: {tags}");
+    }
+
+    #[test]
+    fn status_segments_all_a11y_combined() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings {
+            high_contrast: true,
+            key_hints: true,
+            reduced_motion: true,
+            screen_reader: true,
+        };
+        let (_, _, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            120,
+        );
+        let tags: String = right.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            tags.contains("[hc,rm,sr]"),
+            "all a11y flags should be combined, got: {tags}"
+        );
+    }
+
+    #[test]
+    fn status_segments_theme_name_at_wide_width() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let (_, _, right) = plan_status_segments(
+            &state,
+            MailScreenId::Dashboard,
+            false,
+            &a11y,
+            &[],
+            false,
+            120,
+        );
+        let theme = crate::tui_theme::current_theme_name();
+        let tags: String = right.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            tags.contains(theme),
+            "theme name '{theme}' should appear in right segments, got: {tags}"
+        );
     }
 }
