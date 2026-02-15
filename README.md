@@ -33,6 +33,36 @@ mcp-agent-mail serve --transport api    # Use /api/ transport
 mcp-agent-mail                          # stdio transport (for MCP client integration)
 ```
 
+### Browser State Sync Endpoint (WASM Dashboard)
+
+For browser/WASM clients, Agent Mail exposes a polling-based state sync contract
+under the Mail UI namespace:
+
+- `GET /mail/ws-state` returns a snapshot payload.
+- `GET /mail/ws-state?since=<seq>&limit=<n>` returns deltas since a sequence.
+- `POST /mail/ws-input` accepts remote terminal ingress events (`Input`, `Resize`).
+
+Important transport note:
+
+- `/mail/ws-state` is intentionally HTTP polling, not WebSocket upgrade.
+- WebSocket upgrade attempts to `/mail/ws-state` return `501 Not Implemented`
+  with a JSON detail message.
+
+Examples:
+
+```bash
+# Snapshot
+curl -sS 'http://127.0.0.1:8765/mail/ws-state?limit=50' | jq .
+
+# Delta from a known sequence
+curl -sS 'http://127.0.0.1:8765/mail/ws-state?since=1200&limit=200' | jq .
+
+# Input ingress (key event)
+curl -sS -X POST 'http://127.0.0.1:8765/mail/ws-input' \
+  -H 'Content-Type: application/json' \
+  --data '{"type":"Input","data":{"kind":"Key","key":"j","modifiers":0}}' | jq .
+```
+
 ### CLI tool
 
 ```bash
