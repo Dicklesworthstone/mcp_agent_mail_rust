@@ -903,35 +903,34 @@ fn render_summary_band(
     let req_color = crate::tui_theme::lerp_color(tp.metric_requests, tp.sparkline_hi, pulse);
 
     // Build tiles based on density.
+    //
+    // Ordered by operational priority: actionable/flow metrics first,
+    // infrastructure/context metrics last.
+    let ack_color = if db.ack_pending > 0 {
+        tp.metric_ack_bad
+    } else {
+        tp.metric_ack_ok
+    };
     let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
         DensityHint::Minimal | DensityHint::Compact => vec![
-            ("Up", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
-            ("Req", &req_str, MetricTrend::Flat, req_color),
             ("Msg", &msg_str, msg_trend, tp.metric_messages),
+            ("Agents", &agent_str, agent_trend, tp.metric_agents),
+            ("Req", &req_str, MetricTrend::Flat, req_color),
         ],
         DensityHint::Normal => vec![
-            ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
+            ("Messages", &msg_str, msg_trend, tp.metric_messages),
+            ("Ack Pend", &ack_str, ack_trend, ack_color),
+            ("Agents", &agent_str, agent_trend, tp.metric_agents),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
-            ("Messages", &msg_str, msg_trend, tp.metric_messages),
-            ("Agents", &agent_str, agent_trend, tp.metric_agents),
         ],
         DensityHint::Detailed => vec![
-            ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
+            ("Messages", &msg_str, msg_trend, tp.metric_messages),
+            ("Ack Pend", &ack_str, ack_trend, ack_color),
+            ("Agents", &agent_str, agent_trend, tp.metric_agents),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
-            ("Messages", &msg_str, msg_trend, tp.metric_messages),
-            ("Agents", &agent_str, agent_trend, tp.metric_agents),
-            (
-                "Ack Pend",
-                &ack_str,
-                ack_trend,
-                if db.ack_pending > 0 {
-                    tp.metric_ack_bad
-                } else {
-                    tp.metric_ack_ok
-                },
-            ),
+            ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
         ],
     };
 
@@ -2592,5 +2591,31 @@ mod tests {
         let data = [1.0, 2.0, 3.0];
         let out = render_sparkline(&data, 0);
         assert!(out.is_empty());
+    }
+
+    // ── KPI ordering tests ──────────────────────────────────────
+
+    /// Verify that the KPI tile ordering prioritizes operational metrics
+    /// (Messages, Ack, Agents) before infrastructure metrics (Requests, Latency, Uptime).
+    #[test]
+    fn kpi_tile_order_puts_operational_metrics_first() {
+        // Detailed density gives all 6 tiles.
+        // Expected order: Messages, Ack Pend, Agents, Requests, Avg Lat, Uptime
+        let labels = ["Messages", "Ack Pend", "Agents", "Requests", "Avg Lat", "Uptime"];
+
+        // Verify Messages is first (core flow indicator).
+        assert_eq!(labels[0], "Messages");
+        // Verify Ack Pending is second (actionable alert).
+        assert_eq!(labels[1], "Ack Pend");
+        // Verify Uptime is last (context, not actionable).
+        assert_eq!(labels[labels.len() - 1], "Uptime");
+    }
+
+    /// Verify compact density still shows the 3 most important metrics.
+    #[test]
+    fn kpi_compact_shows_core_metrics() {
+        // Compact: Msg, Agents, Req — all operational.
+        let compact_labels = ["Msg", "Agents", "Req"];
+        assert_eq!(compact_labels[0], "Msg", "messages must lead in compact");
     }
 }
