@@ -1,6 +1,6 @@
 //! Criterion benchmarks for cache eviction strategies.
 //!
-//! Compares S3-FIFO (three-queue frequency-based) against IndexMap LRU
+//! Compares S3-FIFO (three-queue frequency-based) against `IndexMap` LRU
 //! (insertion-order with move-to-back) on insert, lookup, and mixed workloads.
 
 use std::hint::black_box;
@@ -16,7 +16,7 @@ const OPS: usize = 100_000;
 ///
 /// Given a step index, produces a key biased toward lower values
 /// (simulating popular items accessed more frequently).
-fn zipf_key(step: usize, n_unique: usize) -> usize {
+const fn zipf_key(step: usize, n_unique: usize) -> usize {
     // Hash-like scramble to avoid trivial patterns
     let h = step.wrapping_mul(2654435761) >> 16;
     // Square to bias toward low ranks (Zipf-like)

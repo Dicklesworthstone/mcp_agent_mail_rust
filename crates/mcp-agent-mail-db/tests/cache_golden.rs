@@ -4,9 +4,9 @@
 //! cache contents and hit/miss counts.
 //!
 //! Required tests for br-2khpi:
-//! 1. golden_s3fifo_deterministic
-//! 2. bench_s3fifo_faster_than_lru_eviction
-//! 3. hit_rate_comparison_zipf
+//! 1. `golden_s3fifo_deterministic`
+//! 2. `bench_s3fifo_faster_than_lru_eviction`
+//! 3. `hit_rate_comparison_zipf`
 
 use std::path::PathBuf;
 
@@ -24,11 +24,11 @@ struct Lcg {
 }
 
 impl Lcg {
-    fn new(seed: u64) -> Self {
+    const fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         self.state = self
             .state
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -41,7 +41,7 @@ impl Lcg {
     }
 }
 
-/// Run the golden sequence through S3-FIFO and return (sorted_keys, hits, misses).
+/// Run the golden sequence through S3-FIFO and return (`sorted_keys`, hits, misses).
 fn run_s3fifo_golden() -> (Vec<usize>, u64, u64) {
     let mut cache = S3FifoCache::new(CAPACITY);
     let mut rng = Lcg::new(SEED);
@@ -63,7 +63,7 @@ fn run_s3fifo_golden() -> (Vec<usize>, u64, u64) {
     (keys, hits, misses)
 }
 
-/// Run the same golden sequence through IndexMap LRU.
+/// Run the same golden sequence through `IndexMap` LRU.
 fn run_lru_golden() -> (Vec<usize>, u64, u64) {
     let mut map: IndexMap<usize, usize> = IndexMap::with_capacity(CAPACITY);
     let mut rng = Lcg::new(SEED);
@@ -98,7 +98,7 @@ fn fixture_path() -> PathBuf {
     path
 }
 
-/// 1. golden_s3fifo_deterministic -- replay golden sequence, verify exact match.
+/// 1. `golden_s3fifo_deterministic` -- replay golden sequence, verify exact match.
 #[test]
 fn golden_s3fifo_deterministic() {
     let (keys, hits, misses) = run_s3fifo_golden();
@@ -161,7 +161,7 @@ fn golden_s3fifo_deterministic() {
     assert_eq!(misses, misses2);
 }
 
-/// 2. bench_s3fifo_faster_than_lru_eviction -- measure eviction-heavy workload,
+/// 2. `bench_s3fifo_faster_than_lru_eviction` -- measure eviction-heavy workload,
 ///    assert S3-FIFO is faster.
 #[test]
 fn bench_s3fifo_faster_than_lru_eviction() {
@@ -202,7 +202,7 @@ fn bench_s3fifo_faster_than_lru_eviction() {
     );
 }
 
-/// 3. hit_rate_comparison_zipf -- Zipf workload, S3-FIFO hit-rate >= 0.97 * LRU.
+/// 3. `hit_rate_comparison_zipf` -- Zipf workload, S3-FIFO hit-rate >= 0.97 * LRU.
 #[test]
 fn hit_rate_comparison_zipf() {
     let cap = 100;
@@ -244,8 +244,8 @@ fn hit_rate_comparison_zipf() {
         }
     }
 
-    let s3_rate = s3_hits as f64 / ops as f64;
-    let lru_rate = lru_hits as f64 / ops as f64;
+    let s3_rate = s3_hits as f64 / f64::from(ops);
+    let lru_rate = lru_hits as f64 / f64::from(ops);
     let ratio = if lru_rate > 0.0 {
         s3_rate / lru_rate
     } else {

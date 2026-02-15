@@ -139,7 +139,7 @@ fn evidence_multiple_decision_points() {
 
 // ── B.3 integration tests (br-3hkkd) ─────────────────────────────────────
 
-/// 6. Write entries to JSONL file via EvidenceLedger, read back, verify roundtrip.
+/// 6. Write entries to JSONL file via `EvidenceLedger`, read back, verify roundtrip.
 #[test]
 fn evidence_integration_jsonl_roundtrip() {
     let dir = tempfile::tempdir().expect("tempdir");
