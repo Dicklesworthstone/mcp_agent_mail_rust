@@ -29,7 +29,7 @@ fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
 fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
 fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
 
-asupersync = { path = "../asupersync", features = ["tls-webpki-roots"] }
+asupersync = { version = "0.2.0", path = "../asupersync", features = ["tls-webpki-roots"] }
 
 sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
 sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
