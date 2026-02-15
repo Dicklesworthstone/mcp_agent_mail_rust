@@ -163,11 +163,10 @@ run_cargo_cmd() {
     else
         echo -e "  ${_c_red}FAIL${_c_reset} ${label} (${duration}s)"
         echo "  Log: ${log_file}"
-        tail -20 "$log_file" 2>/dev/null | sed 's/^/    /'
+        { tail -20 "$log_file" 2>/dev/null || true; } | sed 's/^/    /'
         record_phase "$label" "FAIL" "$duration"
         ABORT=1
     fi
-    return $rc
 }
 
 run_e2e_suite() {
@@ -196,9 +195,9 @@ run_e2e_suite() {
     set -e
     local duration=$(( $(date +%s) - start_s ))
 
-    # Extract pass/fail counts from the suite's own summary.
-    local suite_summary
-    suite_summary="$(tail -10 "$log_file" | grep -a 'Pass:\|Fail:\|Skip:' || true)"
+    # Extract pass/fail counts from the suite's own summary (pipefail-safe).
+    local suite_summary=""
+    suite_summary="$(tail -10 "$log_file" 2>/dev/null | { grep -a 'Pass:' || true; })" || true
 
     if [ "$rc" -eq 0 ]; then
         echo -e "  ${_c_green}PASS${_c_reset} ${suite_name} (${duration}s) ${suite_summary}"
@@ -206,11 +205,10 @@ run_e2e_suite() {
     else
         echo -e "  ${_c_red}FAIL${_c_reset} ${suite_name} (${duration}s) ${suite_summary}"
         echo "  Log: ${log_file}"
-        tail -15 "$log_file" 2>/dev/null | sed 's/^/    /'
+        { tail -15 "$log_file" 2>/dev/null || true; } | sed 's/^/    /'
         record_phase "e2e/${suite_name}" "FAIL" "$duration"
         ABORT=1
     fi
-    return $rc
 }
 
 # ── Banner ───────────────────────────────────────────────────────────
