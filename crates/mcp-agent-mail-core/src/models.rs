@@ -666,7 +666,6 @@ pub const DESCRIPTIVE_NAME_KEYWORDS: &[&str] = &[
     "assistant",
     "helper",
     "bot",
-    "admin",
     "user",
     "manager",
     "lead",

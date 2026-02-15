@@ -126,7 +126,7 @@ fn test_descriptive_name_detection() {
 
 #[test]
 fn test_unix_username_detection() {
-    for name in ["ubuntu", "root", "jeff"] {
+    for name in ["ubuntu", "root", "admin"] {
         let expected = format!(
             "'{name}' looks like a Unix username (possibly from $USER environment variable). \
              Agent names must be adjective+noun combinations like 'BlueLake' or 'GreenCastle'. \
