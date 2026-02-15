@@ -678,7 +678,7 @@ pub const DESCRIPTIVE_NAME_KEYWORDS: &[&str] = &[
 pub fn looks_like_program_name(value: &str) -> bool {
     let v = value.to_lowercase();
     let v = v.trim();
-    KNOWN_PROGRAM_NAMES.iter().any(|p| *p == v)
+    KNOWN_PROGRAM_NAMES.contains(&v)
 }
 
 /// Check if a value looks like a model name.
@@ -704,7 +704,7 @@ pub fn looks_like_email(value: &str) -> bool {
 pub fn looks_like_broadcast(value: &str) -> bool {
     let v = value.to_lowercase();
     let v = v.trim();
-    BROADCAST_TOKENS.iter().any(|token| *token == v)
+    BROADCAST_TOKENS.contains(&v)
 }
 
 /// Check if a value looks like a descriptive role name.
@@ -712,6 +712,33 @@ pub fn looks_like_broadcast(value: &str) -> bool {
 pub fn looks_like_descriptive_name(value: &str) -> bool {
     let v = value.to_lowercase();
     DESCRIPTIVE_NAME_KEYWORDS.iter().any(|kw| v.contains(kw))
+}
+
+/// Check if a value looks like a Unix username (e.g. from `$USER`).
+///
+/// A unix username is all-lowercase, alphanumeric, 2-16 chars, and NOT a
+/// known adjective or noun from the agent name vocabulary.
+#[must_use]
+pub fn looks_like_unix_username(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    // Agent names are PascalCase; unix usernames are all lowercase
+    if v.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && (2..=16).contains(&v.len())
+    {
+        // If it matches a known adjective or noun, it's not a username
+        let lower = v.to_lowercase();
+        if VALID_ADJECTIVES.iter().any(|a| a.to_lowercase() == lower) {
+            return false;
+        }
+        if VALID_NOUNS.iter().any(|n| n.to_lowercase() == lower) {
+            return false;
+        }
+        return true;
+    }
+    false
 }
 
 /// Detect common mistakes when agents provide invalid agent names.
@@ -725,6 +752,7 @@ pub fn looks_like_descriptive_name(value: &str) -> bool {
 /// 3. `EMAIL_AS_AGENT` — value looks like an email address
 /// 4. `BROADCAST_ATTEMPT` — value is a broadcast token
 /// 5. `DESCRIPTIVE_NAME` — value looks like a descriptive role name
+/// 6. `UNIX_USERNAME_AS_AGENT` — value looks like a Unix username
 #[must_use]
 pub fn detect_agent_name_mistake(value: &str) -> Option<(&'static str, String)> {
     if looks_like_program_name(value) {
@@ -772,6 +800,18 @@ pub fn detect_agent_name_mistake(value: &str) -> Option<(&'static str, String)> 
                 "'{value}' looks like a descriptive role name. Agent names must be randomly generated \
                  adjective+noun combinations like 'WhiteMountain' or 'BrownCreek', NOT descriptive of the agent's task. \
                  Omit the 'name' parameter to auto-generate a valid name."
+            ),
+        ));
+    }
+    if looks_like_unix_username(value) {
+        return Some((
+            "UNIX_USERNAME_AS_AGENT",
+            format!(
+                "'{value}' looks like a Unix username (possibly from $USER environment variable). \
+                 Agent names must be adjective+noun combinations like 'BlueLake' or 'GreenCastle'. \
+                 When you called register_agent, the system likely auto-generated a valid name for you. \
+                 To find your actual agent name, check the response from register_agent or use \
+                 resource://agents/{{project_key}} to list all registered agents in this project."
             ),
         ));
     }
@@ -1120,9 +1160,86 @@ mod tests {
 
     #[test]
     fn detect_mistake_unknown_invalid_returns_none() {
-        // Not a known program, model, or valid name — detect returns None
-        assert!(detect_agent_name_mistake("my-random-thing").is_none());
-        assert!(detect_agent_name_mistake("foobar123").is_none());
+        // Not a known program, model, email, broadcast, descriptive, or unix username
+        assert!(detect_agent_name_mistake("my-random-thing").is_none()); // has hyphen
+        assert!(detect_agent_name_mistake("FooBar123").is_none()); // mixed case
+    }
+
+    // ── Unix username detection (br-3oyfw: T3.3) ──
+
+    #[test]
+    fn unix_username_detection_typical_names() {
+        assert!(looks_like_unix_username("john"));
+        assert!(looks_like_unix_username("alice"));
+        assert!(looks_like_unix_username("ubuntu"));
+        assert!(looks_like_unix_username("jeff"));
+        assert!(looks_like_unix_username("root"));
+        assert!(looks_like_unix_username("admin2"));
+        assert!(looks_like_unix_username("ab")); // minimum 2 chars
+    }
+
+    #[test]
+    fn unix_username_not_adjectives_or_nouns() {
+        // Known adjectives should NOT be flagged as unix usernames
+        assert!(!looks_like_unix_username("red"));
+        assert!(!looks_like_unix_username("blue"));
+        assert!(!looks_like_unix_username("green"));
+        assert!(!looks_like_unix_username("swift"));
+        assert!(!looks_like_unix_username("calm"));
+        // Known nouns should NOT be flagged
+        assert!(!looks_like_unix_username("lake"));
+        assert!(!looks_like_unix_username("dog"));
+        assert!(!looks_like_unix_username("fox"));
+        assert!(!looks_like_unix_username("hawk"));
+        assert!(!looks_like_unix_username("castle"));
+    }
+
+    #[test]
+    fn unix_username_not_mixed_case() {
+        // PascalCase / mixed case is not a unix username
+        assert!(!looks_like_unix_username("GreenLake"));
+        assert!(!looks_like_unix_username("BlueDog"));
+        assert!(!looks_like_unix_username("John"));
+    }
+
+    #[test]
+    fn unix_username_length_bounds() {
+        assert!(!looks_like_unix_username("a")); // too short (< 2)
+        assert!(looks_like_unix_username("ab")); // minimum
+        assert!(looks_like_unix_username("abcdefghijklmnop")); // 16 chars, maximum
+        assert!(!looks_like_unix_username("abcdefghijklmnopq")); // 17 chars, too long
+    }
+
+    #[test]
+    fn unix_username_rejects_non_alnum() {
+        assert!(!looks_like_unix_username("john_doe")); // underscore
+        assert!(!looks_like_unix_username("john-doe")); // hyphen
+        assert!(!looks_like_unix_username("john.doe")); // dot
+        assert!(!looks_like_unix_username("john@host")); // at sign
+    }
+
+    #[test]
+    fn detect_mistake_unix_username() {
+        let result = detect_agent_name_mistake("john");
+        assert!(result.is_some());
+        let (kind, msg) = result.unwrap();
+        assert_eq!(kind, "UNIX_USERNAME_AS_AGENT");
+        assert!(msg.contains("looks like a Unix username"), "message: {msg}");
+        assert!(msg.contains("$USER"), "should mention $USER: {msg}");
+        assert!(msg.contains("resource://agents/"), "should mention agents resource: {msg}");
+    }
+
+    #[test]
+    fn detect_message_exact_format_unix_username() {
+        let (_, msg) = detect_agent_name_mistake("jeff").unwrap();
+        assert_eq!(
+            msg,
+            "'jeff' looks like a Unix username (possibly from $USER environment variable). \
+             Agent names must be adjective+noun combinations like 'BlueLake' or 'GreenCastle'. \
+             When you called register_agent, the system likely auto-generated a valid name for you. \
+             To find your actual agent name, check the response from register_agent or use \
+             resource://agents/{project_key} to list all registered agents in this project."
+        );
     }
 
     #[test]

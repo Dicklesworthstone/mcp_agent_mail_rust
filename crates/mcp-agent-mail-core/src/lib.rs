@@ -79,6 +79,6 @@ pub use models::{
     MessageRecipient, Product, ProductProjectLink, Project, ProjectSiblingSuggestion,
     KNOWN_PROGRAM_NAMES, MODEL_NAME_PATTERNS, VALID_ADJECTIVES, VALID_NOUNS,
     detect_agent_name_mistake, generate_agent_name, is_valid_agent_name, looks_like_model_name,
-    looks_like_program_name,
+    looks_like_program_name, looks_like_unix_username,
 };
 pub use slo::{OpClass, PoolHealth};
