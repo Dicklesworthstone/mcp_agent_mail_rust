@@ -980,4 +980,167 @@ mod tests {
         assert!(matches!(result, Some(ActionMenuResult::Selected(_, _))));
         assert!(!mgr.is_active());
     }
+
+    // ── Hit regions / dispatch / state machine edge cases (br-1xt0m.1.13.7) ──
+
+    #[test]
+    fn empty_state_move_up_down_noop() {
+        let mut state = ActionMenuState::new(Vec::new(), 0, "ctx");
+        state.move_up();
+        assert_eq!(state.selected, 0);
+        state.move_down();
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn single_entry_wraps_to_self() {
+        let entries = vec![ActionEntry::new("Only", ActionKind::Dismiss)];
+        let mut state = ActionMenuState::new(entries, 0, "ctx");
+        state.move_down();
+        assert_eq!(state.selected, 0);
+        state.move_up();
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn navigation_through_mixed_enabled_disabled() {
+        let entries = vec![
+            ActionEntry::new("First", ActionKind::Dismiss),
+            ActionEntry::new("Disabled1", ActionKind::Dismiss).disabled("reason1"),
+            ActionEntry::new("Third", ActionKind::Dismiss),
+            ActionEntry::new("Disabled2", ActionKind::Dismiss).disabled("reason2"),
+        ];
+        let mut state = ActionMenuState::new(entries, 0, "ctx");
+        assert_eq!(state.selected, 0);
+
+        // Navigation doesn't skip disabled entries — it just moves to them.
+        state.move_down();
+        assert_eq!(state.selected, 1);
+        assert!(!state.selected_entry().unwrap().enabled);
+
+        state.move_down();
+        assert_eq!(state.selected, 2);
+        assert!(state.selected_entry().unwrap().enabled);
+    }
+
+    #[test]
+    fn jump_to_char_on_disabled_entry() {
+        let entries = vec![
+            ActionEntry::new("Alpha", ActionKind::Dismiss),
+            ActionEntry::new("Beta", ActionKind::Dismiss).disabled("unavailable"),
+        ];
+        let mut state = ActionMenuState::new(entries, 0, "ctx");
+        // Jump to 'b' should land on disabled entry.
+        assert!(state.jump_to_char('b'));
+        assert_eq!(state.selected, 1);
+        assert!(!state.selected_entry().unwrap().enabled);
+    }
+
+    #[test]
+    fn disabled_attempt_preserves_context_id() {
+        let entries = vec![
+            ActionEntry::new("Disabled", ActionKind::Execute("nope".into()))
+                .disabled("Not available"),
+        ];
+        let mut mgr = ActionMenuManager::new();
+        mgr.open(entries, 0, "my-context-123");
+
+        let result = mgr.handle_event(&key_event(KeyCode::Enter));
+        assert!(
+            matches!(result, Some(ActionMenuResult::DisabledAttempt(ref r)) if r == "Not available"),
+        );
+        // Menu stays open — context ID should be preserved.
+        assert!(mgr.is_active());
+    }
+
+    #[test]
+    fn disabled_attempt_default_reason() {
+        let mut entry = ActionEntry::new("NoReason", ActionKind::Execute("x".into()));
+        entry.enabled = false;
+        // No disabled_reason set — should get default message.
+        let entries = vec![entry];
+        let mut mgr = ActionMenuManager::new();
+        mgr.open(entries, 0, "ctx");
+
+        let result = mgr.handle_event(&key_event(KeyCode::Enter));
+        assert!(
+            matches!(result, Some(ActionMenuResult::DisabledAttempt(ref r)) if r == "Action unavailable"),
+        );
+    }
+
+    #[test]
+    fn messages_actions_without_thread_omits_jump_to_thread() {
+        let actions = messages_actions(42, None, "TestAgent");
+        assert!(!actions.iter().any(|a| a.label == "Jump to thread"));
+        // Should still have other actions.
+        assert!(actions.iter().any(|a| a.label == "View body"));
+        assert!(actions.iter().any(|a| a.label == "Jump to sender"));
+    }
+
+    #[test]
+    fn non_key_events_consumed_when_active() {
+        let mut mgr = ActionMenuManager::new();
+        mgr.open(
+            vec![ActionEntry::new("Go", ActionKind::Dismiss)],
+            0,
+            "ctx",
+        );
+
+        // Mouse event should be consumed (not forwarded), menu stays open.
+        let mouse = Event::Mouse(ftui::MouseEvent {
+            kind: ftui::MouseEventKind::Down(ftui::MouseButton::Left),
+            x: 10,
+            y: 10,
+            modifiers: ftui::Modifiers::empty(),
+        });
+        let result = mgr.handle_event(&mouse);
+        assert!(matches!(result, Some(ActionMenuResult::Consumed)));
+        assert!(mgr.is_active());
+    }
+
+    #[test]
+    fn close_then_reopen_resets_selection() {
+        let mut mgr = ActionMenuManager::new();
+        mgr.open(
+            vec![
+                ActionEntry::new("A", ActionKind::Dismiss),
+                ActionEntry::new("B", ActionKind::Dismiss),
+            ],
+            0,
+            "ctx",
+        );
+        // Move to B.
+        mgr.handle_event(&key_event(KeyCode::Down));
+        mgr.close();
+        assert!(!mgr.is_active());
+
+        // Reopen — selection should be back at 0.
+        mgr.open(
+            vec![
+                ActionEntry::new("X", ActionKind::Dismiss),
+                ActionEntry::new("Y", ActionKind::Dismiss),
+            ],
+            0,
+            "ctx2",
+        );
+        assert!(mgr.is_active());
+        let result = mgr.handle_event(&key_event(KeyCode::Enter));
+        match result {
+            Some(ActionMenuResult::Selected(_, ctx)) => assert_eq!(ctx, "ctx2"),
+            other => panic!("expected Selected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_entry_builder_chain() {
+        let entry = ActionEntry::new("Delete", ActionKind::Execute("delete".into()))
+            .with_description("Permanently delete")
+            .with_keybinding("d")
+            .destructive();
+        assert_eq!(entry.label, "Delete");
+        assert_eq!(entry.description.as_deref(), Some("Permanently delete"));
+        assert_eq!(entry.keybinding.as_deref(), Some("d"));
+        assert!(entry.is_destructive);
+        assert!(entry.enabled);
+    }
 }

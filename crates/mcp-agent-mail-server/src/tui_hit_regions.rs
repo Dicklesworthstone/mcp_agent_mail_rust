@@ -591,4 +591,120 @@ mod tests {
         let r = Rect::new(0, 0, 0, 0);
         assert!(!point_in_rect(r, 0, 0));
     }
+
+    // ── Hit region edge case tests (br-1xt0m.1.13.7) ───────────
+
+    #[test]
+    fn point_in_rect_zero_width() {
+        let r = Rect::new(5, 5, 0, 10);
+        assert!(!point_in_rect(r, 5, 5));
+    }
+
+    #[test]
+    fn point_in_rect_zero_height() {
+        let r = Rect::new(5, 5, 10, 0);
+        assert!(!point_in_rect(r, 5, 5));
+    }
+
+    #[test]
+    fn point_in_rect_single_cell() {
+        let r = Rect::new(5, 5, 1, 1);
+        assert!(point_in_rect(r, 5, 5));
+        assert!(!point_in_rect(r, 6, 5));
+        assert!(!point_in_rect(r, 5, 6));
+    }
+
+    #[test]
+    fn tab_slot_overwrite_updates_region() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        d.record_tab_slot(0, MailScreenId::Dashboard, 0, 8, 0);
+
+        // Overwrite slot 0 with a different screen and region.
+        d.record_tab_slot(0, MailScreenId::Messages, 10, 20, 0);
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 15, 0);
+        assert_eq!(d.dispatch(&ev), MouseAction::SwitchScreen(MailScreenId::Messages));
+
+        // Old region should no longer hit.
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 3, 0);
+        assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn tab_slot_accessor_returns_none_for_unregistered() {
+        let d = MouseDispatcher::new();
+        // Before any recording, slot 0 should return None.
+        assert!(d.tab_slot(0).is_none());
+
+        d.record_tab_slot(0, MailScreenId::Dashboard, 5, 15, 0);
+        let (x0, x1, y) = d.tab_slot(0).expect("slot 0 registered");
+        assert_eq!((x0, x1, y), (5, 15, 0));
+
+        // Out-of-range index.
+        assert!(d.tab_slot(999).is_none());
+    }
+
+    #[test]
+    fn dispatch_with_zero_area_chrome_forwards_all() {
+        let d = MouseDispatcher::new();
+        // Both chrome areas are zero-area → everything forwards.
+        d.update_chrome_areas(Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0));
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn dispatcher_drag_on_tab_forwards() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        d.record_tab_slot(0, MailScreenId::Dashboard, 0, 8, 0);
+        let ev = make_mouse(MouseEventKind::Drag(MouseButton::Left), 3, 0);
+        assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn classify_boundary_ids_between_ranges() {
+        // Last valid tab slot (just within range).
+        let hit = HitId::new(TAB_HIT_BASE + 99);
+        // Beyond ALL_SCREEN_IDS count, so should be Unknown (not tab).
+        assert_eq!(classify_hit(hit), HitLayer::Unknown);
+
+        // First overlay ID.
+        assert!(matches!(
+            classify_hit(HitId::new(OVERLAY_HIT_BASE)),
+            HitLayer::Overlay(_)
+        ));
+
+        // Last ID before overlay (still in pane range, but beyond screen count).
+        let hit = HitId::new(OVERLAY_HIT_BASE - 1);
+        // This is in pane range (4000..5000) but index > screen count → Unknown.
+        assert_eq!(classify_hit(hit), HitLayer::Unknown);
+    }
+
+    #[test]
+    fn status_toggles_have_distinct_hit_ids() {
+        let ids = [STATUS_HELP_TOGGLE, STATUS_PALETTE_TOGGLE, STATUS_PERF_TOGGLE];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i], ids[j], "status toggle IDs must be distinct");
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_sub_ranges_have_distinct_ids() {
+        let ids = [
+            OVERLAY_HELP_CLOSE,
+            OVERLAY_HELP_CONTENT,
+            OVERLAY_PALETTE,
+            OVERLAY_PERF_HUD,
+            OVERLAY_ACTION_MENU,
+            OVERLAY_TOAST,
+        ];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i], ids[j], "overlay sub-range IDs must be distinct");
+            }
+        }
+    }
 }

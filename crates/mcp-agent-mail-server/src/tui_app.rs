@@ -8070,4 +8070,159 @@ mod tests {
             "server-dispatched op should record InFlight outcome"
         );
     }
+
+    // ── Hit regions, dispatch routing, action state machines (br-1xt0m.1.13.7) ──
+
+    #[test]
+    fn overlay_layer_ordering_values_increase() {
+        // OverlayLayer discriminants must increase from None to Help.
+        let layers = [
+            OverlayLayer::None,
+            OverlayLayer::Toasts,
+            OverlayLayer::ToastFocus,
+            OverlayLayer::ActionMenu,
+            OverlayLayer::MacroPlayback,
+            OverlayLayer::Modal,
+            OverlayLayer::Palette,
+            OverlayLayer::Help,
+        ];
+        for i in 1..layers.len() {
+            assert!(
+                (layers[i] as u8) > (layers[i - 1] as u8),
+                "{:?} should be higher than {:?}",
+                layers[i],
+                layers[i - 1],
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_layer_focus_trapping_contracts() {
+        // Layers that should trap focus (consume all events).
+        assert!(OverlayLayer::Palette.traps_focus());
+        assert!(OverlayLayer::Modal.traps_focus());
+        assert!(OverlayLayer::ActionMenu.traps_focus());
+        assert!(OverlayLayer::ToastFocus.traps_focus());
+        assert!(OverlayLayer::MacroPlayback.traps_focus());
+
+        // Layers that should NOT trap focus.
+        assert!(!OverlayLayer::None.traps_focus());
+        assert!(!OverlayLayer::Toasts.traps_focus());
+        assert!(!OverlayLayer::Help.traps_focus());
+    }
+
+    #[test]
+    fn dispatch_navigate_action_switches_screen() {
+        let mut model = test_model();
+        let cmd = model.dispatch_action_menu_selection(
+            ActionKind::Navigate(MailScreenId::Agents),
+            "ctx",
+        );
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn dispatch_deep_link_action_switches_screen() {
+        let mut model = test_model();
+        let cmd = model.dispatch_action_menu_selection(
+            ActionKind::DeepLink(DeepLinkTarget::ThreadById("br-42".to_string())),
+            "ctx",
+        );
+        assert_eq!(model.active_screen(), MailScreenId::Threads);
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn dispatch_copy_to_clipboard_shows_toast() {
+        let mut model = test_model();
+        let cmd = model.dispatch_action_menu_selection(
+            ActionKind::CopyToClipboard("some text to copy".into()),
+            "ctx",
+        );
+        assert!(matches!(cmd, Cmd::None));
+        // A toast notification should have been queued.
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > 0);
+    }
+
+    #[test]
+    fn dispatch_dismiss_action_is_noop() {
+        let mut model = test_model();
+        let prev = model.active_screen();
+        let cmd = model.dispatch_action_menu_selection(ActionKind::Dismiss, "ctx");
+        assert_eq!(model.active_screen(), prev);
+        assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn action_outcome_inflight_to_failure_replacement() {
+        let mut model = test_model();
+        model.record_action_outcome(ActionOutcome::InFlight {
+            operation: "release".into(),
+        });
+        assert_eq!(model.action_outcomes.len(), 1);
+
+        model.record_action_outcome(ActionOutcome::Failure {
+            operation: "release".into(),
+            error: "Not found".into(),
+        });
+        assert_eq!(model.action_outcomes.len(), 1);
+        assert!(matches!(
+            model.action_outcomes[0],
+            ActionOutcome::Failure { .. }
+        ));
+    }
+
+    #[test]
+    fn action_outcome_different_operations_coexist() {
+        let mut model = test_model();
+        model.record_action_outcome(ActionOutcome::InFlight {
+            operation: "ack".into(),
+        });
+        model.record_action_outcome(ActionOutcome::InFlight {
+            operation: "release".into(),
+        });
+        assert_eq!(model.action_outcomes.len(), 2);
+
+        // Resolving one doesn't affect the other.
+        model.record_action_outcome(ActionOutcome::Success {
+            operation: "ack".into(),
+            summary: "done".into(),
+        });
+        assert_eq!(model.action_outcomes.len(), 2);
+    }
+
+    #[test]
+    fn modal_manager_show_and_dismiss() {
+        let mut modal = ModalManager::new();
+        assert!(!modal.is_active());
+        modal.show_confirmation("Title", "Message", ModalSeverity::Info, |_| {});
+        assert!(modal.is_active());
+
+        // Escape dismisses.
+        modal.handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
+        assert!(!modal.is_active());
+    }
+
+    #[test]
+    fn action_menu_blocks_global_shortcuts() {
+        let mut model = test_model();
+        // Open action menu with a dummy entry.
+        model.action_menu.open(
+            vec![crate::tui_action_menu::ActionEntry::new(
+                "Test",
+                ActionKind::Dismiss,
+            )],
+            5,
+            "test-context",
+        );
+        assert!(model.action_menu.is_active());
+
+        // Press 'q' — should NOT quit while action menu is open.
+        let q = Event::Key(ftui::KeyEvent::new(KeyCode::Char('q')));
+        let cmd = model.update(MailMsg::Terminal(q));
+        assert!(!model.state.is_shutdown_requested());
+        assert!(!matches!(cmd, Cmd::Quit));
+    }
 }
