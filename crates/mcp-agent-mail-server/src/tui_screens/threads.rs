@@ -10,16 +10,17 @@ use std::time::Instant;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::Widget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
+use ftui_widgets::tree::{Tree, TreeGuides, TreeNode};
 
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
-use mcp_agent_mail_db::DbConn;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -58,6 +59,34 @@ fn reduced_motion_enabled() -> bool {
     env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
 }
 
+fn parse_tree_guides(raw: &str) -> Option<TreeGuides> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "ascii" => Some(TreeGuides::Ascii),
+        "unicode" => Some(TreeGuides::Unicode),
+        "bold" => Some(TreeGuides::Bold),
+        "double" => Some(TreeGuides::Double),
+        "rounded" => Some(TreeGuides::Rounded),
+        _ => None,
+    }
+}
+
+fn theme_default_tree_guides() -> TreeGuides {
+    // Rounded is the default to align with rounded panel borders.
+    match crate::tui_theme::current_theme_id() {
+        ftui_extras::theme::ThemeId::HighContrast => TreeGuides::Bold,
+        _ => TreeGuides::Rounded,
+    }
+}
+
+fn thread_tree_guides() -> TreeGuides {
+    std::env::var("AM_TUI_THREAD_GUIDES")
+        .ok()
+        .as_deref()
+        .and_then(parse_tree_guides)
+        .unwrap_or_else(theme_default_tree_guides)
+}
+
 fn parse_thread_page_size(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -85,11 +114,7 @@ fn agent_color(name: &str) -> PackedRgba {
 }
 
 fn iso_compact_time(iso: &str) -> &str {
-    if iso.len() >= 19 {
-        &iso[11..19]
-    } else {
-        iso
-    }
+    if iso.len() >= 19 { &iso[11..19] } else { iso }
 }
 
 fn body_preview(body_md: &str, max_len: usize) -> String {
@@ -221,6 +246,13 @@ struct ThreadMessage {
     ack_required: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ThreadTreeRow {
+    message_id: i64,
+    has_children: bool,
+    is_expanded: bool,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Focus state
 // ──────────────────────────────────────────────────────────────────────
@@ -274,8 +306,12 @@ pub struct ThreadExplorerScreen {
     loaded_message_count: usize,
     /// Selected message card in the detail pane.
     detail_cursor: usize,
-    /// Expanded message card IDs.
+    /// Expanded message IDs in preview mode.
     expanded_message_ids: HashSet<i64>,
+    /// Collapsed branch roots in the tree view.
+    collapsed_tree_ids: HashSet<i64>,
+    /// Focus within the detail pane: tree (true) or preview (false).
+    detail_tree_focus: bool,
     /// Page size for pagination.
     page_size: usize,
     /// Whether "Load older" button is selected (when at scroll 0).
@@ -309,6 +345,8 @@ impl ThreadExplorerScreen {
             loaded_message_count: 0,
             detail_cursor: 0,
             expanded_message_ids: HashSet::new(),
+            collapsed_tree_ids: HashSet::new(),
+            detail_tree_focus: true,
             page_size: get_thread_page_size(),
             load_older_selected: false,
             urgent_pulse_on: true,
@@ -416,6 +454,8 @@ impl ThreadExplorerScreen {
             self.loaded_message_count = 0;
             self.detail_cursor = 0;
             self.expanded_message_ids.clear();
+            self.collapsed_tree_ids.clear();
+            self.detail_tree_focus = true;
             self.load_older_selected = false;
             return;
         }
@@ -436,6 +476,8 @@ impl ThreadExplorerScreen {
         self.detail_cursor = self.detail_messages.len().saturating_sub(1);
         self.detail_scroll = self.detail_cursor.saturating_sub(3);
         self.expanded_message_ids.clear();
+        self.collapsed_tree_ids.clear();
+        self.detail_tree_focus = true;
         if let Some(last) = self.detail_messages.last() {
             self.expanded_message_ids.insert(last.id);
         }
@@ -499,16 +541,71 @@ impl ThreadExplorerScreen {
             .saturating_sub(self.loaded_message_count)
     }
 
-    const fn sync_scroll_to_cursor(&mut self) {
-        self.detail_scroll = self.detail_cursor.saturating_sub(3);
+    fn detail_tree_rows(&self) -> Vec<ThreadTreeRow> {
+        let roots = build_thread_tree_items(&self.detail_messages);
+        let mut rows = Vec::new();
+        flatten_thread_tree_rows(&roots, &self.collapsed_tree_ids, &mut rows);
+        rows
+    }
+
+    fn selected_tree_row(&self) -> Option<ThreadTreeRow> {
+        self.detail_tree_rows().get(self.detail_cursor).cloned()
+    }
+
+    fn selected_message(&self) -> Option<&ThreadMessage> {
+        let selected_id = self.selected_tree_row()?.message_id;
+        self.detail_messages
+            .iter()
+            .find(|message| message.id == selected_id)
+    }
+
+    fn clamp_detail_cursor_to_tree_rows(&mut self) {
+        let row_count = self.detail_tree_rows().len();
+        if row_count == 0 {
+            self.detail_cursor = 0;
+        } else {
+            self.detail_cursor = self.detail_cursor.min(row_count.saturating_sub(1));
+        }
+    }
+
+    fn collapse_selected_branch(&mut self) {
+        if let Some(row) = self.selected_tree_row() {
+            if row.has_children {
+                self.collapsed_tree_ids.insert(row.message_id);
+                self.clamp_detail_cursor_to_tree_rows();
+            }
+        }
+    }
+
+    fn expand_selected_branch(&mut self) {
+        if let Some(row) = self.selected_tree_row() {
+            if row.has_children {
+                self.collapsed_tree_ids.remove(&row.message_id);
+            }
+        }
+    }
+
+    fn toggle_selected_branch(&mut self) {
+        if let Some(row) = self.selected_tree_row() {
+            if !row.has_children {
+                return;
+            }
+            if row.is_expanded {
+                self.collapsed_tree_ids.insert(row.message_id);
+                self.clamp_detail_cursor_to_tree_rows();
+            } else {
+                self.collapsed_tree_ids.remove(&row.message_id);
+            }
+        }
     }
 
     fn toggle_selected_expansion(&mut self) {
-        let Some(msg) = self.detail_messages.get(self.detail_cursor) else {
+        let Some(msg) = self.selected_message() else {
             return;
         };
-        if !self.expanded_message_ids.remove(&msg.id) {
-            self.expanded_message_ids.insert(msg.id);
+        let id = msg.id;
+        if !self.expanded_message_ids.remove(&id) {
+            self.expanded_message_ids.insert(id);
         }
     }
 
@@ -633,106 +730,117 @@ impl MailScreen for ThreadExplorerScreen {
                         }
                     }
                     Focus::DetailPanel => {
+                        self.clamp_detail_cursor_to_tree_rows();
+                        let tree_rows = self.detail_tree_rows();
                         match key.code {
                             // Back to thread list
-                            KeyCode::Escape | KeyCode::Char('h') | KeyCode::Left => {
+                            KeyCode::Escape => {
                                 self.focus = Focus::ThreadList;
                                 self.load_older_selected = false;
                             }
-                            // Navigate message cards / load-older button
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                if self.load_older_selected {
-                                    // Move from load-older button into message list
-                                    self.load_older_selected = false;
-                                } else if self.detail_cursor + 1 < self.detail_messages.len() {
-                                    self.detail_cursor += 1;
-                                    self.sync_scroll_to_cursor();
-                                } else {
-                                    self.sync_scroll_to_cursor();
-                                }
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                if self.detail_cursor == 0 && self.has_older_messages() {
-                                    // At top and there are older messages, select the load button
-                                    self.load_older_selected = true;
-                                } else if !self.load_older_selected {
-                                    self.detail_cursor = self.detail_cursor.saturating_sub(1);
-                                    self.sync_scroll_to_cursor();
-                                }
-                            }
-                            KeyCode::Char('d') | KeyCode::PageDown => {
-                                self.load_older_selected = false;
-                                if !self.detail_messages.is_empty() {
-                                    let step = 10usize;
-                                    self.detail_cursor = (self.detail_cursor + step)
-                                        .min(self.detail_messages.len().saturating_sub(1));
-                                    self.sync_scroll_to_cursor();
-                                }
-                            }
-                            KeyCode::Char('u') | KeyCode::PageUp => {
-                                self.load_older_selected = false;
-                                if self.detail_cursor < 10 && self.has_older_messages() {
-                                    // Near top with older messages available
-                                    self.detail_cursor = 0;
-                                    self.detail_scroll = 0;
-                                    self.load_older_selected = true;
-                                } else {
-                                    self.detail_cursor = self.detail_cursor.saturating_sub(10);
-                                    self.sync_scroll_to_cursor();
-                                }
-                            }
-                            KeyCode::Char('G') | KeyCode::End => {
-                                // Jump to newest message card.
-                                self.load_older_selected = false;
-                                self.detail_cursor = self.detail_messages.len().saturating_sub(1);
-                                self.sync_scroll_to_cursor();
-                            }
-                            KeyCode::Char('g') | KeyCode::Home => {
-                                // Jump to oldest loaded card; if there are older messages,
-                                // focus the load button instead.
-                                self.detail_cursor = 0;
-                                self.detail_scroll = 0;
-                                if self.has_older_messages() {
-                                    self.load_older_selected = true;
-                                }
-                            }
-                            // Enter/Space: load older if selected, otherwise toggle card expansion.
-                            KeyCode::Enter | KeyCode::Char(' ') => {
-                                if self.load_older_selected && self.has_older_messages() {
-                                    self.load_older_messages();
-                                    return Cmd::None;
-                                }
-                                self.toggle_selected_expansion();
-                            }
-                            // 'o' key: quick load older messages
-                            KeyCode::Char('o') => {
-                                if self.has_older_messages() {
-                                    self.load_older_messages();
-                                }
-                            }
-                            // Expand/collapse all loaded message cards.
-                            KeyCode::Char('e') => {
-                                self.expand_all();
-                            }
-                            KeyCode::Char('c') => {
-                                self.collapse_all();
-                            }
-                            // Deep-link: jump to timeline at thread last activity.
-                            KeyCode::Char('t') => {
-                                if let Some(thread) = self.threads.get(self.cursor) {
-                                    return Cmd::msg(MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::TimelineAtTime(
-                                            thread.last_timestamp_micros,
-                                        ),
-                                    ));
-                                }
+                            // Toggle focus between hierarchy tree and preview pane.
+                            KeyCode::Tab => {
+                                self.detail_tree_focus = !self.detail_tree_focus;
                             }
                             // Search/filter
                             KeyCode::Char('/') => {
                                 self.focus = Focus::ThreadList;
                                 self.filter_editing = true;
                             }
-                            _ => {}
+                            _ if self.detail_tree_focus => match key.code {
+                                // Tree navigation
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    if self.detail_cursor + 1 < tree_rows.len() {
+                                        self.detail_cursor += 1;
+                                    }
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    self.detail_cursor = self.detail_cursor.saturating_sub(1);
+                                }
+                                KeyCode::Char('d') | KeyCode::PageDown => {
+                                    let step = 10usize;
+                                    self.detail_cursor = (self.detail_cursor + step)
+                                        .min(tree_rows.len().saturating_sub(1));
+                                }
+                                KeyCode::Char('u') | KeyCode::PageUp => {
+                                    self.detail_cursor = self.detail_cursor.saturating_sub(10);
+                                }
+                                KeyCode::Char('G') | KeyCode::End => {
+                                    self.detail_cursor = tree_rows.len().saturating_sub(1);
+                                }
+                                KeyCode::Char('g') | KeyCode::Home => {
+                                    self.detail_cursor = 0;
+                                }
+                                // Tree expansion controls
+                                KeyCode::Left | KeyCode::Char('h') => {
+                                    self.collapse_selected_branch();
+                                }
+                                KeyCode::Right | KeyCode::Char('l') => {
+                                    self.expand_selected_branch();
+                                }
+                                KeyCode::Char(' ') => {
+                                    self.toggle_selected_branch();
+                                }
+                                // Open selected message in preview mode.
+                                KeyCode::Enter => {
+                                    self.toggle_selected_expansion();
+                                    self.detail_tree_focus = false;
+                                }
+                                // Load more history
+                                KeyCode::Char('o') => {
+                                    if self.has_older_messages() {
+                                        self.load_older_messages();
+                                        self.clamp_detail_cursor_to_tree_rows();
+                                    }
+                                }
+                                // Expand/collapse all selected-message previews.
+                                KeyCode::Char('e') => self.expand_all(),
+                                KeyCode::Char('c') => self.collapse_all(),
+                                // Deep-link: jump to timeline at thread last activity.
+                                KeyCode::Char('t') => {
+                                    if let Some(thread) = self.threads.get(self.cursor) {
+                                        return Cmd::msg(MailScreenMsg::DeepLink(
+                                            DeepLinkTarget::TimelineAtTime(
+                                                thread.last_timestamp_micros,
+                                            ),
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            },
+                            _ => match key.code {
+                                // Preview scrolling/actions while preview has focus.
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                                }
+                                KeyCode::Left | KeyCode::Char('h') => {
+                                    self.detail_tree_focus = true;
+                                }
+                                KeyCode::Enter | KeyCode::Char(' ') => {
+                                    self.toggle_selected_expansion();
+                                }
+                                KeyCode::Char('o') => {
+                                    if self.has_older_messages() {
+                                        self.load_older_messages();
+                                        self.clamp_detail_cursor_to_tree_rows();
+                                    }
+                                }
+                                KeyCode::Char('e') => self.expand_all(),
+                                KeyCode::Char('c') => self.collapse_all(),
+                                KeyCode::Char('t') => {
+                                    if let Some(thread) = self.threads.get(self.cursor) {
+                                        return Cmd::msg(MailScreenMsg::DeepLink(
+                                            DeepLinkTarget::TimelineAtTime(
+                                                thread.last_timestamp_micros,
+                                            ),
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            },
                         }
                     }
                 }
@@ -839,12 +947,13 @@ impl MailScreen for ThreadExplorerScreen {
                 self.detail_scroll,
                 self.detail_cursor,
                 &self.expanded_message_ids,
+                &self.collapsed_tree_ids,
                 self.has_older_messages(),
                 self.remaining_older_count(),
                 self.loaded_message_count,
                 self.total_thread_messages,
-                self.load_older_selected,
                 matches!(self.focus, Focus::DetailPanel),
+                self.detail_tree_focus,
             );
         } else {
             // Narrow: show only the active pane
@@ -870,12 +979,13 @@ impl MailScreen for ThreadExplorerScreen {
                         self.detail_scroll,
                         self.detail_cursor,
                         &self.expanded_message_ids,
+                        &self.collapsed_tree_ids,
                         self.has_older_messages(),
                         self.remaining_older_count(),
                         self.loaded_message_count,
                         self.total_thread_messages,
-                        self.load_older_selected,
                         true,
+                        self.detail_tree_focus,
                     );
                 }
             }
@@ -901,8 +1011,16 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Open thread detail",
             },
             HelpEntry {
+                key: "Tab",
+                action: "Toggle tree/preview focus",
+            },
+            HelpEntry {
+                key: "Left/Right",
+                action: "Collapse/expand selected branch",
+            },
+            HelpEntry {
                 key: "Enter/Space",
-                action: "Toggle message expansion",
+                action: "Toggle preview or branch state",
             },
             HelpEntry {
                 key: "e / c",
@@ -1226,11 +1344,7 @@ fn render_thread_list(
         let abs_idx = start + view_idx;
         let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
         let esc_badge = if thread.has_escalation {
-            if urgent_pulse_on {
-                "!"
-            } else {
-                "·"
-            }
+            if urgent_pulse_on { "!" } else { "·" }
         } else {
             " "
         };
@@ -1313,12 +1427,13 @@ fn render_thread_detail(
     scroll: usize,
     selected_idx: usize,
     expanded_message_ids: &HashSet<i64>,
+    collapsed_tree_ids: &HashSet<i64>,
     has_older_messages: bool,
     remaining_older_count: usize,
     loaded_message_count: usize,
     total_thread_messages: usize,
-    load_older_selected: bool,
     focused: bool,
+    tree_focus: bool,
 ) {
     let title = thread.map_or_else(
         || "Thread Detail".to_string(),
@@ -1354,132 +1469,181 @@ fn render_thread_detail(
         return;
     }
 
-    // Build hierarchical metadata once so tree integration can consume the
-    // same structure without re-linking reply chains.
-    let _tree_items = build_thread_tree_items(messages);
+    let tree_items = build_thread_tree_items(messages);
+    let mut tree_rows = Vec::new();
+    flatten_thread_tree_rows(&tree_items, collapsed_tree_ids, &mut tree_rows);
+    if tree_rows.is_empty() {
+        Paragraph::new("  No hierarchy available.").render(inner, frame);
+        return;
+    }
 
-    let body_width = inner.width as usize;
-    let md_theme = ftui_extras::markdown::MarkdownTheme::default();
-    let mut styled_lines: Vec<Line> = Vec::new();
+    let selected_idx = selected_idx.min(tree_rows.len().saturating_sub(1));
+    let selected_row = &tree_rows[selected_idx];
+    let selected_message = messages
+        .iter()
+        .find(|message| message.id == selected_row.message_id)
+        .unwrap_or(&messages[0]);
 
-    // Metadata header.
+    let mut header_lines = Vec::new();
     if let Some(t) = thread {
-        styled_lines.push(Line::raw(format!(
+        header_lines.push(Line::raw(format!(
             "Thread: {}  |  Loaded: {}/{}  |  Unread: {}",
-            truncate_str(&t.thread_id, body_width.saturating_sub(34)),
+            truncate_str(&t.thread_id, inner.width.saturating_sub(34) as usize),
             loaded_message_count,
             total_thread_messages,
             t.unread_count,
         )));
-        styled_lines.push(Line::raw(format!(
+        header_lines.push(Line::raw(format!(
             "Participants ({})  |  {} -> {}",
             t.participant_count,
             iso_compact_time(&t.first_timestamp_iso),
             iso_compact_time(&t.last_timestamp_iso),
         )));
         if !t.participant_names.is_empty() {
-            let mut spans: Vec<Span<'static>> = vec![Span::raw("Agents: ".to_string())];
-            for (idx, name) in t
-                .participant_names
-                .split(", ")
-                .filter(|n| !n.is_empty())
-                .enumerate()
-            {
-                if idx > 0 {
-                    spans.push(Span::raw(", ".to_string()));
-                }
-                spans.push(Span::styled(
-                    name.to_string(),
-                    Style::default().fg(agent_color(name)).bold(),
-                ));
-            }
-            styled_lines.push(Line::from_spans(spans));
+            header_lines.push(Line::raw(format!(
+                "Agents: {}",
+                truncate_str(&t.participant_names, inner.width.saturating_sub(8) as usize)
+            )));
         }
-        styled_lines.push(Line::raw(String::new()));
     }
-
+    header_lines.push(Line::raw(if tree_focus {
+        "Mode: Tree (Tab -> Preview)".to_string()
+    } else {
+        "Mode: Preview (Tab -> Tree)".to_string()
+    }));
     if has_older_messages {
-        let marker = if load_older_selected && focused {
-            ">"
-        } else {
-            " "
-        };
-        styled_lines.push(Line::raw(format!(
-            "{marker} [Load {remaining_older_count} older messages] (Enter/o)"
+        header_lines.push(Line::raw(format!(
+            "[Load {remaining_older_count} older messages] (o)"
         )));
-        styled_lines.push(Line::raw(String::new()));
     }
 
-    // Build conversation cards.
-    for (i, msg) in messages.iter().enumerate() {
-        if i > 0 {
-            styled_lines.push(Line::raw(String::new()));
-        }
+    let header_height = header_lines.len().min(inner.height as usize).min(5) as u16;
+    let header_area = Rect::new(inner.x, inner.y, inner.width, header_height);
+    let body_area = Rect::new(
+        inner.x,
+        inner.y + header_height,
+        inner.width,
+        inner.height.saturating_sub(header_height),
+    );
+    Paragraph::new(Text::from_lines(header_lines)).render(header_area, frame);
+    if body_area.width < 10 || body_area.height == 0 {
+        return;
+    }
 
-        let selected = focused && !load_older_selected && i == selected_idx;
-        let marker = if selected { ">" } else { " " };
-        let expanded = expanded_message_ids.contains(&msg.id);
-        let toggle = if expanded { "[-]" } else { "[+]" };
-        let border = "─".repeat(body_width.saturating_sub(2).max(1));
+    let tree_width = ((u32::from(body_area.width) * 60) / 100) as u16;
+    let tree_width = tree_width.clamp(12, body_area.width.saturating_sub(8));
+    let preview_width = body_area.width.saturating_sub(tree_width);
 
-        styled_lines.push(Line::raw(format!("{marker}┌{border}")));
+    let tree_area = Rect::new(body_area.x, body_area.y, tree_width, body_area.height);
+    let preview_area = Rect::new(
+        body_area.x + tree_width,
+        body_area.y,
+        preview_width,
+        body_area.height,
+    );
 
-        let sender_style = Style::default().fg(agent_color(&msg.from_agent)).bold();
-        let mut header_spans: Vec<Span<'static>> = vec![
-            Span::raw(format!("{marker}│ {toggle} #{} ", msg.id)),
-            Span::styled(msg.from_agent.clone(), sender_style),
-        ];
+    let tree_title = if focused && tree_focus {
+        "Hierarchy *"
+    } else {
+        "Hierarchy"
+    };
+    let tree_block = Block::default()
+        .title(tree_title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(
+            &tp,
+            focused && tree_focus,
+        )));
+    let tree_inner = tree_block.inner(tree_area);
+    tree_block.render(tree_area, frame);
+    if tree_inner.width > 0 && tree_inner.height > 0 {
+        let nodes = tree_items
+            .iter()
+            .map(|item| tree_item_to_widget_node(item, collapsed_tree_ids, selected_row.message_id))
+            .collect::<Vec<_>>();
+        let root = TreeNode::new("root").with_children(nodes);
+        Tree::new(root)
+            .with_show_root(false)
+            .with_guides(thread_tree_guides())
+            .render(tree_inner, frame);
+    }
 
-        if !msg.to_agents.is_empty() {
-            header_spans.push(Span::raw(format!(
-                " -> {}",
-                truncate_str(&msg.to_agents, 26)
-            )));
-        }
-        if msg.importance == "high" || msg.importance == "urgent" {
-            header_spans.push(Span::raw(format!(
-                " [{}]",
-                msg.importance.to_ascii_uppercase()
-            )));
-        }
-        header_spans.push(Span::raw(format!(
+    let preview_title = if focused && !tree_focus {
+        "Preview *"
+    } else {
+        "Preview"
+    };
+    let preview_block = Block::default()
+        .title(preview_title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::tui_theme::focus_border_color(
+            &tp,
+            focused && !tree_focus,
+        )));
+    let preview_inner = preview_block.inner(preview_area);
+    preview_block.render(preview_area, frame);
+    if preview_inner.width == 0 || preview_inner.height == 0 {
+        return;
+    }
+
+    let mut preview_lines = Vec::new();
+    let mut preview_header_spans = vec![
+        Span::styled(
+            selected_message.from_agent.clone(),
+            Style::default()
+                .fg(agent_color(&selected_message.from_agent))
+                .bold(),
+        ),
+        Span::raw(format!(
             " @ {}",
-            iso_compact_time(&msg.timestamp_iso)
+            iso_compact_time(&selected_message.timestamp_iso)
+        )),
+    ];
+    if !selected_message.to_agents.is_empty() {
+        preview_header_spans.push(Span::raw(format!(
+            " -> {}",
+            truncate_str(
+                &selected_message.to_agents,
+                preview_inner.width.saturating_sub(24) as usize
+            )
         )));
-        styled_lines.push(Line::from_spans(header_spans));
+    }
+    if selected_message.importance == "high" || selected_message.importance == "urgent" {
+        preview_header_spans.push(Span::raw(format!(
+            " [{}]",
+            selected_message.importance.to_ascii_uppercase()
+        )));
+    }
+    preview_lines.push(Line::from_spans(preview_header_spans));
+    if !selected_message.subject.is_empty() {
+        preview_lines.push(Line::raw(format!(
+            "Subj: {}",
+            truncate_str(
+                &selected_message.subject,
+                preview_inner.width.saturating_sub(6) as usize
+            )
+        )));
+    }
+    preview_lines.push(Line::raw(String::new()));
 
-        if !msg.subject.is_empty() {
-            styled_lines.push(Line::raw(format!(
-                "{marker}│ Subj: {}",
-                truncate_str(&msg.subject, body_width.saturating_sub(8))
-            )));
+    if expanded_message_ids.contains(&selected_message.id) {
+        let md_theme = ftui_extras::markdown::MarkdownTheme::default();
+        for line in crate::tui_markdown::render_body(&selected_message.body_md, &md_theme).lines() {
+            preview_lines.push(line.clone());
         }
-
-        if expanded {
-            let body_text = crate::tui_markdown::render_body(&msg.body_md, &md_theme);
-            for line in body_text.lines() {
-                styled_lines.push(line.clone());
-            }
-        } else {
-            styled_lines.push(Line::raw(format!(
-                "{marker}│ {}",
-                body_preview(&msg.body_md, body_width.saturating_sub(4))
-            )));
-        }
-
-        styled_lines.push(Line::raw(format!("{marker}└{border}")));
+    } else {
+        preview_lines.push(Line::raw(body_preview(
+            &selected_message.body_md,
+            preview_inner.width.saturating_sub(2) as usize,
+        )));
     }
 
-    // Apply scroll offset
-    let visible_height = inner.height as usize;
-    let visible: Vec<Line> = styled_lines
+    let visible_preview = preview_lines
         .into_iter()
         .skip(scroll)
-        .take(visible_height)
-        .collect();
-    let text = Text::from_lines(visible);
-    let p = Paragraph::new(text);
-    p.render(inner, frame);
+        .take(preview_inner.height as usize)
+        .collect::<Vec<_>>();
+    Paragraph::new(Text::from_lines(visible_preview)).render(preview_inner, frame);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1580,6 +1744,46 @@ fn build_thread_tree_item_node(
 
     recursion_stack.remove(&message_id);
     Some(node)
+}
+
+/// Convert a [`ThreadTreeItem`] into a [`TreeNode`] for the ftui tree widget.
+fn tree_item_to_widget_node(
+    item: &crate::tui_widgets::ThreadTreeItem,
+    collapsed_tree_ids: &HashSet<i64>,
+    selected_id: i64,
+) -> TreeNode {
+    let is_expanded = !collapsed_tree_ids.contains(&item.message_id);
+    let label = if item.message_id == selected_id {
+        format!("> {}", item.render_plain_label(is_expanded))
+    } else {
+        format!("  {}", item.render_plain_label(is_expanded))
+    };
+    let children: Vec<TreeNode> = item
+        .children
+        .iter()
+        .map(|child| tree_item_to_widget_node(child, collapsed_tree_ids, selected_id))
+        .collect();
+    TreeNode::new(label)
+        .with_expanded(is_expanded)
+        .with_children(children)
+}
+
+fn flatten_thread_tree_rows(
+    nodes: &[crate::tui_widgets::ThreadTreeItem],
+    collapsed_tree_ids: &HashSet<i64>,
+    out: &mut Vec<ThreadTreeRow>,
+) {
+    for node in nodes {
+        let is_expanded = !collapsed_tree_ids.contains(&node.message_id);
+        out.push(ThreadTreeRow {
+            message_id: node.message_id,
+            has_children: !node.children.is_empty(),
+            is_expanded,
+        });
+        if is_expanded {
+            flatten_thread_tree_rows(&node.children, collapsed_tree_ids, out);
+        }
+    }
 }
 
 /// Truncate a string to at most `max_len` characters, adding "..." if truncated.
@@ -1815,6 +2019,78 @@ mod tests {
         assert!(screen.expanded_message_ids.is_empty());
     }
 
+    #[test]
+    fn tab_toggles_detail_focus_between_tree_and_preview() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.focus = Focus::DetailPanel;
+        screen.detail_messages.push(make_message(1));
+        screen.detail_messages.push(make_message(2));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        assert!(screen.detail_tree_focus);
+        let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
+        screen.update(&tab, &state);
+        assert!(!screen.detail_tree_focus);
+        screen.update(&tab, &state);
+        assert!(screen.detail_tree_focus);
+    }
+
+    #[test]
+    fn left_and_right_collapse_and_expand_selected_branch() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.focus = Focus::DetailPanel;
+        let root = make_message(1);
+        let mut child = make_message(2);
+        child.reply_to_id = Some(1);
+        screen.detail_messages = vec![root, child];
+        screen.detail_cursor = 0;
+        screen.detail_tree_focus = true;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let left = Event::Key(ftui::KeyEvent::new(KeyCode::Left));
+        screen.update(&left, &state);
+        assert!(screen.collapsed_tree_ids.contains(&1));
+
+        let right = Event::Key(ftui::KeyEvent::new(KeyCode::Right));
+        screen.update(&right, &state);
+        assert!(!screen.collapsed_tree_ids.contains(&1));
+    }
+
+    #[test]
+    fn space_toggles_selected_branch_expansion() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.focus = Focus::DetailPanel;
+        let root = make_message(1);
+        let mut child = make_message(2);
+        child.reply_to_id = Some(1);
+        screen.detail_messages = vec![root, child];
+        screen.detail_cursor = 0;
+        screen.detail_tree_focus = true;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let space = Event::Key(ftui::KeyEvent::new(KeyCode::Char(' ')));
+        screen.update(&space, &state);
+        assert!(screen.collapsed_tree_ids.contains(&1));
+
+        screen.update(&space, &state);
+        assert!(!screen.collapsed_tree_ids.contains(&1));
+    }
+
+    #[test]
+    fn clamp_detail_cursor_drops_hidden_branch_selection() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.focus = Focus::DetailPanel;
+        let root = make_message(1);
+        let mut child = make_message(2);
+        child.reply_to_id = Some(1);
+        screen.detail_messages = vec![root, child];
+        screen.detail_cursor = 1;
+        screen.collapsed_tree_ids.insert(1);
+
+        screen.clamp_detail_cursor_to_tree_rows();
+        assert_eq!(screen.detail_cursor, 0);
+    }
+
     // ── Filter editing ──────────────────────────────────────────────
 
     #[test]
@@ -1982,6 +2258,7 @@ mod tests {
 
         let messages = vec![make_message(1)];
         let expanded: HashSet<i64> = HashSet::new();
+        let collapsed: HashSet<i64> = HashSet::new();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(120, 24, &mut pool);
 
@@ -1993,6 +2270,7 @@ mod tests {
             0,
             0,
             &expanded,
+            &collapsed,
             false,
             0,
             12,
@@ -2012,6 +2290,44 @@ mod tests {
         );
         assert!(text.contains("Beta"), "missing second participant: {text}");
         assert!(text.contains("Gamma"), "missing third participant: {text}");
+    }
+
+    #[test]
+    fn selected_tree_row_updates_preview_subject() {
+        let mut root = make_message(1);
+        root.subject = "Root subject".to_string();
+        let mut child = make_message(2);
+        child.reply_to_id = Some(1);
+        child.subject = "Child subject".to_string();
+
+        let messages = vec![root, child];
+        let expanded: HashSet<i64> = HashSet::new();
+        let collapsed: HashSet<i64> = HashSet::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 24, &mut pool);
+
+        render_thread_detail(
+            &mut frame,
+            Rect::new(0, 0, 120, 24),
+            &messages,
+            None,
+            0,
+            1,
+            &expanded,
+            &collapsed,
+            false,
+            0,
+            2,
+            2,
+            true,
+            true,
+        );
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Subj: Child subject"),
+            "preview did not follow selected tree row: {text}"
+        );
     }
 
     #[test]
@@ -2476,6 +2792,13 @@ mod tests {
 
         screen.tick(URGENT_PULSE_HALF_PERIOD_TICKS, &state);
         assert!(screen.urgent_pulse_on);
+    }
+
+    #[test]
+    fn parse_tree_guides_handles_known_and_unknown_values() {
+        assert_eq!(parse_tree_guides("rounded"), Some(TreeGuides::Rounded));
+        assert_eq!(parse_tree_guides("DOUBLE"), Some(TreeGuides::Double));
+        assert_eq!(parse_tree_guides("nope"), None);
     }
 
     fn make_message(id: i64) -> ThreadMessage {
