@@ -82,3 +82,6 @@ SilverFox:
 # Beads history snapshots
 .beads/.br_history/
 .claude/settings.local.json
+
+# CASS session mining output
+LIST_OF_INPUT_MESSAGES.md
