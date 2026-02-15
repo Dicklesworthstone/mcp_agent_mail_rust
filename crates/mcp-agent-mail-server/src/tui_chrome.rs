@@ -597,124 +597,6 @@ pub fn render_status_line(
 // Help overlay
 // ──────────────────────────────────────────────────────────────────────
 
-/// Build the global keybindings list with a registry-derived jump-key legend.
-fn global_keybindings() -> Vec<(String, &'static str)> {
-    vec![
-        (crate::tui_screens::jump_key_legend(), "Jump to screen"),
-        ("Tab".to_string(), "Next screen"),
-        ("Shift+Tab".to_string(), "Previous screen"),
-        ("m".to_string(), "Toggle MCP/API mode"),
-        ("Ctrl+P / :".to_string(), "Command palette"),
-        ("T".to_string(), "Cycle theme"),
-        ("?".to_string(), "Toggle help"),
-        ("q".to_string(), "Quit"),
-        ("Esc".to_string(), "Dismiss overlay"),
-    ]
-}
-
-/// Render the help overlay centered on the terminal.
-pub fn render_help_overlay(
-    active: MailScreenId,
-    screen_bindings: &[HelpEntry],
-    frame: &mut Frame,
-    area: Rect,
-) {
-    let tp = crate::tui_theme::TuiThemePalette::current();
-
-    // Calculate overlay dimensions (60% width, 60% height, clamped)
-    let overlay_width = (u32::from(area.width) * 60 / 100).clamp(36, 72) as u16;
-    let overlay_height = (u32::from(area.height) * 60 / 100).clamp(10, 24) as u16;
-    let overlay_width = overlay_width.min(area.width.saturating_sub(2));
-    let overlay_height = overlay_height.min(area.height.saturating_sub(2));
-
-    // Center the overlay
-    let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
-    let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
-
-    // Render border frame
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(" Keyboard Shortcuts (Esc to close) ")
-        .style(Style::default().fg(tp.help_border_fg).bg(tp.help_bg));
-
-    let inner = block.inner(overlay_area);
-    block.render(overlay_area, frame);
-
-    // Render keybinding entries inside the inner area
-    let mut y_offset = 0u16;
-    let col_width = inner.width.saturating_sub(1);
-    let key_col = 14u16; // width for key column
-
-    // Global section header
-    if y_offset < inner.height {
-        let header = Paragraph::new("Global").style(
-            Style::default()
-                .fg(tp.help_category_fg)
-                .bg(tp.help_bg)
-                .bold(),
-        );
-        header.render(
-            Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
-            frame,
-        );
-        y_offset += 1;
-    }
-
-    // Global keybindings
-    let global_bindings = global_keybindings();
-    for (key, action) in &global_bindings {
-        if y_offset >= inner.height {
-            break;
-        }
-        render_keybinding_line_themed(
-            key,
-            action,
-            Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
-            key_col,
-            &tp,
-            frame,
-        );
-        y_offset += 1;
-    }
-
-    // Screen-specific section
-    if !screen_bindings.is_empty() && y_offset < inner.height {
-        // Blank separator
-        y_offset += 1;
-
-        let meta = screen_meta(active);
-        if y_offset < inner.height {
-            let header = Paragraph::new(meta.title).style(
-                Style::default()
-                    .fg(tp.help_category_fg)
-                    .bg(tp.help_bg)
-                    .bold(),
-            );
-            header.render(
-                Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
-                frame,
-            );
-            y_offset += 1;
-        }
-
-        for entry in screen_bindings {
-            if y_offset >= inner.height {
-                break;
-            }
-            render_keybinding_line_themed(
-                entry.key,
-                entry.action,
-                Rect::new(inner.x + 1, inner.y + y_offset, col_width, 1),
-                key_col,
-                &tp,
-                frame,
-            );
-            y_offset += 1;
-        }
-    }
-}
-
 /// Render the help overlay from structured `HelpSection`s (profile-aware).
 ///
 /// This version displays the profile name in the title and supports
@@ -1311,25 +1193,36 @@ mod tests {
     }
 
     #[test]
-    fn global_keybindings_complete() {
-        let bindings = global_keybindings();
-        assert!(bindings.len() >= 5);
-        for (key, action) in &bindings {
-            assert!(!key.is_empty(), "empty key in global keybindings");
-            assert!(!action.is_empty(), "empty action in global keybindings");
+    fn global_bindings_registry_complete() {
+        use crate::tui_keymap::GLOBAL_BINDINGS;
+        assert!(
+            GLOBAL_BINDINGS.len() >= 5,
+            "GLOBAL_BINDINGS should have >= 5 entries, got {}",
+            GLOBAL_BINDINGS.len()
+        );
+        for b in GLOBAL_BINDINGS {
+            assert!(!b.label.is_empty(), "empty label in GLOBAL_BINDINGS");
+            assert!(!b.action.is_empty(), "empty action in GLOBAL_BINDINGS");
         }
     }
 
     #[test]
-    fn global_keybindings_jump_key_matches_registry() {
-        let bindings = global_keybindings();
-        let jump_entry = &bindings[0];
-        assert_eq!(jump_entry.1, "Jump to screen");
-        // The jump key legend must include all screen jump keys.
-        let legend = &jump_entry.0;
+    fn global_bindings_jump_key_matches_registry() {
+        use crate::tui_keymap::GLOBAL_BINDINGS;
+        let jump = GLOBAL_BINDINGS
+            .iter()
+            .find(|b| b.action == "Jump to screen")
+            .expect("GLOBAL_BINDINGS should contain 'Jump to screen'");
+        let legend = crate::tui_screens::jump_key_legend();
         assert!(
             legend.contains("1-9"),
             "jump key legend should contain '1-9', got: {legend}"
+        );
+        // The binding label is a static placeholder; the legend is generated
+        // dynamically from the screen registry (auto-synchronized).
+        assert!(
+            !jump.label.is_empty(),
+            "jump binding label should not be empty"
         );
         // With 14 screens, we expect shifted symbols for screens 11-14.
         let screen_count = crate::tui_screens::ALL_SCREEN_IDS.len();
@@ -1339,6 +1232,30 @@ mod tests {
                 "with {screen_count} screens, legend should contain '!' for screen 11, got: {legend}"
             );
         }
+    }
+
+    #[test]
+    fn help_entries_synchronized_with_global_bindings() {
+        use crate::tui_keymap::{GLOBAL_BINDINGS, KeymapRegistry, KeymapProfile};
+        let registry = KeymapRegistry::new(KeymapProfile::Default);
+        let entries = registry.help_entries();
+        // Every GLOBAL_BINDINGS action should appear in help_entries output
+        // (jump action gets a dynamic suffix so use `contains`).
+        for b in GLOBAL_BINDINGS {
+            let found = entries.iter().any(|(_, action)| action.contains(b.action));
+            assert!(
+                found,
+                "GLOBAL_BINDINGS action '{}' missing from help_entries()",
+                b.action
+            );
+        }
+        // help_entries should produce at least as many entries as GLOBAL_BINDINGS.
+        assert!(
+            entries.len() >= GLOBAL_BINDINGS.len(),
+            "help_entries() has {} entries but GLOBAL_BINDINGS has {}",
+            entries.len(),
+            GLOBAL_BINDINGS.len()
+        );
     }
 
     #[test]
