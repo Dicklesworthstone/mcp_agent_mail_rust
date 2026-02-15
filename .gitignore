@@ -85,3 +85,8 @@ SilverFox:
 
 # CASS session mining output
 LIST_OF_INPUT_MESSAGES.md
+
+# Ephemeral files (agent-generated, build artifacts, test detritus)
+ci-artifacts/
+proptest-regressions/
+test_meminfo
