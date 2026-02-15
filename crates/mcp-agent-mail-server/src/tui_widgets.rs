@@ -23,13 +23,14 @@ use std::cell::RefCell;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::Widget;
 use ftui::{Cell, Frame, PackedRgba, Style};
 use ftui_extras::charts::heatmap_gradient;
 use ftui_widgets::progress::ProgressBar;
 use ftui_widgets::sparkline::Sparkline;
+use ftui_widgets::tree::TreeNode;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // WidgetState — loading / empty / error / ready state envelope
@@ -339,12 +340,12 @@ impl Widget for HeatmapGrid<'_> {
                         .unwrap_or(0)
                         .saturating_add(1)
                 }) as u16;
-                let effective_label_width =
-                    if label_width > 0 && label_width * 10 > inner.width * 4 {
-                        0
-                    } else {
-                        label_width
-                    };
+                let effective_label_width = if label_width > 0 && label_width * 10 > inner.width * 4
+                {
+                    0
+                } else {
+                    label_width
+                };
                 let data_w = inner.width.saturating_sub(effective_label_width);
                 #[allow(clippy::cast_possible_truncation)]
                 let cell_w = if max_cols > 0 {
@@ -2062,9 +2063,9 @@ impl<'a> TransparencyWidget<'a> {
         entry: &mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry,
     ) -> PackedRgba {
         match entry.correct {
-            Some(true) => PackedRgba::rgb(80, 200, 80),   // green
-            Some(false) => PackedRgba::rgb(220, 60, 60),   // red
-            None => PackedRgba::rgb(220, 200, 60),         // yellow
+            Some(true) => PackedRgba::rgb(80, 200, 80),  // green
+            Some(false) => PackedRgba::rgb(220, 60, 60), // red
+            None => PackedRgba::rgb(220, 200, 60),       // yellow
         }
     }
 
@@ -2203,8 +2204,10 @@ impl<'a> TransparencyWidget<'a> {
                 .map(|e| e.confidence)
                 .collect();
             if !conf_values.is_empty() {
-                let spark_str =
-                    Sparkline::new(&conf_values).min(0.0).max(1.0).render_to_string();
+                let spark_str = Sparkline::new(&conf_values)
+                    .min(0.0)
+                    .max(1.0)
+                    .render_to_string();
                 for (j, ch) in spark_str.chars().enumerate() {
                     #[allow(clippy::cast_possible_truncation)]
                     let x = inner.x + j as u16;
@@ -2543,6 +2546,115 @@ pub fn truncate_at_word_boundary(body: &str, max_chars: usize) -> String {
 
     // No good word boundary found — hard truncate.
     format!("{truncated}…")
+}
+
+/// Tree adapter item for thread messages.
+///
+/// This is intentionally lightweight: it carries only the fields needed to
+/// render a thread hierarchy row and recursively nests children by reply
+/// relationship.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadTreeItem {
+    pub message_id: i64,
+    pub sender: String,
+    pub subject_snippet: String,
+    pub relative_time: String,
+    pub is_unread: bool,
+    pub is_ack_required: bool,
+    pub children: Vec<ThreadTreeItem>,
+}
+
+impl ThreadTreeItem {
+    #[must_use]
+    pub fn new(
+        message_id: i64,
+        sender: String,
+        subject_snippet: String,
+        relative_time: String,
+        is_unread: bool,
+        is_ack_required: bool,
+    ) -> Self {
+        Self {
+            message_id,
+            sender,
+            subject_snippet,
+            relative_time,
+            is_unread,
+            is_ack_required,
+            children: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_children(mut self, children: Vec<ThreadTreeItem>) -> Self {
+        self.children = children;
+        self
+    }
+
+    #[must_use]
+    pub fn render_plain_label(&self, is_expanded: bool) -> String {
+        let glyph = if self.children.is_empty() {
+            "•"
+        } else if is_expanded {
+            "▼"
+        } else {
+            "▶"
+        };
+        let unread_prefix = if self.is_unread { "*" } else { "" };
+        let ack_suffix = if self.is_ack_required { " [ACK]" } else { "" };
+        format!(
+            "{glyph} {unread_prefix}{}: {} [{}]{ack_suffix}",
+            self.sender, self.subject_snippet, self.relative_time
+        )
+    }
+
+    #[must_use]
+    pub fn render_line(&self, is_selected: bool, is_expanded: bool) -> Line {
+        let selection_prefix = if is_selected { "> " } else { "  " };
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(selection_prefix.to_string())];
+
+        let glyph = if self.children.is_empty() {
+            "•"
+        } else if is_expanded {
+            "▼"
+        } else {
+            "▶"
+        };
+        spans.push(Span::styled(
+            format!("{glyph} "),
+            Style::new().fg(PackedRgba::rgb(170, 170, 180)),
+        ));
+
+        let sender_style = if self.is_unread {
+            Style::new().fg(PackedRgba::rgb(235, 235, 245)).bold()
+        } else {
+            Style::new().fg(PackedRgba::rgb(210, 210, 220))
+        };
+        spans.push(Span::styled(self.sender.clone(), sender_style));
+        spans.push(Span::raw(": ".to_string()));
+        spans.push(Span::raw(self.subject_snippet.clone()));
+        spans.push(Span::styled(
+            format!(" [{}]", self.relative_time),
+            Style::new().fg(PackedRgba::rgb(140, 140, 150)).dim(),
+        ));
+        if self.is_ack_required {
+            spans.push(Span::styled(
+                " [ACK]".to_string(),
+                Style::new().fg(PackedRgba::rgb(255, 185, 100)).bold(),
+            ));
+        }
+        Line::from_spans(spans)
+    }
+
+    #[must_use]
+    pub fn to_tree_node(&self, is_expanded: bool) -> TreeNode {
+        let children = self
+            .children
+            .iter()
+            .map(|child| child.to_tree_node(false))
+            .collect::<Vec<_>>();
+        TreeNode::new(self.render_plain_label(is_expanded)).with_children(children)
+    }
 }
 
 /// Expandable message card widget for thread conversation view.
@@ -3844,9 +3956,9 @@ impl Widget for EvidenceLedgerWidget<'_> {
             let conf_str = format!("{:.2}", entry.confidence);
 
             let (status_char, status_color) = match entry.correct {
-                Some(true) => ("\u{2713}", self.color_correct),   // checkmark
+                Some(true) => ("\u{2713}", self.color_correct), // checkmark
                 Some(false) => ("\u{2717}", self.color_incorrect), // cross
-                None => ("\u{2500}", self.color_pending),          // dash
+                None => ("\u{2500}", self.color_pending),       // dash
             };
 
             lines.push(Line::from_spans(vec![
@@ -3881,8 +3993,8 @@ impl Widget for EvidenceLedgerWidget<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ftui::GraphemePool;
     use ftui::layout::Rect;
+    use ftui::GraphemePool;
 
     fn render_widget(widget: &impl Widget, width: u16, height: u16) -> String {
         let mut pool = GraphemePool::new();
@@ -5251,6 +5363,82 @@ mod tests {
         render_perf(&widget, 80, 20, 500, 500);
     }
 
+    #[test]
+    fn thread_tree_item_plain_label_includes_metadata_and_ack_badge() {
+        let item = ThreadTreeItem::new(
+            42,
+            "GoldHawk".to_string(),
+            "Start implementation".to_string(),
+            "2m ago".to_string(),
+            true,
+            true,
+        );
+        let label = item.render_plain_label(false);
+        assert!(label.contains("GoldHawk"));
+        assert!(label.contains("Start implementation"));
+        assert!(label.contains("[2m ago]"));
+        assert!(label.contains("[ACK]"));
+        assert!(label.contains('*'));
+    }
+
+    #[test]
+    fn thread_tree_item_render_line_styles_unread_and_ack() {
+        use ftui::style::StyleFlags;
+
+        let item = ThreadTreeItem::new(
+            7,
+            "AmberPine".to_string(),
+            "Follow-up".to_string(),
+            "just now".to_string(),
+            true,
+            true,
+        );
+        let line = item.render_line(true, false);
+        let text = line.to_plain_text();
+        assert!(text.contains("AmberPine"));
+        assert!(text.contains("Follow-up"));
+        assert!(text.contains("[ACK]"));
+
+        let sender_span = line
+            .spans()
+            .iter()
+            .find(|span| span.content.contains("AmberPine"))
+            .expect("sender span present");
+        assert!(
+            sender_span
+                .style
+                .unwrap_or_default()
+                .has_attr(StyleFlags::BOLD),
+            "unread sender should render bold"
+        );
+    }
+
+    #[test]
+    fn thread_tree_item_to_tree_node_keeps_children() {
+        let child = ThreadTreeItem::new(
+            2,
+            "SilverRoot".to_string(),
+            "child".to_string(),
+            "1m".to_string(),
+            false,
+            false,
+        );
+        let root = ThreadTreeItem::new(
+            1,
+            "BlueRoot".to_string(),
+            "root".to_string(),
+            "2m".to_string(),
+            false,
+            false,
+        )
+        .with_children(vec![child]);
+
+        let node = root.to_tree_node(true);
+        assert!(node.label().contains("BlueRoot"));
+        assert_eq!(node.children().len(), 1);
+        assert!(node.children()[0].label().contains("SilverRoot"));
+    }
+
     // ─── ChartDataProvider tests ──────────────────────────────────────
 
     use crate::tui_events::{DbStatSnapshot, EventRingBuffer, EventSource, MailEvent};
@@ -6201,19 +6389,34 @@ mod tests {
         let output = render_widget(&widget, 80, 10);
         // Should contain header
         assert!(output.contains("Seq"), "missing Seq header");
-        assert!(output.contains("Decision Point"), "missing Decision Point header");
+        assert!(
+            output.contains("Decision Point"),
+            "missing Decision Point header"
+        );
         assert!(output.contains("Action"), "missing Action header");
         assert!(output.contains("Conf"), "missing Conf header");
         // Should contain entry data
-        assert!(output.contains("cache.eviction"), "missing cache.eviction entry");
+        assert!(
+            output.contains("cache.eviction"),
+            "missing cache.eviction entry"
+        );
         assert!(output.contains("evict"), "missing evict action");
         assert!(output.contains("0.90"), "missing confidence value");
         // Should contain checkmark for correct=true
-        assert!(output.contains('\u{2713}'), "missing checkmark for correct entry");
+        assert!(
+            output.contains('\u{2713}'),
+            "missing checkmark for correct entry"
+        );
         // Should contain cross for correct=false
-        assert!(output.contains('\u{2717}'), "missing cross for incorrect entry");
+        assert!(
+            output.contains('\u{2717}'),
+            "missing cross for incorrect entry"
+        );
         // Should contain dash for pending
-        assert!(output.contains('\u{2500}'), "missing dash for pending entry");
+        assert!(
+            output.contains('\u{2500}'),
+            "missing dash for pending entry"
+        );
     }
 
     /// Empty ledger renders "No evidence entries" message.
@@ -6263,7 +6466,10 @@ mod tests {
         let output = render_widget(&widget, 80, 20);
         // With max_visible=2, should show header + 1 data row (2 total lines)
         assert!(output.contains("Seq"), "header should be present");
-        assert!(output.contains("cache.eviction"), "first entry should be present");
+        assert!(
+            output.contains("cache.eviction"),
+            "first entry should be present"
+        );
         // Third entry should NOT be present due to max_visible=2
         assert!(
             !output.contains("coalesce.outcome"),
@@ -6288,7 +6494,10 @@ mod tests {
 
         // Layout should have been computed exactly once.
         let cache = widget.layout_cache();
-        assert_eq!(cache.compute_count, 1, "stable frames should compute layout once");
+        assert_eq!(
+            cache.compute_count, 1,
+            "stable frames should compute layout once"
+        );
     }
 
     #[test]
@@ -6315,7 +6524,11 @@ mod tests {
         let widget2 = HeatmapGrid::new(&data3).data_generation(1);
         let mut frame = Frame::new(30, 5, &mut pool);
         widget2.render(area, &mut frame);
-        assert_eq!(widget2.layout_cache().compute_count, 1, "new widget always computes once");
+        assert_eq!(
+            widget2.layout_cache().compute_count,
+            1,
+            "new widget always computes once"
+        );
     }
 
     #[test]
@@ -6332,12 +6545,20 @@ mod tests {
         // Render at 30x8 — area changed, should recompute.
         let mut frame = Frame::new(30, 8, &mut pool);
         widget.render(Rect::new(0, 0, 30, 8), &mut frame);
-        assert_eq!(widget.layout_cache().compute_count, 2, "resize should trigger recompute");
+        assert_eq!(
+            widget.layout_cache().compute_count,
+            2,
+            "resize should trigger recompute"
+        );
 
         // Render at 30x8 again — no change.
         let mut frame = Frame::new(30, 8, &mut pool);
         widget.render(Rect::new(0, 0, 30, 8), &mut frame);
-        assert_eq!(widget.layout_cache().compute_count, 2, "same area should not recompute");
+        assert_eq!(
+            widget.layout_cache().compute_count,
+            2,
+            "same area should not recompute"
+        );
     }
 
     #[test]
@@ -6381,7 +6602,10 @@ mod tests {
         // Second render with same area: cache hit, should NOT recompute.
         let mut frame = Frame::new(10, 5, &mut pool);
         render_focus_ring_cached(area, &mut frame, &a11y, Some(&mut cache));
-        assert_eq!(cache.compute_count, 1, "same area should reuse cached cells");
+        assert_eq!(
+            cache.compute_count, 1,
+            "same area should reuse cached cells"
+        );
         assert_eq!(cache.cells.len(), cell_count_1);
 
         // Third render with different area: cache miss, should recompute.
@@ -6673,13 +6897,25 @@ mod tests {
 
         // Check that badge cells have the expected colors.
         let cell0 = frame.buffer.get(0, 0).unwrap();
-        assert_eq!(cell0.fg, PackedRgba::rgb(80, 200, 80), "entry 0: correct=true -> green");
+        assert_eq!(
+            cell0.fg,
+            PackedRgba::rgb(80, 200, 80),
+            "entry 0: correct=true -> green"
+        );
 
         let cell1 = frame.buffer.get(2, 0).unwrap();
-        assert_eq!(cell1.fg, PackedRgba::rgb(220, 60, 60), "entry 1: correct=false -> red");
+        assert_eq!(
+            cell1.fg,
+            PackedRgba::rgb(220, 60, 60),
+            "entry 1: correct=false -> red"
+        );
 
         let cell2 = frame.buffer.get(4, 0).unwrap();
-        assert_eq!(cell2.fg, PackedRgba::rgb(220, 200, 60), "entry 2: correct=None -> yellow");
+        assert_eq!(
+            cell2.fg,
+            PackedRgba::rgb(220, 200, 60),
+            "entry 2: correct=None -> yellow"
+        );
     }
 
     /// 2. Render L1 summary, verify summary text matches expected format.
@@ -6710,12 +6946,21 @@ mod tests {
         let widget = TransparencyWidget::new(&entries).level(DisclosureLevel::Detail);
         let out = render_widget(&widget, 60, 30);
 
-        assert!(out.contains("decision_point: tui.diff_strategy"), "missing decision_point");
+        assert!(
+            out.contains("decision_point: tui.diff_strategy"),
+            "missing decision_point"
+        );
         assert!(out.contains("action: incremental"), "missing action");
         assert!(out.contains("confidence: 0.85"), "missing confidence");
         assert!(out.contains("decision_id: d1"), "missing decision_id");
-        assert!(out.contains("action: promote"), "missing second entry action");
-        assert!(out.contains("cache.eviction"), "missing second decision_point");
+        assert!(
+            out.contains("action: promote"),
+            "missing second entry action"
+        );
+        assert!(
+            out.contains("cache.eviction"),
+            "missing second decision_point"
+        );
     }
 
     /// 4. Render L3 deep-dive, verify sparkline data rendered.
@@ -6790,12 +7035,20 @@ mod tests {
         for _ in 0..4 {
             level = level.next();
         }
-        assert_eq!(level, DisclosureLevel::Badge, "4 next() should cycle back to Badge");
+        assert_eq!(
+            level,
+            DisclosureLevel::Badge,
+            "4 next() should cycle back to Badge"
+        );
 
         let mut level = DisclosureLevel::Badge;
         for _ in 0..4 {
             level = level.prev();
         }
-        assert_eq!(level, DisclosureLevel::Badge, "4 prev() should cycle back to Badge");
+        assert_eq!(
+            level,
+            DisclosureLevel::Badge,
+            "4 prev() should cycle back to Badge"
+        );
     }
 }

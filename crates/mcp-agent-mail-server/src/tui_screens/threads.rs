@@ -5,21 +5,21 @@
 //! and a conversation detail panel on the right showing chronological messages
 //! within the selected thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
-use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::Widget;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
+use mcp_agent_mail_db::DbConn;
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -85,7 +85,11 @@ fn agent_color(name: &str) -> PackedRgba {
 }
 
 fn iso_compact_time(iso: &str) -> &str {
-    if iso.len() >= 19 { &iso[11..19] } else { iso }
+    if iso.len() >= 19 {
+        &iso[11..19]
+    } else {
+        iso
+    }
 }
 
 fn body_preview(body_md: &str, max_len: usize) -> String {
@@ -203,6 +207,7 @@ impl SortMode {
 #[derive(Debug, Clone)]
 struct ThreadMessage {
     id: i64,
+    reply_to_id: Option<i64>,
     from_agent: String,
     to_agents: String,
     subject: String,
@@ -212,6 +217,8 @@ struct ThreadMessage {
     #[allow(dead_code)]
     timestamp_micros: i64,
     importance: String,
+    is_unread: bool,
+    ack_required: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1113,6 +1120,7 @@ fn fetch_thread_messages_paginated(
                     let created_ts = row.get_named::<i64>("created_ts").ok()?;
                     Some(ThreadMessage {
                         id: row.get_named::<i64>("id").ok()?,
+                        reply_to_id: None,
                         from_agent: row
                             .get_named::<String>("sender_name")
                             .ok()
@@ -1129,6 +1137,8 @@ fn fetch_thread_messages_paginated(
                             .get_named::<String>("importance")
                             .ok()
                             .unwrap_or_else(|| "normal".to_string()),
+                        is_unread: false,
+                        ack_required: false,
                     })
                 })
                 .collect()
@@ -1216,7 +1226,11 @@ fn render_thread_list(
         let abs_idx = start + view_idx;
         let marker = if abs_idx == cursor_clamped { '>' } else { ' ' };
         let esc_badge = if thread.has_escalation {
-            if urgent_pulse_on { "!" } else { "·" }
+            if urgent_pulse_on {
+                "!"
+            } else {
+                "·"
+            }
         } else {
             " "
         };
@@ -1339,6 +1353,10 @@ fn render_thread_detail(
         p.render(inner, frame);
         return;
     }
+
+    // Build hierarchical metadata once so tree integration can consume the
+    // same structure without re-linking reply chains.
+    let _tree_items = build_thread_tree_items(messages);
 
     let body_width = inner.width as usize;
     let md_theme = ftui_extras::markdown::MarkdownTheme::default();
@@ -1478,6 +1496,90 @@ fn viewport_range(total: usize, height: usize, cursor: usize) -> (usize, usize) 
     let start = ideal_start.min(total - height);
     let end = (start + height).min(total);
     (start, end)
+}
+
+fn build_thread_tree_items(messages: &[ThreadMessage]) -> Vec<crate::tui_widgets::ThreadTreeItem> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let message_by_id: HashMap<i64, &ThreadMessage> = messages.iter().map(|m| (m.id, m)).collect();
+
+    let mut children_by_parent: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
+    for message in messages {
+        let parent_id = message
+            .reply_to_id
+            .filter(|candidate| message_by_id.contains_key(candidate));
+        children_by_parent
+            .entry(parent_id)
+            .or_default()
+            .push(message.id);
+    }
+
+    for ids in children_by_parent.values_mut() {
+        ids.sort_by_key(|id| {
+            message_by_id.get(id).map_or((i64::MAX, *id), |message| {
+                (message.timestamp_micros, message.id)
+            })
+        });
+    }
+
+    let mut recursion_stack = HashSet::new();
+    children_by_parent
+        .get(&None)
+        .map_or_else(Vec::new, |roots| {
+            roots
+                .iter()
+                .filter_map(|id| {
+                    build_thread_tree_item_node(
+                        *id,
+                        &message_by_id,
+                        &children_by_parent,
+                        &mut recursion_stack,
+                    )
+                })
+                .collect()
+        })
+}
+
+fn build_thread_tree_item_node(
+    message_id: i64,
+    message_by_id: &HashMap<i64, &ThreadMessage>,
+    children_by_parent: &HashMap<Option<i64>, Vec<i64>>,
+    recursion_stack: &mut HashSet<i64>,
+) -> Option<crate::tui_widgets::ThreadTreeItem> {
+    if !recursion_stack.insert(message_id) {
+        return None;
+    }
+
+    let message = *message_by_id.get(&message_id)?;
+    let mut node = crate::tui_widgets::ThreadTreeItem::new(
+        message.id,
+        message.from_agent.clone(),
+        truncate_str(&message.subject, 60),
+        iso_compact_time(&message.timestamp_iso).to_string(),
+        message.is_unread,
+        message.ack_required,
+    );
+
+    node.children = children_by_parent
+        .get(&Some(message_id))
+        .map_or_else(Vec::new, |children| {
+            children
+                .iter()
+                .filter_map(|child_id| {
+                    build_thread_tree_item_node(
+                        *child_id,
+                        message_by_id,
+                        children_by_parent,
+                        recursion_stack,
+                    )
+                })
+                .collect()
+        });
+
+    recursion_stack.remove(&message_id);
+    Some(node)
 }
 
 /// Truncate a string to at most `max_len` characters, adding "..." if truncated.
@@ -2036,6 +2138,72 @@ mod tests {
     }
 
     #[test]
+    fn thread_tree_builder_nests_reply_chains_and_sorts_children() {
+        let mut root = make_message(10);
+        root.subject = "root".to_string();
+        root.timestamp_micros = 10;
+        root.timestamp_iso = "2026-02-06T12:00:10Z".to_string();
+
+        let mut child_newer = make_message(12);
+        child_newer.reply_to_id = Some(10);
+        child_newer.subject = "child-newer".to_string();
+        child_newer.timestamp_micros = 12;
+        child_newer.timestamp_iso = "2026-02-06T12:00:12Z".to_string();
+
+        let mut child_older = make_message(11);
+        child_older.reply_to_id = Some(10);
+        child_older.subject = "child-older".to_string();
+        child_older.timestamp_micros = 11;
+        child_older.timestamp_iso = "2026-02-06T12:00:11Z".to_string();
+        child_older.ack_required = true;
+        child_older.is_unread = true;
+
+        let tree = build_thread_tree_items(&[child_newer, root, child_older]);
+        assert_eq!(tree.len(), 1, "expected a single root node");
+        assert_eq!(tree[0].message_id, 10);
+        assert_eq!(tree[0].children.len(), 2);
+        assert_eq!(tree[0].children[0].message_id, 11);
+        assert_eq!(tree[0].children[1].message_id, 12);
+        assert!(tree[0].children[0].is_unread);
+        assert!(tree[0].children[0].is_ack_required);
+    }
+
+    #[test]
+    fn thread_tree_builder_sorts_roots_chronologically() {
+        let mut first = make_message(1);
+        first.timestamp_micros = 100;
+        first.timestamp_iso = "2026-02-06T12:00:00Z".to_string();
+        first.subject = "first".to_string();
+
+        let mut second = make_message(2);
+        second.timestamp_micros = 300;
+        second.timestamp_iso = "2026-02-06T12:00:03Z".to_string();
+        second.subject = "second".to_string();
+
+        let mut third = make_message(3);
+        third.timestamp_micros = 200;
+        third.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
+        third.subject = "third".to_string();
+
+        let roots = build_thread_tree_items(&[second, first, third]);
+        let root_ids: Vec<i64> = roots.into_iter().map(|item| item.message_id).collect();
+        assert_eq!(root_ids, vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn thread_tree_builder_promotes_orphan_reply_to_root() {
+        let mut orphan = make_message(20);
+        orphan.reply_to_id = Some(9999);
+        orphan.subject = "orphan".to_string();
+        orphan.timestamp_micros = 500;
+        orphan.timestamp_iso = "2026-02-06T12:00:05Z".to_string();
+
+        let roots = build_thread_tree_items(&[orphan]);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].message_id, 20);
+    }
+
+    #[test]
     fn parse_thread_page_size_honors_valid_override() {
         assert_eq!(parse_thread_page_size(Some("7")), 7);
         assert_eq!(parse_thread_page_size(Some(" 42 ")), 42);
@@ -2313,6 +2481,7 @@ mod tests {
     fn make_message(id: i64) -> ThreadMessage {
         ThreadMessage {
             id,
+            reply_to_id: None,
             from_agent: "GoldFox".to_string(),
             to_agents: "SilverWolf".to_string(),
             subject: format!("Message #{id}"),
@@ -2320,6 +2489,8 @@ mod tests {
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
             timestamp_micros: 1_700_000_000_000_000 + id * 1_000_000,
             importance: if id % 3 == 0 { "high" } else { "normal" }.to_string(),
+            is_unread: false,
+            ack_required: false,
         }
     }
 

@@ -4,8 +4,35 @@
 //! auto-detection: if text looks like markdown it's rendered with full
 //! styling, otherwise it's displayed as plain text.
 
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
+use ammonia::Builder;
 use ftui::text::Text;
 pub use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown};
+
+/// Sanitizer for hostile inline HTML embedded in markdown message bodies.
+///
+/// This keeps markdown syntax intact while stripping dangerous HTML/script
+/// payloads and disallowed URL schemes before terminal rendering.
+static TERMINAL_MARKDOWN_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
+    let mut builder = Builder::new();
+    builder.clean_content_tags(["script", "style"].into_iter().collect::<HashSet<_>>());
+    builder.url_schemes(
+        ["http", "https", "mailto", "data"]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+    );
+    builder
+});
+
+#[must_use]
+fn sanitize_body(body: &str) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    TERMINAL_MARKDOWN_SANITIZER.clean(body).to_string()
+}
 
 /// Render a message body with auto-detected markdown support.
 ///
@@ -16,7 +43,8 @@ pub use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markd
 #[must_use]
 pub fn render_body(body: &str, theme: &MarkdownTheme) -> Text {
     let renderer = MarkdownRenderer::new(theme.clone());
-    renderer.auto_render(body)
+    let sanitized = sanitize_body(body);
+    renderer.auto_render(&sanitized)
 }
 
 /// Render a potentially incomplete/streaming message body.
@@ -26,7 +54,8 @@ pub fn render_body(body: &str, theme: &MarkdownTheme) -> Text {
 #[must_use]
 pub fn render_body_streaming(body: &str, theme: &MarkdownTheme) -> Text {
     let renderer = MarkdownRenderer::new(theme.clone());
-    renderer.auto_render_streaming(body)
+    let sanitized = sanitize_body(body);
+    renderer.auto_render_streaming(&sanitized)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -185,6 +214,31 @@ mod tests {
     }
 
     #[test]
+    fn code_fence_priority_languages_render_content() {
+        let cases = [
+            ("json", "{ \"ok\": true, \"count\": 7 }", "count"),
+            ("python", "def greet(name):\n    return name", "greet"),
+            ("rust", "fn main() { println!(\"hi\"); }", "main"),
+            ("javascript", "function hi() { return 1; }", "function"),
+            ("bash", "echo hello-world", "hello-world"),
+        ];
+
+        for (lang, code, needle) in cases {
+            let md = format!("```{lang}\n{code}\n```");
+            let text = render_body(&md, &theme());
+            let rendered = text_to_string(&text);
+            assert!(
+                rendered.contains(needle),
+                "rendered output for {lang} should preserve {needle}"
+            );
+            assert!(
+                text.height() >= 1,
+                "rendered output for {lang} should not be empty"
+            );
+        }
+    }
+
+    #[test]
     fn gfm_table_multirow_renders() {
         let md = "\
 | Name | Age | City |
@@ -270,18 +324,45 @@ Thanks!";
         assert!(text.height() >= 3);
     }
 
+    #[test]
+    fn sanitize_body_strips_script_and_style_tags() {
+        let dirty = "<script>alert('xss')</script><style>body{color:red}</style>ok";
+        let cleaned = sanitize_body(dirty);
+        assert!(!cleaned.to_lowercase().contains("<script"));
+        assert!(!cleaned.to_lowercase().contains("<style"));
+        assert!(cleaned.contains("ok"));
+    }
+
+    #[test]
+    fn sanitize_body_blocks_javascript_urls() {
+        let dirty = "<a href=\"javascript:alert(1)\">click</a>";
+        let cleaned = sanitize_body(dirty);
+        assert!(!cleaned.to_lowercase().contains("javascript:"));
+    }
+
+    #[test]
+    fn sanitize_body_preserves_markdown_syntax() {
+        let md = "# Title\n\n**bold** `code`";
+        let cleaned = sanitize_body(md);
+        assert!(cleaned.contains("# Title"));
+        assert!(cleaned.contains("**bold**"));
+        assert!(cleaned.contains("`code`"));
+    }
+
     // ── Security / hostile markdown tests ─────────────────────────
 
     #[test]
     fn hostile_script_tag_safe_in_terminal() {
-        // In terminal context, HTML tags render as literal text (no DOM execution).
-        // Verify content renders without panic and script is not hidden.
+        // Scripts should be stripped by ammonia before terminal rendering.
         let md = "Hello <script>alert('xss')</script> world";
         let text = render_body(md, &theme());
         let rendered = text_to_string(&text);
-        // Content should be visible (not silently swallowed)
         assert!(rendered.contains("Hello"), "surrounding text preserved");
         assert!(rendered.contains("world"), "surrounding text preserved");
+        assert!(
+            !rendered.to_lowercase().contains("script"),
+            "script tag should be removed"
+        );
         assert!(text.height() >= 1, "renders without panic");
     }
 

@@ -10,12 +10,14 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::Widget;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui::{
+    Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, PackedRgba, Style,
+};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 use ftui_widgets::StatefulWidget;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
@@ -30,6 +32,7 @@ use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 use mcp_agent_mail_db::{parse_query_assistance, DbConn, QueryAssistance};
 
 use crate::tui_bridge::TuiSharedState;
+use crate::tui_layout::DockLayout;
 use crate::tui_markdown;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
@@ -40,8 +43,8 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 /// Max results to display.
 const MAX_RESULTS: usize = 200;
 
-/// Debounce delay in ticks (~100ms each, so 3 ticks = ~300ms).
-const DEBOUNCE_TICKS: u8 = 1;
+/// Debounce delay in ticks. Zero means immediate search-as-you-type.
+const DEBOUNCE_TICKS: u8 = 0;
 
 /// Max chars for the message snippet shown in the detail pane.
 const MAX_SNIPPET_CHARS: usize = 180;
@@ -656,6 +659,12 @@ enum Focus {
     ResultList,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockDragState {
+    Idle,
+    Dragging,
+}
+
 /// Which facet is currently highlighted in the rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FacetSlot {
@@ -742,6 +751,20 @@ pub struct SearchCockpitScreen {
 
     /// `VirtualizedList` state for efficient rendering of search results.
     list_state: RefCell<VirtualizedListState>,
+    /// Resizable results/detail layout.
+    dock: DockLayout,
+    /// Current drag state while resizing split.
+    dock_drag: DockDragState,
+    /// Last rendered query bar area.
+    last_query_area: Cell<Rect>,
+    /// Last rendered facet area.
+    last_facet_area: Cell<Rect>,
+    /// Last rendered results area.
+    last_results_area: Cell<Rect>,
+    /// Last rendered detail area.
+    last_detail_area: Cell<Rect>,
+    /// Last split area (results + detail), used for border hit-testing.
+    last_split_area: Cell<Rect>,
 }
 
 impl SearchCockpitScreen {
@@ -779,6 +802,13 @@ impl SearchCockpitScreen {
             recipes_loaded: false,
             focused_synthetic: None,
             list_state: RefCell::new(VirtualizedListState::default()),
+            dock: DockLayout::right_40(),
+            dock_drag: DockDragState::Idle,
+            last_query_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_facet_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_split_area: Cell::new(Rect::new(0, 0, 0, 0)),
         }
     }
 
@@ -1110,6 +1140,84 @@ impl SearchCockpitScreen {
         self.debounce_remaining = 0;
     }
 
+    fn set_cursor_from_results_click(&mut self, y: u16) {
+        if self.results.is_empty() {
+            return;
+        }
+        let area = self.last_results_area.get();
+        let list_height = area.height.saturating_sub(2) as usize;
+        if list_height == 0 {
+            return;
+        }
+        let inner_top = area.y.saturating_add(1);
+        if y < inner_top {
+            return;
+        }
+        let row = usize::from(y.saturating_sub(inner_top));
+        let (start, end) = viewport_range(self.results.len(), list_height, self.cursor);
+        let idx = start.saturating_add(row);
+        if idx < end {
+            self.cursor = idx;
+            self.detail_scroll = 0;
+        }
+    }
+
+    fn set_active_facet_from_click(&mut self, y: u16) {
+        let area = self.last_facet_area.get();
+        if area.height <= 2 {
+            return;
+        }
+        let inner_top = area.y.saturating_add(1);
+        if y < inner_top {
+            return;
+        }
+        let row = usize::from(y.saturating_sub(inner_top));
+        self.active_facet = match row / 2 {
+            0 => FacetSlot::Scope,
+            1 => FacetSlot::DocKind,
+            2 => FacetSlot::Importance,
+            3 => FacetSlot::AckStatus,
+            4 => FacetSlot::SortOrder,
+            5 => FacetSlot::FieldScope,
+            _ => self.active_facet,
+        };
+    }
+
+    fn detail_visible(&self) -> bool {
+        let area = self.last_detail_area.get();
+        area.width > 0 && area.height > 0
+    }
+
+    fn detail_max_scroll(&self) -> usize {
+        let Some(entry) = self.results.get(self.cursor) else {
+            return 0;
+        };
+        let area = self.last_detail_area.get();
+        // Border (2) + action bar (1) are fixed; only content body scrolls.
+        // Fallback viewport for pre-render calls (unit tests or early key events).
+        let visible = if area.height <= 3 {
+            8
+        } else {
+            usize::from(area.height.saturating_sub(3))
+        };
+        let total = estimate_search_detail_lines(entry);
+        total.saturating_sub(visible)
+    }
+
+    fn scroll_detail_by(&mut self, delta: isize) {
+        let max = self.detail_max_scroll();
+        if delta.is_negative() {
+            self.detail_scroll = self
+                .detail_scroll
+                .saturating_sub(delta.unsigned_abs())
+                .min(max);
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            let add = delta as usize;
+            self.detail_scroll = self.detail_scroll.saturating_add(add).min(max);
+        }
+    }
+
     /// Load saved recipes and recent history from the DB (once).
     fn ensure_recipes_loaded(&mut self) {
         if self.recipes_loaded {
@@ -1381,248 +1489,298 @@ impl Default for SearchCockpitScreen {
 impl MailScreen for SearchCockpitScreen {
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                match self.focus {
-                    Focus::QueryBar => match key.code {
-                        // `?` is reserved for query syntax help while query bar is focused.
-                        KeyCode::Char('?') => {
-                            self.query_help_visible = true;
-                        }
-                        // If the query-help popup is open, any key dismisses it.
-                        // We consume the first key so dismissal is predictable.
-                        _ if self.query_help_visible => {
-                            self.query_help_visible = false;
+        match event {
+            Event::Mouse(mouse) => {
+                let split_area = self.last_split_area.get();
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if self.detail_visible()
+                            && self.dock.hit_test_border(split_area, mouse.x, mouse.y)
+                        {
+                            self.dock_drag = DockDragState::Dragging;
                             return Cmd::None;
                         }
-                        KeyCode::Enter => {
-                            self.search_dirty = true;
-                            self.debounce_remaining = 0;
-                            self.focus = Focus::ResultList;
-                            self.query_input.set_focused(false);
-                            self.history_cursor = None;
-                            self.query_help_visible = false;
+                        if point_in_rect(self.last_query_area.get(), mouse.x, mouse.y) {
+                            self.focus = Focus::QueryBar;
+                            self.query_input.set_focused(true);
+                            return Cmd::None;
                         }
-                        KeyCode::Escape => {
-                            self.focus = Focus::ResultList;
-                            self.query_input.set_focused(false);
-                            self.history_cursor = None;
-                            self.query_help_visible = false;
-                        }
-                        KeyCode::Tab => {
+                        if point_in_rect(self.last_facet_area.get(), mouse.x, mouse.y) {
                             self.focus = Focus::FacetRail;
                             self.query_input.set_focused(false);
-                            self.query_help_visible = false;
+                            self.set_active_facet_from_click(mouse.y);
+                            return Cmd::None;
                         }
-                        KeyCode::Up => {
-                            // Recall previous history entry
-                            if !self.query_history.is_empty() {
-                                let next = match self.history_cursor {
-                                    None => 0,
-                                    Some(c) => (c + 1).min(self.query_history.len() - 1),
-                                };
+                        if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y) {
+                            self.focus = Focus::ResultList;
+                            self.query_input.set_focused(false);
+                            self.set_cursor_from_results_click(mouse.y);
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
+                            self.focus = Focus::ResultList;
+                            self.query_input.set_focused(false);
+                            return Cmd::None;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if self.dock_drag == DockDragState::Dragging {
+                            self.dock.drag_to(split_area, mouse.x, mouse.y);
+                            return Cmd::None;
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        self.dock_drag = DockDragState::Idle;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
+                            self.scroll_detail_by(1);
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y)
+                            && !self.results.is_empty()
+                        {
+                            self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                            self.detail_scroll = 0;
+                            return Cmd::None;
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
+                            self.scroll_detail_by(-1);
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y) {
+                            self.cursor = self.cursor.saturating_sub(1);
+                            self.detail_scroll = 0;
+                            return Cmd::None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match self.focus {
+                Focus::QueryBar => match key.code {
+                    // `?` is reserved for query syntax help while query bar is focused.
+                    KeyCode::Char('?') => {
+                        self.query_help_visible = true;
+                    }
+                    // If the query-help popup is open, any key dismisses it.
+                    _ if self.query_help_visible => {
+                        self.query_help_visible = false;
+                        return Cmd::None;
+                    }
+                    KeyCode::Enter => {
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                        self.focus = Focus::ResultList;
+                        self.query_input.set_focused(false);
+                        self.history_cursor = None;
+                        self.query_help_visible = false;
+                    }
+                    KeyCode::Escape => {
+                        self.focus = Focus::ResultList;
+                        self.query_input.set_focused(false);
+                        self.history_cursor = None;
+                        self.query_help_visible = false;
+                    }
+                    KeyCode::Tab => {
+                        self.focus = Focus::FacetRail;
+                        self.query_input.set_focused(false);
+                        self.query_help_visible = false;
+                    }
+                    KeyCode::Up => {
+                        if !self.query_history.is_empty() {
+                            let next = match self.history_cursor {
+                                None => 0,
+                                Some(c) => (c + 1).min(self.query_history.len() - 1),
+                            };
+                            self.history_cursor = Some(next);
+                            self.query_input
+                                .set_value(&self.query_history[next].query_text);
+                            self.search_dirty = true;
+                            self.debounce_remaining = DEBOUNCE_TICKS;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(c) = self.history_cursor {
+                            if c == 0 {
+                                self.history_cursor = None;
+                                self.query_input.clear();
+                            } else {
+                                let next = c - 1;
                                 self.history_cursor = Some(next);
                                 self.query_input
                                     .set_value(&self.query_history[next].query_text);
-                                self.search_dirty = true;
-                                self.debounce_remaining = DEBOUNCE_TICKS;
-                            }
-                        }
-                        KeyCode::Down => {
-                            // Recall more recent history entry
-                            if let Some(c) = self.history_cursor {
-                                if c == 0 {
-                                    self.history_cursor = None;
-                                    self.query_input.clear();
-                                } else {
-                                    let next = c - 1;
-                                    self.history_cursor = Some(next);
-                                    self.query_input
-                                        .set_value(&self.query_history[next].query_text);
-                                }
-                                self.search_dirty = true;
-                                self.debounce_remaining = DEBOUNCE_TICKS;
-                            }
-                        }
-                        _ => {
-                            let before = self.query_input.value().to_string();
-                            self.query_input.handle_event(event);
-                            if self.query_input.value() != before {
-                                self.search_dirty = true;
-                                self.debounce_remaining = DEBOUNCE_TICKS;
-                                self.history_cursor = None;
-                            }
-                        }
-                    },
-
-                    Focus::FacetRail => match key.code {
-                        KeyCode::Escape | KeyCode::Char('q') | KeyCode::Tab => {
-                            self.focus = Focus::ResultList;
-                        }
-                        KeyCode::Char('/') => {
-                            self.focus = Focus::QueryBar;
-                            self.query_input.set_focused(true);
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            self.active_facet = self.active_facet.next();
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            self.active_facet = self.active_facet.prev();
-                        }
-                        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
-                            self.toggle_active_facet();
-                        }
-                        KeyCode::Left => {
-                            // Reverse toggle
-                            match self.active_facet {
-                                FacetSlot::Scope => {
-                                    self.scope_mode = self.scope_mode.next();
-                                }
-                                FacetSlot::DocKind => {
-                                    self.doc_kind_filter = self.doc_kind_filter.prev();
-                                }
-                                FacetSlot::Importance => {
-                                    // cycle backwards not worth adding, just use next
-                                    self.importance_filter = self.importance_filter.next();
-                                }
-                                FacetSlot::AckStatus => {
-                                    self.ack_filter = self.ack_filter.next();
-                                }
-                                FacetSlot::SortOrder => {
-                                    self.sort_direction = self.sort_direction.next();
-                                }
-                                FacetSlot::FieldScope => {
-                                    self.field_scope = self.field_scope.prev();
-                                }
                             }
                             self.search_dirty = true;
-                            self.debounce_remaining = 0;
-                        }
-                        KeyCode::Char('r') => {
-                            self.reset_facets();
-                        }
-                        _ => {}
-                    },
-
-                    Focus::ResultList => {
-                        match key.code {
-                            KeyCode::Char('/') => {
-                                self.focus = Focus::QueryBar;
-                                self.query_input.set_focused(true);
-                            }
-                            KeyCode::Tab | KeyCode::Char('f') => {
-                                self.focus = Focus::FacetRail;
-                            }
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                if !self.results.is_empty() {
-                                    self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                                    self.detail_scroll = 0;
-                                }
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                self.cursor = self.cursor.saturating_sub(1);
-                                self.detail_scroll = 0;
-                            }
-                            KeyCode::Char('G') | KeyCode::End => {
-                                if !self.results.is_empty() {
-                                    self.cursor = self.results.len() - 1;
-                                    self.detail_scroll = 0;
-                                }
-                            }
-                            KeyCode::Char('g') | KeyCode::Home => {
-                                self.cursor = 0;
-                                self.detail_scroll = 0;
-                            }
-                            KeyCode::Char('d') | KeyCode::PageDown => {
-                                if !self.results.is_empty() {
-                                    self.cursor = (self.cursor + 20).min(self.results.len() - 1);
-                                    self.detail_scroll = 0;
-                                }
-                            }
-                            KeyCode::Char('u') | KeyCode::PageUp => {
-                                self.cursor = self.cursor.saturating_sub(20);
-                                self.detail_scroll = 0;
-                            }
-                            KeyCode::Char('J') => {
-                                self.detail_scroll += 1;
-                            }
-                            KeyCode::Char('K') => {
-                                self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                            }
-                            // Deep-link: Enter on result
-                            KeyCode::Enter => {
-                                if let Some(entry) = self.results.get(self.cursor) {
-                                    return Cmd::msg(match entry.doc_kind {
-                                        DocKind::Message => MailScreenMsg::DeepLink(
-                                            DeepLinkTarget::MessageById(entry.id),
-                                        ),
-                                        DocKind::Agent => MailScreenMsg::DeepLink(
-                                            DeepLinkTarget::AgentByName(entry.title.clone()),
-                                        ),
-                                        DocKind::Project => MailScreenMsg::DeepLink(
-                                            DeepLinkTarget::ProjectBySlug(entry.title.clone()),
-                                        ),
-                                        DocKind::Thread => MailScreenMsg::DeepLink(
-                                            entry.thread_id.as_ref().map_or(
-                                                DeepLinkTarget::MessageById(entry.id),
-                                                |tid| DeepLinkTarget::ThreadById(tid.clone()),
-                                            ),
-                                        ),
-                                    });
-                                }
-                            }
-                            // Cycle doc kind from results
-                            KeyCode::Char('t') => {
-                                self.doc_kind_filter = self.doc_kind_filter.next();
-                                self.search_dirty = true;
-                                self.debounce_remaining = 0;
-                            }
-                            // Cycle importance from results
-                            KeyCode::Char('i') => {
-                                self.importance_filter = self.importance_filter.next();
-                                self.search_dirty = true;
-                                self.debounce_remaining = 0;
-                            }
-                            // Jump to thread (messages only)
-                            KeyCode::Char('o') => {
-                                if let Some(entry) = self.results.get(self.cursor) {
-                                    if let Some(ref tid) = entry.thread_id {
-                                        return Cmd::msg(MailScreenMsg::DeepLink(
-                                            DeepLinkTarget::ThreadById(tid.clone()),
-                                        ));
-                                    }
-                                }
-                            }
-                            // Jump to agent profile
-                            KeyCode::Char('a') => {
-                                if let Some(entry) = self.results.get(self.cursor) {
-                                    if let Some(ref agent) = entry.from_agent {
-                                        return Cmd::msg(MailScreenMsg::DeepLink(
-                                            DeepLinkTarget::AgentByName(agent.clone()),
-                                        ));
-                                    }
-                                }
-                            }
-                            // Jump to timeline at message time
-                            KeyCode::Char('T') => {
-                                if let Some(entry) = self.results.get(self.cursor) {
-                                    if let Some(ts) = entry.created_ts {
-                                        return Cmd::msg(MailScreenMsg::DeepLink(
-                                            DeepLinkTarget::TimelineAtTime(ts),
-                                        ));
-                                    }
-                                }
-                            }
-                            // Clear search
-                            KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
-                                self.query_input.clear();
-                                self.reset_facets();
-                            }
-                            _ => {}
+                            self.debounce_remaining = DEBOUNCE_TICKS;
                         }
                     }
-                }
-            }
+                    _ => {
+                        let before = self.query_input.value().to_string();
+                        self.query_input.handle_event(event);
+                        if self.query_input.value() != before {
+                            self.search_dirty = true;
+                            self.debounce_remaining = DEBOUNCE_TICKS;
+                            self.history_cursor = None;
+                        }
+                    }
+                },
+                Focus::FacetRail => match key.code {
+                    KeyCode::Escape | KeyCode::Char('q') | KeyCode::Tab => {
+                        self.focus = Focus::ResultList;
+                    }
+                    KeyCode::Char('/') => {
+                        self.focus = Focus::QueryBar;
+                        self.query_input.set_focused(true);
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.active_facet = self.active_facet.next();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.active_facet = self.active_facet.prev();
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                        self.toggle_active_facet();
+                    }
+                    KeyCode::Left => {
+                        match self.active_facet {
+                            FacetSlot::Scope => self.scope_mode = self.scope_mode.next(),
+                            FacetSlot::DocKind => {
+                                self.doc_kind_filter = self.doc_kind_filter.prev()
+                            }
+                            FacetSlot::Importance => {
+                                self.importance_filter = self.importance_filter.next()
+                            }
+                            FacetSlot::AckStatus => self.ack_filter = self.ack_filter.next(),
+                            FacetSlot::SortOrder => {
+                                self.sort_direction = self.sort_direction.next()
+                            }
+                            FacetSlot::FieldScope => self.field_scope = self.field_scope.prev(),
+                        }
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                    }
+                    KeyCode::Char('r') => self.reset_facets(),
+                    KeyCode::Char('I') => self.dock.toggle_visible(),
+                    KeyCode::Char(']') => self.dock.grow_dock(),
+                    KeyCode::Char('[') => self.dock.shrink_dock(),
+                    KeyCode::Char('}') => self.dock.cycle_position(),
+                    KeyCode::Char('{') => self.dock.cycle_position_prev(),
+                    _ => {}
+                },
+                Focus::ResultList => match key.code {
+                    KeyCode::Char('/') => {
+                        self.focus = Focus::QueryBar;
+                        self.query_input.set_focused(true);
+                    }
+                    KeyCode::Tab | KeyCode::Char('f') => self.focus = Focus::FacetRail,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if !self.results.is_empty() {
+                            self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.cursor = self.cursor.saturating_sub(1);
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Char('G') | KeyCode::End => {
+                        if !self.results.is_empty() {
+                            self.cursor = self.results.len() - 1;
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => {
+                        self.cursor = 0;
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Char('d') | KeyCode::PageDown => {
+                        if !self.results.is_empty() {
+                            self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    KeyCode::Char('u') | KeyCode::PageUp => {
+                        self.cursor = self.cursor.saturating_sub(20);
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Char('J') => self.scroll_detail_by(1),
+                    KeyCode::Char('K') => self.scroll_detail_by(-1),
+                    KeyCode::Char('I') => self.dock.toggle_visible(),
+                    KeyCode::Char(']') => self.dock.grow_dock(),
+                    KeyCode::Char('[') => self.dock.shrink_dock(),
+                    KeyCode::Char('}') => self.dock.cycle_position(),
+                    KeyCode::Char('{') => self.dock.cycle_position_prev(),
+                    KeyCode::Enter => {
+                        if let Some(entry) = self.results.get(self.cursor) {
+                            return Cmd::msg(match entry.doc_kind {
+                                DocKind::Message => {
+                                    MailScreenMsg::DeepLink(DeepLinkTarget::MessageById(entry.id))
+                                }
+                                DocKind::Agent => MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::AgentByName(entry.title.clone()),
+                                ),
+                                DocKind::Project => MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::ProjectBySlug(entry.title.clone()),
+                                ),
+                                DocKind::Thread => MailScreenMsg::DeepLink(
+                                    entry
+                                        .thread_id
+                                        .as_ref()
+                                        .map_or(DeepLinkTarget::MessageById(entry.id), |tid| {
+                                            DeepLinkTarget::ThreadById(tid.clone())
+                                        }),
+                                ),
+                            });
+                        }
+                    }
+                    KeyCode::Char('t') => {
+                        self.doc_kind_filter = self.doc_kind_filter.next();
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                    }
+                    KeyCode::Char('i') => {
+                        self.importance_filter = self.importance_filter.next();
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                    }
+                    KeyCode::Char('o') => {
+                        if let Some(entry) = self.results.get(self.cursor) {
+                            if let Some(ref tid) = entry.thread_id {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::ThreadById(tid.clone()),
+                                ));
+                            }
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        if let Some(entry) = self.results.get(self.cursor) {
+                            if let Some(ref agent) = entry.from_agent {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::AgentByName(agent.clone()),
+                                ));
+                            }
+                        }
+                    }
+                    KeyCode::Char('T') => {
+                        if let Some(entry) = self.results.get(self.cursor) {
+                            if let Some(ts) = entry.created_ts {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::TimelineAtTime(ts),
+                                ));
+                            }
+                        }
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        self.query_input.clear();
+                        self.reset_facets();
+                    }
+                    _ => {}
+                },
+            },
+            _ => {}
         }
         Cmd::None
     }
@@ -1644,6 +1802,12 @@ impl MailScreen for SearchCockpitScreen {
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         if area.height < 4 || area.width < 30 {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            Block::default()
+                .title("Search")
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(tp.text_muted))
+                .render(area, frame);
             return;
         }
 
@@ -1653,86 +1817,74 @@ impl MailScreen for SearchCockpitScreen {
 
         let query_area = Rect::new(area.x, area.y, area.width, query_h);
         let body_area = Rect::new(area.x, area.y + query_h, area.width, body_h);
+        self.last_query_area.set(query_area);
 
-        // Render query bar
+        let layout_label = if self.dock.visible {
+            self.dock.state_label()
+        } else {
+            "List only".to_string()
+        };
         render_query_bar(
             frame,
             query_area,
             &self.query_input,
             self,
             matches!(self.focus, Focus::QueryBar),
+            &layout_label,
         );
 
-        // Body: facet rail (left) + results + detail (right)
-        let facet_w: u16 = if area.width >= 100 { 20 } else { 16 };
-        let remaining_w = body_area.width.saturating_sub(facet_w);
-
+        // Body: facet rail (left) + dock-split content area (results/detail)
+        let facet_w: u16 = if area.width >= 130 {
+            22
+        } else if area.width >= 100 {
+            20
+        } else {
+            16
+        };
         let facet_area = Rect::new(body_area.x, body_area.y, facet_w, body_area.height);
+        self.last_facet_area.set(facet_area);
+        render_facet_rail(
+            frame,
+            facet_area,
+            self,
+            matches!(self.focus, Focus::FacetRail),
+        );
 
-        // Results + detail split
-        if remaining_w >= 60 {
-            let results_w = remaining_w * 45 / 100;
-            let detail_w = remaining_w - results_w;
-            let results_area = Rect::new(
-                body_area.x + facet_w,
-                body_area.y,
-                results_w,
-                body_area.height,
-            );
-            let detail_area = Rect::new(
-                body_area.x + facet_w + results_w,
-                body_area.y,
-                detail_w,
-                body_area.height,
-            );
+        let split_area = Rect::new(
+            body_area.x + facet_w,
+            body_area.y,
+            body_area.width.saturating_sub(facet_w),
+            body_area.height,
+        );
+        self.last_split_area.set(split_area);
 
-            render_facet_rail(
-                frame,
-                facet_area,
-                self,
-                matches!(self.focus, Focus::FacetRail),
-            );
-            self.sync_list_state();
-            render_results(
-                frame,
-                results_area,
-                &self.results,
-                &mut self.list_state.borrow_mut(),
-                &self.highlight_terms,
-                self.sort_direction,
-                matches!(self.focus, Focus::ResultList),
-            );
+        let mut dock = self.dock;
+        if split_area.width < 60 || split_area.height < 8 {
+            dock.visible = false;
+        }
+        let split = dock.split(split_area);
+        self.last_results_area.set(split.primary);
+        self.last_detail_area
+            .set(split.dock.unwrap_or(Rect::new(0, 0, 0, 0)));
+
+        self.sync_list_state();
+        render_results(
+            frame,
+            split.primary,
+            &self.results,
+            &mut self.list_state.borrow_mut(),
+            &self.highlight_terms,
+            self.sort_direction,
+            matches!(self.focus, Focus::ResultList),
+        );
+        if let Some(detail_area) = split.dock {
             render_detail(
                 frame,
                 detail_area,
                 self.results.get(self.cursor),
                 self.detail_scroll,
                 &self.highlight_terms,
-                false,
-            );
-        } else {
-            // Narrow: facet rail + results only
-            let results_area = Rect::new(
-                body_area.x + facet_w,
-                body_area.y,
-                remaining_w,
-                body_area.height,
-            );
-            render_facet_rail(
-                frame,
-                facet_area,
-                self,
-                matches!(self.focus, Focus::FacetRail),
-            );
-            self.sync_list_state();
-            render_results(
-                frame,
-                results_area,
-                &self.results,
-                &mut self.list_state.borrow_mut(),
-                &self.highlight_terms,
-                self.sort_direction,
-                matches!(self.focus, Focus::ResultList),
+                !matches!(self.focus, Focus::QueryBar),
             );
         }
 
@@ -1779,6 +1931,14 @@ impl MailScreen for SearchCockpitScreen {
             HelpEntry {
                 key: "J/K",
                 action: "Scroll detail",
+            },
+            HelpEntry {
+                key: "I [ ] { }",
+                action: "Toggle/resize/reposition split",
+            },
+            HelpEntry {
+                key: "Mouse",
+                action: "Click/select, wheel scroll, drag split",
             },
             HelpEntry {
                 key: "o",
@@ -2064,6 +2224,7 @@ fn render_query_bar(
     input: &TextInput,
     screen: &SearchCockpitScreen,
     focused: bool,
+    layout_label: &str,
 ) {
     let count = screen.results.len();
     let kind_label = screen.doc_kind_filter.label();
@@ -2078,7 +2239,9 @@ fn render_query_bar(
         ""
     };
 
-    let title = format!("Search {kind_label} ({count} results){thread_label}{focus_label}");
+    let title = format!(
+        "Search {kind_label} ({count} results){thread_label} [{layout_label}]{focus_label}"
+    );
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
@@ -2104,7 +2267,8 @@ fn render_query_bar(
                     || {
                         if screen.focus == Focus::QueryBar {
                             (
-                                "Syntax: \"phrase\" term* AND/OR/NOT (no leading *)".to_string(),
+                                "Syntax: \"phrase\" term* AND/OR/NOT | Mouse drag border to resize"
+                                    .to_string(),
                                 Style::default().fg(FACET_LABEL_FG()),
                             )
                         } else {
@@ -2457,6 +2621,36 @@ fn render_results(
 }
 
 #[allow(clippy::cast_possible_truncation)]
+/// Estimate the number of lines in the search detail panel for a result entry.
+fn estimate_search_detail_lines(entry: &ResultEntry) -> usize {
+    // Type, Title = 2
+    let mut count: usize = 2;
+    if entry.from_agent.is_some() {
+        count += 1; // From
+    }
+    if entry.thread_id.is_some() {
+        count += 1; // Thread
+    }
+    if entry.importance.is_some() {
+        count += 1; // Importance
+    }
+    if entry.ack_required.is_some() {
+        count += 1; // Ack
+    }
+    if entry.created_ts.is_some() {
+        count += 1; // Time
+    }
+    count += 1; // ID line
+    if entry.score.is_some() {
+        count += 1; // Score
+    }
+    count += 2; // Separator + body header
+                // Body lines
+    let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
+    count += body.lines().count().max(1);
+    count
+}
+
 fn render_detail(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2477,16 +2671,45 @@ fn render_detail(
         return;
     }
 
+    let (content_inner, scrollbar_area) = if inner.width > 6 {
+        (
+            Rect::new(
+                inner.x,
+                inner.y,
+                inner.width.saturating_sub(1),
+                inner.height,
+            ),
+            Some(Rect::new(
+                inner.x + inner.width.saturating_sub(1),
+                inner.y,
+                1,
+                inner.height,
+            )),
+        )
+    } else {
+        (inner, None)
+    };
+
     let Some(entry) = entry else {
-        Paragraph::new("  Select a result to view details.").render(inner, frame);
+        Paragraph::new("  Select a result to view details.").render(content_inner, frame);
         return;
     };
 
     // Reserve 1 row for action bar at bottom.
     let action_bar_h: u16 = 1;
-    let content_h = inner.height.saturating_sub(action_bar_h);
-    let content_area = Rect::new(inner.x, inner.y, inner.width, content_h);
-    let action_area = Rect::new(inner.x, inner.y + content_h, inner.width, action_bar_h);
+    let content_h = content_inner.height.saturating_sub(action_bar_h);
+    let content_area = Rect::new(
+        content_inner.x,
+        content_inner.y,
+        content_inner.width,
+        content_h,
+    );
+    let action_area = Rect::new(
+        content_inner.x,
+        content_inner.y + content_h,
+        content_inner.width,
+        action_bar_h,
+    );
 
     let label_style = Style::default().fg(FACET_LABEL_FG());
     let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
@@ -2556,12 +2779,85 @@ fn render_detail(
         )));
     }
 
-    // Apply scroll and render content.
-    let skip = scroll.min(lines.len().saturating_sub(1));
-    Paragraph::new(Text::from_lines(lines.into_iter().skip(skip))).render(content_area, frame);
+    if content_h == 0 {
+        render_action_bar(frame, action_area, entry);
+        return;
+    }
+
+    // Apply scroll and render only the visible content lines.
+    let total_lines = lines.len();
+    let visible = usize::from(content_h);
+    let max_scroll = total_lines.saturating_sub(visible);
+    let clamped_scroll = scroll.min(max_scroll);
+    let visible_lines: Vec<Line> = lines
+        .into_iter()
+        .skip(clamped_scroll)
+        .take(visible)
+        .collect();
+    Paragraph::new(Text::from_lines(visible_lines)).render(content_area, frame);
+
+    if let Some(bar_area) = scrollbar_area {
+        render_vertical_scrollbar(
+            frame,
+            bar_area,
+            clamped_scroll,
+            visible,
+            total_lines,
+            focused,
+        );
+    }
 
     // Contextual action bar.
     render_action_bar(frame, action_area, entry);
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_vertical_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    scroll: usize,
+    visible: usize,
+    total: usize,
+    focused: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let track_style = Style::default().fg(tp.text_disabled);
+    let thumb_style = Style::default()
+        .fg(if focused {
+            tp.selection_indicator
+        } else {
+            tp.status_accent
+        })
+        .bold();
+
+    let rows = usize::from(area.height);
+    let mut lines = Vec::with_capacity(rows);
+    if total <= visible || rows == 0 {
+        lines.extend((0..rows).map(|_| Line::styled("\u{2502}", track_style)));
+    } else {
+        let thumb_len = ((visible as f32 / total as f32) * rows as f32)
+            .ceil()
+            .max(1.0) as usize;
+        let max_start = rows.saturating_sub(thumb_len);
+        let denom = total.saturating_sub(visible).max(1) as f32;
+        let thumb_start = ((scroll as f32 / denom) * max_start as f32).round() as usize;
+        for row in 0..rows {
+            if row >= thumb_start && row < thumb_start + thumb_len {
+                lines.push(Line::styled("\u{2588}", thumb_style));
+            } else {
+                lines.push(Line::styled("\u{2502}", track_style));
+            }
+        }
+    }
+    Paragraph::new(Text::from_lines(lines)).render(area, frame);
 }
 
 /// Render a contextual action bar showing available deep-link keys.
@@ -2613,6 +2909,14 @@ fn viewport_range(total: usize, visible: usize, cursor: usize) -> (usize, usize)
     };
     let end = (start + visible).min(total);
     (start, end)
+}
+
+/// Returns `true` if the point `(x, y)` is inside the rectangle.
+const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
 }
 
 // ──────────────────────────────────────────────────────────────────────

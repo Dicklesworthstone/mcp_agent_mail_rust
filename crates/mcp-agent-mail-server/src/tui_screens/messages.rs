@@ -4,30 +4,31 @@
 //! stream search.  Results are displayed in a split-pane layout with
 //! keyboard-first navigation.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::Widget;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, Style};
 use ftui_extras::syntax::{JsonTokenizer, LineState, TokenKind, Tokenizer};
 use ftui_runtime::program::Cmd;
+use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
-use ftui_widgets::StatefulWidget;
 
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
-use mcp_agent_mail_db::DbConn;
 
-use crate::tui_action_menu::{messages_actions, ActionEntry};
+use crate::tui_action_menu::{ActionEntry, messages_actions};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_events::MailEventKind;
+use crate::tui_layout::DockLayout;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -37,8 +38,8 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 /// Number of results per page.
 const PAGE_SIZE: usize = 50;
 
-/// Debounce delay in ticks (each tick ~100ms, so 2 ticks = ~200ms).
-const DEBOUNCE_TICKS: u8 = 1;
+/// Debounce delay in ticks. Zero means immediate search-as-you-type.
+const DEBOUNCE_TICKS: u8 = 0;
 
 /// Max results to cache.
 const MAX_RESULTS: usize = 1000;
@@ -272,6 +273,12 @@ enum Focus {
     ResultList,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockDragState {
+    Idle,
+    Dragging,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // MessageBrowserScreen
 // ──────────────────────────────────────────────────────────────────────
@@ -312,6 +319,18 @@ pub struct MessageBrowserScreen {
     last_local_project: Option<String>,
     /// Reduced-motion mode forces static urgency badges.
     reduced_motion: bool,
+    /// Resizable results/detail layout.
+    dock: DockLayout,
+    /// Current drag state while resizing dock split.
+    dock_drag: DockDragState,
+    /// Last rendered content area for hit testing.
+    last_content_area: Cell<Rect>,
+    /// Last rendered search bar area.
+    last_search_area: Cell<Rect>,
+    /// Last rendered results area.
+    last_results_area: Cell<Rect>,
+    /// Last rendered detail area.
+    last_detail_area: Cell<Rect>,
 }
 
 impl MessageBrowserScreen {
@@ -339,6 +358,12 @@ impl MessageBrowserScreen {
             inbox_mode: InboxMode::Global,
             last_local_project: None,
             reduced_motion: reduced_motion_enabled(),
+            dock: DockLayout::right_40(),
+            dock_drag: DockDragState::Idle,
+            last_content_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_search_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
         }
     }
 
@@ -412,6 +437,63 @@ impl MessageBrowserScreen {
         self.search_input.set_value(preset.query);
         self.search_dirty = true;
         self.debounce_remaining = 0;
+    }
+
+    fn set_cursor_from_results_click(&mut self, y: u16) {
+        if self.results.is_empty() {
+            return;
+        }
+        let area = self.last_results_area.get();
+        let list_height = area.height.saturating_sub(2) as usize;
+        if list_height == 0 {
+            return;
+        }
+        let inner_top = area.y.saturating_add(1);
+        if y < inner_top {
+            return;
+        }
+        let row = usize::from(y.saturating_sub(inner_top));
+        let (start, end) = viewport_range(self.results.len(), list_height, self.cursor);
+        let idx = start.saturating_add(row);
+        if idx < end {
+            self.cursor = idx;
+            self.detail_scroll = 0;
+        }
+    }
+
+    fn detail_visible(&self) -> bool {
+        let area = self.last_detail_area.get();
+        area.width > 0 && area.height > 0
+    }
+
+    /// Rough estimate of lines in the detail panel for a message entry.
+    fn detail_max_scroll(&self) -> usize {
+        let Some(entry) = self.results.get(self.cursor) else {
+            return 0;
+        };
+        let area = self.last_detail_area.get();
+        // Fallback viewport for pre-render calls (unit tests or early key events).
+        let visible_height = if area.height <= 2 {
+            8
+        } else {
+            usize::from(area.height.saturating_sub(2))
+        };
+        let total_lines = estimate_message_detail_lines(entry);
+        total_lines.saturating_sub(visible_height)
+    }
+
+    fn scroll_detail_by(&mut self, delta: isize) {
+        let max = self.detail_max_scroll();
+        if delta.is_negative() {
+            self.detail_scroll = self
+                .detail_scroll
+                .saturating_sub(delta.unsigned_abs())
+                .min(max);
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            let add = delta as usize;
+            self.detail_scroll = self.detail_scroll.saturating_add(add).min(max);
+        }
     }
 
     /// Return the current active preset, if any.
@@ -529,119 +611,179 @@ impl Default for MessageBrowserScreen {
 impl MailScreen for MessageBrowserScreen {
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                match self.focus {
-                    Focus::SearchBar => {
-                        match key.code {
-                            KeyCode::Enter => {
-                                // Execute search immediately and switch to results
-                                self.search_dirty = true;
-                                self.debounce_remaining = 0;
-                                self.focus = Focus::ResultList;
-                                self.search_input.set_focused(false);
-                                return Cmd::None;
-                            }
-                            KeyCode::Escape | KeyCode::Tab => {
-                                self.focus = Focus::ResultList;
-                                self.search_input.set_focused(false);
-                                return Cmd::None;
-                            }
-                            _ => {
-                                let before = self.search_input.value().to_string();
-                                self.search_input.handle_event(event);
-                                if self.search_input.value() != before {
-                                    self.search_dirty = true;
-                                    self.debounce_remaining = DEBOUNCE_TICKS;
-                                }
-                                return Cmd::None;
-                            }
+        match event {
+            Event::Mouse(mouse) => {
+                let content_area = self.last_content_area.get();
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if self.detail_visible()
+                            && self.dock.hit_test_border(content_area, mouse.x, mouse.y)
+                        {
+                            self.dock_drag = DockDragState::Dragging;
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_search_area.get(), mouse.x, mouse.y) {
+                            self.focus = Focus::SearchBar;
+                            self.search_input.set_focused(true);
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y) {
+                            self.focus = Focus::ResultList;
+                            self.search_input.set_focused(false);
+                            self.set_cursor_from_results_click(mouse.y);
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
+                            self.focus = Focus::ResultList;
+                            self.search_input.set_focused(false);
+                            return Cmd::None;
                         }
                     }
-                    Focus::ResultList => {
-                        match key.code {
-                            // Enter search mode
-                            KeyCode::Char('/') | KeyCode::Tab => {
-                                self.focus = Focus::SearchBar;
-                                self.search_input.set_focused(true);
-                                return Cmd::None;
-                            }
-                            // Cursor navigation
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                if !self.results.is_empty() {
-                                    self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                                    self.detail_scroll = 0;
-                                }
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                self.cursor = self.cursor.saturating_sub(1);
-                                self.detail_scroll = 0;
-                            }
-                            KeyCode::Char('G') | KeyCode::End => {
-                                if !self.results.is_empty() {
-                                    self.cursor = self.results.len() - 1;
-                                    self.detail_scroll = 0;
-                                }
-                            }
-                            KeyCode::Home => {
-                                self.cursor = 0;
-                                self.detail_scroll = 0;
-                            }
-                            // Toggle inbox mode (Local/Global)
-                            KeyCode::Char('g') => {
-                                self.toggle_inbox_mode();
-                                return Cmd::None;
-                            }
-                            // Page navigation
-                            KeyCode::Char('d') | KeyCode::PageDown => {
-                                if !self.results.is_empty() {
-                                    self.cursor = (self.cursor + 20).min(self.results.len() - 1);
-                                    self.detail_scroll = 0;
-                                }
-                            }
-                            KeyCode::Char('u') | KeyCode::PageUp => {
-                                self.cursor = self.cursor.saturating_sub(20);
-                                self.detail_scroll = 0;
-                            }
-                            // Detail scroll
-                            KeyCode::Char('J') => {
-                                self.detail_scroll += 1;
-                            }
-                            KeyCode::Char('K') => {
-                                self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                            }
-                            // Deep-link: jump to timeline at message timestamp
-                            KeyCode::Enter => {
-                                if let Some(entry) = self.results.get(self.cursor) {
-                                    return Cmd::msg(MailScreenMsg::DeepLink(
-                                        DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
-                                    ));
-                                }
-                            }
-                            // Cycle query presets
-                            KeyCode::Char('p') => {
-                                self.apply_preset(self.preset_index + 1);
-                            }
-                            KeyCode::Char('P') => {
-                                let idx = if self.preset_index == 0 {
-                                    QUERY_PRESETS.len() - 1
-                                } else {
-                                    self.preset_index - 1
-                                };
-                                self.apply_preset(idx);
-                            }
-                            // Clear search
-                            KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
-                                self.search_input.clear();
-                                self.search_dirty = true;
-                                self.debounce_remaining = 0;
-                                self.preset_index = 0;
-                            }
-                            _ => {}
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if self.dock_drag == DockDragState::Dragging {
+                            self.dock.drag_to(content_area, mouse.x, mouse.y);
+                            return Cmd::None;
                         }
                     }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        self.dock_drag = DockDragState::Idle;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
+                            self.scroll_detail_by(1);
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y)
+                            && !self.results.is_empty()
+                        {
+                            self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                            self.detail_scroll = 0;
+                            return Cmd::None;
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
+                            self.scroll_detail_by(-1);
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y) {
+                            self.cursor = self.cursor.saturating_sub(1);
+                            self.detail_scroll = 0;
+                            return Cmd::None;
+                        }
+                    }
+                    _ => {}
                 }
             }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match self.focus {
+                Focus::SearchBar => match key.code {
+                    KeyCode::Enter => {
+                        // Execute search immediately and switch to results
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                        self.focus = Focus::ResultList;
+                        self.search_input.set_focused(false);
+                        return Cmd::None;
+                    }
+                    KeyCode::Escape | KeyCode::Tab => {
+                        self.focus = Focus::ResultList;
+                        self.search_input.set_focused(false);
+                        return Cmd::None;
+                    }
+                    _ => {
+                        let before = self.search_input.value().to_string();
+                        self.search_input.handle_event(event);
+                        if self.search_input.value() != before {
+                            self.search_dirty = true;
+                            self.debounce_remaining = DEBOUNCE_TICKS;
+                        }
+                        return Cmd::None;
+                    }
+                },
+                Focus::ResultList => match key.code {
+                    // Enter search mode
+                    KeyCode::Char('/') | KeyCode::Tab => {
+                        self.focus = Focus::SearchBar;
+                        self.search_input.set_focused(true);
+                        return Cmd::None;
+                    }
+                    // Cursor navigation
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if !self.results.is_empty() {
+                            self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.cursor = self.cursor.saturating_sub(1);
+                        self.detail_scroll = 0;
+                    }
+                    KeyCode::Char('G') | KeyCode::End => {
+                        if !self.results.is_empty() {
+                            self.cursor = self.results.len() - 1;
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    KeyCode::Home => {
+                        self.cursor = 0;
+                        self.detail_scroll = 0;
+                    }
+                    // Toggle inbox mode (Local/Global)
+                    KeyCode::Char('g') => {
+                        self.toggle_inbox_mode();
+                        return Cmd::None;
+                    }
+                    // Page navigation
+                    KeyCode::Char('d') | KeyCode::PageDown => {
+                        if !self.results.is_empty() {
+                            self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    KeyCode::Char('u') | KeyCode::PageUp => {
+                        self.cursor = self.cursor.saturating_sub(20);
+                        self.detail_scroll = 0;
+                    }
+                    // Detail scroll
+                    KeyCode::Char('J') => self.scroll_detail_by(1),
+                    KeyCode::Char('K') => self.scroll_detail_by(-1),
+                    // Split layout controls
+                    KeyCode::Char('i') => self.dock.toggle_visible(),
+                    KeyCode::Char(']') => self.dock.grow_dock(),
+                    KeyCode::Char('[') => self.dock.shrink_dock(),
+                    KeyCode::Char('}') => self.dock.cycle_position(),
+                    KeyCode::Char('{') => self.dock.cycle_position_prev(),
+                    // Deep-link: jump to timeline at message timestamp
+                    KeyCode::Enter => {
+                        if let Some(entry) = self.results.get(self.cursor) {
+                            return Cmd::msg(MailScreenMsg::DeepLink(
+                                DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
+                            ));
+                        }
+                    }
+                    // Cycle query presets
+                    KeyCode::Char('p') => {
+                        self.apply_preset(self.preset_index + 1);
+                    }
+                    KeyCode::Char('P') => {
+                        let idx = if self.preset_index == 0 {
+                            QUERY_PRESETS.len() - 1
+                        } else {
+                            self.preset_index - 1
+                        };
+                        self.apply_preset(idx);
+                    }
+                    // Clear search
+                    KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        self.search_input.clear();
+                        self.search_dirty = true;
+                        self.debounce_remaining = 0;
+                        self.preset_index = 0;
+                    }
+                    _ => {}
+                },
+            },
+            _ => {}
         }
         Cmd::None
     }
@@ -689,16 +831,24 @@ impl MailScreen for MessageBrowserScreen {
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
-        if area.height < 4 || area.width < 20 {
+        if area.height < 3 || area.width < 12 {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            Block::default()
+                .title("Messages")
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(tp.text_muted))
+                .render(area, frame);
             return;
         }
 
-        // Layout: 1 row search bar, remaining split into results + detail
+        // Layout: search bar + dock-split content area
         let search_height: u16 = 3; // border + input + border
         let content_height = area.height.saturating_sub(search_height);
 
         let search_area = Rect::new(area.x, area.y, area.width, search_height);
         let content_area = Rect::new(area.x, area.y + search_height, area.width, content_height);
+        self.last_search_area.set(search_area);
+        self.last_content_area.set(content_area);
 
         // Render search bar with explainability and mode indicator
         let method_label = match self.search_method {
@@ -713,6 +863,11 @@ impl MailScreen for MessageBrowserScreen {
             ""
         };
         let mode_label = self.inbox_mode.label();
+        let layout_label = if self.dock.visible {
+            self.dock.state_label()
+        } else {
+            "List only".to_string()
+        };
         render_search_bar(
             frame,
             search_area,
@@ -722,49 +877,39 @@ impl MailScreen for MessageBrowserScreen {
             method_label,
             preset_label,
             &mode_label,
+            &layout_label,
         );
 
-        // Split content: 45% results, 55% detail (if wide enough)
-        if content_area.width >= 80 {
-            let results_width = content_area.width * 45 / 100;
-            let detail_width = content_area.width - results_width;
-            let results_area = Rect::new(
-                content_area.x,
-                content_area.y,
-                results_width,
-                content_area.height,
-            );
-            let detail_area = Rect::new(
-                content_area.x + results_width,
-                content_area.y,
-                detail_width,
-                content_area.height,
-            );
+        let mut dock = self.dock;
+        if content_area.width < 68 || content_area.height < 8 {
+            dock.visible = false;
+        }
+        let split = dock.split(content_area);
+        self.last_results_area.set(split.primary);
+        self.last_detail_area
+            .set(split.dock.unwrap_or(Rect::new(0, 0, 0, 0)));
 
-            // Sync and borrow list state for rendering
-            self.sync_list_state();
-            let mut list_state = self.list_state.borrow_mut();
-            let results_focused = matches!(self.focus, Focus::ResultList);
-            render_results_list(
-                frame,
-                results_area,
-                &self.results,
-                &mut list_state,
-                results_focused,
-            );
-            drop(list_state);
+        // Sync and borrow list state for rendering
+        self.sync_list_state();
+        let mut list_state = self.list_state.borrow_mut();
+        let results_focused = matches!(self.focus, Focus::ResultList);
+        render_results_list(
+            frame,
+            split.primary,
+            &self.results,
+            &mut list_state,
+            results_focused,
+        );
+        drop(list_state);
+
+        if let Some(detail_area) = split.dock {
             render_detail_panel(
                 frame,
                 detail_area,
                 self.results.get(self.cursor),
                 self.detail_scroll,
-                !results_focused,
+                !matches!(self.focus, Focus::SearchBar),
             );
-        } else {
-            // Narrow: results only
-            self.sync_list_state();
-            let mut list_state = self.list_state.borrow_mut();
-            render_results_list(frame, content_area, &self.results, &mut list_state, true);
         }
 
         // Also merge live events into display if searching
@@ -804,8 +949,12 @@ impl MailScreen for MessageBrowserScreen {
                 action: "Scroll detail",
             },
             HelpEntry {
-                key: "Tab",
-                action: "Toggle focus",
+                key: "i [ ] { }",
+                action: "Toggle/resize/reposition split",
+            },
+            HelpEntry {
+                key: "Mouse",
+                action: "Click/select, wheel scroll, drag split",
             },
             HelpEntry {
                 key: "Esc",
@@ -1081,6 +1230,7 @@ fn render_search_bar(
     method_label: &str,
     preset_label: &str,
     mode_label: &str,
+    layout_label: &str,
 ) {
     let mut title = if focused {
         format!("Search ({total_results} results) [EDITING]")
@@ -1099,6 +1249,9 @@ fn render_search_bar(
     if !mode_label.is_empty() {
         let _ = std::fmt::Write::write_fmt(&mut title, format_args!(" | [{mode_label}]"));
     }
+    if !layout_label.is_empty() {
+        let _ = std::fmt::Write::write_fmt(&mut title, format_args!(" | {layout_label}"));
+    }
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
         .title(&title)
@@ -1109,7 +1262,15 @@ fn render_search_bar(
 
     // Render the TextInput inside the block
     if inner.height > 0 && inner.width > 0 {
-        input.render(inner, frame);
+        let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
+        input.render(input_area, frame);
+        if inner.height > 1 {
+            let hint = "Mouse: click/select, wheel scroll, drag border resize";
+            let hint_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+            Paragraph::new(truncate_str(hint, inner.width as usize))
+                .style(Style::default().fg(tp.text_muted))
+                .render(hint_area, frame);
+        }
     }
 }
 
@@ -1208,11 +1369,7 @@ fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Tex
                         }
                         break;
                     }
-                    if is_key {
-                        key_style
-                    } else {
-                        string_style
-                    }
+                    if is_key { key_style } else { string_style }
                 }
                 TokenKind::Number => number_style,
                 TokenKind::Boolean | TokenKind::Constant => literal_style,
@@ -1231,6 +1388,25 @@ fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Tex
 
 /// Render the detail panel for the selected message.
 #[allow(clippy::cast_possible_truncation)]
+/// Estimate how many lines the detail panel needs for a message entry.
+fn estimate_message_detail_lines(entry: &MessageEntry) -> usize {
+    // Header lines: From, To, Subject, Project, Time, Importance = 6
+    let mut count: usize = 6;
+    if !entry.thread_id.is_empty() {
+        count += 1; // Thread line
+    }
+    if entry.ack_required {
+        count += 1; // Ack line
+    }
+    if entry.id >= 0 {
+        count += 1; // ID line
+    }
+    count += 2; // Blank separator + "--- Body ---"
+    // Body lines: count newlines + 1
+    count += entry.body_md.lines().count().max(1);
+    count
+}
+
 fn render_detail_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1250,9 +1426,28 @@ fn render_detail_panel(
         return;
     }
 
+    let (content_inner, scrollbar_area) = if inner.width > 6 {
+        (
+            Rect::new(
+                inner.x,
+                inner.y,
+                inner.width.saturating_sub(1),
+                inner.height,
+            ),
+            Some(Rect::new(
+                inner.x + inner.width.saturating_sub(1),
+                inner.y,
+                1,
+                inner.height,
+            )),
+        )
+    } else {
+        (inner, None)
+    };
+
     let Some(msg) = entry else {
         let p = Paragraph::new("  Select a message to view details.");
-        p.render(inner, frame);
+        p.render(content_inner, frame);
         return;
     };
 
@@ -1290,19 +1485,31 @@ fn render_detail_panel(
     let header_height = lines.len();
 
     // Apply scroll offset across combined header + body
-    let visible_height = inner.height as usize;
-    if scroll < header_height {
+    let visible_height = content_inner.height as usize;
+    if visible_height == 0 {
+        return;
+    }
+    let total_lines = header_height.saturating_add(body_height.max(1));
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let clamped_scroll = scroll.min(max_scroll);
+
+    if clamped_scroll < header_height {
         // Some header lines visible
         let header_visible: Vec<&str> = lines
             .iter()
-            .skip(scroll)
+            .skip(clamped_scroll)
             .take(visible_height)
             .map(String::as_str)
             .collect();
         let header_text = header_visible.join("\n");
 
         let header_rows = header_visible.len().min(visible_height);
-        let header_area = Rect::new(inner.x, inner.y, inner.width, header_rows as u16);
+        let header_area = Rect::new(
+            content_inner.x,
+            content_inner.y,
+            content_inner.width,
+            header_rows as u16,
+        );
         let p = Paragraph::new(header_text);
         p.render(header_area, frame);
 
@@ -1310,9 +1517,9 @@ fn render_detail_panel(
         let body_rows = visible_height.saturating_sub(header_rows);
         if body_rows > 0 {
             let body_area = Rect::new(
-                inner.x,
-                inner.y + header_rows as u16,
-                inner.width,
+                content_inner.x,
+                content_inner.y + header_rows as u16,
+                content_inner.width,
                 body_rows as u16,
             );
             let p = Paragraph::new(body_text);
@@ -1320,7 +1527,7 @@ fn render_detail_panel(
         }
     } else {
         // Scrolled past header — only body visible
-        let body_scroll = scroll - header_height;
+        let body_scroll = clamped_scroll - header_height;
         // Extract visible portion of body text by skipping lines
         let all_lines = body_text.lines();
         let visible_body: Vec<_> = all_lines
@@ -1329,16 +1536,80 @@ fn render_detail_panel(
             .take(visible_height)
             .cloned()
             .collect();
-        let _ = body_height; // suppress unused warning
         let text = ftui::text::Text::from_lines(visible_body);
         let p = Paragraph::new(text);
-        p.render(inner, frame);
+        p.render(content_inner, frame);
     }
+
+    if let Some(bar_area) = scrollbar_area {
+        render_vertical_scrollbar(
+            frame,
+            bar_area,
+            clamped_scroll,
+            visible_height,
+            total_lines,
+            focused,
+        );
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_vertical_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    scroll: usize,
+    visible: usize,
+    total: usize,
+    focused: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let track_style = Style::default().fg(tp.text_disabled);
+    let thumb_style = Style::default()
+        .fg(if focused {
+            tp.selection_indicator
+        } else {
+            tp.status_accent
+        })
+        .bold();
+    let rows = area.height as usize;
+    let mut lines = Vec::with_capacity(rows);
+    if total <= visible || rows == 0 {
+        lines.extend((0..rows).map(|_| Line::styled("\u{2502}", track_style)));
+    } else {
+        let thumb_len = ((visible as f32 / total as f32) * rows as f32)
+            .ceil()
+            .max(1.0) as usize;
+        let max_start = rows.saturating_sub(thumb_len);
+        let denom = total.saturating_sub(visible).max(1) as f32;
+        let thumb_start = ((scroll as f32 / denom) * max_start as f32).round() as usize;
+        for row in 0..rows {
+            if row >= thumb_start && row < thumb_start + thumb_len {
+                lines.push(Line::styled("\u{2588}", thumb_style));
+            } else {
+                lines.push(Line::styled("\u{2502}", track_style));
+            }
+        }
+    }
+    Paragraph::new(Text::from_lines(lines)).render(area, frame);
 }
 
 // ──────────────────────────────────────────────────────────────────────
 // Utility helpers
 // ──────────────────────────────────────────────────────────────────────
+
+const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
+}
 
 /// Compute the viewport [start, end) to keep cursor visible.
 /// (Retained for test coverage; `VirtualizedList` handles this internally.)
@@ -1515,6 +1786,8 @@ mod tests {
     #[test]
     fn detail_scroll() {
         let mut screen = MessageBrowserScreen::new();
+        // Set a non-zero detail area so scroll_detail_by doesn't clamp to 0.
+        screen.last_detail_area.set(Rect::new(0, 0, 80, 5));
         screen.results.push(MessageEntry {
             id: 1,
             subject: "Test".to_string(),
@@ -1586,6 +1859,41 @@ mod tests {
         assert_eq!(result, "\"quoted\" \"term\"");
     }
 
+    // ── JSON helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn looks_like_json_detects_objects_and_arrays() {
+        assert!(looks_like_json("{\"ok\":true}"));
+        assert!(looks_like_json("   [1,2,3]"));
+        assert!(!looks_like_json("# heading"));
+        assert!(!looks_like_json("plain text payload"));
+    }
+
+    #[test]
+    fn colorize_json_body_preserves_core_tokens() {
+        let palette = crate::tui_theme::TuiThemePalette::current();
+        let text = colorize_json_body(
+            "{\n  \"ok\": true,\n  \"count\": 42,\n  \"name\": \"agent-mail\"\n}",
+            &palette,
+        );
+        let rendered = text
+            .lines()
+            .iter()
+            .map(|line| {
+                line.spans()
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("ok"));
+        assert!(rendered.contains("true"));
+        assert!(rendered.contains("42"));
+        assert!(rendered.contains("agent-mail"));
+    }
+
     // ── Truncation ──────────────────────────────────────────────────
 
     #[test]
@@ -1641,6 +1949,7 @@ mod tests {
             "FTS",
             "",
             "", // mode_label
+            "",
         );
     }
 
@@ -2006,6 +2315,7 @@ mod tests {
             "FTS",
             "Urgent",
             "", // mode_label
+            "Right 40%",
         );
     }
 
@@ -2020,6 +2330,7 @@ mod tests {
             &input,
             0,
             true,
+            "",
             "",
             "",
             "",
@@ -2177,9 +2488,11 @@ mod tests {
     fn keybindings_include_inbox_mode() {
         let screen = MessageBrowserScreen::new();
         let bindings = screen.keybindings();
-        assert!(bindings
-            .iter()
-            .any(|b| b.key == "g" && b.action.contains("Local/Global")));
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.key == "g" && b.action.contains("Local/Global"))
+        );
     }
 
     #[test]
