@@ -725,7 +725,8 @@ pub fn looks_like_unix_username(value: &str) -> bool {
         return false;
     }
     // Agent names are PascalCase; unix usernames are all lowercase
-    if v.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    if v.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && (2..=16).contains(&v.len())
     {
         // If it matches a known adjective or noun, it's not a username
@@ -1226,7 +1227,10 @@ mod tests {
         assert_eq!(kind, "UNIX_USERNAME_AS_AGENT");
         assert!(msg.contains("looks like a Unix username"), "message: {msg}");
         assert!(msg.contains("$USER"), "should mention $USER: {msg}");
-        assert!(msg.contains("resource://agents/"), "should mention agents resource: {msg}");
+        assert!(
+            msg.contains("resource://agents/"),
+            "should mention agents resource: {msg}"
+        );
     }
 
     #[test]

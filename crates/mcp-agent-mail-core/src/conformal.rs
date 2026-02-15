@@ -113,6 +113,11 @@ impl ConformalPredictor {
     /// Returns `None` if the calibration window has fewer than
     /// `MIN_CALIBRATION` (30) observations.
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn predict(&self) -> Option<PredictionInterval> {
         let n = self.observations.len();
         if n < MIN_CALIBRATION {
@@ -123,7 +128,11 @@ impl ConformalPredictor {
         let median = self.median();
 
         // Compute nonconformity scores: |obs - median|.
-        let mut scores: Vec<f64> = self.observations.iter().map(|&x| (x - median).abs()).collect();
+        let mut scores: Vec<f64> = self
+            .observations
+            .iter()
+            .map(|&x| (x - median).abs())
+            .collect();
         scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // The conformal quantile: ceil((n+1) * coverage) / n.
@@ -171,6 +180,7 @@ impl ConformalPredictor {
     /// Empirical coverage: fraction of predictions that contained the
     /// actual observation. Returns `None` if no predictions have been made.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn empirical_coverage(&self) -> Option<f64> {
         if self.predictions_made == 0 {
             return None;
@@ -288,6 +298,7 @@ mod tests {
     /// (approximately exchangeable) order.
     /// Conformal prediction is distribution-free for exchangeable data.
     #[test]
+    #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
     fn conformal_coverage_for_heavy_tailed() {
         let mut predictor = ConformalPredictor::new(200, 0.90);
 
@@ -298,7 +309,7 @@ mod tests {
             .map(|i| {
                 // Simple hash-based pseudo-random: maps i to a deterministic
                 // but well-distributed value.
-                let h = (i as u64).wrapping_mul(2654435761).wrapping_add(13) % 10000;
+                let h = (i as u64).wrapping_mul(2_654_435_761).wrapping_add(13) % 10000;
                 let u = (h as f64 + 0.5) / 10001.0; // (0, 1)
                 // Map through tan for heavy tails, but clamp to avoid infinity.
                 let angle = (u - 0.5) * std::f64::consts::PI * 0.95;
@@ -319,13 +330,14 @@ mod tests {
 
     /// Prediction interval contains the correct coverage metadata.
     #[test]
+    #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
     fn conformal_interval_metadata() {
         let mut predictor = ConformalPredictor::new(500, 0.90);
 
         // Feed stable data.
         for i in 0..100 {
             // Use hash-based scramble for stable pseudo-random values.
-            let h = (i as u64).wrapping_mul(2654435761) % 1000;
+            let h = (i as u64).wrapping_mul(2_654_435_761) % 1000;
             predictor.observe((h as f64 / 1000.0).mul_add(0.2, 5.0) - 0.1);
         }
 

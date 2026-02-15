@@ -77,10 +77,12 @@ impl NigStats {
 
         let z = (x - self.mu) / scale;
         let half_df = df / 2.0;
-        let half_df_plus_half = f64::midpoint(df, 1.0);
+        let nu_term = f64::midpoint(df, 1.0);
 
-        0.5f64.mul_add(-(df * std::f64::consts::PI * scale_sq).ln(), ln_gamma(half_df_plus_half) - ln_gamma(half_df))
-            - half_df_plus_half * (z * z / df).ln_1p()
+        0.5f64.mul_add(
+            -(df * std::f64::consts::PI * scale_sq).ln(),
+            ln_gamma(nu_term) - ln_gamma(half_df),
+        ) - nu_term * (z * z / df).ln_1p()
     }
 
     /// Predictive mean (= the current posterior mean of mu).
@@ -90,6 +92,7 @@ impl NigStats {
 }
 
 /// Log-gamma function via the Lanczos approximation (g=7, n=9).
+#[allow(clippy::cast_precision_loss, clippy::items_after_statements)]
 fn ln_gamma(x: f64) -> f64 {
     if x <= 0.0 {
         return f64::INFINITY;
@@ -243,15 +246,18 @@ impl BocpdDetector {
         let mut new_log_run_dist = Vec::with_capacity(n + 1);
 
         // Change-point: run length resets to 0.
-        let cp_terms: Vec<f64> = (0..n)
-            .map(|r| self.log_run_dist[r] + log_pred[r] + log_hazard)
+        let cp_terms: Vec<f64> = self
+            .log_run_dist
+            .iter()
+            .zip(log_pred.iter())
+            .map(|(log_r, log_p)| log_r + log_p + log_hazard)
             .collect();
         let log_cp = log_sum_exp(&cp_terms);
         new_log_run_dist.push(log_cp);
 
         // Growth: run length increases by 1.
-        for r in 0..n {
-            let log_growth = self.log_run_dist[r] + log_pred[r] + log_1_minus_hazard;
+        for (log_r, log_p) in self.log_run_dist.iter().zip(log_pred.iter()) {
+            let log_growth = log_r + log_p + log_1_minus_hazard;
             new_log_run_dist.push(log_growth);
         }
 
@@ -340,10 +346,7 @@ impl BocpdDetector {
     /// Cumulative posterior mass on run lengths < `CHANGE_WINDOW`.
     fn short_run_mass(&self) -> f64 {
         let window = CHANGE_WINDOW.min(self.log_run_dist.len());
-        self.log_run_dist[..window]
-            .iter()
-            .map(|v| v.exp())
-            .sum()
+        self.log_run_dist[..window].iter().map(|v| v.exp()).sum()
     }
 
     /// Current run-length posterior distribution (probabilities, not log).
@@ -374,10 +377,7 @@ fn log_sum_exp(log_vals: &[f64]) -> f64 {
     if log_vals.is_empty() {
         return f64::NEG_INFINITY;
     }
-    let max = log_vals
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let max = log_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if max == f64::NEG_INFINITY {
         return f64::NEG_INFINITY;
     }
@@ -563,6 +563,7 @@ mod tests {
 
     /// Log-sum-exp helper is numerically stable.
     #[test]
+    #[allow(clippy::float_cmp)]
     fn log_sum_exp_stable() {
         let vals = vec![1000.0, 1001.0, 999.0];
         let result = log_sum_exp(&vals);

@@ -142,7 +142,9 @@ fn sqlite_path_component(database_url: &str) -> Option<&str> {
     let url = database_url.trim();
     let stripped = if let Some(rest) = url.strip_prefix("sqlite+aiosqlite://") {
         rest
-    } else { url.strip_prefix("sqlite://")? };
+    } else {
+        url.strip_prefix("sqlite://")?
+    };
     Some(stripped.split(['?', '#']).next().unwrap_or(stripped))
 }
 

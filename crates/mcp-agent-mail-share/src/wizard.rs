@@ -630,6 +630,19 @@ mod tests {
     }
 
     #[test]
+    fn provider_identifiers_and_labels_are_stable() {
+        assert_eq!(HostingProvider::GithubPages.id(), "github_pages");
+        assert_eq!(HostingProvider::CloudflarePages.id(), "cloudflare_pages");
+        assert_eq!(HostingProvider::GithubPages.display_name(), "GitHub Pages");
+        assert_eq!(HostingProvider::S3.display_name(), "Amazon S3");
+        assert!(
+            HostingProvider::Netlify
+                .description()
+                .contains("Continuous deployment")
+        );
+    }
+
+    #[test]
     fn error_code_exit_codes_are_stable() {
         // These exit codes must not change
         assert_eq!(WizardErrorCode::BundleNotFound.code(), 1);
@@ -637,6 +650,15 @@ mod tests {
         assert_eq!(WizardErrorCode::CommandFailed.code(), 3);
         assert_eq!(WizardErrorCode::UserCancelled.code(), 130);
         assert_eq!(WizardErrorCode::InternalError.code(), 99);
+    }
+
+    #[test]
+    fn error_code_categories_are_grouped_correctly() {
+        assert_eq!(WizardErrorCode::BundleInvalid.category(), "validation");
+        assert_eq!(WizardErrorCode::ToolNotFound.category(), "environment");
+        assert_eq!(WizardErrorCode::VerificationFailed.category(), "execution");
+        assert_eq!(WizardErrorCode::UserCancelled.category(), "cancelled");
+        assert_eq!(WizardErrorCode::InternalError.category(), "internal");
     }
 
     #[test]
@@ -662,6 +684,51 @@ mod tests {
         assert!(json.contains("\"success\": true"));
         assert!(json.contains("\"provider\": \"github_pages\""));
         assert!(json.contains("https://example.github.io/agent-mail"));
+    }
+
+    #[test]
+    fn json_output_failure_contains_error_details() {
+        let error = WizardError::new(WizardErrorCode::CommandFailed, "deploy failed");
+        let output = WizardJsonOutput::failure(error, Some(PathBuf::from("/tmp/bundle")));
+        assert!(!output.success);
+        assert!(output.provider.is_empty());
+        assert_eq!(output.bundle_path, "/tmp/bundle");
+        assert_eq!(output.error.as_deref(), Some("deploy failed"));
+        assert_eq!(output.error_code.as_deref(), Some("COMMAND_FAILED"));
+    }
+
+    #[test]
+    fn json_output_with_environment_and_plan_populates_fields() {
+        let base = WizardJsonOutput::failure(
+            WizardError::new(WizardErrorCode::InternalError, "internal"),
+            None,
+        );
+        let env = DetectedEnvironment {
+            github_env: true,
+            ..Default::default()
+        };
+        let plan = DeploymentPlan {
+            provider: HostingProvider::GithubPages,
+            bundle_path: PathBuf::from("/tmp/bundle"),
+            steps: vec![PlanStep {
+                index: 1,
+                id: "generate".to_string(),
+                description: "Generate workflow".to_string(),
+                command: Some("am share wizard --provider github_pages".to_string()),
+                optional: false,
+                requires_confirm: true,
+            }],
+            expected_url: Some("https://example.github.io/repo".to_string()),
+            generated_files: vec![PathBuf::from("deploy.yml")],
+            warnings: vec!["Manual DNS check recommended".to_string()],
+        };
+
+        let output = base.with_environment(env).with_plan(plan.clone());
+        assert!(output.environment.is_some());
+        assert_eq!(
+            output.plan.expect("plan should be set").provider,
+            plan.provider
+        );
     }
 
     #[test]

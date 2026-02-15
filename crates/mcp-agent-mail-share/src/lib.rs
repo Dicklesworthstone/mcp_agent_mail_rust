@@ -511,3 +511,301 @@ pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportC
         scrub_preset,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn export_redaction_policy_presets_map_to_expected_flags() {
+        let standard = ExportRedactionPolicy::from_preset(ScrubPreset::Standard);
+        assert!(standard.scan_secrets);
+        assert!(!standard.redact_bodies);
+        assert!(!standard.redact_recipients);
+        assert!(standard.is_active());
+
+        let strict = ExportRedactionPolicy::from_preset(ScrubPreset::Strict);
+        assert!(strict.scan_secrets);
+        assert!(strict.redact_bodies);
+        assert!(strict.redact_recipients);
+        assert!(strict.is_active());
+
+        let archive = ExportRedactionPolicy::from_preset(ScrubPreset::Archive);
+        assert!(!archive.scan_secrets);
+        assert!(!archive.redact_bodies);
+        assert!(!archive.redact_recipients);
+        assert!(!archive.is_active());
+    }
+
+    #[test]
+    fn redaction_audit_log_records_reason_counters() {
+        let mut log = RedactionAuditLog::default();
+        log.record(
+            RedactionReason::SecretDetected,
+            "msg-1".to_string(),
+            Some(1),
+        );
+        log.record(RedactionReason::BodyRedacted, "msg-2".to_string(), Some(2));
+        log.record(RedactionReason::ScrubPreset, "msg-3".to_string(), Some(3));
+        log.record(
+            RedactionReason::SnippetExcluded,
+            "search-1".to_string(),
+            None,
+        );
+        log.record(
+            RedactionReason::RecipientsHidden,
+            "msg-4".to_string(),
+            Some(4),
+        );
+
+        assert_eq!(log.total(), 5);
+        assert_eq!(log.events.len(), 5);
+        assert_eq!(log.secrets_caught, 1);
+        assert_eq!(log.bodies_redacted, 2);
+        assert_eq!(log.snippets_filtered, 1);
+        assert_eq!(log.recipients_hidden, 1);
+        assert_eq!(
+            RedactionReason::SnippetExcluded.description(),
+            "Search snippet excluded to prevent content leakage"
+        );
+    }
+
+    #[test]
+    fn normalize_scrub_preset_accepts_case_and_trims() {
+        assert_eq!(
+            normalize_scrub_preset("  StRiCt  ").expect("strict preset should parse"),
+            ScrubPreset::Strict
+        );
+        assert_eq!(
+            normalize_scrub_preset("standard").expect("standard preset should parse"),
+            ScrubPreset::Standard
+        );
+        assert_eq!(
+            normalize_scrub_preset("archive").expect("archive preset should parse"),
+            ScrubPreset::Archive
+        );
+    }
+
+    #[test]
+    fn normalize_scrub_preset_rejects_unknown_values() {
+        let err = normalize_scrub_preset("  unknown  ").expect_err("expected invalid preset");
+        match err {
+            ShareError::InvalidScrubPreset { preset } => assert_eq!(preset, "unknown"),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adjust_detach_threshold_preserves_or_bumps_value() {
+        assert_eq!(adjust_detach_threshold(10_000, 20_000), 20_000);
+        assert_eq!(adjust_detach_threshold(10_000, 10_000), 15_000);
+        assert_eq!(adjust_detach_threshold(512, 1), 1_536);
+    }
+
+    #[test]
+    fn validate_thresholds_rejects_invalid_inputs() {
+        let cases = [
+            ("inline_threshold", -1, 10, 20, 1024),
+            ("detach_threshold", 1, -10, 20, 1024),
+            ("chunk_threshold", 1, 10, -20, 1024),
+            ("chunk_size", 1, 10, 20, 1023),
+        ];
+        for (field, inline, detach, chunk_threshold, chunk_size) in cases {
+            let err = validate_thresholds(inline, detach, chunk_threshold, chunk_size)
+                .expect_err("expected invalid threshold");
+            match err {
+                ShareError::InvalidThreshold {
+                    field: actual_field,
+                    ..
+                } => assert_eq!(actual_field, field),
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_thresholds_accepts_non_negative_and_min_chunk_size() {
+        validate_thresholds(0, 0, 0, 1024).expect("thresholds should be valid");
+    }
+
+    #[test]
+    fn default_decrypt_output_strips_age_extension() {
+        assert_eq!(
+            default_decrypt_output(Path::new("/tmp/export.zip.age")),
+            PathBuf::from("/tmp/export.zip")
+        );
+        assert_eq!(
+            default_decrypt_output(Path::new("/tmp/export.tar.AGE")),
+            PathBuf::from("/tmp/export.tar")
+        );
+    }
+
+    #[test]
+    fn default_decrypt_output_adds_suffix_for_non_age_files() {
+        assert_eq!(
+            default_decrypt_output(Path::new("/tmp/export.tar.gz")),
+            PathBuf::from("/tmp/export.tar_decrypted.gz")
+        );
+        assert_eq!(
+            default_decrypt_output(Path::new("/tmp/export")),
+            PathBuf::from("/tmp/export_decrypted")
+        );
+    }
+
+    #[test]
+    fn resolve_sqlite_database_path_handles_prefixes_and_relative_paths() {
+        assert_eq!(
+            resolve_sqlite_database_path("sqlite:////tmp/agent-mail.sqlite3")
+                .expect("absolute path should resolve"),
+            PathBuf::from("/tmp/agent-mail.sqlite3")
+        );
+
+        let relative = resolve_sqlite_database_path("sqlite:var/db.sqlite3")
+            .expect("relative path should resolve");
+        assert!(relative.ends_with(Path::new("var/db.sqlite3")));
+
+        assert_eq!(
+            resolve_sqlite_database_path("sqlite+aiosqlite:////tmp/agent-mail-aio.sqlite3")
+                .expect("aiosqlite prefix should resolve"),
+            PathBuf::from("/tmp/agent-mail-aio.sqlite3")
+        );
+    }
+
+    #[test]
+    fn resolve_sqlite_database_path_rejects_empty_input() {
+        let err = resolve_sqlite_database_path("").expect_err("empty url should fail");
+        match err {
+            ShareError::SnapshotSourceNotFound { path } => {
+                assert_eq!(path, "empty database URL");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_bundle_export_config_errors_when_manifest_missing() {
+        let dir = tempdir().expect("tempdir");
+        let err = load_bundle_export_config(dir.path()).expect_err("missing manifest should fail");
+        match err {
+            ShareError::ManifestNotFound { path } => {
+                assert_eq!(path, dir.path().display().to_string());
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_bundle_export_config_errors_on_invalid_manifest_json() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("manifest.json"), "{not json").expect("write manifest");
+
+        let err =
+            load_bundle_export_config(dir.path()).expect_err("invalid manifest should fail parse");
+        match err {
+            ShareError::ManifestParse { message } => {
+                assert!(!message.is_empty());
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_bundle_export_config_prefers_export_config_values() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = json!({
+            "export_config": {
+                "projects": ["alpha", "beta"],
+                "inline_threshold": "111",
+                "detach_threshold": 222,
+                "chunk_threshold": "333",
+                "chunk_size": "4444",
+                "scrub_preset": "strict"
+            },
+            "attachments": {
+                "config": {
+                    "inline_threshold": 9_999,
+                    "detach_threshold": 9_998
+                }
+            },
+            "project_scope": {"requested": ["fallback"]},
+            "scrub": {"preset": "archive"}
+        });
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let cfg = load_bundle_export_config(dir.path()).expect("manifest should parse");
+        assert_eq!(cfg.projects, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(cfg.inline_threshold, 111);
+        assert_eq!(cfg.detach_threshold, 222);
+        assert_eq!(cfg.chunk_threshold, 333);
+        assert_eq!(cfg.chunk_size, 4_444);
+        assert_eq!(cfg.scrub_preset, "strict");
+    }
+
+    #[test]
+    fn load_bundle_export_config_uses_fallback_sections_when_export_missing() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = json!({
+            "project_scope": {"requested": ["project-a"]},
+            "attachments": {
+                "config": {
+                    "inline_threshold": 1_500,
+                    "detach_threshold": 2_500
+                }
+            },
+            "database": {
+                "chunk_manifest": {
+                    "chunk_size": 3_072
+                }
+            },
+            "scrub": {"preset": "archive"}
+        });
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let cfg = load_bundle_export_config(dir.path()).expect("manifest should parse");
+        assert_eq!(cfg.projects, vec!["project-a".to_string()]);
+        assert_eq!(cfg.inline_threshold, 1_500);
+        assert_eq!(cfg.detach_threshold, 2_500);
+        assert_eq!(cfg.chunk_threshold, DEFAULT_CHUNK_THRESHOLD as i64);
+        assert_eq!(cfg.chunk_size, 3_072);
+        assert_eq!(cfg.scrub_preset, "archive");
+    }
+
+    #[test]
+    fn load_bundle_export_config_chunk_config_file_overrides_thresholds() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = json!({
+            "export_config": {
+                "chunk_threshold": 5_000,
+                "chunk_size": 6_000
+            }
+        });
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        let chunk_cfg = json!({
+            "chunk_size": "7000",
+            "threshold_bytes": "8000"
+        });
+        std::fs::write(
+            dir.path().join("mailbox.sqlite3.config.json"),
+            serde_json::to_string_pretty(&chunk_cfg).expect("serialize chunk config"),
+        )
+        .expect("write chunk config");
+
+        let cfg = load_bundle_export_config(dir.path()).expect("manifest should parse");
+        assert_eq!(cfg.chunk_size, 7_000);
+        assert_eq!(cfg.chunk_threshold, 8_000);
+    }
+}

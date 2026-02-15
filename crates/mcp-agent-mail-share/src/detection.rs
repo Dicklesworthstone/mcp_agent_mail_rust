@@ -530,6 +530,18 @@ mod tests {
     }
 
     #[test]
+    fn extract_github_repo_git_protocol() {
+        assert_eq!(
+            extract_github_repo("git://github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            extract_github_repo("git://github.com/owner/repo"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
     fn extract_github_repo_non_github() {
         assert_eq!(
             extract_github_repo("https://gitlab.com/owner/repo.git"),
@@ -610,6 +622,48 @@ mod tests {
         };
         let provider = determine_recommended_provider(&env);
         assert_eq!(provider, Some(HostingProvider::Netlify));
+    }
+
+    #[test]
+    fn determine_provider_requires_s3_signal_when_only_aws_env_present() {
+        let env = DetectedEnvironment {
+            aws_env: true,
+            ..Default::default()
+        };
+        let provider = determine_recommended_provider(&env);
+        assert_eq!(provider, None);
+    }
+
+    #[test]
+    fn find_ancestor_path_searches_from_file_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        let marker = dir.path().join("wrangler.toml");
+        std::fs::write(&marker, "name = \"demo\"").expect("write marker");
+        let source_file = nested.join("file.txt");
+        std::fs::write(&source_file, "content").expect("write file");
+
+        let found = find_ancestor_path(&source_file, "wrangler.toml")
+            .expect("expected ancestor path from file parent");
+        assert_eq!(found, marker);
+    }
+
+    #[test]
+    fn detect_environment_marks_existing_bundle_when_manifest_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle dir");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let env = detect_environment(Some(&bundle), dir.path());
+        assert_eq!(env.existing_bundle, Some(bundle.clone()));
+        assert!(
+            env.signals
+                .iter()
+                .any(|signal| signal.detail.contains("Bundle found at")),
+            "expected bundle-detected signal"
+        );
     }
 
     #[test]
