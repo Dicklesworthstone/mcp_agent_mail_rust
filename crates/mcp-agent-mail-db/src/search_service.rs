@@ -1754,6 +1754,7 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     #[test]
+    #[allow(clippy::needless_collect)]
     fn get_or_init_two_tier_bridge_initializes_once_under_contention() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;

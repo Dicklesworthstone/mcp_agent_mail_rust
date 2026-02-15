@@ -5628,6 +5628,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn list_recent_contact_agent_ids_union_matches_legacy_queries() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -6077,6 +6078,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_wrap)]
     fn list_recent_contact_agent_ids_caps_candidate_list_at_max_items() {
         use asupersync::runtime::RuntimeBuilder;
 

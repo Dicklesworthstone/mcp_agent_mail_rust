@@ -1736,7 +1736,9 @@ mod tests {
     fn sharded_single_thread_executes() {
         // Basic smoke test: single-threaded execution uses the shard correctly.
         let map: CoalesceMap<&str, i32> = CoalesceMap::new(100, Duration::from_millis(100));
-        let result = map.execute_or_join("shard-key-1", || Ok::<_, String>(42)).unwrap();
+        let result = map
+            .execute_or_join("shard-key-1", || Ok::<_, String>(42))
+            .unwrap();
         assert!(!result.was_joined());
         assert_eq!(result.into_inner(), 42);
         assert_eq!(map.inflight_count(), 0);
@@ -1888,7 +1890,9 @@ mod tests {
         assert_eq!(m.joined_count, 0);
 
         // Map still works after reset.
-        let r = map.execute_or_join("post-reset".to_string(), || Ok::<_, String>(7)).unwrap();
+        let r = map
+            .execute_or_join("post-reset".to_string(), || Ok::<_, String>(7))
+            .unwrap();
         assert_eq!(r.into_inner(), 7);
         assert_eq!(map.metrics().leader_count, 1);
     }

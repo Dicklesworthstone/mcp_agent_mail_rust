@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use mcp_agent_mail_core::evidence_ledger::{evidence_ledger, EvidenceLedger, EvidenceLedgerEntry};
+use mcp_agent_mail_core::evidence_ledger::{EvidenceLedger, EvidenceLedgerEntry, evidence_ledger};
 use mcp_agent_mail_db::coalesce::CoalesceMap;
 use mcp_agent_mail_db::models::ProjectRow;
 use mcp_agent_mail_db::read_cache;
@@ -229,10 +229,16 @@ fn evidence_integration_jsonl_roundtrip() {
 
     // Verify hit_rate computation
     let cache_rate = ledger.hit_rate("cache.eviction", 10);
-    assert!((cache_rate - 1.0).abs() < 1e-9, "cache hit_rate should be 1.0 (1/1 correct)");
+    assert!(
+        (cache_rate - 1.0).abs() < 1e-9,
+        "cache hit_rate should be 1.0 (1/1 correct)"
+    );
 
     let tui_rate = ledger.hit_rate("tui.diff_strategy", 10);
-    assert!((tui_rate - 0.0).abs() < 1e-9, "tui hit_rate should be 0.0 (0/1 correct)");
+    assert!(
+        (tui_rate - 0.0).abs() < 1e-9,
+        "tui hit_rate should be 0.0 (0/1 correct)"
+    );
 }
 
 /// 7. Full storage flow exercises all decision points and verifies entries.

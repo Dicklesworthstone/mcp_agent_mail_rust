@@ -18,7 +18,7 @@ const OPS: usize = 100_000;
 /// (simulating popular items accessed more frequently).
 const fn zipf_key(step: usize, n_unique: usize) -> usize {
     // Hash-like scramble to avoid trivial patterns
-    let h = step.wrapping_mul(2654435761) >> 16;
+    let h = step.wrapping_mul(2_654_435_761) >> 16;
     // Square to bias toward low ranks (Zipf-like)
     let rank = h % n_unique;
     (rank * rank) % n_unique

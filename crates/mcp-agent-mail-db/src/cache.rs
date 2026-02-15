@@ -1314,6 +1314,7 @@ mod tests {
     /// 3. `readcache_s3fifo_capacity_respected` -- insert > capacity items,
     ///    verify `len()` never exceeds capacity.
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn readcache_s3fifo_capacity_respected() {
         let cap = 20;
         let cache = ReadCache::with_capacity(cap);
@@ -1406,6 +1407,11 @@ mod tests {
     /// 6. `readcache_s3fifo_hit_rate_not_regressed` -- synthetic Zipf workload,
     ///    verifies S3-FIFO hit-rate is competitive with LRU baseline.
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     fn readcache_s3fifo_hit_rate_not_regressed() {
         let cap = 100;
         let cache = ReadCache::with_capacity(cap);

@@ -36,7 +36,8 @@ impl Lcg {
         self.state
     }
 
-    fn next_key(&mut self, n_unique: usize) -> usize {
+    #[allow(clippy::cast_possible_truncation)]
+    const fn next_key(&mut self, n_unique: usize) -> usize {
         (self.next() % n_unique as u64) as usize
     }
 }
@@ -110,6 +111,7 @@ fn golden_s3fifo_deterministic() {
         let fixture: serde_json::Value =
             serde_json::from_str(&content).expect("parse golden fixture");
 
+        #[allow(clippy::cast_possible_truncation)]
         let expected_keys: Vec<usize> = fixture["s3fifo"]["keys"]
             .as_array()
             .unwrap()
@@ -164,6 +166,7 @@ fn golden_s3fifo_deterministic() {
 /// 2. `bench_s3fifo_faster_than_lru_eviction` -- measure eviction-heavy workload,
 ///    assert S3-FIFO is faster.
 #[test]
+#[allow(clippy::cast_precision_loss)]
 fn bench_s3fifo_faster_than_lru_eviction() {
     use std::time::Instant;
 
@@ -204,6 +207,7 @@ fn bench_s3fifo_faster_than_lru_eviction() {
 
 /// 3. `hit_rate_comparison_zipf` -- Zipf workload, S3-FIFO hit-rate >= 0.97 * LRU.
 #[test]
+#[allow(clippy::cast_precision_loss)]
 fn hit_rate_comparison_zipf() {
     let cap = 100;
     let n_unique = 1_000;

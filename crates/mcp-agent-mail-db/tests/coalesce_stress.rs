@@ -13,9 +13,13 @@ use mcp_agent_mail_db::coalesce::CoalesceMap;
 
 /// 50 threads on the same key. All must complete. At least one should join.
 #[test]
+#[allow(clippy::needless_collect)]
 fn stress_sharded_50_threads_same_key() {
     let n = 50;
-    let map = Arc::new(CoalesceMap::<String, i32>::new(200, Duration::from_secs(10)));
+    let map = Arc::new(CoalesceMap::<String, i32>::new(
+        200,
+        Duration::from_secs(10),
+    ));
     let barrier = Arc::new(Barrier::new(n));
     let exec_count = Arc::new(AtomicUsize::new(0));
 
@@ -62,9 +66,13 @@ fn stress_sharded_50_threads_same_key() {
 
 /// 50 threads with 50 distinct keys. Each should execute independently.
 #[test]
+#[allow(clippy::needless_collect, clippy::cast_possible_truncation)]
 fn stress_sharded_50_threads_50_keys() {
     let n = 50;
-    let map = Arc::new(CoalesceMap::<String, usize>::new(200, Duration::from_millis(500)));
+    let map = Arc::new(CoalesceMap::<String, usize>::new(
+        200,
+        Duration::from_millis(500),
+    ));
     let barrier = Arc::new(Barrier::new(n));
     let exec_count = Arc::new(AtomicUsize::new(0));
 
@@ -108,10 +116,14 @@ fn stress_sharded_50_threads_50_keys() {
 
 /// 100 threads with 10 distinct keys (10 threads per key). Verify coalescing.
 #[test]
+#[allow(clippy::needless_collect)]
 fn stress_sharded_mixed_keys_100_threads() {
     let n = 100;
     let keys = 10;
-    let map = Arc::new(CoalesceMap::<String, usize>::new(200, Duration::from_secs(10)));
+    let map = Arc::new(CoalesceMap::<String, usize>::new(
+        200,
+        Duration::from_secs(10),
+    ));
     let barrier = Arc::new(Barrier::new(n));
     let exec_count = Arc::new(AtomicUsize::new(0));
 
@@ -172,7 +184,9 @@ fn stress_sharded_rapid_fire_1000_sequential() {
 
     let start = Instant::now();
     for i in 0..1000 {
-        let r = map.execute_or_join("rapid-fire", || Ok::<_, String>(i)).unwrap();
+        let r = map
+            .execute_or_join("rapid-fire", || Ok::<_, String>(i))
+            .unwrap();
         assert!(!r.was_joined(), "sequential calls should never join");
         assert_eq!(r.into_inner(), i);
         assert_eq!(map.inflight_count(), 0, "inflight must be 0 after each op");
@@ -193,7 +207,7 @@ fn stress_sharded_rapid_fire_1000_sequential() {
 }
 
 /// Isomorphism proof: for a deterministic sequence of operations, verify
-/// structural invariants hold. Since we can't compare against a SingleCoalesceMap
+/// structural invariants hold. Since we can't compare against a `SingleCoalesceMap`
 /// (not in the crate), we verify the key properties that must hold for ANY
 /// correct coalescer implementation:
 ///
@@ -210,7 +224,10 @@ fn isomorphism_structural_invariants() {
     for i in 0..500 {
         let key = format!("iso-{i}");
         let result = map.execute_or_join(key, || Ok::<_, String>(i)).unwrap();
-        assert!(!result.was_joined(), "distinct sequential key should not join");
+        assert!(
+            !result.was_joined(),
+            "distinct sequential key should not join"
+        );
         assert_eq!(result.into_inner(), i, "value mismatch for key {i}");
     }
 
@@ -267,6 +284,7 @@ fn isomorphism_structural_invariants() {
 /// by checking that concurrent distinct-key operations complete faster than
 /// sequential single-shard operations.
 #[test]
+#[allow(clippy::needless_collect)]
 fn shard_distribution_concurrency_benefit() {
     // Baseline: 16 sequential operations on the same key (all go to one shard).
     let map_seq: CoalesceMap<String, usize> = CoalesceMap::new(200, Duration::from_millis(500));
@@ -320,11 +338,15 @@ fn shard_distribution_concurrency_benefit() {
 
 /// Concurrent shard access: verify per-key correctness with many keys and threads.
 #[test]
+#[allow(clippy::needless_collect)]
 fn stress_correctness_per_key_results() {
     let n_keys = 20;
     let threads_per_key = 5;
     let total = n_keys * threads_per_key;
-    let map = Arc::new(CoalesceMap::<String, String>::new(200, Duration::from_secs(10)));
+    let map = Arc::new(CoalesceMap::<String, String>::new(
+        200,
+        Duration::from_secs(10),
+    ));
     let barrier = Arc::new(Barrier::new(total));
 
     let handles: Vec<_> = (0..total)
