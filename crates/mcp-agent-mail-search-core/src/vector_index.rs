@@ -23,9 +23,13 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::document::DocKind;
 use crate::error::{SearchError, SearchResult};
+use crate::fs_bridge::map_fs_error;
+use frankensearch::core::filter::SearchFilter;
+use frankensearch::VectorIndex as FsVectorIndex;
 
 // ────────────────────────────────────────────────────────────────────
 // Types
@@ -257,6 +261,62 @@ impl VectorFilter {
     }
 }
 
+/// Separator for encoded frankensearch doc keys.
+const FS_DOC_KEY_SEPARATOR: &str = "::";
+
+/// Counter used to generate collision-free temporary probe index paths.
+static FS_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Encode a domain doc reference as a stable frankensearch string doc key.
+fn to_fs_doc_key(doc_id: i64, doc_kind: DocKind) -> String {
+    format!("{doc_id}{FS_DOC_KEY_SEPARATOR}{doc_kind}")
+}
+
+/// Build a temporary path for a one-shot frankensearch probe index.
+fn fs_probe_index_path() -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    let nonce = FS_PROBE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let pid = std::process::id();
+    path.push(format!("mcp-agent-mail-vector-probe-{pid}-{nonce}.fsvi"));
+    path
+}
+
+/// Adapter that applies [`VectorFilter`] semantics to frankensearch `SearchFilter`.
+#[derive(Debug)]
+pub struct FsVectorFilterAdapter<'a> {
+    filter: Option<&'a VectorFilter>,
+    metadata_by_doc_key: &'a HashMap<String, VectorMetadata>,
+}
+
+impl<'a> FsVectorFilterAdapter<'a> {
+    /// Create a new adapter from an optional filter and metadata map.
+    #[must_use]
+    pub const fn new(
+        filter: Option<&'a VectorFilter>,
+        metadata_by_doc_key: &'a HashMap<String, VectorMetadata>,
+    ) -> Self {
+        Self {
+            filter,
+            metadata_by_doc_key,
+        }
+    }
+}
+
+impl SearchFilter for FsVectorFilterAdapter<'_> {
+    fn matches(&self, doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
+        let Some(active_filter) = self.filter else {
+            return true;
+        };
+        self.metadata_by_doc_key
+            .get(doc_id)
+            .is_some_and(|meta| active_filter.matches(meta))
+    }
+
+    fn name(&self) -> &str {
+        "mcp-agent-mail-vector-filter-adapter"
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Index entry
 // ────────────────────────────────────────────────────────────────────
@@ -457,6 +517,87 @@ impl VectorIndex {
         Ok(candidates)
     }
 
+    /// Probe seam: run search through `frankensearch::VectorIndex` while preserving
+    /// the current `VectorHit` metadata contract.
+    ///
+    /// This is an explicit migration helper and does not alter the default search path.
+    ///
+    /// # Errors
+    /// Returns `SearchError::InvalidQuery` for dimension mismatches and maps
+    /// frankensearch failures via `fs_bridge::map_fs_error`.
+    pub fn search_with_frankensearch_probe(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&VectorFilter>,
+    ) -> SearchResult<Vec<VectorHit>> {
+        if query.len() != self.config.dimension {
+            return Err(SearchError::InvalidQuery(format!(
+                "Query dimension mismatch: expected {}, got {}",
+                self.config.dimension,
+                query.len()
+            )));
+        }
+
+        if self.entries.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query_normalized = crate::embedder::normalize_l2(query);
+        let index_path = fs_probe_index_path();
+
+        let mut writer = FsVectorIndex::create(
+            &index_path,
+            "mcp-agent-mail-search-core-vector-probe",
+            self.config.dimension,
+        )
+        .map_err(map_fs_error)?;
+
+        let mut metadata_by_doc_key: HashMap<String, VectorMetadata> =
+            HashMap::with_capacity(self.entries.len());
+
+        for entry in &self.entries {
+            let doc_key = to_fs_doc_key(entry.metadata.doc_id, entry.metadata.doc_kind);
+            writer
+                .write_record(&doc_key, &entry.vector)
+                .map_err(map_fs_error)?;
+            metadata_by_doc_key.insert(doc_key, entry.metadata.clone());
+        }
+
+        writer.finish().map_err(map_fs_error)?;
+
+        let fs_index = FsVectorIndex::open(&index_path).map_err(map_fs_error)?;
+        let filter_adapter = FsVectorFilterAdapter::new(filter, &metadata_by_doc_key);
+        let fs_hits = fs_index
+            .search_top_k(&query_normalized, k, Some(&filter_adapter))
+            .map_err(map_fs_error)?;
+        drop(fs_index);
+
+        let mut hits = Vec::with_capacity(fs_hits.len());
+        for hit in fs_hits {
+            if let Some(meta) = metadata_by_doc_key.get(&hit.doc_id) {
+                let index_position = usize::try_from(hit.index).map_err(|_| {
+                    SearchError::Internal(format!(
+                        "frankensearch hit index {} does not fit usize",
+                        hit.index
+                    ))
+                })?;
+                hits.push(VectorHit::new(
+                    meta.doc_id,
+                    meta.doc_kind,
+                    meta.project_id,
+                    hit.score,
+                    index_position,
+                ));
+            }
+        }
+
+        let _ = std::fs::remove_file(&index_path);
+        let _ = std::fs::remove_file(frankensearch::index::wal_path_for(&index_path));
+
+        Ok(hits)
+    }
+
     /// Get a vector by document reference.
     #[must_use]
     pub fn get(&self, doc_id: i64, doc_kind: DocKind) -> Option<&IndexEntry> {
@@ -564,6 +705,7 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch::core::filter::SearchFilter as _;
 
     fn make_entry(doc_id: i64, kind: DocKind, vector: &[f32]) -> IndexEntry {
         IndexEntry::new(vector, VectorMetadata::new(doc_id, kind, "test-model"))
@@ -1345,5 +1487,126 @@ mod tests {
         let ids: Vec<i64> = results.iter().map(|h| h.doc_id).collect();
         assert!(!ids.contains(&2));
         assert!(!ids.contains(&4));
+    }
+
+    #[test]
+    fn fs_vector_filter_adapter_matches_vector_filter_rules() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            to_fs_doc_key(1, DocKind::Message),
+            VectorMetadata::new(1, DocKind::Message, "m").with_project(7),
+        );
+        metadata.insert(
+            to_fs_doc_key(2, DocKind::Agent),
+            VectorMetadata::new(2, DocKind::Agent, "m").with_project(7),
+        );
+        metadata.insert(
+            to_fs_doc_key(3, DocKind::Message),
+            VectorMetadata::new(3, DocKind::Message, "m").with_project(9),
+        );
+
+        let filter = VectorFilter::new()
+            .with_project(7)
+            .with_doc_kinds(vec![DocKind::Message]);
+
+        let adapter = FsVectorFilterAdapter::new(Some(&filter), &metadata);
+        assert!(adapter.matches(&to_fs_doc_key(1, DocKind::Message), None));
+        assert!(!adapter.matches(&to_fs_doc_key(2, DocKind::Agent), None));
+        assert!(!adapter.matches(&to_fs_doc_key(3, DocKind::Message), None));
+        assert!(!adapter.matches("999::message", None));
+    }
+
+    #[test]
+    fn search_with_frankensearch_probe_matches_legacy_search() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+
+        index
+            .upsert(make_entry_with_project(
+                1,
+                DocKind::Message,
+                42,
+                &[1.0, 0.0, 0.0],
+            ))
+            .unwrap();
+        index
+            .upsert(make_entry_with_project(
+                2,
+                DocKind::Message,
+                42,
+                &[0.8, 0.2, 0.0],
+            ))
+            .unwrap();
+        index
+            .upsert(make_entry_with_project(
+                3,
+                DocKind::Agent,
+                7,
+                &[0.0, 1.0, 0.0],
+            ))
+            .unwrap();
+
+        let query = [1.0, 0.0, 0.0];
+        let legacy = index.search(&query, 3, None).unwrap();
+        let probe = index
+            .search_with_frankensearch_probe(&query, 3, None)
+            .unwrap();
+
+        assert_eq!(legacy.len(), probe.len());
+        for (left, right) in legacy.iter().zip(probe.iter()) {
+            assert_eq!(left.doc_id, right.doc_id);
+            assert_eq!(left.doc_kind, right.doc_kind);
+            assert_eq!(left.project_id, right.project_id);
+            assert!((left.score - right.score).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn search_with_frankensearch_probe_honors_filters() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+
+        index
+            .upsert(make_entry_with_project(
+                1,
+                DocKind::Message,
+                11,
+                &[1.0, 0.0, 0.0],
+            ))
+            .unwrap();
+        index
+            .upsert(make_entry_with_project(
+                2,
+                DocKind::Agent,
+                11,
+                &[0.9, 0.1, 0.0],
+            ))
+            .unwrap();
+        index
+            .upsert(make_entry_with_project(
+                3,
+                DocKind::Message,
+                22,
+                &[0.8, 0.2, 0.0],
+            ))
+            .unwrap();
+
+        let filter = VectorFilter::new()
+            .with_project(11)
+            .with_doc_kinds(vec![DocKind::Message]);
+        let query = [1.0, 0.0, 0.0];
+
+        let legacy = index.search(&query, 10, Some(&filter)).unwrap();
+        let probe = index
+            .search_with_frankensearch_probe(&query, 10, Some(&filter))
+            .unwrap();
+
+        let legacy_ids: Vec<i64> = legacy.iter().map(|hit| hit.doc_id).collect();
+        let probe_ids: Vec<i64> = probe.iter().map(|hit| hit.doc_id).collect();
+        assert_eq!(legacy_ids, probe_ids);
     }
 }
