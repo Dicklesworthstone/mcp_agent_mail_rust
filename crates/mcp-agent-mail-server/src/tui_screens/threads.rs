@@ -1709,35 +1709,74 @@ fn render_thread_detail(
 
     let mut header_lines = Vec::new();
     if let Some(t) = thread {
-        header_lines.push(Line::raw(format!(
-            "Thread: {}  |  Loaded: {}/{}  |  Unread: {}",
-            truncate_str(&t.thread_id, inner.width.saturating_sub(34) as usize),
-            loaded_message_count,
-            total_thread_messages,
-            t.unread_count,
-        )));
-        header_lines.push(Line::raw(format!(
-            "Participants ({})  |  {} -> {}",
-            t.participant_count,
-            iso_compact_time(&t.first_timestamp_iso),
-            iso_compact_time(&t.last_timestamp_iso),
-        )));
+        // Thread identity + counts
+        let unread_span = if t.unread_count > 0 {
+            Span::styled(
+                format!("  {} unread", t.unread_count),
+                crate::tui_theme::text_accent(&tp),
+            )
+        } else {
+            Span::raw("")
+        };
+        header_lines.push(Line::from_spans([
+            Span::styled("Thread: ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                truncate_str(&t.thread_id, inner.width.saturating_sub(34) as usize),
+                Style::default().fg(tp.text_primary).bold(),
+            ),
+            Span::styled(
+                format!("  {loaded_message_count}/{total_thread_messages} loaded"),
+                crate::tui_theme::text_meta(&tp),
+            ),
+            unread_span,
+        ]));
+        // Participants + time span
+        header_lines.push(Line::from_spans([
+            Span::styled(
+                format!("{} participants", t.participant_count),
+                crate::tui_theme::text_meta(&tp),
+            ),
+            Span::styled(
+                format!("  {} \u{2192} {}", iso_compact_time(&t.first_timestamp_iso), iso_compact_time(&t.last_timestamp_iso)),
+                crate::tui_theme::text_hint(&tp),
+            ),
+        ]));
         if !t.participant_names.is_empty() {
-            header_lines.push(Line::raw(format!(
-                "Agents: {}",
-                truncate_str(&t.participant_names, inner.width.saturating_sub(8) as usize)
-            )));
+            header_lines.push(Line::from_spans([
+                Span::styled("Agents: ", crate::tui_theme::text_meta(&tp)),
+                Span::styled(
+                    truncate_str(&t.participant_names, inner.width.saturating_sub(8) as usize),
+                    Style::default().fg(tp.text_secondary),
+                ),
+            ]));
         }
     }
-    header_lines.push(Line::raw(if tree_focus {
-        "Mode: Tree (Tab -> Preview)".to_string()
+    // Mode indicator with styled keybind
+    header_lines.push(if tree_focus {
+        Line::from_spans([
+            Span::styled("Mode: ", crate::tui_theme::text_meta(&tp)),
+            Span::styled("Tree", Style::default().fg(tp.text_primary).bold()),
+            Span::styled("  ", Style::default()),
+            Span::styled("Tab", crate::tui_theme::text_action_key(&tp)),
+            Span::styled(" Preview", crate::tui_theme::text_hint(&tp)),
+        ])
     } else {
-        "Mode: Preview (Tab -> Tree)".to_string()
-    }));
+        Line::from_spans([
+            Span::styled("Mode: ", crate::tui_theme::text_meta(&tp)),
+            Span::styled("Preview", Style::default().fg(tp.text_primary).bold()),
+            Span::styled("  ", Style::default()),
+            Span::styled("Tab", crate::tui_theme::text_action_key(&tp)),
+            Span::styled(" Tree", crate::tui_theme::text_hint(&tp)),
+        ])
+    });
     if has_older_messages {
-        header_lines.push(Line::raw(format!(
-            "[Load {remaining_older_count} older messages] (o)"
-        )));
+        header_lines.push(Line::from_spans([
+            Span::styled("o", crate::tui_theme::text_action_key(&tp)),
+            Span::styled(
+                format!(" Load {remaining_older_count} older messages"),
+                crate::tui_theme::text_hint(&tp),
+            ),
+        ]));
     }
 
     let header_height = header_lines.len().min(inner.height as usize).min(5) as u16;
@@ -1831,21 +1870,35 @@ fn render_thread_detail(
             )
         )));
     }
-    if selected_message.importance == "high" || selected_message.importance == "urgent" {
-        preview_header_spans.push(Span::raw(format!(
-            " [{}]",
-            selected_message.importance.to_ascii_uppercase()
-        )));
+    if selected_message.importance == "high" {
+        preview_header_spans.push(Span::styled(
+            " [HIGH]",
+            crate::tui_theme::text_warning(&tp),
+        ));
+    } else if selected_message.importance == "urgent" {
+        preview_header_spans.push(Span::styled(
+            " [URGENT]",
+            crate::tui_theme::text_critical(&tp),
+        ));
+    }
+    if selected_message.ack_required {
+        preview_header_spans.push(Span::styled(
+            " @ACK",
+            crate::tui_theme::text_accent(&tp),
+        ));
     }
     preview_lines.push(Line::from_spans(preview_header_spans));
     if !selected_message.subject.is_empty() {
-        preview_lines.push(Line::raw(format!(
-            "Subj: {}",
-            truncate_str(
-                &selected_message.subject,
-                preview_inner.width.saturating_sub(6) as usize
-            )
-        )));
+        preview_lines.push(Line::from_spans([
+            Span::styled("Subject: ", crate::tui_theme::text_meta(&tp)),
+            Span::styled(
+                truncate_str(
+                    &selected_message.subject,
+                    preview_inner.width.saturating_sub(9) as usize,
+                ),
+                Style::default().fg(tp.text_primary),
+            ),
+        ]));
     }
     preview_lines.push(Line::raw(String::new()));
 
@@ -2634,7 +2687,7 @@ mod tests {
 
         let text = buffer_to_text(&frame.buffer);
         assert!(
-            text.contains("Participants (3)"),
+            text.contains("3 participants"),
             "missing participant count: {text}"
         );
         assert!(
@@ -2678,7 +2731,7 @@ mod tests {
 
         let text = buffer_to_text(&frame.buffer);
         assert!(
-            text.contains("Subj: Child subject"),
+            text.contains("Subject: Child subject"),
             "preview did not follow selected tree row: {text}"
         );
     }
@@ -3610,5 +3663,52 @@ mod tests {
             10, 3, 2.5_f64,
         );
         assert_eq!(meta, "10m  3a  2.5/hr");
+    }
+
+    #[test]
+    fn detail_header_styled_importance_badges() {
+        // Verify HIGH and URGENT importance levels produce styled badges
+        // in the preview header (not plain text)
+        let mut msg = make_message(1);
+        msg.importance = "urgent".to_string();
+        msg.ack_required = true;
+        msg.subject = "Critical alert".to_string();
+
+        let messages = vec![msg];
+        let expanded: HashSet<i64> = HashSet::new();
+        let collapsed: HashSet<i64> = HashSet::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 24, &mut pool);
+
+        render_thread_detail(
+            &mut frame,
+            Rect::new(0, 0, 120, 24),
+            &messages,
+            None,
+            0,
+            0,
+            &expanded,
+            &collapsed,
+            false,
+            0,
+            1,
+            1,
+            true,
+            false,
+        );
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("[URGENT]"),
+            "missing styled URGENT badge: {text}"
+        );
+        assert!(
+            text.contains("@ACK"),
+            "missing ack-required indicator: {text}"
+        );
+        assert!(
+            text.contains("Subject: Critical alert"),
+            "missing styled subject line: {text}"
+        );
     }
 }
