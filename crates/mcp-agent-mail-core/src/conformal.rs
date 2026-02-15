@@ -150,7 +150,7 @@ impl ConformalPredictor {
             return 0.0;
         }
         if n % 2 == 0 {
-            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+            f64::midpoint(sorted[n / 2 - 1], sorted[n / 2])
         } else {
             sorted[n / 2]
         }
@@ -164,7 +164,7 @@ impl ConformalPredictor {
 
     /// Total observations seen (including those evicted from window).
     #[must_use]
-    pub fn total_observations(&self) -> usize {
+    pub const fn total_observations(&self) -> usize {
         self.total_count
     }
 
@@ -198,7 +198,7 @@ mod tests {
         let pseudo_normal: Vec<f64> = (0..10000)
             .map(|i| {
                 // Deterministic spread around 0 with varying magnitudes.
-                let phase = (i as f64) * 0.1;
+                let phase = f64::from(i) * 0.1;
                 phase.sin() * 2.0
             })
             .collect();
@@ -214,13 +214,13 @@ mod tests {
         );
     }
 
-    /// Window size is respected: calibration_size never exceeds window.
+    /// Window size is respected: `calibration_size` never exceeds window.
     #[test]
     fn conformal_window_size_respected() {
         let mut predictor = ConformalPredictor::new(100, 0.90);
 
         for i in 0..200 {
-            predictor.observe(i as f64);
+            predictor.observe(f64::from(i));
         }
 
         assert_eq!(
@@ -238,7 +238,7 @@ mod tests {
 
         // Less than MIN_CALIBRATION observations.
         for i in 0..29 {
-            predictor.observe(i as f64);
+            predictor.observe(f64::from(i));
         }
         assert!(
             predictor.predict().is_none(),
@@ -260,7 +260,7 @@ mod tests {
 
         // 100 observations from a distribution centered at 0.
         for i in 0..100 {
-            let x = (i as f64 * 0.5).sin();
+            let x = (f64::from(i) * 0.5).sin();
             predictor.observe(x);
         }
 
@@ -268,15 +268,15 @@ mod tests {
 
         // 100 observations from a distribution centered at 10.
         for i in 0..100 {
-            let x = 10.0 + (i as f64 * 0.5).sin();
+            let x = 10.0 + (f64::from(i) * 0.5).sin();
             predictor.observe(x);
         }
 
         let interval_after = predictor.predict().unwrap();
 
         // After the shift, the interval center should have moved toward 10.
-        let center_before = (interval_before.lower + interval_before.upper) / 2.0;
-        let center_after = (interval_after.lower + interval_after.upper) / 2.0;
+        let center_before = f64::midpoint(interval_before.lower, interval_before.upper);
+        let center_after = f64::midpoint(interval_after.lower, interval_after.upper);
 
         assert!(
             center_after > center_before + 5.0,
@@ -326,7 +326,7 @@ mod tests {
         for i in 0..100 {
             // Use hash-based scramble for stable pseudo-random values.
             let h = (i as u64).wrapping_mul(2654435761) % 1000;
-            predictor.observe(5.0 + (h as f64 / 1000.0) * 0.2 - 0.1);
+            predictor.observe((h as f64 / 1000.0).mul_add(0.2, 5.0) - 0.1);
         }
 
         let interval = predictor.predict().unwrap();
@@ -342,7 +342,7 @@ mod tests {
             interval.upper
         );
         // Interval should be centered near 5.0.
-        let center = (interval.lower + interval.upper) / 2.0;
+        let center = f64::midpoint(interval.lower, interval.upper);
         assert!(
             (center - 5.0).abs() < 0.5,
             "center should be near 5.0, got {center}"

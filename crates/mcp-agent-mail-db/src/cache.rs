@@ -1253,7 +1253,7 @@ mod tests {
     // 6 required tests for br-22zwu (S3-FIFO wiring verification)
     // =========================================================================
 
-    /// 1. readcache_s3fifo_project_hit_miss -- same as project_cache_hit_and_miss
+    /// 1. `readcache_s3fifo_project_hit_miss` -- same as `project_cache_hit_and_miss`
     ///    but explicitly verifying S3-FIFO backing (ghost promotion path).
     #[test]
     fn readcache_s3fifo_project_hit_miss() {
@@ -1286,8 +1286,8 @@ mod tests {
         }
     }
 
-    /// 2. readcache_s3fifo_agent_dual_index_sync -- invalidation from
-    ///    agent_by_key also removes from agent_by_id.
+    /// 2. `readcache_s3fifo_agent_dual_index_sync` -- invalidation from
+    ///    `agent_by_key` also removes from `agent_by_id`.
     #[test]
     fn readcache_s3fifo_agent_dual_index_sync() {
         let cache = ReadCache::with_capacity(100);
@@ -1311,8 +1311,8 @@ mod tests {
         assert!(cache.get_agent_by_id(99).is_some());
     }
 
-    /// 3. readcache_s3fifo_capacity_respected -- insert > capacity items,
-    ///    verify len() never exceeds capacity.
+    /// 3. `readcache_s3fifo_capacity_respected` -- insert > capacity items,
+    ///    verify `len()` never exceeds capacity.
     #[test]
     fn readcache_s3fifo_capacity_respected() {
         let cap = 20;
@@ -1348,7 +1348,7 @@ mod tests {
         }
     }
 
-    /// 4. readcache_s3fifo_adaptive_ttl_preserved -- hot entries still get
+    /// 4. `readcache_s3fifo_adaptive_ttl_preserved` -- hot entries still get
     ///    extended TTL after switching to S3-FIFO eviction.
     #[test]
     fn readcache_s3fifo_adaptive_ttl_preserved() {
@@ -1375,7 +1375,7 @@ mod tests {
         }
     }
 
-    /// 5. readcache_s3fifo_warm_agents_bulk -- bulk insert path works with
+    /// 5. `readcache_s3fifo_warm_agents_bulk` -- bulk insert path works with
     ///    S3-FIFO, all agents retrievable.
     #[test]
     fn readcache_s3fifo_warm_agents_bulk() {
@@ -1403,7 +1403,7 @@ mod tests {
         }
     }
 
-    /// 6. readcache_s3fifo_hit_rate_not_regressed -- synthetic Zipf workload,
+    /// 6. `readcache_s3fifo_hit_rate_not_regressed` -- synthetic Zipf workload,
     ///    verifies S3-FIFO hit-rate is competitive with LRU baseline.
     #[test]
     fn readcache_s3fifo_hit_rate_not_regressed() {
@@ -1450,7 +1450,7 @@ mod tests {
 
     // ── I.1: Flat combining for cache flush (br-11fd5) ──────────────────
 
-    /// 1. Enqueue a touch, verify has_pending_touches() is true.
+    /// 1. Enqueue a touch, verify `has_pending_touches()` is true.
     #[test]
     fn atomic_pending_flag_set_on_enqueue() {
         let cache = ReadCache::new_for_testing();
@@ -1460,7 +1460,7 @@ mod tests {
         assert!(cache.has_pending_touches(), "set after enqueue");
     }
 
-    /// 2. Enqueue, drain, verify has_pending_touches() is false.
+    /// 2. Enqueue, drain, verify `has_pending_touches()` is false.
     #[test]
     fn atomic_pending_flag_cleared_on_drain() {
         let cache = ReadCache::new_for_testing();
@@ -1489,7 +1489,7 @@ mod tests {
         assert!(!cache.has_pending_touches());
     }
 
-    /// 4. Verify has_pending_touches() uses atomic (no mutex) by checking timing.
+    /// 4. Verify `has_pending_touches()` uses atomic (no mutex) by checking timing.
     #[test]
     fn atomic_pending_flag_no_spurious_locks() {
         let cache = ReadCache::new_for_testing();

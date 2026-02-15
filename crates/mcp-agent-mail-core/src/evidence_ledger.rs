@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(recent[2].seq, 3);
     }
 
-    /// 2. Record 2000 entries with max_entries=1000, verify len <= 1000.
+    /// 2. Record 2000 entries with `max_entries=1000`, verify len <= 1000.
     #[test]
     fn evidence_ring_buffer_bounded() {
         let ledger = EvidenceLedger::new(1000);
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(entry.correct, Some(true));
     }
 
-    /// 4. 10 entries with 7 correct, hit_rate returns 0.7.
+    /// 4. 10 entries with 7 correct, `hit_rate` returns 0.7.
     #[test]
     fn evidence_hit_rate_computation() {
         let ledger = EvidenceLedger::new(1000);
@@ -559,7 +559,7 @@ mod tests {
         );
     }
 
-    /// 5. Filter entries by decision_point string.
+    /// 5. Filter entries by `decision_point` string.
     #[test]
     fn evidence_query_by_decision_point() {
         let ledger = EvidenceLedger::new(1000);

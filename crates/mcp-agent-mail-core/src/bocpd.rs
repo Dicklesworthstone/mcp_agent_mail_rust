@@ -1,4 +1,4 @@
-//! Bayesian Online Change-Point Detection (Adams & MacKay, 2007).
+//! Bayesian Online Change-Point Detection (Adams & `MacKay`, 2007).
 //!
 //! Maintains a posterior distribution over "run lengths" — the number of
 //! observations since the last change point. When the posterior mass shifts
@@ -10,7 +10,7 @@
 //!
 //! # References
 //!
-//! Adams, R. P. & MacKay, D. J. C. (2007). *Bayesian Online Changepoint
+//! Adams, R. P. & `MacKay`, D. J. C. (2007). *Bayesian Online Changepoint
 //! Detection*. arXiv:0710.3742.
 
 /// A detected change point in the observation stream.
@@ -42,7 +42,7 @@ struct NigStats {
 
 impl NigStats {
     /// Default prior: weakly informative centered at 0.
-    fn default_prior() -> Self {
+    const fn default_prior() -> Self {
         Self {
             mu: 0.0,
             kappa: 0.1, // weak prior on mean location
@@ -54,7 +54,7 @@ impl NigStats {
     /// Update NIG parameters with a new observation.
     fn update(&self, x: f64) -> Self {
         let kappa_new = self.kappa + 1.0;
-        let mu_new = (self.kappa * self.mu + x) / kappa_new;
+        let mu_new = self.kappa.mul_add(self.mu, x) / kappa_new;
         let alpha_new = self.alpha + 0.5;
         let beta_new = self.beta + 0.5 * self.kappa * (x - self.mu).powi(2) / kappa_new;
         Self {
@@ -77,15 +77,14 @@ impl NigStats {
 
         let z = (x - self.mu) / scale;
         let half_df = df / 2.0;
-        let half_df_plus_half = (df + 1.0) / 2.0;
+        let half_df_plus_half = f64::midpoint(df, 1.0);
 
-        ln_gamma(half_df_plus_half) - ln_gamma(half_df)
-            - 0.5 * (df * std::f64::consts::PI * scale_sq).ln()
-            - half_df_plus_half * (1.0 + z * z / df).ln()
+        0.5f64.mul_add(-(df * std::f64::consts::PI * scale_sq).ln(), ln_gamma(half_df_plus_half) - ln_gamma(half_df))
+            - half_df_plus_half * (z * z / df).ln_1p()
     }
 
     /// Predictive mean (= the current posterior mean of mu).
-    fn predictive_mean(&self) -> f64 {
+    const fn predictive_mean(&self) -> f64 {
         self.mu
     }
 }
@@ -97,7 +96,7 @@ fn ln_gamma(x: f64) -> f64 {
     }
 
     const COEFFS: [f64; 9] = [
-        0.999_999_999_999_809_93,
+        0.999_999_999_999_809_9,
         676.520_368_121_885_1,
         -1_259.139_216_722_403,
         771.323_428_777_653_1,
@@ -115,7 +114,7 @@ fn ln_gamma(x: f64) -> f64 {
     }
 
     let t = x + 7.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
+    0.5f64.mul_add((2.0 * std::f64::consts::PI).ln(), (x + 0.5) * t.ln()) - t + sum.ln()
 }
 
 /// Window size for computing the "short run length" mass used in
@@ -270,8 +269,7 @@ impl BocpdDetector {
                 .enumerate()
                 .skip(1)
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(r, _)| r)
-                .unwrap_or(1);
+                .map_or(1, |(r, _)| r);
             self.stats[max_r.min(self.stats.len() - 1)].predictive_mean()
         } else {
             self.stats[0].predictive_mean()
@@ -302,8 +300,7 @@ impl BocpdDetector {
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(r, _)| r)
-                .unwrap_or(0);
+                .map_or(0, |(r, _)| r);
             new_stats[best_short].predictive_mean()
         } else {
             new_stats[0].predictive_mean()
@@ -357,7 +354,7 @@ impl BocpdDetector {
 
     /// Number of observations processed so far.
     #[must_use]
-    pub fn observation_count(&self) -> usize {
+    pub const fn observation_count(&self) -> usize {
         self.index
     }
 
@@ -368,8 +365,7 @@ impl BocpdDetector {
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(r, _)| r)
-            .unwrap_or(0)
+            .map_or(0, |(r, _)| r)
     }
 }
 
@@ -581,7 +577,7 @@ mod tests {
         assert!((log_sum_exp(&[42.0]) - 42.0).abs() < 1e-10);
     }
 
-    /// ln_gamma matches known values.
+    /// `ln_gamma` matches known values.
     #[test]
     fn ln_gamma_known_values() {
         assert!(
