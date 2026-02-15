@@ -69,8 +69,12 @@ test_logs/
 # Compiler crash reports
 rustc-ice-*.txt
 
-# Codex build artifacts
+# Codex/agent build artifacts
 target-codex*/
+target_*/
+
+# Archived mailbox state snapshots (ephemeral debug exports)
+**/archived_mailbox_states/
 
 # Ephemeral agent debug/test artifacts (accidental shell output)
 18
