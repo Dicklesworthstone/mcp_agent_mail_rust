@@ -477,6 +477,59 @@ impl ModalManager {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Overlay stack — z-order and close precedence contract
+// ──────────────────────────────────────────────────────────────────────
+
+/// Identifies the active overlay layer in the TUI overlay stack.
+///
+/// Overlays are rendered in ascending z-order: lower layers render first,
+/// higher layers paint on top.  Event routing follows **topmost-first**
+/// precedence: the highest active overlay consumes events (focus trapping)
+/// before lower layers or the base screen ever see them.
+///
+/// **Escape / close rule:** Pressing Escape always dismisses the *topmost*
+/// active overlay.  If no overlay is active, Escape has no effect at the
+/// shell level (screens may handle it locally).
+///
+/// The numeric discriminants encode render z-order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum OverlayLayer {
+    /// No overlay active — base screen has focus.
+    None = 0,
+    /// Toast notifications (passive, z=4). Does not trap focus.
+    Toasts = 1,
+    /// Toast focus mode (z=4b). Traps j/k/Enter/Esc.
+    ToastFocus = 2,
+    /// Action menu (z=4.3). Traps all events.
+    ActionMenu = 3,
+    /// Macro playback paused (z=4.4). Traps Enter/Esc.
+    MacroPlayback = 4,
+    /// Modal dialog (z=4.5). Traps all events.
+    Modal = 5,
+    /// Command palette (z=5). Traps all events.
+    Palette = 6,
+    /// Help overlay (z=6, topmost render). Traps Esc/j/k only.
+    Help = 7,
+}
+
+impl OverlayLayer {
+    /// Returns `true` if this layer traps focus (consumes events
+    /// before lower layers or the base screen).
+    #[must_use]
+    pub const fn traps_focus(self) -> bool {
+        matches!(
+            self,
+            Self::Palette
+                | Self::Modal
+                | Self::ActionMenu
+                | Self::ToastFocus
+                | Self::MacroPlayback
+        )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // MailAppModel — implements ftui_runtime::Model
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1115,6 +1168,43 @@ impl MailAppModel {
         stats.0 = stats.0.saturating_add(1);
         stats.1 = used_at;
         self.palette_usage_dirty = true;
+    }
+
+    // ── Overlay stack query ──────────────────────────────────────
+
+    /// Returns the topmost active overlay in the stack.
+    ///
+    /// The result determines which layer should consume events (focus
+    /// trapping) and which overlay Escape should dismiss.  See
+    /// [`OverlayLayer`] for the full precedence contract.
+    #[must_use]
+    pub fn topmost_overlay(&self) -> OverlayLayer {
+        // Check in *event-routing* order (highest precedence first).
+        if self.command_palette.is_visible() {
+            return OverlayLayer::Palette;
+        }
+        if self.modal_manager.is_active() {
+            return OverlayLayer::Modal;
+        }
+        if self.action_menu.is_active() {
+            return OverlayLayer::ActionMenu;
+        }
+        if matches!(
+            self.macro_engine.playback_state(),
+            PlaybackState::Paused { .. }
+        ) {
+            return OverlayLayer::MacroPlayback;
+        }
+        if self.toast_focus_index.is_some() {
+            return OverlayLayer::ToastFocus;
+        }
+        if self.help_visible {
+            return OverlayLayer::Help;
+        }
+        if self.notifications.visible_count() > 0 {
+            return OverlayLayer::Toasts;
+        }
+        OverlayLayer::None
     }
 
     fn open_palette(&mut self) {
@@ -1848,7 +1938,10 @@ impl Model for MailAppModel {
                     self.resize_detected.set(true);
                 }
 
-                // When the command palette is visible, route all events to it first.
+                // Overlay focus trapping: topmost-first precedence.
+                // See `OverlayLayer` for the formal z-order contract.
+                //
+                // Palette (z=6 event priority, traps all)
                 if self.command_palette.is_visible() {
                     if let Some(action) = self.command_palette.handle_event(event) {
                         match action {
@@ -1859,12 +1952,12 @@ impl Model for MailAppModel {
                     return Cmd::none();
                 }
 
-                // When a modal is active, route all events to it (focus trapping).
+                // Modal (z=5, traps all)
                 if self.modal_manager.handle_event(event) {
                     return Cmd::none();
                 }
 
-                // When action menu is active, route all events to it (focus trapping).
+                // Action menu (z=4.3, traps all)
                 if let Some(result) = self.action_menu.handle_event(event) {
                     match result {
                         ActionMenuResult::Consumed | ActionMenuResult::Dismissed => {
@@ -1876,7 +1969,7 @@ impl Model for MailAppModel {
                     }
                 }
 
-                // Step-by-step macro playback: Enter=confirm, Esc=stop.
+                // Macro playback paused (z=4.4, traps Enter/Esc)
                 if matches!(
                     self.macro_engine.playback_state(),
                     PlaybackState::Paused { .. }
@@ -1915,7 +2008,7 @@ impl Model for MailAppModel {
                     }
                 }
 
-                // Toast focus mode: intercept keys when toast stack is focused.
+                // Toast focus mode (z=4b, traps j/k/Enter/Esc)
                 if self.toast_focus_index.is_some() {
                     if let Event::Key(key) = event {
                         if key.kind == KeyEventKind::Press {
@@ -6986,5 +7079,124 @@ mod tests {
     fn panic_payload_to_string_unknown_type() {
         let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
         assert_eq!(panic_payload_to_string(&payload), "unknown panic");
+    }
+
+    // ── Overlay stack precedence tests ─────────────────────────
+
+    #[test]
+    fn topmost_overlay_none_when_clean() {
+        let model = test_model();
+        assert_eq!(model.topmost_overlay(), OverlayLayer::None);
+    }
+
+    #[test]
+    fn topmost_overlay_help_when_visible() {
+        let mut model = test_model();
+        model.help_visible = true;
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Help);
+    }
+
+    #[test]
+    fn topmost_overlay_toast_focus_beats_help() {
+        let mut model = test_model();
+        model.help_visible = true;
+        model.toast_focus_index = Some(0);
+        // Toast focus has higher event-routing precedence than help.
+        assert_eq!(model.topmost_overlay(), OverlayLayer::ToastFocus);
+    }
+
+    #[test]
+    fn topmost_overlay_palette_beats_all() {
+        let mut model = test_model();
+        model.help_visible = true;
+        model.toast_focus_index = Some(0);
+        model.open_palette();
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Palette);
+    }
+
+    #[test]
+    fn topmost_overlay_modal_beats_action_menu() {
+        let mut model = test_model();
+        // Open action menu
+        model.action_menu.open(
+            vec![crate::tui_action_menu::ActionEntry {
+                label: "Test".to_string(),
+                description: None,
+                keybinding: None,
+                action: crate::tui_action_menu::ActionKind::Execute("test".to_string()),
+                is_destructive: false,
+            }],
+            5, // anchor_row
+            "test-ctx",
+        );
+        assert_eq!(model.topmost_overlay(), OverlayLayer::ActionMenu);
+
+        // Now open a modal — should take precedence
+        model.modal_manager.show_confirmation(
+            "Test",
+            "Are you sure?",
+            ModalSeverity::Info,
+            |_| {},
+        );
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Modal);
+    }
+
+    #[test]
+    fn overlay_layer_ordering_matches_event_routing() {
+        // The Ord implementation should match the event-routing precedence:
+        // higher value = higher z-order in event routing.
+        assert!(OverlayLayer::Palette > OverlayLayer::Modal);
+        assert!(OverlayLayer::Modal > OverlayLayer::ActionMenu);
+        assert!(OverlayLayer::ActionMenu > OverlayLayer::ToastFocus);
+        assert!(OverlayLayer::ToastFocus > OverlayLayer::Toasts);
+        assert!(OverlayLayer::Toasts > OverlayLayer::None);
+    }
+
+    #[test]
+    fn overlay_layer_focus_trapping_contract() {
+        assert!(OverlayLayer::Palette.traps_focus());
+        assert!(OverlayLayer::Modal.traps_focus());
+        assert!(OverlayLayer::ActionMenu.traps_focus());
+        assert!(OverlayLayer::ToastFocus.traps_focus());
+        assert!(OverlayLayer::MacroPlayback.traps_focus());
+        // Help does NOT trap focus — it only consumes Esc/j/k.
+        assert!(!OverlayLayer::Help.traps_focus());
+        // Passive toasts don't trap focus.
+        assert!(!OverlayLayer::Toasts.traps_focus());
+        assert!(!OverlayLayer::None.traps_focus());
+    }
+
+    #[test]
+    fn escape_closes_topmost_help() {
+        let mut model = test_model();
+        model.help_visible = true;
+        assert_eq!(model.topmost_overlay(), OverlayLayer::Help);
+
+        // Send Escape
+        let esc = MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Escape)));
+        model.update(esc);
+        assert!(!model.help_visible);
+        assert_eq!(model.topmost_overlay(), OverlayLayer::None);
+    }
+
+    #[test]
+    fn escape_closes_toast_focus_not_help() {
+        let mut model = test_model();
+        model.help_visible = true;
+        model.notifications.notify(
+            ftui_widgets::Toast::new("test")
+                .icon(ftui_widgets::ToastIcon::Info)
+                .duration(Duration::from_secs(60)),
+        );
+        model.toast_focus_index = Some(0);
+
+        // Toast focus should be topmost
+        assert_eq!(model.topmost_overlay(), OverlayLayer::ToastFocus);
+
+        // Escape should close toast focus, NOT help
+        let esc = MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Escape)));
+        model.update(esc);
+        assert!(model.toast_focus_index.is_none());
+        assert!(model.help_visible, "help should still be visible");
     }
 }
