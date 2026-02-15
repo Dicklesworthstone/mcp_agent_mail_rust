@@ -2746,16 +2746,13 @@ impl Model for MailAppModel {
         // frame — producing blank/flashing screens.
         let tick_budget_ms = TICK_INTERVAL.as_secs_f64() * 1000.0;
         let now = Instant::now();
-        let budget_remaining_ms = self
-            .last_view_instant
-            .get()
-            .map_or(tick_budget_ms, |prev| {
-                let elapsed_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
-                // Budget = tick_budget minus any overshoot beyond expected interval.
-                // On-schedule (elapsed ≈ tick): budget ≈ tick_budget (healthy).
-                // Behind (elapsed ≈ 2×tick): budget ≈ 0 (degraded).
-                (tick_budget_ms - (elapsed_ms - tick_budget_ms).max(0.0)).max(0.0)
-            });
+        let budget_remaining_ms = self.last_view_instant.get().map_or(tick_budget_ms, |prev| {
+            let elapsed_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
+            // Budget = tick_budget minus any overshoot beyond expected interval.
+            // On-schedule (elapsed ≈ tick): budget ≈ tick_budget (healthy).
+            // Behind (elapsed ≈ 2×tick): budget ≈ 0 (degraded).
+            (tick_budget_ms - (elapsed_ms - tick_budget_ms).max(0.0)).max(0.0)
+        });
         self.last_view_instant.set(Some(now));
 
         // Bayesian diff strategy: observe frame state and decide action.
