@@ -94,29 +94,28 @@ seed_data() {
 
     {
         echo "$INIT_REQ"
-        sleep 0.2
-        # MCP requires initialized notification before tools/call.
-        echo '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
-        sleep 0.2
+        sleep 0.5
         # Ensure project
         echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${project}\"}}}"
-        sleep 0.2
+        sleep 0.5
         # Register agents
         echo "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${project}\",\"program\":\"claude-code\",\"model\":\"opus-4.6\",\"name\":\"BlueLake\",\"task_description\":\"E2E testing\"}}}"
-        sleep 0.2
+        sleep 0.5
         echo "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${project}\",\"program\":\"codex-cli\",\"model\":\"gpt-5.2\",\"name\":\"RedFox\",\"task_description\":\"E2E testing\"}}}"
-        sleep 0.3
+        sleep 0.5
         # Set RedFox's contact policy to "open" so anyone can message them
         echo "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"RedFox\",\"policy\":\"open\"}}}"
-        sleep 0.3
+        sleep 0.5
         # Send two messages in the same thread for thread/message command coverage.
         echo "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message 1\",\"body_md\":\"This is test message 1 for robot E2E validation.\",\"importance\":\"high\",\"thread_id\":\"robot-e2e-thread\"}}}"
-        sleep 0.3
+        sleep 0.5
         echo "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message 2\",\"body_md\":\"This is test message 2 for robot E2E validation.\",\"importance\":\"normal\",\"thread_id\":\"robot-e2e-thread\"}}}"
-        sleep 0.3
+        sleep 0.5
         # Create a file reservation
         echo "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"paths\":[\"src/test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"E2E test\"}}}"
-        sleep 0.2
+        sleep 0.5
+        # Keep stdin open briefly so the server can flush all responses.
+        sleep 1
     } > "$fifo" &
     local write_pid=$!
 
