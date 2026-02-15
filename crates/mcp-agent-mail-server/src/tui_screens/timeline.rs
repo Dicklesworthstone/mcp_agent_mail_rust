@@ -668,6 +668,11 @@ impl MailScreen for TimelineScreen {
         Some("Chronological event log. Expand entries for detail, use correlation links.")
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let entry = self.pane.selected_entry()?;
+        Some(entry.display.summary.clone())
+    }
+
     fn title(&self) -> &'static str {
         "Event Timeline"
     }
@@ -2615,7 +2620,8 @@ mod tests {
                 TimelineEntry {
                     display: format_event(&event),
                     seq: idx,
-                    timestamp_micros: now - (idx as i64 * 10_000),
+                    timestamp_micros: now
+                        - (i64::try_from(idx).expect("test idx should fit i64") * 10_000),
                     source: EventSource::Mail,
                     severity: EventSeverity::Info,
                     raw: event,

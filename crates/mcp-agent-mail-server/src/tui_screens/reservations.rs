@@ -496,6 +496,13 @@ impl MailScreen for ReservationsScreen {
         false
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let idx = self.table_state.selected?;
+        let key = self.sorted_keys.get(idx)?;
+        let res = self.reservations.get(key)?;
+        Some(format!("{} ({})", res.path_pattern, res.agent))
+    }
+
     fn title(&self) -> &'static str {
         "Reservations"
     }

@@ -2082,6 +2082,17 @@ impl MailScreen for SearchCockpitScreen {
         matches!(self.focus, Focus::QueryBar)
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let entry = self.results.get(self.cursor)?;
+        if let Some(body) = &entry.full_body {
+            Some(format!("{}\n\n{}", entry.title, body))
+        } else if !entry.body_preview.is_empty() {
+            Some(format!("{}\n\n{}", entry.title, entry.body_preview))
+        } else {
+            Some(entry.title.clone())
+        }
+    }
+
     fn title(&self) -> &'static str {
         "Search"
     }

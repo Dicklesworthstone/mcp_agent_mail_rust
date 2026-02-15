@@ -257,6 +257,15 @@ pub trait MailScreen {
         None
     }
 
+    /// Return the currently focused item's text content for clipboard copy.
+    ///
+    /// Called when the user presses `y` (yank) to copy the focused item.
+    /// Each screen should return a meaningful string representation of the
+    /// currently selected/focused entity, or `None` if nothing is selected.
+    fn copyable_content(&self) -> Option<String> {
+        None
+    }
+
     /// Title shown in the help overlay header.
     fn title(&self) -> &'static str;
 
@@ -303,6 +312,8 @@ pub enum DeepLinkTarget {
     TimelineAtTime(i64),
     /// Jump to a specific message in the Messages screen.
     MessageById(i64),
+    /// Open compose form in Messages screen with pre-filled recipient.
+    ComposeToAgent(String),
     /// Jump to a specific thread in the Thread Explorer.
     ThreadById(String),
     /// Jump to an agent in the Agent Roster screen.
@@ -327,7 +338,7 @@ impl DeepLinkTarget {
     pub const fn target_screen(&self) -> MailScreenId {
         match self {
             Self::TimelineAtTime(_) => MailScreenId::Timeline,
-            Self::MessageById(_) => MailScreenId::Messages,
+            Self::MessageById(_) | Self::ComposeToAgent(_) => MailScreenId::Messages,
             Self::ThreadById(_) => MailScreenId::Threads,
             Self::AgentByName(_) => MailScreenId::Agents,
             Self::ToolByName(_) => MailScreenId::ToolMetrics,
@@ -793,6 +804,7 @@ mod tests {
         // Ensure all variants can be constructed
         let _ = DeepLinkTarget::TimelineAtTime(0);
         let _ = DeepLinkTarget::MessageById(0);
+        let _ = DeepLinkTarget::ComposeToAgent(String::new());
         let _ = DeepLinkTarget::ThreadById(String::new());
         let _ = DeepLinkTarget::AgentByName(String::new());
         let _ = DeepLinkTarget::ToolByName(String::new());

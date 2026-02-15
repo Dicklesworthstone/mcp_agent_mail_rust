@@ -449,6 +449,11 @@ impl MailScreen for AnalyticsScreen {
         Some("Message volume, response times, and agent activity analytics.")
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let card = self.selected_card()?;
+        Some(format!("{}\n\n{}", card.headline, card.rationale))
+    }
+
     fn title(&self) -> &'static str {
         "Analytics"
     }

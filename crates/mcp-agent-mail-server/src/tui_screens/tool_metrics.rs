@@ -1130,6 +1130,12 @@ impl MailScreen for ToolMetricsScreen {
         false
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let idx = self.table_state.selected?;
+        let tool_name = self.sorted_tools.get(idx)?;
+        Some(tool_name.clone())
+    }
+
     fn title(&self) -> &'static str {
         "Tool Metrics"
     }

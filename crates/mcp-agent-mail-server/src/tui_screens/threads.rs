@@ -1202,6 +1202,11 @@ impl MailScreen for ThreadExplorerScreen {
         self.filter_editing
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let thread = self.threads.get(self.cursor)?;
+        Some(format!("[{}] {}", thread.thread_id, thread.last_subject))
+    }
+
     fn title(&self) -> &'static str {
         "Threads"
     }

@@ -310,6 +310,12 @@ impl MailScreen for ProjectsScreen {
         self.filter_active
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let idx = self.table_state.selected?;
+        let proj = self.projects.get(idx)?;
+        Some(proj.human_key.clone())
+    }
+
     fn title(&self) -> &'static str {
         "Projects"
     }

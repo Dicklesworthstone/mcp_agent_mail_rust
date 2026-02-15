@@ -421,6 +421,15 @@ impl MailScreen for ContactsScreen {
         Some((actions, anchor_row, context_id))
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let idx = self.table_state.selected?;
+        let contact = self.contacts.get(idx)?;
+        Some(format!(
+            "{} -> {} ({})",
+            contact.from_agent, contact.to_agent, contact.status
+        ))
+    }
+
     fn title(&self) -> &'static str {
         "Contacts"
     }

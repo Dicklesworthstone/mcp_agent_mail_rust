@@ -1123,6 +1123,15 @@ impl MailScreen for MailExplorerScreen {
         matches!(self.focus, Focus::SearchBar)
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let entry = self.entries.get(self.cursor)?;
+        if !entry.body_preview.is_empty() {
+            Some(format!("{}\n\n{}", entry.subject, entry.body_preview))
+        } else {
+            Some(entry.subject.clone())
+        }
+    }
+
     fn title(&self) -> &'static str {
         "Explorer"
     }

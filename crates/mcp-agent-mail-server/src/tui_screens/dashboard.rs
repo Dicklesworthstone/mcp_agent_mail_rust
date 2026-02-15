@@ -1753,8 +1753,11 @@ mod tests {
                 kind: MailEventKind::MessageReceived,
                 severity: EventSeverity::Info,
                 seq: idx,
-                timestamp_micros: now - (idx as i64 * 10_000),
-                timestamp: format_ts(now - (idx as i64 * 10_000)),
+                timestamp_micros: now
+                    - (i64::try_from(idx).expect("test idx should fit i64") * 10_000),
+                timestamp: format_ts(
+                    now - (i64::try_from(idx).expect("test idx should fit i64") * 10_000),
+                ),
                 icon: '✉',
                 summary: format!("message-{idx}"),
             })

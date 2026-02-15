@@ -282,6 +282,505 @@ impl TuiThemePalette {
         }
     }
 
+    /// Solarized Dark theme based on Ethan Schoonover's official palette.
+    ///
+    /// <https://ethanschoonover.com/solarized/>
+    #[must_use]
+    pub const fn solarized_dark() -> Self {
+        // Solarized base tones
+        let base03 = PackedRgba::rgb(0, 43, 54); // #002b36 — dark bg
+        let base02 = PackedRgba::rgb(7, 54, 66); // #073642 — bg highlights
+        let base01 = PackedRgba::rgb(88, 110, 117); // #586e75 — comments/secondary
+        let base00 = PackedRgba::rgb(101, 123, 131); // #657b83
+        let base0 = PackedRgba::rgb(131, 148, 150); // #839496 — body text
+        let base1 = PackedRgba::rgb(147, 161, 161); // #93a1a1 — emphasis
+        // Solarized accent colors
+        let yellow = PackedRgba::rgb(181, 137, 0); // #b58900
+        let orange = PackedRgba::rgb(203, 75, 22); // #cb4b16
+        let red = PackedRgba::rgb(220, 50, 47); // #dc322f
+        let magenta = PackedRgba::rgb(211, 54, 130); // #d33682
+        let violet = PackedRgba::rgb(108, 113, 196); // #6c71c4
+        let blue = PackedRgba::rgb(38, 139, 210); // #268bd2
+        let cyan = PackedRgba::rgb(42, 161, 152); // #2aa198
+        let green = PackedRgba::rgb(133, 153, 0); // #859900
+
+        Self {
+            tab_active_bg: base02,
+            tab_active_fg: base1,
+            tab_inactive_bg: base03,
+            tab_inactive_fg: base01,
+            tab_key_fg: blue,
+
+            status_bg: base03,
+            status_fg: base0,
+            status_accent: blue,
+            status_good: green,
+            status_warn: yellow,
+
+            help_bg: base03,
+            help_fg: base0,
+            help_key_fg: blue,
+            help_border_fg: base01,
+            help_category_fg: cyan,
+
+            sparkline_lo: base01,
+            sparkline_hi: green,
+
+            table_header_fg: blue,
+            table_row_alt_bg: base02,
+
+            selection_bg: PackedRgba::rgb(17, 70, 85),
+            selection_fg: base1,
+
+            severity_ok: green,
+            severity_error: red,
+            severity_warn: yellow,
+            severity_critical: orange,
+
+            panel_border: base01,
+            panel_border_focused: blue,
+            panel_border_dim: base00,
+            panel_bg: base03,
+            panel_title_fg: base1,
+
+            selection_indicator: blue,
+            list_hover_bg: PackedRgba::rgb(0, 55, 70),
+
+            chart_series: [green, blue, yellow, red, violet, cyan],
+            chart_axis: base01,
+            chart_grid: base02,
+
+            badge_urgent_bg: red,
+            badge_urgent_fg: base1,
+            badge_info_bg: base02,
+            badge_info_fg: cyan,
+
+            ttl_healthy: green,
+            ttl_warning: yellow,
+            ttl_danger: orange,
+            ttl_expired: base01,
+
+            metric_uptime: green,
+            metric_requests: blue,
+            metric_latency: yellow,
+            metric_messages: violet,
+            metric_agents: magenta,
+            metric_ack_ok: green,
+            metric_ack_bad: red,
+
+            agent_palette: [blue, green, yellow, orange, violet, cyan, magenta, base1],
+
+            contact_approved: green,
+            contact_pending: yellow,
+            contact_blocked: red,
+
+            activity_active: green,
+            activity_idle: yellow,
+            activity_stale: base01,
+
+            text_muted: base01,
+            text_primary: base0,
+            text_secondary: base1,
+            text_disabled: base00,
+            bg_deep: base03,
+            bg_surface: base02,
+            bg_overlay: PackedRgba::rgb(15, 65, 78),
+
+            toast_error: red,
+            toast_warning: orange,
+            toast_info: cyan,
+            toast_success: green,
+            toast_focus: blue,
+
+            json_key: blue,
+            json_string: cyan,
+            json_number: magenta,
+            json_literal: yellow,
+            json_punctuation: base01,
+        }
+    }
+
+    /// Dracula theme based on the official Dracula palette.
+    ///
+    /// Maps to ftui's `Darcula` `ThemeId` which implements the same palette.
+    ///
+    /// <https://draculatheme.com/>
+    #[must_use]
+    pub const fn dracula() -> Self {
+        // Dracula base tones
+        let bg = PackedRgba::rgb(40, 42, 54); // #282a36
+        let current_line = PackedRgba::rgb(68, 71, 90); // #44475a
+        let fg = PackedRgba::rgb(248, 248, 242); // #f8f8f2
+        let comment = PackedRgba::rgb(98, 114, 164); // #6272a4
+        // Dracula accent colors
+        let cyan_d = PackedRgba::rgb(139, 233, 253); // #8be9fd
+        let green_d = PackedRgba::rgb(80, 250, 123); // #50fa7b
+        let orange_d = PackedRgba::rgb(255, 184, 108); // #ffb86c
+        let pink = PackedRgba::rgb(255, 121, 198); // #ff79c6
+        let purple = PackedRgba::rgb(189, 147, 249); // #bd93f9
+        let red_d = PackedRgba::rgb(255, 85, 85); // #ff5555
+        let yellow_d = PackedRgba::rgb(241, 250, 140); // #f1fa8c
+
+        let bg_deep = PackedRgba::rgb(30, 31, 41);
+
+        Self {
+            tab_active_bg: current_line,
+            tab_active_fg: fg,
+            tab_inactive_bg: bg,
+            tab_inactive_fg: comment,
+            tab_key_fg: purple,
+
+            status_bg: bg_deep,
+            status_fg: fg,
+            status_accent: purple,
+            status_good: green_d,
+            status_warn: yellow_d,
+
+            help_bg: bg_deep,
+            help_fg: fg,
+            help_key_fg: purple,
+            help_border_fg: comment,
+            help_category_fg: cyan_d,
+
+            sparkline_lo: comment,
+            sparkline_hi: green_d,
+
+            table_header_fg: purple,
+            table_row_alt_bg: current_line,
+
+            selection_bg: PackedRgba::rgb(55, 58, 78),
+            selection_fg: fg,
+
+            severity_ok: green_d,
+            severity_error: red_d,
+            severity_warn: yellow_d,
+            severity_critical: PackedRgba::rgb(255, 50, 50),
+
+            panel_border: comment,
+            panel_border_focused: purple,
+            panel_border_dim: PackedRgba::rgb(55, 58, 78),
+            panel_bg: bg_deep,
+            panel_title_fg: fg,
+
+            selection_indicator: purple,
+            list_hover_bg: PackedRgba::rgb(50, 52, 68),
+
+            chart_series: [green_d, cyan_d, orange_d, pink, purple, yellow_d],
+            chart_axis: comment,
+            chart_grid: current_line,
+
+            badge_urgent_bg: red_d,
+            badge_urgent_fg: fg,
+            badge_info_bg: current_line,
+            badge_info_fg: cyan_d,
+
+            ttl_healthy: green_d,
+            ttl_warning: yellow_d,
+            ttl_danger: orange_d,
+            ttl_expired: comment,
+
+            metric_uptime: green_d,
+            metric_requests: cyan_d,
+            metric_latency: orange_d,
+            metric_messages: purple,
+            metric_agents: pink,
+            metric_ack_ok: green_d,
+            metric_ack_bad: red_d,
+
+            agent_palette: [
+                cyan_d, green_d, orange_d, pink, purple, yellow_d, red_d, comment,
+            ],
+
+            contact_approved: green_d,
+            contact_pending: yellow_d,
+            contact_blocked: red_d,
+
+            activity_active: green_d,
+            activity_idle: yellow_d,
+            activity_stale: comment,
+
+            text_muted: comment,
+            text_primary: fg,
+            text_secondary: PackedRgba::rgb(220, 220, 210),
+            text_disabled: PackedRgba::rgb(70, 72, 90),
+            bg_deep,
+            bg_surface: bg,
+            bg_overlay: current_line,
+
+            toast_error: red_d,
+            toast_warning: orange_d,
+            toast_info: cyan_d,
+            toast_success: green_d,
+            toast_focus: purple,
+
+            json_key: purple,
+            json_string: yellow_d,
+            json_number: PackedRgba::rgb(189, 147, 249),
+            json_literal: pink,
+            json_punctuation: comment,
+        }
+    }
+
+    /// Nord theme based on Arctic Ice Studio's official palette.
+    ///
+    /// <https://www.nordtheme.com/>
+    #[must_use]
+    pub const fn nord() -> Self {
+        // Polar Night
+        let nord0 = PackedRgba::rgb(46, 52, 64); // #2e3440
+        let nord1 = PackedRgba::rgb(59, 66, 82); // #3b4252
+        let nord2 = PackedRgba::rgb(67, 76, 94); // #434c5e
+        let nord3 = PackedRgba::rgb(76, 86, 106); // #4c566a
+        // Snow Storm
+        let nord4 = PackedRgba::rgb(216, 222, 233); // #d8dee9
+        let nord5 = PackedRgba::rgb(229, 233, 240); // #e5e9f0
+        // nord6 (#eceff4) available but unused in dark theme
+        // Frost
+        let nord7 = PackedRgba::rgb(143, 188, 187); // #8fbcbb
+        let nord8 = PackedRgba::rgb(136, 192, 208); // #88c0d0
+        let nord9 = PackedRgba::rgb(129, 161, 193); // #81a1c1
+        let nord10 = PackedRgba::rgb(94, 129, 172); // #5e81ac
+        // Aurora
+        let nord11 = PackedRgba::rgb(191, 97, 106); // #bf616a — red
+        let nord12 = PackedRgba::rgb(208, 135, 112); // #d08770 — orange
+        let nord13 = PackedRgba::rgb(235, 203, 139); // #ebcb8b — yellow
+        let nord14 = PackedRgba::rgb(163, 190, 140); // #a3be8c — green
+        let nord15 = PackedRgba::rgb(180, 142, 173); // #b48ead — purple
+
+        let bg_deep = PackedRgba::rgb(36, 40, 50);
+
+        Self {
+            tab_active_bg: nord1,
+            tab_active_fg: nord5,
+            tab_inactive_bg: nord0,
+            tab_inactive_fg: nord3,
+            tab_key_fg: nord8,
+
+            status_bg: bg_deep,
+            status_fg: nord4,
+            status_accent: nord8,
+            status_good: nord14,
+            status_warn: nord13,
+
+            help_bg: bg_deep,
+            help_fg: nord4,
+            help_key_fg: nord8,
+            help_border_fg: nord3,
+            help_category_fg: nord9,
+
+            sparkline_lo: nord3,
+            sparkline_hi: nord14,
+
+            table_header_fg: nord8,
+            table_row_alt_bg: nord1,
+
+            selection_bg: nord2,
+            selection_fg: nord5,
+
+            severity_ok: nord14,
+            severity_error: nord11,
+            severity_warn: nord13,
+            severity_critical: PackedRgba::rgb(210, 80, 90),
+
+            panel_border: nord3,
+            panel_border_focused: nord8,
+            panel_border_dim: nord2,
+            panel_bg: bg_deep,
+            panel_title_fg: nord4,
+
+            selection_indicator: nord8,
+            list_hover_bg: PackedRgba::rgb(52, 58, 74),
+
+            chart_series: [nord14, nord8, nord13, nord11, nord15, nord7],
+            chart_axis: nord3,
+            chart_grid: nord1,
+
+            badge_urgent_bg: nord11,
+            badge_urgent_fg: nord5,
+            badge_info_bg: nord2,
+            badge_info_fg: nord8,
+
+            ttl_healthy: nord14,
+            ttl_warning: nord13,
+            ttl_danger: nord12,
+            ttl_expired: nord3,
+
+            metric_uptime: nord14,
+            metric_requests: nord8,
+            metric_latency: nord13,
+            metric_messages: nord15,
+            metric_agents: nord9,
+            metric_ack_ok: nord14,
+            metric_ack_bad: nord11,
+
+            agent_palette: [nord8, nord14, nord13, nord12, nord15, nord7, nord9, nord10],
+
+            contact_approved: nord14,
+            contact_pending: nord13,
+            contact_blocked: nord11,
+
+            activity_active: nord14,
+            activity_idle: nord13,
+            activity_stale: nord3,
+
+            text_muted: nord3,
+            text_primary: nord4,
+            text_secondary: nord5,
+            text_disabled: nord2,
+            bg_deep,
+            bg_surface: nord0,
+            bg_overlay: nord1,
+
+            toast_error: nord11,
+            toast_warning: nord12,
+            toast_info: nord8,
+            toast_success: nord14,
+            toast_focus: nord9,
+
+            json_key: nord8,
+            json_string: nord14,
+            json_number: nord15,
+            json_literal: nord13,
+            json_punctuation: nord3,
+        }
+    }
+
+    /// Gruvbox Dark theme based on morhetz's official palette.
+    ///
+    /// <https://github.com/morhetz/gruvbox>
+    #[must_use]
+    pub const fn gruvbox_dark() -> Self {
+        // Gruvbox dark backgrounds
+        let bg0 = PackedRgba::rgb(40, 40, 40); // #282828
+        let bg1 = PackedRgba::rgb(60, 56, 54); // #3c3836
+        let bg2 = PackedRgba::rgb(80, 73, 69); // #504945
+        let bg3 = PackedRgba::rgb(102, 92, 84); // #665c54
+        // Gruvbox foregrounds
+        let fg0 = PackedRgba::rgb(235, 219, 178); // #ebdbb2
+        let fg2 = PackedRgba::rgb(213, 196, 161); // #d5c4a1
+        let fg4 = PackedRgba::rgb(168, 153, 132); // #a89984
+        // Gruvbox bright accents
+        let red = PackedRgba::rgb(251, 73, 52); // #fb4934
+        let green = PackedRgba::rgb(184, 187, 38); // #b8bb26
+        let yellow = PackedRgba::rgb(250, 189, 47); // #fabd2f
+        let blue = PackedRgba::rgb(131, 165, 152); // #83a598
+        let purple = PackedRgba::rgb(211, 134, 155); // #d3869b
+        let aqua = PackedRgba::rgb(142, 192, 124); // #8ec07c
+        let orange = PackedRgba::rgb(254, 128, 25); // #fe8019
+
+        let bg_deep = PackedRgba::rgb(29, 29, 29);
+
+        Self {
+            tab_active_bg: bg1,
+            tab_active_fg: fg0,
+            tab_inactive_bg: bg0,
+            tab_inactive_fg: fg4,
+            tab_key_fg: yellow,
+
+            status_bg: bg_deep,
+            status_fg: fg0,
+            status_accent: yellow,
+            status_good: green,
+            status_warn: orange,
+
+            help_bg: bg_deep,
+            help_fg: fg0,
+            help_key_fg: yellow,
+            help_border_fg: fg4,
+            help_category_fg: aqua,
+
+            sparkline_lo: fg4,
+            sparkline_hi: green,
+
+            table_header_fg: yellow,
+            table_row_alt_bg: bg1,
+
+            selection_bg: bg2,
+            selection_fg: fg0,
+
+            severity_ok: green,
+            severity_error: red,
+            severity_warn: orange,
+            severity_critical: PackedRgba::rgb(255, 50, 40),
+
+            panel_border: fg4,
+            panel_border_focused: yellow,
+            panel_border_dim: bg3,
+            panel_bg: bg_deep,
+            panel_title_fg: fg0,
+
+            selection_indicator: yellow,
+            list_hover_bg: PackedRgba::rgb(50, 48, 47),
+
+            chart_series: [green, blue, yellow, red, purple, aqua],
+            chart_axis: fg4,
+            chart_grid: bg1,
+
+            badge_urgent_bg: red,
+            badge_urgent_fg: fg0,
+            badge_info_bg: bg2,
+            badge_info_fg: blue,
+
+            ttl_healthy: green,
+            ttl_warning: yellow,
+            ttl_danger: orange,
+            ttl_expired: bg3,
+
+            metric_uptime: green,
+            metric_requests: blue,
+            metric_latency: orange,
+            metric_messages: purple,
+            metric_agents: aqua,
+            metric_ack_ok: green,
+            metric_ack_bad: red,
+
+            agent_palette: [blue, green, yellow, orange, purple, aqua, red, fg4],
+
+            contact_approved: green,
+            contact_pending: yellow,
+            contact_blocked: red,
+
+            activity_active: green,
+            activity_idle: yellow,
+            activity_stale: bg3,
+
+            text_muted: fg4,
+            text_primary: fg0,
+            text_secondary: fg2,
+            text_disabled: bg3,
+            bg_deep,
+            bg_surface: bg0,
+            bg_overlay: bg1,
+
+            toast_error: red,
+            toast_warning: orange,
+            toast_info: blue,
+            toast_success: green,
+            toast_focus: aqua,
+
+            json_key: yellow,
+            json_string: green,
+            json_number: purple,
+            json_literal: orange,
+            json_punctuation: fg4,
+        }
+    }
+
+    /// Resolve a named theme from the `AM_TUI_THEME` config value.
+    ///
+    /// Accepted values: `"default"`, `"solarized"`, `"dracula"`, `"nord"`, `"gruvbox"`.
+    /// Unknown values fall back to the default theme.
+    #[must_use]
+    pub fn from_config_name(name: &str) -> Self {
+        match name {
+            "solarized" => Self::solarized_dark(),
+            "dracula" => Self::dracula(),
+            "nord" => Self::nord(),
+            "gruvbox" => Self::gruvbox_dark(),
+            _ => Self::frankenstein(),
+        }
+    }
+
     /// Resolve a palette from a specific theme ID.
     #[must_use]
     pub fn for_theme(id: ThemeId) -> Self {
@@ -1342,6 +1841,215 @@ mod tests {
                 p.help_key_fg, p.help_fg,
                 "theme {id:?}: help_key_fg and help_fg must differ for visual hierarchy"
             );
+        }
+    }
+
+    // ── Named theme variant tests (br-2k9ze) ────────────────────
+
+    /// All 5 named theme constructors produce valid (non-zero fg) palettes.
+    #[test]
+    fn named_themes_produce_valid_palettes() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+
+        for (name, p) in &themes {
+            // Foreground fields must be visible (non-zero RGB).
+            let fg_fields = [
+                ("tab_active_fg", p.tab_active_fg),
+                ("tab_inactive_fg", p.tab_inactive_fg),
+                ("tab_key_fg", p.tab_key_fg),
+                ("status_fg", p.status_fg),
+                ("status_accent", p.status_accent),
+                ("status_good", p.status_good),
+                ("status_warn", p.status_warn),
+                ("help_fg", p.help_fg),
+                ("help_key_fg", p.help_key_fg),
+                ("sparkline_hi", p.sparkline_hi),
+                ("table_header_fg", p.table_header_fg),
+                ("selection_fg", p.selection_fg),
+                ("severity_ok", p.severity_ok),
+                ("severity_error", p.severity_error),
+                ("severity_warn", p.severity_warn),
+                ("panel_title_fg", p.panel_title_fg),
+                ("text_primary", p.text_primary),
+                ("text_secondary", p.text_secondary),
+            ];
+            for (field, c) in &fg_fields {
+                assert!(
+                    c.r() > 0 || c.g() > 0 || c.b() > 0,
+                    "theme {name}: {field} is invisible (0,0,0)"
+                );
+            }
+        }
+    }
+
+    /// Named themes have distinct accent colors (no two share the same tab_key_fg).
+    #[test]
+    fn named_themes_are_visually_distinct() {
+        let frank = TuiThemePalette::frankenstein();
+        let solar = TuiThemePalette::solarized_dark();
+        let drac = TuiThemePalette::dracula();
+        let nord = TuiThemePalette::nord();
+        let gruv = TuiThemePalette::gruvbox_dark();
+
+        let accents = [
+            ("frankenstein", frank.tab_key_fg),
+            ("solarized", solar.tab_key_fg),
+            ("dracula", drac.tab_key_fg),
+            ("nord", nord.tab_key_fg),
+            ("gruvbox", gruv.tab_key_fg),
+        ];
+
+        // Each theme should have a unique accent color.
+        for i in 0..accents.len() {
+            for j in (i + 1)..accents.len() {
+                assert_ne!(
+                    accents[i].1, accents[j].1,
+                    "themes {} and {} share the same tab_key_fg",
+                    accents[i].0, accents[j].0
+                );
+            }
+        }
+    }
+
+    /// Named themes meet minimum contrast thresholds for readability.
+    #[test]
+    fn named_themes_meet_contrast_thresholds() {
+        const MIN_TEXT: f64 = 3.0;
+
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+
+        for (name, p) in &themes {
+            let pairs = [
+                ("tab_active", p.tab_active_fg, p.tab_active_bg),
+                ("status", p.status_fg, p.status_bg),
+                ("help", p.help_fg, p.help_bg),
+                ("text_on_deep", p.text_primary, p.bg_deep),
+                ("text_on_surface", p.text_primary, p.bg_surface),
+            ];
+            for (pair_name, fg, bg) in &pairs {
+                let ratio = contrast_ratio(*fg, *bg);
+                assert!(
+                    ratio >= MIN_TEXT,
+                    "theme {name}: {pair_name} contrast {ratio:.2} < {MIN_TEXT:.1}"
+                );
+            }
+        }
+    }
+
+    /// `from_config_name` maps config strings to the correct palettes.
+    #[test]
+    fn from_config_name_resolves_correctly() {
+        let default = TuiThemePalette::from_config_name("default");
+        let frank = TuiThemePalette::frankenstein();
+        assert_eq!(default.tab_key_fg, frank.tab_key_fg, "default should map to frankenstein");
+
+        let solar = TuiThemePalette::from_config_name("solarized");
+        let solar_direct = TuiThemePalette::solarized_dark();
+        assert_eq!(solar.tab_key_fg, solar_direct.tab_key_fg);
+
+        let drac = TuiThemePalette::from_config_name("dracula");
+        let drac_direct = TuiThemePalette::dracula();
+        assert_eq!(drac.tab_key_fg, drac_direct.tab_key_fg);
+
+        let nord = TuiThemePalette::from_config_name("nord");
+        let nord_direct = TuiThemePalette::nord();
+        assert_eq!(nord.tab_key_fg, nord_direct.tab_key_fg);
+
+        let gruv = TuiThemePalette::from_config_name("gruvbox");
+        let gruv_direct = TuiThemePalette::gruvbox_dark();
+        assert_eq!(gruv.tab_key_fg, gruv_direct.tab_key_fg);
+    }
+
+    /// Unknown config names fall back to the default theme.
+    #[test]
+    fn from_config_name_unknown_falls_back() {
+        let unknown = TuiThemePalette::from_config_name("matrix");
+        let default = TuiThemePalette::frankenstein();
+        assert_eq!(
+            unknown.tab_key_fg, default.tab_key_fg,
+            "unknown config name should fall back to default"
+        );
+    }
+
+    /// Named theme chart_series arrays have 6 distinct colors.
+    #[test]
+    fn named_themes_chart_series_are_distinct() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+
+        for (name, p) in &themes {
+            for i in 0..p.chart_series.len() {
+                for j in (i + 1)..p.chart_series.len() {
+                    assert_ne!(
+                        p.chart_series[i], p.chart_series[j],
+                        "theme {name}: chart_series[{i}] and chart_series[{j}] are identical"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Named theme agent_palette arrays have 8 entries.
+    #[test]
+    fn named_themes_agent_palette_complete() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+
+        for (name, p) in &themes {
+            assert_eq!(
+                p.agent_palette.len(),
+                8,
+                "theme {name}: agent_palette should have 8 colors"
+            );
+            // At least 6 of 8 should be distinct (some themes may reuse a color for the last slots)
+            let unique: std::collections::HashSet<u32> =
+                p.agent_palette.iter().map(|c| c.0).collect();
+            assert!(
+                unique.len() >= 6,
+                "theme {name}: agent_palette has too few distinct colors ({} of 8)",
+                unique.len()
+            );
+        }
+    }
+
+    /// Severity colors follow the expected hierarchy for all named themes.
+    #[test]
+    fn named_themes_severity_hierarchy() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+
+        for (name, p) in &themes {
+            // ok, warn, error should all be distinct
+            assert_ne!(p.severity_ok, p.severity_warn, "theme {name}: ok == warn");
+            assert_ne!(p.severity_ok, p.severity_error, "theme {name}: ok == error");
+            assert_ne!(p.severity_warn, p.severity_error, "theme {name}: warn == error");
         }
     }
 }

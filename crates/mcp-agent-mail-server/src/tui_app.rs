@@ -24,6 +24,7 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::toast::{ToastId, ToastPosition};
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
 use ftui::{Event, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
 use mcp_agent_mail_db::{DbConn, DbPoolConfig};
@@ -902,6 +903,10 @@ pub struct MailAppModel {
     coach_hints: CoachHintManager,
     /// Recent action outcomes for feedback surfaces.
     action_outcomes: Vec<ActionOutcome>,
+    /// Clipboard helper for OSC 52 / system clipboard copy operations.
+    clipboard: Clipboard,
+    /// Internal clipboard fallback when terminal clipboard is unavailable.
+    internal_clipboard: Option<String>,
 }
 
 impl MailAppModel {
@@ -973,6 +978,8 @@ impl MailAppModel {
             mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher::new(),
             coach_hints: CoachHintManager::new(),
             action_outcomes: Vec::new(),
+            clipboard: Clipboard::auto(ftui::TerminalCapabilities::detect()),
+            internal_clipboard: None,
         }
     }
 
@@ -1193,17 +1200,66 @@ impl MailAppModel {
                 Cmd::none()
             }
             ActionKind::CopyToClipboard(text) => {
-                self.notifications.notify(
-                    Toast::new(format!(
-                        "Copied: {}",
-                        text.chars().take(30).collect::<String>()
-                    ))
-                    .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(2)),
-                );
+                self.copy_to_clipboard(&text);
                 Cmd::none()
             }
             ActionKind::Dismiss => Cmd::none(),
+        }
+    }
+
+    fn notify_compose_result(&mut self, success: bool, context: &str) {
+        let (message, icon, duration) = if success {
+            let msg = if context.is_empty() {
+                "Message sent".to_string()
+            } else {
+                format!("Message sent: {context}")
+            };
+            (msg, ToastIcon::Info, Duration::from_secs(3))
+        } else {
+            let msg = if context.is_empty() {
+                "Message send failed".to_string()
+            } else {
+                format!("Message send failed: {context}")
+            };
+            (msg, ToastIcon::Error, Duration::from_secs(5))
+        };
+        self.notifications
+            .notify(Toast::new(message).icon(icon).duration(duration));
+    }
+
+    /// Copy text to the terminal clipboard via OSC 52, with system and
+    /// internal fallbacks. Shows a toast with a preview of the copied content.
+    fn copy_to_clipboard(&mut self, text: &str) {
+        let preview: String = text.chars().take(40).collect();
+        let truncated = if text.len() > 40 {
+            format!("{preview}...")
+        } else {
+            preview
+        };
+
+        // Attempt OSC 52 / system clipboard.
+        let result = self
+            .clipboard
+            .set(text, ClipboardSelection::Clipboard, &mut std::io::stdout());
+
+        match result {
+            Ok(()) => {
+                self.internal_clipboard = Some(text.to_string());
+                self.notifications.notify(
+                    Toast::new(format!("Copied: {truncated}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(2)),
+                );
+            }
+            Err(_) => {
+                // Fall back to internal clipboard.
+                self.internal_clipboard = Some(text.to_string());
+                self.notifications.notify(
+                    Toast::new(format!("Copied (internal): {truncated}"))
+                        .icon(ToastIcon::Warning)
+                        .duration(Duration::from_secs(3)),
+                );
+            }
         }
     }
 
@@ -1260,10 +1316,13 @@ impl MailAppModel {
                 Cmd::none()
             }
             "compose_to" => {
-                // Navigate to explorer filtered for the agent.
-                self.apply_deep_link_with_transition(&DeepLinkTarget::ExplorerForAgent(
+                self.apply_deep_link_with_transition(&DeepLinkTarget::ComposeToAgent(
                     arg.to_string(),
                 ));
+                Cmd::none()
+            }
+            "compose_result" => {
+                self.notify_compose_result(arg == "ok", context);
                 Cmd::none()
             }
 
@@ -2660,6 +2719,23 @@ impl Model for MailAppModel {
                             }
                             KeyCode::Char('k') | KeyCode::Up if self.help_visible => {
                                 self.help_scroll = self.help_scroll.saturating_sub(1);
+                                return Cmd::none();
+                            }
+                            // Clipboard yank: y copies focused content
+                            KeyCode::Char('y') if !text_mode => {
+                                if let Some(screen) =
+                                    self.screen_manager.active_screen_ref()
+                                {
+                                    if let Some(content) = screen.copyable_content() {
+                                        self.copy_to_clipboard(&content);
+                                    } else {
+                                        self.notifications.notify(
+                                            Toast::new("Nothing to copy")
+                                                .icon(ToastIcon::Warning)
+                                                .duration(Duration::from_secs(2)),
+                                        );
+                                    }
+                                }
                                 return Cmd::none();
                             }
                             KeyCode::Char(c) if !text_mode => {

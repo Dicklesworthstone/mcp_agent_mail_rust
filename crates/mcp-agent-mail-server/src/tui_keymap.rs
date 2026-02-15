@@ -82,6 +82,11 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
         text_suppressible: true,
     },
     GlobalBinding {
+        label: "y",
+        action: "Copy to clipboard",
+        text_suppressible: true,
+    },
+    GlobalBinding {
         label: "q",
         action: "Quit",
         text_suppressible: true,
@@ -286,6 +291,7 @@ fn vim_profile_bindings() -> Vec<ProfileBinding> {
         pb("command_palette_ctrl", "Ctrl+P", "Command palette", false),
         pb("cycle_theme", "T", "Cycle theme", true),
         pb("toggle_help", "?", "Toggle help", true),
+        pb("clipboard_yank", "y", "Copy to clipboard", true),
         pb("quit", "q", "Quit", true),
         pb("dismiss", "Esc", "Dismiss overlay", false),
         // Vim-specific navigation additions
@@ -350,6 +356,7 @@ fn action_id_for_label(label: &str) -> &'static str {
         ":" => "command_palette",
         "T" => "cycle_theme",
         "?" => "toggle_help",
+        "y" => "clipboard_yank",
         "q" => "quit",
         "Esc" => "dismiss",
         _ => "unknown",

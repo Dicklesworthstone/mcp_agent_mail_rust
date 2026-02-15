@@ -43,6 +43,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
@@ -437,6 +438,52 @@ impl TwoTierIndex {
         count
     }
 
+    /// Return a full copy of index entries suitable for lock-free async probes.
+    ///
+    /// This is intentionally allocation-heavy and should only be used by
+    /// migration/probe paths, not steady-state search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if internal embedding buffers are inconsistent with
+    /// `metadata.doc_count`.
+    pub fn entries_snapshot(&self) -> SearchResult<Vec<TwoTierEntry>> {
+        let mut entries = Vec::with_capacity(self.metadata.doc_count);
+
+        for idx in 0..self.metadata.doc_count {
+            let Some(fast_embedding) = self.fast_embedding(idx) else {
+                return Err(SearchError::Internal(format!(
+                    "missing fast embedding for two-tier index position {idx}"
+                )));
+            };
+            let Some(quality_embedding) = self.quality_embedding(idx) else {
+                return Err(SearchError::Internal(format!(
+                    "missing quality embedding for two-tier index position {idx}"
+                )));
+            };
+            let Some(doc_id) = self.doc_ids.get(idx).copied() else {
+                return Err(SearchError::Internal(format!(
+                    "missing doc_id for two-tier index position {idx}"
+                )));
+            };
+
+            entries.push(TwoTierEntry {
+                doc_id,
+                doc_kind: self
+                    .doc_kinds
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(crate::document::DocKind::Message),
+                project_id: self.project_ids.get(idx).copied().flatten(),
+                fast_embedding: fast_embedding.to_vec(),
+                quality_embedding: quality_embedding.to_vec(),
+                has_quality: self.has_quality(idx),
+            });
+        }
+
+        Ok(entries)
+    }
+
     /// Get fast embedding at index.
     fn fast_embedding(&self, idx: usize) -> Option<&[f16]> {
         let dim = self.config.fast_dimension;
@@ -672,10 +719,10 @@ pub fn blend_scores(fast: &[f32], quality: &[f32], quality_weight: f32) -> Vec<f
         .collect()
 }
 
-/// Separator for encoded frankensearch probe doc keys.
+/// Separator used when encoding probe document IDs for frankensearch.
 const FS_TWO_TIER_DOC_KEY_SEPARATOR: &str = "::";
 
-/// Counter used to generate collision-free temporary probe directories.
+/// Monotonic counter for unique probe directory names.
 static FS_TWO_TIER_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
@@ -695,7 +742,7 @@ fn parse_fs_probe_doc_id(doc_key: &str) -> Option<u64> {
         .map_or_else(|| doc_key.parse().ok(), |(doc_id, _)| doc_id.parse().ok())
 }
 
-fn fs_two_tier_probe_dir() -> std::path::PathBuf {
+fn fs_two_tier_probe_dir() -> PathBuf {
     let mut path = std::env::temp_dir();
     let nonce = FS_TWO_TIER_PROBE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
     let pid = std::process::id();
@@ -857,7 +904,7 @@ impl<'a> TwoTierSearcher<'a> {
 
     fn build_frankensearch_probe_index(
         &self,
-        probe_dir: &std::path::Path,
+        probe_dir: &Path,
     ) -> SearchResult<(
         crate::fs_bridge::FsTwoTierIndex,
         HashMap<String, ProbeDocMetadata>,
@@ -867,6 +914,11 @@ impl<'a> TwoTierSearcher<'a> {
             crate::fs_bridge::to_fs_config(&self.config),
         )
         .map_err(crate::fs_bridge::map_fs_error)?;
+
+        builder.set_fast_embedder_id(self.fast_embedder.id());
+        if let Some(quality_embedder) = &self.quality_embedder {
+            builder.set_quality_embedder_id(quality_embedder.id());
+        }
 
         let mut metadata_by_doc_key: HashMap<String, ProbeDocMetadata> =
             HashMap::with_capacity(self.index.doc_ids.len());
@@ -888,10 +940,11 @@ impl<'a> TwoTierSearcher<'a> {
             };
 
             let doc_key = to_fs_probe_doc_key(doc_id, idx);
+            let fast_embedding = f16_slice_to_f32_vec(fast_embedding);
             builder
                 .add_record(
                     doc_key.clone(),
-                    &f16_slice_to_f32_vec(fast_embedding),
+                    &fast_embedding,
                     quality_embedding.as_deref(),
                 )
                 .map_err(crate::fs_bridge::map_fs_error)?;
@@ -916,13 +969,14 @@ impl<'a> TwoTierSearcher<'a> {
     }
 
     /// Probe seam: execute search through `frankensearch::TwoTierSearcher`
-    /// while preserving the current local `SearchPhase` contract.
+    /// while preserving the local `SearchPhase` contract.
     ///
-    /// This is an explicit migration helper and does not alter the default
-    /// synchronous iterator path exposed by [`TwoTierSearcher::search`].
+    /// This path exists for migration verification and should not replace
+    /// the default synchronous iterator without parity evidence.
     ///
     /// # Errors
-    /// Maps frankensearch failures via `fs_bridge::map_fs_error`.
+    ///
+    /// Maps frankensearch failures via [`crate::fs_bridge::map_fs_error`].
     pub async fn search_with_frankensearch_probe(
         &self,
         cx: &crate::fs_bridge::FsCx,
@@ -933,7 +987,7 @@ impl<'a> TwoTierSearcher<'a> {
             return Ok(Vec::new());
         }
 
-        // Preserve local quality-only semantics: return only a refined phase.
+        // Preserve local quality-only semantics: return only refined output.
         if self.config.quality_only {
             let start = Instant::now();
             return match self.search_quality_only(query, k) {
@@ -948,40 +1002,59 @@ impl<'a> TwoTierSearcher<'a> {
         }
 
         let probe_dir = fs_two_tier_probe_dir();
-        let (fs_index, metadata_by_doc_key) = self.build_frankensearch_probe_index(&probe_dir)?;
+        std::fs::create_dir_all(&probe_dir).map_err(|error| {
+            SearchError::Internal(format!(
+                "failed to create frankensearch probe dir {}: {error}",
+                probe_dir.display()
+            ))
+        })?;
 
-        let mut fs_searcher = crate::fs_bridge::FsTwoTierSearcher::new(
-            Arc::new(fs_index),
-            Arc::new(crate::fs_bridge::SyncEmbedderAdapter::fast(
-                self.fast_embedder.clone(),
-            )),
-            crate::fs_bridge::to_fs_config(&self.config),
-        );
+        let result = async {
+            let (fs_index, metadata_by_doc_key) =
+                self.build_frankensearch_probe_index(&probe_dir)?;
+            let metadata_by_doc_key = Arc::new(metadata_by_doc_key);
 
-        if let Some(quality_embedder) = &self.quality_embedder {
-            fs_searcher = fs_searcher.with_quality_embedder(Arc::new(
-                crate::fs_bridge::SyncEmbedderAdapter::quality(quality_embedder.clone()),
-            ));
+            let mut fs_searcher = crate::fs_bridge::FsTwoTierSearcher::new(
+                Arc::new(fs_index),
+                Arc::new(crate::fs_bridge::SyncEmbedderAdapter::fast(
+                    self.fast_embedder.clone(),
+                )),
+                crate::fs_bridge::to_fs_config(&self.config),
+            );
+            if let Some(quality_embedder) = self.quality_embedder.clone() {
+                fs_searcher = fs_searcher.with_quality_embedder(Arc::new(
+                    crate::fs_bridge::SyncEmbedderAdapter::quality(quality_embedder),
+                ));
+            }
+
+            let mut phases = Vec::new();
+            let phase_metadata = Arc::clone(&metadata_by_doc_key);
+            fs_searcher
+                .search(
+                    cx,
+                    query,
+                    k,
+                    |_| None,
+                    |phase| {
+                        phases.push(from_fs_phase(phase, phase_metadata.as_ref()));
+                    },
+                )
+                .await
+                .map_err(crate::fs_bridge::map_fs_error)?;
+            Ok(phases)
+        }
+        .await;
+
+        if let Err(error) = std::fs::remove_dir_all(&probe_dir) {
+            tracing::debug!(
+                target: "search.semantic",
+                path = %probe_dir.display(),
+                error = %error,
+                "failed to remove two-tier probe directory"
+            );
         }
 
-        let mut phases = Vec::new();
-        let search_result = fs_searcher
-            .search(
-                cx,
-                query,
-                k,
-                |_| None,
-                |phase| {
-                    phases.push(from_fs_phase(phase, &metadata_by_doc_key));
-                },
-            )
-            .await;
-
-        let _ = std::fs::remove_dir_all(&probe_dir);
-
-        search_result
-            .map(|_| phases)
-            .map_err(crate::fs_bridge::map_fs_error)
+        result
     }
 }
 
@@ -1233,6 +1306,83 @@ mod tests {
 
     fn doc_ids(results: &[ScoredResult]) -> Vec<u64> {
         results.iter().map(|hit| hit.doc_id).collect()
+    }
+
+    #[test]
+    fn fs_probe_doc_key_roundtrip() {
+        let key = to_fs_probe_doc_key(42, 7);
+        assert_eq!(key, "42::7");
+        assert_eq!(parse_fs_probe_doc_id(&key), Some(42));
+        assert_eq!(parse_fs_probe_doc_id("99"), Some(99));
+        assert_eq!(parse_fs_probe_doc_id("bad::key"), None);
+    }
+
+    #[test]
+    fn from_fs_phase_initial_preserves_domain_metadata() {
+        use frankensearch::core::types::ScoreSource;
+
+        let mut metadata_by_doc_key = HashMap::new();
+        metadata_by_doc_key.insert(
+            "10::3".to_string(),
+            ProbeDocMetadata {
+                idx: 3,
+                doc_kind: crate::document::DocKind::Thread,
+                project_id: Some(77),
+            },
+        );
+
+        let phase = crate::fs_bridge::FsSearchPhase::Initial {
+            results: vec![crate::fs_bridge::FsScoredResult {
+                doc_id: "10::3".to_string(),
+                score: 0.91,
+                source: ScoreSource::SemanticFast,
+                fast_score: Some(0.91),
+                quality_score: None,
+                lexical_score: None,
+                rerank_score: None,
+                metadata: None,
+            }],
+            latency: std::time::Duration::from_millis(9),
+            metrics: frankensearch::core::types::PhaseMetrics {
+                embedder_id: "probe".to_string(),
+                vectors_searched: 1,
+                lexical_candidates: 0,
+                fused_count: 1,
+            },
+        };
+
+        match from_fs_phase(phase, &metadata_by_doc_key) {
+            SearchPhase::Initial {
+                results,
+                latency_ms,
+            } => {
+                assert_eq!(latency_ms, 9);
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].doc_id, 10);
+                assert_eq!(results[0].idx, 3);
+                assert_eq!(results[0].doc_kind, crate::document::DocKind::Thread);
+                assert_eq!(results[0].project_id, Some(77));
+            }
+            other => panic!("expected initial phase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_fs_phase_refinement_failed_maps_error_string() {
+        let phase = crate::fs_bridge::FsSearchPhase::RefinementFailed {
+            initial_results: Vec::new(),
+            error: frankensearch::SearchError::ModelNotFound {
+                name: "quality-model".to_string(),
+            },
+            latency: std::time::Duration::from_millis(11),
+        };
+
+        match from_fs_phase(phase, &HashMap::new()) {
+            SearchPhase::RefinementFailed { error } => {
+                assert!(error.contains("quality-model"));
+            }
+            other => panic!("expected refinement failed phase, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2418,85 +2568,6 @@ mod tests {
         assert_eq!(scores.len(), 3);
         for &s in &scores {
             assert!(s.abs() < f32::EPSILON);
-        }
-    }
-
-    #[test]
-    fn fs_probe_doc_key_roundtrip() {
-        let key = to_fs_probe_doc_key(42, 7);
-        assert_eq!(key, "42::7");
-        assert_eq!(parse_fs_probe_doc_id(&key), Some(42));
-        assert_eq!(parse_fs_probe_doc_id("77"), Some(77));
-        assert_eq!(parse_fs_probe_doc_id("not-a-doc"), None);
-    }
-
-    #[test]
-    fn from_fs_phase_initial_preserves_domain_metadata() {
-        let mut metadata_by_doc_key = HashMap::new();
-        metadata_by_doc_key.insert(
-            "42::1".to_owned(),
-            ProbeDocMetadata {
-                idx: 1,
-                doc_kind: crate::document::DocKind::Thread,
-                project_id: Some(99),
-            },
-        );
-
-        let phase = crate::fs_bridge::FsSearchPhase::Initial {
-            results: vec![crate::fs_bridge::FsScoredResult {
-                doc_id: "42::1".to_owned(),
-                score: 0.75,
-                source: frankensearch::core::types::ScoreSource::SemanticFast,
-                fast_score: Some(0.75),
-                quality_score: None,
-                lexical_score: None,
-                rerank_score: None,
-                metadata: None,
-            }],
-            latency: std::time::Duration::from_millis(5),
-            metrics: crate::fs_bridge::FsPhaseMetrics {
-                embedder_id: "fast".to_owned(),
-                vectors_searched: 3,
-                lexical_candidates: 0,
-                fused_count: 1,
-            },
-        };
-
-        let converted = from_fs_phase(phase, &metadata_by_doc_key);
-        match converted {
-            SearchPhase::Initial {
-                results,
-                latency_ms,
-            } => {
-                assert_eq!(latency_ms, 5);
-                assert_eq!(results.len(), 1);
-                let only = &results[0];
-                assert_eq!(only.doc_id, 42);
-                assert_eq!(only.idx, 1);
-                assert_eq!(only.doc_kind, crate::document::DocKind::Thread);
-                assert_eq!(only.project_id, Some(99));
-                assert!((only.score - 0.75).abs() < f32::EPSILON);
-            }
-            other => panic!("expected Initial phase, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn from_fs_phase_refinement_failed_maps_error_string() {
-        let phase = crate::fs_bridge::FsSearchPhase::RefinementFailed {
-            initial_results: Vec::new(),
-            error: frankensearch::SearchError::ModelNotFound {
-                name: "missing-quality-model".to_owned(),
-            },
-            latency: std::time::Duration::from_millis(3),
-        };
-
-        let converted = from_fs_phase(phase, &HashMap::new());
-        match converted {
-            SearchPhase::RefinementFailed { error } => {
-                assert!(error.contains("missing-quality-model"));
-            }
-            other => panic!("expected RefinementFailed phase, got {other:?}"),
         }
     }
 }

@@ -806,6 +806,11 @@ impl MailScreen for AttachmentExplorerScreen {
         self.text_filter_active
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let entry = self.selected_entry()?;
+        Some(entry.path.clone().unwrap_or_else(|| entry.sha1.clone()))
+    }
+
     fn title(&self) -> &'static str {
         "Attachments"
     }

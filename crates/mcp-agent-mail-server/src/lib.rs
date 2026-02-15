@@ -6006,6 +6006,27 @@ mod tests {
     }
 
     #[test]
+    fn bearer_auth_runs_before_oversized_body_validation() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let mut req = make_request(
+            Http1Method::Post,
+            "/api",
+            &[("Content-Type", "application/json")],
+        );
+        req.body = vec![b'x'; (10 * 1024 * 1024) + 1];
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 401,
+            "missing bearer auth must 401 before oversized-body transport validation"
+        );
+    }
+
+    #[test]
     fn bearer_auth_localhost_bypass_applies_and_forwarded_headers_disable_it() {
         let config = mcp_agent_mail_core::Config {
             http_bearer_token: Some("secret".to_string()),
@@ -6045,6 +6066,37 @@ mod tests {
         );
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 401);
+    }
+
+    #[test]
+    fn bearer_auth_runs_before_well_known_method_validation() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req_missing_auth = make_request(
+            Http1Method::Post,
+            "/.well-known/oauth-authorization-server",
+            &[],
+        );
+        let resp_missing_auth = block_on(state.handle(req_missing_auth));
+        assert_eq!(
+            resp_missing_auth.status, 401,
+            "missing auth must 401 before well-known method validation"
+        );
+
+        let req_with_auth = make_request(
+            Http1Method::Post,
+            "/.well-known/oauth-authorization-server",
+            &[("Authorization", "Bearer secret")],
+        );
+        let resp_with_auth = block_on(state.handle(req_with_auth));
+        assert_eq!(
+            resp_with_auth.status, 405,
+            "with valid auth, request should reach well-known method validation"
+        );
     }
 
     #[test]
@@ -6564,6 +6616,300 @@ mod tests {
         assert_eq!(resp.status, 405);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
         assert_eq!(body["detail"], "Method Not Allowed");
+    }
+
+    #[test]
+    fn http_post_rate_limit_exceeded_returns_429_with_detail() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let mut req1 = make_request_with_peer_addr(Http1Method::Post, "/api", &[], Some(peer));
+        req1.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 1_i64))
+            .expect("serialize json-rpc");
+        let resp1 = block_on(state.handle(req1));
+        assert_eq!(resp1.status, 200);
+
+        let mut req2 = make_request_with_peer_addr(Http1Method::Post, "/api", &[], Some(peer));
+        req2.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 2_i64))
+            .expect("serialize json-rpc");
+        let resp2 = block_on(state.handle(req2));
+        assert_eq!(resp2.status, 429);
+
+        let body: serde_json::Value = serde_json::from_slice(&resp2.body).expect("json response");
+        assert_eq!(body["detail"], "Rate limit exceeded");
+    }
+
+    #[test]
+    fn unauthenticated_requests_do_not_consume_rate_limit_bucket() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        // Missing auth should fail before rate-limit consumption.
+        let mut unauth = make_request_with_peer_addr(Http1Method::Post, "/api", &[], Some(peer));
+        unauth.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 10_i64))
+            .expect("serialize json-rpc");
+        let unauth_resp = block_on(state.handle(unauth));
+        assert_eq!(unauth_resp.status, 401);
+
+        // First authenticated request must still pass (bucket was not consumed above).
+        let mut auth_ok = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", "Bearer secret")],
+            Some(peer),
+        );
+        auth_ok.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 11_i64))
+            .expect("serialize json-rpc");
+        let auth_ok_resp = block_on(state.handle(auth_ok));
+        assert_eq!(auth_ok_resp.status, 200);
+
+        // Second authenticated request should hit the one-request bucket.
+        let mut auth_limited = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", "Bearer secret")],
+            Some(peer),
+        );
+        auth_limited.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 12_i64))
+            .expect("serialize json-rpc");
+        let auth_limited_resp = block_on(state.handle(auth_limited));
+        assert_eq!(auth_limited_resp.status, 429);
+    }
+
+    #[test]
+    fn http_post_rbac_forbidden_returns_403_with_detail() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", auth.as_str())],
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({ "name": "send_message", "arguments": {} })),
+            33_i64,
+        ))
+        .expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 403);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Forbidden");
+    }
+
+    #[test]
+    fn http_post_expired_jwt_returns_401_with_detail() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_secs(),
+        )
+        .expect("timestamp fits i64");
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "role": "writer",
+            "exp": now - 1
+        });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", auth.as_str())],
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 34_i64))
+            .expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Unauthorized");
+    }
+
+    #[test]
+    fn http_post_missing_auth_with_jwt_enabled_returns_401_with_detail() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[],
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 35_i64))
+            .expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["detail"], "Unauthorized");
+    }
+
+    #[test]
+    fn invalid_jwt_requests_do_not_consume_rate_limit_bucket() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        // Invalid JWT should fail before rate-limit consumption.
+        let mut invalid = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", "Bearer abc.def.ghi")],
+            Some(peer),
+        );
+        invalid.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 36_i64))
+            .expect("serialize json-rpc");
+        let invalid_resp = block_on(state.handle(invalid));
+        assert_eq!(invalid_resp.status, 401);
+
+        // First valid JWT request should still pass.
+        let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+        let mut valid_first = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        valid_first.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 37_i64))
+            .expect("serialize json-rpc");
+        let valid_first_resp = block_on(state.handle(valid_first));
+        assert_eq!(valid_first_resp.status, 200);
+
+        // Second valid JWT request should hit the one-request bucket.
+        let mut valid_second = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        valid_second.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 38_i64))
+            .expect("serialize json-rpc");
+        let valid_second_resp = block_on(state.handle(valid_second));
+        assert_eq!(valid_second_resp.status, 429);
+    }
+
+    #[test]
+    fn forbidden_requests_do_not_consume_rate_limit_bucket() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let reader_claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let reader_token = hs256_token(b"secret", &reader_claims);
+        let reader_auth = format!("Bearer {reader_token}");
+
+        let writer_claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+        let writer_token = hs256_token(b"secret", &writer_claims);
+        let writer_auth = format!("Bearer {writer_token}");
+
+        let make_send_message_call = |auth: &str, id: i64| {
+            let mut req = make_request_with_peer_addr(
+                Http1Method::Post,
+                "/api",
+                &[("Authorization", auth)],
+                Some(peer),
+            );
+            req.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "send_message",
+                    "arguments": {
+                        "project_key": "/data/projects/mcp_agent_mail_rust",
+                        "sender_name": "nobody",
+                        "to": ["nobody"],
+                        "subject": "x",
+                        "body_md": "x"
+                    }
+                })),
+                id,
+            ))
+            .expect("serialize json-rpc");
+            req
+        };
+
+        // Reader role is forbidden for send_message (writer tool).
+        let reader_resp = block_on(state.handle(make_send_message_call(reader_auth.as_str(), 40)));
+        assert_eq!(reader_resp.status, 403);
+
+        // First writer request with same sub should still pass rate limit gate.
+        let writer_first = block_on(state.handle(make_send_message_call(writer_auth.as_str(), 41)));
+        assert_ne!(writer_first.status, 403);
+        assert_ne!(writer_first.status, 429);
+
+        // Second writer request for same sub should hit the one-request bucket.
+        let writer_second = block_on(state.handle(make_send_message_call(writer_auth.as_str(), 42)));
+        assert_eq!(writer_second.status, 429);
+        let body: serde_json::Value =
+            serde_json::from_slice(&writer_second.body).expect("json response");
+        assert_eq!(body["detail"], "Rate limit exceeded");
     }
 
     #[test]

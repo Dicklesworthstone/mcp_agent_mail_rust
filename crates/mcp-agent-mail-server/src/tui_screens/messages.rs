@@ -8,6 +8,9 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use asupersync::Cx;
+use fastmcp::prelude::McpContext;
+use fastmcp_core::block_on;
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
@@ -22,6 +25,7 @@ use ftui_extras::syntax::{JsonTokenizer, LineState, TokenKind, Tokenizer};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
+use ftui_widgets::textarea::TextArea;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 
 use mcp_agent_mail_db::DbConn;
@@ -50,6 +54,9 @@ const URGENT_PULSE_HALF_PERIOD_TICKS: u64 = 5;
 const SHIMMER_WINDOW_MICROS: i64 = 500_000;
 const SHIMMER_MAX_ROWS: usize = 5;
 const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
+const COMPOSE_BODY_MIN_ROWS: u16 = 10;
+const COMPOSE_SENDER_NAME: &str = "HumanOverseer";
+const COMPOSE_IMPORTANCE_LEVELS: [&str; 3] = ["normal", "high", "urgent"];
 
 /// Max body preview length in the results list (used for future
 /// inline preview in narrow mode).
@@ -378,6 +385,243 @@ enum DockDragState {
     Dragging,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeField {
+    To,
+    Cc,
+    Subject,
+    ThreadId,
+    Importance,
+    AckRequired,
+    Body,
+}
+
+impl ComposeField {
+    const fn next(self) -> Self {
+        match self {
+            Self::To => Self::Cc,
+            Self::Cc => Self::Subject,
+            Self::Subject => Self::ThreadId,
+            Self::ThreadId => Self::Importance,
+            Self::Importance => Self::AckRequired,
+            Self::AckRequired => Self::Body,
+            Self::Body => Self::To,
+        }
+    }
+
+    const fn prev(self) -> Self {
+        match self {
+            Self::To => Self::Body,
+            Self::Cc => Self::To,
+            Self::Subject => Self::Cc,
+            Self::ThreadId => Self::Subject,
+            Self::Importance => Self::ThreadId,
+            Self::AckRequired => Self::Importance,
+            Self::Body => Self::AckRequired,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ComposeValidationErrors {
+    to: Option<String>,
+    cc: Option<String>,
+    subject: Option<String>,
+    thread_id: Option<String>,
+    body: Option<String>,
+    general: Option<String>,
+}
+
+impl ComposeValidationErrors {
+    const fn has_any(&self) -> bool {
+        self.to.is_some()
+            || self.cc.is_some()
+            || self.subject.is_some()
+            || self.thread_id.is_some()
+            || self.body.is_some()
+            || self.general.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ComposePayload {
+    project_slug: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    subject: String,
+    thread_id: Option<String>,
+    body_md: String,
+    importance: String,
+    ack_required: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ComposeFormState {
+    project_slug: String,
+    to_input: TextInput,
+    cc_input: TextInput,
+    subject_input: TextInput,
+    thread_id_input: TextInput,
+    body_input: TextArea,
+    importance_idx: usize,
+    ack_required: bool,
+    focus: ComposeField,
+    available_agents: Vec<String>,
+    suggestions: Vec<String>,
+    suggestion_cursor: usize,
+    errors: ComposeValidationErrors,
+}
+
+impl ComposeFormState {
+    fn new(
+        project_slug: String,
+        prefill_to: Option<String>,
+        available_agents: Vec<String>,
+    ) -> Self {
+        let mut form = Self {
+            project_slug,
+            to_input: TextInput::new()
+                .with_placeholder("Recipient agent (comma-separated)")
+                .with_focused(true),
+            cc_input: TextInput::new().with_placeholder("CC recipients (optional)"),
+            subject_input: TextInput::new().with_placeholder("Subject (required, max 200 chars)"),
+            thread_id_input: TextInput::new()
+                .with_placeholder("Thread ID (optional, auto-generated if blank)"),
+            body_input: TextArea::new()
+                .with_placeholder("Markdown body...")
+                .with_soft_wrap(true)
+                .with_focus(false),
+            importance_idx: 0,
+            ack_required: false,
+            focus: ComposeField::To,
+            available_agents,
+            suggestions: Vec::new(),
+            suggestion_cursor: 0,
+            errors: ComposeValidationErrors::default(),
+        };
+        if let Some(to) = prefill_to {
+            form.to_input.set_value(&to);
+        }
+        form.update_focus();
+        form.refresh_suggestions();
+        form
+    }
+
+    const fn importance(&self) -> &'static str {
+        COMPOSE_IMPORTANCE_LEVELS[self.importance_idx]
+    }
+
+    fn update_focus(&mut self) {
+        self.to_input
+            .set_focused(matches!(self.focus, ComposeField::To));
+        self.cc_input
+            .set_focused(matches!(self.focus, ComposeField::Cc));
+        self.subject_input
+            .set_focused(matches!(self.focus, ComposeField::Subject));
+        self.thread_id_input
+            .set_focused(matches!(self.focus, ComposeField::ThreadId));
+        self.body_input
+            .set_focused(matches!(self.focus, ComposeField::Body));
+    }
+
+    fn set_focus(&mut self, focus: ComposeField) {
+        self.focus = focus;
+        self.update_focus();
+        self.refresh_suggestions();
+    }
+
+    fn cycle_focus_next(&mut self) {
+        self.set_focus(self.focus.next());
+    }
+
+    fn cycle_focus_prev(&mut self) {
+        self.set_focus(self.focus.prev());
+    }
+
+    const fn recipient_input(&self) -> Option<&TextInput> {
+        match self.focus {
+            ComposeField::To => Some(&self.to_input),
+            ComposeField::Cc => Some(&self.cc_input),
+            _ => None,
+        }
+    }
+
+    const fn recipient_input_mut(&mut self) -> Option<&mut TextInput> {
+        match self.focus {
+            ComposeField::To => Some(&mut self.to_input),
+            ComposeField::Cc => Some(&mut self.cc_input),
+            _ => None,
+        }
+    }
+
+    fn refresh_suggestions(&mut self) {
+        let Some(input) = self.recipient_input() else {
+            self.suggestions.clear();
+            self.suggestion_cursor = 0;
+            return;
+        };
+
+        let raw = input.value();
+        let (_, prefix) = split_recipient_prefix(raw);
+        let prefix_lower = prefix.to_ascii_lowercase();
+        let already = parse_recipient_list(raw);
+        self.suggestions = self
+            .available_agents
+            .iter()
+            .filter(|name| {
+                let name_lower = name.to_ascii_lowercase();
+                (prefix_lower.is_empty() || name_lower.starts_with(&prefix_lower))
+                    && !already.iter().any(|existing| existing == *name)
+            })
+            .take(6)
+            .cloned()
+            .collect();
+
+        if self.suggestion_cursor >= self.suggestions.len() {
+            self.suggestion_cursor = 0;
+        }
+    }
+
+    fn move_suggestion(&mut self, delta: isize) {
+        if self.suggestions.is_empty() {
+            return;
+        }
+        let len = self.suggestions.len();
+        if delta.is_negative() {
+            self.suggestion_cursor = if self.suggestion_cursor == 0 {
+                len - 1
+            } else {
+                self.suggestion_cursor - 1
+            };
+        } else {
+            self.suggestion_cursor = (self.suggestion_cursor + 1) % len;
+        }
+    }
+
+    fn apply_suggestion(&mut self) -> bool {
+        if self.suggestions.is_empty() {
+            return false;
+        }
+        let selected = self.suggestions[self.suggestion_cursor].clone();
+        let Some(input) = self.recipient_input_mut() else {
+            return false;
+        };
+        let current = input.value().to_string();
+        let (prefix_start, _) = split_recipient_prefix(&current);
+        let base = current[..prefix_start].trim_end();
+        let next = if base.is_empty() {
+            selected
+        } else if base.ends_with(',') {
+            format!("{base} {selected}")
+        } else {
+            format!("{base}, {selected}")
+        };
+        input.set_value(&next);
+        self.refresh_suggestions();
+        true
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // MessageBrowserScreen
 // ──────────────────────────────────────────────────────────────────────
@@ -432,6 +676,8 @@ pub struct MessageBrowserScreen {
     last_results_area: Cell<Rect>,
     /// Last rendered detail area.
     last_detail_area: Cell<Rect>,
+    /// Message compose modal state (when active).
+    compose_form: Option<ComposeFormState>,
 }
 
 impl MessageBrowserScreen {
@@ -466,6 +712,7 @@ impl MessageBrowserScreen {
             last_search_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            compose_form: None,
         }
     }
 
@@ -476,6 +723,256 @@ impl MessageBrowserScreen {
         }
         let pulse_on = ((tick_count / URGENT_PULSE_HALF_PERIOD_TICKS) % 2) == 0;
         MESSAGE_URGENT_PULSE_ON.store(pulse_on, Ordering::Relaxed);
+    }
+
+    fn compose_project_slug(&self) -> Option<String> {
+        match &self.inbox_mode {
+            InboxMode::Local(slug) if !slug.is_empty() && slug != "default" => {
+                return Some(slug.clone());
+            }
+            _ => {}
+        }
+
+        if let Some(entry) = self.results.get(self.cursor) {
+            if !entry.project_slug.is_empty() {
+                return Some(entry.project_slug.clone());
+            }
+        }
+
+        let conn = self.db_conn.as_ref()?;
+        let sql = "SELECT slug FROM projects ORDER BY created_at DESC LIMIT 1";
+        conn.query_sync(sql, &[])
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|row| row.get_named::<String>("slug").ok())
+    }
+
+    fn load_agent_names_for_project(&self, project_slug: &str) -> Vec<String> {
+        let Some(conn) = &self.db_conn else {
+            return Vec::new();
+        };
+        let escaped_slug = project_slug.replace('\'', "''");
+        let sql = format!(
+            "SELECT a.name AS name \
+             FROM agents a \
+             JOIN projects p ON p.id = a.project_id \
+             WHERE p.slug = '{escaped_slug}' \
+             ORDER BY a.name"
+        );
+        conn.query_sync(&sql, &[])
+            .ok()
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|row| row.get_named::<String>("name").ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn open_compose_modal(&mut self, state: Option<&TuiSharedState>, prefill_to: Option<String>) {
+        if self.db_conn.is_none() {
+            if let Some(state) = state {
+                self.ensure_db_conn(state);
+            } else {
+                let cfg = DbPoolConfig::from_env();
+                if let Ok(path) = cfg.sqlite_path() {
+                    self.db_conn = DbConn::open_file(&path).ok();
+                    self.db_conn_attempted = true;
+                }
+            }
+        }
+        let Some(project_slug) = self.compose_project_slug() else {
+            let mut form = ComposeFormState::new(String::new(), prefill_to, Vec::new());
+            form.errors.general = Some(
+                "Unable to determine project for compose. Select a message first or switch to Local mode."
+                    .to_string(),
+            );
+            self.compose_form = Some(form);
+            return;
+        };
+
+        let agents = self.load_agent_names_for_project(&project_slug);
+        let mut form = ComposeFormState::new(project_slug, prefill_to, agents);
+        if form.available_agents.is_empty() {
+            form.errors.general = Some(
+                "No registered agents found in this project. Register agents before composing."
+                    .to_string(),
+            );
+        }
+        self.compose_form = Some(form);
+    }
+
+    fn ensure_compose_sender(&self, project_slug: &str) -> Result<(), String> {
+        let Some(conn) = &self.db_conn else {
+            return Err("Database connection unavailable".to_string());
+        };
+        let escaped_slug = project_slug.replace('\'', "''");
+        let project_sql = format!("SELECT id FROM projects WHERE slug = '{escaped_slug}' LIMIT 1");
+        let project_id = conn
+            .query_sync(&project_sql, &[])
+            .map_err(|e| format!("Failed to resolve project: {e}"))?
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("id").ok())
+            .ok_or_else(|| format!("Project not found: {project_slug}"))?;
+
+        let sender_sql = format!(
+            "SELECT id FROM agents WHERE project_id = {project_id} AND name = '{COMPOSE_SENDER_NAME}' LIMIT 1"
+        );
+        let sender_exists = conn
+            .query_sync(&sender_sql, &[])
+            .map_err(|e| format!("Failed to check compose sender: {e}"))?
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("id").ok())
+            .is_some();
+        let now = unix_epoch_micros_now().unwrap_or(0);
+        if sender_exists {
+            let touch_sql = format!(
+                "UPDATE agents SET last_active_ts = {now} \
+                 WHERE project_id = {project_id} AND name = '{COMPOSE_SENDER_NAME}'"
+            );
+            conn.execute_sync(&touch_sql, &[])
+                .map_err(|e| format!("Failed to update compose sender activity: {e}"))?;
+            return Ok(());
+        }
+
+        let insert_sql = format!(
+            "INSERT INTO agents \
+             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES \
+             ({project_id}, '{COMPOSE_SENDER_NAME}', 'am-tui', 'human', \
+              'Human operator composing messages in TUI', {now}, {now}, 'auto', 'auto')"
+        );
+        conn.execute_sync(&insert_sql, &[])
+            .map_err(|e| format!("Failed to create compose sender: {e}"))?;
+        Ok(())
+    }
+
+    fn submit_compose_form(&mut self) -> Cmd<MailScreenMsg> {
+        let (payload, errors) = match self.compose_form.as_ref() {
+            Some(form) => match validate_compose_form(form) {
+                Ok(payload) => (Some(payload), ComposeValidationErrors::default()),
+                Err(errors) => (None, *errors),
+            },
+            None => return Cmd::None,
+        };
+        if errors.has_any() {
+            if let Some(form) = self.compose_form.as_mut() {
+                form.errors = errors;
+            }
+            return Cmd::None;
+        }
+        let Some(mut payload) = payload else {
+            return Cmd::None;
+        };
+        if payload.thread_id.is_none() {
+            let micros = unix_epoch_micros_now().unwrap_or(0);
+            payload.thread_id = Some(format!("tui-{micros}"));
+        }
+
+        if let Err(err) = self.ensure_compose_sender(&payload.project_slug) {
+            if let Some(form) = self.compose_form.as_mut() {
+                form.errors.general = Some(err.clone());
+            }
+            return Cmd::msg(MailScreenMsg::ActionExecute(
+                "compose_result:error".to_string(),
+                err,
+            ));
+        }
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = block_on(mcp_agent_mail_tools::messaging::send_message(
+            &ctx,
+            payload.project_slug.clone(),
+            COMPOSE_SENDER_NAME.to_string(),
+            payload.to.clone(),
+            payload.subject.clone(),
+            payload.body_md.clone(),
+            if payload.cc.is_empty() {
+                None
+            } else {
+                Some(payload.cc.clone())
+            },
+            None,
+            None,
+            None,
+            Some(payload.importance.clone()),
+            Some(payload.ack_required),
+            payload.thread_id.clone(),
+            None,
+            None,
+            None,
+        ));
+
+        match result {
+            Ok(_) => {
+                let to_summary = if payload.to.len() == 1 {
+                    payload.to[0].clone()
+                } else {
+                    format!("{} (+{})", payload.to[0], payload.to.len() - 1)
+                };
+                let thread = payload.thread_id.unwrap_or_else(|| "n/a".to_string());
+                self.compose_form = None;
+                self.search_dirty = true;
+                self.debounce_remaining = 0;
+                Cmd::msg(MailScreenMsg::ActionExecute(
+                    "compose_result:ok".to_string(),
+                    format!("to {to_summary} · thread {thread}"),
+                ))
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if let Some(form) = self.compose_form.as_mut() {
+                    form.errors.general = Some(message.clone());
+                }
+                Cmd::msg(MailScreenMsg::ActionExecute(
+                    "compose_result:error".to_string(),
+                    message,
+                ))
+            }
+        }
+    }
+
+    fn handle_compose_event(&mut self, event: &Event) -> Cmd<MailScreenMsg> {
+        if self.compose_form.is_none() {
+            return Cmd::None;
+        }
+        let Event::Key(key) = event else {
+            return Cmd::None;
+        };
+        if key.kind != KeyEventKind::Press {
+            return Cmd::None;
+        }
+
+        let ctrl_enter =
+            key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Enter);
+        if matches!(key.code, KeyCode::Escape) {
+            self.compose_form = None;
+            return Cmd::None;
+        }
+        if ctrl_enter || matches!(key.code, KeyCode::F(5)) {
+            return self.submit_compose_form();
+        }
+
+        let Some(form) = self.compose_form.as_mut() else {
+            return Cmd::None;
+        };
+        match key.code {
+            KeyCode::Tab => {
+                form.cycle_focus_next();
+                return Cmd::None;
+            }
+            KeyCode::BackTab => {
+                form.cycle_focus_prev();
+                return Cmd::None;
+            }
+            _ => {}
+        }
+
+        apply_compose_field_key(form, event, key.code);
+        Cmd::None
     }
 
     /// Toggle between Local and Global inbox modes.
@@ -765,7 +1262,10 @@ impl Default for MessageBrowserScreen {
 
 impl MailScreen for MessageBrowserScreen {
     #[allow(clippy::too_many_lines)]
-    fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+    fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        if self.compose_form.is_some() {
+            return self.handle_compose_event(event);
+        }
         match event {
             Event::Mouse(mouse) => {
                 let content_area = self.last_content_area.get();
@@ -941,6 +1441,11 @@ impl MailScreen for MessageBrowserScreen {
                         };
                         self.apply_preset(idx);
                     }
+                    // Compose message modal
+                    KeyCode::Char('c') if !key.modifiers.contains(Modifiers::CTRL) => {
+                        self.open_compose_modal(Some(state), None);
+                        return Cmd::None;
+                    }
                     // Clear search
                     KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
                         self.search_input.clear();
@@ -993,6 +1498,15 @@ impl MailScreen for MessageBrowserScreen {
                     self.focus = Focus::ResultList;
                     self.search_input.set_focused(false);
                 }
+                true
+            }
+            DeepLinkTarget::ComposeToAgent(agent_name) => {
+                let prefill = if agent_name.is_empty() {
+                    None
+                } else {
+                    Some(agent_name.clone())
+                };
+                self.open_compose_modal(None, prefill);
                 true
             }
             _ => false,
@@ -1099,6 +1613,10 @@ impl MailScreen for MessageBrowserScreen {
                 !matches!(self.focus, Focus::SearchBar),
             );
         }
+
+        if let Some(form) = &self.compose_form {
+            render_compose_modal(frame, area, form);
+        }
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -1151,15 +1669,23 @@ impl MailScreen for MessageBrowserScreen {
                 key: "p/P",
                 action: "Next/prev preset",
             },
+            HelpEntry {
+                key: "c",
+                action: "Compose message",
+            },
+            HelpEntry {
+                key: "F5/Ctrl+Enter",
+                action: "Submit compose form",
+            },
         ]
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("Browse and triage messages. Use / to filter, Enter to view body.")
+        Some("Browse and triage messages. Use c to compose, / to filter, Enter to jump timeline.")
     }
 
     fn consumes_text_input(&self) -> bool {
-        matches!(self.focus, Focus::SearchBar)
+        self.compose_form.is_some() || matches!(self.focus, Focus::SearchBar)
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -1179,6 +1705,15 @@ impl MailScreen for MessageBrowserScreen {
         let context_id = message.id.to_string();
 
         Some((actions, anchor_row, context_id))
+    }
+
+    fn copyable_content(&self) -> Option<String> {
+        let msg = self.results.get(self.cursor)?;
+        if msg.body_md.is_empty() {
+            Some(msg.subject.clone())
+        } else {
+            Some(format!("{}\n\n{}", msg.subject, msg.body_md))
+        }
     }
 
     fn title(&self) -> &'static str {
@@ -1987,6 +2522,277 @@ fn render_vertical_scrollbar(
     Paragraph::new(Text::from_lines(lines)).render(area, frame);
 }
 
+fn render_compose_label(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    cursor_y: &mut u16,
+    bottom: u16,
+    label: &str,
+    focused: bool,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    if *cursor_y >= bottom {
+        return;
+    }
+    let style = if focused {
+        Style::default().fg(tp.selection_indicator).bold()
+    } else {
+        crate::tui_theme::text_meta(tp)
+    };
+    Paragraph::new(label)
+        .style(style)
+        .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
+    *cursor_y = (*cursor_y).saturating_add(1);
+}
+
+fn render_compose_error_line(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    cursor_y: &mut u16,
+    bottom: u16,
+    error: Option<&str>,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    if let Some(err) = error {
+        if *cursor_y < bottom {
+            Paragraph::new(truncate_str(err, inner.width as usize))
+                .style(crate::tui_theme::text_warning(tp))
+                .render(Rect::new(inner.x, *cursor_y, inner.width, 1), frame);
+            *cursor_y = (*cursor_y).saturating_add(1);
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormState) {
+    if area.width < 40 || area.height < 16 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    Paragraph::new("")
+        .style(Style::default().bg(tp.bg_overlay))
+        .render(area, frame);
+
+    let modal_width = ((u32::from(area.width) * 88) / 100).clamp(62, 116) as u16;
+    let modal_height = ((u32::from(area.height) * 88) / 100).clamp(22, 36) as u16;
+    let width = modal_width.min(area.width.saturating_sub(2));
+    let height = modal_height.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal = Rect::new(x, y, width, height);
+
+    let modal_title = format!("Compose Message · project {}", form.project_slug);
+    let block = Block::default()
+        .title(&modal_title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.selection_indicator));
+    let inner = block.inner(modal);
+    block.render(modal, frame);
+    if inner.height < 8 || inner.width < 16 {
+        return;
+    }
+
+    let mut cursor_y = inner.y;
+    let bottom = inner.y + inner.height;
+
+    render_compose_label(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        "To*",
+        matches!(form.focus, ComposeField::To),
+        &tp,
+    );
+    if cursor_y < bottom {
+        form.to_input
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+    if matches!(form.focus, ComposeField::To) && !form.suggestions.is_empty() && cursor_y < bottom {
+        let suggestions: Vec<String> = form
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                if idx == form.suggestion_cursor {
+                    format!("[{item}]")
+                } else {
+                    item.clone()
+                }
+            })
+            .collect();
+        let line = format!("Suggestions: {}", suggestions.join(" · "));
+        Paragraph::new(truncate_str(&line, inner.width as usize))
+            .style(crate::tui_theme::text_hint(&tp))
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+    render_compose_error_line(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.to.as_deref(),
+        &tp,
+    );
+
+    render_compose_label(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        "CC",
+        matches!(form.focus, ComposeField::Cc),
+        &tp,
+    );
+    if cursor_y < bottom {
+        form.cc_input
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+    if matches!(form.focus, ComposeField::Cc) && !form.suggestions.is_empty() && cursor_y < bottom {
+        let suggestions: Vec<String> = form
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                if idx == form.suggestion_cursor {
+                    format!("[{item}]")
+                } else {
+                    item.clone()
+                }
+            })
+            .collect();
+        let line = format!("Suggestions: {}", suggestions.join(" · "));
+        Paragraph::new(truncate_str(&line, inner.width as usize))
+            .style(crate::tui_theme::text_hint(&tp))
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+    render_compose_error_line(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.cc.as_deref(),
+        &tp,
+    );
+
+    render_compose_label(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        "Subject*",
+        matches!(form.focus, ComposeField::Subject),
+        &tp,
+    );
+    if cursor_y < bottom {
+        form.subject_input
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+    render_compose_error_line(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.subject.as_deref(),
+        &tp,
+    );
+
+    render_compose_label(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        "Thread ID",
+        matches!(form.focus, ComposeField::ThreadId),
+        &tp,
+    );
+    if cursor_y < bottom {
+        form.thread_id_input
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+    render_compose_error_line(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.thread_id.as_deref(),
+        &tp,
+    );
+
+    if cursor_y < bottom {
+        let importance = format!("Importance: {}", form.importance().to_ascii_uppercase());
+        let ack = if form.ack_required {
+            "Ack Required: [x]"
+        } else {
+            "Ack Required: [ ]"
+        };
+        let line = format!("{importance}  ·  {ack}");
+        let style = if matches!(
+            form.focus,
+            ComposeField::Importance | ComposeField::AckRequired
+        ) {
+            Style::default().fg(tp.selection_indicator).bold()
+        } else {
+            Style::default().fg(tp.text_secondary)
+        };
+        Paragraph::new(truncate_str(&line, inner.width as usize))
+            .style(style)
+            .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        cursor_y = cursor_y.saturating_add(1);
+    }
+
+    let body_label =
+        format!("Body* (Markdown, min {COMPOSE_BODY_MIN_ROWS} rows on normal terminals)");
+    render_compose_label(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        &body_label,
+        matches!(form.focus, ComposeField::Body),
+        &tp,
+    );
+    let footer_rows: u16 = 2;
+    let max_body_rows = bottom.saturating_sub(cursor_y).saturating_sub(footer_rows);
+    if max_body_rows > 0 {
+        ftui_widgets::Widget::render(
+            &form.body_input,
+            Rect::new(inner.x, cursor_y, inner.width, max_body_rows),
+            frame,
+        );
+        cursor_y = cursor_y.saturating_add(max_body_rows);
+    }
+    render_compose_error_line(
+        frame,
+        inner,
+        &mut cursor_y,
+        bottom,
+        form.errors.body.as_deref(),
+        &tp,
+    );
+
+    if let Some(error) = &form.errors.general {
+        if cursor_y < bottom {
+            Paragraph::new(truncate_str(error, inner.width as usize))
+                .style(crate::tui_theme::text_warning(&tp))
+                .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
+        }
+    }
+
+    let footer_y = bottom.saturating_sub(1);
+    let footer = "Tab/Shift+Tab fields • ↑/↓ suggestions • F5 or Ctrl+Enter submit • Esc cancel";
+    Paragraph::new(truncate_str(footer, inner.width as usize))
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
+}
+
 const fn spinner_glyph(phase: u8) -> &'static str {
     match phase % 8 {
         0 | 4 => "\u{25d0}",
@@ -2034,6 +2840,169 @@ fn runtime_telemetry_line(state: &TuiSharedState, ui_phase: u8) -> String {
 // ──────────────────────────────────────────────────────────────────────
 // Utility helpers
 // ──────────────────────────────────────────────────────────────────────
+
+fn split_recipient_prefix(input: &str) -> (usize, String) {
+    let start = input.rfind(',').map_or(0, |idx| idx + 1);
+    let prefix = input[start..].trim_start().to_string();
+    (start, prefix)
+}
+
+fn parse_recipient_list(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let name = part.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if out.iter().all(|existing| existing != name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn is_valid_compose_thread_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return false;
+    }
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn validate_compose_form(
+    form: &ComposeFormState,
+) -> Result<ComposePayload, Box<ComposeValidationErrors>> {
+    let mut errors = ComposeValidationErrors::default();
+    let to = parse_recipient_list(form.to_input.value());
+    let cc = parse_recipient_list(form.cc_input.value());
+    let known_agents: std::collections::HashSet<&str> =
+        form.available_agents.iter().map(String::as_str).collect();
+    if to.is_empty() {
+        errors.to = Some("At least one recipient is required.".to_string());
+    } else if let Some(invalid) = to.iter().find(|name| !known_agents.contains(name.as_str())) {
+        errors.to = Some(format!("Unknown recipient: {invalid}"));
+    }
+    if let Some(invalid) = cc.iter().find(|name| !known_agents.contains(name.as_str())) {
+        errors.cc = Some(format!("Unknown CC recipient: {invalid}"));
+    }
+
+    let subject = form.subject_input.value().trim().to_string();
+    if subject.is_empty() {
+        errors.subject = Some("Subject is required.".to_string());
+    } else if subject.chars().count() > 200 {
+        errors.subject = Some("Subject must be 1-200 characters.".to_string());
+    }
+
+    let body_md = form.body_input.text();
+    if body_md.trim().is_empty() {
+        errors.body = Some("Body is required.".to_string());
+    }
+
+    let thread_raw = form.thread_id_input.value().trim();
+    let thread_id = if thread_raw.is_empty() {
+        None
+    } else if is_valid_compose_thread_id(thread_raw) {
+        Some(thread_raw.to_string())
+    } else {
+        errors.thread_id = Some(
+            "Thread ID must start with alphanumeric and contain only letters, digits, '.', '_' or '-'.".to_string(),
+        );
+        None
+    };
+
+    if errors.has_any() {
+        return Err(Box::new(errors));
+    }
+
+    Ok(ComposePayload {
+        project_slug: form.project_slug.clone(),
+        to,
+        cc,
+        subject,
+        thread_id,
+        body_md,
+        importance: form.importance().to_string(),
+        ack_required: form.ack_required,
+    })
+}
+
+fn apply_compose_field_key(form: &mut ComposeFormState, event: &Event, code: KeyCode) {
+    match form.focus {
+        ComposeField::Importance => match code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                if form.importance_idx == 0 {
+                    form.importance_idx = COMPOSE_IMPORTANCE_LEVELS.len() - 1;
+                } else {
+                    form.importance_idx -= 1;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                form.importance_idx = (form.importance_idx + 1) % COMPOSE_IMPORTANCE_LEVELS.len();
+            }
+            KeyCode::Enter => form.cycle_focus_next(),
+            _ => {}
+        },
+        ComposeField::AckRequired => match code {
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                form.ack_required = !form.ack_required;
+            }
+            _ => {}
+        },
+        ComposeField::Body => {
+            let _ = form.body_input.handle_event(event);
+            form.errors.body = None;
+            form.errors.general = None;
+        }
+        ComposeField::To | ComposeField::Cc => match code {
+            KeyCode::Down => form.move_suggestion(1),
+            KeyCode::Up => form.move_suggestion(-1),
+            KeyCode::Enter => {
+                if !form.apply_suggestion() {
+                    form.cycle_focus_next();
+                }
+            }
+            _ => {
+                let changed = form.recipient_input_mut().is_some_and(|input| {
+                    let before = input.value().to_string();
+                    let _ = input.handle_event(event);
+                    input.value() != before
+                });
+                if changed {
+                    if matches!(form.focus, ComposeField::To) {
+                        form.errors.to = None;
+                    } else {
+                        form.errors.cc = None;
+                    }
+                    form.errors.general = None;
+                    form.refresh_suggestions();
+                }
+            }
+        },
+        ComposeField::Subject => {
+            let before = form.subject_input.value().to_string();
+            let _ = form.subject_input.handle_event(event);
+            if form.subject_input.value() != before {
+                form.errors.subject = None;
+                form.errors.general = None;
+            }
+        }
+        ComposeField::ThreadId => {
+            let before = form.thread_id_input.value().to_string();
+            let _ = form.thread_id_input.handle_event(event);
+            if form.thread_id_input.value() != before {
+                form.errors.thread_id = None;
+                form.errors.general = None;
+            }
+        }
+    }
+}
 
 const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x
@@ -2330,6 +3299,17 @@ mod tests {
         let mut screen = MessageBrowserScreen::new();
         assert!(!screen.consumes_text_input());
         screen.focus = Focus::SearchBar;
+        assert!(screen.consumes_text_input());
+    }
+
+    #[test]
+    fn compose_modal_consumes_text_input() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.compose_form = Some(ComposeFormState::new(
+            "proj".to_string(),
+            None,
+            vec!["BlueLake".to_string()],
+        ));
         assert!(screen.consumes_text_input());
     }
 
@@ -2841,6 +3821,39 @@ mod tests {
         assert!(!handled);
     }
 
+    #[test]
+    fn receive_deep_link_compose_prefills_recipient() {
+        let mut screen = MessageBrowserScreen::new();
+        let handled =
+            screen.receive_deep_link(&DeepLinkTarget::ComposeToAgent("BlueLake".to_string()));
+        assert!(handled);
+        let form = screen.compose_form.expect("compose form");
+        assert_eq!(form.to_input.value(), "BlueLake");
+    }
+
+    #[test]
+    fn c_key_opens_compose_modal() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.results.push(MessageEntry {
+            id: 1,
+            subject: "Test".to_string(),
+            from_agent: "RedFox".to_string(),
+            to_agents: "BlueLake".to_string(),
+            project_slug: "proj".to_string(),
+            thread_id: String::new(),
+            timestamp_iso: String::new(),
+            timestamp_micros: 0,
+            body_md: String::new(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        });
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let event = Event::Key(ftui::KeyEvent::new(KeyCode::Char('c')));
+        let _ = screen.update(&event, &state);
+        assert!(screen.compose_form.is_some());
+    }
+
     // ── Query presets ──────────────────────────────────────────────
 
     #[test]
@@ -2985,6 +3998,41 @@ mod tests {
         let screen = MessageBrowserScreen::new();
         let bindings = screen.keybindings();
         assert!(bindings.iter().any(|b| b.key == "p/P"));
+    }
+
+    #[test]
+    fn keybindings_include_compose() {
+        let screen = MessageBrowserScreen::new();
+        let bindings = screen.keybindings();
+        assert!(bindings.iter().any(|b| b.key == "c"));
+        assert!(bindings.iter().any(|b| b.key == "F5/Ctrl+Enter"));
+    }
+
+    #[test]
+    fn compose_validation_flags_required_fields() {
+        let form = ComposeFormState::new(
+            "proj".to_string(),
+            None,
+            vec!["BlueLake".to_string(), "RedFox".to_string()],
+        );
+        let err = validate_compose_form(&form).expect_err("expected validation error");
+        assert!(err.to.is_some());
+        assert!(err.subject.is_some());
+        assert!(err.body.is_some());
+    }
+
+    #[test]
+    fn compose_autocomplete_applies_selected_agent() {
+        let mut form = ComposeFormState::new(
+            "proj".to_string(),
+            None,
+            vec!["BlueLake".to_string(), "BluePeak".to_string()],
+        );
+        form.to_input.set_value("Blue");
+        form.set_focus(ComposeField::To);
+        assert!(!form.suggestions.is_empty());
+        assert!(form.apply_suggestion());
+        assert_eq!(form.to_input.value(), "BlueLake");
     }
 
     // ── truncate_str UTF-8 safety ────────────────────────────────────

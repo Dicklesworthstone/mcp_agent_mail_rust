@@ -617,6 +617,12 @@ impl MailScreen for AgentsScreen {
         self.filter_active
     }
 
+    fn copyable_content(&self) -> Option<String> {
+        let idx = self.table_state.selected?;
+        let agent = self.agents.get(idx)?;
+        Some(agent.name.clone())
+    }
+
     fn title(&self) -> &'static str {
         "Agents"
     }
