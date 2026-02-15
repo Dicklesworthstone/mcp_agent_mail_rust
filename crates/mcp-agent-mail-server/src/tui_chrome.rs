@@ -265,6 +265,190 @@ pub fn record_tab_hit_slots(
 // Status line
 // ──────────────────────────────────────────────────────────────────────
 
+/// Semantic priority level for status-bar segments.
+///
+/// Segments are added in priority order; lower-priority segments are
+/// the first to be dropped when the terminal is too narrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StatusPriority {
+    /// Always shown (screen name, help hint).
+    Critical = 0,
+    /// Shown at >= 60 cols (transport mode).
+    High = 1,
+    /// Shown at >= 80 cols (uptime, error count).
+    Medium = 2,
+    /// Shown at >= 100 cols (full counters, latency, key hints).
+    Low = 3,
+}
+
+/// A semantic segment of the status bar.
+struct StatusSegment {
+    priority: StatusPriority,
+    text: String,
+    fg: PackedRgba,
+    bold: bool,
+}
+
+/// Compute which segments to show given available width.
+///
+/// Segments are grouped into left (always left-aligned), center
+/// (centered between left and right), and right (right-aligned).
+/// Lower-priority segments are dropped until everything fits.
+#[allow(clippy::too_many_lines)]
+fn plan_status_segments(
+    state: &TuiSharedState,
+    active: MailScreenId,
+    help_visible: bool,
+    accessibility: &AccessibilitySettings,
+    screen_bindings: &[HelpEntry],
+    toast_muted: bool,
+    available: u16,
+) -> (Vec<StatusSegment>, Vec<StatusSegment>, Vec<StatusSegment>) {
+    let counters = state.request_counters();
+    let uptime = state.uptime();
+    let meta = screen_meta(active);
+    let transport_mode = state.config_snapshot().transport_mode();
+    let tp = crate::tui_theme::TuiThemePalette::current();
+
+    // Uptime formatting
+    let uptime_secs = uptime.as_secs();
+    let hours = uptime_secs / 3600;
+    let mins = (uptime_secs % 3600) / 60;
+    let secs = uptime_secs % 60;
+    let uptime_str = if hours > 0 {
+        format!("{hours}h{mins:02}m")
+    } else {
+        format!("{mins}m{secs:02}s")
+    };
+
+    // Counter data
+    let avg_latency = state.avg_latency_ms();
+    let error_count = counters.status_4xx + counters.status_5xx;
+    let total = counters.total;
+    let ok = counters.status_2xx;
+    let counter_fg = if error_count > 0 { tp.status_warn } else { tp.status_good };
+
+    // ── Left segments (always left-aligned) ──
+    let mut left = vec![StatusSegment {
+        priority: StatusPriority::Critical,
+        text: format!(" {}", meta.title),
+        fg: tp.status_accent,
+        bold: true,
+    }];
+
+    // Transport mode (High priority)
+    left.push(StatusSegment {
+        priority: StatusPriority::High,
+        text: format!(" {transport_mode}"),
+        fg: tp.status_fg,
+        bold: false,
+    });
+
+    // Uptime (Medium priority)
+    left.push(StatusSegment {
+        priority: StatusPriority::Medium,
+        text: format!(" up:{uptime_str}"),
+        fg: tp.status_fg,
+        bold: false,
+    });
+
+    // ── Center segments (centered) ──
+    let mut center = Vec::new();
+
+    // Error count alone at Medium priority (most critical counter)
+    if error_count > 0 {
+        center.push(StatusSegment {
+            priority: StatusPriority::Medium,
+            text: format!("err:{error_count}"),
+            fg: tp.status_warn,
+            bold: true,
+        });
+    }
+
+    // Full counter string at Low priority
+    center.push(StatusSegment {
+        priority: StatusPriority::Low,
+        text: format!("req:{total} ok:{ok} err:{error_count} avg:{avg_latency}ms"),
+        fg: counter_fg,
+        bold: false,
+    });
+
+    // Key hints at Low priority
+    if accessibility.key_hints && !accessibility.screen_reader && !screen_bindings.is_empty() {
+        let max_hint = (available / 3).max(20) as usize;
+        let hints = build_key_hints(screen_bindings, 6, max_hint);
+        if !hints.is_empty() {
+            center.push(StatusSegment {
+                priority: StatusPriority::Low,
+                text: hints,
+                fg: tp.status_fg,
+                bold: false,
+            });
+        }
+    }
+
+    // ── Right segments (right-aligned) ──
+    let help_hint = if help_visible { "[?]" } else { "?" };
+    let mut right = vec![StatusSegment {
+        priority: StatusPriority::Critical,
+        text: format!("{help_hint} "),
+        fg: tp.tab_key_fg,
+        bold: false,
+    }];
+
+    // Toast mute indicator (High priority)
+    if toast_muted {
+        right.push(StatusSegment {
+            priority: StatusPriority::High,
+            text: "[muted] ".to_string(),
+            fg: tp.status_warn,
+            bold: false,
+        });
+    }
+
+    // Accessibility indicators (Medium priority)
+    let a11y = match (accessibility.reduced_motion, accessibility.screen_reader) {
+        (false, false) => None,
+        (true, false) => Some("[rm]"),
+        (false, true) => Some("[sr]"),
+        (true, true) => Some("[rm,sr]"),
+    };
+    if let Some(hint) = a11y {
+        right.push(StatusSegment {
+            priority: StatusPriority::Medium,
+            text: format!("{hint} "),
+            fg: tp.status_fg,
+            bold: false,
+        });
+    }
+
+    // Drop segments that don't fit.
+    // Width breakpoints: Critical always fits, High >= 60, Medium >= 80, Low >= 100.
+    let max_priority = if available >= 100 {
+        StatusPriority::Low
+    } else if available >= 80 {
+        StatusPriority::Medium
+    } else if available >= 60 {
+        StatusPriority::High
+    } else {
+        StatusPriority::Critical
+    };
+
+    left.retain(|s| s.priority <= max_priority);
+    center.retain(|s| s.priority <= max_priority);
+    right.retain(|s| s.priority <= max_priority);
+
+    // If both Medium error count and Low full counters survived, drop
+    // the Medium error-only duplicate (full counters include it).
+    if center.len() > 1
+        && center.iter().any(|s| s.priority == StatusPriority::Low && s.text.contains("req:"))
+    {
+        center.retain(|s| !(s.priority == StatusPriority::Medium && s.text.starts_with("err:")));
+    }
+
+    (left, center, right)
+}
+
 /// Render the status line into a 1-row area.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_status_line(
@@ -282,187 +466,137 @@ pub fn render_status_line(
     let tp = crate::tui_theme::TuiThemePalette::current();
 
     // Fill background
-    let bg = Style::default().bg(tp.status_bg);
-    Paragraph::new("").style(bg).render(area, frame);
+    let bg_style = Style::default().bg(tp.status_bg);
+    Paragraph::new("").style(bg_style).render(area, frame);
 
-    let counters = state.request_counters();
-    let uptime = state.uptime();
-    let meta = screen_meta(active);
-    let transport_mode = state.config_snapshot().transport_mode();
+    let (left, center, right) = plan_status_segments(
+        state,
+        active,
+        help_visible,
+        accessibility,
+        screen_bindings,
+        toast_muted,
+        area.width,
+    );
 
-    // Build left section
-    let uptime_secs = uptime.as_secs();
-    let hours = uptime_secs / 3600;
-    let mins = (uptime_secs % 3600) / 60;
-    let secs = uptime_secs % 60;
-    let uptime_str = if hours > 0 {
-        format!("{hours}h{mins:02}m")
-    } else {
-        format!("{mins}m{secs:02}s")
-    };
+    // Compute total widths.
+    let left_width: u16 = left.iter().map(|s| s.text.len() as u16).sum();
+    let center_width: u16 = center
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let sep = if i > 0 { 3u16 } else { 0 }; // " | "
+            s.text.len() as u16 + sep
+        })
+        .sum();
+    let right_width: u16 = right.iter().map(|s| s.text.len() as u16).sum();
 
-    // Build center section (live counters)
-    let avg_latency = state.avg_latency_ms();
-    let error_count = counters.status_4xx + counters.status_5xx;
-    let total = counters.total;
-    let ok = counters.status_2xx;
-    let center_str = format!("req:{total} ok:{ok} err:{error_count} avg:{avg_latency}ms");
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(16);
 
-    // Build right section
-    let help_hint = if help_visible { "[?] Help" } else { "? help" };
-    let muted_hint = if toast_muted { " [Toasts: muted]" } else { "" };
-    let a11y_hint = match (accessibility.reduced_motion, accessibility.screen_reader) {
-        (false, false) => "",
-        (true, false) => " [A11y: reduced-motion]",
-        (false, true) => " [A11y: screen-reader]",
-        (true, true) => " [A11y: reduced-motion,screen-reader]",
-    };
-    let right_str = format!("{help_hint}{muted_hint}{a11y_hint}");
-
-    // Calculate widths
-    let title = meta.title;
-    let left_len =
-        u16::try_from(1 + title.len() + 12 + transport_mode.len() + uptime_str.len() + 1)
-            .unwrap_or(u16::MAX);
-    let center_len = u16::try_from(center_str.len()).unwrap_or(u16::MAX);
-    let right_len = u16::try_from(1 + right_str.len() + 1).unwrap_or(u16::MAX);
-    let available = area.width;
-
-    // Optional key hints (inserted after counters if we have room).
-    let sep = " | ";
-    let sep_len = u16::try_from(sep.len()).unwrap_or(u16::MAX);
-    let key_hints = if accessibility.key_hints
-        && !accessibility.screen_reader
-        && !screen_bindings.is_empty()
-        && left_len
-            .saturating_add(center_len)
-            .saturating_add(right_len)
-            .saturating_add(sep_len)
-            < available
-    {
-        let reserved = left_len
-            .saturating_add(center_len)
-            .saturating_add(right_len)
-            .saturating_add(sep_len);
-        let max_hint_width = usize::from(available.saturating_sub(reserved));
-        build_key_hints(screen_bindings, 6, max_hint_width)
-    } else {
-        String::new()
-    };
-    let hints_len = u16::try_from(key_hints.len()).unwrap_or(u16::MAX);
-    let center_total_len = if key_hints.is_empty() {
-        center_len
-    } else {
-        center_len.saturating_add(sep_len).saturating_add(hints_len)
-    };
-
-    let total_len = left_len
-        .saturating_add(center_total_len)
-        .saturating_add(right_len);
-
-    // Responsive degradation thresholds
-    let show_center = available >= 100;
-    let show_left_detail = available >= 60;
-
-    // Build spans
-    let mut spans = Vec::with_capacity(8);
-
-    // Left: screen name (+ optional mode/uptime when wide enough)
-    spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
-    spans.push(Span::styled(
-        title,
-        Style::default()
-            .fg(tp.status_accent)
-            .bg(tp.status_bg)
-            .bold(),
-    ));
-    if show_left_detail {
-        spans.push(Span::styled(
-            format!(" | mode:{transport_mode} up:{uptime_str} "),
-            Style::default().fg(tp.status_fg).bg(tp.status_bg),
-        ));
-    } else {
-        spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
+    // Left segments
+    for seg in &left {
+        let mut style = Style::default().fg(seg.fg).bg(tp.status_bg);
+        if seg.bold {
+            style = style.bold();
+        }
+        spans.push(Span::styled(seg.text.as_str(), style));
     }
 
-    // Center padding + counters (hidden on narrow terminals)
-    if show_center {
-        if total_len < available {
-            let pad = (available - total_len) / 2;
-            if pad > 0 {
-                spans.push(Span::styled(
-                    " ".repeat(pad as usize),
-                    Style::default().bg(tp.status_bg),
-                ));
-            }
-        }
-
-        let counter_fg = if error_count > 0 {
-            tp.status_warn
-        } else {
-            tp.status_good
-        };
-        spans.push(Span::styled(
-            center_str,
-            Style::default().fg(counter_fg).bg(tp.status_bg),
-        ));
-
-        if !key_hints.is_empty() {
-            // Separator between counters and key hints.
+    // Center padding + center segments
+    let total_fixed = left_width + center_width + right_width;
+    if center_width > 0 && total_fixed < area.width {
+        let gap = area.width - total_fixed;
+        let left_pad = gap / 2;
+        if left_pad > 0 {
             spans.push(Span::styled(
-                sep,
+                " ".repeat(left_pad as usize),
+                bg_style,
+            ));
+        }
+    } else if center_width == 0 {
+        // No center — push right to the far right.
+        let gap = area.width.saturating_sub(left_width + right_width);
+        if gap > 0 {
+            spans.push(Span::styled(" ".repeat(gap as usize), bg_style));
+        }
+    }
+
+    for (i, seg) in center.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(
+                " | ",
                 Style::default().fg(tp.status_fg).bg(tp.status_bg),
             ));
-
-            // Parse the hint string into styled spans: keys in accent, text in dim.
-            let mut rest = key_hints.as_str();
-            while let Some(open) = rest.find('[') {
-                if open > 0 {
-                    spans.push(Span::styled(
-                        &rest[..open],
-                        Style::default().fg(tp.status_fg).bg(tp.status_bg),
-                    ));
-                }
-                rest = &rest[open..];
-                if let Some(close) = rest.find(']') {
-                    spans.push(Span::styled(
-                        &rest[..=close],
-                        Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
-                    ));
-                    rest = &rest[close + 1..];
-                } else {
-                    break;
-                }
+        }
+        // Key hints get special parsing (keys in accent color).
+        if seg.priority == StatusPriority::Low && seg.text.contains('[') && !seg.text.contains("req:") {
+            push_key_hint_spans(&mut spans, &seg.text, &tp);
+        } else {
+            let mut style = Style::default().fg(seg.fg).bg(tp.status_bg);
+            if seg.bold {
+                style = style.bold();
             }
-            if !rest.is_empty() {
-                spans.push(Span::styled(
-                    rest,
-                    Style::default().fg(tp.status_fg).bg(tp.status_bg),
-                ));
-            }
+            spans.push(Span::styled(seg.text.as_str(), style));
         }
     }
 
-    // Right padding + help hint
-    if show_center && total_len < available {
-        let used_with_center_pad = total_len + (available - total_len) / 2;
-        let right_pad = available.saturating_sub(used_with_center_pad);
+    // Right padding
+    if center_width > 0 && total_fixed < area.width {
+        let gap = area.width - total_fixed;
+        let right_pad = gap - gap / 2;
         if right_pad > 0 {
             spans.push(Span::styled(
                 " ".repeat(right_pad as usize),
-                Style::default().bg(tp.status_bg),
+                bg_style,
             ));
         }
     }
 
-    spans.push(Span::styled(
-        right_str,
-        Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
-    ));
-    spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
+    // Right segments
+    for seg in &right {
+        let mut style = Style::default().fg(seg.fg).bg(tp.status_bg);
+        if seg.bold {
+            style = style.bold();
+        }
+        spans.push(Span::styled(seg.text.as_str(), style));
+    }
 
     let line = Line::from_spans(spans);
     Paragraph::new(Text::from_lines([line])).render(area, frame);
+}
+
+/// Parse a key-hints string and push styled spans (keys in accent, rest in dim).
+fn push_key_hint_spans<'a>(
+    spans: &mut Vec<ftui::text::Span<'a>>,
+    hints: &'a str,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    use ftui::text::Span;
+    let mut rest = hints;
+    while let Some(open) = rest.find('[') {
+        if open > 0 {
+            spans.push(Span::styled(
+                &rest[..open],
+                Style::default().fg(tp.status_fg).bg(tp.status_bg),
+            ));
+        }
+        rest = &rest[open..];
+        if let Some(close) = rest.find(']') {
+            spans.push(Span::styled(
+                &rest[..=close],
+                Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
+            ));
+            rest = &rest[close + 1..];
+        } else {
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(
+            rest,
+            Style::default().fg(tp.status_fg).bg(tp.status_bg),
+        ));
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
