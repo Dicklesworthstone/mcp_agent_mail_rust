@@ -780,6 +780,25 @@ impl Default for MailExplorerScreen {
 impl MailScreen for MailExplorerScreen {
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        // Mouse: scroll wheel moves result list cursor (parity with j/k)
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                ftui::MouseEventKind::ScrollDown => {
+                    if self.focus == Focus::ResultList && !self.entries.is_empty() {
+                        self.cursor = (self.cursor + 1).min(self.entries.len() - 1);
+                        self.detail_scroll = 0;
+                    }
+                }
+                ftui::MouseEventKind::ScrollUp => {
+                    if self.focus == Focus::ResultList {
+                        self.cursor = self.cursor.saturating_sub(1);
+                        self.detail_scroll = 0;
+                    }
+                }
+                _ => {}
+            }
+            return Cmd::None;
+        }
         if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Press {
                 match self.focus {
@@ -1088,6 +1107,10 @@ impl MailScreen for MailExplorerScreen {
             HelpEntry {
                 key: "r",
                 action: "Reset filters",
+            },
+            HelpEntry {
+                key: "Mouse",
+                action: "Wheel scroll results",
             },
         ]
     }
@@ -2309,5 +2332,63 @@ mod tests {
     #[test]
     fn truncate_str_empty() {
         assert_eq!(truncate_str("", 5), "");
+    }
+
+    // ── Mouse parity tests (br-1xt0m.1.12.4) ──────────────────
+
+    fn stub_entry(id: i64) -> DisplayEntry {
+        DisplayEntry {
+            message_id: id,
+            project_slug: String::new(),
+            sender_name: String::new(),
+            to_agents: String::new(),
+            subject: String::new(),
+            body_preview: String::new(),
+            thread_id: None,
+            importance: String::new(),
+            ack_required: false,
+            created_ts: 0,
+            direction: Direction::Inbound,
+            read_ts: None,
+            ack_ts: None,
+        }
+    }
+
+    #[test]
+    fn mouse_scroll_down_moves_cursor_forward() {
+        let mut screen = MailExplorerScreen::new();
+        screen.entries = vec![stub_entry(1), stub_entry(2), stub_entry(3)];
+        screen.cursor = 0;
+        screen.focus = Focus::ResultList;
+
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+
+        let scroll_down = ftui::Event::Mouse(ftui::MouseEvent::new(
+            ftui::MouseEventKind::ScrollDown,
+            10,
+            10,
+        ));
+        screen.update(&scroll_down, &state);
+        assert_eq!(screen.cursor, 1, "scroll down should advance cursor");
+    }
+
+    #[test]
+    fn mouse_scroll_up_moves_cursor_back() {
+        let mut screen = MailExplorerScreen::new();
+        screen.entries = vec![stub_entry(1), stub_entry(2)];
+        screen.cursor = 1;
+        screen.focus = Focus::ResultList;
+
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+
+        let scroll_up = ftui::Event::Mouse(ftui::MouseEvent::new(
+            ftui::MouseEventKind::ScrollUp,
+            10,
+            10,
+        ));
+        screen.update(&scroll_up, &state);
+        assert_eq!(screen.cursor, 0, "scroll up should move cursor back");
     }
 }

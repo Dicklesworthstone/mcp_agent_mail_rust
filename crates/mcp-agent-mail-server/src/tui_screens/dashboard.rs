@@ -484,79 +484,94 @@ impl Default for DashboardScreen {
 
 impl MailScreen for DashboardScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                match key.code {
-                    // Scroll
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if self.scroll_offset > 0 {
-                            self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                        }
-                        if self.scroll_offset == 0 {
-                            self.auto_follow = true;
-                        }
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                // Scroll
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if self.scroll_offset > 0 {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.scroll_offset += 1;
-                        self.auto_follow = false;
-                    }
-                    KeyCode::Char('G') | KeyCode::End => {
-                        self.scroll_offset = 0;
+                    if self.scroll_offset == 0 {
                         self.auto_follow = true;
                     }
-                    KeyCode::Char('g') | KeyCode::Home => {
-                        let visible = self.visible_entries();
-                        self.scroll_offset = visible.len().saturating_sub(1);
-                        self.auto_follow = false;
-                    }
-                    // Toggle follow mode
-                    KeyCode::Char('f') => {
-                        self.auto_follow = !self.auto_follow;
-                        if self.auto_follow {
-                            self.scroll_offset = 0;
-                        }
-                    }
-                    // Deep-link: jump to Timeline at focused event timestamp.
-                    KeyCode::Enter => {
-                        let visible = self.visible_entries();
-                        let idx = visible.len().saturating_sub(1 + self.scroll_offset);
-                        if let Some(entry) = visible.get(idx) {
-                            return Cmd::msg(MailScreenMsg::DeepLink(
-                                DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
-                            ));
-                        }
-                    }
-                    // Cycle verbosity tier
-                    KeyCode::Char('v') => {
-                        self.verbosity = self.verbosity.next();
-                    }
-                    // Toggle trend panel visibility
-                    KeyCode::Char('p') => {
-                        self.show_trend_panel = !self.show_trend_panel;
-                    }
-                    // Toggle console log panel
-                    KeyCode::Char('l') => {
-                        self.show_log_panel = !self.show_log_panel;
-                    }
-                    // Toggle type filter
-                    KeyCode::Char('t') => {
-                        // Cycle through filter states:
-                        // empty -> ToolCallEnd only -> MessageSent only -> HttpRequest only -> clear
-                        if self.type_filter.is_empty() {
-                            self.type_filter.insert(MailEventKind::ToolCallEnd);
-                        } else if self.type_filter.contains(&MailEventKind::ToolCallEnd) {
-                            self.type_filter.clear();
-                            self.type_filter.insert(MailEventKind::MessageSent);
-                        } else if self.type_filter.contains(&MailEventKind::MessageSent) {
-                            self.type_filter.clear();
-                            self.type_filter.insert(MailEventKind::HttpRequest);
-                        } else {
-                            self.type_filter.clear();
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.scroll_offset += 1;
+                    self.auto_follow = false;
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    self.scroll_offset = 0;
+                    self.auto_follow = true;
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    let visible = self.visible_entries();
+                    self.scroll_offset = visible.len().saturating_sub(1);
+                    self.auto_follow = false;
+                }
+                // Toggle follow mode
+                KeyCode::Char('f') => {
+                    self.auto_follow = !self.auto_follow;
+                    if self.auto_follow {
+                        self.scroll_offset = 0;
+                    }
+                }
+                // Deep-link: jump to Timeline at focused event timestamp.
+                KeyCode::Enter => {
+                    let visible = self.visible_entries();
+                    let idx = visible.len().saturating_sub(1 + self.scroll_offset);
+                    if let Some(entry) = visible.get(idx) {
+                        return Cmd::msg(MailScreenMsg::DeepLink(
+                            DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
+                        ));
+                    }
+                }
+                // Cycle verbosity tier
+                KeyCode::Char('v') => {
+                    self.verbosity = self.verbosity.next();
+                }
+                // Toggle trend panel visibility
+                KeyCode::Char('p') => {
+                    self.show_trend_panel = !self.show_trend_panel;
+                }
+                // Toggle console log panel
+                KeyCode::Char('l') => {
+                    self.show_log_panel = !self.show_log_panel;
+                }
+                // Toggle type filter
+                KeyCode::Char('t') => {
+                    // Cycle through filter states:
+                    // empty -> ToolCallEnd only -> MessageSent only -> HttpRequest only -> clear
+                    if self.type_filter.is_empty() {
+                        self.type_filter.insert(MailEventKind::ToolCallEnd);
+                    } else if self.type_filter.contains(&MailEventKind::ToolCallEnd) {
+                        self.type_filter.clear();
+                        self.type_filter.insert(MailEventKind::MessageSent);
+                    } else if self.type_filter.contains(&MailEventKind::MessageSent) {
+                        self.type_filter.clear();
+                        self.type_filter.insert(MailEventKind::HttpRequest);
+                    } else {
+                        self.type_filter.clear();
+                    }
+                }
+                _ => {}
+            },
+            // Mouse: scroll wheel moves event log (parity with j/k)
+            Event::Mouse(mouse) => match mouse.kind {
+                ftui::MouseEventKind::ScrollDown => {
+                    if self.scroll_offset > 0 {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                    }
+                    if self.scroll_offset == 0 {
+                        self.auto_follow = true;
+                    }
+                }
+                ftui::MouseEventKind::ScrollUp => {
+                    self.scroll_offset += 1;
+                    self.auto_follow = false;
+                }
+                _ => {}
+            },
+            _ => {}
         }
         Cmd::None
     }
@@ -759,6 +774,10 @@ impl MailScreen for DashboardScreen {
             HelpEntry {
                 key: "l",
                 action: "Toggle console log",
+            },
+            HelpEntry {
+                key: "Mouse",
+                action: "Wheel scroll event log",
             },
         ]
     }
@@ -2672,5 +2691,48 @@ mod tests {
         // Info and Debug should NOT be bold (standard/subdued).
         assert!(!has(EventSeverity::Info.style(), StyleFlags::BOLD));
         assert!(!has(EventSeverity::Debug.style(), StyleFlags::BOLD));
+    }
+
+    // ── Mouse parity tests (br-1xt0m.1.12.4) ──────────────────
+
+    #[test]
+    fn mouse_scroll_up_increases_offset() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        assert_eq!(screen.scroll_offset, 0);
+
+        let scroll_up = Event::Mouse(ftui::MouseEvent::new(
+            ftui::MouseEventKind::ScrollUp,
+            10,
+            10,
+        ));
+        screen.update(&scroll_up, &state);
+        assert_eq!(screen.scroll_offset, 1, "scroll up should increase offset");
+        assert!(!screen.auto_follow, "scroll up should disable auto-follow");
+    }
+
+    #[test]
+    fn mouse_scroll_down_decreases_offset() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.scroll_offset = 5;
+        screen.auto_follow = false;
+
+        let scroll_down = Event::Mouse(ftui::MouseEvent::new(
+            ftui::MouseEventKind::ScrollDown,
+            10,
+            10,
+        ));
+        screen.update(&scroll_down, &state);
+        assert_eq!(screen.scroll_offset, 4, "scroll down should decrease offset");
+
+        // Scroll to bottom re-enables auto-follow
+        for _ in 0..10 {
+            screen.update(&scroll_down, &state);
+        }
+        assert_eq!(screen.scroll_offset, 0);
+        assert!(screen.auto_follow, "reaching bottom should re-enable auto-follow");
     }
 }
