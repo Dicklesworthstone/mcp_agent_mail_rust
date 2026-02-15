@@ -31,7 +31,7 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 // ──────────────────────────────────────────────────────────────────────
 
 const MAX_ENTRIES: usize = 200;
-const DEBOUNCE_TICKS: u8 = 3;
+const DEBOUNCE_TICKS: u8 = 1;
 
 /// Default SLA threshold for overdue acks: 30 minutes in microseconds.
 const ACK_SLA_THRESHOLD_MICROS: i64 = 30 * 60 * 1_000_000;

@@ -38,7 +38,7 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 const PAGE_SIZE: usize = 50;
 
 /// Debounce delay in ticks (each tick ~100ms, so 2 ticks = ~200ms).
-const DEBOUNCE_TICKS: u8 = 2;
+const DEBOUNCE_TICKS: u8 = 1;
 
 /// Max results to cache.
 const MAX_RESULTS: usize = 1000;

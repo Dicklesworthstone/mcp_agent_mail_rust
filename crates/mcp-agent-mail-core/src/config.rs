@@ -794,7 +794,7 @@ impl Default for Config {
             console_interactive_enabled: true,
             console_ui_height_percent: 33,
             console_ui_anchor: ConsoleUiAnchor::Bottom,
-            console_ui_auto_size: false,
+            console_ui_auto_size: true,
             console_inline_auto_min_rows: 8,
             console_inline_auto_max_rows: 18,
             console_split_mode: ConsoleSplitMode::Inline,
@@ -2178,7 +2178,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.console_ui_height_percent, 33);
         assert_eq!(config.console_ui_anchor, ConsoleUiAnchor::Bottom);
-        assert!(!config.console_ui_auto_size);
+        assert!(config.console_ui_auto_size);
         assert_eq!(config.console_inline_auto_min_rows, 8);
         assert_eq!(config.console_inline_auto_max_rows, 18);
         assert_eq!(config.console_split_mode, ConsoleSplitMode::Inline);

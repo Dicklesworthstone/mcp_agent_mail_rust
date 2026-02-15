@@ -233,6 +233,8 @@ pub enum DeepLinkTarget {
     ContactByPair(String, String),
     /// Jump to the Explorer filtered for a specific agent.
     ExplorerForAgent(String),
+    /// Open Search Cockpit with query bar focused (and optional pre-filled query).
+    SearchFocused(String),
 }
 
 impl DeepLinkTarget {
@@ -249,6 +251,7 @@ impl DeepLinkTarget {
             Self::ReservationByAgent(_) => MailScreenId::Reservations,
             Self::ContactByPair(_, _) => MailScreenId::Contacts,
             Self::ExplorerForAgent(_) => MailScreenId::Explorer,
+            Self::SearchFocused(_) => MailScreenId::Search,
         }
     }
 }
@@ -615,6 +618,7 @@ mod tests {
         let _ = DeepLinkTarget::ReservationByAgent(String::new());
         let _ = DeepLinkTarget::ContactByPair(String::new(), String::new());
         let _ = DeepLinkTarget::ExplorerForAgent(String::new());
+        let _ = DeepLinkTarget::SearchFocused(String::new());
     }
 
     #[test]

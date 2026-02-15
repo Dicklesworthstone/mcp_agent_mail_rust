@@ -2017,6 +2017,13 @@ impl Model for MailAppModel {
                                 self.activate_screen(prev);
                                 return Cmd::none();
                             }
+                            // Global search: / opens SearchCockpit with query bar focused
+                            KeyCode::Char('/') if !text_mode => {
+                                self.apply_deep_link_with_transition(
+                                    &DeepLinkTarget::SearchFocused(String::new()),
+                                );
+                                return Cmd::none();
+                            }
                             // Action menu: . opens contextual actions for selected item
                             KeyCode::Char('.') if !text_mode => {
                                 if let Some(screen) = self.screen_manager.active_screen_ref() {
@@ -2554,6 +2561,7 @@ struct PaletteMessageSummary {
     to_agents: String,
     thread_id: String,
     timestamp_micros: i64,
+    body_snippet: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2661,6 +2669,7 @@ fn query_palette_recent_messages(
     conn.query_sync(
         &format!(
             "SELECT m.id, m.subject, m.thread_id, m.created_ts, \
+             COALESCE(SUBSTR(m.body_md, 1, 150), '') AS body_snippet, \
              a_sender.name AS from_agent, \
              COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
              FROM messages m \
@@ -2693,6 +2702,10 @@ fn query_palette_recent_messages(
                         .ok()
                         .unwrap_or_default(),
                     timestamp_micros: row.get_named::<i64>("created_ts").ok().unwrap_or(0),
+                    body_snippet: row
+                        .get_named::<String>("body_snippet")
+                        .ok()
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -2757,21 +2770,47 @@ fn append_palette_message_actions(messages: &[PaletteMessageSummary], out: &mut 
         } else {
             message.to_agents.as_str()
         };
+        let desc = if message.body_snippet.is_empty() {
+            format!(
+                "{} -> {} | {}",
+                message.from_agent,
+                to_agents,
+                format_timestamp_micros(message.timestamp_micros)
+            )
+        } else {
+            // Single-line snippet for cleaner palette display
+            let snippet: String = message
+                .body_snippet
+                .chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .collect();
+            format!(
+                "{} -> {} | {} | {}",
+                message.from_agent,
+                to_agents,
+                format_timestamp_micros(message.timestamp_micros),
+                snippet.trim()
+            )
+        };
         let mut action = ActionItem::new(
             format!("{}{}", palette_action_ids::MESSAGE_PREFIX, message.id),
             format!("Message: {}", truncate_subject(&message.subject, 60)),
         )
-        .with_description(format!(
-            "{} -> {} | {}",
-            message.from_agent,
-            to_agents,
-            format_timestamp_micros(message.timestamp_micros)
-        ))
+        .with_description(desc)
         .with_category("Messages");
         action.tags.push("message".to_string());
         action.tags.push(message.from_agent.clone());
         if !message.thread_id.is_empty() {
             action.tags.push(message.thread_id.clone());
+        }
+        // Add body snippet words as tags for fuzzy matching
+        if !message.body_snippet.is_empty() {
+            for word in message.body_snippet.split_whitespace().take(10) {
+                let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+                if word.len() >= 3 {
+                    action.tags.push(word.to_lowercase());
+                }
+            }
         }
         out.push(action);
     }
@@ -4516,6 +4555,7 @@ mod tests {
             to_agents: "RedFox,GreenWolf".to_string(),
             thread_id: "br-42".to_string(),
             timestamp_micros: 1_700_000_000_000_000,
+            body_snippet: String::new(),
         }];
 
         append_palette_message_actions(&messages, &mut out);
@@ -4604,6 +4644,7 @@ mod tests {
             to_agents: "RedFox".to_string(),
             thread_id: "br-7".to_string(),
             timestamp_micros: now_micros(),
+            body_snippet: String::new(),
         };
 
         let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
@@ -4647,6 +4688,7 @@ mod tests {
             to_agents: "RedFox".to_string(),
             thread_id: "br-11".to_string(),
             timestamp_micros: now_micros(),
+            body_snippet: String::new(),
         };
 
         let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));

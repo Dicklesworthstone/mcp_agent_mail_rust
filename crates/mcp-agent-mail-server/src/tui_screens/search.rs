@@ -41,7 +41,7 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 const MAX_RESULTS: usize = 200;
 
 /// Debounce delay in ticks (~100ms each, so 3 ticks = ~300ms).
-const DEBOUNCE_TICKS: u8 = 3;
+const DEBOUNCE_TICKS: u8 = 1;
 
 /// Max chars for the message snippet shown in the detail pane.
 const MAX_SNIPPET_CHARS: usize = 180;
@@ -1847,6 +1847,16 @@ impl MailScreen for SearchCockpitScreen {
                 self.doc_kind_filter = DocKindFilter::Messages;
                 self.search_dirty = true;
                 self.debounce_remaining = 0;
+                true
+            }
+            DeepLinkTarget::SearchFocused(query) => {
+                self.focus = Focus::QueryBar;
+                self.query_input.set_focused(true);
+                if !query.is_empty() {
+                    self.query_input.set_value(query);
+                    self.search_dirty = true;
+                    self.debounce_remaining = 0;
+                }
                 true
             }
             _ => false,
