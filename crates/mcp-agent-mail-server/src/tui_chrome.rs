@@ -72,6 +72,20 @@ pub struct ChromeAreas {
 // Tab bar
 // ──────────────────────────────────────────────────────────────────────
 
+/// Map a screen category to a theme color for the tab key indicator.
+fn category_key_color(
+    category: crate::tui_screens::ScreenCategory,
+    tp: &crate::tui_theme::TuiThemePalette,
+) -> PackedRgba {
+    use crate::tui_screens::ScreenCategory;
+    match category {
+        ScreenCategory::Overview => tp.status_accent,
+        ScreenCategory::Communication => tp.metric_messages,
+        ScreenCategory::Operations => tp.severity_warn,
+        ScreenCategory::System => tp.severity_ok,
+    }
+}
+
 /// Render the tab bar into a 1-row area.
 pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut Frame, area: Rect) {
     use ftui::text::{Line, Span, Text};
@@ -142,9 +156,11 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
             Span::styled(label, label_style)
         };
 
+        // Use category-specific color for the key number to aid wayfinding.
+        let key_fg = category_key_color(meta.category, &tp);
         let line = Line::from_spans(vec![
             Span::styled(" ", Style::default().bg(bg)),
-            Span::styled(key_str.as_str(), Style::default().fg(tp.tab_key_fg).bg(bg)),
+            Span::styled(key_str.as_str(), Style::default().fg(key_fg).bg(bg)),
             Span::styled(":", Style::default().fg(tp.tab_inactive_fg).bg(bg)),
             label_span,
             Span::styled(" ", Style::default().bg(bg)),

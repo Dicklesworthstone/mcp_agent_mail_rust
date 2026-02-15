@@ -332,13 +332,45 @@ impl DeepLinkTarget {
 // Screen Registry — static metadata
 // ──────────────────────────────────────────────────────────────────────
 
-/// Screen category for grouping in the help overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Screen category for grouping in the help overlay and chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScreenCategory {
     Overview,
     Communication,
     Operations,
     System,
+}
+
+impl ScreenCategory {
+    /// Short display label (max 4 chars) for compact UI.
+    #[must_use]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Overview => "Over",
+            Self::Communication => "Comm",
+            Self::Operations => "Ops",
+            Self::System => "Sys",
+        }
+    }
+
+    /// Full display label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Communication => "Communication",
+            Self::Operations => "Operations",
+            Self::System => "System",
+        }
+    }
+
+    /// All category variants in display order.
+    pub const ALL: &[Self] = &[
+        Self::Overview,
+        Self::Communication,
+        Self::Operations,
+        Self::System,
+    ];
 }
 
 /// Static metadata for a screen.
@@ -634,6 +666,30 @@ mod tests {
             screen_meta(MailScreenId::SystemHealth).category,
             ScreenCategory::System
         );
+    }
+
+    #[test]
+    fn every_category_has_at_least_one_screen() {
+        for &cat in ScreenCategory::ALL {
+            let count = MAIL_SCREEN_REGISTRY
+                .iter()
+                .filter(|m| m.category == cat)
+                .count();
+            assert!(
+                count > 0,
+                "category {:?} has no screens in the registry",
+                cat
+            );
+        }
+    }
+
+    #[test]
+    fn category_labels_are_non_empty() {
+        for &cat in ScreenCategory::ALL {
+            assert!(!cat.label().is_empty());
+            assert!(!cat.short_label().is_empty());
+            assert!(cat.short_label().len() <= 4);
+        }
     }
 
     // ── Screen ID edge cases ────────────────────────────────────
