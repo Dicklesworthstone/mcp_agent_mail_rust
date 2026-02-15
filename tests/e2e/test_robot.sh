@@ -58,6 +58,8 @@ DB_PATH="${WORK}/db.sqlite3"
 STORAGE_ROOT="${WORK}/storage_root"
 PROJECT_PATH="${WORK}/test_project"
 mkdir -p "${STORAGE_ROOT}" "${PROJECT_PATH}"
+TIMINGS_FILE="${WORK}/robot_case_timings.tsv"
+printf "case_id\tcommand\telapsed_ms\n" > "${TIMINGS_FILE}"
 
 export DATABASE_URL="sqlite:///${DB_PATH}"
 export STORAGE_ROOT
@@ -103,11 +105,13 @@ seed_data() {
         # Set RedFox's contact policy to "open" so anyone can message them
         echo "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"RedFox\",\"policy\":\"open\"}}}"
         sleep 0.3
-        # Send a message (now allowed since RedFox accepts all contacts)
-        echo "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message\",\"body_md\":\"This is a test message for robot E2E validation.\",\"importance\":\"high\"}}}"
+        # Send two messages in the same thread for thread/message command coverage.
+        echo "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message 1\",\"body_md\":\"This is test message 1 for robot E2E validation.\",\"importance\":\"high\",\"thread_id\":\"robot-e2e-thread\"}}}"
+        sleep 0.3
+        echo "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message 2\",\"body_md\":\"This is test message 2 for robot E2E validation.\",\"importance\":\"normal\",\"thread_id\":\"robot-e2e-thread\"}}}"
         sleep 0.3
         # Create a file reservation
-        echo "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"paths\":[\"src/test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"E2E test\"}}}"
+        echo "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"paths\":[\"src/test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"E2E test\"}}}"
         sleep 0.2
     } > "$fifo" &
     local write_pid=$!
@@ -155,6 +159,20 @@ run_robot() {
     output=$(DATABASE_URL="sqlite:///${DB_PATH}" STORAGE_ROOT="${STORAGE_ROOT}" \
         AM_INTERFACE_MODE=cli am robot --project "${PROJECT_PATH}" "$subcommand" "$@" 2>&1) || true
     echo "$output"
+}
+
+run_robot_timed() {
+    local case_id="$1"
+    shift
+    local t0 t1 elapsed output
+    t0="$(date +%s%3N 2>/dev/null || echo 0)"
+    output="$(run_robot "$@")"
+    t1="$(date +%s%3N 2>/dev/null || echo 0)"
+    if [ "$t0" -gt 0 ] && [ "$t1" -ge "$t0" ]; then
+        elapsed=$((t1 - t0))
+        printf "%s\t%s\t%s\n" "$case_id" "am robot $*" "$elapsed" >> "${TIMINGS_FILE}"
+    fi
+    printf '%s' "$output"
 }
 
 # Validate JSON output
@@ -207,17 +225,35 @@ e2e_case_banner "robot inbox -> actionable inbox"
 INBOX_OUT="$(run_robot inbox --agent RedFox --format json)"
 e2e_save_artifact "case_inbox.json" "$INBOX_OUT"
 assert_valid_json "inbox" "$INBOX_OUT" && assert_envelope "inbox" "$INBOX_OUT"
-# Check for messages array
-if echo "$INBOX_OUT" | jq -e '.messages' >/dev/null 2>&1; then
-    e2e_pass "inbox: messages array present"
+# Check for inbox array and derive IDs for downstream robot thread/message tests.
+if echo "$INBOX_OUT" | jq -e '.inbox' >/dev/null 2>&1; then
+    e2e_pass "inbox: inbox array present"
 else
-    e2e_skip "inbox: messages array (format may differ)"
+    e2e_fail "inbox: inbox array missing"
 fi
+THREAD_ID="$(echo "$INBOX_OUT" | jq -r '.inbox[0].thread // empty' 2>/dev/null || true)"
+MESSAGE_ID="$(echo "$INBOX_OUT" | jq -r '.inbox[0].id // empty' 2>/dev/null || true)"
+if [ -n "$THREAD_ID" ] && [ -n "$MESSAGE_ID" ]; then
+    e2e_pass "inbox: extracted thread/message IDs for follow-up cases"
+else
+    e2e_fail "inbox: failed to extract thread/message IDs"
+fi
+e2e_save_artifact "case_inbox_ids.txt" "THREAD_ID=${THREAD_ID}\nMESSAGE_ID=${MESSAGE_ID}"
 
 e2e_case_banner "robot inbox --urgent filter"
 INBOX_URGENT_OUT="$(run_robot inbox --agent RedFox --urgent --format json)"
 e2e_save_artifact "case_inbox_urgent.json" "$INBOX_URGENT_OUT"
 assert_valid_json "inbox_urgent" "$INBOX_URGENT_OUT"
+
+e2e_case_banner "robot inbox --ack-overdue filter"
+INBOX_ACK_OVERDUE_OUT="$(run_robot inbox --agent RedFox --ack-overdue --format json)"
+e2e_save_artifact "case_inbox_ack_overdue.json" "$INBOX_ACK_OVERDUE_OUT"
+assert_valid_json "inbox_ack_overdue" "$INBOX_ACK_OVERDUE_OUT"
+
+e2e_case_banner "robot inbox --all filter"
+INBOX_ALL_OUT="$(run_robot inbox --agent RedFox --all --format json)"
+e2e_save_artifact "case_inbox_all.json" "$INBOX_ALL_OUT"
+assert_valid_json "inbox_all" "$INBOX_ALL_OUT"
 
 e2e_case_banner "robot timeline -> events"
 TIMELINE_OUT="$(run_robot timeline --format json)"
@@ -232,6 +268,34 @@ assert_valid_json "overview" "$OVERVIEW_OUT" && assert_envelope "overview" "$OVE
 # ---------------------------------------------------------------------------
 # Track 3: Context & Discovery
 # ---------------------------------------------------------------------------
+
+e2e_case_banner "robot thread -> full conversation rendering"
+if [ -n "$THREAD_ID" ]; then
+    THREAD_OUT="$(run_robot_timed "thread_json" thread "$THREAD_ID" --format json)"
+    e2e_save_artifact "case_thread.json" "$THREAD_OUT"
+    assert_valid_json "thread" "$THREAD_OUT" && assert_envelope "thread" "$THREAD_OUT"
+    if echo "$THREAD_OUT" | jq -e '.message_count >= 2' >/dev/null 2>&1; then
+        e2e_pass "thread: message_count >= 2 for seeded thread"
+    else
+        e2e_fail "thread: expected at least 2 messages in seeded thread"
+    fi
+else
+    e2e_skip "thread: THREAD_ID unavailable from inbox seed data"
+fi
+
+e2e_case_banner "robot message -> full message context"
+if [ -n "$MESSAGE_ID" ]; then
+    MESSAGE_OUT="$(run_robot_timed "message_json" message "$MESSAGE_ID" --format json)"
+    e2e_save_artifact "case_message.json" "$MESSAGE_OUT"
+    assert_valid_json "message" "$MESSAGE_OUT" && assert_envelope "message" "$MESSAGE_OUT"
+    if echo "$MESSAGE_OUT" | jq -e ".id == ${MESSAGE_ID}" >/dev/null 2>&1; then
+        e2e_pass "message: returned requested message ID ${MESSAGE_ID}"
+    else
+        e2e_fail "message: response ID mismatch for requested ID ${MESSAGE_ID}"
+    fi
+else
+    e2e_skip "message: MESSAGE_ID unavailable from inbox seed data"
+fi
 
 e2e_case_banner "robot search -> FTS results"
 SEARCH_OUT="$(run_robot search "Robot E2E" --format json)"
@@ -357,6 +421,24 @@ else
     e2e_fail "format_toon: empty output"
 fi
 
+e2e_case_banner "Format: --format md validation (thread)"
+if [ -n "$THREAD_ID" ]; then
+    THREAD_MD_OUT="$(run_robot thread "$THREAD_ID" --format md)"
+    e2e_save_artifact "case_format_md.md" "$THREAD_MD_OUT"
+    if echo "$THREAD_MD_OUT" | jq . >/dev/null 2>&1; then
+        e2e_fail "format_md: markdown output unexpectedly parsed as JSON"
+    else
+        e2e_pass "format_md: markdown output is non-JSON"
+    fi
+    if echo "$THREAD_MD_OUT" | grep -q "^# Thread:"; then
+        e2e_pass "format_md: markdown thread heading present"
+    else
+        e2e_fail "format_md: markdown thread heading missing"
+    fi
+else
+    e2e_skip "format_md: THREAD_ID unavailable from inbox seed data"
+fi
+
 e2e_case_banner "Format: auto-detect piped (should be json)"
 PIPED_OUT="$(run_robot status | cat)"
 e2e_save_artifact "case_format_piped.txt" "$PIPED_OUT"
@@ -365,6 +447,15 @@ if echo "$PIPED_OUT" | jq . >/dev/null 2>&1; then
     e2e_pass "format_piped: valid JSON when piped"
 else
     e2e_skip "format_piped: output may vary"
+fi
+
+e2e_case_banner "Format: explicit --format override beats pipe auto-detect"
+PIPED_TOON_OUT="$(run_robot status --format toon | cat)"
+e2e_save_artifact "case_format_piped_toon.txt" "$PIPED_TOON_OUT"
+if echo "$PIPED_TOON_OUT" | jq . >/dev/null 2>&1; then
+    e2e_fail "format_piped_override: expected toon/non-JSON output"
+else
+    e2e_pass "format_piped_override: explicit toon preserved under pipe"
 fi
 
 # ---------------------------------------------------------------------------
@@ -389,4 +480,5 @@ fi
 # ---------------------------------------------------------------------------
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
+e2e_save_artifact "case_timings.tsv" "$(cat "${TIMINGS_FILE}")"
 e2e_summary
