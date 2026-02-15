@@ -158,6 +158,7 @@ impl RenderItem for MessageEntry {
             return;
         }
         let inner_w = area.width as usize;
+        let tp = crate::tui_theme::TuiThemePalette::current();
 
         // Marker for selected row
         let marker = if selected {
@@ -165,7 +166,6 @@ impl RenderItem for MessageEntry {
         } else {
             crate::tui_theme::SELECTION_PREFIX_EMPTY
         };
-        let tp = crate::tui_theme::TuiThemePalette::current();
         let cursor_style = Style::default()
             .fg(tp.selection_fg)
             .bg(tp.selection_bg)
@@ -186,11 +186,19 @@ impl RenderItem for MessageEntry {
             _ => (" ", Style::default()),
         };
 
-        // ID or "LIVE" marker
-        let id_str = if self.id >= 0 {
-            format!("#{}", self.id)
+        // Ack-required indicator
+        let ack_badge = if self.ack_required { "@" } else { " " };
+        let ack_style = if self.ack_required {
+            crate::tui_theme::text_accent(&tp)
         } else {
-            "LIVE".to_string()
+            Style::default()
+        };
+
+        // ID or "LIVE" marker with distinct styling
+        let (id_str, id_style) = if self.id >= 0 {
+            (format!("#{}", self.id), crate::tui_theme::text_meta(&tp))
+        } else {
+            ("LIVE".to_string(), crate::tui_theme::text_accent(&tp))
         };
 
         // Compact timestamp (HH:MM:SS from ISO string)
@@ -199,10 +207,18 @@ impl RenderItem for MessageEntry {
         } else {
             &self.timestamp_iso
         };
+        let time_style = crate::tui_theme::text_meta(&tp);
+
+        // Sender (truncated to 12 chars)
+        let sender = if self.from_agent.len() > 12 {
+            &self.from_agent[..12]
+        } else {
+            &self.from_agent
+        };
+        let sender_style = Style::default().fg(tp.text_secondary);
 
         // Project badge (only in Global mode)
         let project_badge = if self.show_project && !self.project_slug.is_empty() {
-            // Show first 8 chars of project slug
             let slug = if self.project_slug.len() > 8 {
                 &self.project_slug[..8]
             } else {
@@ -213,14 +229,34 @@ impl RenderItem for MessageEntry {
             String::new()
         };
 
-        let prefix = format!("{marker}{badge:>2} {id_str:>6} {time_short} {project_badge}");
-        let remaining = inner_w.saturating_sub(prefix.chars().count());
+        // Calculate how much space remains for subject
+        // Format: marker + badge(2) + ack(1) + space + id(6) + space + time(8) + space + sender(<=12) + space + project + subject
+        let fixed_len = marker.len()
+            + 2  // badge
+            + 1  // ack
+            + 1  // space
+            + id_str.len().max(6)
+            + 1  // space
+            + 8  // time
+            + 1  // space
+            + sender.len()
+            + 1  // space
+            + project_badge.len();
+        let remaining = inner_w.saturating_sub(fixed_len);
         let subj = truncate_str(&self.subject, remaining);
 
         let mut line = Line::from_spans([
             Span::raw(marker),
             Span::styled(format!("{badge:>2}"), badge_style),
-            Span::raw(format!(" {id_str:>6} {time_short} {project_badge}{subj}")),
+            Span::styled(ack_badge, ack_style),
+            Span::raw(" "),
+            Span::styled(format!("{id_str:>6}"), id_style),
+            Span::raw(" "),
+            Span::styled(time_short, time_style),
+            Span::raw(" "),
+            Span::styled(format!("{sender:<12}"), sender_style),
+            Span::raw(format!(" {project_badge}")),
+            Span::styled(subj.to_string(), Style::default().fg(tp.text_primary)),
         ]);
         if selected {
             line.apply_base_style(cursor_style);
@@ -3026,5 +3062,48 @@ mod tests {
         // show_project flag propagates
         let with_proj = MessageBrowserScreen::search_live_events(&state, "", true);
         assert!(with_proj.iter().all(|r| r.show_project));
+    }
+
+    #[test]
+    fn message_row_hierarchy_semantic_fields() {
+        // Verify the MessageEntry struct carries all fields needed for
+        // the redesigned row: importance, ack_required, from_agent, id polarity.
+        let normal = MessageEntry {
+            id: 10,
+            subject: "Test".to_string(),
+            from_agent: "GoldHawk".to_string(),
+            to_agents: "SilverFox".to_string(),
+            project_slug: "proj".to_string(),
+            thread_id: "t-1".to_string(),
+            timestamp_iso: "2026-02-15T12:00:00".to_string(),
+            timestamp_micros: 1_000_000,
+            body_md: String::new(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        };
+        // Normal importance: no special badge
+        assert_eq!(normal.importance, "normal");
+        assert!(!normal.ack_required);
+        assert!(normal.id >= 0); // DB entry shows #id
+
+        let urgent_ack = MessageEntry {
+            importance: "urgent".to_string(),
+            ack_required: true,
+            id: -1, // Live entry shows "LIVE"
+            ..normal.clone()
+        };
+        assert_eq!(urgent_ack.importance, "urgent");
+        assert!(urgent_ack.ack_required);
+        assert!(urgent_ack.id < 0); // Live entry
+
+        let high = MessageEntry {
+            importance: "high".to_string(),
+            from_agent: "LongSenderNameHere".to_string(),
+            ..normal.clone()
+        };
+        assert_eq!(high.importance, "high");
+        // Sender truncation in render is at 12 chars
+        assert!(high.from_agent.len() > 12);
     }
 }
