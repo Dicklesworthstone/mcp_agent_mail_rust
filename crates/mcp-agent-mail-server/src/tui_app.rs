@@ -607,13 +607,13 @@ const COACH_HINTS: &[CoachHint] = &[
     CoachHint { id: "dashboard:welcome", screen: MailScreenId::Dashboard, message: "Tip: Press ? for help, Ctrl+P for command palette" },
     CoachHint { id: "messages:search", screen: MailScreenId::Messages, message: "Tip: Press / to filter messages, Enter to view body" },
     CoachHint { id: "threads:expand", screen: MailScreenId::Threads, message: "Tip: Enter expands a thread, h collapses it" },
-    CoachHint { id: "agents:inbox", screen: MailScreenId::Agents, message: "Tip: Enter views an agent\u{2019}s inbox, / filters by name" },
+    CoachHint { id: "agents:inbox", screen: MailScreenId::Agents, message: "Tip: Use / to filter agents, s to cycle sort columns" },
     CoachHint { id: "search:syntax", screen: MailScreenId::Search, message: "Tip: Use quoted phrases and AND/OR operators in search" },
     CoachHint { id: "reservations:force", screen: MailScreenId::Reservations, message: "Tip: Press f to force-release a stale reservation" },
     CoachHint { id: "tool_metrics:sort", screen: MailScreenId::ToolMetrics, message: "Tip: Sort columns with Tab, slow calls are highlighted" },
     CoachHint { id: "system_health:diag", screen: MailScreenId::SystemHealth, message: "Tip: WAL size and pool stats refresh every tick" },
     CoachHint { id: "timeline:expand", screen: MailScreenId::Timeline, message: "Tip: Enter expands an event, use correlation links to trace" },
-    CoachHint { id: "projects:browse", screen: MailScreenId::Projects, message: "Tip: Enter drills into a project\u{2019}s agents and messages" },
+    CoachHint { id: "projects:browse", screen: MailScreenId::Projects, message: "Tip: Use / to filter projects, s to cycle sort columns" },
     CoachHint { id: "contacts:approve", screen: MailScreenId::Contacts, message: "Tip: Accept or deny pending contact requests inline" },
     CoachHint { id: "explorer:filter", screen: MailScreenId::Explorer, message: "Tip: Filter by agent, project, or date range" },
     CoachHint { id: "analytics:volume", screen: MailScreenId::Analytics, message: "Tip: Message volume charts update in real time" },
@@ -7747,6 +7747,78 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for hint in COACH_HINTS {
             assert!(seen.insert(hint.id), "duplicate coach hint id: {}", hint.id);
+        }
+    }
+
+    #[test]
+    fn coach_hints_reference_valid_keys() {
+        // Verify that key names mentioned in coach hints exist in either
+        // screen-local keybindings or GLOBAL_BINDINGS — auto-synchronization
+        // contract (br-1xt0m.1.12.3).
+        use crate::tui_keymap::GLOBAL_BINDINGS;
+
+        let config = mcp_agent_mail_core::Config::default();
+        let state = std::sync::Arc::new(TuiSharedState::new(&config));
+
+        // Known key-like tokens that appear in hint messages.
+        let key_tokens: &[(&str, &[&str])] = &[
+            ("dashboard:welcome", &["?", "Ctrl+P"]),
+            ("messages:search", &["/", "Enter"]),
+            ("threads:expand", &["Enter", "h"]),
+            ("agents:inbox", &["/", "s"]),
+            ("search:syntax", &[]),                  // syntax tips, no specific key
+            ("reservations:force", &["f"]),
+            ("tool_metrics:sort", &["Tab"]),
+            ("system_health:diag", &[]),             // informational, no specific key
+            ("timeline:expand", &["Enter"]),
+            ("projects:browse", &["/", "s"]),
+            ("contacts:approve", &[]),               // inline action, no specific key
+            ("explorer:filter", &[]),                // informational
+            ("analytics:volume", &[]),               // informational
+            ("attachments:preview", &["Enter", "/"]),
+        ];
+
+        for (hint_id, keys) in key_tokens {
+            let hint = COACH_HINTS
+                .iter()
+                .find(|h| h.id == *hint_id)
+                .unwrap_or_else(|| panic!("missing hint {hint_id}"));
+            let screen = ScreenManager::create_screen(hint.screen, &state);
+            let bindings = screen.keybindings();
+
+            for key in *keys {
+                let in_screen = bindings.iter().any(|b| b.key.contains(key));
+                let in_global = GLOBAL_BINDINGS.iter().any(|b| b.label.contains(key));
+                assert!(
+                    in_screen || in_global,
+                    "coach hint '{hint_id}' references key '{key}' not found in \
+                     screen {:?} keybindings or GLOBAL_BINDINGS",
+                    hint.screen,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_help_tips_cover_all_screens() {
+        // Every screen should provide a non-empty context_help_tip()
+        // for the help overlay (br-1xt0m.1.12.3 acceptance).
+        let config = mcp_agent_mail_core::Config::default();
+        let state = std::sync::Arc::new(TuiSharedState::new(&config));
+        for &id in ALL_SCREEN_IDS {
+            let screen = ScreenManager::create_screen(id, &state);
+            let tip = screen.context_help_tip();
+            assert!(
+                tip.is_some(),
+                "screen {:?} missing context_help_tip()",
+                id
+            );
+            let text = tip.unwrap();
+            assert!(
+                !text.is_empty(),
+                "screen {:?} has empty context_help_tip()",
+                id
+            );
         }
     }
 
