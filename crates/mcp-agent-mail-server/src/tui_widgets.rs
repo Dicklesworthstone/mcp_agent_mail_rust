@@ -23,9 +23,9 @@ use std::cell::RefCell;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::Widget;
 use ftui::{Cell, Frame, PackedRgba, Style};
 use ftui_extras::charts::heatmap_gradient;
 use ftui_widgets::progress::ProgressBar;
@@ -171,7 +171,7 @@ impl LayoutCache {
     }
 
     /// Mark the cache as dirty, forcing recomputation on next render.
-    pub fn invalidate(&mut self) {
+    pub const fn invalidate(&mut self) {
         self.dirty = true;
     }
 }
@@ -2059,7 +2059,7 @@ impl<'a> TransparencyWidget<'a> {
     }
 
     /// Badge color for an entry based on its correctness.
-    fn badge_color(
+    const fn badge_color(
         entry: &mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry,
     ) -> PackedRgba {
         match entry.correct {
@@ -2092,6 +2092,7 @@ impl<'a> TransparencyWidget<'a> {
             if y >= inner.bottom() {
                 break;
             }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let pct = (entry.confidence * 100.0) as u32;
             let line = format!("{}: {} ({pct}%)", entry.decision_point, entry.action);
             let color = Self::badge_color(entry);
@@ -2362,7 +2363,7 @@ pub struct ChartTransition {
 impl ChartTransition {
     /// Create a transition helper with a fixed animation duration.
     #[must_use]
-    pub fn new(duration: std::time::Duration) -> Self {
+    pub const fn new(duration: std::time::Duration) -> Self {
         Self {
             from: Vec::new(),
             to: Vec::new(),
@@ -2415,7 +2416,7 @@ impl ChartTransition {
             .enumerate()
             .map(|(idx, &target)| {
                 let start = self.from.get(idx).copied().unwrap_or(target);
-                start + (target - start) * progress
+                (target - start).mul_add(progress, start)
             })
             .collect()
     }
@@ -2561,12 +2562,12 @@ pub struct ThreadTreeItem {
     pub relative_time: String,
     pub is_unread: bool,
     pub is_ack_required: bool,
-    pub children: Vec<ThreadTreeItem>,
+    pub children: Vec<Self>,
 }
 
 impl ThreadTreeItem {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         message_id: i64,
         sender: String,
         subject_snippet: String,
@@ -2586,7 +2587,7 @@ impl ThreadTreeItem {
     }
 
     #[must_use]
-    pub fn with_children(mut self, children: Vec<ThreadTreeItem>) -> Self {
+    pub fn with_children(mut self, children: Vec<Self>) -> Self {
         self.children = children;
         self
     }
@@ -3993,8 +3994,8 @@ impl Widget for EvidenceLedgerWidget<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ftui::layout::Rect;
     use ftui::GraphemePool;
+    use ftui::layout::Rect;
 
     fn render_widget(widget: &impl Widget, width: u16, height: u16) -> String {
         let mut pool = GraphemePool::new();
@@ -5548,6 +5549,7 @@ mod tests {
     // ─── AggregatedTimeSeries tests ───────────────────────────────────
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn aggregated_series_empty_y_range() {
         let series = AggregatedTimeSeries::new(Granularity::OneSecond, 1);
         let (lo, hi) = series.y_range();
@@ -5617,6 +5619,7 @@ mod tests {
     // ─── ThroughputProvider tests ─────────────────────────────────────
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn throughput_empty_buffer_returns_no_data() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         let mut provider =
@@ -5634,7 +5637,7 @@ mod tests {
     #[test]
     fn throughput_single_event() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(tool_call_end_at(5_000_000, 10));
+        let _ = ring.push(tool_call_end_at(5_000_000, 10));
         let mut provider =
             ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5650,9 +5653,9 @@ mod tests {
     fn throughput_multiple_events_same_bucket() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         // Three events in the same 1-second bucket (5s - 5.999s)
-        ring.push(tool_call_end_at(5_000_000, 10));
-        ring.push(tool_call_end_at(5_200_000, 20));
-        ring.push(tool_call_end_at(5_800_000, 30));
+        let _ = ring.push(tool_call_end_at(5_000_000, 10));
+        let _ = ring.push(tool_call_end_at(5_200_000, 20));
+        let _ = ring.push(tool_call_end_at(5_800_000, 30));
         let mut provider =
             ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5668,9 +5671,9 @@ mod tests {
     fn throughput_multiple_buckets() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         // Events in two different 1-second buckets
-        ring.push(tool_call_end_at(1_000_000, 10));
-        ring.push(tool_call_end_at(1_500_000, 10));
-        ring.push(tool_call_end_at(3_000_000, 10));
+        let _ = ring.push(tool_call_end_at(1_000_000, 10));
+        let _ = ring.push(tool_call_end_at(1_500_000, 10));
+        let _ = ring.push(tool_call_end_at(3_000_000, 10));
         let mut provider =
             ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5686,8 +5689,8 @@ mod tests {
     #[test]
     fn throughput_ignores_non_toolcallend_events() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(message_sent_at(1_000_000));
-        ring.push(agent_registered_at(2_000_000));
+        let _ = ring.push(message_sent_at(1_000_000));
+        let _ = ring.push(agent_registered_at(2_000_000));
         let mut provider =
             ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5701,7 +5704,7 @@ mod tests {
     #[test]
     fn throughput_incremental_refresh() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(tool_call_end_at(1_000_000, 10));
+        let _ = ring.push(tool_call_end_at(1_000_000, 10));
         let mut provider = ThroughputProvider::new(
             ring.clone(),
             Granularity::OneSecond,
@@ -5712,7 +5715,7 @@ mod tests {
         assert_eq!(points1.len(), 1);
 
         // Push more events and refresh again
-        ring.push(tool_call_end_at(5_000_000, 20));
+        let _ = ring.push(tool_call_end_at(5_000_000, 20));
         provider.refresh();
         let points2 = provider.data_points(0, Duration::from_secs(60));
         assert!(
@@ -5725,8 +5728,8 @@ mod tests {
     fn throughput_gap_filling() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         // Events 3 seconds apart should create gap-filled zero buckets
-        ring.push(tool_call_end_at(1_000_000, 10));
-        ring.push(tool_call_end_at(4_000_000, 10));
+        let _ = ring.push(tool_call_end_at(1_000_000, 10));
+        let _ = ring.push(tool_call_end_at(4_000_000, 10));
         let mut provider =
             ThroughputProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5761,7 +5764,7 @@ mod tests {
     #[test]
     fn latency_single_sample_all_percentiles_equal() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(tool_call_end_at(1_000_000, 42));
+        let _ = ring.push(tool_call_end_at(1_000_000, 42));
         let mut provider =
             LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5779,7 +5782,7 @@ mod tests {
         let ring = Arc::new(EventRingBuffer::with_capacity(200));
         // Push 100 events in same bucket: durations 1ms through 100ms
         for i in 1..=100 {
-            ring.push(tool_call_end_at(1_000_000, i));
+            let _ = ring.push(tool_call_end_at(1_000_000, i));
         }
         let mut provider =
             LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
@@ -5809,7 +5812,7 @@ mod tests {
     #[test]
     fn latency_zero_duration_handled() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(tool_call_end_at(1_000_000, 0));
+        let _ = ring.push(tool_call_end_at(1_000_000, 0));
         let mut provider =
             LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5822,9 +5825,9 @@ mod tests {
     fn latency_large_variance() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         // Mix of very fast and very slow calls
-        ring.push(tool_call_end_at(1_000_000, 1));
-        ring.push(tool_call_end_at(1_100_000, 1));
-        ring.push(tool_call_end_at(1_200_000, 10_000));
+        let _ = ring.push(tool_call_end_at(1_000_000, 1));
+        let _ = ring.push(tool_call_end_at(1_100_000, 1));
+        let _ = ring.push(tool_call_end_at(1_200_000, 10_000));
         let mut provider =
             LatencyProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5869,7 +5872,7 @@ mod tests {
     #[test]
     fn resource_single_pulse() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(health_pulse_at(1_000_000, 3, 5, 100, 2));
+        let _ = ring.push(health_pulse_at(1_000_000, 3, 5, 100, 2));
         let mut provider =
             ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5888,8 +5891,8 @@ mod tests {
     fn resource_last_pulse_wins_in_bucket() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         // Two pulses in same bucket — last should win
-        ring.push(health_pulse_at(1_000_000, 1, 1, 1, 1));
-        ring.push(health_pulse_at(1_500_000, 10, 20, 30, 40));
+        let _ = ring.push(health_pulse_at(1_000_000, 1, 1, 1, 1));
+        let _ = ring.push(health_pulse_at(1_500_000, 10, 20, 30, 40));
         let mut provider =
             ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5905,8 +5908,8 @@ mod tests {
     #[test]
     fn resource_ignores_non_health_events() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(tool_call_end_at(1_000_000, 10));
-        ring.push(message_sent_at(2_000_000));
+        let _ = ring.push(tool_call_end_at(1_000_000, 10));
+        let _ = ring.push(message_sent_at(2_000_000));
         let mut provider =
             ResourceProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5949,9 +5952,9 @@ mod tests {
     fn heatmap_provider_counts_by_kind() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         // Push events of different kinds in the same bucket
-        ring.push(tool_call_end_at(1_000_000, 10));
-        ring.push(tool_call_end_at(1_100_000, 20));
-        ring.push(message_sent_at(1_200_000));
+        let _ = ring.push(tool_call_end_at(1_000_000, 10));
+        let _ = ring.push(tool_call_end_at(1_100_000, 20));
+        let _ = ring.push(message_sent_at(1_200_000));
         let mut provider =
             EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5977,8 +5980,8 @@ mod tests {
     #[test]
     fn heatmap_provider_multiple_buckets() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(tool_call_end_at(1_000_000, 10));
-        ring.push(message_sent_at(3_000_000));
+        let _ = ring.push(tool_call_end_at(1_000_000, 10));
+        let _ = ring.push(message_sent_at(3_000_000));
         let mut provider =
             EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -5999,8 +6002,8 @@ mod tests {
     fn heatmap_provider_gap_filling() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         // Events 3 seconds apart
-        ring.push(agent_registered_at(1_000_000));
-        ring.push(agent_registered_at(4_000_000));
+        let _ = ring.push(agent_registered_at(1_000_000));
+        let _ = ring.push(agent_registered_at(4_000_000));
         let mut provider =
             EventHeatmapProvider::new(ring, Granularity::OneSecond, Duration::from_secs(60));
         provider.refresh();
@@ -6035,8 +6038,8 @@ mod tests {
     #[test]
     fn providers_share_ring_buffer() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
-        ring.push(tool_call_end_at(1_000_000, 50));
-        ring.push(health_pulse_at(1_000_000, 2, 4, 10, 1));
+        let _ = ring.push(tool_call_end_at(1_000_000, 50));
+        let _ = ring.push(health_pulse_at(1_000_000, 2, 4, 10, 1));
 
         let mut throughput = ThroughputProvider::new(
             ring.clone(),
@@ -6073,10 +6076,10 @@ mod tests {
             (ts_points[0].1).abs() < f64::EPSILON,
             "ToolStart count should be 0"
         );
-        let te_points = heatmap.data_points(1, Duration::from_secs(60));
-        assert_eq!(te_points.len(), 1);
+        let tool_end_points = heatmap.data_points(1, Duration::from_secs(60));
+        assert_eq!(tool_end_points.len(), 1);
         assert!(
-            (te_points[0].1 - 1.0).abs() < f64::EPSILON,
+            (tool_end_points[0].1 - 1.0).abs() < f64::EPSILON,
             "ToolEnd count should be 1"
         );
     }
@@ -6108,11 +6111,11 @@ mod tests {
     fn five_second_granularity_bucketing() {
         let ring = Arc::new(EventRingBuffer::with_capacity(100));
         // Events within the same 5-second bucket
-        ring.push(tool_call_end_at(5_000_000, 10));
-        ring.push(tool_call_end_at(7_000_000, 20));
-        ring.push(tool_call_end_at(9_999_999, 30));
+        let _ = ring.push(tool_call_end_at(5_000_000, 10));
+        let _ = ring.push(tool_call_end_at(7_000_000, 20));
+        let _ = ring.push(tool_call_end_at(9_999_999, 30));
         // Event in next 5-second bucket
-        ring.push(tool_call_end_at(10_000_000, 40));
+        let _ = ring.push(tool_call_end_at(10_000_000, 40));
         let mut provider =
             ThroughputProvider::new(ring, Granularity::FiveSeconds, Duration::from_secs(300));
         provider.refresh();
@@ -6381,7 +6384,7 @@ mod tests {
         ]
     }
 
-    /// Widget renders entries with correct formatting (seq, decision_point, action, conf, status).
+    /// Widget renders entries with correct formatting (seq, `decision_point`, action, conf, status).
     #[test]
     fn evidence_widget_renders_entries() {
         let entries = make_ledger_entries();
@@ -6458,7 +6461,7 @@ mod tests {
         );
     }
 
-    /// Widget respects max_visible limit.
+    /// Widget respects `max_visible` limit.
     #[test]
     fn evidence_widget_max_visible() {
         let entries = make_ledger_entries();
@@ -6676,7 +6679,7 @@ mod tests {
     #[test]
     fn golden_heatmap_5x5() {
         let data: Vec<Vec<f64>> = (0..5)
-            .map(|r| (0..5).map(|c| ((r * 5 + c) as f64) / 24.0).collect())
+            .map(|r| (0..5).map(|c| f64::from(r * 5 + c) / 24.0).collect())
             .collect();
         let row_labels: &[&str] = &["A", "B", "C", "D", "E"];
         let col_labels: &[&str] = &["1", "2", "3", "4", "5"];
@@ -6728,7 +6731,7 @@ mod tests {
     #[test]
     fn cached_vs_uncached_identical() {
         let data: Vec<Vec<f64>> = (0..8)
-            .map(|r| (0..8).map(|c| ((r * 8 + c) as f64) / 63.0).collect())
+            .map(|r| (0..8).map(|c| f64::from(r * 8 + c) / 63.0).collect())
             .collect();
         let row_labels: &[&str] = &["R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7"];
         let area = Rect::new(0, 0, 40, 10);
@@ -6759,11 +6762,11 @@ mod tests {
 
     /// 3. 100 stable frames with cache should recompute layout only once.
     ///    100 frames with cache invalidated each time should recompute 100 times.
-    ///    The cached version must be faster (we verify compute_count as a proxy).
+    ///    The cached version must be faster (we verify `compute_count` as a proxy).
     #[test]
     fn bench_stable_frames_faster_with_cache() {
         let data: Vec<Vec<f64>> = (0..20)
-            .map(|r| (0..20).map(|c| ((r * 20 + c) as f64) / 400.0).collect())
+            .map(|r| (0..20).map(|c| f64::from(r * 20 + c) / 400.0).collect())
             .collect();
         let area = Rect::new(0, 0, 80, 24);
         let mut pool = GraphemePool::new();
@@ -6804,9 +6807,10 @@ mod tests {
     /// 4. Changing data every frame should have similar cost regardless of cache,
     ///    since the cache is invalidated by the generation counter each time.
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn bench_changing_frames_same_cost() {
         let data: Vec<Vec<f64>> = (0..10)
-            .map(|r| (0..10).map(|c| ((r * 10 + c) as f64) / 100.0).collect())
+            .map(|r| (0..10).map(|c| f64::from(r * 10 + c) / 100.0).collect())
             .collect();
         let area = Rect::new(0, 0, 40, 12);
         let mut pool = GraphemePool::new();
@@ -6872,7 +6876,7 @@ mod tests {
                 e
             },
             {
-                let mut e = EvidenceLedgerEntry::new(
+                let e = EvidenceLedgerEntry::new(
                     "d3",
                     "tui.diff_strategy",
                     "full",
@@ -6939,7 +6943,7 @@ mod tests {
         );
     }
 
-    /// 3. Render L2 detail, verify all EvidenceLedgerEntry fields visible.
+    /// 3. Render L2 detail, verify all `EvidenceLedgerEntry` fields visible.
     #[test]
     fn transparency_l2_detail_fields() {
         let entries = make_test_entries();

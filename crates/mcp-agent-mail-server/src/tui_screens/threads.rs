@@ -1418,7 +1418,11 @@ fn render_thread_list(
 }
 
 /// Render the thread detail/conversation panel.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
 fn render_thread_detail(
     frame: &mut Frame<'_>,
     area: Rect,

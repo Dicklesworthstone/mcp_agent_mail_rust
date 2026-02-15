@@ -14,7 +14,7 @@ use ftui::widgets::Widget;
 use ftui::{Frame, GraphemePool};
 use mcp_agent_mail_core::bocpd::BocpdDetector;
 use mcp_agent_mail_core::conformal::ConformalPredictor;
-use mcp_agent_mail_core::evidence_ledger::{evidence_ledger, EvidenceLedgerEntry};
+use mcp_agent_mail_core::evidence_ledger::{EvidenceLedgerEntry, evidence_ledger};
 use mcp_agent_mail_db::s3fifo::S3FifoCache;
 use mcp_agent_mail_server::tui_decision::{BayesianDiffStrategy, DiffAction, FrameState};
 use mcp_agent_mail_server::tui_widgets::{DisclosureLevel, TransparencyWidget};
@@ -89,10 +89,9 @@ fn alien_e2e_coalesce_sharded_evidence() {
     // observe the map but since they're sequential, each will be a new leader.
     let mut results = Vec::new();
     for i in 0..10 {
-        let outcome = map.execute_or_join(
-            "shared_key".to_string(),
-            || -> Result<u64, String> { Ok(i * 10) },
-        );
+        let outcome = map.execute_or_join("shared_key".to_string(), || -> Result<u64, String> {
+            Ok(i * 10)
+        });
         results.push(outcome.unwrap().into_inner());
     }
 
@@ -139,7 +138,7 @@ fn alien_e2e_bocpd_conformal_tui() {
     // Phase 1: 100 normal latencies (mean=10, small variance).
     let mut change_point_detected = false;
     for i in 0..100 {
-        let latency = 10.0 + (i as f64 * 0.01); // very stable
+        let latency = f64::from(i).mul_add(0.01, 10.0); // very stable
         conformal.observe(latency);
         if bocpd.observe(latency).is_some() {
             change_point_detected = true;
@@ -152,14 +151,11 @@ fn alien_e2e_bocpd_conformal_tui() {
         stable_interval.is_some(),
         "conformal should produce an interval after 100 observations"
     );
-    let stable_width = stable_interval
-        .as_ref()
-        .map(|i| i.upper - i.lower)
-        .unwrap_or(0.0);
+    let stable_width = stable_interval.as_ref().map_or(0.0, |i| i.upper - i.lower);
 
     // Phase 2: 50 shifted latencies (mean=50, larger than before).
     for i in 0..50 {
-        let latency = 50.0 + (i as f64 * 0.1); // shifted mean
+        let latency = f64::from(i).mul_add(0.1, 50.0); // shifted mean
         conformal.observe(latency);
         if bocpd.observe(latency).is_some() {
             change_point_detected = true;
@@ -178,10 +174,7 @@ fn alien_e2e_bocpd_conformal_tui() {
         shifted_interval.is_some(),
         "conformal should still produce interval after shift"
     );
-    let shifted_width = shifted_interval
-        .as_ref()
-        .map(|i| i.upper - i.lower)
-        .unwrap_or(0.0);
+    let shifted_width = shifted_interval.as_ref().map_or(0.0, |i| i.upper - i.lower);
     assert!(
         shifted_width > stable_width,
         "interval should widen after mean shift: stable={stable_width:.2}, shifted={shifted_width:.2}"
@@ -235,7 +228,9 @@ fn alien_e2e_bayesian_layout_integration() {
     // Phase 3: Determinism — same inputs produce same sequence.
     let mut s1 = BayesianDiffStrategy::new();
     let mut s2 = BayesianDiffStrategy::new();
-    let frames = [stable, resize, stable, stable, resize, stable, stable, stable];
+    let frames = [
+        stable, resize, stable, stable, resize, stable, stable, stable,
+    ];
     for frame in &frames {
         let a1 = s1.observe(frame);
         let a2 = s2.observe(frame);
@@ -253,7 +248,7 @@ fn alien_e2e_bayesian_layout_integration() {
 
 /// 5. Galaxy-Brain transparency: L0-L3 drill-down without panic.
 ///
-/// Record 20 evidence entries, render TransparencyWidget at all 4 levels,
+/// Record 20 evidence entries, render `TransparencyWidget` at all 4 levels,
 /// verify each level renders different output.
 #[test]
 fn alien_e2e_transparency_full_drill() {
@@ -277,7 +272,7 @@ fn alien_e2e_transparency_full_drill() {
                 format!("drill-{i}"),
                 dp,
                 action,
-                0.5 + (i as f64) * 0.025,
+                f64::from(i).mul_add(0.025, 0.5),
                 serde_json::json!({"idx": i}),
             );
             if i % 5 == 0 {

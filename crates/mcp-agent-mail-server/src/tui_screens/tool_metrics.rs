@@ -266,7 +266,7 @@ struct LatencyRibbonRow {
 }
 
 impl LatencyRibbonRow {
-    fn values(&self) -> [f64; 3] {
+    const fn values(&self) -> [f64; 3] {
         [self.p50, self.p95, self.p99]
     }
 }
@@ -571,6 +571,7 @@ impl ToolMetricsScreen {
     }
 
     /// Render the table view (original view).
+    #[allow(clippy::too_many_lines)]
     fn render_table_view(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let header_h = 1_u16;
@@ -586,7 +587,11 @@ impl ToolMetricsScreen {
             "\u{25bc}"
         };
         let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
-        let total_cp: usize = self.tool_map.values().map(|ts| ts.change_point_count()).sum();
+        let total_cp: usize = self
+            .tool_map
+            .values()
+            .map(ToolStats::change_point_count)
+            .sum();
         let summary = format!(
             " {} tools | {} calls | {} errors | avg {}ms | {} CP | Sort: {}{} | v=dashboard",
             self.tool_map.len(),
@@ -602,7 +607,14 @@ impl ToolMetricsScreen {
 
         // Table
         let header = Row::new([
-            "Tool Name", "Calls", "Errors", "Err%", "Avg(ms)", "CP", "CI(90%)", "Trend",
+            "Tool Name",
+            "Calls",
+            "Errors",
+            "Err%",
+            "Avg(ms)",
+            "CP",
+            "CI(90%)",
+            "Trend",
         ])
         .style(Style::default().bold());
 
@@ -615,6 +627,7 @@ impl ToolMetricsScreen {
                 let err_pct = format!("{:.1}%", stats.err_pct());
                 let spark = stats.sparkline_str();
                 let cp_count = format!("{}", stats.change_point_count());
+                #[allow(clippy::option_if_let_else)]
                 let ci_str = if let Some(interval) = stats.conformal.predict() {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let lo = interval.lower.max(0.0) as u64;
@@ -698,9 +711,7 @@ impl ToolMetricsScreen {
             match self.disclosure_level {
                 DisclosureLevel::Badge => 1,
                 DisclosureLevel::Summary => 3_u16.min(after_anomaly / 4),
-                DisclosureLevel::Detail | DisclosureLevel::DeepDive => {
-                    5_u16.min(after_anomaly / 3)
-                }
+                DisclosureLevel::Detail | DisclosureLevel::DeepDive => 5_u16.min(after_anomaly / 3),
             }
         };
         let tiles_area = Rect::new(area.x, area.y, area.width, tiles_h);
@@ -756,7 +767,12 @@ impl ToolMetricsScreen {
         let final_ribbon_h = if after_all > 12 { 8_u16 } else { after_all / 2 };
         let final_leader_h = after_all.saturating_sub(final_ribbon_h);
         let ribbon_area = Rect::new(area.x, y_offset, area.width, final_ribbon_h);
-        let leader_area = Rect::new(area.x, y_offset + final_ribbon_h, area.width, final_leader_h);
+        let leader_area = Rect::new(
+            area.x,
+            y_offset + final_ribbon_h,
+            area.width,
+            final_leader_h,
+        );
 
         // --- Percentile Ribbon ---
         if final_ribbon_h >= 3 {
@@ -1690,10 +1706,7 @@ mod tests {
         let a_cp = screen.tool_map["tool_a"].change_point_count();
         let b_cp = screen.tool_map["tool_b"].change_point_count();
 
-        assert!(
-            a_cp >= 1,
-            "tool_a should have change points, got {a_cp}"
-        );
+        assert!(a_cp >= 1, "tool_a should have change points, got {a_cp}");
         assert_eq!(
             b_cp, 0,
             "tool_b should have no change points (stable), got {b_cp}"
@@ -1710,7 +1723,14 @@ mod tests {
 
         // Populate tools so dashboard renders content (not empty state).
         let _ = state.push_event(MailEvent::tool_call_end(
-            "tool_x", 25, None, 1, 0.5, vec![], None, None,
+            "tool_x",
+            25,
+            None,
+            1,
+            0.5,
+            vec![],
+            None,
+            None,
         ));
         screen.ingest_events(&state);
 
@@ -1795,16 +1815,31 @@ mod tests {
 
         // Populate data.
         let _ = state.push_event(MailEvent::tool_call_end(
-            "t1", 30, None, 1, 0.5, vec![], None, None,
+            "t1",
+            30,
+            None,
+            1,
+            0.5,
+            vec![],
+            None,
+            None,
         ));
         screen.ingest_events(&state);
 
         screen.evidence_entries = vec![
             mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry::new(
-                "dd1", "cache.eviction", "promote", 0.65, serde_json::json!({}),
+                "dd1",
+                "cache.eviction",
+                "promote",
+                0.65,
+                serde_json::json!({}),
             ),
             mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry::new(
-                "dd2", "tui.diff", "full", 0.9, serde_json::json!({}),
+                "dd2",
+                "tui.diff",
+                "full",
+                0.9,
+                serde_json::json!({}),
             ),
         ];
         screen.view_mode = ViewMode::Dashboard;
@@ -1827,13 +1862,21 @@ mod tests {
 
     /// 5. Verify cache eviction entries appear in the dashboard cache section (H.2).
     #[test]
+    #[allow(clippy::needless_collect)]
     fn transparency_cache_screen_integration() {
         let state = test_state();
         let mut screen = ToolMetricsScreen::new();
 
         // Populate tools so dashboard renders content.
         let _ = state.push_event(MailEvent::tool_call_end(
-            "tool_y", 15, None, 1, 0.0, vec![], None, None,
+            "tool_y",
+            15,
+            None,
+            1,
+            0.0,
+            vec![],
+            None,
+            None,
         ));
         screen.ingest_events(&state);
 
@@ -1920,23 +1963,42 @@ mod tests {
         screen.update(&esc_key, &state); // Detail -> Summary
         screen.update(&esc_key, &state); // Summary -> Badge
         screen.update(&esc_key, &state); // Badge -> deactivate
-        assert!(!screen.drilldown_active, "Escape at Badge should deactivate drill-down");
+        assert!(
+            !screen.drilldown_active,
+            "Escape at Badge should deactivate drill-down"
+        );
 
         // Numeric shortcuts: 1-4 jump directly.
         let key3 = Event::Key(ftui::KeyEvent::new(KeyCode::Char('3')));
         screen.update(&key3, &state);
-        assert_eq!(screen.disclosure_level, DisclosureLevel::Detail, "3 -> Detail");
+        assert_eq!(
+            screen.disclosure_level,
+            DisclosureLevel::Detail,
+            "3 -> Detail"
+        );
 
         let key1 = Event::Key(ftui::KeyEvent::new(KeyCode::Char('1')));
         screen.update(&key1, &state);
-        assert_eq!(screen.disclosure_level, DisclosureLevel::Badge, "1 -> Badge");
+        assert_eq!(
+            screen.disclosure_level,
+            DisclosureLevel::Badge,
+            "1 -> Badge"
+        );
 
         let key4 = Event::Key(ftui::KeyEvent::new(KeyCode::Char('4')));
         screen.update(&key4, &state);
-        assert_eq!(screen.disclosure_level, DisclosureLevel::DeepDive, "4 -> DeepDive");
+        assert_eq!(
+            screen.disclosure_level,
+            DisclosureLevel::DeepDive,
+            "4 -> DeepDive"
+        );
 
         let key2 = Event::Key(ftui::KeyEvent::new(KeyCode::Char('2')));
         screen.update(&key2, &state);
-        assert_eq!(screen.disclosure_level, DisclosureLevel::Summary, "2 -> Summary");
+        assert_eq!(
+            screen.disclosure_level,
+            DisclosureLevel::Summary,
+            "2 -> Summary"
+        );
     }
 }

@@ -114,7 +114,11 @@ impl RenderItem for TimelineEntry {
             sev.styled_badge(),
             Span::raw(format!(" [{src_badge}] ")),
             Span::styled(format!("{}", self.display.icon), sev.style()),
-            Span::raw(format!(" {}", self.display.summary)),
+            Span::raw(format!(
+                " {:<10} {}",
+                self.display.kind.compact_label(),
+                self.display.summary
+            )),
         ]);
         if selected {
             line.apply_base_style(cursor_style);

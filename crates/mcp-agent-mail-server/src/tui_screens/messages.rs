@@ -15,6 +15,9 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, Style};
+use ftui_extras::image::{
+    DetectionHints, Image, ImageFit, ImageProtocol, Iterm2Dimension, Iterm2Options, detect_protocol,
+};
 use ftui_extras::syntax::{JsonTokenizer, LineState, TokenKind, Tokenizer};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
@@ -319,6 +322,8 @@ pub struct MessageBrowserScreen {
     last_local_project: Option<String>,
     /// Reduced-motion mode forces static urgency badges.
     reduced_motion: bool,
+    /// Small animation phase for header/status flourish.
+    ui_phase: u8,
     /// Resizable results/detail layout.
     dock: DockLayout,
     /// Current drag state while resizing dock split.
@@ -358,6 +363,7 @@ impl MessageBrowserScreen {
             inbox_mode: InboxMode::Global,
             last_local_project: None,
             reduced_motion: reduced_motion_enabled(),
+            ui_phase: 0,
             dock: DockLayout::right_40(),
             dock_drag: DockDragState::Idle,
             last_content_area: Cell::new(Rect::new(0, 0, 0, 0)),
@@ -649,6 +655,10 @@ impl MailScreen for MessageBrowserScreen {
                         self.dock_drag = DockDragState::Idle;
                     }
                     MouseEventKind::ScrollDown => {
+                        if point_in_rect(self.last_search_area.get(), mouse.x, mouse.y) {
+                            self.apply_preset(self.preset_index + 1);
+                            return Cmd::None;
+                        }
                         if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
                             self.scroll_detail_by(1);
                             return Cmd::None;
@@ -662,6 +672,15 @@ impl MailScreen for MessageBrowserScreen {
                         }
                     }
                     MouseEventKind::ScrollUp => {
+                        if point_in_rect(self.last_search_area.get(), mouse.x, mouse.y) {
+                            let idx = if self.preset_index == 0 {
+                                QUERY_PRESETS.len() - 1
+                            } else {
+                                self.preset_index - 1
+                            };
+                            self.apply_preset(idx);
+                            return Cmd::None;
+                        }
                         if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
                             self.scroll_detail_by(-1);
                             return Cmd::None;
@@ -790,6 +809,7 @@ impl MailScreen for MessageBrowserScreen {
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         self.update_urgent_pulse(tick_count);
+        self.ui_phase = (tick_count % 16) as u8;
         // Debounce search execution
         if self.search_dirty {
             if self.debounce_remaining > 0 {
@@ -841,8 +861,21 @@ impl MailScreen for MessageBrowserScreen {
             return;
         }
 
-        // Layout: search bar + dock-split content area
-        let search_height: u16 = 3; // border + input + border
+        // Always paint the full content area so no cells remain stale between resizes.
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        Paragraph::new("")
+            .style(Style::default().bg(tp.bg_deep))
+            .render(area, frame);
+
+        // Layout: search bar + dock-split content area.
+        // Give the header an extra row on larger terminals for richer status text.
+        let search_height: u16 = if area.height >= 18 {
+            5
+        } else if area.height >= 12 {
+            4
+        } else {
+            3
+        };
         let content_height = area.height.saturating_sub(search_height);
 
         let search_area = Rect::new(area.x, area.y, area.width, search_height);
@@ -868,6 +901,7 @@ impl MailScreen for MessageBrowserScreen {
         } else {
             "List only".to_string()
         };
+        let telemetry = runtime_telemetry_line(state, self.ui_phase);
         render_search_bar(
             frame,
             search_area,
@@ -878,6 +912,9 @@ impl MailScreen for MessageBrowserScreen {
             preset_label,
             &mode_label,
             &layout_label,
+            self.ui_phase,
+            MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed),
+            &telemetry,
         );
 
         let mut dock = self.dock;
@@ -954,7 +991,7 @@ impl MailScreen for MessageBrowserScreen {
             },
             HelpEntry {
                 key: "Mouse",
-                action: "Click/select, wheel scroll, drag split",
+                action: "Click/select, wheel preset/scroll, drag split",
             },
             HelpEntry {
                 key: "Esc",
@@ -1231,11 +1268,15 @@ fn render_search_bar(
     preset_label: &str,
     mode_label: &str,
     layout_label: &str,
+    ui_phase: u8,
+    pulse_on: bool,
+    telemetry: &str,
 ) {
+    let spinner = spinner_glyph(ui_phase);
     let mut title = if focused {
-        format!("Search ({total_results} results) [EDITING]")
+        format!("{spinner} Search ({total_results} results) [EDITING]")
     } else {
-        format!("Search ({total_results} results)")
+        format!("{spinner} Search ({total_results} results)")
     };
     // Append search method for explainability
     if !method_label.is_empty() {
@@ -1265,11 +1306,21 @@ fn render_search_bar(
         let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
         input.render(input_area, frame);
         if inner.height > 1 {
-            let hint = "Mouse: click/select, wheel scroll, drag border resize";
+            let pulse = if pulse_on { "\u{25cf}" } else { "\u{25cb}" };
+            let meter = pulse_meter(ui_phase, 10);
+            let hint = format!(
+                "{pulse} {meter}  Mouse: click/select, wheel preset/scroll, drag split border  |  Ops: / j k J K"
+            );
             let hint_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-            Paragraph::new(truncate_str(hint, inner.width as usize))
+            Paragraph::new(truncate_str(&hint, inner.width as usize))
                 .style(Style::default().fg(tp.text_muted))
                 .render(hint_area, frame);
+        }
+        if inner.height > 2 {
+            let telemetry_area = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+            Paragraph::new(truncate_str(telemetry, inner.width as usize))
+                .style(Style::default().fg(tp.selection_indicator))
+                .render(telemetry_area, frame);
         }
     }
 }
@@ -1282,9 +1333,14 @@ fn render_results_list(
     list_state: &mut VirtualizedListState,
     focused: bool,
 ) {
+    let title = if results.is_empty() {
+        "Results".to_string()
+    } else {
+        format!("Results ({})", results.len())
+    };
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
-        .title("Results")
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
@@ -1386,6 +1442,152 @@ fn colorize_json_body(body: &str, tp: &crate::tui_theme::TuiThemePalette) -> Tex
     Text::from_lines(lines)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkdownImageRef {
+    alt: String,
+    source: String,
+}
+
+/// Extract markdown image references in the form `![alt](source)`.
+fn collect_markdown_image_refs(markdown: &str) -> Vec<MarkdownImageRef> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < markdown.len() {
+        let Some(rel_start) = markdown[cursor..].find("![") else {
+            break;
+        };
+        let alt_start = cursor + rel_start + 2;
+        let Some(rel_alt_end) = markdown[alt_start..].find(']') else {
+            break;
+        };
+        let alt_end = alt_start + rel_alt_end;
+        let after_alt = alt_end.saturating_add(1);
+        if after_alt >= markdown.len() || !markdown[after_alt..].starts_with('(') {
+            cursor = after_alt;
+            continue;
+        }
+        let src_start = after_alt + 1;
+        let Some(rel_src_end) = markdown[src_start..].find(')') else {
+            break;
+        };
+        let src_end = src_start + rel_src_end;
+
+        let alt = markdown[alt_start..alt_end].trim();
+        let source = markdown[src_start..src_end].trim();
+        if !source.is_empty() {
+            out.push(MarkdownImageRef {
+                alt: alt.to_string(),
+                source: source.to_string(),
+            });
+        }
+        cursor = src_end.saturating_add(1);
+    }
+
+    out
+}
+
+const fn image_protocol_name(protocol: ImageProtocol) -> &'static str {
+    match protocol {
+        ImageProtocol::Kitty => "kitty",
+        ImageProtocol::Iterm2 => "iterm2",
+        ImageProtocol::Sixel => "sixel",
+        ImageProtocol::Ascii => "ascii",
+    }
+}
+
+/// Build a textual/ASCII image preview block appended below markdown body.
+///
+/// This favors robust degraded behavior: no panics on missing/invalid bytes.
+fn build_inline_image_block(markdown: &str, width: u16) -> String {
+    build_inline_image_block_with_hints(markdown, width, &DetectionHints::from_env())
+}
+
+fn build_inline_image_block_with_hints(
+    markdown: &str,
+    width: u16,
+    hints: &DetectionHints,
+) -> String {
+    let refs = collect_markdown_image_refs(markdown);
+    if refs.is_empty() {
+        return String::new();
+    }
+
+    let caps = ftui::TerminalCapabilities::detect();
+    let protocol = detect_protocol(caps, hints);
+    let mut lines = Vec::new();
+    let preview_width = u32::from(width.clamp(16, 120));
+
+    for image_ref in refs {
+        let label = if image_ref.alt.is_empty() {
+            image_ref.source.as_str()
+        } else {
+            image_ref.alt.as_str()
+        };
+        lines.push(format!(
+            "[Image: {label} | protocol={}]",
+            image_protocol_name(protocol)
+        ));
+
+        match std::fs::read(&image_ref.source) {
+            Ok(bytes) => match Image::from_bytes(&bytes) {
+                Ok(image) => {
+                    match protocol {
+                        ImageProtocol::Kitty => match image.encode_kitty(
+                            Some(preview_width),
+                            Some(8),
+                            ImageFit::Contain,
+                        ) {
+                            Ok(chunks) => lines.push(format!(
+                                "[kitty inline payload prepared: {} chunk(s)]",
+                                chunks.len()
+                            )),
+                            Err(_) => lines
+                                .push(format!("[Image kitty encode failed: {}]", image_ref.source)),
+                        },
+                        ImageProtocol::Iterm2 => {
+                            let options = Iterm2Options {
+                                width: Some(Iterm2Dimension::Cells(preview_width)),
+                                height: Some(Iterm2Dimension::Cells(8)),
+                                ..Iterm2Options::default()
+                            };
+                            match image.encode_iterm2(
+                                Some(preview_width),
+                                Some(8),
+                                ImageFit::Contain,
+                                &options,
+                            ) {
+                                Ok(sequence) => lines.push(format!(
+                                    "[iterm2 inline payload prepared: {} byte(s)]",
+                                    sequence.len()
+                                )),
+                                Err(_) => lines.push(format!(
+                                    "[Image iTerm2 encode failed: {}]",
+                                    image_ref.source
+                                )),
+                            }
+                        }
+                        ImageProtocol::Sixel => lines.push(
+                            "[sixel detected; using ASCII fallback preview (encoder unavailable)]"
+                                .to_string(),
+                        ),
+                        ImageProtocol::Ascii => {}
+                    }
+
+                    for line in image.render_ascii(preview_width, 8, ImageFit::Contain) {
+                        lines.push(truncate_str(&line, width as usize));
+                    }
+                }
+                Err(_) => lines.push(format!("[Image decode failed: {}]", image_ref.source)),
+            },
+            Err(_) => lines.push(format!("[Image unavailable: {}]", image_ref.source)),
+        }
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
 /// Render the detail panel for the selected message.
 #[allow(clippy::cast_possible_truncation)]
 /// Estimate how many lines the detail panel needs for a message entry.
@@ -1404,9 +1606,15 @@ fn estimate_message_detail_lines(entry: &MessageEntry) -> usize {
     count += 2; // Blank separator + "--- Body ---"
     // Body lines: count newlines + 1
     count += entry.body_md.lines().count().max(1);
+    // Markdown image references may expand into additional inline preview rows.
+    // Over-estimate to avoid clamping scroll too early.
+    count += collect_markdown_image_refs(&entry.body_md)
+        .len()
+        .saturating_mul(12);
     count
 }
 
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn render_detail_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1414,9 +1622,19 @@ fn render_detail_panel(
     scroll: usize,
     focused: bool,
 ) {
+    let detail_title = entry.map_or_else(
+        || "Detail".to_string(),
+        |msg| {
+            let viewport = usize::from(area.height.saturating_sub(2)).max(1);
+            let total = estimate_message_detail_lines(msg);
+            let max_scroll = total.saturating_sub(viewport);
+            let clamped = scroll.min(max_scroll);
+            format!("Detail [{clamped}/{max_scroll}]")
+        },
+    );
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
-        .title("Detail")
+        .title(&detail_title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
@@ -1476,8 +1694,14 @@ fn render_detail_panel(
     let body_text = if looks_like_json(&msg.body_md) {
         colorize_json_body(&msg.body_md, &tp)
     } else {
+        let mut body_md = msg.body_md.clone();
+        let image_block = build_inline_image_block(&msg.body_md, content_inner.width);
+        if !image_block.is_empty() {
+            body_md.push_str("\n\n");
+            body_md.push_str(&image_block);
+        }
         let md_theme = crate::tui_theme::markdown_theme();
-        crate::tui_markdown::render_body(&msg.body_md, &md_theme)
+        crate::tui_markdown::render_body(&body_md, &md_theme)
     };
     let body_height = body_text.height();
 
@@ -1600,6 +1824,50 @@ fn render_vertical_scrollbar(
     Paragraph::new(Text::from_lines(lines)).render(area, frame);
 }
 
+const fn spinner_glyph(phase: u8) -> &'static str {
+    match phase % 8 {
+        0 | 4 => "\u{25d0}",
+        1 | 5 => "\u{25d3}",
+        2 | 6 => "\u{25d1}",
+        _ => "\u{25d2}",
+    }
+}
+
+fn pulse_meter(phase: u8, width: usize) -> String {
+    const BARS: [char; 8] = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    let w = width.max(4);
+    let mut out = String::with_capacity(w);
+    for idx in 0..w {
+        let pos = (usize::from(phase) + idx) % BARS.len();
+        out.push(BARS[pos]);
+    }
+    out
+}
+
+fn runtime_telemetry_line(state: &TuiSharedState, ui_phase: u8) -> String {
+    let counters = state.request_counters();
+    let err = counters.status_4xx.saturating_add(counters.status_5xx);
+    let spark_raw = state.sparkline_snapshot();
+    let spark = crate::tui_screens::dashboard::render_sparkline(&spark_raw, 12);
+    let meter = pulse_meter(ui_phase, 6);
+    let sparkline = if spark.is_empty() {
+        "......".to_string()
+    } else {
+        spark
+    };
+    format!(
+        "{meter} req:{} ok:{} err:{} avg:{}ms spark:{}",
+        counters.total,
+        counters.status_2xx,
+        err,
+        state.avg_latency_ms(),
+        sparkline
+    )
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Utility helpers
 // ──────────────────────────────────────────────────────────────────────
@@ -1645,6 +1913,8 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use tempfile::tempdir;
 
     // ── Construction ────────────────────────────────────────────────
 
@@ -1870,6 +2140,109 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_json_rejects_fenced_json_code_block() {
+        let fenced = "```json\n{\"ok\":true}\n```";
+        assert!(!looks_like_json(fenced));
+    }
+
+    #[test]
+    fn collect_markdown_image_refs_parses_alt_and_source() {
+        let md = "before ![diagram](./fixtures/diagram.png) middle ![](./img.webp) after";
+        let refs = collect_markdown_image_refs(md);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].alt, "diagram");
+        assert_eq!(refs[0].source, "./fixtures/diagram.png");
+        assert_eq!(refs[1].alt, "");
+        assert_eq!(refs[1].source, "./img.webp");
+    }
+
+    #[test]
+    fn build_inline_image_block_handles_missing_file_without_panicking() {
+        let md = "![missing](./definitely-does-not-exist-image.png)";
+        let block = build_inline_image_block_with_hints(md, 40, &DetectionHints::default());
+        assert!(block.contains("[Image: missing | protocol="));
+        assert!(block.contains("[Image unavailable: ./definitely-does-not-exist-image.png]"));
+    }
+
+    fn write_png_fixture_path() -> (tempfile::TempDir, String) {
+        // 1x1 transparent PNG.
+        const PNG_1X1_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("inline-preview.png");
+        let bytes = STANDARD
+            .decode(PNG_1X1_BASE64)
+            .expect("decode PNG fixture bytes");
+        std::fs::write(&path, bytes).expect("write PNG fixture");
+        (dir, path.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn build_inline_image_block_kitty_path_uses_protocol_dispatch() {
+        let (_dir, image_path) = write_png_fixture_path();
+        let markdown = format!("![fixture]({image_path})");
+        let hints = DetectionHints::default()
+            .with_kitty_graphics(true)
+            .with_iterm2_inline(false)
+            .with_sixel(false);
+
+        let block = build_inline_image_block_with_hints(&markdown, 80, &hints);
+        assert!(block.contains("protocol=kitty"));
+        assert!(block.contains("[kitty inline payload prepared:"));
+    }
+
+    #[test]
+    fn build_inline_image_block_iterm2_path_uses_protocol_dispatch() {
+        let (_dir, image_path) = write_png_fixture_path();
+        let markdown = format!("![fixture]({image_path})");
+        let hints = DetectionHints::default()
+            .with_kitty_graphics(false)
+            .with_iterm2_inline(true)
+            .with_sixel(false);
+
+        let block = build_inline_image_block_with_hints(&markdown, 80, &hints);
+        assert!(block.contains("protocol=iterm2"));
+        assert!(block.contains("[iterm2 inline payload prepared:"));
+    }
+
+    #[test]
+    fn build_inline_image_block_sixel_path_uses_ascii_fallback_note() {
+        let (_dir, image_path) = write_png_fixture_path();
+        let markdown = format!("![fixture]({image_path})");
+        let hints = DetectionHints::default()
+            .with_kitty_graphics(false)
+            .with_iterm2_inline(false)
+            .with_sixel(true);
+
+        let block = build_inline_image_block_with_hints(&markdown, 80, &hints);
+        assert!(block.contains("protocol=sixel"));
+        assert!(block.contains("[sixel detected; using ASCII fallback preview"));
+    }
+
+    #[test]
+    fn estimate_message_detail_lines_adds_image_headroom() {
+        let msg = MessageEntry {
+            id: -1,
+            subject: "Image detail".to_string(),
+            from_agent: "A".to_string(),
+            to_agents: "B".to_string(),
+            project_slug: "p".to_string(),
+            thread_id: String::new(),
+            timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
+            timestamp_micros: 0,
+            body_md: "hello\n![img](./missing.png)".to_string(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        };
+        let baseline = 6 + 2 + msg.body_md.lines().count().max(1);
+        let estimate = estimate_message_detail_lines(&msg);
+        assert!(
+            estimate >= baseline + 12,
+            "expected image headroom in estimate, baseline={baseline}, estimate={estimate}"
+        );
+    }
+
+    #[test]
     fn colorize_json_body_preserves_core_tokens() {
         let palette = crate::tui_theme::TuiThemePalette::current();
         let text = colorize_json_body(
@@ -1949,6 +2322,9 @@ mod tests {
             "FTS",
             "",
             "", // mode_label
+            "",
+            0,
+            false,
             "",
         );
     }
@@ -2063,6 +2439,27 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
         render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 10, true);
+    }
+
+    #[test]
+    fn render_detail_with_json_body_no_panic() {
+        let msg = MessageEntry {
+            id: 2,
+            subject: "JSON payload".to_string(),
+            from_agent: "Agent".to_string(),
+            to_agents: "Peer".to_string(),
+            project_slug: "proj".to_string(),
+            thread_id: String::new(),
+            timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
+            timestamp_micros: 0,
+            body_md: "{\n  \"ok\": true,\n  \"count\": 3\n}".to_string(),
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        render_detail_panel(&mut frame, Rect::new(40, 0, 40, 20), Some(&msg), 0, true);
     }
 
     #[test]
@@ -2316,6 +2713,9 @@ mod tests {
             "Urgent",
             "", // mode_label
             "Right 40%",
+            3,
+            true,
+            "req:1 ok:1 err:0 avg:1ms spark:......",
         );
     }
 
@@ -2333,6 +2733,9 @@ mod tests {
             "",
             "",
             "",
+            "",
+            0,
+            false,
             "",
         );
     }

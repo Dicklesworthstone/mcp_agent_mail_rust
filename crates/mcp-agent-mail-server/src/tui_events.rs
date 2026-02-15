@@ -42,6 +42,38 @@ pub enum MailEventKind {
     ServerShutdown,
 }
 
+impl MailEventKind {
+    /// Compact display label for log/timeline renderers.
+    #[must_use]
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::ToolCallStart => "ToolStart",
+            Self::ToolCallEnd => "ToolEnd",
+            Self::MessageSent => "MsgSent",
+            Self::MessageReceived => "MsgRecv",
+            Self::ReservationGranted => "ResGrant",
+            Self::ReservationReleased => "ResRelease",
+            Self::AgentRegistered => "AgentReg",
+            Self::HttpRequest => "HTTP",
+            Self::HealthPulse => "Health",
+            Self::ServerStarted => "SrvStart",
+            Self::ServerShutdown => "SrvStop",
+        }
+    }
+}
+
+/// Pre-formatted event log entry used by Dashboard/Timeline log views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventLogEntry {
+    pub kind: MailEventKind,
+    pub severity: EventSeverity,
+    pub seq: u64,
+    pub timestamp_micros: i64,
+    pub timestamp: String,
+    pub icon: char,
+    pub summary: String,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // EventSeverity — derived importance level for filtering
 // ──────────────────────────────────────────────────────────────────────
@@ -147,6 +179,58 @@ impl EventSeverity {
         let s: String = self.symbol().into();
         ftui::text::Span::styled(s, self.style())
     }
+}
+
+pub(crate) const fn event_log_icon(kind: MailEventKind) -> char {
+    match kind {
+        MailEventKind::ToolCallStart | MailEventKind::ToolCallEnd => '⚙',
+        MailEventKind::MessageSent => '✉',
+        MailEventKind::MessageReceived => '📨',
+        MailEventKind::ReservationGranted => '🔒',
+        MailEventKind::ReservationReleased => '🔓',
+        MailEventKind::AgentRegistered => '👤',
+        MailEventKind::HttpRequest => '↔',
+        MailEventKind::HealthPulse => '♥',
+        MailEventKind::ServerStarted => '▶',
+        MailEventKind::ServerShutdown => '⏹',
+    }
+}
+
+/// Format microsecond timestamps as `HH:MM:SS.mmm`.
+#[must_use]
+pub fn format_event_timestamp(micros: i64) -> String {
+    let secs = micros / 1_000_000;
+    let millis = (micros % 1_000_000).unsigned_abs() / 1000;
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        h.unsigned_abs(),
+        m.unsigned_abs(),
+        s.unsigned_abs(),
+        millis,
+    )
+}
+
+fn format_event_context(project: Option<&str>, agent: Option<&str>) -> String {
+    match (project, agent) {
+        (Some(p), Some(a)) => format!(" [{a}@{p}]"),
+        (None, Some(a)) => format!(" [{a}]"),
+        (Some(p), None) => format!(" [@{p}]"),
+        (None, None) => String::new(),
+    }
+}
+
+fn truncate_utf8_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -706,6 +790,113 @@ impl MailEvent {
             | Self::HealthPulse { redacted, .. }
             | Self::ServerStarted { redacted, .. }
             | Self::ServerShutdown { redacted, .. } => *redacted,
+        }
+    }
+
+    /// Build a compact, severity-aware log entry for dashboard/timeline views.
+    #[must_use]
+    pub fn to_event_log_entry(&self) -> EventLogEntry {
+        let kind = self.kind();
+        EventLogEntry {
+            kind,
+            severity: self.severity(),
+            seq: self.seq(),
+            timestamp_micros: self.timestamp_micros(),
+            timestamp: format_event_timestamp(self.timestamp_micros()),
+            icon: event_log_icon(kind),
+            summary: self.to_event_log_summary(),
+        }
+    }
+
+    /// Build the one-line summary text shown in log views.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn to_event_log_summary(&self) -> String {
+        match self {
+            Self::ToolCallStart {
+                tool_name,
+                project,
+                agent,
+                ..
+            } => {
+                let ctx = format_event_context(project.as_deref(), agent.as_deref());
+                format!("→ {tool_name}{ctx}")
+            }
+            Self::ToolCallEnd {
+                tool_name,
+                duration_ms,
+                queries,
+                project,
+                agent,
+                ..
+            } => {
+                let ctx = format_event_context(project.as_deref(), agent.as_deref());
+                format!("{tool_name} {duration_ms}ms q={queries}{ctx}")
+            }
+            Self::MessageSent {
+                from,
+                to,
+                subject,
+                id,
+                ..
+            } => {
+                let recipients = if to.len() > 2 {
+                    format!("{}, {} +{}", to[0], to[1], to.len() - 2)
+                } else {
+                    to.join(", ")
+                };
+                format!(
+                    "#{id} {from} → {recipients}: {}",
+                    truncate_utf8_boundary(subject, 40)
+                )
+            }
+            Self::MessageReceived {
+                from, subject, id, ..
+            } => {
+                format!("#{id} from {from}: {}", truncate_utf8_boundary(subject, 40))
+            }
+            Self::ReservationGranted {
+                agent,
+                paths,
+                exclusive,
+                ..
+            } => {
+                let ex = if *exclusive { " (excl)" } else { "" };
+                let path_display = if paths.len() > 2 {
+                    format!("{} +{}", paths[0], paths.len() - 1)
+                } else {
+                    paths.join(", ")
+                };
+                format!("{agent}: {path_display}{ex}")
+            }
+            Self::ReservationReleased { agent, paths, .. } => {
+                let path_display = if paths.len() > 2 {
+                    format!("{} +{}", paths[0], paths.len() - 1)
+                } else {
+                    paths.join(", ")
+                };
+                format!("{agent}: released {path_display}")
+            }
+            Self::AgentRegistered {
+                name,
+                program,
+                model_name,
+                project,
+                ..
+            } => format!("{name} ({program}/{model_name}) in {project}"),
+            Self::HttpRequest {
+                method,
+                path,
+                status,
+                duration_ms,
+                ..
+            } => format!("{method} {path} {status} {duration_ms}ms"),
+            Self::HealthPulse { db_stats, .. } => format!(
+                "p={} a={} m={}",
+                db_stats.projects, db_stats.agents, db_stats.messages
+            ),
+            Self::ServerStarted { endpoint, .. } => format!("Server started at {endpoint}"),
+            Self::ServerShutdown { .. } => "Server shutting down".to_string(),
         }
     }
 
@@ -2219,6 +2410,51 @@ mod tests {
             MailEvent::health_pulse(DbStatSnapshot::default()).severity(),
             EventSeverity::Trace
         );
+    }
+
+    #[test]
+    fn compact_labels_are_stable_and_short() {
+        let labels = [
+            MailEventKind::ToolCallStart.compact_label(),
+            MailEventKind::ToolCallEnd.compact_label(),
+            MailEventKind::MessageSent.compact_label(),
+            MailEventKind::MessageReceived.compact_label(),
+            MailEventKind::ReservationGranted.compact_label(),
+            MailEventKind::ReservationReleased.compact_label(),
+            MailEventKind::AgentRegistered.compact_label(),
+            MailEventKind::HttpRequest.compact_label(),
+            MailEventKind::HealthPulse.compact_label(),
+            MailEventKind::ServerStarted.compact_label(),
+            MailEventKind::ServerShutdown.compact_label(),
+        ];
+        for label in labels {
+            assert!(!label.is_empty());
+            assert!(label.len() <= 10, "label too long: {label}");
+        }
+    }
+
+    #[test]
+    fn to_event_log_entry_formats_expected_fields() {
+        let event = MailEvent::tool_call_end(
+            "send_message",
+            42,
+            Some("ok".to_string()),
+            5,
+            1.2,
+            vec![("messages".to_string(), 3)],
+            Some("my-proj".to_string()),
+            Some("RedFox".to_string()),
+        );
+        let entry = event.to_event_log_entry();
+        assert_eq!(entry.kind, MailEventKind::ToolCallEnd);
+        assert_eq!(entry.severity, EventSeverity::Debug);
+        assert_eq!(entry.icon, '⚙');
+        assert!(entry.timestamp.contains(':'));
+        assert!(entry.timestamp.contains('.'));
+        assert!(entry.summary.contains("send_message"));
+        assert!(entry.summary.contains("42ms"));
+        assert!(entry.summary.contains("q=5"));
+        assert!(entry.summary.contains("[RedFox@my-proj]"));
     }
 
     #[test]

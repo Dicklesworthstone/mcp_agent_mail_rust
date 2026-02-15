@@ -65,6 +65,7 @@ pub fn render_body_streaming(body: &str, theme: &MarkdownTheme) -> Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn theme() -> MarkdownTheme {
         MarkdownTheme::default()
@@ -239,6 +240,46 @@ mod tests {
     }
 
     #[test]
+    fn code_fence_unknown_language_falls_back_without_losing_content() {
+        let md = "```unknownlang\n++>---.\n```";
+        let text = render_body(md, &theme());
+        let rendered = text_to_string(&text);
+        assert!(
+            rendered.contains("++>---."),
+            "unknown language fence should preserve code content"
+        );
+        assert!(text.height() >= 1);
+    }
+
+    #[test]
+    fn long_code_block_render_timing_diagnostic() {
+        let code = (0..1000)
+            .map(|i| format!("let v{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let md = format!("```rust\n{code}\n```");
+        let started = Instant::now();
+        let text = render_body(&md, &theme());
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "scenario=md_long_code_block lines=1000 elapsed_ms={} height={}",
+            elapsed.as_millis(),
+            text.height()
+        );
+
+        assert!(
+            text.height() >= 1000,
+            "expected rendered code lines to remain visible"
+        );
+        assert!(
+            elapsed.as_secs_f64() < 5.0,
+            "unexpectedly slow long-code render: {:.3}s",
+            elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
     fn gfm_table_multirow_renders() {
         let md = "\
 | Name | Age | City |
@@ -325,6 +366,7 @@ Thanks!";
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn sanitize_body_strips_script_and_style_tags() {
         let dirty = "<script>alert('xss')</script><style>body{color:red}</style>ok";
         let cleaned = sanitize_body(dirty);

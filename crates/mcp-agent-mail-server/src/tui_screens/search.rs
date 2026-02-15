@@ -6,30 +6,30 @@
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::Widget;
 use ftui::{
     Event, Frame, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, PackedRgba, Style,
 };
 use ftui_runtime::program::Cmd;
+use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
-use ftui_widgets::StatefulWidget;
 use std::cell::{Cell, RefCell};
 
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
-    plan_search, DocKind, Importance, RankingMode, SearchQuery,
+    DocKind, Importance, RankingMode, SearchQuery, plan_search,
 };
 use mcp_agent_mail_db::search_recipes::{
-    insert_history, insert_recipe, list_recent_history, list_recipes, touch_recipe,
-    QueryHistoryEntry, ScopeMode, SearchRecipe, MAX_RECIPES,
+    MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
+    list_recent_history, list_recipes, touch_recipe,
 };
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
-use mcp_agent_mail_db::{parse_query_assistance, DbConn, QueryAssistance};
+use mcp_agent_mail_db::{DbConn, QueryAssistance, parse_query_assistance};
 
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_layout::DockLayout;
@@ -294,6 +294,14 @@ impl SortDirection {
             Self::NewestFirst => Self::OldestFirst,
             Self::OldestFirst => Self::Relevance,
             Self::Relevance => Self::NewestFirst,
+        }
+    }
+
+    const fn prev(self) -> Self {
+        match self {
+            Self::NewestFirst => Self::Relevance,
+            Self::OldestFirst => Self::NewestFirst,
+            Self::Relevance => Self::OldestFirst,
         }
     }
 }
@@ -765,6 +773,8 @@ pub struct SearchCockpitScreen {
     last_detail_area: Cell<Rect>,
     /// Last split area (results + detail), used for border hit-testing.
     last_split_area: Cell<Rect>,
+    /// Small animation phase for header/status flourish.
+    ui_phase: u8,
 }
 
 impl SearchCockpitScreen {
@@ -809,6 +819,7 @@ impl SearchCockpitScreen {
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_split_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            ui_phase: 0,
         }
     }
 
@@ -1162,25 +1173,34 @@ impl SearchCockpitScreen {
         }
     }
 
-    fn set_active_facet_from_click(&mut self, y: u16) {
+    fn facet_slot_from_click(&self, y: u16) -> Option<FacetSlot> {
         let area = self.last_facet_area.get();
         if area.height <= 2 {
-            return;
+            return None;
         }
         let inner_top = area.y.saturating_add(1);
         if y < inner_top {
-            return;
+            return None;
         }
         let row = usize::from(y.saturating_sub(inner_top));
-        self.active_facet = match row / 2 {
-            0 => FacetSlot::Scope,
-            1 => FacetSlot::DocKind,
-            2 => FacetSlot::Importance,
-            3 => FacetSlot::AckStatus,
-            4 => FacetSlot::SortOrder,
-            5 => FacetSlot::FieldScope,
-            _ => self.active_facet,
-        };
+        match row / 2 {
+            0 => Some(FacetSlot::Scope),
+            1 => Some(FacetSlot::DocKind),
+            2 => Some(FacetSlot::Importance),
+            3 => Some(FacetSlot::AckStatus),
+            4 => Some(FacetSlot::SortOrder),
+            5 => Some(FacetSlot::FieldScope),
+            _ => None,
+        }
+    }
+
+    fn set_active_facet_from_click(&mut self, y: u16) -> bool {
+        if let Some(slot) = self.facet_slot_from_click(y) {
+            self.active_facet = slot;
+            true
+        } else {
+            false
+        }
     }
 
     fn detail_visible(&self) -> bool {
@@ -1508,7 +1528,12 @@ impl MailScreen for SearchCockpitScreen {
                         if point_in_rect(self.last_facet_area.get(), mouse.x, mouse.y) {
                             self.focus = Focus::FacetRail;
                             self.query_input.set_focused(false);
-                            self.set_active_facet_from_click(mouse.y);
+                            let prev = self.active_facet;
+                            if self.set_active_facet_from_click(mouse.y)
+                                && self.active_facet == prev
+                            {
+                                self.toggle_active_facet();
+                            }
                             return Cmd::None;
                         }
                         if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y) {
@@ -1533,6 +1558,16 @@ impl MailScreen for SearchCockpitScreen {
                         self.dock_drag = DockDragState::Idle;
                     }
                     MouseEventKind::ScrollDown => {
+                        if point_in_rect(self.last_query_area.get(), mouse.x, mouse.y) {
+                            self.sort_direction = self.sort_direction.next();
+                            self.search_dirty = true;
+                            self.debounce_remaining = 0;
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_facet_area.get(), mouse.x, mouse.y) {
+                            self.active_facet = self.active_facet.next();
+                            return Cmd::None;
+                        }
                         if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
                             self.scroll_detail_by(1);
                             return Cmd::None;
@@ -1546,6 +1581,16 @@ impl MailScreen for SearchCockpitScreen {
                         }
                     }
                     MouseEventKind::ScrollUp => {
+                        if point_in_rect(self.last_query_area.get(), mouse.x, mouse.y) {
+                            self.sort_direction = self.sort_direction.prev();
+                            self.search_dirty = true;
+                            self.debounce_remaining = 0;
+                            return Cmd::None;
+                        }
+                        if point_in_rect(self.last_facet_area.get(), mouse.x, mouse.y) {
+                            self.active_facet = self.active_facet.prev();
+                            return Cmd::None;
+                        }
                         if point_in_rect(self.last_detail_area.get(), mouse.x, mouse.y) {
                             self.scroll_detail_by(-1);
                             return Cmd::None;
@@ -1648,14 +1693,14 @@ impl MailScreen for SearchCockpitScreen {
                         match self.active_facet {
                             FacetSlot::Scope => self.scope_mode = self.scope_mode.next(),
                             FacetSlot::DocKind => {
-                                self.doc_kind_filter = self.doc_kind_filter.prev()
+                                self.doc_kind_filter = self.doc_kind_filter.prev();
                             }
                             FacetSlot::Importance => {
-                                self.importance_filter = self.importance_filter.next()
+                                self.importance_filter = self.importance_filter.next();
                             }
                             FacetSlot::AckStatus => self.ack_filter = self.ack_filter.next(),
                             FacetSlot::SortOrder => {
-                                self.sort_direction = self.sort_direction.next()
+                                self.sort_direction = self.sort_direction.next();
                             }
                             FacetSlot::FieldScope => self.field_scope = self.field_scope.prev(),
                         }
@@ -1785,7 +1830,8 @@ impl MailScreen for SearchCockpitScreen {
         Cmd::None
     }
 
-    fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
+    fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        self.ui_phase = (tick_count % 16) as u8;
         if self.search_dirty {
             if self.debounce_remaining > 0 {
                 self.debounce_remaining -= 1;
@@ -1800,7 +1846,7 @@ impl MailScreen for SearchCockpitScreen {
         self.focused_synthetic.as_ref()
     }
 
-    fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 4 || area.width < 30 {
             let tp = crate::tui_theme::TuiThemePalette::current();
             Block::default()
@@ -1811,8 +1857,22 @@ impl MailScreen for SearchCockpitScreen {
             return;
         }
 
+        // Always paint the whole area before pane rendering.
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        Paragraph::new("")
+            .style(Style::default().bg(tp.bg_deep))
+            .render(area, frame);
+
         // Layout: query bar (3-4h) + body
-        let query_h: u16 = if area.height >= 6 { 4 } else { 3 };
+        let query_h: u16 = if area.height >= 20 {
+            6
+        } else if area.height >= 16 {
+            5
+        } else if area.height >= 6 {
+            4
+        } else {
+            3
+        };
         let body_h = area.height.saturating_sub(query_h);
 
         let query_area = Rect::new(area.x, area.y, area.width, query_h);
@@ -1824,6 +1884,7 @@ impl MailScreen for SearchCockpitScreen {
         } else {
             "List only".to_string()
         };
+        let telemetry = runtime_telemetry_line(state, self.ui_phase);
         render_query_bar(
             frame,
             query_area,
@@ -1831,16 +1892,19 @@ impl MailScreen for SearchCockpitScreen {
             self,
             matches!(self.focus, Focus::QueryBar),
             &layout_label,
+            self.ui_phase,
+            &telemetry,
         );
 
         // Body: facet rail (left) + dock-split content area (results/detail)
-        let facet_w: u16 = if area.width >= 130 {
-            22
-        } else if area.width >= 100 {
-            20
-        } else {
-            16
-        };
+        let min_remaining_for_results: u16 = 26;
+        let max_facet_w = body_area
+            .width
+            .saturating_sub(min_remaining_for_results)
+            .max(12);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let computed_facet_w = ((f32::from(body_area.width) * 0.2).round() as u16).clamp(12, 28);
+        let facet_w: u16 = computed_facet_w.min(max_facet_w).max(12);
         let facet_area = Rect::new(body_area.x, body_area.y, facet_w, body_area.height);
         self.last_facet_area.set(facet_area);
         render_facet_rail(
@@ -1938,7 +2002,7 @@ impl MailScreen for SearchCockpitScreen {
             },
             HelpEntry {
                 key: "Mouse",
-                action: "Click/select, wheel scroll, drag split",
+                action: "Click/select, wheel facets/sort, drag split",
             },
             HelpEntry {
                 key: "o",
@@ -2218,6 +2282,7 @@ fn QUERY_HELP_BG() -> PackedRgba {
     crate::tui_theme::TuiThemePalette::current().bg_deep
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_query_bar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2225,9 +2290,17 @@ fn render_query_bar(
     screen: &SearchCockpitScreen,
     focused: bool,
     layout_label: &str,
+    ui_phase: u8,
+    telemetry: &str,
 ) {
     let count = screen.results.len();
     let kind_label = screen.doc_kind_filter.label();
+    let active_filters = usize::from(screen.thread_filter.is_some())
+        + usize::from(screen.importance_filter != ImportanceFilter::Any)
+        + usize::from(screen.ack_filter != AckFilter::Any)
+        + usize::from(screen.doc_kind_filter != DocKindFilter::Messages)
+        + usize::from(screen.scope_mode != ScopeMode::Global)
+        + usize::from(screen.field_scope != FieldScope::default());
     let focus_label = if screen.focus == Focus::QueryBar {
         " [EDITING]"
     } else {
@@ -2239,8 +2312,9 @@ fn render_query_bar(
         ""
     };
 
+    let spinner = spinner_glyph(ui_phase);
     let title = format!(
-        "Search {kind_label} ({count} results){thread_label} [{layout_label}]{focus_label}"
+        "{spinner} Search {kind_label} ({count} results, {active_filters} filters){thread_label} [{layout_label}]{focus_label}"
     );
 
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -2267,7 +2341,7 @@ fn render_query_bar(
                     || {
                         if screen.focus == Focus::QueryBar {
                             (
-                                "Syntax: \"phrase\" term* AND/OR/NOT | Mouse drag border to resize"
+                                "Syntax: \"phrase\" term* AND/OR/NOT | field:value | Mouse wheel sort + drag split"
                                     .to_string(),
                                 Style::default().fg(FACET_LABEL_FG()),
                             )
@@ -2288,6 +2362,29 @@ fn render_query_bar(
         Paragraph::new(truncate_str(&hint, w))
             .style(style)
             .render(hint_area, frame);
+    }
+
+    if inner.height >= 3 {
+        let meter = pulse_meter(ui_phase, 8);
+        let chips = format!(
+            "{}  scope:{}  type:{}  sort:{}  terms:{}",
+            meter,
+            screen.scope_mode.as_str(),
+            screen.doc_kind_filter.label(),
+            screen.sort_direction.label(),
+            screen.highlight_terms.len()
+        );
+        let chips_area = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+        Paragraph::new(truncate_str(&chips, inner.width as usize))
+            .style(Style::default().fg(RESULT_CURSOR_FG()))
+            .render(chips_area, frame);
+    }
+
+    if inner.height >= 4 {
+        let telemetry_area = Rect::new(inner.x, inner.y + 3, inner.width, 1);
+        Paragraph::new(truncate_str(telemetry, inner.width as usize))
+            .style(Style::default().fg(FACET_ACTIVE_FG()))
+            .render(telemetry_area, frame);
     }
 }
 
@@ -2332,6 +2429,7 @@ Esc/any key: close";
         .render(inner, frame);
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_facet_rail(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2354,16 +2452,36 @@ fn render_facet_rail(
     let w = inner.width as usize;
 
     let facets: &[(FacetSlot, &str, &str)] = &[
-        (FacetSlot::Scope, "Scope", screen.scope_mode.as_str()),
-        (FacetSlot::DocKind, "Type", screen.doc_kind_filter.label()),
+        (
+            FacetSlot::Scope,
+            "\u{25ce} Scope",
+            screen.scope_mode.as_str(),
+        ),
+        (
+            FacetSlot::DocKind,
+            "\u{25a7} Type",
+            screen.doc_kind_filter.label(),
+        ),
         (
             FacetSlot::Importance,
-            "Imp.",
+            "\u{26a1} Imp.",
             screen.importance_filter.label(),
         ),
-        (FacetSlot::AckStatus, "Ack", screen.ack_filter.label()),
-        (FacetSlot::SortOrder, "Sort", screen.sort_direction.label()),
-        (FacetSlot::FieldScope, "Field", screen.field_scope.label()),
+        (
+            FacetSlot::AckStatus,
+            "\u{2713} Ack",
+            screen.ack_filter.label(),
+        ),
+        (
+            FacetSlot::SortOrder,
+            "\u{21f5} Sort",
+            screen.sort_direction.label(),
+        ),
+        (
+            FacetSlot::FieldScope,
+            "\u{25f3} Field",
+            screen.field_scope.label(),
+        ),
     ];
 
     for (i, &(slot, label, value)) in facets.iter().enumerate() {
@@ -2377,7 +2495,7 @@ fn render_facet_rail(
         let marker = if is_active { '>' } else { ' ' };
 
         let label_style = if is_active {
-            Style::default().fg(FACET_ACTIVE_FG())
+            Style::default().fg(FACET_ACTIVE_FG()).bg(tp.bg_overlay)
         } else {
             Style::default().fg(FACET_LABEL_FG())
         };
@@ -2397,7 +2515,7 @@ fn render_facet_rail(
             let val_line = truncate_str(&val_text, w);
             let val_area = Rect::new(inner.x, value_y, inner.width, 1);
             let val_style = if is_active {
-                Style::default().fg(RESULT_CURSOR_FG())
+                Style::default().fg(RESULT_CURSOR_FG()).bg(tp.bg_overlay)
             } else {
                 Style::default()
             };
@@ -2419,18 +2537,94 @@ fn render_facet_rail(
         }
     }
 
+    render_query_lab(frame, inner, screen);
+
     // Help hint at bottom
     let help_y = inner.y + inner.height - 1;
     if help_y > inner.y + 11 {
         let hint = if in_rail {
-            "Enter:toggle r:reset"
+            "Enter/click:toggle  wheel:facet  r:reset"
         } else {
-            "f:facets"
+            "f:facets  mouse:click/wheel"
         };
         let hint_area = Rect::new(inner.x, help_y, inner.width, 1);
         Paragraph::new(truncate_str(hint, w))
             .style(Style::default().fg(FACET_LABEL_FG()))
             .render(hint_area, frame);
+    }
+}
+
+fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitScreen) {
+    if inner.height < 13 || inner.width < 14 {
+        return;
+    }
+
+    let top = inner.y.saturating_add(12);
+    let available_h = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(top)
+        .saturating_sub(1);
+    if available_h < 4 {
+        return;
+    }
+    let lab_area = Rect::new(inner.x, top, inner.width, available_h);
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let block = Block::default()
+        .title("Query Lab")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(tp.panel_border_dim));
+    let lab_inner = block.inner(lab_area);
+    block.render(lab_area, frame);
+    if lab_inner.height == 0 || lab_inner.width == 0 {
+        return;
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    let q = screen.query_input.value().trim();
+    rows.push(format!(
+        "q: {}",
+        if q.is_empty() {
+            "<empty>".to_string()
+        } else {
+            truncate_str(q, 36)
+        }
+    ));
+    rows.push(format!(
+        "route: {}",
+        truncate_str(&screen.route_string(), 36)
+    ));
+    let meter = pulse_meter(screen.ui_phase, 6);
+    rows.push(format!(
+        "{meter} terms:{} matches:{}",
+        screen.highlight_terms.len(),
+        screen.results.len()
+    ));
+    rows.push(format!(
+        "focus:{} sort:{}",
+        match screen.focus {
+            Focus::QueryBar => "query",
+            Focus::FacetRail => "facets",
+            Focus::ResultList => "results",
+        },
+        screen.sort_direction.label()
+    ));
+
+    for (idx, row) in rows.into_iter().enumerate() {
+        let y = lab_inner.y + u16::try_from(idx).unwrap_or(0);
+        if y >= lab_inner.y + lab_inner.height {
+            break;
+        }
+        let line_area = Rect::new(lab_inner.x, y, lab_inner.width, 1);
+        let style = if idx == 0 {
+            Style::default().fg(RESULT_CURSOR_FG())
+        } else {
+            Style::default().fg(FACET_LABEL_FG())
+        };
+        Paragraph::new(truncate_str(&row, lab_inner.width as usize))
+            .style(style)
+            .render(line_area, frame);
     }
 }
 
@@ -2571,13 +2765,17 @@ fn render_results(
     sort_direction: SortDirection,
     focused: bool,
 ) {
-    // Show match count in header: "Results (42 matches)" or "Results"
+    // Show match count and search posture in header.
     let title = if results.is_empty() {
         "Results".to_string()
     } else {
         let count = results.len();
         let plural = if count == 1 { "match" } else { "matches" };
-        format!("Results ({count} {plural})")
+        format!(
+            "Results ({count} {plural} • {} • {} terms)",
+            sort_direction.label(),
+            highlight_terms.len()
+        )
     };
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
@@ -2645,12 +2843,13 @@ fn estimate_search_detail_lines(entry: &ResultEntry) -> usize {
         count += 1; // Score
     }
     count += 2; // Separator + body header
-                // Body lines
+    // Body lines
     let body = entry.full_body.as_deref().unwrap_or(&entry.body_preview);
     count += body.lines().count().max(1);
     count
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_detail(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2911,6 +3110,50 @@ fn viewport_range(total: usize, visible: usize, cursor: usize) -> (usize, usize)
     (start, end)
 }
 
+const fn spinner_glyph(phase: u8) -> &'static str {
+    match phase % 8 {
+        0 | 4 => "\u{25d0}",
+        1 | 5 => "\u{25d3}",
+        2 | 6 => "\u{25d1}",
+        _ => "\u{25d2}",
+    }
+}
+
+fn pulse_meter(phase: u8, width: usize) -> String {
+    const BARS: [char; 8] = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    let w = width.max(4);
+    let mut out = String::with_capacity(w);
+    for idx in 0..w {
+        let pos = (usize::from(phase) + idx) % BARS.len();
+        out.push(BARS[pos]);
+    }
+    out
+}
+
+fn runtime_telemetry_line(state: &TuiSharedState, ui_phase: u8) -> String {
+    let counters = state.request_counters();
+    let err = counters.status_4xx.saturating_add(counters.status_5xx);
+    let spark_raw = state.sparkline_snapshot();
+    let spark = crate::tui_screens::dashboard::render_sparkline(&spark_raw, 12);
+    let meter = pulse_meter(ui_phase, 6);
+    let sparkline = if spark.is_empty() {
+        "......".to_string()
+    } else {
+        spark
+    };
+    let prefix = format!(
+        "{meter} req:{} ok:{} err:{} avg:{}ms",
+        counters.total,
+        counters.status_2xx,
+        err,
+        state.avg_latency_ms()
+    );
+    format!("{prefix} spark:{sparkline}")
+}
+
 /// Returns `true` if the point `(x, y)` is inside the rectangle.
 const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x
@@ -3000,6 +3243,17 @@ mod tests {
     }
 
     #[test]
+    fn sort_direction_prev_cycles() {
+        let mut d = SortDirection::NewestFirst;
+        d = d.prev();
+        assert_eq!(d, SortDirection::Relevance);
+        d = d.prev();
+        assert_eq!(d, SortDirection::OldestFirst);
+        d = d.prev();
+        assert_eq!(d, SortDirection::NewestFirst);
+    }
+
+    #[test]
     fn facet_slot_cycles() {
         let mut s = FacetSlot::Scope;
         s = s.next();
@@ -3027,6 +3281,20 @@ mod tests {
         assert_eq!(s, FacetSlot::SortOrder);
         s = s.prev();
         assert_eq!(s, FacetSlot::AckStatus);
+    }
+
+    #[test]
+    fn set_active_facet_from_click_ignores_non_facet_rows() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.last_facet_area.set(Rect::new(0, 0, 20, 24));
+        screen.active_facet = FacetSlot::DocKind;
+
+        assert!(screen.set_active_facet_from_click(1));
+        assert_eq!(screen.active_facet, FacetSlot::Scope);
+
+        let changed = screen.set_active_facet_from_click(17);
+        assert!(!changed);
+        assert_eq!(screen.active_facet, FacetSlot::Scope);
     }
 
     #[test]
@@ -3621,12 +3889,16 @@ mod tests {
 
         let plain: String = spans.iter().map(Span::as_str).collect();
         assert_eq!(plain, "xxNEEDLEyy");
-        assert!(spans
-            .iter()
-            .any(|s| s.as_str() == "NEEDLE" && s.style == Some(highlight)));
-        assert!(spans
-            .iter()
-            .any(|s| s.as_str() == "xx" && s.style == Some(base)));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.as_str() == "NEEDLE" && s.style == Some(highlight))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.as_str() == "xx" && s.style == Some(base))
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────

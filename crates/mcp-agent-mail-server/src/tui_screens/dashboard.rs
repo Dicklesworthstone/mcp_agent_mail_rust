@@ -22,7 +22,10 @@ use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_events::{DbStatSnapshot, EventSeverity, MailEvent, MailEventKind, VerbosityTier};
+use crate::tui_events::{
+    DbStatSnapshot, EventLogEntry, EventSeverity, MailEvent, MailEventKind, VerbosityTier,
+    format_event_timestamp,
+};
 use crate::tui_layout::{
     DensityHint, PanelConstraint, PanelPolicy, PanelSlot, ReactiveLayout, SplitAxis, TerminalClass,
 };
@@ -181,16 +184,7 @@ pub struct DashboardScreen {
 }
 
 /// A pre-formatted event log entry.
-#[derive(Debug, Clone)]
-pub(crate) struct EventEntry {
-    pub(crate) kind: MailEventKind,
-    pub(crate) severity: EventSeverity,
-    pub(crate) seq: u64,
-    pub(crate) timestamp_micros: i64,
-    pub(crate) timestamp: String,
-    pub(crate) icon: char,
-    pub(crate) summary: String,
-}
+pub(crate) type EventEntry = EventLogEntry;
 
 /// Dashboard preview payload for the most recent message event.
 #[derive(Debug, Clone)]
@@ -774,151 +768,18 @@ impl MailScreen for DashboardScreen {
 // Event formatting
 // ──────────────────────────────────────────────────────────────────────
 
-/// Icons for each event kind.
-const fn event_icon(kind: MailEventKind) -> char {
-    match kind {
-        MailEventKind::ToolCallStart | MailEventKind::ToolCallEnd => '⚙',
-        MailEventKind::MessageSent => '✉',
-        MailEventKind::MessageReceived => '📨',
-        MailEventKind::ReservationGranted => '🔒',
-        MailEventKind::ReservationReleased => '🔓',
-        MailEventKind::AgentRegistered => '👤',
-        MailEventKind::HttpRequest => '↔',
-        MailEventKind::HealthPulse => '♥',
-        MailEventKind::ServerStarted => '▶',
-        MailEventKind::ServerShutdown => '⏹',
-    }
-}
-
 /// Format a timestamp (microseconds) as HH:MM:SS.mmm.
 fn format_ts(micros: i64) -> String {
-    let secs = micros / 1_000_000;
-    let millis = (micros % 1_000_000).unsigned_abs() / 1000;
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    format!(
-        "{:02}:{:02}:{:02}.{:03}",
-        h.unsigned_abs(),
-        m.unsigned_abs(),
-        s.unsigned_abs(),
-        millis,
-    )
+    format_event_timestamp(micros)
 }
 
 /// Format a single `MailEvent` into a compact log entry.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub(crate) fn format_event(event: &MailEvent) -> EventEntry {
-    let kind = event.kind();
-    let icon = event_icon(kind);
-    let seq = event.seq();
-    let timestamp_micros = event.timestamp_micros();
-    let timestamp = format_ts(timestamp_micros);
-
-    let summary = match event {
-        MailEvent::ToolCallStart {
-            tool_name,
-            project,
-            agent,
-            ..
-        } => {
-            let ctx = format_ctx(project.as_deref(), agent.as_deref());
-            format!("→ {tool_name}{ctx}")
-        }
-        MailEvent::ToolCallEnd {
-            tool_name,
-            duration_ms,
-            queries,
-            project,
-            agent,
-            ..
-        } => {
-            let ctx = format_ctx(project.as_deref(), agent.as_deref());
-            format!("{tool_name} {duration_ms}ms q={queries}{ctx}")
-        }
-        MailEvent::MessageSent {
-            from,
-            to,
-            subject,
-            id,
-            ..
-        } => {
-            let recipients = if to.len() > 2 {
-                format!("{}, {} +{}", to[0], to[1], to.len() - 2)
-            } else {
-                to.join(", ")
-            };
-            format!("#{id} {from} → {recipients}: {}", truncate(subject, 40))
-        }
-        MailEvent::MessageReceived {
-            from, subject, id, ..
-        } => {
-            format!("#{id} from {from}: {}", truncate(subject, 40))
-        }
-        MailEvent::ReservationGranted {
-            agent,
-            paths,
-            exclusive,
-            ..
-        } => {
-            let ex = if *exclusive { " (excl)" } else { "" };
-            let p = if paths.len() > 2 {
-                format!("{} +{}", paths[0], paths.len() - 1)
-            } else {
-                paths.join(", ")
-            };
-            format!("{agent}: {p}{ex}")
-        }
-        MailEvent::ReservationReleased { agent, paths, .. } => {
-            let p = if paths.len() > 2 {
-                format!("{} +{}", paths[0], paths.len() - 1)
-            } else {
-                paths.join(", ")
-            };
-            format!("{agent}: released {p}")
-        }
-        MailEvent::AgentRegistered {
-            name,
-            program,
-            model_name,
-            project,
-            ..
-        } => {
-            format!("{name} ({program}/{model_name}) in {project}")
-        }
-        MailEvent::HttpRequest {
-            method,
-            path,
-            status,
-            duration_ms,
-            ..
-        } => {
-            format!("{method} {path} {status} {duration_ms}ms")
-        }
-        MailEvent::HealthPulse { db_stats, .. } => {
-            format!(
-                "p={} a={} m={}",
-                db_stats.projects, db_stats.agents, db_stats.messages
-            )
-        }
-        MailEvent::ServerStarted { endpoint, .. } => {
-            format!("Server started at {endpoint}")
-        }
-        MailEvent::ServerShutdown { .. } => "Server shutting down".to_string(),
-    };
-
-    EventEntry {
-        kind,
-        severity: event.severity(),
-        seq,
-        timestamp_micros,
-        timestamp,
-        icon,
-        summary,
-    }
+    event.to_event_log_entry()
 }
 
+#[cfg(test)]
 fn format_ctx(project: Option<&str>, agent: Option<&str>) -> String {
     match (project, agent) {
         (Some(p), Some(a)) => format!(" [{a}@{p}]"),
@@ -1477,7 +1338,11 @@ fn render_event_log(
             pulsing_severity_badge(sev, pulse_phase, reduced_motion),
             Span::raw(" "),
             Span::styled(format!("{}", entry.icon), sev.style()),
-            Span::raw(format!(" {}", entry.summary)),
+            Span::raw(format!(
+                " {:<10} {}",
+                entry.kind.compact_label(),
+                entry.summary
+            )),
         ]);
         if Some(abs_idx) == focused_abs_idx {
             line.apply_base_style(focus_style);
@@ -1878,8 +1743,10 @@ mod tests {
 
     #[test]
     fn main_layout_ultrawide_exposes_double_surface_vs_standard() {
-        let standard = DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 100, 30));
-        let ultra = DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 200, 50));
+        let standard =
+            DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 100, 30));
+        let ultra =
+            DashboardScreen::main_content_layout(true, false).compute(Rect::new(0, 0, 200, 50));
 
         let standard_visible = standard
             .panels
@@ -2323,7 +2190,7 @@ mod tests {
             MailEventKind::ServerShutdown,
         ];
         for kind in kinds {
-            let icon = event_icon(kind);
+            let icon = crate::tui_events::event_log_icon(kind);
             assert_ne!(icon, '\0');
         }
     }

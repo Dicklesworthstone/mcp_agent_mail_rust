@@ -854,6 +854,7 @@ fn truncate_to_vis_width(s: &str, max_vis: usize) -> String {
 }
 
 /// Strip ANSI escape sequences and return the cleaned string.
+#[must_use]
 pub fn strip_ansi_content(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_escape = false;
@@ -878,25 +879,25 @@ pub fn strip_ansi_content(s: &str) -> String {
 /// Standard 8-color ANSI palette (SGR codes 30–37 / 40–47).
 const ANSI_PALETTE: [PackedRgba; 8] = [
     PackedRgba::rgb(0, 0, 0),       // black
-    PackedRgba::rgb(205, 49, 49),    // red
-    PackedRgba::rgb(13, 188, 121),   // green
-    PackedRgba::rgb(229, 229, 16),   // yellow
-    PackedRgba::rgb(36, 114, 200),   // blue
-    PackedRgba::rgb(188, 63, 188),   // magenta
-    PackedRgba::rgb(17, 168, 205),   // cyan
-    PackedRgba::rgb(229, 229, 229),  // white
+    PackedRgba::rgb(205, 49, 49),   // red
+    PackedRgba::rgb(13, 188, 121),  // green
+    PackedRgba::rgb(229, 229, 16),  // yellow
+    PackedRgba::rgb(36, 114, 200),  // blue
+    PackedRgba::rgb(188, 63, 188),  // magenta
+    PackedRgba::rgb(17, 168, 205),  // cyan
+    PackedRgba::rgb(229, 229, 229), // white
 ];
 
 /// Bright 8-color ANSI palette (SGR codes 90–97 / 100–107).
 const ANSI_BRIGHT_PALETTE: [PackedRgba; 8] = [
-    PackedRgba::rgb(102, 102, 102),  // bright black
-    PackedRgba::rgb(241, 76, 76),    // bright red
-    PackedRgba::rgb(35, 209, 139),   // bright green
-    PackedRgba::rgb(245, 245, 67),   // bright yellow
-    PackedRgba::rgb(59, 142, 234),   // bright blue
-    PackedRgba::rgb(214, 112, 214),  // bright magenta
-    PackedRgba::rgb(41, 184, 219),   // bright cyan
-    PackedRgba::rgb(255, 255, 255),  // bright white
+    PackedRgba::rgb(102, 102, 102), // bright black
+    PackedRgba::rgb(241, 76, 76),   // bright red
+    PackedRgba::rgb(35, 209, 139),  // bright green
+    PackedRgba::rgb(245, 245, 67),  // bright yellow
+    PackedRgba::rgb(59, 142, 234),  // bright blue
+    PackedRgba::rgb(214, 112, 214), // bright magenta
+    PackedRgba::rgb(41, 184, 219),  // bright cyan
+    PackedRgba::rgb(255, 255, 255), // bright white
 ];
 
 /// Convert an ANSI 256-color index to RGB.
@@ -911,9 +912,7 @@ fn ansi_256_to_rgb(idx: u8) -> PackedRgba {
         let ri = n / 36;
         let gi = (n / 6) % 6;
         let bi = n % 6;
-        let to_rgb = |v: u8| -> u8 {
-            if v == 0 { 0 } else { 55 + 40 * v }
-        };
+        let to_rgb = |v: u8| -> u8 { if v == 0 { 0 } else { 55 + 40 * v } };
         PackedRgba::rgb(to_rgb(ri), to_rgb(gi), to_rgb(bi))
     } else {
         // Grayscale ramp 232..=255
@@ -932,9 +931,7 @@ fn apply_sgr_to_style(style: &mut ftui::Style, code: u8, params: &[u8], param_id
         4 => *style = style.underline(),
         7 => {
             // Reverse: swap fg/bg
-            let fg = style.fg;
-            style.fg = style.bg;
-            style.bg = fg;
+            std::mem::swap(&mut style.fg, &mut style.bg);
         }
         9 => {
             if let Some(ref mut a) = style.attrs {
@@ -960,9 +957,7 @@ fn apply_sgr_to_style(style: &mut ftui::Style, code: u8, params: &[u8], param_id
                 a.remove(ftui::StyleFlags::UNDERLINE);
             }
         }
-        27 => {
-            // Reset reverse — just clear any swapped state; no-op for simplicity
-        }
+        // 27 (reset reverse) is a no-op; handled by the `_ => {}` wildcard below.
         29 => {
             if let Some(ref mut a) = style.attrs {
                 a.remove(ftui::StyleFlags::STRIKETHROUGH);
@@ -1004,14 +999,12 @@ fn apply_sgr_to_style(style: &mut ftui::Style, code: u8, params: &[u8], param_id
                         *param_idx += 1;
                         style.bg = Some(ansi_256_to_rgb(idx));
                     }
-                } else if mode == 2 {
-                    if params.len() >= *param_idx + 3 {
-                        let r = params[*param_idx];
-                        let g = params[*param_idx + 1];
-                        let b = params[*param_idx + 2];
-                        *param_idx += 3;
-                        style.bg = Some(PackedRgba::rgb(r, g, b));
-                    }
+                } else if mode == 2 && params.len() >= *param_idx + 3 {
+                    let r = params[*param_idx];
+                    let g = params[*param_idx + 1];
+                    let b = params[*param_idx + 2];
+                    *param_idx += 3;
+                    style.bg = Some(PackedRgba::rgb(r, g, b));
                 }
             }
         }
@@ -1029,6 +1022,7 @@ fn apply_sgr_to_style(style: &mut ftui::Style, code: u8, params: &[u8], param_id
 /// Converts SGR (Select Graphic Rendition) sequences into properly styled
 /// `Span` objects, preserving colors, bold, italic, etc. Non-SGR escape
 /// sequences are silently ignored.
+#[must_use]
 pub fn ansi_to_line(input: &str) -> ftui::text::Line {
     use ftui::text::{Line, Span};
 
@@ -2887,8 +2881,7 @@ mod tests {
             "body_md": "x".repeat(500),
             "subject": "y".repeat(200),
         });
-        let start_lines =
-            render_tool_call_start("send_message", &long_body, None, None);
+        let start_lines = render_tool_call_start("send_message", &long_body, None, None);
         for (i, line) in start_lines.iter().enumerate() {
             let vis = strip_ansi_len(line);
             assert!(
@@ -2902,10 +2895,7 @@ mod tests {
             render_tool_call_end("send_message", 42, Some(&long_result), 5, 12.0, &[], 2000);
         for (i, line) in end_lines.iter().enumerate() {
             let vis = strip_ansi_len(line);
-            assert!(
-                vis <= 80,
-                "end line {i} has visible width {vis}: {line}"
-            );
+            assert!(vis <= 80, "end line {i} has visible width {vis}: {line}");
         }
     }
 

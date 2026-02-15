@@ -19,6 +19,7 @@ use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
 use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
 use ftui::widgets::modal::{Dialog, DialogResult, DialogState};
 use ftui::widgets::notification_queue::NotificationStack;
+use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::toast::{ToastId, ToastPosition};
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
 use ftui::{Event, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
@@ -620,9 +621,9 @@ pub struct MailAppModel {
     screen_transition: Option<ScreenTransition>,
     /// Bayesian diff strategy for frame rendering decisions.
     diff_strategy: RefCell<crate::tui_decision::BayesianDiffStrategy>,
-    /// Whether a resize event was observed since the last view().
+    /// Whether a resize event was observed since the last `view()`.
     resize_detected: Cell<bool>,
-    /// Timestamp of last view() call for frame budget tracking.
+    /// Timestamp of last `view()` call for frame budget tracking.
     last_view_instant: Cell<Option<Instant>>,
 }
 
@@ -2103,7 +2104,7 @@ impl Model for MailAppModel {
             .map_or(16.0, |prev| {
                 let elapsed = now.duration_since(prev);
                 // Target: 16ms per frame (60 fps). Budget is what's left.
-                16.0_f64 - elapsed.as_secs_f64() * 1000.0
+                elapsed.as_secs_f64().mul_add(-1000.0, 16.0_f64)
             })
             .max(0.0);
         self.last_view_instant.set(Some(now));
@@ -2134,6 +2135,11 @@ impl Model for MailAppModel {
         }
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
+        // Hard guarantee that each frame paints the full terminal surface.
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        Paragraph::new("")
+            .style(Style::default().bg(tp.bg_deep))
+            .render(area, frame);
         let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();
 

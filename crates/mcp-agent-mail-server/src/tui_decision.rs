@@ -461,9 +461,9 @@ mod tests {
     // ─── Integration tests for D.2 wiring (br-v3hid) ─────────────────
 
     /// 9. Render 100 frames with mutations, compare to full-diff baseline.
-    /// Since ftui doesn't support differential rendering yet, we verify
-    /// that Bayesian mode chooses actions without errors and produces
-    /// consistent posteriors.
+    ///    Since ftui doesn't support differential rendering yet, we verify
+    ///    that Bayesian mode chooses actions without errors and produces
+    ///    consistent posteriors.
     #[test]
     fn tui_bayes_integration_no_glitch() {
         let mut strategy = BayesianDiffStrategy::new();
@@ -586,7 +586,12 @@ mod tests {
         use std::time::Instant;
 
         const FRAMES: usize = 10_000;
-        let frames = [stable_frame(), bursty_frame(), resize_frame(), degraded_frame()];
+        let frames = [
+            stable_frame(),
+            bursty_frame(),
+            resize_frame(),
+            degraded_frame(),
+        ];
 
         // Measure Bayesian strategy.
         let mut strategy = BayesianDiffStrategy::new();
@@ -647,11 +652,17 @@ mod tests {
     ///     Feed 500+ decision times into a conformal predictor; verify that
     ///     >= 90% of subsequent times fall within the predicted interval.
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn conformal_coverage_90pct() {
         use mcp_agent_mail_core::conformal::ConformalPredictor;
         use std::time::Instant;
 
-        let frames = [stable_frame(), bursty_frame(), resize_frame(), degraded_frame()];
+        let frames = [
+            stable_frame(),
+            bursty_frame(),
+            resize_frame(),
+            degraded_frame(),
+        ];
         let mut strategy = BayesianDiffStrategy::new();
         let mut predictor = ConformalPredictor::new(200, 0.90);
 
@@ -740,9 +751,17 @@ mod tests {
         );
 
         // 2. Resize frame (index 15) should choose Full.
-        assert_eq!(decisions[15], DiffAction::Full, "resize frame should be Full");
+        assert_eq!(
+            decisions[15],
+            DiffAction::Full,
+            "resize frame should be Full"
+        );
 
         // 3. Second resize (index 36) should also choose Full.
-        assert_eq!(decisions[36], DiffAction::Full, "second resize should be Full");
+        assert_eq!(
+            decisions[36],
+            DiffAction::Full,
+            "second resize should be Full"
+        );
     }
 }

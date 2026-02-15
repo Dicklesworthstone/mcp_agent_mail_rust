@@ -1,4 +1,4 @@
-//! Criterion benchmarks for HeatmapGrid layout caching (br-3m7xo, F.2).
+//! Criterion benchmarks for `HeatmapGrid` layout caching (br-3m7xo, F.2).
 //!
 //! Measures frame times with and without layout cache reuse to validate
 //! that caching improves performance for stable frames while not regressing
@@ -7,23 +7,23 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use ftui::GraphemePool;
 use ftui::layout::Rect;
 use ftui::render::frame::Frame;
-use ftui::GraphemePool;
 use ftui::widgets::Widget;
 use mcp_agent_mail_server::tui_widgets::HeatmapGrid;
 
 /// Build a 20x20 data grid with deterministic values.
 fn make_grid_20x20() -> Vec<Vec<f64>> {
     (0..20)
-        .map(|r| (0..20).map(|c| ((r * 20 + c) as f64) / 400.0).collect())
+        .map(|r| (0..20).map(|c| f64::from(r * 20 + c) / 400.0).collect())
         .collect()
 }
 
 /// Build a 5x5 data grid.
 fn make_grid_5x5() -> Vec<Vec<f64>> {
     (0..5)
-        .map(|r| (0..5).map(|c| ((r * 5 + c) as f64) / 24.0).collect())
+        .map(|r| (0..5).map(|c| f64::from(r * 5 + c) / 24.0).collect())
         .collect()
 }
 
@@ -88,8 +88,7 @@ fn bench_focus_ring_stable_100_frames(c: &mut Criterion) {
     c.bench_function("focus_ring_stable_100_frames", |b| {
         b.iter(|| {
             let a11y = mcp_agent_mail_server::tui_widgets::A11yConfig::default();
-            let mut cache =
-                mcp_agent_mail_server::tui_widgets::FocusRingCache::new();
+            let mut cache = mcp_agent_mail_server::tui_widgets::FocusRingCache::new();
             let mut pool = GraphemePool::new();
             for _ in 0..100 {
                 let mut frame = Frame::new(40, 12, &mut pool);

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// A single recorded step in a macro.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MacroStep {
-    /// Palette action ID (e.g. "screen:Messages", "macro:view_thread:t1").
+    /// Palette action ID (e.g. "screen:Messages", "`macro:view_thread:t1`").
     pub action_id: String,
     /// Human-readable label for display in playback log.
     pub label: String,
@@ -41,7 +41,7 @@ impl MacroStep {
 
     /// Set the delay from the previous step.
     #[must_use]
-    pub fn with_delay(mut self, ms: u64) -> Self {
+    pub const fn with_delay(mut self, ms: u64) -> Self {
         self.delay_ms = ms;
         self
     }
@@ -160,7 +160,7 @@ pub enum PlaybackState {
 impl PlaybackState {
     /// Whether playback is active (playing or paused).
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         matches!(self, Self::Playing { .. } | Self::Paused { .. })
     }
 
@@ -203,7 +203,7 @@ pub enum RecorderState {
 impl RecorderState {
     /// Whether the recorder is active.
     #[must_use]
-    pub fn is_recording(&self) -> bool {
+    pub const fn is_recording(&self) -> bool {
         matches!(self, Self::Recording { .. })
     }
 }
@@ -281,13 +281,13 @@ impl MacroEngine {
 
     /// Current recorder state.
     #[must_use]
-    pub fn recorder_state(&self) -> &RecorderState {
+    pub const fn recorder_state(&self) -> &RecorderState {
         &self.recorder
     }
 
     /// Current playback state.
     #[must_use]
-    pub fn playback_state(&self) -> &PlaybackState {
+    pub const fn playback_state(&self) -> &PlaybackState {
         &self.playback
     }
 
@@ -344,10 +344,11 @@ impl MacroEngine {
             return;
         }
 
-        let delay_ms = self
-            .last_step_ts
-            .map(|ts| ts.elapsed().as_millis() as u64)
-            .unwrap_or(0);
+        let delay_ms = self.last_step_ts.map_or(0, |ts| {
+            #[allow(clippy::cast_possible_truncation)]
+            let ms = ts.elapsed().as_millis() as u64;
+            ms
+        });
         self.last_step_ts = Some(std::time::Instant::now());
 
         self.recording_buffer.push(MacroStep {
@@ -426,7 +427,7 @@ impl MacroEngine {
 
     /// Get the next action to execute during playback.
     ///
-    /// For `Continuous` mode: returns the next step's action_id and advances.
+    /// For `Continuous` mode: returns the next step's `action_id` and advances.
     /// For `StepByStep` mode: returns the next step after confirmation.
     /// For `DryRun` mode: returns step info without executing.
     ///
@@ -491,7 +492,7 @@ impl MacroEngine {
 
     /// Confirm the current step in step-by-step mode.
     ///
-    /// Returns the action_id to execute.
+    /// Returns the `action_id` to execute.
     pub fn confirm_step(&mut self) -> Option<String> {
         let mac = self.playback_macro.as_ref()?;
 
@@ -549,7 +550,7 @@ impl MacroEngine {
         let Some(mac) = self.playback_macro.as_ref() else {
             return;
         };
-        let step = self.playback_log.last().map(|e| e.step_index).unwrap_or(0);
+        let step = self.playback_log.last().map_or(0, |e| e.step_index);
         self.playback = PlaybackState::Failed {
             name: mac.name.clone(),
             step,
@@ -568,7 +569,7 @@ impl MacroEngine {
         let Some(mac) = self.playback_macro.as_ref() else {
             return;
         };
-        let step = self.playback_log.last().map(|e| e.step_index).unwrap_or(0);
+        let step = self.playback_log.last().map_or(0, |e| e.step_index);
         self.playback = PlaybackState::Failed {
             name: mac.name.clone(),
             step,

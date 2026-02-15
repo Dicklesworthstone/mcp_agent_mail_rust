@@ -8,7 +8,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use mcp_agent_mail_server::tui_decision::{BayesianDiffStrategy, FrameState};
 
-fn stable_frame() -> FrameState {
+const fn stable_frame() -> FrameState {
     FrameState {
         change_ratio: 0.05,
         is_resize: false,
@@ -17,7 +17,7 @@ fn stable_frame() -> FrameState {
     }
 }
 
-fn bursty_frame() -> FrameState {
+const fn bursty_frame() -> FrameState {
     FrameState {
         change_ratio: 0.6,
         is_resize: false,
@@ -26,7 +26,7 @@ fn bursty_frame() -> FrameState {
     }
 }
 
-fn resize_frame() -> FrameState {
+const fn resize_frame() -> FrameState {
     FrameState {
         change_ratio: 0.0,
         is_resize: true,
@@ -35,7 +35,7 @@ fn resize_frame() -> FrameState {
     }
 }
 
-fn degraded_frame() -> FrameState {
+const fn degraded_frame() -> FrameState {
     FrameState {
         change_ratio: 0.2,
         is_resize: false,
@@ -60,7 +60,12 @@ fn bench_frame_bayesian_stable(c: &mut Criterion) {
 
 /// Benchmark: 100 frames with mixed conditions (cycling through all 4 states).
 fn bench_frame_bayesian_mixed(c: &mut Criterion) {
-    let frames = [stable_frame(), bursty_frame(), resize_frame(), degraded_frame()];
+    let frames = [
+        stable_frame(),
+        bursty_frame(),
+        resize_frame(),
+        degraded_frame(),
+    ];
     c.bench_function("bayesian_100_mixed_frames", |b| {
         b.iter(|| {
             let mut strategy = BayesianDiffStrategy::new();
@@ -89,7 +94,12 @@ fn bench_frame_full_baseline(c: &mut Criterion) {
 
 /// Benchmark: 1000 frames to measure throughput at scale.
 fn bench_frame_bayesian_1000(c: &mut Criterion) {
-    let frames = [stable_frame(), bursty_frame(), resize_frame(), degraded_frame()];
+    let frames = [
+        stable_frame(),
+        bursty_frame(),
+        resize_frame(),
+        degraded_frame(),
+    ];
     c.bench_function("bayesian_1000_mixed_frames", |b| {
         b.iter(|| {
             let mut strategy = BayesianDiffStrategy::new();
