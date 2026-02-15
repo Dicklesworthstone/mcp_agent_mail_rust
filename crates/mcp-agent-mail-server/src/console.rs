@@ -3144,6 +3144,21 @@ mod tests {
     }
 
     #[test]
+    fn log_pane_regex_filter_matches_formatted_entries() {
+        let mut pane = LogPane::new();
+        pane.push("[00:00:00.000] INFO  MessageSent    GoldFox -> SilverWolf");
+        pane.push("[00:00:00.001] DEBUG ToolCallEnd   send_message (12ms)");
+        pane.push("[00:00:00.002] WARN  ResReleased   GoldFox src/**");
+
+        pane.set_filter(Some(r"^\[\d{2}:\d{2}:\d{2}\.\d{3}\]\s+WARN\s+ResReleased"));
+        assert_eq!(pane.search("ResReleased"), 1);
+        assert_eq!(pane.search("MessageSent"), 0);
+
+        pane.set_filter(None);
+        assert_eq!(pane.search("MessageSent"), 1);
+    }
+
+    #[test]
     fn log_pane_follow_toggle() {
         let mut pane = LogPane::new();
         assert!(pane.auto_scroll_enabled());

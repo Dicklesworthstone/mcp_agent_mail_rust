@@ -132,7 +132,6 @@ fn digest(s: &str) -> String {
 /// Commands that should be accepted (parsed) by the CLI binary.
 /// We test with --help to avoid side effects; exit code 0 means clap accepted it.
 const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
-    &["start", "--help"],
     &["serve-http", "--help"],
     &["serve-stdio", "--help"],
     &["check-inbox", "--help"],
@@ -168,7 +167,6 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
 
 /// Commands that MCP binary should deny (exit code 2).
 const MCP_DENY_COMMANDS: &[&[&str]] = &[
-    &["start"],
     &["share"],
     &["archive"],
     &["guard"],

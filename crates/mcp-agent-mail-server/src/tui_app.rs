@@ -3580,6 +3580,7 @@ mod tests {
     use mcp_agent_mail_core::Config;
     use serde::Serialize;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
 
     fn test_model() -> MailAppModel {
         let config = Config::default();
@@ -5548,6 +5549,71 @@ mod tests {
         assert!(!model.toast_muted);
     }
 
+    #[test]
+    fn ctrl_t_toggles_toast_focus_mode_when_visible_toasts_exist() {
+        let mut model = test_model();
+        model.notifications.notify(
+            Toast::new("focus target")
+                .icon(ToastIcon::Info)
+                .duration(Duration::from_secs(60)),
+        );
+        model.notifications.tick(Duration::from_millis(16));
+        assert_eq!(model.notifications.visible_count(), 1);
+        assert!(model.toast_focus_index.is_none());
+
+        let ctrl_t = Event::Key(KeyEvent::new(KeyCode::Char('t')).with_modifiers(Modifiers::CTRL));
+        let cmd = model.update(MailMsg::Terminal(ctrl_t.clone()));
+        assert!(matches!(cmd, Cmd::None));
+        assert_eq!(model.toast_focus_index, Some(0));
+
+        let cmd = model.update(MailMsg::Terminal(ctrl_t));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(model.toast_focus_index.is_none());
+    }
+
+    #[test]
+    fn ctrl_t_does_not_enter_focus_mode_with_no_visible_toasts() {
+        let mut model = test_model();
+        assert_eq!(model.notifications.visible_count(), 0);
+
+        let ctrl_t = Event::Key(KeyEvent::new(KeyCode::Char('t')).with_modifiers(Modifiers::CTRL));
+        let cmd = model.update(MailMsg::Terminal(ctrl_t));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(model.toast_focus_index.is_none());
+    }
+
+    #[test]
+    fn toast_focus_navigation_and_dismissal_work_via_terminal_events() {
+        let mut model = test_model();
+        for i in 0..3 {
+            model.notifications.notify(
+                Toast::new(format!("toast {i}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(60)),
+            );
+        }
+        model.notifications.tick(Duration::from_millis(16));
+        assert_eq!(model.notifications.visible_count(), 3);
+
+        let ctrl_t = Event::Key(KeyEvent::new(KeyCode::Char('t')).with_modifiers(Modifiers::CTRL));
+        model.update(MailMsg::Terminal(ctrl_t));
+        assert_eq!(model.toast_focus_index, Some(0));
+
+        let down = Event::Key(KeyEvent::new(KeyCode::Down));
+        model.update(MailMsg::Terminal(down));
+        assert_eq!(model.toast_focus_index, Some(1));
+
+        let up = Event::Key(KeyEvent::new(KeyCode::Up));
+        model.update(MailMsg::Terminal(up));
+        assert_eq!(model.toast_focus_index, Some(0));
+
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter));
+        model.update(MailMsg::Terminal(enter));
+        model.notifications.tick(Duration::from_millis(16));
+        assert_eq!(model.notifications.visible_count(), 2);
+        assert_eq!(model.toast_focus_index, Some(0));
+    }
+
     // ── toast_for_event tests ───────────────────────────────────────
 
     #[test]
@@ -5779,6 +5845,32 @@ mod tests {
         // Second insert is a no-op
         model.warned_reservations.insert(key);
         assert_eq!(model.warned_reservations.len(), 1);
+    }
+
+    #[test]
+    fn reservation_tracker_updates_from_grant_and_release_events() {
+        let mut model = test_model();
+        assert!(model.state.push_event(MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/**".to_string()],
+            true,
+            600,
+            "proj-a",
+        )));
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert_eq!(model.reservation_tracker.len(), 1);
+
+        assert!(model.state.push_event(MailEvent::reservation_released(
+            "BlueLake",
+            vec!["src/**".to_string()],
+            "proj-a",
+        )));
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert!(
+            model.reservation_tracker.is_empty(),
+            "release event should clear reservation tracker entry"
+        );
     }
 
     // ── Toast focus mode tests ──────────────────────────────────
@@ -6079,6 +6171,131 @@ mod tests {
             }
         }
         assert!(found, "Hint text should be rendered with highlight color");
+    }
+
+    // ── Modal manager tests ─────────────────────────────────────
+
+    #[test]
+    fn modal_manager_enter_confirms_and_invokes_callback() {
+        let mut manager = ModalManager::new();
+        let (tx, rx) = mpsc::channel();
+        manager.show_confirmation(
+            "Confirm",
+            "Proceed?",
+            ModalSeverity::Warning,
+            move |result| {
+                tx.send(result).expect("send modal result");
+            },
+        );
+        assert!(manager.is_active());
+
+        let consumed = manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
+        assert!(consumed);
+        assert!(!manager.is_active());
+        assert_eq!(rx.recv().expect("modal callback result"), DialogResult::Ok);
+    }
+
+    #[test]
+    fn modal_manager_escape_dismisses_and_invokes_callback() {
+        let mut manager = ModalManager::new();
+        let (tx, rx) = mpsc::channel();
+        manager.show_confirmation(
+            "Confirm",
+            "Proceed?",
+            ModalSeverity::Warning,
+            move |result| {
+                tx.send(result).expect("send modal result");
+            },
+        );
+        assert!(manager.is_active());
+
+        let consumed = manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
+        assert!(consumed);
+        assert!(!manager.is_active());
+        assert_eq!(
+            rx.recv().expect("modal callback result"),
+            DialogResult::Dismissed
+        );
+    }
+
+    #[test]
+    fn modal_manager_tab_cycles_button_focus() {
+        let mut manager = ModalManager::new();
+        manager.show_confirmation("Confirm", "Proceed?", ModalSeverity::Info, |_| {});
+        assert!(manager.is_active());
+        assert!(
+            manager
+                .active
+                .as_ref()
+                .expect("active modal")
+                .state
+                .focused_button
+                .is_none()
+        );
+
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab));
+        manager.handle_event(&tab);
+        assert_eq!(
+            manager
+                .active
+                .as_ref()
+                .expect("active modal")
+                .state
+                .focused_button,
+            Some(1)
+        );
+
+        manager.handle_event(&tab);
+        assert_eq!(
+            manager
+                .active
+                .as_ref()
+                .expect("active modal")
+                .state
+                .focused_button,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn modal_manager_dismiss_clears_without_callback() {
+        let mut manager = ModalManager::new();
+        let (tx, rx) = mpsc::channel();
+        manager.show_confirmation("Confirm", "Proceed?", ModalSeverity::Info, move |result| {
+            tx.send(result).expect("send modal result");
+        });
+        assert!(manager.is_active());
+
+        manager.dismiss();
+        assert!(!manager.is_active());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn modal_focus_trap_blocks_palette_shortcuts_until_modal_closes() {
+        let mut model = test_model();
+        let (tx, rx) = mpsc::channel();
+        model.modal_manager.show_confirmation(
+            "Confirm",
+            "Proceed?",
+            ModalSeverity::Warning,
+            move |result| {
+                tx.send(result).expect("send modal result");
+            },
+        );
+        assert!(model.modal_manager.is_active());
+        assert!(!model.command_palette.is_visible());
+
+        let ctrl_p = Event::Key(KeyEvent::new(KeyCode::Char('p')).with_modifiers(Modifiers::CTRL));
+        let cmd = model.update(MailMsg::Terminal(ctrl_p));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(model.modal_manager.is_active());
+        assert!(!model.command_palette.is_visible());
+
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Enter))));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(!model.modal_manager.is_active());
+        assert_eq!(rx.recv().expect("modal callback result"), DialogResult::Ok);
     }
 
     // ── Performance benchmarks (br-2bbt.11.4) ─────────────────────────────────

@@ -2413,6 +2413,62 @@ mod tests {
     }
 
     #[test]
+    fn severity_mapping_covers_all_event_variants_explicitly() {
+        let cases = vec![
+            (
+                MailEvent::tool_call_start("tool", Value::Null, None, None),
+                EventSeverity::Trace,
+            ),
+            (
+                MailEvent::tool_call_end("tool", 1, None, 0, 0.0, vec![], None, None),
+                EventSeverity::Debug,
+            ),
+            (
+                MailEvent::message_sent(1, "A", vec!["B".to_string()], "s", "t", "p"),
+                EventSeverity::Info,
+            ),
+            (
+                MailEvent::message_received(1, "A", vec!["B".to_string()], "s", "t", "p"),
+                EventSeverity::Info,
+            ),
+            (
+                MailEvent::reservation_granted("A", vec!["src/**".to_string()], true, 60, "p"),
+                EventSeverity::Info,
+            ),
+            (
+                MailEvent::reservation_released("A", vec!["src/**".to_string()], "p"),
+                EventSeverity::Info,
+            ),
+            (
+                MailEvent::agent_registered("A", "codex-cli", "gpt-5-codex", "p"),
+                EventSeverity::Info,
+            ),
+            (
+                MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1"),
+                EventSeverity::Debug,
+            ),
+            (
+                MailEvent::health_pulse(DbStatSnapshot::default()),
+                EventSeverity::Trace,
+            ),
+            (
+                MailEvent::server_started("http://127.0.0.1:8765", "cfg"),
+                EventSeverity::Info,
+            ),
+            (MailEvent::server_shutdown(), EventSeverity::Warn),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(
+                event.severity(),
+                expected,
+                "unexpected severity for {:?}",
+                event.kind()
+            );
+        }
+    }
+
+    #[test]
     fn compact_labels_are_stable_and_short() {
         let labels = [
             MailEventKind::ToolCallStart.compact_label(),
@@ -2455,6 +2511,43 @@ mod tests {
         assert!(entry.summary.contains("42ms"));
         assert!(entry.summary.contains("q=5"));
         assert!(entry.summary.contains("[RedFox@my-proj]"));
+    }
+
+    #[test]
+    fn to_event_log_entry_timestamp_is_zero_padded_hh_mm_ss_mmm() {
+        let event = MailEvent::ServerStarted {
+            seq: 7,
+            // 05:07:09.456 (in microseconds)
+            timestamp_micros: (((5 * 3600) + (7 * 60) + 9) * 1_000_000) + 456_000,
+            source: EventSource::Lifecycle,
+            redacted: false,
+            endpoint: "http://127.0.0.1:8765".to_string(),
+            config_summary: "cfg".to_string(),
+        };
+
+        let entry = event.to_event_log_entry();
+        assert_eq!(entry.timestamp, "05:07:09.456");
+    }
+
+    #[test]
+    fn to_event_log_entry_message_summary_compacts_multiple_recipients() {
+        let event = MailEvent::message_sent(
+            9,
+            "GoldFox",
+            vec!["SilverWolf".to_string(), "BlueBear".to_string()],
+            "Re: progress update",
+            "thread-1",
+            "proj",
+        );
+        let entry = event.to_event_log_entry();
+
+        assert!(entry.summary.contains("GoldFox"));
+        assert!(
+            entry.summary.contains("SilverWolf +1"),
+            "summary should compact multiple recipients: {}",
+            entry.summary
+        );
+        assert!(entry.summary.contains("Re: progress update"));
     }
 
     #[test]

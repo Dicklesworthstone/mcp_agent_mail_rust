@@ -25,6 +25,7 @@ use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
+use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::Config;
 
@@ -177,6 +178,7 @@ impl SystemHealthScreen {
     /// Render the original text diagnostics view.
     fn render_text_view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         let snap = self.snapshot();
+        let effects_enabled = state.config_snapshot().tui_effects;
 
         let mut body = String::new();
         let _ = writeln!(body, "Endpoint: {}", snap.endpoint);
@@ -282,30 +284,80 @@ impl SystemHealthScreen {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
         Paragraph::new(body).block(block).render(area, frame);
+
+        if diagnostics_probe_in_progress(&snap, self.refresh_requested.load(Ordering::Relaxed)) {
+            render_probing_indicator(frame, area, state, effects_enabled);
+        }
     }
 
     /// Render the widget dashboard view.
     #[allow(clippy::cast_possible_truncation)]
     fn render_dashboard_view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         let snap = self.snapshot();
+        let effects_enabled = state.config_snapshot().tui_effects;
+        let probing =
+            diagnostics_probe_in_progress(&snap, self.refresh_requested.load(Ordering::Relaxed));
+
+        let critical_alerts = critical_finding_count(&snap);
+        let content_area = if critical_alerts > 0 && area.height > 1 {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let alert_text = format!("CRITICAL: {critical_alerts} failing health checks");
+            let alert_style = Style::default().fg(tp.severity_critical).bold();
+            Paragraph::new(alert_text.as_str())
+                .style(alert_style)
+                .render(Rect::new(area.x, area.y, area.width, 1), frame);
+            if effects_enabled {
+                StyledText::new(alert_text)
+                    .effect(TextEffect::PulsingGlow {
+                        color: tp.severity_critical,
+                        speed: 0.5,
+                    })
+                    .base_color(tp.severity_critical)
+                    .bold()
+                    .time(state.uptime().as_secs_f64())
+                    .render(Rect::new(area.x, area.y, area.width, 1), frame);
+            }
+            Rect::new(
+                area.x,
+                area.y.saturating_add(1),
+                area.width,
+                area.height.saturating_sub(1),
+            )
+        } else {
+            area
+        };
+
+        if probing {
+            render_probing_indicator(frame, area, state, effects_enabled);
+        }
 
         if snap.checked_at.is_none() {
             let widget: WidgetState<'_, Paragraph<'_>> = WidgetState::Loading {
                 message: "Running diagnostics...",
             };
-            widget.render(area, frame);
+            widget.render(content_area, frame);
             return;
         }
 
         // Layout: metric tiles (3h) + gauge (3h) + anomaly cards (rest)
-        let tiles_h = 3_u16.min(area.height);
-        let remaining = area.height.saturating_sub(tiles_h);
+        let tiles_h = 3_u16.min(content_area.height);
+        let remaining = content_area.height.saturating_sub(tiles_h);
         let gauge_h = 3_u16.min(remaining);
         let cards_h = remaining.saturating_sub(gauge_h);
 
-        let tiles_area = Rect::new(area.x, area.y, area.width, tiles_h);
-        let gauge_area = Rect::new(area.x, area.y + tiles_h, area.width, gauge_h);
-        let cards_area = Rect::new(area.x, area.y + tiles_h + gauge_h, area.width, cards_h);
+        let tiles_area = Rect::new(content_area.x, content_area.y, content_area.width, tiles_h);
+        let gauge_area = Rect::new(
+            content_area.x,
+            content_area.y + tiles_h,
+            content_area.width,
+            gauge_h,
+        );
+        let cards_area = Rect::new(
+            content_area.x,
+            content_area.y + tiles_h + gauge_h,
+            content_area.width,
+            cards_h,
+        );
 
         // --- Metric Tiles ---
         self.render_metric_tiles(frame, tiles_area, state, &snap);
@@ -589,6 +641,59 @@ fn format_uptime(d: Duration) -> String {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
         format!("{h}h {m}m")
+    }
+}
+
+fn critical_finding_count(snap: &DiagnosticsSnapshot) -> usize {
+    usize::from(snap.tcp_error.is_some())
+        + snap
+            .lines
+            .iter()
+            .filter(|line| line.level == Level::Fail)
+            .count()
+}
+
+const fn diagnostics_probe_in_progress(
+    snap: &DiagnosticsSnapshot,
+    refresh_requested: bool,
+) -> bool {
+    snap.checked_at.is_none() || refresh_requested
+}
+
+fn render_probing_indicator(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiSharedState,
+    effects_enabled: bool,
+) {
+    if area.height == 0 || area.width < 12 {
+        return;
+    }
+
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let label = "PROBING...";
+    let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX);
+    let margin = 1_u16;
+    let x = area.x.saturating_add(
+        area.width
+            .saturating_sub(label_width.saturating_add(margin)),
+    );
+    let render_area = Rect::new(x, area.y, area.width.saturating_sub(x - area.x), 1);
+
+    if effects_enabled {
+        StyledText::new(label)
+            .effect(TextEffect::Pulse {
+                speed: 2.0 / 3.0,
+                min_alpha: 0.35,
+            })
+            .base_color(tp.severity_warn)
+            .bold()
+            .time(state.uptime().as_secs_f64())
+            .render(render_area, frame);
+    } else {
+        Paragraph::new(label)
+            .style(Style::default().fg(tp.severity_warn).bold())
+            .render(render_area, frame);
     }
 }
 
@@ -1699,6 +1804,49 @@ mod tests {
     #[test]
     fn format_uptime_hours() {
         assert_eq!(format_uptime(Duration::from_secs(7200 + 300)), "2h 5m");
+    }
+
+    #[test]
+    fn critical_finding_count_includes_tcp_and_fail_lines() {
+        let snap = DiagnosticsSnapshot {
+            tcp_error: Some("connect failed".to_string()),
+            lines: vec![
+                ProbeLine {
+                    level: Level::Warn,
+                    name: "warn-only",
+                    detail: "warn".to_string(),
+                    remediation: None,
+                },
+                ProbeLine {
+                    level: Level::Fail,
+                    name: "fail-one",
+                    detail: "fail".to_string(),
+                    remediation: None,
+                },
+                ProbeLine {
+                    level: Level::Fail,
+                    name: "fail-two",
+                    detail: "fail".to_string(),
+                    remediation: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(critical_finding_count(&snap), 3);
+    }
+
+    #[test]
+    fn diagnostics_probe_in_progress_tracks_refresh_flag() {
+        let checked = DiagnosticsSnapshot {
+            checked_at: Some(Utc::now()),
+            ..Default::default()
+        };
+        assert!(diagnostics_probe_in_progress(
+            &DiagnosticsSnapshot::default(),
+            false
+        ));
+        assert!(diagnostics_probe_in_progress(&checked, true));
+        assert!(!diagnostics_probe_in_progress(&checked, false));
     }
 
     #[test]

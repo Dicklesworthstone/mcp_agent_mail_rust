@@ -17,7 +17,7 @@ use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::pattern_overlap::CompiledPattern;
 use crate::tool_util::{
@@ -179,6 +179,83 @@ fn contact_required_error(
             "suggested_tool_calls": examples,
         }),
     )
+}
+
+fn recipient_not_found_error(
+    project_human_key: &str,
+    project_slug: &str,
+    sender: &mcp_agent_mail_db::AgentRow,
+    missing_local: &[String],
+) -> McpError {
+    let mut missing_sorted = missing_local.to_vec();
+    missing_sorted.sort_unstable();
+    missing_sorted.dedup();
+
+    let hint = format!(
+        "Use resource://agents/{project_slug} to list registered agents or register new identities."
+    );
+    let message = format!(
+        "Unable to send message — local recipients {} are not registered in project '{project_human_key}'; {hint}",
+        missing_sorted.join(", "),
+    );
+
+    let suggested_tool_calls: Vec<Value> = missing_sorted
+        .iter()
+        .take(5)
+        .map(|name| {
+            json!({
+                "tool": "register_agent",
+                "arguments": {
+                    "project_key": project_human_key,
+                    "name": name,
+                    "program": sender.program,
+                    "model": sender.model,
+                    "task_description": sender.task_description,
+                },
+            })
+        })
+        .collect();
+
+    let mut data = json!({
+        "unknown_local": missing_sorted,
+        "hint": hint,
+    });
+    if !suggested_tool_calls.is_empty() {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert(
+                "suggested_tool_calls".to_string(),
+                Value::Array(suggested_tool_calls),
+            );
+        }
+    }
+
+    legacy_tool_error("RECIPIENT_NOT_FOUND", message, true, data)
+}
+
+fn extract_recipient_not_found_names(err: &McpError) -> Option<Vec<String>> {
+    let error_payload = err
+        .data
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|root| root.get("error"))
+        .and_then(Value::as_object)?;
+    if error_payload.get("type").and_then(Value::as_str) != Some("RECIPIENT_NOT_FOUND") {
+        return None;
+    }
+    let names = error_payload
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("unknown_local"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(names)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,6 +529,152 @@ const fn has_any_recipients(to: &[String], cc: &[String], bcc: &[String]) -> boo
     !(to.is_empty() && cc.is_empty() && bcc.is_empty())
 }
 
+const THIRTY_DAYS_MICROS: i64 = 30_i64 * 24 * 60 * 60 * 1_000_000;
+
+fn python_json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "int"
+            } else {
+                "float"
+            }
+        }
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+fn python_value_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
+        Value::Array(_) | Value::Object(_) => value.to_string(),
+    }
+}
+
+fn send_message_has_explicit_to_recipients(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())),
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn normalize_send_message_to_argument(
+    arguments: &mut serde_json::Map<String, Value>,
+) -> McpResult<()> {
+    let Some(to_value) = arguments.get("to").cloned() else {
+        return Ok(());
+    };
+    match to_value {
+        Value::String(s) => {
+            arguments.insert("to".to_string(), json!([s]));
+            Ok(())
+        }
+        Value::Array(items) => {
+            if let Some(invalid_item) = items.iter().find(|item| !item.is_string()) {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Each recipient in 'to' must be a string (agent name). Got: {}",
+                        python_json_type_name(invalid_item)
+                    ),
+                    true,
+                    json!({
+                        "argument": "to",
+                        "invalid_item": python_value_repr(invalid_item),
+                    }),
+                ));
+            }
+            Ok(())
+        }
+        other => Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "'to' must be a list of agent names (e.g., ['BlueLake']) or a single agent name string. Received: {}",
+                python_json_type_name(&other)
+            ),
+            true,
+            json!({
+                "argument": "to",
+                "received_type": python_json_type_name(&other),
+            }),
+        )),
+    }
+}
+
+fn normalize_send_message_cc_bcc_argument(
+    arguments: &mut serde_json::Map<String, Value>,
+    field: &str,
+) -> McpResult<()> {
+    let Some(value) = arguments.get(field).cloned() else {
+        return Ok(());
+    };
+
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            arguments.insert(field.to_string(), json!([s]));
+            Ok(())
+        }
+        Value::Array(items) => {
+            if items.iter().any(|item| !item.is_string()) {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!("{field} items must be strings (agent names)."),
+                    true,
+                    json!({ "argument": field }),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!("{field} must be a list of strings or a single string."),
+            true,
+            json!({ "argument": field }),
+        )),
+    }
+}
+
+/// Normalize raw `send_message` arguments for parity with the Python reference:
+/// - accepts single-string forms for to/cc/bcc (converts to one-element arrays)
+/// - validates recipient container/item types with parity messages
+/// - enforces broadcast+explicit-to mutual exclusivity message parity
+pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> {
+    let Some(args) = arguments.as_object_mut() else {
+        return Ok(());
+    };
+
+    if args
+        .get("broadcast")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && send_message_has_explicit_to_recipients(args.get("to"))
+    {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
+            true,
+            json!({ "argument": "broadcast" }),
+        ));
+    }
+
+    normalize_send_message_to_argument(args)?;
+    normalize_send_message_cc_bcc_argument(args, "cc")?;
+    normalize_send_message_cc_bcc_argument(args, "bcc")?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_recipient(
     ctx: &McpContext,
@@ -461,6 +684,8 @@ async fn push_recipient(
     kind: &str,
     sender: &mcp_agent_mail_db::AgentRow,
     config: &Config,
+    project_human_key: &str,
+    project_slug: &str,
     recipient_map: &mut HashMap<String, mcp_agent_mail_db::AgentRow>,
     all_recipients: &mut SmallVec<[(i64, String); 8]>,
     resolved_list: &mut SmallVec<[String; 4]>,
@@ -469,7 +694,41 @@ async fn push_recipient(
     let agent = if let Some(existing) = recipient_map.get(&name_key) {
         existing.clone()
     } else {
-        let agent = resolve_or_register_agent(ctx, pool, project_id, name, sender, config).await?;
+        let agent = match resolve_or_register_agent(ctx, pool, project_id, name, sender, config)
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                // Re-wrap NOT_FOUND as RECIPIENT_NOT_FOUND with Python-parity message.
+                if let Some(data) = &e.data {
+                    if let Some(err_type) = data
+                        .as_object()
+                        .and_then(|o| o.get("error"))
+                        .and_then(|e| e.get("type"))
+                        .and_then(|t| t.as_str())
+                    {
+                        if err_type == "NOT_FOUND" {
+                            let hint = format!(
+                                "Use resource://agents/{project_slug} to list registered agents or register new identities."
+                            );
+                            let message = format!(
+                                "Unable to send message — local recipients {name} are not registered in project '{project_human_key}'; {hint}"
+                            );
+                            return Err(legacy_tool_error(
+                                "RECIPIENT_NOT_FOUND",
+                                message,
+                                true,
+                                json!({
+                                    "unknown_local": [name],
+                                    "hint": hint,
+                                }),
+                            ));
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
         let key = agent.name.to_lowercase();
         recipient_map.insert(key, agent.clone());
         agent
@@ -609,7 +868,7 @@ pub async fn send_message(
     ctx: &McpContext,
     project_key: String,
     sender_name: String,
-    to: Vec<String>,
+    mut to: Vec<String>,
     subject: String,
     body_md: String,
     cc: Option<Vec<String>>,
@@ -619,21 +878,10 @@ pub async fn send_message(
     importance: Option<String>,
     ack_required: Option<bool>,
     thread_id: Option<String>,
+    topic: Option<String>,
+    broadcast: Option<bool>,
     auto_contact_if_blocked: Option<bool>,
 ) -> McpResult<String> {
-    // Validate recipients
-    if to.is_empty() {
-        return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "At least one recipient (to) is required. Provide agent names in the 'to' array.",
-            true,
-            json!({
-                "field": "to",
-                "error_detail": "empty recipient list",
-            }),
-        ));
-    }
-
     // Truncate subject at 200 chars (parity with Python legacy).
     // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
     let subject = if subject.chars().count() > 200 {
@@ -667,6 +915,7 @@ pub async fn send_message(
     let thread_id = thread_id
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
+    let _topic = topic;
 
     // Validate thread_id format if provided
     if let Some(ref tid) = thread_id {
@@ -748,6 +997,75 @@ effective_free_bytes={free}"
     .await?;
     let sender_id = sender.id.unwrap_or(0);
 
+    let broadcast = broadcast.unwrap_or(false);
+    if broadcast {
+        if to.iter().any(|name| !name.trim().is_empty()) {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
+                true,
+                json!({ "argument": "broadcast" }),
+            ));
+        }
+
+        let cutoff = mcp_agent_mail_db::now_micros() - THIRTY_DAYS_MICROS;
+        let sender_lower = sender_name.trim().to_ascii_lowercase();
+        let eligible = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+        )?;
+        to = eligible
+            .into_iter()
+            .filter(|agent| {
+                !agent.name.trim().is_empty()
+                    && agent.last_active_ts > cutoff
+                    && agent.name.to_ascii_lowercase() != sender_lower
+                    && !agent.contact_policy.eq_ignore_ascii_case("block_all")
+            })
+            .map(|agent| agent.name)
+            .collect();
+
+        if to.is_empty() {
+            tracing::warn!(
+                "[warn] Broadcast: no eligible recipients found (sender is the only active agent)."
+            );
+        }
+    }
+
+    // Self-send detection: warn if sender is sending to themselves (Python parity)
+    {
+        let sender_lower = sender_name.trim().to_ascii_lowercase();
+        let all_named: Vec<&str> = to
+            .iter()
+            .chain(cc.iter().flatten())
+            .chain(bcc.iter().flatten())
+            .map(String::as_str)
+            .collect();
+        if all_named
+            .iter()
+            .any(|r| r.trim().to_ascii_lowercase() == sender_lower)
+        {
+            tracing::warn!(
+                "[note] You ({sender_name}) are sending a message to yourself. \
+                 This is allowed but usually not intended. To communicate with other agents, \
+                 use their agent names (e.g., 'BlueLake'). To discover agents, \
+                 use resource://agents/{project_key}."
+            );
+        }
+    }
+
+    // Validate recipients
+    if to.is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "At least one recipient (to) is required. Provide agent names in the 'to' array.",
+            true,
+            json!({
+                "field": "to",
+                "error_detail": "empty recipient list",
+            }),
+        ));
+    }
+
     // Resolve all recipients (to, cc, bcc) with optional auto-registration
     let cc_list = cc.unwrap_or_default();
     let bcc_list = bcc.unwrap_or_default();
@@ -760,9 +1078,10 @@ effective_free_bytes={free}"
         SmallVec::with_capacity(bcc_list.len());
     let mut recipient_map: HashMap<String, mcp_agent_mail_db::AgentRow> =
         HashMap::with_capacity(total_recip);
+    let mut missing_local: Vec<String> = Vec::new();
 
     for name in &to {
-        push_recipient(
+        if let Err(err) = push_recipient(
             ctx,
             &pool,
             project_id,
@@ -770,14 +1089,27 @@ effective_free_bytes={free}"
             "to",
             &sender,
             config,
+            &project.human_key,
+            &project.slug,
             &mut recipient_map,
             &mut all_recipients,
             &mut resolved_to,
         )
-        .await?;
+        .await
+        {
+            if let Some(mut names) = extract_recipient_not_found_names(&err) {
+                if names.is_empty() {
+                    missing_local.push(name.clone());
+                } else {
+                    missing_local.append(&mut names);
+                }
+                continue;
+            }
+            return Err(err);
+        }
     }
     for name in &cc_list {
-        push_recipient(
+        if let Err(err) = push_recipient(
             ctx,
             &pool,
             project_id,
@@ -785,14 +1117,27 @@ effective_free_bytes={free}"
             "cc",
             &sender,
             config,
+            &project.human_key,
+            &project.slug,
             &mut recipient_map,
             &mut all_recipients,
             &mut resolved_cc_recipients,
         )
-        .await?;
+        .await
+        {
+            if let Some(mut names) = extract_recipient_not_found_names(&err) {
+                if names.is_empty() {
+                    missing_local.push(name.clone());
+                } else {
+                    missing_local.append(&mut names);
+                }
+                continue;
+            }
+            return Err(err);
+        }
     }
     for name in &bcc_list {
-        push_recipient(
+        if let Err(err) = push_recipient(
             ctx,
             &pool,
             project_id,
@@ -800,11 +1145,33 @@ effective_free_bytes={free}"
             "bcc",
             &sender,
             config,
+            &project.human_key,
+            &project.slug,
             &mut recipient_map,
             &mut all_recipients,
             &mut resolved_bcc_recipients,
         )
-        .await?;
+        .await
+        {
+            if let Some(mut names) = extract_recipient_not_found_names(&err) {
+                if names.is_empty() {
+                    missing_local.push(name.clone());
+                } else {
+                    missing_local.append(&mut names);
+                }
+                continue;
+            }
+            return Err(err);
+        }
+    }
+
+    if !missing_local.is_empty() {
+        return Err(recipient_not_found_error(
+            &project.human_key,
+            &project.slug,
+            &sender,
+            &missing_local,
+        ));
     }
 
     // Determine attachment processing settings
@@ -1650,6 +2017,7 @@ pub async fn fetch_inbox(
     since_ts: Option<String>,
     limit: Option<i32>,
     include_bodies: Option<bool>,
+    topic: Option<String>,
 ) -> McpResult<String> {
     let mut msg_limit = limit.unwrap_or(20);
     if msg_limit < 1 {
@@ -1677,6 +2045,7 @@ pub async fn fetch_inbox(
     })?;
     let include_body = include_bodies.unwrap_or(false);
     let urgent = urgent_only.unwrap_or(false);
+    let _topic = topic;
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -2039,6 +2408,93 @@ mod tests {
     }
 
     #[test]
+    fn extract_recipient_not_found_names_parses_payload() {
+        let err = legacy_tool_error(
+            "RECIPIENT_NOT_FOUND",
+            "test",
+            true,
+            json!({
+                "unknown_local": ["Zulu", "Alpha"],
+            }),
+        );
+        let names = extract_recipient_not_found_names(&err).expect("should parse names");
+        assert_eq!(names, vec!["Zulu", "Alpha"]);
+    }
+
+    #[test]
+    fn extract_recipient_not_found_names_ignores_other_error_types() {
+        let err = legacy_tool_error(
+            "NOT_FOUND",
+            "test",
+            true,
+            json!({
+                "unknown_local": ["Zulu"],
+            }),
+        );
+        assert!(extract_recipient_not_found_names(&err).is_none());
+    }
+
+    #[test]
+    fn recipient_not_found_error_sorts_names_and_includes_suggestions() {
+        let sender = mcp_agent_mail_db::AgentRow {
+            name: "BlueLake".to_string(),
+            program: "codex-cli".to_string(),
+            model: "gpt-5".to_string(),
+            task_description: "test task".to_string(),
+            ..mcp_agent_mail_db::AgentRow::default()
+        };
+        let err = recipient_not_found_error(
+            "/tmp/proj",
+            "proj-slug",
+            &sender,
+            &["Zulu".to_string(), "Alpha".to_string(), "Zulu".to_string()],
+        );
+
+        assert_eq!(
+            err.message,
+            "Unable to send message — local recipients Alpha, Zulu are not registered in project '/tmp/proj'; Use resource://agents/proj-slug to list registered agents or register new identities."
+        );
+
+        let data = err
+            .data
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|root| root.get("error"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|payload| payload.get("data"))
+            .and_then(serde_json::Value::as_object)
+            .expect("RECIPIENT_NOT_FOUND payload should include error.data object");
+        assert_eq!(
+            data.get("unknown_local"),
+            Some(&serde_json::json!(["Alpha", "Zulu"]))
+        );
+        assert_eq!(
+            data.get("hint"),
+            Some(&serde_json::json!(
+                "Use resource://agents/proj-slug to list registered agents or register new identities."
+            ))
+        );
+        let calls = data
+            .get("suggested_tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .expect("suggested_tool_calls should be present");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            serde_json::json!({
+                "tool": "register_agent",
+                "arguments": {
+                    "project_key": "/tmp/proj",
+                    "name": "Alpha",
+                    "program": "codex-cli",
+                    "model": "gpt-5",
+                    "task_description": "test task",
+                },
+            })
+        );
+    }
+
+    #[test]
     fn contact_policy_decision_self_allowed_even_if_block_all() {
         assert_eq!(
             contact_policy_decision("AgentA", "AgentA", "block_all", false, false),
@@ -2092,6 +2548,134 @@ mod tests {
             contact_policy_decision("AgentA", "AgentB", "unexpected_policy", false, false),
             ContactPolicyDecision::RequireApproval
         );
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_converts_single_string_recipient_forms() {
+        let mut args = json!({
+            "to": "BlueLake",
+            "cc": "RedCat",
+            "bcc": "GoldHawk",
+        });
+        normalize_send_message_arguments(&mut args).expect("should normalize single-string forms");
+        assert_eq!(args["to"], json!(["BlueLake"]));
+        assert_eq!(args["cc"], json!(["RedCat"]));
+        assert_eq!(args["bcc"], json!(["GoldHawk"]));
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_rejects_broadcast_with_explicit_to() {
+        let mut args = json!({
+            "broadcast": true,
+            "to": ["BlueLake"],
+        });
+        let err = normalize_send_message_arguments(&mut args)
+            .expect_err("broadcast with explicit to should fail");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast."
+        );
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["argument"], "broadcast");
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_rejects_non_list_to() {
+        let mut args = json!({ "to": 123 });
+        let err =
+            normalize_send_message_arguments(&mut args).expect_err("numeric to should be rejected");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "'to' must be a list of agent names (e.g., ['BlueLake']) or a single agent name string. Received: int"
+        );
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["argument"], "to");
+        assert_eq!(data["error"]["data"]["received_type"], "int");
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_rejects_non_string_to_items() {
+        let mut args = json!({ "to": [42] });
+        let err = normalize_send_message_arguments(&mut args)
+            .expect_err("non-string to item should be rejected");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "Each recipient in 'to' must be a string (agent name). Got: int"
+        );
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["argument"], "to");
+        assert_eq!(data["error"]["data"]["invalid_item"], "42");
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_rejects_non_list_cc() {
+        let mut args = json!({
+            "to": ["BlueLake"],
+            "cc": 123,
+        });
+        let err = normalize_send_message_arguments(&mut args).expect_err("non-list cc should fail");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "cc must be a list of strings or a single string."
+        );
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["argument"], "cc");
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_rejects_non_list_bcc() {
+        let mut args = json!({
+            "to": ["BlueLake"],
+            "bcc": 123,
+        });
+        let err =
+            normalize_send_message_arguments(&mut args).expect_err("non-list bcc should fail");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "bcc must be a list of strings or a single string."
+        );
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["argument"], "bcc");
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_rejects_non_string_cc_items() {
+        let mut args = json!({
+            "to": ["BlueLake"],
+            "cc": ["RedCat", 7],
+        });
+        let err = normalize_send_message_arguments(&mut args)
+            .expect_err("non-string cc item should fail");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(err.message, "cc items must be strings (agent names).");
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["argument"], "cc");
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_rejects_non_string_bcc_items() {
+        let mut args = json!({
+            "to": ["BlueLake"],
+            "bcc": ["GoldHawk", false],
+        });
+        let err = normalize_send_message_arguments(&mut args)
+            .expect_err("non-string bcc item should fail");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(err.message, "bcc items must be strings (agent names).");
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["argument"], "bcc");
     }
 
     // -----------------------------------------------------------------------

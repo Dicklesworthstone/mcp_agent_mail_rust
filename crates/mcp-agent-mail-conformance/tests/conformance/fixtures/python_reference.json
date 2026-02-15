@@ -60,7 +60,8 @@
                   "over_80_for_s": 0,
                   "warning": false
                 }
-              }
+              },
+              "semantic_indexing": null
             }
           },
           "normalize": {
@@ -68,6 +69,7 @@
               "/database_url",
               "/disk",
               "/health_level",
+              "/semantic_indexing",
               "/pool_utilization/acquire_p50_ms",
               "/pool_utilization/acquire_p95_ms",
               "/pool_utilization/acquire_p99_ms",

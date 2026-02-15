@@ -859,6 +859,86 @@ mod tests {
         pane
     }
 
+    fn push_event_entry(pane: &mut TimelinePane, seq: u64, event: MailEvent) {
+        let ts = i64::try_from(seq).expect("test seq fits i64") * 1_000_000;
+        pane.entries.push(TimelineEntry {
+            display: format_event(&event),
+            seq,
+            timestamp_micros: ts,
+            source: event.source(),
+            severity: event.severity(),
+            raw: event,
+        });
+    }
+
+    fn seed_log_filter_fixture(pane: &mut TimelinePane) {
+        push_event_entry(
+            pane,
+            1,
+            MailEvent::tool_call_start("fetch_inbox", serde_json::Value::Null, None, None),
+        );
+        push_event_entry(
+            pane,
+            2,
+            MailEvent::tool_call_end("fetch_inbox", 12, None, 0, 0.0, vec![], None, None),
+        );
+        push_event_entry(
+            pane,
+            3,
+            MailEvent::message_sent(
+                1,
+                "GoldFox",
+                vec!["SilverWolf".to_string()],
+                "hello",
+                "t",
+                "p",
+            ),
+        );
+        push_event_entry(
+            pane,
+            4,
+            MailEvent::message_received(
+                2,
+                "SilverWolf",
+                vec!["GoldFox".to_string()],
+                "re: hello",
+                "t",
+                "p",
+            ),
+        );
+        push_event_entry(
+            pane,
+            5,
+            MailEvent::reservation_granted("GoldFox", vec!["src/**".to_string()], true, 120, "p"),
+        );
+        push_event_entry(
+            pane,
+            6,
+            MailEvent::reservation_released("GoldFox", vec!["src/**".to_string()], "p"),
+        );
+        push_event_entry(
+            pane,
+            7,
+            MailEvent::agent_registered("GoldFox", "codex-cli", "gpt-5-codex", "p"),
+        );
+        push_event_entry(
+            pane,
+            8,
+            MailEvent::http_request("GET", "/mcp", 200, 3, "127.0.0.1"),
+        );
+        push_event_entry(
+            pane,
+            9,
+            MailEvent::health_pulse(crate::tui_events::DbStatSnapshot::default()),
+        );
+        push_event_entry(
+            pane,
+            10,
+            MailEvent::server_started("http://127.0.0.1:8765", "cfg"),
+        );
+        push_event_entry(pane, 11, MailEvent::server_shutdown());
+    }
+
     #[test]
     fn new_pane_is_empty() {
         let pane = TimelinePane::new();
@@ -1132,6 +1212,77 @@ mod tests {
         // Lifecycle → clear
         cycle_kind_filter(&mut filter);
         assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn filter_preset_all_shows_all_events() {
+        let mut pane = test_pane();
+        seed_log_filter_fixture(&mut pane);
+
+        assert_eq!(pane.filtered_len(), 11);
+    }
+
+    #[test]
+    fn filter_preset_messages_shows_only_message_events() {
+        let mut pane = test_pane();
+        seed_log_filter_fixture(&mut pane);
+        pane.kind_filter.insert(MailEventKind::MessageSent);
+        pane.kind_filter.insert(MailEventKind::MessageReceived);
+
+        let filtered = pane.filtered_entries();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|entry| matches!(
+            entry.display.kind,
+            MailEventKind::MessageSent | MailEventKind::MessageReceived
+        )));
+    }
+
+    #[test]
+    fn filter_preset_tools_shows_only_tool_events() {
+        let mut pane = test_pane();
+        seed_log_filter_fixture(&mut pane);
+        pane.kind_filter.insert(MailEventKind::ToolCallStart);
+        pane.kind_filter.insert(MailEventKind::ToolCallEnd);
+
+        let filtered = pane.filtered_entries();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|entry| matches!(
+            entry.display.kind,
+            MailEventKind::ToolCallStart | MailEventKind::ToolCallEnd
+        )));
+    }
+
+    #[test]
+    fn filter_preset_reservations_shows_only_reservation_events() {
+        let mut pane = test_pane();
+        seed_log_filter_fixture(&mut pane);
+        pane.kind_filter.insert(MailEventKind::ReservationGranted);
+        pane.kind_filter.insert(MailEventKind::ReservationReleased);
+
+        let filtered = pane.filtered_entries();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|entry| matches!(
+            entry.display.kind,
+            MailEventKind::ReservationGranted | MailEventKind::ReservationReleased
+        )));
+    }
+
+    #[test]
+    fn filter_preset_health_shows_health_and_lifecycle_events() {
+        let mut pane = test_pane();
+        seed_log_filter_fixture(&mut pane);
+        pane.kind_filter.insert(MailEventKind::HealthPulse);
+        pane.kind_filter.insert(MailEventKind::ServerStarted);
+        pane.kind_filter.insert(MailEventKind::ServerShutdown);
+
+        let filtered = pane.filtered_entries();
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.iter().all(|entry| matches!(
+            entry.display.kind,
+            MailEventKind::HealthPulse
+                | MailEventKind::ServerStarted
+                | MailEventKind::ServerShutdown
+        )));
     }
 
     #[test]

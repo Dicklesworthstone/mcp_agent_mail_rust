@@ -183,6 +183,7 @@ fn error_code_catalog_is_stable() {
         "INVALID_TIMESTAMP",
         "MISSING_FIELD",
         "NOT_FOUND",
+        "RECIPIENT_NOT_FOUND",
         "RESERVATION_ACTIVE",
         "RESOURCE_BUSY",
         "TYPE_ERROR",

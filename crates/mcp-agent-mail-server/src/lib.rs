@@ -3797,8 +3797,13 @@ impl HttpState {
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
-                let params: fastmcp_protocol::CallToolParams = parse_params(request.params)?;
+                let mut params: fastmcp_protocol::CallToolParams = parse_params(request.params)?;
                 let tool_name = params.name.clone();
+                if tool_name == "send_message" {
+                    if let Some(arguments) = params.arguments.as_mut() {
+                        mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    }
+                }
                 // Extract format param before dispatch (TOON support)
                 let format_value = params
                     .arguments

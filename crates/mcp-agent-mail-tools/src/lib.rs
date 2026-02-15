@@ -45,7 +45,7 @@ pub use reservations::*;
 pub use resources::*;
 pub use search::*;
 
-pub(crate) mod tool_util {
+pub mod tool_util {
     use fastmcp::McpErrorCode;
     use fastmcp::prelude::*;
     use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, get_or_create_pool};
@@ -67,6 +67,7 @@ pub(crate) mod tool_util {
         })
     }
 
+    #[must_use]
     pub fn legacy_mcp_error(
         code: McpErrorCode,
         error_type: &str,
@@ -82,6 +83,7 @@ pub(crate) mod tool_util {
         )
     }
 
+    #[must_use]
     pub fn legacy_tool_error(
         error_type: &str,
         message: impl Into<String>,
@@ -98,6 +100,7 @@ pub(crate) mod tool_util {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[must_use]
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
         match e {
             DbError::InvalidArgument { field, message } => legacy_tool_error(
@@ -137,16 +140,28 @@ pub(crate) mod tool_util {
             ),
             DbError::Sqlite(message) | DbError::Schema(message) => legacy_tool_error(
                 "DATABASE_ERROR",
-                format!("Database error: {message}"),
+                "A database error occurred. This may be a transient issue - try again.",
                 true,
                 json!({ "error_detail": message }),
             ),
-            DbError::Serialization(message) => legacy_tool_error(
-                "TYPE_ERROR",
-                format!("Argument type mismatch: {message}."),
-                true,
-                json!({ "error_detail": message }),
-            ),
+            DbError::Serialization(message) => {
+                // Python-parity hint selection based on error content
+                let hint = if message.contains("got an unexpected keyword argument") {
+                    " Check parameter names for typos."
+                } else if message.contains("missing") && message.contains("required") {
+                    " Ensure all required parameters are provided."
+                } else if message.contains("NoneType") {
+                    " A required value was None/null."
+                } else {
+                    ""
+                };
+                legacy_tool_error(
+                    "TYPE_ERROR",
+                    format!("Argument type mismatch: {message}.{hint}"),
+                    true,
+                    json!({ "error_detail": message }),
+                )
+            }
             DbError::Internal(message) => legacy_tool_error(
                 "UNHANDLED_EXCEPTION",
                 format!("Unexpected error (DbError): {message}"),
@@ -739,6 +754,53 @@ pub(crate) mod tool_util {
                     .unwrap()
                     .contains("type mismatch")
             );
+        }
+
+        #[test]
+        fn type_error_hint_unexpected_keyword() {
+            let err = db_error_to_mcp_error(DbError::Serialization(
+                "foo() got an unexpected keyword argument 'bar'".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            let msg = data["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.ends_with("Check parameter names for typos."),
+                "expected typo hint, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn type_error_hint_missing_required() {
+            let err = db_error_to_mcp_error(DbError::Serialization(
+                "missing 1 required positional argument: 'x'".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            let msg = data["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.ends_with("Ensure all required parameters are provided."),
+                "expected required-params hint, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn type_error_hint_nonetype() {
+            let err = db_error_to_mcp_error(DbError::Serialization(
+                "unsupported operand type(s) for +: 'NoneType' and 'int'".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            let msg = data["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.ends_with("A required value was None/null."),
+                "expected NoneType hint, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn type_error_no_hint_generic() {
+            let err = db_error_to_mcp_error(DbError::Serialization("invalid JSON".into()));
+            let data = err.data.expect("expected data payload");
+            let msg = data["error"]["message"].as_str().unwrap();
+            assert_eq!(msg, "Argument type mismatch: invalid JSON.");
         }
 
         #[test]

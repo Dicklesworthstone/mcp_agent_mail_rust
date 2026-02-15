@@ -27,7 +27,13 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Cell, Frame, PackedRgba, Style};
+use ftui_extras::canvas::Mode;
 use ftui_extras::charts::heatmap_gradient;
+use ftui_extras::theme;
+use ftui_extras::visual_fx::effects::DoomFireFx;
+use ftui_extras::visual_fx::effects::metaballs::{MetaballsFx, MetaballsPalette, MetaballsParams};
+use ftui_extras::visual_fx::effects::plasma::{PlasmaFx, PlasmaPalette};
+use ftui_extras::visual_fx::{BackdropFx, FxContext, FxQuality, ThemeInputs};
 use ftui_widgets::progress::ProgressBar;
 use ftui_widgets::sparkline::Sparkline;
 use ftui_widgets::tree::TreeNode;
@@ -1725,6 +1731,613 @@ impl A11yConfig {
             PackedRgba::rgb(160, 160, 160)
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AmbientEffectRenderer — state-aware background FX (br-2kc6j)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const AMBIENT_IDLE_THRESHOLD_SECS: u64 = 5 * 60;
+const AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD: f64 = 0.80;
+
+/// Ambient effect visibility mode.
+///
+/// `subtle` and `full` map directly to `AM_TUI_AMBIENT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AmbientMode {
+    /// Disable ambient effects entirely.
+    Off,
+    /// 90% transparency (effect opacity 10%).
+    #[default]
+    Subtle,
+    /// 70% transparency (effect opacity 30%).
+    Full,
+}
+
+impl AmbientMode {
+    /// Parse from config value. Invalid values fall back to [`Self::Subtle`].
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "full" => Self::Full,
+            _ => Self::Subtle,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    #[must_use]
+    pub const fn effect_opacity(self) -> f32 {
+        match self {
+            Self::Off => 0.0,
+            Self::Subtle => 0.10, // 90% transparency
+            Self::Full => 0.30,   // 70% transparency
+        }
+    }
+}
+
+/// Health states that drive ambient visual effect selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AmbientHealthState {
+    /// No critical conditions, probes passing, event buffer below warning threshold.
+    #[default]
+    Healthy,
+    /// Some degradation (probe failures or high event-buffer utilization).
+    Warning,
+    /// Critical alerts active or multiple probes failing.
+    Critical,
+    /// No events observed for a prolonged period.
+    Idle,
+}
+
+/// Input snapshot used to classify ambient health state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AmbientHealthInput {
+    /// Whether any critical alert is currently active.
+    pub critical_alerts_active: bool,
+    /// Number of failing probes in the latest health snapshot.
+    pub failed_probe_count: u32,
+    /// Total probe count in the latest health snapshot.
+    pub total_probe_count: u32,
+    /// Event ring utilization as `[0.0, 1.0+]`.
+    pub event_buffer_utilization: f64,
+    /// Seconds since the most recent event.
+    pub seconds_since_last_event: u64,
+}
+
+impl Default for AmbientHealthInput {
+    fn default() -> Self {
+        Self {
+            critical_alerts_active: false,
+            failed_probe_count: 0,
+            total_probe_count: 0,
+            event_buffer_utilization: 0.0,
+            seconds_since_last_event: 0,
+        }
+    }
+}
+
+impl AmbientHealthInput {
+    #[must_use]
+    pub fn normalized_buffer_utilization(self) -> f64 {
+        self.event_buffer_utilization.clamp(0.0, 1.0)
+    }
+
+    #[must_use]
+    pub const fn has_probe_failures(self) -> bool {
+        self.failed_probe_count > 0
+    }
+
+    #[must_use]
+    pub const fn has_multiple_probe_failures(self) -> bool {
+        self.failed_probe_count > 1
+    }
+
+    /// Severity scalar used for critical-fire intensity/tinting.
+    #[must_use]
+    pub fn severity_score(self) -> f32 {
+        let alert_score: f32 = if self.critical_alerts_active {
+            1.0
+        } else {
+            0.0
+        };
+        let probe_score: f32 = if self.total_probe_count > 0 {
+            self.failed_probe_count as f32 / self.total_probe_count as f32
+        } else if self.failed_probe_count > 0 {
+            1.0
+        } else {
+            0.0
+        };
+        let buffer = self.normalized_buffer_utilization() as f32;
+        let buffer_score: f32 = if buffer > AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD as f32 {
+            (buffer - AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD as f32)
+                / (1.0 - AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD as f32)
+        } else {
+            0.0
+        };
+        alert_score
+            .max(probe_score)
+            .max(buffer_score)
+            .clamp(0.0, 1.0)
+    }
+}
+
+/// Determine ambient health state from system snapshot.
+///
+/// Priority order intentionally keeps critical conditions visible even when
+/// the system is otherwise idle.
+#[must_use]
+pub fn determine_ambient_health_state(input: AmbientHealthInput) -> AmbientHealthState {
+    if input.critical_alerts_active || input.has_multiple_probe_failures() {
+        return AmbientHealthState::Critical;
+    }
+    if input.seconds_since_last_event > AMBIENT_IDLE_THRESHOLD_SECS {
+        return AmbientHealthState::Idle;
+    }
+    if input.has_probe_failures()
+        || input.normalized_buffer_utilization() > AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD
+    {
+        return AmbientHealthState::Warning;
+    }
+    AmbientHealthState::Healthy
+}
+
+/// Active effect kind selected for a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AmbientEffectKind {
+    #[default]
+    None,
+    Plasma,
+    DoomFire,
+    Metaballs,
+}
+
+/// Structured diagnostics for ambient renderer behavior.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AmbientRenderTelemetry {
+    pub state: AmbientHealthState,
+    pub effect: AmbientEffectKind,
+    pub mode: AmbientMode,
+    pub quality: FxQuality,
+    pub effect_opacity: f32,
+    pub subpixel_width: u16,
+    pub subpixel_height: u16,
+    pub render_duration: std::time::Duration,
+}
+
+impl Default for AmbientRenderTelemetry {
+    fn default() -> Self {
+        Self {
+            state: AmbientHealthState::Healthy,
+            effect: AmbientEffectKind::None,
+            mode: AmbientMode::Off,
+            quality: FxQuality::Off,
+            effect_opacity: 0.0,
+            subpixel_width: 0,
+            subpixel_height: 0,
+            render_duration: std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Ambient FX renderer that draws into a reusable background buffer and
+/// composites once per frame.
+#[derive(Debug, Clone)]
+pub struct AmbientEffectRenderer {
+    plasma_fx: PlasmaFx,
+    doom_fire_fx: DoomFireFx,
+    metaballs_fx: MetaballsFx,
+    effect_buffer: Vec<PackedRgba>,
+    frame_counter: u64,
+    resolution_mode: Mode,
+    last_telemetry: AmbientRenderTelemetry,
+}
+
+impl AmbientEffectRenderer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            plasma_fx: PlasmaFx::theme(),
+            doom_fire_fx: DoomFireFx::new(),
+            metaballs_fx: MetaballsFx::default_theme(),
+            effect_buffer: Vec::new(),
+            frame_counter: 0,
+            resolution_mode: Mode::HalfBlock,
+            last_telemetry: AmbientRenderTelemetry::default(),
+        }
+    }
+
+    #[must_use]
+    pub const fn resolution_mode(&self) -> Mode {
+        self.resolution_mode
+    }
+
+    #[must_use]
+    pub const fn last_telemetry(&self) -> AmbientRenderTelemetry {
+        self.last_telemetry
+    }
+
+    /// Render ambient background effect into z-layer 0 (background colors only).
+    ///
+    /// `animation_seconds` should be a monotonic animation clock from the caller.
+    pub fn render(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame,
+        mode: AmbientMode,
+        health: AmbientHealthInput,
+        animation_seconds: f64,
+    ) -> AmbientRenderTelemetry {
+        let render_start = std::time::Instant::now();
+        let state = determine_ambient_health_state(health);
+
+        if area.is_empty() || !mode.is_enabled() {
+            return self.finish_telemetry(
+                state,
+                AmbientEffectKind::None,
+                mode,
+                FxQuality::Off,
+                0.0,
+                0,
+                0,
+                render_start.elapsed(),
+            );
+        }
+
+        let subpixel_width = area
+            .width
+            .saturating_mul(self.resolution_mode.cols_per_cell());
+        let subpixel_height = area
+            .height
+            .saturating_mul(self.resolution_mode.rows_per_cell());
+        let len = usize::from(subpixel_width) * usize::from(subpixel_height);
+        if len == 0 {
+            return self.finish_telemetry(
+                state,
+                AmbientEffectKind::None,
+                mode,
+                FxQuality::Off,
+                0.0,
+                subpixel_width,
+                subpixel_height,
+                render_start.elapsed(),
+            );
+        }
+
+        if self.effect_buffer.len() < len {
+            self.effect_buffer.resize(len, PackedRgba::TRANSPARENT);
+        }
+        self.effect_buffer[..len].fill(PackedRgba::TRANSPARENT);
+
+        let quality = FxQuality::from_degradation_with_area(frame.buffer.degradation, len);
+        if !quality.is_enabled() {
+            return self.finish_telemetry(
+                state,
+                AmbientEffectKind::None,
+                mode,
+                quality,
+                0.0,
+                subpixel_width,
+                subpixel_height,
+                render_start.elapsed(),
+            );
+        }
+
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        let theme_inputs = build_ambient_theme_inputs(state);
+
+        let effect = match state {
+            AmbientHealthState::Healthy => {
+                self.render_plasma(
+                    PlasmaPalette::ThemeAccents,
+                    0.35,
+                    quality,
+                    subpixel_width,
+                    subpixel_height,
+                    animation_seconds,
+                    &theme_inputs,
+                    len,
+                );
+                AmbientEffectKind::Plasma
+            }
+            AmbientHealthState::Warning => {
+                self.render_plasma(
+                    PlasmaPalette::Ember,
+                    0.85,
+                    quality,
+                    subpixel_width,
+                    subpixel_height,
+                    animation_seconds,
+                    &theme_inputs,
+                    len,
+                );
+                AmbientEffectKind::Plasma
+            }
+            AmbientHealthState::Critical => {
+                let severity = health.severity_score();
+                self.render_critical_fire(
+                    quality,
+                    subpixel_width,
+                    subpixel_height,
+                    animation_seconds,
+                    &theme_inputs,
+                    severity,
+                    len,
+                );
+                AmbientEffectKind::DoomFire
+            }
+            AmbientHealthState::Idle => {
+                self.render_idle_metaballs(
+                    quality,
+                    subpixel_width,
+                    subpixel_height,
+                    animation_seconds,
+                    &theme_inputs,
+                    len,
+                );
+                AmbientEffectKind::Metaballs
+            }
+        };
+
+        let opacity = mode.effect_opacity();
+        self.composite_halfblock(area, frame, opacity, subpixel_width, subpixel_height);
+
+        self.finish_telemetry(
+            state,
+            effect,
+            mode,
+            quality,
+            opacity,
+            subpixel_width,
+            subpixel_height,
+            render_start.elapsed(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_plasma(
+        &mut self,
+        palette: PlasmaPalette,
+        speed_scale: f64,
+        quality: FxQuality,
+        width: u16,
+        height: u16,
+        animation_seconds: f64,
+        theme_inputs: &ThemeInputs,
+        len: usize,
+    ) {
+        self.plasma_fx.set_palette(palette);
+        self.plasma_fx.resize(width, height);
+        let ctx = FxContext {
+            width,
+            height,
+            frame: self.frame_counter,
+            time_seconds: animation_seconds * speed_scale,
+            quality,
+            theme: theme_inputs,
+        };
+        self.plasma_fx.render(ctx, &mut self.effect_buffer[..len]);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_critical_fire(
+        &mut self,
+        quality: FxQuality,
+        width: u16,
+        height: u16,
+        animation_seconds: f64,
+        theme_inputs: &ThemeInputs,
+        severity: f32,
+        len: usize,
+    ) {
+        let wind = if severity > 0.66 {
+            1
+        } else if severity > 0.33 {
+            0
+        } else {
+            -1
+        };
+        self.doom_fire_fx.set_wind(wind);
+        self.doom_fire_fx.set_active(true);
+        self.doom_fire_fx.resize(width, height);
+        let ctx = FxContext {
+            width,
+            height,
+            frame: self.frame_counter,
+            time_seconds: animation_seconds,
+            quality,
+            theme: theme_inputs,
+        };
+        self.doom_fire_fx
+            .render(ctx, &mut self.effect_buffer[..len]);
+
+        let tint_strength = 0.30 + severity.clamp(0.0, 1.0) * 0.70;
+        for pixel in &mut self.effect_buffer[..len] {
+            *pixel = blend_rgb(*pixel, theme_inputs.accent_primary, tint_strength);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_idle_metaballs(
+        &mut self,
+        quality: FxQuality,
+        width: u16,
+        height: u16,
+        animation_seconds: f64,
+        theme_inputs: &ThemeInputs,
+        len: usize,
+    ) {
+        let mut params = MetaballsParams::default();
+        params.palette = MetaballsPalette::ThemeAccents;
+        params.time_scale = 10.0;
+        params.pulse_speed = 0.65;
+        params.hue_speed = 0.02;
+        self.metaballs_fx.set_params(params);
+        self.metaballs_fx.resize(width, height);
+        let ctx = FxContext {
+            width,
+            height,
+            frame: self.frame_counter,
+            time_seconds: animation_seconds,
+            quality,
+            theme: theme_inputs,
+        };
+        self.metaballs_fx
+            .render(ctx, &mut self.effect_buffer[..len]);
+    }
+
+    fn composite_halfblock(
+        &mut self,
+        area: Rect,
+        frame: &mut Frame,
+        opacity: f32,
+        subpixel_width: u16,
+        subpixel_height: u16,
+    ) {
+        if opacity <= 0.0 || area.is_empty() || subpixel_width == 0 || subpixel_height == 0 {
+            return;
+        }
+
+        let stride = usize::from(subpixel_width);
+        let max_sub_y = usize::from(subpixel_height.saturating_sub(1));
+
+        for dy in 0..area.height {
+            let top_sub_y = usize::from(dy) * usize::from(self.resolution_mode.rows_per_cell());
+            let bottom_sub_y = (top_sub_y + 1).min(max_sub_y);
+            let top_row = top_sub_y * stride;
+            let bottom_row = bottom_sub_y * stride;
+
+            for dx in 0..area.width {
+                let sub_x = usize::from(dx);
+                let top = self.effect_buffer[top_row + sub_x];
+                let bottom = self.effect_buffer[bottom_row + sub_x];
+                let merged = average_rgb(top, bottom);
+                let overlay = merged.with_opacity(opacity);
+                if overlay.a() == 0 {
+                    continue;
+                }
+                if let Some(cell) = frame
+                    .buffer
+                    .get_mut(area.x.saturating_add(dx), area.y.saturating_add(dy))
+                {
+                    cell.bg = overlay.over(cell.bg);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_telemetry(
+        &mut self,
+        state: AmbientHealthState,
+        effect: AmbientEffectKind,
+        mode: AmbientMode,
+        quality: FxQuality,
+        effect_opacity: f32,
+        subpixel_width: u16,
+        subpixel_height: u16,
+        render_duration: std::time::Duration,
+    ) -> AmbientRenderTelemetry {
+        let telemetry = AmbientRenderTelemetry {
+            state,
+            effect,
+            mode,
+            quality,
+            effect_opacity,
+            subpixel_width,
+            subpixel_height,
+            render_duration,
+        };
+        self.last_telemetry = telemetry;
+        telemetry
+    }
+}
+
+impl Default for AmbientEffectRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn build_ambient_theme_inputs(state: AmbientHealthState) -> ThemeInputs {
+    let tui = crate::tui_theme::TuiThemePalette::current();
+    let base = theme::current_palette();
+
+    let (accent_primary, accent_secondary, accent_slots) = match state {
+        AmbientHealthState::Healthy => (
+            tui.severity_ok,
+            base.accent_secondary,
+            [
+                tui.severity_ok,
+                base.accent_secondary,
+                tui.status_good,
+                tui.status_accent,
+            ],
+        ),
+        AmbientHealthState::Warning => (
+            tui.severity_warn,
+            blend_rgb(tui.severity_warn, base.accent_warning, 0.5),
+            [
+                tui.severity_warn,
+                blend_rgb(tui.severity_warn, base.accent_warning, 0.5),
+                blend_rgb(tui.severity_warn, tui.severity_critical, 0.25),
+                base.accent_warning,
+            ],
+        ),
+        AmbientHealthState::Critical => (
+            tui.severity_critical,
+            blend_rgb(tui.severity_critical, base.accent_warning, 0.5),
+            [
+                tui.severity_critical,
+                blend_rgb(tui.severity_critical, base.accent_warning, 0.5),
+                base.accent_error,
+                base.accent_warning,
+            ],
+        ),
+        AmbientHealthState::Idle => (
+            base.accent_primary,
+            base.accent_info,
+            [
+                base.accent_primary,
+                base.accent_info,
+                base.accent_secondary,
+                tui.status_accent,
+            ],
+        ),
+    };
+
+    ThemeInputs::new(
+        tui.bg_deep,
+        tui.bg_surface,
+        tui.bg_overlay,
+        tui.text_primary,
+        tui.text_muted,
+        accent_primary,
+        accent_secondary,
+        accent_slots,
+    )
+}
+
+fn blend_rgb(left: PackedRgba, right: PackedRgba, mix: f32) -> PackedRgba {
+    let t = mix.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    PackedRgba::rgb(
+        (left.r() as f32 * inv + right.r() as f32 * t) as u8,
+        (left.g() as f32 * inv + right.g() as f32 * t) as u8,
+        (left.b() as f32 * inv + right.b() as f32 * t) as u8,
+    )
+}
+
+fn average_rgb(top: PackedRgba, bottom: PackedRgba) -> PackedRgba {
+    PackedRgba::rgb(
+        ((u16::from(top.r()) + u16::from(bottom.r())) / 2) as u8,
+        ((u16::from(top.g()) + u16::from(bottom.g())) / 2) as u8,
+        ((u16::from(top.b()) + u16::from(bottom.b())) / 2) as u8,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7662,6 +8275,244 @@ mod tests {
             level,
             DisclosureLevel::Badge,
             "4 prev() should cycle back to Badge"
+        );
+    }
+
+    fn fill_bg(frame: &mut Frame, width: u16, height: u16, color: PackedRgba) {
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(cell) = frame.buffer.get_mut(x, y) {
+                    cell.bg = color;
+                }
+            }
+        }
+    }
+
+    fn total_bg_delta(frame: &Frame, width: u16, height: u16, base: PackedRgba) -> u64 {
+        let mut total = 0_u64;
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    total += u64::from(cell.bg.r().abs_diff(base.r()));
+                    total += u64::from(cell.bg.g().abs_diff(base.g()));
+                    total += u64::from(cell.bg.b().abs_diff(base.b()));
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn ambient_mode_parse_defaults_to_subtle() {
+        assert_eq!(AmbientMode::parse("off"), AmbientMode::Off);
+        assert_eq!(AmbientMode::parse("full"), AmbientMode::Full);
+        assert_eq!(AmbientMode::parse("subtle"), AmbientMode::Subtle);
+        assert_eq!(AmbientMode::parse("unexpected"), AmbientMode::Subtle);
+    }
+
+    #[test]
+    fn ambient_health_state_priority_rules() {
+        let critical_idle = AmbientHealthInput {
+            critical_alerts_active: true,
+            failed_probe_count: 0,
+            total_probe_count: 4,
+            event_buffer_utilization: 0.0,
+            seconds_since_last_event: 1_000,
+        };
+        assert_eq!(
+            determine_ambient_health_state(critical_idle),
+            AmbientHealthState::Critical
+        );
+
+        let idle = AmbientHealthInput {
+            seconds_since_last_event: 301,
+            ..AmbientHealthInput::default()
+        };
+        assert_eq!(
+            determine_ambient_health_state(idle),
+            AmbientHealthState::Idle
+        );
+
+        let warning_probe = AmbientHealthInput {
+            failed_probe_count: 1,
+            total_probe_count: 4,
+            ..AmbientHealthInput::default()
+        };
+        assert_eq!(
+            determine_ambient_health_state(warning_probe),
+            AmbientHealthState::Warning
+        );
+
+        let warning_buffer = AmbientHealthInput {
+            event_buffer_utilization: 0.81,
+            ..AmbientHealthInput::default()
+        };
+        assert_eq!(
+            determine_ambient_health_state(warning_buffer),
+            AmbientHealthState::Warning
+        );
+
+        assert_eq!(
+            determine_ambient_health_state(AmbientHealthInput::default()),
+            AmbientHealthState::Healthy
+        );
+    }
+
+    #[test]
+    fn ambient_renderer_off_is_noop() {
+        let mut renderer = AmbientEffectRenderer::new();
+        let mut pool = GraphemePool::new();
+        let width = 40;
+        let height = 12;
+        let area = Rect::new(0, 0, width, height);
+        let base = PackedRgba::rgb(12, 18, 24);
+        let mut frame = Frame::new(width, height, &mut pool);
+        fill_bg(&mut frame, width, height, base);
+        let before = extract_buffer_snapshot(&frame, width, height);
+
+        let telemetry = renderer.render(
+            area,
+            &mut frame,
+            AmbientMode::Off,
+            AmbientHealthInput::default(),
+            10.0,
+        );
+
+        let after = extract_buffer_snapshot(&frame, width, height);
+        assert_eq!(before, after, "off mode must not modify background");
+        assert_eq!(telemetry.effect, AmbientEffectKind::None);
+        assert_eq!(telemetry.mode, AmbientMode::Off);
+    }
+
+    #[test]
+    fn ambient_renderer_selects_effect_by_health_state() {
+        let mut renderer = AmbientEffectRenderer::new();
+        let mut pool = GraphemePool::new();
+        let width = 32;
+        let height = 10;
+        let area = Rect::new(0, 0, width, height);
+        let base = PackedRgba::rgb(8, 10, 14);
+
+        let mut frame = Frame::new(width, height, &mut pool);
+        fill_bg(&mut frame, width, height, base);
+        let healthy = renderer.render(
+            area,
+            &mut frame,
+            AmbientMode::Subtle,
+            AmbientHealthInput::default(),
+            1.0,
+        );
+        assert_eq!(healthy.state, AmbientHealthState::Healthy);
+        assert_eq!(healthy.effect, AmbientEffectKind::Plasma);
+
+        let mut frame = Frame::new(width, height, &mut pool);
+        fill_bg(&mut frame, width, height, base);
+        let warning = renderer.render(
+            area,
+            &mut frame,
+            AmbientMode::Subtle,
+            AmbientHealthInput {
+                event_buffer_utilization: 0.9,
+                ..AmbientHealthInput::default()
+            },
+            2.0,
+        );
+        assert_eq!(warning.state, AmbientHealthState::Warning);
+        assert_eq!(warning.effect, AmbientEffectKind::Plasma);
+
+        let mut frame = Frame::new(width, height, &mut pool);
+        fill_bg(&mut frame, width, height, base);
+        let critical = renderer.render(
+            area,
+            &mut frame,
+            AmbientMode::Subtle,
+            AmbientHealthInput {
+                failed_probe_count: 2,
+                total_probe_count: 4,
+                ..AmbientHealthInput::default()
+            },
+            3.0,
+        );
+        assert_eq!(critical.state, AmbientHealthState::Critical);
+        assert_eq!(critical.effect, AmbientEffectKind::DoomFire);
+
+        let mut frame = Frame::new(width, height, &mut pool);
+        fill_bg(&mut frame, width, height, base);
+        let idle = renderer.render(
+            area,
+            &mut frame,
+            AmbientMode::Subtle,
+            AmbientHealthInput {
+                seconds_since_last_event: 301,
+                ..AmbientHealthInput::default()
+            },
+            4.0,
+        );
+        assert_eq!(idle.state, AmbientHealthState::Idle);
+        assert_eq!(idle.effect, AmbientEffectKind::Metaballs);
+    }
+
+    #[test]
+    fn ambient_renderer_full_mode_is_more_visible_than_subtle() {
+        let width = 44;
+        let height = 14;
+        let area = Rect::new(0, 0, width, height);
+        let base = PackedRgba::rgb(10, 14, 22);
+        let health = AmbientHealthInput {
+            event_buffer_utilization: 0.85,
+            ..AmbientHealthInput::default()
+        };
+
+        let mut subtle_renderer = AmbientEffectRenderer::new();
+        let mut subtle_pool = GraphemePool::new();
+        let mut subtle_frame = Frame::new(width, height, &mut subtle_pool);
+        fill_bg(&mut subtle_frame, width, height, base);
+        subtle_renderer.render(area, &mut subtle_frame, AmbientMode::Subtle, health, 12.0);
+        let subtle_delta = total_bg_delta(&subtle_frame, width, height, base);
+
+        let mut full_renderer = AmbientEffectRenderer::new();
+        let mut full_pool = GraphemePool::new();
+        let mut full_frame = Frame::new(width, height, &mut full_pool);
+        fill_bg(&mut full_frame, width, height, base);
+        full_renderer.render(area, &mut full_frame, AmbientMode::Full, health, 12.0);
+        let full_delta = total_bg_delta(&full_frame, width, height, base);
+
+        assert!(
+            full_delta > subtle_delta,
+            "full mode should have stronger visual impact (full={full_delta}, subtle={subtle_delta})"
+        );
+    }
+
+    #[test]
+    fn perf_ambient_renderer_under_2ms() {
+        let mut renderer = AmbientEffectRenderer::new();
+        let width = 40;
+        let height = 16;
+        let area = Rect::new(0, 0, width, height);
+        let base = PackedRgba::rgb(14, 20, 30);
+        let health = AmbientHealthInput {
+            event_buffer_utilization: 0.9,
+            ..AmbientHealthInput::default()
+        };
+        let iters = 120_u32;
+
+        let mut total_us = 0_u128;
+        for i in 0..iters {
+            let mut pool = GraphemePool::new();
+            let mut frame = Frame::new(width, height, &mut pool);
+            fill_bg(&mut frame, width, height, base);
+            let telemetry =
+                renderer.render(area, &mut frame, AmbientMode::Subtle, health, f64::from(i));
+            total_us += telemetry.render_duration.as_micros();
+        }
+
+        let per_iter_us = total_us / u128::from(iters);
+        eprintln!(
+            "ambient perf: {iters} frames in {total_us}µs ({per_iter_us}µs/frame, budget 2000µs)"
+        );
+        assert!(
+            per_iter_us <= 2_000,
+            "ambient renderer exceeded budget: {per_iter_us}µs/frame"
         );
     }
 }

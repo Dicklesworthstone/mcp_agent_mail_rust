@@ -1795,7 +1795,10 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     impl Embedder for FixedSemanticTestEmbedder {
-        fn embed(&self, text: &str) -> SearchResult<EmbeddingResult> {
+        fn embed(
+            &self,
+            text: &str,
+        ) -> mcp_agent_mail_search_core::error::SearchResult<EmbeddingResult> {
             Ok(EmbeddingResult::new(
                 vec![0.42_f32; self.info.dimension],
                 self.info.id.clone(),
@@ -1845,7 +1848,7 @@ mod tests {
 
         let hits = bridge
             .index()
-            .search(&vec![0.42_f32; 4], 8, None)
+            .search(&[0.42_f32; 4], 8, None)
             .expect("vector index search should succeed");
         assert!(
             hits.iter().any(|hit| hit.doc_id == 7001),

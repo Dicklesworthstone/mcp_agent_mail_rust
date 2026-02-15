@@ -1,12 +1,13 @@
 MCP Agent Mail CLI (Rust)
 
-Usage: am <COMMAND>
+Usage: am [COMMAND]
 
 Commands:
   serve-http
   serve-stdio
   check-inbox                 Check agent inbox for unread messages (for git hooks and editor integrations)
   ci                          Run CI quality gates (format, lint, build, test)
+  bench                       Run native CLI benchmarks
   lint
   typecheck
   e2e                         Run E2E test suites

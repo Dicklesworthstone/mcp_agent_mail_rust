@@ -145,18 +145,24 @@ impl ActionMenuState {
         self.entries.is_empty()
     }
 
-    /// Move selection up.
+    /// Move selection up (wraps from first to last).
     pub fn move_up(&mut self) {
-        if !self.entries.is_empty() && self.selected > 0 {
+        if self.entries.is_empty() {
+            return;
+        }
+        if self.selected == 0 {
+            self.selected = self.entries.len() - 1;
+        } else {
             self.selected -= 1;
         }
     }
 
-    /// Move selection down.
+    /// Move selection down (wraps from last to first).
     pub fn move_down(&mut self) {
-        if !self.entries.is_empty() && self.selected < self.entries.len() - 1 {
-            self.selected += 1;
+        if self.entries.is_empty() {
+            return;
         }
+        self.selected = (self.selected + 1) % self.entries.len();
     }
 
     /// Jump to the first entry starting with the given character.
@@ -701,17 +707,14 @@ mod tests {
         state.move_down();
         assert_eq!(state.selected, 2);
 
-        state.move_down(); // Should stay at 2
+        state.move_down(); // Wrap to first
+        assert_eq!(state.selected, 0);
+
+        state.move_up();
         assert_eq!(state.selected, 2);
 
         state.move_up();
         assert_eq!(state.selected, 1);
-
-        state.move_up();
-        assert_eq!(state.selected, 0);
-
-        state.move_up(); // Should stay at 0
-        assert_eq!(state.selected, 0);
     }
 
     #[test]
@@ -764,5 +767,108 @@ mod tests {
         assert!(!actions.iter().any(|a| a.label == "Approve"));
         assert!(!actions.iter().any(|a| a.label == "Deny"));
         assert!(actions.iter().any(|a| a.label == "Block"));
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(ftui::KeyEvent::new(code))
+    }
+
+    #[test]
+    fn test_action_menu_manager_open_ignores_empty_entries() {
+        let mut manager = ActionMenuManager::new();
+        manager.open(Vec::new(), 0, "ctx");
+        assert!(!manager.is_active());
+        assert!(manager.handle_event(&key_event(KeyCode::Enter)).is_none());
+    }
+
+    #[test]
+    fn test_action_menu_manager_enter_selects_and_closes() {
+        let mut manager = ActionMenuManager::new();
+        manager.open(
+            vec![ActionEntry::new(
+                "Run",
+                ActionKind::Execute("run_action".to_string()),
+            )],
+            1,
+            "message:42",
+        );
+        assert!(manager.is_active());
+
+        let result = manager.handle_event(&key_event(KeyCode::Enter));
+        assert!(!manager.is_active());
+        match result {
+            Some(ActionMenuResult::Selected(ActionKind::Execute(op), context)) => {
+                assert_eq!(op, "run_action");
+                assert_eq!(context, "message:42");
+            }
+            other => panic!("expected selected execute result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_action_menu_manager_escape_dismisses() {
+        let mut manager = ActionMenuManager::new();
+        manager.open(
+            vec![ActionEntry::new("Dismiss", ActionKind::Dismiss)],
+            1,
+            "ctx",
+        );
+        let result = manager.handle_event(&key_event(KeyCode::Escape));
+        assert!(!manager.is_active());
+        assert!(matches!(result, Some(ActionMenuResult::Dismissed)));
+    }
+
+    #[test]
+    fn test_action_menu_manager_alpha_jump_then_enter() {
+        let mut manager = ActionMenuManager::new();
+        manager.open(
+            vec![
+                ActionEntry::new("Alpha", ActionKind::Execute("a".to_string())),
+                ActionEntry::new("Beta", ActionKind::Execute("b".to_string())),
+                ActionEntry::new("Charlie", ActionKind::Execute("c".to_string())),
+            ],
+            0,
+            "ctx-jump",
+        );
+
+        let _ = manager.handle_event(&key_event(KeyCode::Char('c')));
+        let result = manager.handle_event(&key_event(KeyCode::Enter));
+        match result {
+            Some(ActionMenuResult::Selected(ActionKind::Execute(op), context)) => {
+                assert_eq!(op, "c");
+                assert_eq!(context, "ctx-jump");
+            }
+            other => panic!("expected char-jump selected result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_action_menu_manager_noop_when_inactive() {
+        let mut manager = ActionMenuManager::new();
+        assert!(manager.handle_event(&key_event(KeyCode::Enter)).is_none());
+    }
+
+    #[test]
+    fn test_agents_threads_timeline_actions_have_core_entries() {
+        let agents = agents_actions("BlueLake");
+        assert!(agents.iter().any(|a| a.label == "View profile"));
+        assert!(agents.iter().any(|a| a.label == "Send message"));
+
+        let threads = threads_actions("th-1");
+        assert!(threads.iter().any(|a| a.label == "View messages"));
+        assert!(threads.iter().any(|a| a.label == "Summarize"));
+
+        let timeline = timeline_actions("tool_call_end", "http");
+        assert!(timeline.iter().any(|a| a.label == "View details"));
+        assert!(timeline.iter().any(|a| a.label == "Filter by source"));
+    }
+
+    #[test]
+    fn test_contacts_actions_blocked_status_omits_block_action() {
+        let actions = contacts_actions("AgentA", "AgentB", "blocked");
+        assert!(!actions.iter().any(|a| a.label == "Block"));
+        assert!(!actions.iter().any(|a| a.label == "Approve"));
+        assert!(!actions.iter().any(|a| a.label == "Deny"));
+        assert!(actions.iter().any(|a| a.label == "View agent"));
     }
 }

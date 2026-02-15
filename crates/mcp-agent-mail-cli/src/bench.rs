@@ -1369,7 +1369,7 @@ mod tests {
         let b = fixture_signature("help", "--help", "{}", &hw);
         assert_eq!(a, b);
         assert_eq!(a.len(), 16);
-        assert_eq!(a, "6f9ed3a2c04bb2dd");
+        assert_eq!(a, "49d26a42643b7ee5");
     }
 
     #[test]

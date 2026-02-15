@@ -154,6 +154,7 @@ pub async fn macro_start_session(
         None,
         Some(inbox_limit.unwrap_or(10)),
         Some(false),
+        None,
     )
     .await?;
     let inbox: Vec<InboxMessage> = parse_json(inbox_json, "inbox")?;
@@ -329,6 +330,7 @@ pub async fn macro_prepare_thread(
         None,
         Some(inbox_limit.unwrap_or(10)),
         Some(include_inbox_bodies.unwrap_or(false)),
+        None,
     )
     .await?;
     let inbox: Vec<InboxMessage> = parse_json(inbox_json, "inbox")?;
@@ -695,6 +697,8 @@ pub async fn macro_contact_handshake(
                 None,
                 None, // ack_required
                 thread_id,
+                None,
+                None,
                 None,
             )
             .await?;

@@ -772,4 +772,94 @@ mod tests {
         );
         assert_eq!(dropped, 32);
     }
+
+    #[test]
+    fn remote_terminal_event_drain_respects_limit_and_order() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        assert!(!state.push_remote_terminal_event(RemoteTerminalEvent::Key {
+            key: "a".to_string(),
+            modifiers: 0,
+        }));
+        assert!(!state.push_remote_terminal_event(RemoteTerminalEvent::Key {
+            key: "b".to_string(),
+            modifiers: 0,
+        }));
+        assert!(!state.push_remote_terminal_event(RemoteTerminalEvent::Key {
+            key: "c".to_string(),
+            modifiers: 0,
+        }));
+
+        let drained = state.drain_remote_terminal_events(2);
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(
+            &drained[0],
+            RemoteTerminalEvent::Key { key, modifiers: 0 } if key == "a"
+        ));
+        assert!(matches!(
+            &drained[1],
+            RemoteTerminalEvent::Key { key, modifiers: 0 } if key == "b"
+        ));
+
+        assert_eq!(state.remote_terminal_queue_len(), 1);
+        let remaining = state.drain_remote_terminal_events(8);
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(
+            &remaining[0],
+            RemoteTerminalEvent::Key { key, modifiers: 0 } if key == "c"
+        ));
+    }
+
+    #[test]
+    fn remote_terminal_event_drain_zero_limit_noop() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(
+            !state.push_remote_terminal_event(RemoteTerminalEvent::Resize {
+                cols: 100,
+                rows: 30,
+            })
+        );
+        let drained = state.drain_remote_terminal_events(0);
+        assert!(drained.is_empty());
+        assert_eq!(state.remote_terminal_queue_len(), 1);
+    }
+
+    #[test]
+    fn console_log_since_filters_monotonically() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        state.push_console_log("first".to_string());
+        state.push_console_log("second".to_string());
+        state.push_console_log("third".to_string());
+
+        let all = state.console_log_since(0);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].0, 1);
+        assert_eq!(all[1].0, 2);
+        assert_eq!(all[2].0, 3);
+        assert_eq!(all[2].1, "third");
+
+        let tail = state.console_log_since(2);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].0, 3);
+        assert_eq!(tail[0].1, "third");
+    }
+
+    #[test]
+    fn console_log_ring_is_bounded_to_capacity() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        for i in 0..(CONSOLE_LOG_CAPACITY + 5) {
+            state.push_console_log(format!("line-{i}"));
+        }
+
+        let entries = state.console_log_since(0);
+        assert_eq!(entries.len(), CONSOLE_LOG_CAPACITY);
+        assert_eq!(entries[0].0, 6);
+        assert_eq!(entries.last().map(|(seq, _)| *seq), Some(2005));
+    }
 }

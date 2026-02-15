@@ -104,6 +104,8 @@ async fn send_basic_message(
         Some("normal".to_string()),
         Some(false),
         None,
+        None,
+        None,
         auto_contact_if_blocked,
     )
     .await
@@ -165,6 +167,7 @@ fn test_contact_blocked_message() {
             None,
             Some(20),
             Some(true),
+            None,
         )
         .await
         .expect("fetch_inbox");
@@ -332,6 +335,7 @@ fn test_mixed_recipients_partial_block() {
             None,
             Some(20),
             Some(true),
+            None,
         )
         .await
         .expect("fetch BlueLake inbox");

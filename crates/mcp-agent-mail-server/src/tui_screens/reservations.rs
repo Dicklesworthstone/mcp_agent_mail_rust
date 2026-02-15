@@ -11,6 +11,7 @@ use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::progress::ProgressBar;
 
@@ -217,13 +218,17 @@ impl ReservationsScreen {
         self.table_state.selected = Some(next);
     }
 
-    fn summary_counts(&self) -> (usize, usize, usize) {
+    fn summary_counts(&self) -> (usize, usize, usize, usize) {
         let mut active = 0usize;
         let mut exclusive = 0usize;
         let mut shared = 0usize;
+        let mut expired = 0usize;
         for res in self.reservations.values() {
             if !res.released {
                 active += 1;
+                if res.remaining_secs() == 0 {
+                    expired += 1;
+                }
                 if res.exclusive {
                     exclusive += 1;
                 } else {
@@ -231,7 +236,7 @@ impl ReservationsScreen {
                 }
             }
         }
-        (active, exclusive, shared)
+        (active, exclusive, shared, expired)
     }
 }
 
@@ -311,11 +316,14 @@ impl MailScreen for ReservationsScreen {
         Some((actions, anchor_row, context_id))
     }
 
-    fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
+    #[allow(clippy::too_many_lines)]
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         if area.height < 3 || area.width < 30 {
             return;
         }
         let tp = crate::tui_theme::TuiThemePalette::current();
+        let effects_enabled = state.config_snapshot().tui_effects;
+        let animation_time = state.uptime().as_secs_f64();
 
         let header_h = 1_u16;
         let table_h = area.height.saturating_sub(header_h);
@@ -323,7 +331,7 @@ impl MailScreen for ReservationsScreen {
         let table_area = Rect::new(area.x, area.y + header_h, area.width, table_h);
 
         // Summary line
-        let (active, exclusive, shared) = self.summary_counts();
+        let (active, exclusive, shared, expired) = self.summary_counts();
         let sort_indicator = if self.sort_asc {
             "\u{25b2}"
         } else {
@@ -335,11 +343,43 @@ impl MailScreen for ReservationsScreen {
         } else {
             ""
         };
-        let summary = format!(
+        let summary_base = format!(
             " {active} active | {exclusive} exclusive | {shared} shared | Sort: {sort_label}{sort_indicator} {released_label}",
         );
+        let critical_alert = if expired > 0 {
+            format!(" | CRITICAL: {expired} expired")
+        } else {
+            String::new()
+        };
+        let summary = format!("{summary_base}{critical_alert}");
         let p = Paragraph::new(summary);
         p.render(header_area, frame);
+        if !critical_alert.is_empty() {
+            let start_offset = u16::try_from(summary_base.len()).unwrap_or(u16::MAX);
+            if start_offset < header_area.width {
+                let alert_area = Rect::new(
+                    header_area.x.saturating_add(start_offset),
+                    header_area.y,
+                    header_area.width.saturating_sub(start_offset),
+                    1,
+                );
+                if effects_enabled {
+                    StyledText::new(critical_alert.trim_start())
+                        .effect(TextEffect::PulsingGlow {
+                            color: tp.severity_critical,
+                            speed: 0.5,
+                        })
+                        .base_color(tp.severity_critical)
+                        .bold()
+                        .time(animation_time)
+                        .render(alert_area, frame);
+                } else {
+                    Paragraph::new(critical_alert.trim_start())
+                        .style(Style::default().fg(tp.severity_critical).bold())
+                        .render(alert_area, frame);
+                }
+            }
+        }
 
         // Table rows
         let header = Row::new(["Agent", "Path Pattern", "Excl", "TTL Remaining", "Project"])
@@ -670,10 +710,11 @@ mod tests {
         screen.ingest_events(&state);
         assert_eq!(screen.reservations.len(), 2);
 
-        let (active, excl, shared) = screen.summary_counts();
+        let (active, excl, shared, expired) = screen.summary_counts();
         assert_eq!(active, 2);
         assert_eq!(excl, 1);
         assert_eq!(shared, 1);
+        assert_eq!(expired, 0);
     }
 
     #[test]
@@ -695,8 +736,9 @@ mod tests {
         ));
 
         screen.ingest_events(&state);
-        let (active, _, _) = screen.summary_counts();
+        let (active, _, _, expired) = screen.summary_counts();
         assert_eq!(active, 0);
+        assert_eq!(expired, 0);
 
         // Without show_released, sorted_keys should be empty
         screen.rebuild_sorted();
@@ -748,6 +790,32 @@ mod tests {
         assert_eq!(format_ttl(30), "30s left");
         assert_eq!(format_ttl(300), "5m left");
         assert_eq!(format_ttl(7200), "2h left");
+    }
+
+    #[test]
+    fn summary_counts_tracks_expired_entries() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+        let _ = state.push_event(MailEvent::reservation_granted(
+            "BlueLake",
+            vec!["src/**/*.rs".to_string()],
+            true,
+            0,
+            "proj",
+        ));
+        let _ = state.push_event(MailEvent::reservation_granted(
+            "RedStone",
+            vec!["tests/*.rs".to_string()],
+            false,
+            1800,
+            "proj",
+        ));
+        screen.ingest_events(&state);
+        let (active, exclusive, shared, expired) = screen.summary_counts();
+        assert_eq!(active, 2);
+        assert_eq!(exclusive, 1);
+        assert_eq!(shared, 1);
+        assert_eq!(expired, 1);
     }
 
     #[test]

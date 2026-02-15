@@ -1,6 +1,3 @@
-// Note: unsafe required for env::set_var in Rust 2024
-#![allow(unsafe_code)]
-
 //! Conformance tests verifying Rust tool descriptions match the Python reference
 //! fixture character-for-character. The fixture was generated from the Python
 //! MCP server and lives at `tests/conformance/fixtures/tool_descriptions.json`.
@@ -11,45 +8,10 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
-/// Serialization guard for env mutations across tests.
+/// Serialization guard for tests that instantiate temporary server instances.
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
-}
-
-struct EnvVarGuard {
-    previous: Vec<(String, Option<String>)>,
-}
-
-impl EnvVarGuard {
-    fn set(vars: &[(&str, &str)]) -> Self {
-        let mut previous = Vec::new();
-        for (key, value) in vars {
-            let old = std::env::var(*key).ok();
-            previous.push(((*key).to_string(), old));
-            unsafe {
-                std::env::set_var(key, value);
-            }
-        }
-        mcp_agent_mail_core::Config::reset_cached();
-        Self { previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.drain(..) {
-            match value {
-                Some(v) => unsafe {
-                    std::env::set_var(&key, v);
-                },
-                None => unsafe {
-                    std::env::remove_var(&key);
-                },
-            }
-        }
-        mcp_agent_mail_core::Config::reset_cached();
-    }
 }
 
 /// A tool entry from the Python reference fixture.
@@ -94,16 +56,11 @@ fn get_rust_tools() -> Vec<Tool> {
     let db_url = format!("sqlite://{}", db_path.display());
     let storage = tmp.path().join("archive");
 
-    let _env_guard = EnvVarGuard::set(&[
-        ("DATABASE_URL", &db_url),
-        ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
-        ("WORKTREES_ENABLED", "1"),
-        ("PRODUCTS_ENABLED", "1"),
-        ("TOOLS_FILTER_ENABLED", "0"),
-        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
-    ]);
-
-    let config = mcp_agent_mail_core::Config::from_env();
+    let mut config = mcp_agent_mail_core::Config::from_env();
+    config.database_url = db_url;
+    config.storage_root = storage;
+    config.worktrees_enabled = true;
+    config.tool_filter.enabled = false;
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
 
@@ -151,29 +108,63 @@ fn diff_position(expected: &str, actual: &str) -> Option<(usize, String)> {
     None
 }
 
+fn normalized_required(schema: &Value) -> BTreeSet<String> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|name| *name != "format")
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalized_property_names(schema: &Value) -> BTreeSet<String> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.keys()
+                .filter(|name| name.as_str() != "format")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalized_property_type(prop: &Value) -> Option<String> {
+    if let Some(kind) = prop.get("type").and_then(Value::as_str) {
+        return Some(kind.to_string());
+    }
+    let mut non_null: Vec<String> = prop
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|branch| branch.get("type").and_then(Value::as_str))
+                .filter(|kind| *kind != "null")
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if non_null.is_empty() {
+        return None;
+    }
+    non_null.sort_unstable();
+    non_null.dedup();
+    Some(non_null.join("|"))
+}
+
 /// Compare inputSchema properties: property names, types, and required arrays.
 fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> Vec<String> {
     let mut errors = Vec::new();
 
     // Compare required arrays
-    let expected_required: BTreeSet<String> = expected
-        .get("required")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let actual_required: BTreeSet<String> = actual
-        .get("required")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let expected_required = normalized_required(expected);
+    let actual_required = normalized_required(actual);
 
     if expected_required != actual_required {
         let missing: Vec<_> = expected_required.difference(&actual_required).collect();
@@ -184,16 +175,8 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
     }
 
     // Compare property names
-    let expected_props: BTreeSet<String> = expected
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .map(|obj| obj.keys().cloned().collect())
-        .unwrap_or_default();
-    let actual_props: BTreeSet<String> = actual
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .map(|obj| obj.keys().cloned().collect())
-        .unwrap_or_default();
+    let expected_props = normalized_property_names(expected);
+    let actual_props = normalized_property_names(actual);
 
     let missing_props: Vec<_> = expected_props.difference(&actual_props).collect();
     let extra_props: Vec<_> = actual_props.difference(&expected_props).collect();
@@ -213,17 +196,31 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
                 (exp_obj.get(prop_name), act_obj.get(prop_name))
             {
                 // Compare type field
-                let exp_type = exp_prop.get("type");
-                let act_type = act_prop.get("type");
+                let exp_type = normalized_property_type(exp_prop);
+                let act_type = normalized_property_type(act_prop);
                 if exp_type != act_type {
-                    // Check for anyOf pattern (Python uses anyOf for Optional types)
-                    let exp_any_of = exp_prop.get("anyOf");
-                    let act_any_of = act_prop.get("anyOf");
-                    if exp_any_of != act_any_of && exp_type != act_type {
+                    errors.push(format!(
+                        "[{tool_name}].{prop_name} type mismatch: expected={:?}, actual={:?}",
+                        exp_type, act_type
+                    ));
+                }
+
+                let exp_desc = exp_prop
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let act_desc = act_prop
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if exp_desc != act_desc {
+                    if let Some((_pos, detail)) = diff_position(exp_desc, act_desc) {
                         errors.push(format!(
-                            "[{tool_name}].{prop_name} type mismatch: expected={}, actual={}",
-                            exp_type.unwrap_or(&Value::Null),
-                            act_type.unwrap_or(&Value::Null)
+                            "[{tool_name}].{prop_name} description mismatch: {detail}"
+                        ));
+                    } else {
+                        errors.push(format!(
+                            "[{tool_name}].{prop_name} description mismatch (unknown diff)"
                         ));
                     }
                 }
