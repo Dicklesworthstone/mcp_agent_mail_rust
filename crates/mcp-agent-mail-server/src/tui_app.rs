@@ -60,25 +60,65 @@ const TOAST_ENTRANCE_TICKS: u8 = 4;
 const TOAST_EXIT_TICKS: u8 = 3;
 const REMOTE_EVENTS_PER_TICK: usize = 64;
 
+/// Semantic transition kind inferred from source/destination screen categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitionKind {
+    /// Same category — subtle slide indicator.
+    Lateral,
+    /// Different category — brief cross-fade with destination label.
+    CrossCategory,
+}
+
+/// Navigation direction inferred from tab ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitionDirection {
+    Forward,
+    Backward,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScreenTransition {
     from: MailScreenId,
     to: MailScreenId,
     ticks_remaining: u8,
+    kind: TransitionKind,
+    direction: TransitionDirection,
 }
 
 impl ScreenTransition {
-    const fn new(from: MailScreenId, to: MailScreenId) -> Self {
+    fn new(from: MailScreenId, to: MailScreenId) -> Self {
+        let from_cat = screen_meta(from).category;
+        let to_cat = screen_meta(to).category;
+        let kind = if from_cat == to_cat {
+            TransitionKind::Lateral
+        } else {
+            TransitionKind::CrossCategory
+        };
+        let from_idx = ALL_SCREEN_IDS.iter().position(|&s| s == from).unwrap_or(0);
+        let to_idx = ALL_SCREEN_IDS.iter().position(|&s| s == to).unwrap_or(0);
+        let direction = if to_idx >= from_idx {
+            TransitionDirection::Forward
+        } else {
+            TransitionDirection::Backward
+        };
         Self {
             from,
             to,
             ticks_remaining: SCREEN_TRANSITION_TICKS,
+            kind,
+            direction,
         }
     }
 
     fn progress(self) -> f32 {
         let done = SCREEN_TRANSITION_TICKS.saturating_sub(self.ticks_remaining);
         f32::from(done) / f32::from(SCREEN_TRANSITION_TICKS.max(1))
+    }
+
+    /// Ease-out cubic curve for more natural deceleration.
+    fn eased_progress(self) -> f32 {
+        let t = self.progress().clamp(0.0, 1.0);
+        1.0 - (1.0 - t).powi(3)
     }
 }
 
@@ -3621,36 +3661,74 @@ fn render_screen_transition_overlay(transition: ScreenTransition, area: Rect, fr
         return;
     }
 
-    let theme = crate::tui_theme::TuiThemePalette::current();
-    let progress = transition.progress().clamp(0.0, 1.0);
-    let remaining_ratio = 1.0 - progress;
-    let wipe_width = ((f32::from(area.width) * remaining_ratio).round() as u16).min(area.width);
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let eased = transition.eased_progress();
 
-    if wipe_width > 0 {
-        let wipe_height = area.height.min(2);
-        ftui::widgets::paragraph::Paragraph::new("")
-            .style(Style::default().bg(theme.tab_active_bg))
-            .render(Rect::new(area.x, area.y, wipe_width, wipe_height), frame);
-    }
+    match transition.kind {
+        TransitionKind::Lateral => {
+            // Subtle directional slide indicator: a thin accent line that sweeps
+            // across the top edge in the direction of navigation.
+            let full_w = area.width;
+            let indicator_w = (f32::from(full_w) * 0.3).round().max(2.0) as u16;
+            let travel = full_w.saturating_sub(indicator_w);
+            let offset = match transition.direction {
+                TransitionDirection::Forward => {
+                    (f32::from(travel) * eased).round() as u16
+                }
+                TransitionDirection::Backward => {
+                    travel.saturating_sub((f32::from(travel) * eased).round() as u16)
+                }
+            };
+            let x = area.x.saturating_add(offset).min(area.x + full_w - 1);
+            let w = indicator_w.min(area.x + full_w - x);
+            Paragraph::new("")
+                .style(Style::default().bg(tp.selection_indicator))
+                .render(Rect::new(x, area.y, w, 1), frame);
+        }
+        TransitionKind::CrossCategory => {
+            // Cross-category: fade-in destination label centered in a banner
+            // that shrinks vertically as the transition progresses.
+            let banner_h = if eased < 0.5 { 2u16 } else { 1 };
+            let banner_h = banner_h.min(area.height);
 
-    let from_title = screen_meta(transition.from).title;
-    let to_title = screen_meta(transition.to).title;
-    let label = format!("Transition: {from_title} -> {to_title}");
-    let label_area = Rect::new(
-        area.x.saturating_add(1),
-        area.y,
-        area.width.saturating_sub(2),
-        1,
-    );
-    if label_area.width > 0 {
-        ftui::widgets::paragraph::Paragraph::new(label)
-            .style(
-                Style::default()
-                    .fg(theme.status_accent)
-                    .bg(theme.tab_active_bg)
-                    .bold(),
-            )
-            .render(label_area, frame);
+            // Semi-transparent overlay (painted as solid bg that fades out).
+            let fade_alpha = 1.0 - eased;
+            if fade_alpha > 0.05 {
+                Paragraph::new("")
+                    .style(Style::default().bg(tp.bg_overlay))
+                    .render(Rect::new(area.x, area.y, area.width, banner_h), frame);
+            }
+
+            // Destination label with category arrow.
+            let to_meta = screen_meta(transition.to);
+            let arrow = match transition.direction {
+                TransitionDirection::Forward => "\u{2192}",  // →
+                TransitionDirection::Backward => "\u{2190}", // ←
+            };
+            let label = format!(
+                " {arrow} {} \u{2022} {} ",
+                to_meta.category.short_label(),
+                to_meta.title,
+            );
+            let label_w = display_width(&label) as u16;
+            let label_x = area.x + area.width.saturating_sub(label_w) / 2;
+            let label_area = Rect::new(
+                label_x,
+                area.y,
+                label_w.min(area.width),
+                1,
+            );
+            if label_area.width > 0 {
+                Paragraph::new(label)
+                    .style(
+                        Style::default()
+                            .fg(tp.status_accent)
+                            .bg(tp.bg_overlay)
+                            .bold(),
+                    )
+                    .render(label_area, frame);
+            }
+        }
     }
 }
 
@@ -4315,6 +4393,56 @@ mod tests {
             model.update(MailMsg::Terminal(Event::Tick));
         }
         assert!(model.screen_transition.is_none());
+    }
+
+    // ── Semantic transition tests ────────────────────────────────
+
+    #[test]
+    fn transition_lateral_within_same_category() {
+        // Dashboard and Timeline are both Overview — should be Lateral
+        let t = ScreenTransition::new(MailScreenId::Dashboard, MailScreenId::Timeline);
+        assert_eq!(t.kind, TransitionKind::Lateral);
+    }
+
+    #[test]
+    fn transition_cross_category_between_different_categories() {
+        // Dashboard (Overview) → Messages (Communication)
+        let t = ScreenTransition::new(MailScreenId::Dashboard, MailScreenId::Messages);
+        assert_eq!(t.kind, TransitionKind::CrossCategory);
+    }
+
+    #[test]
+    fn transition_forward_direction_when_tab_index_increases() {
+        // Dashboard (idx 0) → Messages (idx 1)
+        let t = ScreenTransition::new(MailScreenId::Dashboard, MailScreenId::Messages);
+        assert_eq!(t.direction, TransitionDirection::Forward);
+    }
+
+    #[test]
+    fn transition_backward_direction_when_tab_index_decreases() {
+        // Messages (idx 1) → Dashboard (idx 0)
+        let t = ScreenTransition::new(MailScreenId::Messages, MailScreenId::Dashboard);
+        assert_eq!(t.direction, TransitionDirection::Backward);
+    }
+
+    #[test]
+    fn transition_eased_progress_starts_at_zero() {
+        let t = ScreenTransition::new(MailScreenId::Dashboard, MailScreenId::Messages);
+        // At full ticks_remaining, progress is 0
+        assert!((t.eased_progress() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn transition_eased_progress_decelerates() {
+        // Eased progress should be >= linear progress at midpoint
+        let mut t = ScreenTransition::new(MailScreenId::Dashboard, MailScreenId::Messages);
+        t.ticks_remaining = SCREEN_TRANSITION_TICKS / 2;
+        let linear = t.progress();
+        let eased = t.eased_progress();
+        assert!(
+            eased >= linear,
+            "eased ({eased}) should be >= linear ({linear}) at midpoint"
+        );
     }
 
     #[test]
