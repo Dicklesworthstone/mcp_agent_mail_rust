@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn detect_conflicts_no_overlap() {
-        let screen_bindings = &[("x", "Do X"), ("y", "Do Y")];
+        let screen_bindings = &[("x", "Do X"), ("z", "Do Z")];
         let conflicts = detect_conflicts(screen_bindings);
         assert!(conflicts.is_empty());
     }
@@ -879,7 +879,7 @@ mod tests {
                         binding.label
                     );
                 }
-                "q" | "?" | ":" | "m" | "T" | JUMP_BINDING_LABEL => {
+                "q" | "?" | ":" | "m" | "T" | "y" | JUMP_BINDING_LABEL => {
                     assert!(
                         binding.text_suppressible,
                         "{} should be text-suppressible",
