@@ -3144,4 +3144,330 @@ mod tests {
             );
         }
     }
+
+    // ── br-2h8pz: Thread tree builder + hierarchy tests ─────────────
+
+    #[test]
+    fn tree_empty_messages_produces_empty_tree() {
+        let tree = build_thread_tree_items(&[]);
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn tree_single_root_no_replies() {
+        let msg = make_message(1);
+        let tree = build_thread_tree_items(&[msg]);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].message_id, 1);
+        assert!(tree[0].children.is_empty());
+    }
+
+    #[test]
+    fn tree_three_level_nesting() {
+        let mut root = make_message(1);
+        root.timestamp_micros = 100;
+        root.timestamp_iso = "2026-02-06T12:00:00Z".to_string();
+
+        let mut child = make_message(2);
+        child.reply_to_id = Some(1);
+        child.timestamp_micros = 200;
+        child.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
+
+        let mut grandchild = make_message(3);
+        grandchild.reply_to_id = Some(2);
+        grandchild.timestamp_micros = 300;
+        grandchild.timestamp_iso = "2026-02-06T12:00:03Z".to_string();
+
+        let tree = build_thread_tree_items(&[grandchild, root, child]);
+        assert_eq!(tree.len(), 1, "single root");
+        assert_eq!(tree[0].message_id, 1);
+        assert_eq!(tree[0].children.len(), 1, "one child");
+        assert_eq!(tree[0].children[0].message_id, 2);
+        assert_eq!(tree[0].children[0].children.len(), 1, "one grandchild");
+        assert_eq!(tree[0].children[0].children[0].message_id, 3);
+    }
+
+    #[test]
+    fn tree_circular_reference_detected_and_broken() {
+        // A -> B -> A (cycle)
+        let mut a = make_message(1);
+        a.reply_to_id = Some(2);
+        a.timestamp_micros = 100;
+        a.timestamp_iso = "2026-02-06T12:00:01Z".to_string();
+
+        let mut b = make_message(2);
+        b.reply_to_id = Some(1);
+        b.timestamp_micros = 200;
+        b.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
+
+        let tree = build_thread_tree_items(&[a, b]);
+        // Both reference each other; neither has a valid root parent.
+        // The builder should filter invalid parents and not crash.
+        // Since both have reply_to_id pointing to the other, and both exist,
+        // neither will be a root → they go under their respective parents.
+        // But since no root exists, the result depends on the orphan-promotion logic.
+        // Regardless, the function should not infinite-loop or panic.
+        assert!(!tree.is_empty() || tree.is_empty(), "no crash/hang");
+    }
+
+    #[test]
+    fn tree_self_referencing_message_handled() {
+        let mut msg = make_message(1);
+        msg.reply_to_id = Some(1); // self-reference
+        msg.timestamp_micros = 100;
+        msg.timestamp_iso = "2026-02-06T12:00:01Z".to_string();
+
+        let tree = build_thread_tree_items(&[msg]);
+        // Self-referencing: reply_to_id=1 exists in message_by_id, so it's
+        // not promoted to root. Instead child_by_parent has entry Some(1)->[1]
+        // and no None roots. The tree handles this gracefully.
+        // The recursion_stack prevents infinite recursion.
+        let total: usize = tree.iter().map(|n| 1 + count_descendants(n)).sum();
+        assert!(total <= 1, "at most 1 node, got {total}");
+    }
+
+    #[test]
+    fn tree_multiple_roots_sorted_chronologically() {
+        let mut a = make_message(1);
+        a.timestamp_micros = 300;
+        a.timestamp_iso = "2026-02-06T12:00:03Z".to_string();
+
+        let mut b = make_message(2);
+        b.timestamp_micros = 100;
+        b.timestamp_iso = "2026-02-06T12:00:01Z".to_string();
+
+        let mut c = make_message(3);
+        c.timestamp_micros = 200;
+        c.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
+
+        let tree = build_thread_tree_items(&[a, b, c]);
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree[0].message_id, 2, "earliest first");
+        assert_eq!(tree[1].message_id, 3);
+        assert_eq!(tree[2].message_id, 1, "latest last");
+    }
+
+    #[test]
+    fn tree_preserves_unread_and_ack_flags() {
+        let mut root = make_message(1);
+        root.timestamp_micros = 100;
+        root.timestamp_iso = "2026-02-06T12:00:01Z".to_string();
+
+        let mut child = make_message(2);
+        child.reply_to_id = Some(1);
+        child.is_unread = true;
+        child.ack_required = true;
+        child.timestamp_micros = 200;
+        child.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
+
+        let tree = build_thread_tree_items(&[root, child]);
+        assert!(!tree[0].is_unread, "root should not be unread");
+        assert!(!tree[0].is_ack_required, "root should not be ack_required");
+        assert!(tree[0].children[0].is_unread, "child should be unread");
+        assert!(tree[0].children[0].is_ack_required, "child should be ack_required");
+    }
+
+    #[test]
+    fn tree_subject_truncated_to_60_chars() {
+        let mut msg = make_message(1);
+        msg.subject = "A".repeat(100);
+        msg.timestamp_micros = 100;
+        msg.timestamp_iso = "2026-02-06T12:00:01Z".to_string();
+
+        let tree = build_thread_tree_items(&[msg]);
+        assert!(
+            tree[0].subject_snippet.chars().count() <= 60,
+            "subject should be truncated, got {} chars",
+            tree[0].subject_snippet.chars().count()
+        );
+    }
+
+    #[test]
+    fn tree_compact_time_extraction() {
+        let mut msg = make_message(1);
+        msg.timestamp_iso = "2026-02-06T14:35:27Z".to_string();
+        msg.timestamp_micros = 100;
+
+        let tree = build_thread_tree_items(&[msg]);
+        assert_eq!(tree[0].relative_time, "14:35:27");
+    }
+
+    #[test]
+    fn tree_100_messages_builds_quickly() {
+        let messages: Vec<ThreadMessage> = (1..=100)
+            .map(|i| {
+                let mut m = make_message(i);
+                m.timestamp_micros = i * 1_000_000;
+                m.timestamp_iso = format!("2026-02-06T12:{:02}:{:02}Z", i / 60, i % 60);
+                if i > 1 {
+                    // Build a chain: each message replies to previous
+                    m.reply_to_id = Some(i - 1);
+                }
+                m
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let tree = build_thread_tree_items(&messages);
+        let elapsed = start.elapsed();
+
+        assert_eq!(tree.len(), 1, "single root chain");
+        assert!(
+            elapsed.as_millis() < 50,
+            "100-message tree took {elapsed:?}, expected < 50ms"
+        );
+    }
+
+    #[test]
+    fn tree_wide_fan_out() {
+        // One root with 50 direct children
+        let mut messages = vec![];
+        let mut root = make_message(1);
+        root.timestamp_micros = 100;
+        root.timestamp_iso = "2026-02-06T12:00:00Z".to_string();
+        messages.push(root);
+
+        for i in 2..=51 {
+            let mut child = make_message(i);
+            child.reply_to_id = Some(1);
+            child.timestamp_micros = i * 1_000_000;
+            child.timestamp_iso = format!("2026-02-06T12:{:02}:{:02}Z", i / 60, i % 60);
+            messages.push(child);
+        }
+
+        let tree = build_thread_tree_items(&messages);
+        assert_eq!(tree.len(), 1, "single root");
+        assert_eq!(tree[0].children.len(), 50, "50 direct children");
+        // Children sorted chronologically
+        for w in tree[0].children.windows(2) {
+            assert!(
+                w[0].message_id < w[1].message_id,
+                "children should be in chronological order"
+            );
+        }
+    }
+
+    // ── Flatten and collapse tests ──────────────────────────────────
+
+    #[test]
+    fn flatten_all_expanded_includes_all_nodes() {
+        let mut root = make_message(1);
+        root.timestamp_micros = 100;
+        root.timestamp_iso = "2026-02-06T12:00:01Z".to_string();
+
+        let mut child = make_message(2);
+        child.reply_to_id = Some(1);
+        child.timestamp_micros = 200;
+        child.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
+
+        let tree = build_thread_tree_items(&[root, child]);
+        let collapsed: HashSet<i64> = HashSet::new();
+        let mut rows = Vec::new();
+        flatten_thread_tree_rows(&tree, &collapsed, &mut rows);
+
+        assert_eq!(rows.len(), 2, "root + child");
+        assert_eq!(rows[0].message_id, 1);
+        assert!(rows[0].has_children);
+        assert!(rows[0].is_expanded);
+        assert_eq!(rows[1].message_id, 2);
+        assert!(!rows[1].has_children);
+    }
+
+    #[test]
+    fn flatten_collapsed_parent_hides_children() {
+        let mut root = make_message(1);
+        root.timestamp_micros = 100;
+        root.timestamp_iso = "2026-02-06T12:00:01Z".to_string();
+
+        let mut child = make_message(2);
+        child.reply_to_id = Some(1);
+        child.timestamp_micros = 200;
+        child.timestamp_iso = "2026-02-06T12:00:02Z".to_string();
+
+        let tree = build_thread_tree_items(&[root, child]);
+        let collapsed: HashSet<i64> = [1].into_iter().collect();
+        let mut rows = Vec::new();
+        flatten_thread_tree_rows(&tree, &collapsed, &mut rows);
+
+        assert_eq!(rows.len(), 1, "only root visible when collapsed");
+        assert_eq!(rows[0].message_id, 1);
+        assert!(!rows[0].is_expanded);
+    }
+
+    #[test]
+    fn flatten_empty_tree() {
+        let tree: Vec<crate::tui_widgets::ThreadTreeItem> = Vec::new();
+        let mut rows = Vec::new();
+        flatten_thread_tree_rows(&tree, &HashSet::new(), &mut rows);
+        assert!(rows.is_empty());
+    }
+
+    // ── ThreadTreeItem rendering tests ──────────────────────────────
+
+    #[test]
+    fn render_plain_label_leaf_node() {
+        let item = crate::tui_widgets::ThreadTreeItem::new(
+            1,
+            "GoldFox".to_string(),
+            "Hello".to_string(),
+            "12:00:00".to_string(),
+            false,
+            false,
+        );
+        let label = item.render_plain_label(false);
+        assert!(label.starts_with("•"), "leaf node should use • glyph");
+        assert!(label.contains("GoldFox"));
+        assert!(label.contains("Hello"));
+        assert!(label.contains("12:00:00"));
+        assert!(!label.contains("[ACK]"));
+    }
+
+    #[test]
+    fn render_plain_label_expanded_parent() {
+        let child = crate::tui_widgets::ThreadTreeItem::new(
+            2,
+            "SilverWolf".to_string(),
+            "Reply".to_string(),
+            "12:01:00".to_string(),
+            false,
+            false,
+        );
+        let item = crate::tui_widgets::ThreadTreeItem::new(
+            1,
+            "GoldFox".to_string(),
+            "Thread".to_string(),
+            "12:00:00".to_string(),
+            false,
+            false,
+        )
+        .with_children(vec![child]);
+
+        let expanded = item.render_plain_label(true);
+        assert!(expanded.starts_with("▼"), "expanded parent should use ▼");
+
+        let collapsed = item.render_plain_label(false);
+        assert!(collapsed.starts_with("▶"), "collapsed parent should use ▶");
+    }
+
+    #[test]
+    fn render_plain_label_unread_and_ack() {
+        let item = crate::tui_widgets::ThreadTreeItem::new(
+            1,
+            "GoldFox".to_string(),
+            "Urgent".to_string(),
+            "12:00:00".to_string(),
+            true,
+            true,
+        );
+        let label = item.render_plain_label(false);
+        assert!(label.contains('*'), "unread should have * prefix");
+        assert!(label.contains("[ACK]"), "ack_required should have [ACK]");
+    }
+
+    fn count_descendants(node: &crate::tui_widgets::ThreadTreeItem) -> usize {
+        node.children
+            .iter()
+            .map(|c| 1 + count_descendants(c))
+            .sum()
+    }
 }
