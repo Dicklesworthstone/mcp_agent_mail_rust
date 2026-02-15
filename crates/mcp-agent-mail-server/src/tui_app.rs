@@ -4911,6 +4911,54 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_toggle_cancels_inflight_transition() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        assert!(model.screen_transition.is_some());
+
+        // Enabling reduced-motion mid-flight should cancel the transition.
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION);
+        assert!(model.screen_transition.is_none());
+    }
+
+    #[test]
+    fn reduced_motion_toggle_persists_to_envfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = mcp_agent_mail_core::Config {
+            console_persist_path: dir.path().join("config.env"),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let mut model = MailAppModel::with_config(state, &config);
+
+        assert!(!model.accessibility().reduced_motion);
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION);
+        assert!(model.accessibility().reduced_motion);
+
+        // Check persisted value
+        let contents = std::fs::read_to_string(&config.console_persist_path)
+            .unwrap_or_default();
+        assert!(
+            contents.contains("TUI_REDUCED_MOTION=true"),
+            "reduced_motion should be persisted; contents: {contents}"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_semantic_transitions_skipped() {
+        let mut model = test_model();
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION);
+        assert!(model.accessibility().reduced_motion);
+
+        // Both lateral and cross-category transitions should be skipped.
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        assert!(model.screen_transition.is_none(), "cross-category should be skipped");
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Threads));
+        assert!(model.screen_transition.is_none(), "lateral should be skipped");
+    }
+
+    #[test]
     fn toggle_screen_reader_via_palette_disables_key_hints() {
         let mut model = test_model();
         assert!(!model.accessibility().screen_reader);
