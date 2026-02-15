@@ -2385,6 +2385,7 @@ fn handle_serve_stdio() -> CliResult<()> {
 ///
 /// Checks the agent inbox for unread messages. Designed for git hooks and editor integrations.
 /// Exits silently on any error (fail-safe for hooks - never interrupt agent work).
+#[allow(clippy::too_many_arguments)]
 fn handle_check_inbox(
     agent: Option<String>,
     rate_limit: u64,
@@ -8560,7 +8561,7 @@ mod tests {
     #[test]
     fn format_micros_as_iso_produces_valid_timestamp() {
         // 2026-01-01 00:00:00 UTC in microseconds
-        let micros = 1767225600_000_000_i64;
+        let micros = 1_767_225_600_000_000_i64;
         let result = format_micros_as_iso(micros);
         // Should produce ISO-8601 format
         assert!(result.contains("2026"), "year should be 2026, got {result}");
@@ -20977,15 +20978,15 @@ fn handle_tooling_decommission_fts(force: bool, json_mode: bool) -> CliResult<()
         ftui_runtime::ftui_println!("");
         output::kv(
             "Triggers before",
-            &format!("{}", report.triggers_before.join(", ")),
+            &report.triggers_before.join(", ").to_string(),
         );
         output::kv(
             "Dropped triggers",
-            &format!("{}", report.dropped_triggers.join(", ")),
+            &report.dropped_triggers.join(", ").to_string(),
         );
         output::kv(
             "Triggers after",
-            &format!("{}", report.triggers_after.join(", ")),
+            &report.triggers_after.join(", ").to_string(),
         );
 
         if !report.warnings.is_empty() {

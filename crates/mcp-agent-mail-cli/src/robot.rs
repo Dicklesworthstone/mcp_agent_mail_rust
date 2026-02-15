@@ -1084,7 +1084,7 @@ fn build_inbox(
     agent_name: &str,
     urgent_only: bool,
     ack_overdue_only: bool,
-    unread_only: bool,
+    _unread_only: bool,
     show_all: bool,
     limit: usize,
     include_bodies: bool,
@@ -1100,10 +1100,8 @@ fn build_inbox(
         "AND priority_bucket <= 2"
     } else if show_all {
         "" // no filter
-    } else if unread_only {
-        "AND priority_bucket <= 5"
     } else {
-        "AND priority_bucket <= 5" // default: unread only
+        "AND priority_bucket <= 5" // default (and unread_only): unread only
     };
 
     let sql = format!(
@@ -1774,19 +1772,19 @@ fn build_search(
         .into_iter()
         .map(|(v, c)| FacetEntry { value: v, count: c })
         .collect();
-    by_thread.sort_by(|a, b| b.count.cmp(&a.count));
+    by_thread.sort_by_key(|x| std::cmp::Reverse(x.count));
 
     let mut by_agent: Vec<FacetEntry> = agent_counts
         .into_iter()
         .map(|(v, c)| FacetEntry { value: v, count: c })
         .collect();
-    by_agent.sort_by(|a, b| b.count.cmp(&a.count));
+    by_agent.sort_by_key(|x| std::cmp::Reverse(x.count));
 
     let mut by_importance: Vec<FacetEntry> = importance_counts
         .into_iter()
         .map(|(v, c)| FacetEntry { value: v, count: c })
         .collect();
-    by_importance.sort_by(|a, b| b.count.cmp(&a.count));
+    by_importance.sort_by_key(|x| std::cmp::Reverse(x.count));
 
     let total = results.len();
     Ok(SearchData {
@@ -2466,7 +2464,7 @@ fn build_agents(
     // Sort
     match sort_field {
         Some("name") => agents.sort_by(|a, b| a.name.cmp(&b.name)),
-        Some("msg_count") => agents.sort_by(|a, b| b.msg_count.cmp(&a.msg_count)),
+        Some("msg_count") => agents.sort_by_key(|x| std::cmp::Reverse(x.msg_count)),
         _ => {} // Default: already sorted by last_active (DESC from SQL)
     }
 
@@ -2563,6 +2561,7 @@ fn build_projects(conn: &SqliteConnection) -> Result<Vec<ProjectRow>, CliError> 
 /// Resolved navigate data - wraps whatever resource was requested.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 enum NavigateResult {
     Projects {
         projects: Vec<ProjectRow>,
@@ -3027,7 +3026,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 if error_pct > 50.0 {
                     env = env.with_alert(
                         "error",
-                        &format!(
+                        format!(
                             "{} has {:.1}% error rate ({}/{})",
                             e.name, error_pct, e.errors, e.calls
                         ),
@@ -3036,7 +3035,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 } else if error_pct > 10.0 {
                     env = env.with_alert(
                         "warn",
-                        &format!(
+                        format!(
                             "{} has {:.1}% error rate ({}/{})",
                             e.name, error_pct, e.errors, e.calls
                         ),
@@ -3047,7 +3046,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     if lat.avg_ms > 2000.0 {
                         env = env.with_alert(
                             "warn",
-                            &format!("{} avg latency {:.0}ms (>2s)", e.name, lat.avg_ms),
+                            format!("{} avg latency {:.0}ms (>2s)", e.name, lat.avg_ms),
                             None,
                         );
                     }
@@ -3056,7 +3055,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             if error_rate > 5.0 {
                 env = env.with_alert(
                     "error",
-                    &format!("Overall error rate {error_rate:.1}% (>{} threshold)", 5),
+                    format!("Overall error rate {error_rate:.1}% (>{} threshold)", 5),
                     None,
                 );
             }
@@ -3071,10 +3070,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let db_ok = match crate::open_db_sync() {
                 Ok(conn) => {
                     // Verify with a lightweight query
-                    match conn.query_sync("SELECT 1", &[]) {
-                        Ok(_) => true,
-                        Err(_) => false,
-                    }
+                    conn.query_sync("SELECT 1", &[]).is_ok()
                 }
                 Err(_) => false,
             };
@@ -3216,7 +3212,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             if !integrity_ok {
                 env = env.with_alert(
                     "warn",
-                    &format!(
+                    format!(
                         "{} integrity check failures detected",
                         integrity.failures_total
                     ),
@@ -3228,7 +3224,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             {
                 env = env.with_alert(
                     "error",
-                    &format!(
+                    format!(
                         "Disk pressure: {} ({free_mb} MB free)",
                         disk.pressure.label()
                     ),
@@ -3237,7 +3233,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             } else if disk.pressure == mcp_agent_mail_core::disk::DiskPressure::Warning {
                 env = env.with_alert(
                     "warn",
-                    &format!("Disk pressure: warning ({free_mb} MB free)"),
+                    format!("Disk pressure: warning ({free_mb} MB free)"),
                     None,
                 );
             }
