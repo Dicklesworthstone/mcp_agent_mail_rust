@@ -95,12 +95,17 @@ impl BayesianDiffStrategy {
             // stable_frame      1         8      20
             // bursty_change    12         3       5
             // resize           15         2      10
-            // degraded         10         6       1
+            // degraded         10         3      15
+            //
+            // NOTE: At 10fps (100ms tick), deferring a frame causes 100-200ms
+            // of blank screen, which is extremely visible. The degraded row
+            // now favours Full (3) over Deferred (15) so we always render
+            // *something* rather than showing a blank frame.
             loss: [
                 [1.0, 8.0, 20.0],  // stable
                 [12.0, 3.0, 5.0],  // bursty
                 [15.0, 2.0, 10.0], // resize
-                [10.0, 6.0, 1.0],  // degraded
+                [10.0, 3.0, 15.0], // degraded — Full preferred over Deferred
             ],
             alpha: 0.3,
             deterministic_fallback: false,
@@ -334,12 +339,14 @@ mod tests {
         assert_eq!(action, DiffAction::Full);
     }
 
-    /// 3. Low budget, high error count => `Deferred`.
+    /// 3. Low budget, high error count => `Full` (not Deferred).
+    ///    At 10fps, deferring a frame causes visible blank screens, so the
+    ///    loss matrix now prefers Full in the degraded state.
     #[test]
-    fn bayes_degraded_chooses_deferred() {
+    fn bayes_degraded_chooses_full() {
         let mut strategy = BayesianDiffStrategy::new();
         let action = strategy.observe_with_ledger(&degraded_frame(), None);
-        assert_eq!(action, DiffAction::Deferred);
+        assert_eq!(action, DiffAction::Full);
     }
 
     /// 4. High change ratio => `Full`.
@@ -432,8 +439,8 @@ mod tests {
         let strategy = BayesianDiffStrategy::new();
         // Uniform prior: [0.25, 0.25, 0.25, 0.25]
         // Expected loss for Incremental: 0.25*(1+12+15+10) = 0.25*38 = 9.5
-        // Expected loss for Full:        0.25*(8+3+2+6)    = 0.25*19 = 4.75
-        // Expected loss for Deferred:    0.25*(20+5+10+1)  = 0.25*36 = 9.0
+        // Expected loss for Full:        0.25*(8+3+2+3)    = 0.25*16 = 4.0
+        // Expected loss for Deferred:    0.25*(20+5+10+15)  = 0.25*50 = 12.5
         let el_inc = strategy.expected_loss(DiffAction::Incremental);
         let el_full = strategy.expected_loss(DiffAction::Full);
         let el_def = strategy.expected_loss(DiffAction::Deferred);
@@ -443,12 +450,12 @@ mod tests {
             "incremental expected loss {el_inc} != 9.5"
         );
         assert!(
-            (el_full - 4.75).abs() < 1e-9,
-            "full expected loss {el_full} != 4.75"
+            (el_full - 4.0).abs() < 1e-9,
+            "full expected loss {el_full} != 4.0"
         );
         assert!(
-            (el_def - 9.0).abs() < 1e-9,
-            "deferred expected loss {el_def} != 9.0"
+            (el_def - 12.5).abs() < 1e-9,
+            "deferred expected loss {el_def} != 12.5"
         );
 
         // With uniform prior, Full should have the lowest expected loss.
