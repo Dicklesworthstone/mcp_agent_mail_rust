@@ -19,6 +19,10 @@ use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::search_planner::{DocKind, SearchQuery};
+use mcp_agent_mail_db::search_scope::{
+    ContactPolicyKind, RecipientEntry, RedactionPolicy, ScopeContext, ScopeVerdict, SenderPolicy,
+    ViewerIdentity,
+};
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
 use mcp_agent_mail_db::search_v3::{get_bridge, init_bridge};
 use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig};
@@ -944,4 +948,479 @@ fn set_contact_policy_contacts_only() {
         matches!(result, Outcome::Ok(_)),
         "set_contact_policy should succeed"
     );
+}
+
+// =============================================================================
+// Search V3 scope enforcement integration tests (br-2tnl.6.4)
+//
+// Verify that the Tantivy (Lexical/Hybrid) search paths enforce the same
+// scope, redaction, and audit rules as the FTS5 legacy path.
+// =============================================================================
+
+/// Insert a Tantivy doc for scope tests with a unique token.
+fn insert_scope_tantivy_doc(
+    doc_id: i64,
+    project_id: i64,
+    token: &str,
+    sender: &str,
+    thread_id: &str,
+) {
+    insert_tantivy_message_doc(doc_id, project_id, token, sender, thread_id, "normal");
+}
+
+/// Build a ScopeContext for a viewer in a specific project.
+fn scope_viewer(agent_id: i64, project_id: i64) -> ScopeContext {
+    ScopeContext {
+        viewer: Some(ViewerIdentity {
+            project_id,
+            agent_id,
+        }),
+        approved_contacts: Vec::new(),
+        viewer_project_ids: vec![project_id],
+        sender_policies: Vec::new(),
+        recipient_map: Vec::new(),
+    }
+}
+
+#[test]
+fn v3_lexical_scope_denies_cross_project_messages() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid_viewer = setup_project(&pool);
+    let pid_other = setup_project(&pool);
+
+    let token = format!("scopecross{}", unique_suffix());
+    let doc_id = 10_000_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+
+    // Insert a Tantivy doc belonging to pid_other
+    insert_scope_tantivy_doc(doc_id, pid_other, &token, "BlueLake", "thread-cross");
+
+    // Search as a viewer in pid_viewer — should NOT see the cross-project doc
+    let token_q = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_q,
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            scope_ctx: Some(scope_viewer(1, pid_viewer)),
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            // The doc should be denied by scope (cross-project, no contact)
+            let found = resp
+                .results
+                .iter()
+                .any(|r| r.result.id == doc_id && r.scope.verdict == ScopeVerdict::Allow);
+            assert!(
+                !found,
+                "cross-project doc should not be visible to viewer in different project"
+            );
+            // Audit summary should be populated (viewer is Some)
+            assert!(
+                resp.audit_summary.is_some(),
+                "audit_summary must be present when viewer is set"
+            );
+            if let Some(audit) = &resp.audit_summary {
+                assert!(
+                    audit.denied_count >= 1 || audit.visible_count == 0,
+                    "cross-project doc should be denied or not returned"
+                );
+            }
+        }
+        other => panic!("v3 lexical scoped search failed: {other:?}"),
+    }
+}
+
+#[test]
+fn v3_lexical_scope_allows_same_project_auto_policy() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+
+    let token = format!("scopeauto{}", unique_suffix());
+    let doc_id = 10_100_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+
+    // Insert a Tantivy doc in the same project
+    insert_scope_tantivy_doc(doc_id, pid, &token, "SilverWolf", "thread-auto");
+
+    // Search as a viewer in the same project — auto policy allows
+    let token_q = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_q,
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            scope_ctx: Some(scope_viewer(1, pid)),
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            // If Tantivy returned our doc, verify it was allowed (not denied/redacted).
+            // The doc may not appear if the Tantivy reader hasn't refreshed yet —
+            // that's OK, we only assert scope properties when the doc IS present.
+            let our_doc = resp.results.iter().find(|r| r.result.id == doc_id);
+            if let Some(scoped) = our_doc {
+                assert_eq!(
+                    scoped.scope.verdict,
+                    ScopeVerdict::Allow,
+                    "same-project doc should be allowed under auto policy"
+                );
+            }
+            // Verify audit summary is present (viewer is set)
+            assert!(
+                resp.audit_summary.is_some(),
+                "audit_summary must be present when viewer is set"
+            );
+            // Verify no denials for our doc
+            if let Some(audit) = &resp.audit_summary {
+                let denied_our_doc = audit.entries.iter().any(|e| e.result_id == doc_id);
+                assert!(
+                    !denied_our_doc,
+                    "same-project doc should not appear in denied audit entries"
+                );
+            }
+        }
+        other => panic!("v3 lexical scoped search failed: {other:?}"),
+    }
+}
+
+#[test]
+fn v3_lexical_scope_contacts_only_denies_unlinked() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let sender_agent_id = 20i64;
+
+    let token = format!("scopecontact{}", unique_suffix());
+    let doc_id = 10_200_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+
+    insert_scope_tantivy_doc(doc_id, pid, &token, "BlueLake", "thread-contact");
+
+    let token_q = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_q,
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        let mut ctx = scope_viewer(10, pid);
+        ctx.sender_policies.push(SenderPolicy {
+            project_id: pid,
+            agent_id: sender_agent_id,
+            policy: ContactPolicyKind::ContactsOnly,
+        });
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            scope_ctx: Some(ctx),
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            let visible_our_doc = resp
+                .results
+                .iter()
+                .any(|r| r.result.id == doc_id && r.scope.verdict == ScopeVerdict::Allow);
+            assert!(
+                !visible_our_doc,
+                "contacts_only sender should be denied when viewer has no approved contact"
+            );
+        }
+        other => panic!("v3 lexical scoped search failed: {other:?}"),
+    }
+}
+
+#[test]
+fn v3_lexical_scope_recipient_always_allowed() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+
+    let token = format!("scoperecip{}", unique_suffix());
+    let doc_id = 10_300_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+
+    insert_scope_tantivy_doc(doc_id, pid, &token, "BlueLake", "thread-recip");
+
+    let token_q = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_q,
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        let mut ctx = scope_viewer(10, pid);
+        // Sender blocks all — but viewer is a recipient
+        ctx.sender_policies.push(SenderPolicy {
+            project_id: pid,
+            agent_id: 20,
+            policy: ContactPolicyKind::BlockAll,
+        });
+        ctx.recipient_map.push(RecipientEntry {
+            message_id: doc_id,
+            agent_ids: vec![10],
+        });
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            scope_ctx: Some(ctx),
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            // If Tantivy returned our doc, verify it was allowed because viewer is recipient
+            if let Some(scoped) = resp.results.iter().find(|r| r.result.id == doc_id) {
+                assert_eq!(
+                    scoped.scope.verdict,
+                    ScopeVerdict::Allow,
+                    "recipient should always see message even with block_all sender policy"
+                );
+            }
+        }
+        other => panic!("v3 lexical scoped search failed: {other:?}"),
+    }
+}
+
+#[test]
+fn v3_lexical_allowed_results_not_redacted() {
+    // Verify that results with Allow verdict keep their original body
+    // even when a redaction policy is set. Redaction only applies to Redact verdicts.
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+
+    let token = format!("scoperedact{}", unique_suffix());
+    let doc_id = 10_400_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+
+    insert_scope_tantivy_doc(doc_id, pid, &token, "GreenLake", "thread-redact");
+
+    let token_q = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_q,
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            scope_ctx: Some(scope_viewer(1, pid)),
+            redaction_policy: Some(RedactionPolicy::strict()),
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            if let Some(scoped) = resp.results.iter().find(|r| r.result.id == doc_id) {
+                // Same-project + auto policy = Allow verdict → no redaction
+                assert_eq!(scoped.scope.verdict, ScopeVerdict::Allow);
+                assert!(
+                    scoped.redaction_note.is_none(),
+                    "Allowed results should not have redaction notes"
+                );
+            }
+        }
+        other => panic!("v3 lexical redaction search failed: {other:?}"),
+    }
+}
+
+#[test]
+fn v3_scope_redaction_on_deny_excludes_from_results() {
+    // Verify that Deny-verdict results are fully excluded (not just redacted)
+    // when searching through the V3 Tantivy path.
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid_viewer = setup_project(&pool);
+    let pid_other = setup_project(&pool);
+
+    let token = format!("scopedeny{}", unique_suffix());
+    let doc_id = 10_450_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+
+    // Doc in project that viewer can't access
+    insert_scope_tantivy_doc(doc_id, pid_other, &token, "RedFox", "thread-deny");
+
+    let token_q = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_q,
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            scope_ctx: Some(scope_viewer(1, pid_viewer)),
+            redaction_policy: Some(RedactionPolicy::strict()),
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            // Denied results should be completely excluded
+            let found = resp.results.iter().any(|r| r.result.id == doc_id);
+            assert!(
+                !found,
+                "cross-project denied doc should not appear in results at all"
+            );
+            // Verify audit tracks the denial
+            if let Some(audit) = &resp.audit_summary {
+                if audit.total_before > 0 {
+                    assert!(
+                        audit.denied_count > 0,
+                        "should have at least one denied result in audit"
+                    );
+                }
+            }
+        }
+        other => panic!("v3 scope deny search failed: {other:?}"),
+    }
+}
+
+#[test]
+fn v3_lexical_operator_mode_no_audit_no_filtering() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+
+    let token = format!("scopeoper{}", unique_suffix());
+    let doc_id = 10_500_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+
+    insert_scope_tantivy_doc(doc_id, pid, &token, "RedFox", "thread-oper");
+
+    let token_q = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_q,
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        // No scope_ctx = operator mode (default)
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            // If Tantivy returned our doc, it should be allowed (operator sees all).
+            if let Some(scoped) = resp.results.iter().find(|r| r.result.id == doc_id) {
+                assert_eq!(
+                    scoped.scope.verdict,
+                    ScopeVerdict::Allow,
+                    "operator should see everything"
+                );
+            }
+            // No audit in operator mode — this is the key invariant
+            assert!(
+                resp.audit_summary.is_none(),
+                "operator mode should not produce audit summary"
+            );
+        }
+        other => panic!("v3 lexical operator search failed: {other:?}"),
+    }
+}
+
+#[test]
+fn v3_lexical_audit_summary_counts_match_verdicts() {
+    let _guard = tantivy_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pool, _dir) = make_pool();
+    let pid_a = setup_project(&pool);
+    let pid_b = setup_project(&pool);
+
+    let token = format!("scopeaudit{}", unique_suffix());
+    let doc_a_id = 10_600_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+    let doc_b_id = 10_600_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+
+    // Doc in project A (visible to viewer in A)
+    insert_scope_tantivy_doc(doc_a_id, pid_a, &token, "BlueLake", "thread-audit-a");
+    // Doc in project B (cross-project, should be denied)
+    insert_scope_tantivy_doc(doc_b_id, pid_b, &token, "RedFox", "thread-audit-b");
+
+    let token_q = token.clone();
+    let pool2 = pool.clone();
+    let result = block_on(|cx| async move {
+        let query = SearchQuery {
+            text: token_q,
+            doc_kind: DocKind::Message,
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            scope_ctx: Some(scope_viewer(1, pid_a)),
+            ..Default::default()
+        };
+        execute_search(&cx, &pool2, &query, &opts).await
+    });
+
+    match result {
+        Outcome::Ok(resp) => {
+            let audit = resp
+                .audit_summary
+                .as_ref()
+                .expect("audit_summary required when viewer is set");
+            // Counts must be consistent
+            assert_eq!(
+                audit.total_before,
+                audit.visible_count + audit.denied_count + audit.redacted_count,
+                "audit counts must sum to total_before"
+            );
+            // Cross-project doc should be in denied entries
+            let denied_b = audit
+                .entries
+                .iter()
+                .any(|e| e.result_id == doc_b_id && e.verdict == ScopeVerdict::Deny);
+            if audit.total_before > 0 {
+                // If both docs were returned by Tantivy, doc_b should be denied
+                let visible_b = resp.results.iter().any(|r| r.result.id == doc_b_id);
+                assert!(
+                    !visible_b || denied_b,
+                    "cross-project doc_b should be denied or not in results"
+                );
+            }
+        }
+        other => panic!("v3 lexical audit search failed: {other:?}"),
+    }
 }

@@ -371,6 +371,12 @@ fn build_hit(
         metadata.insert("created_ts".to_string(), serde_json::json!(ts));
     }
 
+    // project_id is stored as u64 in the index; emit as i64 for scope enforcement
+    if let Some(pid) = doc.get_first(handles.project_id).and_then(|v| v.as_u64()) {
+        #[allow(clippy::cast_possible_wrap)]
+        metadata.insert("project_id".to_string(), serde_json::json!(pid as i64));
+    }
+
     SearchHit {
         doc_id: id,
         doc_kind,
