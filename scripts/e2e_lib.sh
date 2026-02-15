@@ -113,6 +113,18 @@ _E2E_TOTAL=0
 # Current case (for trace correlation)
 _E2E_CURRENT_CASE=""
 
+# Per-assertion ID tracking (br-1xt0m.1.13.13)
+# Auto-incremented within each case; reset by e2e_case_banner.
+_E2E_ASSERT_SEQ=0
+
+# Step tracking (br-1xt0m.1.13.13)
+# Optional structured step within a case. Set via e2e_step_start/e2e_step_end.
+_E2E_CURRENT_STEP=""
+_E2E_STEP_START_MS=0
+
+# Case timing (br-1xt0m.1.13.13)
+_E2E_CASE_START_MS=0
+
 # Optional fixture identifiers gathered by suites/harness.
 # Suites can append with e2e_add_fixture_id; environment injection is also
 # supported via E2E_FIXTURE_IDS (comma/space-separated).
@@ -196,6 +208,9 @@ e2e_case_banner() {
     local case_name="$1"
     (( _E2E_TOTAL++ )) || true
     _E2E_CURRENT_CASE="$case_name"
+    _E2E_ASSERT_SEQ=0
+    _E2E_CURRENT_STEP=""
+    _E2E_CASE_START_MS="$(_e2e_now_ms)"
     _e2e_trace_event "case_start" "" "$case_name"
     echo ""
     echo -e "${_e2e_color_blue}── Case: ${case_name} ──${_e2e_color_reset}"
@@ -204,22 +219,60 @@ e2e_case_banner() {
 e2e_pass() {
     local msg="${1:-}"
     (( _E2E_PASS++ )) || true
-    _e2e_trace_event "assert_pass" "$msg"
+    (( _E2E_ASSERT_SEQ++ )) || true
+    local aid="${_E2E_CURRENT_CASE:+${_E2E_CURRENT_CASE}.}a${_E2E_ASSERT_SEQ}"
+    local now_ms elapsed=""
+    now_ms="$(_e2e_now_ms)"
+    if [ "${_E2E_CASE_START_MS:-0}" -gt 0 ]; then
+        elapsed=$(( now_ms - _E2E_CASE_START_MS ))
+    fi
+    _e2e_trace_event "assert_pass" "$msg" "" "$aid" "" "$elapsed"
     echo -e "  ${_e2e_color_green}PASS${_e2e_color_reset} ${msg}"
 }
 
 e2e_fail() {
     local msg="${1:-}"
     (( _E2E_FAIL++ )) || true
-    _e2e_trace_event "assert_fail" "$msg"
+    (( _E2E_ASSERT_SEQ++ )) || true
+    local aid="${_E2E_CURRENT_CASE:+${_E2E_CURRENT_CASE}.}a${_E2E_ASSERT_SEQ}"
+    local now_ms elapsed=""
+    now_ms="$(_e2e_now_ms)"
+    if [ "${_E2E_CASE_START_MS:-0}" -gt 0 ]; then
+        elapsed=$(( now_ms - _E2E_CASE_START_MS ))
+    fi
+    _e2e_trace_event "assert_fail" "$msg" "" "$aid" "" "$elapsed"
     echo -e "  ${_e2e_color_red}FAIL${_e2e_color_reset} ${msg}"
 }
 
 e2e_skip() {
     local msg="${1:-}"
     (( _E2E_SKIP++ )) || true
-    _e2e_trace_event "assert_skip" "$msg"
+    (( _E2E_ASSERT_SEQ++ )) || true
+    local aid="${_E2E_CURRENT_CASE:+${_E2E_CURRENT_CASE}.}a${_E2E_ASSERT_SEQ}"
+    _e2e_trace_event "assert_skip" "$msg" "" "$aid"
     echo -e "  ${_e2e_color_yellow}SKIP${_e2e_color_reset} ${msg}"
+}
+
+# Step tracking (br-1xt0m.1.13.13)
+# Wraps a logical step within a test case. Steps appear as "step" fields in trace
+# events. Call e2e_step_end to emit a step_end event with elapsed_ms.
+e2e_step_start() {
+    local step_name="$1"
+    _E2E_CURRENT_STEP="$step_name"
+    _E2E_STEP_START_MS="$(_e2e_now_ms)"
+    _e2e_trace_event "step_start" "" "" "" "$step_name"
+}
+
+e2e_step_end() {
+    local step_name="${1:-${_E2E_CURRENT_STEP:-}}"
+    local now_ms elapsed=""
+    now_ms="$(_e2e_now_ms)"
+    if [ "${_E2E_STEP_START_MS:-0}" -gt 0 ]; then
+        elapsed=$(( now_ms - _E2E_STEP_START_MS ))
+    fi
+    _e2e_trace_event "step_end" "" "" "" "$step_name" "$elapsed"
+    _E2E_CURRENT_STEP=""
+    _E2E_STEP_START_MS=0
 }
 
 # Print expected vs actual for a mismatch
@@ -604,10 +657,31 @@ _e2e_now_rfc3339() {
     date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+# Monotonic millisecond clock for elapsed_ms tracking (br-1xt0m.1.13.13).
+# Returns milliseconds since epoch. In deterministic mode returns synthetic
+# values derived from _E2E_TRACE_SEQ (1000ms per tick).
+_e2e_now_ms() {
+    if [ "${E2E_CLOCK_MODE:-wall}" = "deterministic" ]; then
+        echo $(( (E2E_RUN_START_EPOCH_S + _E2E_TRACE_SEQ) * 1000 ))
+        return 0
+    fi
+    # Try nanosecond-resolution date first (GNU coreutils), fall back to second.
+    local ns
+    ns="$(date +%s%N 2>/dev/null)" || true
+    if [ -n "$ns" ] && [ ${#ns} -gt 10 ]; then
+        echo $(( ns / 1000000 ))
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
 _e2e_trace_event() {
     local kind="$1"
     local msg="${2:-}"
     local case_name="${3:-${_E2E_CURRENT_CASE:-}}"
+    local assertion_id="${4:-}"
+    local step_name="${5:-${_E2E_CURRENT_STEP:-}}"
+    local elapsed_ms="${6:-}"
 
     if [ -z "${_E2E_TRACE_FILE:-}" ]; then
         return 0
@@ -626,7 +700,19 @@ _e2e_trace_event() {
     safe_case="$(_e2e_json_escape "$case_name")"
     safe_msg="$(_e2e_json_escape "$msg")"
 
-    echo "{\"schema_version\":1,\"suite\":\"${safe_suite}\",\"run_timestamp\":\"${safe_run_ts}\",\"ts\":\"${safe_ts}\",\"kind\":\"${safe_kind}\",\"case\":\"${safe_case}\",\"message\":\"${safe_msg}\",\"counters\":{\"total\":${_E2E_TOTAL},\"pass\":${_E2E_PASS},\"fail\":${_E2E_FAIL},\"skip\":${_E2E_SKIP}}}" >>"$_E2E_TRACE_FILE"
+    # Build optional v2 fields (br-1xt0m.1.13.13)
+    local v2_fields=""
+    if [ -n "$assertion_id" ]; then
+        v2_fields="${v2_fields},\"assertion_id\":\"$(_e2e_json_escape "$assertion_id")\""
+    fi
+    if [ -n "$step_name" ]; then
+        v2_fields="${v2_fields},\"step\":\"$(_e2e_json_escape "$step_name")\""
+    fi
+    if [ -n "$elapsed_ms" ]; then
+        v2_fields="${v2_fields},\"elapsed_ms\":${elapsed_ms}"
+    fi
+
+    echo "{\"schema_version\":2,\"suite\":\"${safe_suite}\",\"run_timestamp\":\"${safe_run_ts}\",\"ts\":\"${safe_ts}\",\"kind\":\"${safe_kind}\",\"case\":\"${safe_case}\",\"message\":\"${safe_msg}\",\"counters\":{\"total\":${_E2E_TOTAL},\"pass\":${_E2E_PASS},\"fail\":${_E2E_FAIL},\"skip\":${_E2E_SKIP}}${v2_fields}}" >>"$_E2E_TRACE_FILE"
 }
 
 e2e_write_summary_json() {
@@ -837,7 +923,7 @@ e2e_write_bundle_manifest() {
         echo "      \"env_redacted\": {\"path\": \"diagnostics/env_redacted.txt\"},"
         echo "      \"tree\": {\"path\": \"diagnostics/tree.txt\"}"
         echo "    },"
-        echo "    \"trace\": {\"events\": {\"path\": \"trace/events.jsonl\", \"schema\": \"trace-events.v1\"}},"
+        echo "    \"trace\": {\"events\": {\"path\": \"trace/events.jsonl\", \"schema\": \"trace-events.v2\"}},"
         echo "    \"transcript\": {\"summary\": {\"path\": \"transcript/summary.txt\"}},"
         echo "    \"logs\": {\"index\": {\"path\": \"logs/index.json\", \"schema\": \"logs-index.v1\"}},"
         echo "    \"screenshots\": {\"index\": {\"path\": \"screenshots/index.json\", \"schema\": \"screenshots-index.v1\"}},"
@@ -875,7 +961,7 @@ e2e_write_bundle_manifest() {
                     ;;
                 trace/events.jsonl)
                     kind="trace"
-                    schema_json="\"trace-events.v1\""
+                    schema_json="\"trace-events.v2\""
                     ;;
                 logs/index.json)
                     kind="log"
@@ -1217,8 +1303,9 @@ with open(events_path, "r", encoding="utf-8") as f:
             fail(f"trace/events.jsonl invalid JSON at line {ln}: {e}")
         if not isinstance(ev, dict):
             fail(f"trace/events.jsonl line {ln}: expected object")
-        if ev.get("schema_version") != 1:
-            fail(f"trace/events.jsonl line {ln}: schema_version must be 1")
+        sv = ev.get("schema_version")
+        if sv not in (1, 2):
+            fail(f"trace/events.jsonl line {ln}: schema_version must be 1 or 2, got {sv}")
         if ev.get("suite") != suite:
             fail(f"trace/events.jsonl line {ln}: suite mismatch")
         if ev.get("run_timestamp") != timestamp:
@@ -1242,6 +1329,13 @@ with open(events_path, "r", encoding="utf-8") as f:
         for k in ("total", "pass", "fail", "skip"):
             if not isinstance(ctr.get(k), int):
                 fail(f"trace/events.jsonl line {ln}: counters.{k} must be int")
+        # v2 optional fields (br-1xt0m.1.13.13): assertion_id, step, elapsed_ms
+        if "assertion_id" in ev and not isinstance(ev["assertion_id"], str):
+            fail(f"trace/events.jsonl line {ln}: assertion_id must be string")
+        if "step" in ev and not isinstance(ev["step"], str):
+            fail(f"trace/events.jsonl line {ln}: step must be string")
+        if "elapsed_ms" in ev and not isinstance(ev["elapsed_ms"], (int, float)):
+            fail(f"trace/events.jsonl line {ln}: elapsed_ms must be number")
 
 if not seen_start:
     fail("trace/events.jsonl missing suite_start")
@@ -2121,7 +2215,14 @@ EOJSON
 _e2e_original_fail() {
     local msg="${1:-}"
     (( _E2E_FAIL++ )) || true
-    _e2e_trace_event "assert_fail" "$msg"
+    (( _E2E_ASSERT_SEQ++ )) || true
+    local aid="${_E2E_CURRENT_CASE:+${_E2E_CURRENT_CASE}.}a${_E2E_ASSERT_SEQ}"
+    local now_ms elapsed=""
+    now_ms="$(_e2e_now_ms)"
+    if [ "${_E2E_CASE_START_MS:-0}" -gt 0 ]; then
+        elapsed=$(( now_ms - _E2E_CASE_START_MS ))
+    fi
+    _e2e_trace_event "assert_fail" "$msg" "" "$aid" "" "$elapsed"
     echo -e "  ${_e2e_color_red}FAIL${_e2e_color_reset} ${msg}"
 }
 

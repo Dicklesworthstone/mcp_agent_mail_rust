@@ -31,8 +31,8 @@ E2E_RUN_ENDED_AT="$(_e2e_now_rfc3339)"
 E2E_RUN_END_EPOCH_S="$(date +%s)"
 
 cat > "${GOOD_DIR}/trace/events.jsonl" <<EOF
-{"schema_version":1,"suite":"${E2E_SUITE}","run_timestamp":"${E2E_TIMESTAMP}","ts":"${E2E_RUN_STARTED_AT}","kind":"suite_start","case":"","message":"","counters":{"total":0,"pass":0,"fail":0,"skip":0}}
-{"schema_version":1,"suite":"${E2E_SUITE}","run_timestamp":"${E2E_TIMESTAMP}","ts":"${E2E_RUN_ENDED_AT}","kind":"suite_end","case":"","message":"","counters":{"total":0,"pass":0,"fail":0,"skip":0}}
+{"schema_version":2,"suite":"${E2E_SUITE}","run_timestamp":"${E2E_TIMESTAMP}","ts":"${E2E_RUN_STARTED_AT}","kind":"suite_start","case":"","message":"","counters":{"total":0,"pass":0,"fail":0,"skip":0}}
+{"schema_version":2,"suite":"${E2E_SUITE}","run_timestamp":"${E2E_TIMESTAMP}","ts":"${E2E_RUN_ENDED_AT}","kind":"suite_end","case":"","message":"","counters":{"total":0,"pass":0,"fail":0,"skip":0}}
 EOF
 
 e2e_write_summary_json "${GOOD_DIR}"
