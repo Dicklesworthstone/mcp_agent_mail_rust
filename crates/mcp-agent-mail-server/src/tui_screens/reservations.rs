@@ -17,7 +17,7 @@ use ftui_widgets::progress::ProgressBar;
 
 use crate::tui_action_menu::{ActionEntry, reservations_actions};
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_events::MailEvent;
+use crate::tui_events::{DbStatSnapshot, MailEvent, ReservationSnapshot};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 const COL_AGENT: usize = 0;
@@ -29,7 +29,7 @@ const COL_PROJECT: usize = 4;
 const SORT_LABELS: &[&str] = &["Agent", "Path", "Excl", "TTL", "Project"];
 
 /// Tracked reservation state from events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveReservation {
     agent: String,
     path_pattern: String,
@@ -88,6 +88,8 @@ pub struct ReservationsScreen {
     sort_asc: bool,
     show_released: bool,
     last_seq: u64,
+    /// Timestamp of the last DB snapshot consumed by this screen.
+    last_snapshot_micros: i64,
     /// Synthetic event for the focused reservation (palette quick actions).
     focused_synthetic: Option<crate::tui_events::MailEvent>,
 }
@@ -103,6 +105,7 @@ impl ReservationsScreen {
             sort_asc: true,
             show_released: false,
             last_seq: 0,
+            last_snapshot_micros: 0,
             focused_synthetic: None,
         }
     }
@@ -125,7 +128,8 @@ impl ReservationsScreen {
             });
     }
 
-    fn ingest_events(&mut self, state: &TuiSharedState) {
+    fn ingest_events(&mut self, state: &TuiSharedState) -> bool {
+        let mut changed = false;
         let events = state.events_since(self.last_seq);
         for event in &events {
             self.last_seq = event.seq().max(self.last_seq);
@@ -149,7 +153,11 @@ impl ReservationsScreen {
                             project: project.clone(),
                             released: false,
                         };
-                        self.reservations.insert(res.key(), res);
+                        let key = res.key();
+                        if self.reservations.get(&key) != Some(&res) {
+                            self.reservations.insert(key, res);
+                            changed = true;
+                        }
                     }
                 }
                 MailEvent::ReservationReleased {
@@ -161,13 +169,57 @@ impl ReservationsScreen {
                     for path in paths {
                         let key = format!("{project}:{agent}:{path}");
                         if let Some(res) = self.reservations.get_mut(&key) {
-                            res.released = true;
+                            if !res.released {
+                                res.released = true;
+                                changed = true;
+                            }
                         }
                     }
                 }
                 _ => {}
             }
         }
+        changed
+    }
+
+    fn ttl_secs_from_snapshot(snapshot: &ReservationSnapshot) -> u64 {
+        if snapshot.expires_ts <= snapshot.granted_ts {
+            return 0;
+        }
+        let ttl_micros = snapshot.expires_ts.saturating_sub(snapshot.granted_ts);
+        let ttl_secs = ttl_micros.saturating_add(999_999) / 1_000_000;
+        u64::try_from(ttl_secs).unwrap_or(u64::MAX)
+    }
+
+    fn apply_db_snapshot(&mut self, snapshot: &DbStatSnapshot) -> bool {
+        if snapshot.timestamp_micros <= self.last_snapshot_micros {
+            return false;
+        }
+        self.last_snapshot_micros = snapshot.timestamp_micros;
+
+        let next: HashMap<String, ActiveReservation> = snapshot
+            .reservation_snapshots
+            .iter()
+            .map(|row| {
+                let reservation = ActiveReservation {
+                    agent: row.agent_name.clone(),
+                    path_pattern: row.path_pattern.clone(),
+                    exclusive: row.exclusive,
+                    granted_ts: row.granted_ts,
+                    ttl_s: Self::ttl_secs_from_snapshot(row),
+                    project: row.project_slug.clone(),
+                    released: row.is_released(),
+                };
+                (reservation.key(), reservation)
+            })
+            .collect();
+
+        if self.reservations == next {
+            return false;
+        }
+
+        self.reservations = next;
+        true
     }
 
     fn rebuild_sorted(&mut self) {
@@ -283,8 +335,12 @@ impl MailScreen for ReservationsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        self.ingest_events(state);
-        if tick_count % 10 == 0 {
+        let mut changed = false;
+        if let Some(snapshot) = state.db_stats_snapshot() {
+            changed |= self.apply_db_snapshot(&snapshot);
+        }
+        changed |= self.ingest_events(state);
+        if changed || tick_count % 10 == 0 {
             self.rebuild_sorted();
         }
         self.sync_focused_event();
@@ -718,7 +774,8 @@ mod tests {
             "proj",
         ));
 
-        screen.ingest_events(&state);
+        let changed = screen.ingest_events(&state);
+        assert!(changed);
         assert_eq!(screen.reservations.len(), 2);
 
         let (active, excl, shared, expired) = screen.summary_counts();
@@ -746,7 +803,8 @@ mod tests {
             "proj",
         ));
 
-        screen.ingest_events(&state);
+        let changed = screen.ingest_events(&state);
+        assert!(changed);
         let (active, _, _, expired) = screen.summary_counts();
         assert_eq!(active, 0);
         assert_eq!(expired, 0);
@@ -821,7 +879,8 @@ mod tests {
             1800,
             "proj",
         ));
-        screen.ingest_events(&state);
+        let changed = screen.ingest_events(&state);
+        assert!(changed);
         let (active, exclusive, shared, expired) = screen.summary_counts();
         assert_eq!(active, 2);
         assert_eq!(exclusive, 1);
@@ -858,7 +917,8 @@ mod tests {
             "proj",
         ));
 
-        screen.ingest_events(&state);
+        let changed = screen.ingest_events(&state);
+        assert!(changed);
         screen.rebuild_sorted();
 
         // Deep-link to RedStone's reservation
@@ -871,5 +931,44 @@ mod tests {
         let handled =
             screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("Unknown".into()));
         assert!(!handled);
+    }
+
+    #[test]
+    fn applies_db_snapshot_on_first_tick() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            reservation_snapshots: vec![
+                ReservationSnapshot {
+                    id: 10,
+                    project_slug: "proj".into(),
+                    agent_name: "BlueLake".into(),
+                    path_pattern: "src/**".into(),
+                    exclusive: true,
+                    granted_ts: 1_000_000,
+                    expires_ts: 4_000_000,
+                    released_ts: None,
+                },
+                ReservationSnapshot {
+                    id: 11,
+                    project_slug: "proj".into(),
+                    agent_name: "RedStone".into(),
+                    path_pattern: "tests/**".into(),
+                    exclusive: false,
+                    granted_ts: 1_000_000,
+                    expires_ts: 7_000_000,
+                    released_ts: None,
+                },
+            ],
+            timestamp_micros: 42,
+            ..Default::default()
+        });
+
+        screen.tick(1, &state);
+
+        assert_eq!(screen.reservations.len(), 2);
+        assert_eq!(screen.last_snapshot_micros, 42);
+        assert!(!screen.sorted_keys.is_empty());
     }
 }

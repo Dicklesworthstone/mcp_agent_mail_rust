@@ -23,7 +23,9 @@ use ftui::widgets::notification_queue::NotificationStack;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::toast::{ToastId, ToastPosition};
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
-use ftui::{Event, KeyCode, KeyEventKind, Modifiers, PackedRgba, Style};
+use ftui::{
+    Event, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, PackedRgba, Style,
+};
 use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
@@ -60,7 +62,7 @@ const PALETTE_USAGE_HALF_LIFE_MICROS: i64 = 60 * 60 * 1_000_000;
 const SCREEN_TRANSITION_TICKS: u8 = 4;
 const TOAST_ENTRANCE_TICKS: u8 = 4;
 const TOAST_EXIT_TICKS: u8 = 3;
-const REMOTE_EVENTS_PER_TICK: usize = 64;
+const REMOTE_EVENTS_PER_TICK: usize = 256;
 
 /// Deferred action from a confirmed modal callback.
 ///
@@ -1019,6 +1021,8 @@ impl MailAppModel {
             MailScreenId::Timeline,
             Box::new(TimelineScreen::with_config(config)),
         );
+        // Initialize the named palette theme from config (T14.2).
+        crate::tui_theme::init_named_theme(&config.tui_theme);
         let initial_theme = crate::tui_theme::current_theme_id();
         model.last_non_hc_theme = if initial_theme == ThemeId::HighContrast {
             ThemeId::CyberpunkAurora
@@ -1100,6 +1104,46 @@ impl MailAppModel {
         graph
             .node(self.focus_manager.current())
             .map(|node| node.rect)
+    }
+
+    fn terminal_area_from_last_content(&self) -> Rect {
+        let content = *self.last_content_area.borrow();
+        Rect::new(
+            content.x,
+            content.y.saturating_sub(1),
+            content.width,
+            content.height.saturating_add(2),
+        )
+    }
+
+    fn handle_help_overlay_mouse(&mut self, event: &Event) -> bool {
+        if !self.help_visible {
+            return false;
+        }
+        let Event::Mouse(mouse) = event else {
+            return false;
+        };
+
+        let overlay = crate::tui_chrome::help_overlay_rect(self.terminal_area_from_last_content());
+        let inside_overlay = crate::tui_hit_regions::point_in_rect(overlay, mouse.x, mouse.y);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !inside_overlay {
+                    self.help_visible = false;
+                }
+                true
+            }
+            MouseEventKind::ScrollDown if inside_overlay => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+                true
+            }
+            MouseEventKind::ScrollUp if inside_overlay => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+                true
+            }
+            _ => true,
+        }
     }
 
     fn activate_screen(&mut self, id: MailScreenId) {
@@ -1238,9 +1282,9 @@ impl MailAppModel {
         };
 
         // Attempt OSC 52 / system clipboard.
-        let result = self
-            .clipboard
-            .set(text, ClipboardSelection::Clipboard, &mut std::io::stdout());
+        let result =
+            self.clipboard
+                .set(text, ClipboardSelection::Clipboard, &mut std::io::stdout());
 
         match result {
             Ok(()) => {
@@ -1550,10 +1594,14 @@ impl MailAppModel {
             return;
         };
 
-        let mut map: HashMap<&'static str, String> = HashMap::with_capacity(5);
+        let mut map: HashMap<&'static str, String> = HashMap::with_capacity(6);
         map.insert(
             "CONSOLE_THEME",
             crate::tui_theme::current_theme_env_value().to_string(),
+        );
+        map.insert(
+            "TUI_THEME",
+            crate::tui_theme::active_named_theme_config_name().to_string(),
         );
         map.insert(
             "TUI_HIGH_CONTRAST",
@@ -1595,7 +1643,9 @@ impl MailAppModel {
     }
 
     fn cycle_theme(&mut self) -> &'static str {
+        // Cycle both the ftui console theme and the named palette theme (T14.2).
         let name = crate::tui_theme::cycle_and_get_name();
+        let _named = crate::tui_theme::cycle_named_theme();
         let theme_id = crate::tui_theme::current_theme_id();
         self.accessibility.high_contrast = theme_id == ThemeId::HighContrast;
         if theme_id != ThemeId::HighContrast {
@@ -2597,34 +2647,42 @@ impl Model for MailAppModel {
                     }
                 }
 
+                let text_mode = self.consumes_text_input();
+
+                // Help overlay is topmost and traps pointer input.
+                if self.handle_help_overlay_mouse(event) {
+                    return Cmd::none();
+                }
+
                 // Central mouse dispatch for shell-level interactions
                 // (tab clicks, status line). Checked before global keybindings
                 // so that shell regions consume the event and prevent
                 // accidental forwarding to screens.
                 if let Event::Mouse(ref mouse) = *event {
-                    use crate::tui_hit_regions::MouseAction;
-                    match self.mouse_dispatcher.dispatch(mouse) {
-                        MouseAction::SwitchScreen(id) => {
-                            self.activate_screen(id);
-                            return Cmd::none();
+                    if !text_mode {
+                        use crate::tui_hit_regions::MouseAction;
+                        match self.mouse_dispatcher.dispatch(mouse) {
+                            MouseAction::SwitchScreen(id) => {
+                                self.activate_screen(id);
+                                return Cmd::none();
+                            }
+                            MouseAction::ToggleHelp => {
+                                self.help_visible = !self.help_visible;
+                                self.help_scroll = 0;
+                                return Cmd::none();
+                            }
+                            MouseAction::OpenPalette => {
+                                self.open_palette();
+                                return Cmd::none();
+                            }
+                            MouseAction::Forward => {}
                         }
-                        MouseAction::ToggleHelp => {
-                            self.help_visible = !self.help_visible;
-                            self.help_scroll = 0;
-                            return Cmd::none();
-                        }
-                        MouseAction::OpenPalette => {
-                            self.open_palette();
-                            return Cmd::none();
-                        }
-                        MouseAction::Forward => {}
                     }
                 }
 
                 // Global keybindings (checked before screen dispatch)
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
-                        let text_mode = self.consumes_text_input();
                         let is_ctrl_p = key.modifiers.contains(Modifiers::CTRL)
                             && matches!(key.code, KeyCode::Char('p'));
                         if (is_ctrl_p || matches!(key.code, KeyCode::Char(':'))) && !text_mode {
@@ -2723,9 +2781,7 @@ impl Model for MailAppModel {
                             }
                             // Clipboard yank: y copies focused content
                             KeyCode::Char('y') if !text_mode => {
-                                if let Some(screen) =
-                                    self.screen_manager.active_screen_ref()
-                                {
+                                if let Some(screen) = self.screen_manager.active_screen_ref() {
                                     if let Some(content) = screen.copyable_content() {
                                         self.copy_to_clipboard(&content);
                                     } else {
@@ -5106,6 +5162,42 @@ mod tests {
         let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
         model.update(MailMsg::Terminal(esc));
         assert!(!model.help_visible());
+    }
+
+    #[test]
+    fn mouse_click_outside_help_overlay_dismisses_help() {
+        let mut model = test_model();
+        *model.last_content_area.borrow_mut() = Rect::new(0, 1, 120, 38);
+        model.update(MailMsg::ToggleHelp);
+        assert!(model.help_visible());
+
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: 0,
+            y: 0,
+            modifiers: Modifiers::empty(),
+        });
+        model.update(MailMsg::Terminal(click));
+        assert!(!model.help_visible());
+    }
+
+    #[test]
+    fn mouse_click_inside_help_overlay_keeps_help_visible() {
+        let mut model = test_model();
+        let root_area = Rect::new(0, 0, 120, 40);
+        *model.last_content_area.borrow_mut() = Rect::new(0, 1, 120, 38);
+        model.update(MailMsg::ToggleHelp);
+        assert!(model.help_visible());
+
+        let overlay = crate::tui_chrome::help_overlay_rect(root_area);
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: overlay.x.saturating_add(1),
+            y: overlay.y.saturating_add(1),
+            modifiers: Modifiers::empty(),
+        });
+        model.update(MailMsg::Terminal(click));
+        assert!(model.help_visible());
     }
 
     #[test]

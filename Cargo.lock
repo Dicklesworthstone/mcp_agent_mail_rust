@@ -978,6 +978,8 @@ dependencies = [
  "dotenvy",
  "fastembed",
  "flate2",
+ "frankensearch-embed",
+ "frankensearch-index",
  "ftui",
  "ftui-extras",
  "glob",

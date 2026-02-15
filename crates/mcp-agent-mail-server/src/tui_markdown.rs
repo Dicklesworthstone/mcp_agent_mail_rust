@@ -580,7 +580,113 @@ Thanks!";
         assert!(rendered.contains("gamma"));
     }
 
+    #[test]
+    fn snapshot_golden_regression_matrix() {
+        struct Case {
+            scenario_id: &'static str,
+            markdown: &'static str,
+            min_height: usize,
+            required_fragments: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                scenario_id: "heading_bold",
+                markdown: "# Title\n\nSome **bold** text.",
+                min_height: 2,
+                required_fragments: &["Title", "Some", "bold"],
+            },
+            Case {
+                scenario_id: "json_code_fence",
+                markdown: "```json\n{\"service\":\"mail\",\"enabled\":true}\n```",
+                min_height: 1,
+                required_fragments: &["service", "enabled"],
+            },
+            Case {
+                scenario_id: "hostile_script_sanitized",
+                markdown: "Before <script>alert('xss')</script> After",
+                min_height: 1,
+                required_fragments: &["Before", "After"],
+            },
+            Case {
+                scenario_id: "nested_list",
+                markdown: "- parent\n  - child\n    - grandchild",
+                min_height: 3,
+                required_fragments: &["parent", "child", "grandchild"],
+            },
+        ];
+
+        for case in cases {
+            let first = render_body(case.markdown, &theme());
+            let second = render_body(case.markdown, &theme());
+            let canonical = canonical_text(&first);
+            let digest = stable_digest(&canonical);
+            let second_digest = stable_digest(&canonical_text(&second));
+
+            eprintln!(
+                "scenario={} digest={} height={}",
+                case.scenario_id,
+                digest,
+                first.height()
+            );
+
+            assert!(
+                first.height() >= case.min_height,
+                "{}: expected height >= {}, got {}",
+                case.scenario_id,
+                case.min_height,
+                first.height()
+            );
+            for fragment in case.required_fragments {
+                assert!(
+                    canonical.contains(fragment),
+                    "{}: rendered output missing fragment {:?}",
+                    case.scenario_id,
+                    fragment
+                );
+            }
+            assert!(
+                digest != 0,
+                "{}: digest unexpectedly zero",
+                case.scenario_id
+            );
+            assert_eq!(
+                digest, second_digest,
+                "{}: render digest should be deterministic",
+                case.scenario_id
+            );
+        }
+    }
+
     // ── Helper ────────────────────────────────────────────────────
+
+    /// Canonicalize rendered text for deterministic snapshot hashing.
+    fn canonical_text(text: &Text) -> String {
+        text.lines()
+            .iter()
+            .map(|line| {
+                line.spans()
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Stable FNV-1a digest for compact golden snapshot assertions.
+    fn stable_digest(input: &str) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = FNV_OFFSET;
+        for byte in input.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
 
     /// Flatten styled Text into a plain string for assertion checks.
     fn text_to_string(text: &Text) -> String {

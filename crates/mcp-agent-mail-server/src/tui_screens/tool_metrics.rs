@@ -891,11 +891,11 @@ impl ToolMetricsScreen {
             .map(|row| row.p99)
             .fold(0.0_f64, f64::max);
         let severity_color = if max_p99 < 100.0 {
-            PackedRgba::rgb(0, 200, 80) // green
+            tp.severity_ok
         } else if max_p99 < 500.0 {
-            PackedRgba::rgb(240, 180, 0) // yellow
+            tp.severity_warn
         } else {
-            PackedRgba::rgb(240, 60, 60) // red
+            tp.severity_error
         };
         let colors: Vec<PackedRgba> = vec![
             tp.chart_series[0], // P50 — theme default

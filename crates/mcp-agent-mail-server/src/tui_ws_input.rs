@@ -160,4 +160,51 @@ mod tests {
             .expect_err("expected invalid payload error");
         assert!(err.contains("Invalid /mail/ws-input payload"));
     }
+
+    #[test]
+    fn parse_rejects_empty_body() {
+        let err = parse_remote_terminal_events(&[]).expect_err("expected empty-body error");
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn parse_accepts_max_batch_size_boundary() {
+        let events: Vec<serde_json::Value> = (0..MAX_INGRESS_EVENTS)
+            .map(|_| json!({"type":"Ping"}))
+            .collect();
+        let body = serde_json::to_vec(&json!({ "events": events })).expect("serialize payload");
+        let parsed = parse_remote_terminal_events(&body).expect("parse max-sized batch");
+        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.ignored, MAX_INGRESS_EVENTS);
+    }
+
+    #[test]
+    fn parse_alias_forms_are_supported() {
+        let payload = br#"{
+            "events": [
+                {"type":"input","data":{"kind":"key","key":"x","modifiers":2}},
+                {"type":"resize","data":{"cols":99,"rows":41}}
+            ]
+        }"#;
+        let parsed = parse_remote_terminal_events(payload).expect("parse alias forms");
+        assert_eq!(
+            parsed.events,
+            vec![
+                RemoteTerminalEvent::Key {
+                    key: "x".to_string(),
+                    modifiers: 2,
+                },
+                RemoteTerminalEvent::Resize { cols: 99, rows: 41 }
+            ]
+        );
+        assert_eq!(parsed.ignored, 0);
+    }
+
+    #[test]
+    fn parse_ping_only_payload_is_ignored_not_error() {
+        let payload = br#"{"type":"Ping"}"#;
+        let parsed = parse_remote_terminal_events(payload).expect("parse ping payload");
+        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.ignored, 1);
+    }
 }

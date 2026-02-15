@@ -4,6 +4,7 @@
 //! Layout: `[tab_bar(1)] [screen_content(fill)] [status_line(1)]`
 
 use ftui::layout::{Constraint, Flex, Rect};
+use ftui::text::display_width;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
@@ -523,7 +524,7 @@ fn plan_status_segments(
 
 #[inline]
 fn segment_text_width(text: &str) -> u16 {
-    u16::try_from(text.len()).unwrap_or(u16::MAX)
+    u16::try_from(display_width(text)).unwrap_or(u16::MAX)
 }
 
 /// Render the status line into a 1-row area.
@@ -588,7 +589,7 @@ pub fn render_status_line(
             style = style.bold();
         }
         spans.push(Span::styled(seg.text.as_str(), style));
-        cursor_x = cursor_x.saturating_add(u16::try_from(seg.text.len()).unwrap_or(u16::MAX));
+        cursor_x = cursor_x.saturating_add(segment_text_width(&seg.text));
     }
 
     // Center padding + center segments
@@ -627,7 +628,7 @@ pub fn render_status_line(
             }
             spans.push(Span::styled(seg.text.as_str(), style));
         }
-        cursor_x = cursor_x.saturating_add(u16::try_from(seg.text.len()).unwrap_or(u16::MAX));
+        cursor_x = cursor_x.saturating_add(segment_text_width(&seg.text));
     }
 
     // Right padding
@@ -646,7 +647,7 @@ pub fn render_status_line(
         if seg.bold {
             style = style.bold();
         }
-        let seg_width = u16::try_from(seg.text.len()).unwrap_or(u16::MAX);
+        let seg_width = segment_text_width(&seg.text);
         if effects_enabled && seg.effect != StatusEffect::None && seg_width > 0 {
             effect_overlays.push((cursor_x, seg_width, seg.effect, seg.fg, seg.text.clone()));
         }
@@ -663,7 +664,9 @@ pub fn render_status_line(
             if label.is_empty() {
                 continue;
             }
-            let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX).min(width);
+            let label_width = u16::try_from(display_width(label))
+                .unwrap_or(u16::MAX)
+                .min(width);
             let effect = match effect {
                 StatusEffect::LivePulse => TextEffect::Pulse {
                     speed: 2.0 / 3.0,
@@ -700,15 +703,7 @@ pub fn render_help_overlay_sections(
     area: Rect,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
-
-    let overlay_width = (u32::from(area.width) * 60 / 100).clamp(36, 72) as u16;
-    let overlay_height = (u32::from(area.height) * 60 / 100).clamp(10, 28) as u16;
-    let overlay_width = overlay_width.min(area.width.saturating_sub(2));
-    let overlay_height = overlay_height.min(area.height.saturating_sub(2));
-
-    let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
-    let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
+    let overlay_area = help_overlay_rect(area);
 
     // Total line count for scroll indicator.
     let total_lines: usize = sections
@@ -717,7 +712,7 @@ pub fn render_help_overlay_sections(
         .sum::<usize>()
         .saturating_sub(1); // no trailing separator
 
-    let scroll_hint = if total_lines > usize::from(overlay_height.saturating_sub(2)) {
+    let scroll_hint = if total_lines > usize::from(overlay_area.height.saturating_sub(2)) {
         " (j/k to scroll) "
     } else {
         " "
@@ -788,6 +783,19 @@ pub fn render_help_overlay_sections(
             line_idx += 1;
         }
     }
+}
+
+/// Compute the centered help-overlay rectangle for a terminal frame area.
+#[must_use]
+pub fn help_overlay_rect(area: Rect) -> Rect {
+    let overlay_width = (u32::from(area.width) * 60 / 100).clamp(36, 72) as u16;
+    let overlay_height = (u32::from(area.height) * 60 / 100).clamp(10, 28) as u16;
+    let overlay_width = overlay_width.min(area.width.saturating_sub(2));
+    let overlay_height = overlay_height.min(area.height.saturating_sub(2));
+
+    let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+    Rect::new(x, y, overlay_width, overlay_height)
 }
 
 /// Render a single keybinding line with keycap style: `  key   action`.

@@ -939,6 +939,16 @@ impl MessageBrowserScreen {
         if self.compose_form.is_none() {
             return Cmd::None;
         }
+        if let Event::Mouse(mouse) = event {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let modal_area = compose_modal_rect(self.screen_area());
+                if !point_in_rect(modal_area, mouse.x, mouse.y) {
+                    self.compose_form = None;
+                }
+            }
+            // Compose modal traps pointer input.
+            return Cmd::None;
+        }
         let Event::Key(key) = event else {
             return Cmd::None;
         };
@@ -1063,6 +1073,14 @@ impl MessageBrowserScreen {
     fn detail_visible(&self) -> bool {
         let area = self.last_detail_area.get();
         area.width > 0 && area.height > 0
+    }
+
+    fn screen_area(&self) -> Rect {
+        let search = self.last_search_area.get();
+        let content = self.last_content_area.get();
+        let bottom = content.y.saturating_add(content.height);
+        let height = bottom.saturating_sub(search.y);
+        Rect::new(search.x, search.y, search.width.max(content.width), height)
     }
 
     /// Rough estimate of lines in the detail panel for a message entry.
@@ -2432,7 +2450,7 @@ fn render_detail_panel(
             content_inner.width,
             header_rows as u16,
         );
-        let p = Paragraph::new(header_text);
+        let p = Paragraph::new(header_text).wrap(ftui::text::WrapMode::Word);
         p.render(header_area, frame);
 
         // Render body in remaining space
@@ -2444,7 +2462,7 @@ fn render_detail_panel(
                 content_inner.width,
                 body_rows as u16,
             );
-            let p = Paragraph::new(body_text);
+            let p = Paragraph::new(body_text).wrap(ftui::text::WrapMode::Word);
             p.render(body_area, frame);
         }
     } else {
@@ -2459,7 +2477,7 @@ fn render_detail_panel(
             .cloned()
             .collect();
         let text = ftui::text::Text::from_lines(visible_body);
-        let p = Paragraph::new(text);
+        let p = Paragraph::new(text).wrap(ftui::text::WrapMode::Word);
         p.render(content_inner, frame);
     }
 
@@ -2563,6 +2581,20 @@ fn render_compose_error_line(
     }
 }
 
+#[must_use]
+fn compose_modal_rect(area: Rect) -> Rect {
+    if area.width < 40 || area.height < 16 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let modal_width = ((u32::from(area.width) * 88) / 100).clamp(62, 116) as u16;
+    let modal_height = ((u32::from(area.height) * 88) / 100).clamp(22, 36) as u16;
+    let width = modal_width.min(area.width.saturating_sub(2));
+    let height = modal_height.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormState) {
     if area.width < 40 || area.height < 16 {
@@ -2574,13 +2606,7 @@ fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormSta
         .style(Style::default().bg(tp.bg_overlay))
         .render(area, frame);
 
-    let modal_width = ((u32::from(area.width) * 88) / 100).clamp(62, 116) as u16;
-    let modal_height = ((u32::from(area.height) * 88) / 100).clamp(22, 36) as u16;
-    let width = modal_width.min(area.width.saturating_sub(2));
-    let height = modal_height.min(area.height.saturating_sub(2));
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let modal = Rect::new(x, y, width, height);
+    let modal = compose_modal_rect(area);
 
     let modal_title = format!("Compose Message · project {}", form.project_slug);
     let block = Block::default()
@@ -3311,6 +3337,51 @@ mod tests {
             vec!["BlueLake".to_string()],
         ));
         assert!(screen.consumes_text_input());
+    }
+
+    #[test]
+    fn compose_modal_click_outside_dismisses_modal() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.last_search_area.set(Rect::new(0, 0, 120, 5));
+        screen.last_content_area.set(Rect::new(0, 5, 120, 35));
+        screen.compose_form = Some(ComposeFormState::new(
+            "proj".to_string(),
+            None,
+            vec!["BlueLake".to_string()],
+        ));
+
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: 0,
+            y: 0,
+            modifiers: ftui::Modifiers::empty(),
+        });
+        let _ = screen.update(&click, &state);
+        assert!(screen.compose_form.is_none());
+    }
+
+    #[test]
+    fn compose_modal_click_inside_keeps_modal_open() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.last_search_area.set(Rect::new(0, 0, 120, 5));
+        screen.last_content_area.set(Rect::new(0, 5, 120, 35));
+        screen.compose_form = Some(ComposeFormState::new(
+            "proj".to_string(),
+            None,
+            vec!["BlueLake".to_string()],
+        ));
+
+        let modal = compose_modal_rect(Rect::new(0, 0, 120, 40));
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: modal.x.saturating_add(2),
+            y: modal.y.saturating_add(2),
+            modifiers: ftui::Modifiers::empty(),
+        });
+        let _ = screen.update(&click, &state);
+        assert!(screen.compose_form.is_some());
     }
 
     // ── FTS sanitization ────────────────────────────────────────────

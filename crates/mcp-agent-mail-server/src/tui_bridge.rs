@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const REQUEST_SPARKLINE_CAPACITY: usize = 60;
-const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 1024;
+const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4096;
 /// Max console log entries in the ring buffer.
 const CONSOLE_LOG_CAPACITY: usize = 2000;
 
@@ -186,7 +186,7 @@ impl TuiSharedState {
 
     #[must_use]
     pub fn events_since(&self, seq: u64) -> Vec<MailEvent> {
-        self.events.try_events_since_seq(seq).unwrap_or_default()
+        self.events.events_since_seq(seq)
     }
 
     #[must_use]
@@ -410,6 +410,21 @@ mod tests {
     }
 
     #[test]
+    fn record_request_large_duration_clamped_for_sparkline() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        state.record_request(200, u64::MAX);
+
+        let counters = state.request_counters();
+        assert_eq!(counters.total, 1);
+        assert_eq!(counters.latency_total_ms, u64::MAX);
+
+        let sparkline = state.sparkline_snapshot();
+        assert_eq!(sparkline.len(), 1);
+        assert!((sparkline[0] - f64::from(u32::MAX)).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn sparkline_is_bounded() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
@@ -618,6 +633,18 @@ mod tests {
     }
 
     #[test]
+    fn transport_base_from_http_path_trims_whitespace() {
+        assert_eq!(
+            TransportBase::from_http_path("  /mcp/  "),
+            Some(TransportBase::Mcp)
+        );
+        assert_eq!(
+            TransportBase::from_http_path("  api  "),
+            Some(TransportBase::Api)
+        );
+    }
+
+    #[test]
     fn transport_base_str_and_path() {
         assert_eq!(TransportBase::Mcp.as_str(), "mcp");
         assert_eq!(TransportBase::Api.as_str(), "api");
@@ -687,6 +714,20 @@ mod tests {
         state.set_server_control_sender(tx);
         drop(rx); // Drop receiver
         assert!(!state.try_send_server_control(ServerControlMsg::Shutdown));
+    }
+
+    #[test]
+    fn server_control_with_live_receiver_succeeds() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.set_server_control_sender(tx);
+
+        assert!(state.try_send_server_control(ServerControlMsg::ToggleTransportBase));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(100)).ok(),
+            Some(ServerControlMsg::ToggleTransportBase)
+        );
     }
 
     #[test]
@@ -861,5 +902,16 @@ mod tests {
         assert_eq!(entries.len(), CONSOLE_LOG_CAPACITY);
         assert_eq!(entries[0].0, 6);
         assert_eq!(entries.last().map(|(seq, _)| *seq), Some(2005));
+    }
+
+    #[test]
+    fn console_log_since_future_seq_returns_empty() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        state.push_console_log("alpha".to_string());
+        state.push_console_log("beta".to_string());
+
+        let future = state.console_log_since(999);
+        assert!(future.is_empty());
     }
 }

@@ -6905,7 +6905,8 @@ mod tests {
         assert_ne!(writer_first.status, 429);
 
         // Second writer request for same sub should hit the one-request bucket.
-        let writer_second = block_on(state.handle(make_send_message_call(writer_auth.as_str(), 42)));
+        let writer_second =
+            block_on(state.handle(make_send_message_call(writer_auth.as_str(), 42)));
         assert_eq!(writer_second.status, 429);
         let body: serde_json::Value =
             serde_json::from_slice(&writer_second.body).expect("json response");

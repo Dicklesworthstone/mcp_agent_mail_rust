@@ -333,7 +333,28 @@ pub struct DbStatSnapshot {
     pub agents_list: Vec<AgentSummary>,
     pub projects_list: Vec<ProjectSummary>,
     pub contacts_list: Vec<ContactSummary>,
+    pub reservation_snapshots: Vec<ReservationSnapshot>,
     pub timestamp_micros: i64,
+}
+
+/// Cached reservation metadata derived from the `file_reservations` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReservationSnapshot {
+    pub id: i64,
+    pub project_slug: String,
+    pub agent_name: String,
+    pub path_pattern: String,
+    pub exclusive: bool,
+    pub granted_ts: i64,
+    pub expires_ts: i64,
+    pub released_ts: Option<i64>,
+}
+
+impl ReservationSnapshot {
+    #[must_use]
+    pub const fn is_released(&self) -> bool {
+        self.released_ts.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

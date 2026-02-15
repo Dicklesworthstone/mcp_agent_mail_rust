@@ -72,9 +72,16 @@ pub struct TuiPreferences {
     /// Active dashboard preset name (e.g. "default", "incident-triage").
     #[serde(default = "default_preset_name")]
     pub active_dashboard_preset: String,
+    /// Active theme config name (e.g. "default", "solarized", "dracula", "nord", "gruvbox").
+    #[serde(default = "default_theme_name")]
+    pub active_theme: String,
 }
 
 fn default_preset_name() -> String {
+    "default".to_string()
+}
+
+fn default_theme_name() -> String {
     "default".to_string()
 }
 
@@ -224,6 +231,7 @@ impl TuiPreferences {
             },
             keymap_profile,
             active_dashboard_preset: config.tui_active_preset.clone(),
+            active_theme: config.tui_theme.clone(),
         }
     }
 
@@ -287,6 +295,7 @@ impl TuiPreferences {
             self.keymap_profile.label().to_ascii_lowercase(),
         );
         map.insert("TUI_ACTIVE_PRESET", self.active_dashboard_preset.clone());
+        map.insert("TUI_THEME", self.active_theme.clone());
         map
     }
 }
@@ -1286,5 +1295,74 @@ mod tests {
 
         let loaded = load_dismissed_hints_or_default(&path);
         assert!(loaded.is_empty());
+    }
+
+    // ── Theme persistence tests ─────────────────────────────────
+
+    #[test]
+    fn theme_from_config_default() {
+        let config = Config::default();
+        let prefs = TuiPreferences::from_config(&config);
+        assert_eq!(prefs.active_theme, "default");
+    }
+
+    #[test]
+    fn theme_from_config_named() {
+        let config = Config {
+            tui_theme: "dracula".to_string(),
+            ..Config::default()
+        };
+        let prefs = TuiPreferences::from_config(&config);
+        assert_eq!(prefs.active_theme, "dracula");
+    }
+
+    #[test]
+    fn theme_persisted_to_env_map() {
+        let prefs = TuiPreferences {
+            active_theme: "nord".to_string(),
+            ..Default::default()
+        };
+        let map = prefs.to_env_map();
+        assert_eq!(map.get("TUI_THEME").unwrap(), "nord");
+    }
+
+    #[test]
+    fn theme_json_roundtrip() {
+        let prefs = TuiPreferences {
+            active_theme: "gruvbox".to_string(),
+            ..Default::default()
+        };
+        let json = prefs.to_json().unwrap();
+        let restored = TuiPreferences::from_json(&json).unwrap();
+        assert_eq!(restored.active_theme, "gruvbox");
+    }
+
+    #[test]
+    fn theme_json_missing_defaults_to_default() {
+        let json = r#"{"dock":{"position":"right","ratio":0.4,"visible":true}}"#;
+        let prefs = TuiPreferences::from_json(json).unwrap();
+        assert_eq!(prefs.active_theme, "default");
+    }
+
+    #[test]
+    fn theme_persists_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.env");
+        let config = Config {
+            console_persist_path: path.clone(),
+            console_auto_save: true,
+            ..Config::default()
+        };
+
+        let prefs = TuiPreferences {
+            active_theme: "solarized".to_string(),
+            ..Default::default()
+        };
+
+        let mut persister = PreferencePersister::new(&config);
+        assert!(persister.save_now(&prefs));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("TUI_THEME=solarized"));
     }
 }

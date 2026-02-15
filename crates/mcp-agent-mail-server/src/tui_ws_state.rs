@@ -157,6 +157,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_poll_params_ignores_invalid_values() {
+        let parsed = parse_poll_params(Some("since=not-a-number&limit=abc&ignored=1"));
+        assert_eq!(parsed.since, None);
+        assert_eq!(parsed.limit, DEFAULT_EVENT_LIMIT);
+    }
+
+    #[test]
+    fn parse_poll_params_clamps_limit_lower_bound() {
+        let parsed = parse_poll_params(Some("limit=0"));
+        assert_eq!(parsed.limit, 1);
+    }
+
+    #[test]
     fn poll_payload_snapshot_mode() {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);
@@ -185,5 +198,70 @@ mod tests {
                 .as_array()
                 .is_some_and(|events| !events.is_empty())
         );
+    }
+
+    #[test]
+    fn poll_payload_snapshot_respects_limit() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let _ = state.push_event(MailEvent::server_started("endpoint-1", "cfg"));
+        let _ = state.push_event(MailEvent::server_shutdown());
+        let _ = state.push_event(MailEvent::server_started("endpoint-2", "cfg"));
+
+        let payload = poll_payload(&state, Some("limit=1"));
+        assert_eq!(payload["mode"], "snapshot");
+        assert_eq!(payload["event_count"], 1);
+        assert!(
+            payload["events"]
+                .as_array()
+                .is_some_and(|events| events.len() == 1)
+        );
+    }
+
+    #[test]
+    fn poll_payload_delta_without_new_events_sets_to_seq_to_since() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let _ = state.push_event(MailEvent::server_started("endpoint", "cfg"));
+        let snapshot = poll_payload(&state, None);
+        let since = snapshot["next_seq"].as_u64().expect("next_seq");
+
+        let payload = poll_payload(&state, Some(&format!("since={since}&limit=10")));
+        assert_eq!(payload["mode"], "delta");
+        assert_eq!(payload["since_seq"], since);
+        assert_eq!(payload["to_seq"], since);
+        assert_eq!(payload["event_count"], 0);
+        assert!(
+            payload["events"]
+                .as_array()
+                .is_some_and(|events| events.is_empty())
+        );
+    }
+
+    #[test]
+    fn poll_payload_delta_respects_limit_and_tracks_latest_seq() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let _ = state.push_event(MailEvent::server_started("endpoint-1", "cfg"));
+        let _ = state.push_event(MailEvent::server_shutdown());
+        let snapshot = poll_payload(&state, None);
+        let since = snapshot["next_seq"].as_u64().expect("next_seq");
+
+        let _ = state.push_event(MailEvent::server_started("endpoint-2", "cfg"));
+        let _ = state.push_event(MailEvent::server_shutdown());
+        let _ = state.push_event(MailEvent::server_started("endpoint-3", "cfg"));
+
+        let payload = poll_payload(&state, Some(&format!("since={since}&limit=2")));
+        let events = payload["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 2);
+        assert_eq!(payload["event_count"], 2);
+
+        let to_seq = payload["to_seq"].as_u64().expect("to_seq");
+        let last_seq = events
+            .last()
+            .and_then(|event| event["seq"].as_u64())
+            .expect("event seq");
+        assert_eq!(to_seq, last_seq);
+        assert!(to_seq >= since);
     }
 }

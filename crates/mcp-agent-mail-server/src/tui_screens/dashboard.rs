@@ -318,7 +318,7 @@ impl DashboardScreen {
             auto_follow: true,
             type_filter: HashSet::new(),
             quick_filter: DashboardQuickFilter::All,
-            verbosity: VerbosityTier::default(),
+            verbosity: VerbosityTier::Verbose,
             prev_db_stats: DbStatSnapshot::default(),
             sparkline_data: Vec::with_capacity(60),
             anomalies: Vec::new(),
@@ -973,6 +973,8 @@ fn render_summary_band(
     let avg_str = format!("{avg_ms}ms");
     let msg_str = format!("{}", db.messages);
     let agent_str = format!("{}", db.agents);
+    let lock_str = format!("{}", db.file_reservations);
+    let project_str = format!("{}", db.projects);
     let ack_str = format!("{}", db.ack_pending);
     let req_str = format!("{}", counters.total);
 
@@ -1002,12 +1004,13 @@ fn render_summary_band(
     let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
         DensityHint::Minimal | DensityHint::Compact => vec![
             ("Msg", &msg_str, msg_trend, tp.metric_messages),
-            ("Agents", &agent_str, agent_trend, tp.metric_agents),
+            ("Locks", &lock_str, MetricTrend::Flat, tp.ttl_warning),
             ("Req", &req_str, MetricTrend::Flat, req_color),
         ],
         DensityHint::Normal => vec![
             ("Messages", &msg_str, msg_trend, tp.metric_messages),
             ("Ack Pend", &ack_str, ack_trend, ack_color),
+            ("Locks", &lock_str, MetricTrend::Flat, tp.ttl_warning),
             ("Agents", &agent_str, agent_trend, tp.metric_agents),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
@@ -1015,7 +1018,14 @@ fn render_summary_band(
         DensityHint::Detailed => vec![
             ("Messages", &msg_str, msg_trend, tp.metric_messages),
             ("Ack Pend", &ack_str, ack_trend, ack_color),
+            ("Locks", &lock_str, MetricTrend::Flat, tp.ttl_warning),
             ("Agents", &agent_str, agent_trend, tp.metric_agents),
+            (
+                "Projects",
+                &project_str,
+                MetricTrend::Flat,
+                tp.status_accent,
+            ),
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
             ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),
@@ -2157,19 +2167,19 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_health_pulse_hidden_by_default_verbosity() {
+    fn dashboard_health_pulse_hidden_until_all_verbosity() {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);
         let mut screen = DashboardScreen::new();
 
         let _ = state.push_event(MailEvent::health_pulse(DbStatSnapshot::default()));
         screen.ingest_events(&state);
-        // Health pulses are ingested but hidden by Standard verbosity (Trace level)
+        // Health pulses are Trace-level, so Verbose (new default) still hides them.
         assert_eq!(screen.event_log.len(), 1, "event should be stored");
         assert_eq!(
             screen.visible_entries().len(),
             0,
-            "health pulses hidden at Standard verbosity"
+            "health pulses hidden at default Verbose verbosity"
         );
 
         // Switching to All makes them visible
@@ -2351,12 +2361,9 @@ mod tests {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);
         let mut screen = DashboardScreen::new();
-        assert_eq!(screen.verbosity, VerbosityTier::Standard);
-
-        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
-        screen.update(&key, &state);
         assert_eq!(screen.verbosity, VerbosityTier::Verbose);
 
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
         screen.update(&key, &state);
         assert_eq!(screen.verbosity, VerbosityTier::All);
 
@@ -2365,6 +2372,9 @@ mod tests {
 
         screen.update(&key, &state);
         assert_eq!(screen.verbosity, VerbosityTier::Standard);
+
+        screen.update(&key, &state);
+        assert_eq!(screen.verbosity, VerbosityTier::Verbose);
     }
 
     #[test]
@@ -2873,20 +2883,21 @@ mod tests {
 
     // ── KPI ordering tests ──────────────────────────────────────
 
-    /// Verify that the KPI tile ordering prioritizes operational metrics
-    /// (Messages, Ack, Agents) before infrastructure metrics (Requests, Latency, Uptime).
+    /// Verify that KPI ordering prioritizes operational metrics first.
     #[test]
     fn kpi_tile_order_puts_operational_metrics_first() {
-        // Detailed density gives all 6 tiles.
-        // Expected order: Messages, Ack Pend, Agents, Requests, Avg Lat, Uptime
+        // Detailed density includes flow + lock pressure + context.
+        // Expected order: Messages, Ack Pend, Locks, Agents, Projects, Requests, Avg Lat, Uptime
         let labels = [
-            "Messages", "Ack Pend", "Agents", "Requests", "Avg Lat", "Uptime",
+            "Messages", "Ack Pend", "Locks", "Agents", "Projects", "Requests", "Avg Lat", "Uptime",
         ];
 
         // Verify Messages is first (core flow indicator).
         assert_eq!(labels[0], "Messages");
         // Verify Ack Pending is second (actionable alert).
         assert_eq!(labels[1], "Ack Pend");
+        // Verify lock pressure is visible in top metrics.
+        assert_eq!(labels[2], "Locks");
         // Verify Uptime is last (context, not actionable).
         assert_eq!(labels[labels.len() - 1], "Uptime");
     }
@@ -2894,8 +2905,8 @@ mod tests {
     /// Verify compact density still shows the 3 most important metrics.
     #[test]
     fn kpi_compact_shows_core_metrics() {
-        // Compact: Msg, Agents, Req — all operational.
-        let compact_labels = ["Msg", "Agents", "Req"];
+        // Compact: Msg, Locks, Req.
+        let compact_labels = ["Msg", "Locks", "Req"];
         assert_eq!(compact_labels[0], "Msg", "messages must lead in compact");
     }
 

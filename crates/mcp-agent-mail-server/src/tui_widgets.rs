@@ -6953,6 +6953,7 @@ mod tests {
                 agents_list: vec![],
                 projects_list: vec![],
                 contacts_list: vec![],
+                reservation_snapshots: vec![],
                 timestamp_micros: 0,
             },
         }

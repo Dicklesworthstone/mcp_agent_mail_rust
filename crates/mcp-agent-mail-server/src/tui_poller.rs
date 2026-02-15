@@ -15,7 +15,9 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::timestamps::now_micros;
 
 use crate::tui_bridge::TuiSharedState;
-use crate::tui_events::{AgentSummary, ContactSummary, DbStatSnapshot, MailEvent, ProjectSummary};
+use crate::tui_events::{
+    AgentSummary, ContactSummary, DbStatSnapshot, MailEvent, ProjectSummary, ReservationSnapshot,
+};
 
 /// Default polling interval (2 seconds).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -28,6 +30,9 @@ const MAX_PROJECTS: usize = 100;
 
 /// Maximum contact links to fetch per poll cycle.
 const MAX_CONTACTS: usize = 200;
+
+/// Maximum reservation rows to fetch per poll cycle.
+const MAX_RESERVATIONS: usize = 1000;
 
 /// Batched aggregate counters used to populate [`DbStatSnapshot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +68,7 @@ impl<'a> DbStatQueryBatcher<'a> {
             agents_list: fetch_agents_list(self.conn),
             projects_list: fetch_projects_list(self.conn),
             contacts_list: fetch_contacts_list(self.conn),
+            reservation_snapshots: fetch_reservation_snapshots(self.conn),
             timestamp_micros: now_micros(),
         }
     }
@@ -388,6 +394,44 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
     .unwrap_or_default()
 }
 
+/// Fetch active file reservations with project and agent names.
+fn fetch_reservation_snapshots(conn: &DbConn) -> Vec<ReservationSnapshot> {
+    conn.query_sync(
+        &format!(
+            "SELECT fr.id, p.slug AS project_slug, a.name AS agent_name, \
+             fr.path_pattern, fr.exclusive, fr.created_ts, fr.expires_ts, fr.released_ts \
+             FROM file_reservations fr \
+             JOIN projects p ON p.id = fr.project_id \
+             JOIN agents a ON a.id = fr.agent_id \
+             WHERE fr.released_ts IS NULL \
+             ORDER BY fr.expires_ts ASC \
+             LIMIT {MAX_RESERVATIONS}"
+        ),
+        &[],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| {
+                Some(ReservationSnapshot {
+                    id: row.get_named::<i64>("id").ok()?,
+                    project_slug: row.get_named::<String>("project_slug").ok()?,
+                    agent_name: row.get_named::<String>("agent_name").ok()?,
+                    path_pattern: row.get_named::<String>("path_pattern").ok()?,
+                    exclusive: row
+                        .get_named::<i64>("exclusive")
+                        .ok()
+                        .is_none_or(|value| value != 0),
+                    granted_ts: row.get_named::<i64>("created_ts").ok()?,
+                    expires_ts: row.get_named::<i64>("expires_ts").ok()?,
+                    released_ts: row.get_named::<i64>("released_ts").ok(),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Read `CONSOLE_POLL_INTERVAL_MS` from environment, default 2000ms.
 fn poll_interval_from_env() -> Duration {
     std::env::var("CONSOLE_POLL_INTERVAL_MS")
@@ -413,6 +457,7 @@ pub fn snapshot_delta(prev: &DbStatSnapshot, curr: &DbStatSnapshot) -> SnapshotD
         agents_list_changed: prev.agents_list != curr.agents_list,
         projects_list_changed: prev.projects_list != curr.projects_list,
         contacts_list_changed: prev.contacts_list != curr.contacts_list,
+        reservation_snapshots_changed: prev.reservation_snapshots != curr.reservation_snapshots,
     }
 }
 
@@ -429,6 +474,7 @@ pub struct SnapshotDelta {
     pub agents_list_changed: bool,
     pub projects_list_changed: bool,
     pub contacts_list_changed: bool,
+    pub reservation_snapshots_changed: bool,
 }
 
 impl SnapshotDelta {
@@ -444,6 +490,7 @@ impl SnapshotDelta {
             || self.agents_list_changed
             || self.projects_list_changed
             || self.contacts_list_changed
+            || self.reservation_snapshots_changed
     }
 
     /// Count of changed fields.
@@ -459,6 +506,7 @@ impl SnapshotDelta {
             self.agents_list_changed,
             self.projects_list_changed,
             self.contacts_list_changed,
+            self.reservation_snapshots_changed,
         ]
         .iter()
         .filter(|&&b| b)
@@ -528,6 +576,7 @@ mod tests {
         assert!(d.ack_changed);
         assert!(!d.agents_changed);
         assert!(!d.reservations_changed);
+        assert!(!d.reservation_snapshots_changed);
         assert_eq!(d.changed_count(), 3);
     }
 
@@ -545,6 +594,43 @@ mod tests {
         b.agents_list[0].last_active_ts = 200;
         let d = snapshot_delta(&a, &b);
         assert!(d.agents_list_changed);
+        assert_eq!(d.changed_count(), 1);
+    }
+
+    #[test]
+    fn delta_detects_reservation_snapshot_change_without_count_change() {
+        let a = DbStatSnapshot {
+            file_reservations: 1,
+            reservation_snapshots: vec![ReservationSnapshot {
+                id: 1,
+                project_slug: "proj".into(),
+                agent_name: "BlueLake".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                granted_ts: 10,
+                expires_ts: 20,
+                released_ts: None,
+            }],
+            ..Default::default()
+        };
+        let b = DbStatSnapshot {
+            file_reservations: 1,
+            reservation_snapshots: vec![ReservationSnapshot {
+                id: 1,
+                project_slug: "proj".into(),
+                agent_name: "BlueLake".into(),
+                path_pattern: "tests/**".into(),
+                exclusive: true,
+                granted_ts: 10,
+                expires_ts: 20,
+                released_ts: None,
+            }],
+            ..Default::default()
+        };
+
+        let d = snapshot_delta(&a, &b);
+        assert!(!d.reservations_changed);
+        assert!(d.reservation_snapshots_changed);
         assert_eq!(d.changed_count(), 1);
     }
 
@@ -573,10 +659,11 @@ mod tests {
                 to_agent: "B".into(),
                 ..Default::default()
             }],
+            reservation_snapshots: vec![],
             timestamp_micros: 1,
         };
         let d = snapshot_delta(&a, &b);
-        assert_eq!(d.changed_count(), 9);
+        assert_eq!(d.changed_count(), 10);
     }
 
     // ── Poll interval ────────────────────────────────────────────────

@@ -13,6 +13,96 @@ use crate::tui_events::{EventSeverity, MailEventKind};
 static CUSTOM_THEME_OVERRIDE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Active named theme index (0..NAMED_THEME_COUNT). Used by `cycle_named_theme`.
+static ACTIVE_NAMED_THEME_INDEX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// ──────────────────────────────────────────────────────────────────────
+// Named theme registry
+// ──────────────────────────────────────────────────────────────────────
+
+/// Named themes in cycling order: (config_name, display_name).
+///
+/// The config_name matches values accepted by `AM_TUI_THEME` / `from_config_name`.
+/// The display_name is shown in the status line and command palette.
+pub const NAMED_THEMES: &[(&str, &str)] = &[
+    ("default", "Frankenstein"),
+    ("solarized", "Solarized Dark"),
+    ("dracula", "Dracula"),
+    ("nord", "Nord"),
+    ("gruvbox", "Gruvbox Dark"),
+];
+
+/// Number of built-in named themes.
+pub const NAMED_THEME_COUNT: usize = 5;
+
+/// Get the config name for a theme index (wraps modulo `NAMED_THEME_COUNT`).
+#[must_use]
+pub fn named_theme_config_name(index: usize) -> &'static str {
+    NAMED_THEMES[index % NAMED_THEME_COUNT].0
+}
+
+/// Get the display name for a theme index (wraps modulo `NAMED_THEME_COUNT`).
+#[must_use]
+pub fn named_theme_display_name(index: usize) -> &'static str {
+    NAMED_THEMES[index % NAMED_THEME_COUNT].1
+}
+
+/// Initialize the active named theme from a config name (call once at startup).
+///
+/// Sets the internal index so that subsequent `cycle_named_theme` calls
+/// cycle from the correct starting position.
+pub fn init_named_theme(config_name: &str) {
+    let idx = TuiThemePalette::config_name_to_index(config_name);
+    ACTIVE_NAMED_THEME_INDEX.store(idx, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Get the current active named theme index.
+#[must_use]
+pub fn active_named_theme_index() -> usize {
+    ACTIVE_NAMED_THEME_INDEX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get the current active named theme's config name.
+#[must_use]
+pub fn active_named_theme_config_name() -> &'static str {
+    named_theme_config_name(active_named_theme_index())
+}
+
+/// Get the current active named theme's display name.
+#[must_use]
+pub fn active_named_theme_display() -> &'static str {
+    named_theme_display_name(active_named_theme_index())
+}
+
+/// Get the current active named theme palette.
+#[must_use]
+pub fn active_named_palette() -> TuiThemePalette {
+    TuiThemePalette::from_index(active_named_theme_index())
+}
+
+/// Cycle to the next named theme and return `(config_name, display_name, palette)`.
+///
+/// Increments the active index modulo [`NAMED_THEME_COUNT`].
+/// Callers should persist the returned `config_name` to the envfile.
+pub fn cycle_named_theme() -> (&'static str, &'static str, TuiThemePalette) {
+    let old = ACTIVE_NAMED_THEME_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+    let new = (old + 1) % NAMED_THEME_COUNT;
+    ACTIVE_NAMED_THEME_INDEX.store(new, std::sync::atomic::Ordering::Relaxed);
+    let (cfg, display) = NAMED_THEMES[new];
+    (cfg, display, TuiThemePalette::from_config_name(cfg))
+}
+
+/// Set the active named theme by index and return `(config_name, display_name, palette)`.
+///
+/// Used by command palette to select a theme directly.
+pub fn set_named_theme(index: usize) -> (&'static str, &'static str, TuiThemePalette) {
+    let idx = index % NAMED_THEME_COUNT;
+    ACTIVE_NAMED_THEME_INDEX.store(idx, std::sync::atomic::Ordering::Relaxed);
+    let (cfg, display) = NAMED_THEMES[idx];
+    (cfg, display, TuiThemePalette::from_config_name(cfg))
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Spacing system
 // ──────────────────────────────────────────────────────────────────────
@@ -113,6 +203,8 @@ pub struct TuiThemePalette {
     pub metric_agents: PackedRgba,
     pub metric_ack_ok: PackedRgba,
     pub metric_ack_bad: PackedRgba,
+    pub metric_reservations: PackedRgba,
+    pub metric_projects: PackedRgba,
 
     // ── Agent palette ────────────────────────────────────────────
     pub agent_palette: [PackedRgba; 8],
@@ -240,6 +332,8 @@ impl TuiThemePalette {
             metric_agents: PackedRgba::rgb(255, 100, 150),
             metric_ack_ok: PackedRgba::rgb(80, 220, 100),
             metric_ack_bad: PackedRgba::rgb(220, 50, 50),
+            metric_reservations: PackedRgba::rgb(220, 200, 50),
+            metric_projects: PackedRgba::rgb(120, 200, 220),
 
             agent_palette: [
                 PackedRgba::rgb(92, 201, 255),
@@ -367,6 +461,8 @@ impl TuiThemePalette {
             metric_agents: magenta,
             metric_ack_ok: green,
             metric_ack_bad: red,
+            metric_reservations: yellow,
+            metric_projects: cyan,
 
             agent_palette: [blue, green, yellow, orange, violet, cyan, magenta, base1],
 
@@ -486,6 +582,8 @@ impl TuiThemePalette {
             metric_agents: pink,
             metric_ack_ok: green_d,
             metric_ack_bad: red_d,
+            metric_reservations: yellow_d,
+            metric_projects: cyan_d,
 
             agent_palette: [
                 cyan_d, green_d, orange_d, pink, purple, yellow_d, red_d, comment,
@@ -612,6 +710,8 @@ impl TuiThemePalette {
             metric_agents: nord9,
             metric_ack_ok: nord14,
             metric_ack_bad: nord11,
+            metric_reservations: nord13,
+            metric_projects: nord8,
 
             agent_palette: [nord8, nord14, nord13, nord12, nord15, nord7, nord9, nord10],
 
@@ -733,6 +833,8 @@ impl TuiThemePalette {
             metric_agents: aqua,
             metric_ack_ok: green,
             metric_ack_bad: red,
+            metric_reservations: yellow,
+            metric_projects: blue,
 
             agent_palette: [blue, green, yellow, orange, purple, aqua, red, fg4],
 
@@ -779,6 +881,25 @@ impl TuiThemePalette {
             "gruvbox" => Self::gruvbox_dark(),
             _ => Self::frankenstein(),
         }
+    }
+
+    /// Resolve a palette by its zero-based index in the named theme registry.
+    ///
+    /// The index wraps modulo [`NAMED_THEME_COUNT`].
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
+        Self::from_config_name(named_theme_config_name(index))
+    }
+
+    /// Convert a config name to its index in the named theme registry.
+    ///
+    /// Returns 0 (default) for unrecognized names.
+    #[must_use]
+    pub fn config_name_to_index(name: &str) -> usize {
+        NAMED_THEMES
+            .iter()
+            .position(|(cfg, _)| *cfg == name)
+            .unwrap_or(0)
     }
 
     /// Resolve a palette from a specific theme ID.
@@ -858,6 +979,8 @@ impl TuiThemePalette {
             metric_agents: p.accent_secondary,
             metric_ack_ok: p.accent_success,
             metric_ack_bad: p.accent_error,
+            metric_reservations: p.accent_warning,
+            metric_projects: p.accent_info,
 
             agent_palette: [
                 p.accent_slots[0],
@@ -900,13 +1023,13 @@ impl TuiThemePalette {
         }
     }
 
-    /// Resolve a palette from the currently active ftui theme.
+    /// Resolve the palette for the currently active named theme.
+    ///
+    /// Uses the named theme index set by [`init_named_theme`] or
+    /// [`cycle_named_theme`].
     #[must_use]
     pub fn current() -> Self {
-        if CUSTOM_THEME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-            return Self::frankenstein();
-        }
-        Self::for_theme(theme::current_theme())
+        active_named_palette()
     }
 }
 
@@ -1467,12 +1590,13 @@ mod tests {
     }
 
     #[test]
-    fn current_palette_matches_active_theme() {
-        let _guard = ScopedThemeLock::new(ThemeId::NordicFrost);
+    fn current_palette_matches_active_named_theme() {
+        init_named_theme("nord");
         let current = TuiThemePalette::current();
-        let explicit = TuiThemePalette::for_theme(ThemeId::NordicFrost);
+        let explicit = TuiThemePalette::nord();
         assert_eq!(current.tab_key_fg, explicit.tab_key_fg);
         assert_eq!(current.status_good, explicit.status_good);
+        init_named_theme("default");
     }
 
     #[test]
@@ -1953,7 +2077,10 @@ mod tests {
     fn from_config_name_resolves_correctly() {
         let default = TuiThemePalette::from_config_name("default");
         let frank = TuiThemePalette::frankenstein();
-        assert_eq!(default.tab_key_fg, frank.tab_key_fg, "default should map to frankenstein");
+        assert_eq!(
+            default.tab_key_fg, frank.tab_key_fg,
+            "default should map to frankenstein"
+        );
 
         let solar = TuiThemePalette::from_config_name("solarized");
         let solar_direct = TuiThemePalette::solarized_dark();
@@ -2049,7 +2176,501 @@ mod tests {
             // ok, warn, error should all be distinct
             assert_ne!(p.severity_ok, p.severity_warn, "theme {name}: ok == warn");
             assert_ne!(p.severity_ok, p.severity_error, "theme {name}: ok == error");
-            assert_ne!(p.severity_warn, p.severity_error, "theme {name}: warn == error");
+            assert_ne!(
+                p.severity_warn, p.severity_error,
+                "theme {name}: warn == error"
+            );
+        }
+    }
+
+    // ── Theme registry tests ─────────────────────────────────────
+
+    #[test]
+    fn named_theme_registry_count() {
+        assert_eq!(NAMED_THEMES.len(), NAMED_THEME_COUNT);
+    }
+
+    #[test]
+    fn named_theme_config_names_resolve() {
+        for (i, (cfg_name, _display_name)) in NAMED_THEMES.iter().enumerate() {
+            let by_name = TuiThemePalette::from_config_name(cfg_name);
+            let by_index = TuiThemePalette::from_index(i);
+            assert_eq!(
+                by_name.tab_key_fg, by_index.tab_key_fg,
+                "theme '{cfg_name}' (index {i}): from_config_name and from_index should match"
+            );
+        }
+    }
+
+    #[test]
+    fn config_name_to_index_roundtrip() {
+        for (i, (cfg_name, _)) in NAMED_THEMES.iter().enumerate() {
+            assert_eq!(
+                TuiThemePalette::config_name_to_index(cfg_name),
+                i,
+                "config_name_to_index('{cfg_name}') should return {i}"
+            );
+        }
+        assert_eq!(TuiThemePalette::config_name_to_index("matrix"), 0);
+    }
+
+    #[test]
+    fn from_index_wraps() {
+        let p0 = TuiThemePalette::from_index(0);
+        let p_wrap = TuiThemePalette::from_index(NAMED_THEME_COUNT);
+        assert_eq!(p0.tab_key_fg, p_wrap.tab_key_fg, "index should wrap");
+    }
+
+    #[test]
+    fn named_theme_display_names_unique() {
+        let names: std::collections::HashSet<&str> = NAMED_THEMES.iter().map(|(_, d)| *d).collect();
+        assert_eq!(
+            names.len(),
+            NAMED_THEME_COUNT,
+            "display names should be unique"
+        );
+        for (_, display) in NAMED_THEMES {
+            assert!(!display.is_empty());
+        }
+    }
+
+    #[test]
+    fn named_theme_display_name_by_index() {
+        assert_eq!(named_theme_display_name(0), "Frankenstein");
+        assert_eq!(named_theme_display_name(1), "Solarized Dark");
+        assert_eq!(named_theme_display_name(2), "Dracula");
+        assert_eq!(named_theme_display_name(3), "Nord");
+        assert_eq!(named_theme_display_name(4), "Gruvbox Dark");
+    }
+
+    #[test]
+    fn init_named_theme_sets_index() {
+        init_named_theme("dracula");
+        assert_eq!(active_named_theme_index(), 2);
+        assert_eq!(active_named_theme_config_name(), "dracula");
+        assert_eq!(active_named_theme_display(), "Dracula");
+        init_named_theme("default");
+    }
+
+    #[test]
+    fn cycle_named_theme_wraps() {
+        init_named_theme("default");
+        assert_eq!(active_named_theme_index(), 0);
+
+        let (cfg, display, _) = cycle_named_theme();
+        assert_eq!(cfg, "solarized");
+        assert_eq!(display, "Solarized Dark");
+
+        let (cfg, _, _) = cycle_named_theme();
+        assert_eq!(cfg, "dracula");
+        let (cfg, _, _) = cycle_named_theme();
+        assert_eq!(cfg, "nord");
+        let (cfg, _, _) = cycle_named_theme();
+        assert_eq!(cfg, "gruvbox");
+
+        let (cfg, display, _) = cycle_named_theme();
+        assert_eq!(cfg, "default");
+        assert_eq!(display, "Frankenstein");
+
+        init_named_theme("default");
+    }
+
+    #[test]
+    fn set_named_theme_by_index() {
+        let (cfg, display, palette) = set_named_theme(3);
+        assert_eq!(cfg, "nord");
+        assert_eq!(display, "Nord");
+        let direct = TuiThemePalette::nord();
+        assert_eq!(palette.tab_key_fg, direct.tab_key_fg);
+        init_named_theme("default");
+    }
+
+    #[test]
+    fn active_named_palette_matches_index() {
+        init_named_theme("gruvbox");
+        let palette = active_named_palette();
+        let direct = TuiThemePalette::gruvbox_dark();
+        assert_eq!(palette.tab_key_fg, direct.tab_key_fg);
+        assert_eq!(palette.panel_bg, direct.panel_bg);
+        init_named_theme("default");
+    }
+
+    // ── T14.3: Theme variant and hot-switching tests (br-3n86p) ───
+
+    /// No named theme has any foreground token set to fully-transparent black (PackedRgba(0)).
+    #[test]
+    fn named_themes_no_invisible_fg_tokens() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+
+        for (name, p) in &themes {
+            let fg_tokens: &[(&str, PackedRgba)] = &[
+                ("tab_active_fg", p.tab_active_fg),
+                ("tab_inactive_fg", p.tab_inactive_fg),
+                ("tab_key_fg", p.tab_key_fg),
+                ("status_fg", p.status_fg),
+                ("status_accent", p.status_accent),
+                ("status_good", p.status_good),
+                ("status_warn", p.status_warn),
+                ("help_fg", p.help_fg),
+                ("help_key_fg", p.help_key_fg),
+                ("help_border_fg", p.help_border_fg),
+                ("help_category_fg", p.help_category_fg),
+                ("sparkline_lo", p.sparkline_lo),
+                ("sparkline_hi", p.sparkline_hi),
+                ("table_header_fg", p.table_header_fg),
+                ("selection_fg", p.selection_fg),
+                ("severity_ok", p.severity_ok),
+                ("severity_error", p.severity_error),
+                ("severity_warn", p.severity_warn),
+                ("severity_critical", p.severity_critical),
+                ("panel_border", p.panel_border),
+                ("panel_border_focused", p.panel_border_focused),
+                ("panel_title_fg", p.panel_title_fg),
+                ("selection_indicator", p.selection_indicator),
+                ("chart_axis", p.chart_axis),
+                ("badge_urgent_fg", p.badge_urgent_fg),
+                ("badge_info_fg", p.badge_info_fg),
+                ("ttl_healthy", p.ttl_healthy),
+                ("ttl_warning", p.ttl_warning),
+                ("ttl_danger", p.ttl_danger),
+                ("ttl_expired", p.ttl_expired),
+                ("metric_uptime", p.metric_uptime),
+                ("metric_requests", p.metric_requests),
+                ("metric_latency", p.metric_latency),
+                ("metric_messages", p.metric_messages),
+                ("metric_agents", p.metric_agents),
+                ("contact_approved", p.contact_approved),
+                ("contact_pending", p.contact_pending),
+                ("contact_blocked", p.contact_blocked),
+                ("activity_active", p.activity_active),
+                ("activity_idle", p.activity_idle),
+                ("activity_stale", p.activity_stale),
+                ("text_primary", p.text_primary),
+                ("text_secondary", p.text_secondary),
+            ];
+            for (field, c) in fg_tokens {
+                assert_ne!(c.0, 0, "theme {name}: {field} is PackedRgba(0) (invisible)");
+            }
+        }
+    }
+
+    /// Default theme matches frankenstein exactly — regression guard.
+    #[test]
+    fn default_theme_matches_frankenstein_production() {
+        let default = TuiThemePalette::from_config_name("default");
+        let frank = TuiThemePalette::frankenstein();
+
+        assert_eq!(default.tab_active_fg, frank.tab_active_fg);
+        assert_eq!(default.tab_active_bg, frank.tab_active_bg);
+        assert_eq!(default.tab_inactive_fg, frank.tab_inactive_fg);
+        assert_eq!(default.tab_key_fg, frank.tab_key_fg);
+        assert_eq!(default.status_fg, frank.status_fg);
+        assert_eq!(default.status_bg, frank.status_bg);
+        assert_eq!(default.status_accent, frank.status_accent);
+        assert_eq!(default.status_good, frank.status_good);
+        assert_eq!(default.status_warn, frank.status_warn);
+        assert_eq!(default.help_fg, frank.help_fg);
+        assert_eq!(default.help_bg, frank.help_bg);
+        assert_eq!(default.help_key_fg, frank.help_key_fg);
+        assert_eq!(default.sparkline_lo, frank.sparkline_lo);
+        assert_eq!(default.sparkline_hi, frank.sparkline_hi);
+        assert_eq!(default.table_header_fg, frank.table_header_fg);
+        assert_eq!(default.selection_fg, frank.selection_fg);
+        assert_eq!(default.selection_bg, frank.selection_bg);
+        assert_eq!(default.severity_ok, frank.severity_ok);
+        assert_eq!(default.severity_error, frank.severity_error);
+        assert_eq!(default.severity_warn, frank.severity_warn);
+        assert_eq!(default.severity_critical, frank.severity_critical);
+        assert_eq!(default.panel_bg, frank.panel_bg);
+        assert_eq!(default.panel_border, frank.panel_border);
+        assert_eq!(default.text_primary, frank.text_primary);
+        assert_eq!(default.bg_deep, frank.bg_deep);
+        assert_eq!(default.bg_surface, frank.bg_surface);
+        assert_eq!(default.chart_series, frank.chart_series);
+        assert_eq!(default.agent_palette, frank.agent_palette);
+    }
+
+    /// Theme cycling via `cycle_named_theme` completes in under 1ms.
+    #[test]
+    fn cycle_named_theme_sub_millisecond() {
+        init_named_theme("default");
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = cycle_named_theme();
+        }
+        let elapsed = start.elapsed();
+        // 100 cycles should complete well under 100ms (< 1ms each).
+        assert!(
+            elapsed.as_millis() < 100,
+            "100 theme cycles took {elapsed:?}, expected < 100ms"
+        );
+        init_named_theme("default");
+    }
+
+    /// Selection fg/bg pairs meet contrast threshold across all named themes.
+    #[test]
+    fn named_themes_selection_contrast() {
+        const MIN_CONTRAST: f64 = 3.0;
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            let ratio = contrast_ratio(p.selection_fg, p.selection_bg);
+            assert!(
+                ratio >= MIN_CONTRAST,
+                "theme {name}: selection contrast {ratio:.2} < {MIN_CONTRAST:.1}"
+            );
+        }
+    }
+
+    /// Severity colors on panel_bg meet contrast threshold.
+    #[test]
+    fn named_themes_severity_on_panel_contrast() {
+        const MIN_CONTRAST: f64 = 2.5;
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            let pairs = [
+                ("severity_ok", p.severity_ok),
+                ("severity_warn", p.severity_warn),
+                ("severity_error", p.severity_error),
+                ("severity_critical", p.severity_critical),
+            ];
+            for (pair_name, fg) in &pairs {
+                let ratio = contrast_ratio(*fg, p.panel_bg);
+                assert!(
+                    ratio >= MIN_CONTRAST,
+                    "theme {name}: {pair_name} on panel_bg contrast {ratio:.2} < {MIN_CONTRAST:.1}"
+                );
+            }
+        }
+    }
+
+    /// Badge fg/bg pairs meet contrast threshold (lower bar since badges are small + colorful).
+    #[test]
+    fn named_themes_badge_contrast() {
+        const MIN_CONTRAST: f64 = 1.5;
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            let urgent = contrast_ratio(p.badge_urgent_fg, p.badge_urgent_bg);
+            let info = contrast_ratio(p.badge_info_fg, p.badge_info_bg);
+            assert!(
+                urgent >= MIN_CONTRAST,
+                "theme {name}: badge_urgent contrast {urgent:.2} < {MIN_CONTRAST:.1}"
+            );
+            assert!(
+                info >= MIN_CONTRAST,
+                "theme {name}: badge_info contrast {info:.2} < {MIN_CONTRAST:.1}"
+            );
+        }
+    }
+
+    /// `init_named_theme` with each valid config name sets the correct index.
+    #[test]
+    fn init_named_theme_all_config_names() {
+        for (expected_idx, (cfg_name, _)) in NAMED_THEMES.iter().enumerate() {
+            init_named_theme(cfg_name);
+            assert_eq!(
+                active_named_theme_index(),
+                expected_idx,
+                "init_named_theme('{cfg_name}') should set index to {expected_idx}"
+            );
+        }
+        init_named_theme("default");
+    }
+
+    /// Invalid config name falls back to index 0 (default) via `init_named_theme`.
+    #[test]
+    fn init_named_theme_invalid_falls_back() {
+        init_named_theme("nonexistent_theme");
+        assert_eq!(active_named_theme_index(), 0);
+        assert_eq!(active_named_theme_config_name(), "default");
+        init_named_theme("default");
+    }
+
+    /// `TuiThemePalette::current()` updates after `cycle_named_theme`.
+    #[test]
+    fn current_updates_after_cycle() {
+        init_named_theme("default");
+        let before = TuiThemePalette::current();
+
+        let (_, _, cycled_palette) = cycle_named_theme();
+        let after = TuiThemePalette::current();
+
+        // After cycling from default to solarized, palette should change.
+        assert_ne!(
+            before.tab_key_fg, after.tab_key_fg,
+            "current() should reflect new palette after cycle"
+        );
+        assert_eq!(
+            cycled_palette.tab_key_fg, after.tab_key_fg,
+            "current() should match the palette returned by cycle"
+        );
+        init_named_theme("default");
+    }
+
+    /// `set_named_theme` wraps on out-of-bounds index.
+    #[test]
+    fn set_named_theme_wraps_on_overflow() {
+        let (cfg, _, _) = set_named_theme(NAMED_THEME_COUNT + 2);
+        let expected_idx = (NAMED_THEME_COUNT + 2) % NAMED_THEME_COUNT;
+        assert_eq!(
+            cfg,
+            named_theme_config_name(expected_idx),
+            "set_named_theme should wrap index"
+        );
+        init_named_theme("default");
+    }
+
+    /// TTL band colors are all distinct within each theme.
+    #[test]
+    fn named_themes_ttl_bands_distinct() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            let bands = [p.ttl_healthy, p.ttl_warning, p.ttl_danger, p.ttl_expired];
+            for i in 0..bands.len() {
+                for j in (i + 1)..bands.len() {
+                    assert_ne!(
+                        bands[i], bands[j],
+                        "theme {name}: ttl band [{i}] and [{j}] are identical"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Contact status colors are all distinct within each theme.
+    #[test]
+    fn named_themes_contact_colors_distinct() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            assert_ne!(
+                p.contact_approved, p.contact_pending,
+                "theme {name}: approved == pending"
+            );
+            assert_ne!(
+                p.contact_approved, p.contact_blocked,
+                "theme {name}: approved == blocked"
+            );
+            assert_ne!(
+                p.contact_pending, p.contact_blocked,
+                "theme {name}: pending == blocked"
+            );
+        }
+    }
+
+    /// Activity recency colors form a distinguishable gradient.
+    #[test]
+    fn named_themes_activity_recency_distinct() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            assert_ne!(
+                p.activity_active, p.activity_idle,
+                "theme {name}: active == idle"
+            );
+            assert_ne!(
+                p.activity_active, p.activity_stale,
+                "theme {name}: active == stale"
+            );
+            assert_ne!(
+                p.activity_idle, p.activity_stale,
+                "theme {name}: idle == stale"
+            );
+        }
+    }
+
+    /// Metric tile colors are all distinct within each theme.
+    #[test]
+    fn named_themes_metric_tile_colors_distinct() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            let metrics = [
+                ("uptime", p.metric_uptime),
+                ("requests", p.metric_requests),
+                ("latency", p.metric_latency),
+                ("messages", p.metric_messages),
+                ("agents", p.metric_agents),
+            ];
+            for i in 0..metrics.len() {
+                for j in (i + 1)..metrics.len() {
+                    assert_ne!(
+                        metrics[i].1, metrics[j].1,
+                        "theme {name}: metric {} and {} are identical",
+                        metrics[i].0, metrics[j].0
+                    );
+                }
+            }
+        }
+    }
+
+    /// `text_muted` and `text_disabled` differ from `text_primary` in all themes.
+    #[test]
+    fn named_themes_text_hierarchy_distinct() {
+        let themes: [(&str, TuiThemePalette); 5] = [
+            ("frankenstein", TuiThemePalette::frankenstein()),
+            ("solarized_dark", TuiThemePalette::solarized_dark()),
+            ("dracula", TuiThemePalette::dracula()),
+            ("nord", TuiThemePalette::nord()),
+            ("gruvbox_dark", TuiThemePalette::gruvbox_dark()),
+        ];
+        for (name, p) in &themes {
+            assert_ne!(
+                p.text_primary, p.text_muted,
+                "theme {name}: primary == muted"
+            );
+            assert_ne!(
+                p.text_primary, p.text_disabled,
+                "theme {name}: primary == disabled"
+            );
+            assert_ne!(
+                p.text_primary, p.text_secondary,
+                "theme {name}: primary == secondary"
+            );
         }
     }
 }
