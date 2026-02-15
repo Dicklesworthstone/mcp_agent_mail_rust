@@ -11,10 +11,11 @@
 
 use std::sync::Arc;
 
-use asupersync::Cx;
-
 use crate::document::DocKind;
-use crate::error::{SearchError, SearchResult};
+
+// Cx re-exported through frankensearch (which re-exports from asupersync).
+// We do NOT depend on asupersync directly from this crate.
+use frankensearch::Cx;
 
 // ─── Re-exports ──────────────────────────────────────────────────────────────
 
@@ -24,32 +25,22 @@ pub use frankensearch as fs;
 // Core types re-exported with `Fs` prefix to avoid ambiguity with
 // search-core's domain-specific types of the same name.
 pub use frankensearch::Cx as FsCx;
-pub use frankensearch::core::config::{TwoTierConfig as FsTwoTierConfig, TwoTierMetrics as FsTwoTierMetrics};
-pub use frankensearch::core::types::{
-    FusedHit as FsFusedHit,
-    IndexableDocument,
-    PhaseMetrics as FsPhaseMetrics,
-    ScoredResult as FsScoredResult,
-    SearchMode as FsSearchMode,
-    SearchPhase as FsSearchPhase,
-    VectorHit as FsVectorHit,
+pub use frankensearch::core::config::{
+    TwoTierConfig as FsTwoTierConfig, TwoTierMetrics as FsTwoTierMetrics,
 };
 pub use frankensearch::core::traits::{
-    Embedder as FsEmbedder,
-    ModelCategory as FsModelCategory,
-    ModelInfo as FsModelInfo,
-    ModelTier as FsModelTier,
-    SearchFuture as FsSearchFuture,
+    Embedder as FsEmbedder, ModelCategory as FsModelCategory, ModelInfo as FsModelInfo,
+    ModelTier as FsModelTier, SearchFuture as FsSearchFuture,
+};
+pub use frankensearch::core::types::{
+    FusedHit as FsFusedHit, IndexableDocument, PhaseMetrics as FsPhaseMetrics,
+    ScoredResult as FsScoredResult, SearchMode as FsSearchMode, SearchPhase as FsSearchPhase,
+    VectorHit as FsVectorHit,
 };
 pub use frankensearch::{
-    EmbedderStack as FsEmbedderStack,
-    TwoTierAvailability as FsTwoTierAvailability,
-    TwoTierIndex as FsTwoTierIndex,
-    TwoTierSearcher as FsTwoTierSearcher,
-    VectorIndex as FsVectorIndex,
-    RrfConfig as FsRrfConfig,
-    rrf_fuse as fs_rrf_fuse,
-    IndexBuilder as FsIndexBuilder,
+    EmbedderStack as FsEmbedderStack, IndexBuilder as FsIndexBuilder, RrfConfig as FsRrfConfig,
+    TwoTierAvailability as FsTwoTierAvailability, TwoTierIndex as FsTwoTierIndex,
+    TwoTierSearcher as FsTwoTierSearcher, VectorIndex as FsVectorIndex, rrf_fuse as fs_rrf_fuse,
 };
 
 // ─── Doc ID Conversion ──────────────────────────────────────────────────────
@@ -106,9 +97,7 @@ pub fn from_fs_config(config: &FsTwoTierConfig) -> crate::two_tier::TwoTierConfi
 /// Domain-specific fields (`doc_kind`, `project_id`) are set to defaults;
 /// callers should enrich them from the document store.
 #[must_use]
-pub fn from_fs_scored_result(
-    result: &FsScoredResult,
-) -> Option<crate::two_tier::ScoredResult> {
+pub fn from_fs_scored_result(result: &FsScoredResult) -> Option<crate::two_tier::ScoredResult> {
     let doc_id: u64 = result.doc_id.parse().ok()?;
     Some(crate::two_tier::ScoredResult {
         idx: 0,
@@ -121,17 +110,13 @@ pub fn from_fs_scored_result(
 
 /// Convert a batch of frankensearch `ScoredResult`s, skipping unparseable IDs.
 #[must_use]
-pub fn from_fs_scored_results(
-    results: &[FsScoredResult],
-) -> Vec<crate::two_tier::ScoredResult> {
+pub fn from_fs_scored_results(results: &[FsScoredResult]) -> Vec<crate::two_tier::ScoredResult> {
     results.iter().filter_map(from_fs_scored_result).collect()
 }
 
 /// Convert a search-core `ScoredResult` to a frankensearch `ScoredResult`.
 #[must_use]
-pub fn to_fs_scored_result(
-    result: &crate::two_tier::ScoredResult,
-) -> FsScoredResult {
+pub fn to_fs_scored_result(result: &crate::two_tier::ScoredResult) -> FsScoredResult {
     use frankensearch::core::types::ScoreSource;
     FsScoredResult {
         doc_id: doc_id_to_string(result.doc_id),
@@ -152,7 +137,7 @@ pub fn to_fs_scored_result(
 ///
 /// `Hash` maps to `Fast` since hash embedders serve as fast-tier fallback.
 #[must_use]
-pub fn to_fs_model_tier(tier: crate::embedder::ModelTier) -> FsModelTier {
+pub const fn to_fs_model_tier(tier: crate::embedder::ModelTier) -> FsModelTier {
     match tier {
         crate::embedder::ModelTier::Hash | crate::embedder::ModelTier::Fast => FsModelTier::Fast,
         crate::embedder::ModelTier::Quality => FsModelTier::Quality,
@@ -161,7 +146,7 @@ pub fn to_fs_model_tier(tier: crate::embedder::ModelTier) -> FsModelTier {
 
 /// Convert frankensearch's `ModelTier` to search-core's version.
 #[must_use]
-pub fn from_fs_model_tier(tier: FsModelTier) -> crate::embedder::ModelTier {
+pub const fn from_fs_model_tier(tier: FsModelTier) -> crate::embedder::ModelTier {
     match tier {
         FsModelTier::Fast => crate::embedder::ModelTier::Fast,
         FsModelTier::Quality => crate::embedder::ModelTier::Quality,
@@ -199,13 +184,13 @@ impl SyncEmbedderAdapter {
         }
     }
 
-    /// Create a fast-tier adapter (e.g., for Model2Vec).
+    /// Create a fast-tier adapter (e.g., for `Model2Vec`).
     #[must_use]
     pub fn fast(embedder: Arc<dyn crate::two_tier::TwoTierEmbedder>) -> Self {
         Self::new(embedder, true, FsModelCategory::StaticEmbedder)
     }
 
-    /// Create a quality-tier adapter (e.g., for FastEmbed).
+    /// Create a quality-tier adapter (e.g., for `FastEmbed`).
     #[must_use]
     pub fn quality(embedder: Arc<dyn crate::two_tier::TwoTierEmbedder>) -> Self {
         Self::new(embedder, true, FsModelCategory::TransformerEmbedder)
@@ -224,20 +209,20 @@ impl std::fmt::Debug for SyncEmbedderAdapter {
             .field("model_name", &self.model_name)
             .field("dimension", &self.inner.dimension())
             .field("is_semantic", &self.is_semantic)
+            .field("category", &self.category)
             .finish()
     }
 }
 
 impl FsEmbedder for SyncEmbedderAdapter {
-    fn embed<'a>(
-        &'a self,
-        _cx: &'a Cx,
-        text: &'a str,
-    ) -> FsSearchFuture<'a, Vec<f32>> {
+    fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> FsSearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
-            self.inner.embed(text).map_err(|e| {
-                frankensearch::SearchError::EmbeddingFailed(e.to_string())
-            })
+            self.inner
+                .embed(text)
+                .map_err(|e| frankensearch::SearchError::EmbeddingFailed {
+                    model: self.model_name.clone(),
+                    source: Box::new(e),
+                })
         })
     }
 
@@ -259,6 +244,33 @@ impl FsEmbedder for SyncEmbedderAdapter {
 
     fn category(&self) -> FsModelCategory {
         self.category
+    }
+}
+
+// ─── Error Mapping ─────────────────────────────────────────────────────────
+
+/// Map a frankensearch `SearchError` to a search-core `SearchError`.
+///
+/// This preserves the error semantics while translating between the two
+/// crates' error enums.
+pub fn map_fs_error(err: frankensearch::SearchError) -> crate::error::SearchError {
+    match err {
+        frankensearch::SearchError::ModelNotFound { name } => {
+            crate::error::SearchError::ModeUnavailable(format!("model not found: {name}"))
+        }
+        frankensearch::SearchError::ModelLoadFailed { path, source } => {
+            crate::error::SearchError::Internal(format!(
+                "model load failed at {}: {source}",
+                path.display()
+            ))
+        }
+        frankensearch::SearchError::EmbeddingFailed { model, source } => {
+            crate::error::SearchError::Internal(format!("embedding failed ({model}): {source}"))
+        }
+        frankensearch::SearchError::Cancelled { phase, reason } => {
+            crate::error::SearchError::Timeout(format!("{phase}: {reason}"))
+        }
+        other => crate::error::SearchError::Internal(other.to_string()),
     }
 }
 

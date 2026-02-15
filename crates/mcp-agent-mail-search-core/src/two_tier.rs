@@ -49,7 +49,6 @@ use std::time::Instant;
 use half::f16;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
-use wide::f32x8;
 
 use crate::error::{SearchError, SearchResult};
 
@@ -637,76 +636,24 @@ impl Ord for ScoredEntry {
 
 /// SIMD-accelerated dot product between f16 embedding and f32 query.
 ///
-/// Uses `wide::f32x8` for 8-way SIMD parallelism.
+/// Delegates to `frankensearch::index::simd::dot_product_f16_f32()` for the
+/// actual computation. Returns 0.0 on dimension mismatch (matching legacy
+/// behavior).
+///
+/// Note: This module is compiled only when the `semantic` feature is enabled,
+/// which always brings in the frankensearch dependency.
 #[inline]
 #[must_use]
 pub fn dot_product_f16_simd(embedding: &[f16], query: &[f32]) -> f32 {
-    debug_assert_eq!(
-        embedding.len(),
-        query.len(),
-        "dot_product_f16_simd: dimension mismatch (embedding={}, query={})",
-        embedding.len(),
-        query.len()
-    );
-
-    // Early return for mismatched lengths in release mode
-    if embedding.len() != query.len() {
-        return 0.0;
-    }
-
-    if embedding.is_empty() {
-        return 0.0;
-    }
-
-    let chunks = embedding.len() / 8;
-    let mut sum = f32x8::ZERO;
-
-    for i in 0..chunks {
-        let base = i * 8;
-        let emb_f32 = [
-            f32::from(embedding[base]),
-            f32::from(embedding[base + 1]),
-            f32::from(embedding[base + 2]),
-            f32::from(embedding[base + 3]),
-            f32::from(embedding[base + 4]),
-            f32::from(embedding[base + 5]),
-            f32::from(embedding[base + 6]),
-            f32::from(embedding[base + 7]),
-        ];
-        // Convert query slice to array
-        let q_arr: [f32; 8] = query[base..base + 8]
-            .try_into()
-            .expect("slice length mismatch in SIMD chunk");
-        sum += f32x8::from(emb_f32) * f32x8::from(q_arr);
-    }
-
-    let mut result: f32 = sum.reduce_add();
-
-    // Handle remainder
-    let remainder_start = chunks * 8;
-    for i in remainder_start..embedding.len() {
-        result += f32::from(embedding[i]) * query[i];
-    }
-
-    result
+    frankensearch::index::simd::dot_product_f16_f32(embedding, query).unwrap_or(0.0)
 }
 
-/// Normalize scores to [0, 1] range using min-max scaling.
+/// Normalize scores to \[0, 1\] range using min-max scaling.
+///
+/// Delegates to `frankensearch::fusion::normalize::normalize_scores()`.
 #[must_use]
 pub fn normalize_scores(scores: &[f32]) -> Vec<f32> {
-    if scores.is_empty() {
-        return Vec::new();
-    }
-
-    let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let range = max - min;
-
-    if range.abs() < f32::EPSILON {
-        return vec![1.0; scores.len()];
-    }
-
-    scores.iter().map(|&s| (s - min) / range).collect()
+    frankensearch::fusion::normalize::normalize_scores(scores)
 }
 
 /// Blend fast and quality scores with the given weight.
@@ -1156,9 +1103,10 @@ mod tests {
         let scores = vec![0.5, 0.5, 0.5];
         let normalized = normalize_scores(&scores);
 
-        // All same value should normalize to 1.0
+        // All same value: frankensearch maps degenerate inputs to 0.5 (neutral).
+        // This is more appropriate than 1.0 since all scores are equally ranked.
         for n in &normalized {
-            assert!((n - 1.0).abs() < 0.001);
+            assert!((n - 0.5).abs() < 0.001);
         }
     }
 

@@ -38,6 +38,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::error::SearchResult;
 use crate::fastembed::{FastEmbedEmbedder, get_quality_embedder};
+use crate::fs_bridge::{FsEmbedderStack, SyncEmbedderAdapter};
 use crate::model2vec::{Model2VecEmbedder, get_fast_embedder};
 use crate::two_tier::{TwoTierConfig, TwoTierEmbedder, TwoTierIndex, TwoTierSearcher};
 
@@ -175,6 +176,35 @@ impl TwoTierContext {
     #[must_use]
     pub fn create_index(&self) -> TwoTierIndex {
         TwoTierIndex::new(&self.config)
+    }
+
+    /// Create a frankensearch `EmbedderStack` from the auto-detected embedders.
+    ///
+    /// This uses `SyncEmbedderAdapter` to bridge search-core's sync embedders
+    /// to frankensearch's async `Embedder` trait. Returns `None` if no embedders
+    /// are available.
+    ///
+    /// This is the primary integration point for consumers migrating to
+    /// frankensearch — use this stack with `frankensearch::IndexBuilder` or
+    /// `frankensearch::TwoTierSearcher`.
+    #[must_use]
+    pub fn create_fs_embedder_stack(&self) -> Option<FsEmbedderStack> {
+        let fast: Arc<dyn frankensearch::Embedder> = if get_fast_embedder().is_some() {
+            Arc::new(SyncEmbedderAdapter::fast(Arc::new(FastEmbedderWrapper)))
+        } else {
+            return None;
+        };
+
+        let quality: Option<Arc<dyn frankensearch::Embedder>> = if get_quality_embedder().is_some()
+        {
+            Some(Arc::new(SyncEmbedderAdapter::quality(Arc::new(
+                QualityEmbedderWrapper,
+            ))))
+        } else {
+            None
+        };
+
+        Some(FsEmbedderStack::from_parts(fast, quality))
     }
 
     /// Create a searcher for the given index.
