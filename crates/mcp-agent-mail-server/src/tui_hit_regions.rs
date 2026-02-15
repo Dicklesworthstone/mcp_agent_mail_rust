@@ -190,6 +190,144 @@ pub fn category_from_hit(id: HitId) -> Option<ScreenCategory> {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// MouseDispatcher — central mouse event routing
+// ──────────────────────────────────────────────────────────────────────
+
+use std::cell::Cell;
+
+use ftui::layout::Rect;
+use ftui::{MouseButton, MouseEvent, MouseEventKind};
+
+/// Result of dispatching a mouse event through the shell layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MouseAction {
+    /// Switch to a screen (tab click).
+    SwitchScreen(MailScreenId),
+    /// Toggle the help overlay.
+    ToggleHelp,
+    /// Open the command palette.
+    OpenPalette,
+    /// Mouse event was not consumed by the shell — forward to active screen.
+    Forward,
+}
+
+/// Per-tab hit region cached from the last `view()` call.
+#[derive(Debug, Clone, Copy, Default)]
+struct TabHitSlot {
+    screen: Option<MailScreenId>,
+    x_start: u16,
+    x_end: u16,
+    y: u16,
+}
+
+/// Central mouse dispatcher for shell-level interactions.
+///
+/// Caches chrome area positions from the last `view()` call and maps
+/// mouse coordinates to shell actions (tab switch, help toggle, etc.).
+/// Events that don't hit any shell region return [`MouseAction::Forward`]
+/// so the active screen can handle them.
+pub struct MouseDispatcher {
+    /// Tab bar row cached from last `view()`.
+    tab_bar_area: Cell<Rect>,
+    /// Status line row cached from last `view()`.
+    status_line_area: Cell<Rect>,
+    /// Per-tab hit regions. Up to `ALL_SCREEN_IDS.len()` entries.
+    tab_slots: Vec<Cell<TabHitSlot>>,
+    /// Last hover target for coalesced hover events (future use).
+    #[allow(dead_code)]
+    last_hover_screen: Cell<Option<MailScreenId>>,
+}
+
+impl MouseDispatcher {
+    /// Create a new dispatcher with empty cached regions.
+    pub fn new() -> Self {
+        let tab_slots = ALL_SCREEN_IDS
+            .iter()
+            .map(|_| Cell::new(TabHitSlot::default()))
+            .collect();
+        Self {
+            tab_bar_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            status_line_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            tab_slots,
+            last_hover_screen: Cell::new(None),
+        }
+    }
+
+    /// Update cached chrome areas after a `view()` call.
+    pub fn update_chrome_areas(&self, tab_bar: Rect, status_line: Rect) {
+        self.tab_bar_area.set(tab_bar);
+        self.status_line_area.set(status_line);
+    }
+
+    /// Record a tab's hit region during tab-bar rendering.
+    ///
+    /// `index` is the 0-based position in `ALL_SCREEN_IDS`.
+    pub fn record_tab_slot(&self, index: usize, screen: MailScreenId, x_start: u16, x_end: u16, y: u16) {
+        if let Some(slot) = self.tab_slots.get(index) {
+            slot.set(TabHitSlot {
+                screen: Some(screen),
+                x_start,
+                x_end,
+                y,
+            });
+        }
+    }
+
+    /// Dispatch a mouse event through the shell priority chain.
+    ///
+    /// Priority order (highest first):
+    /// 1. Tab bar clicks → `SwitchScreen`
+    /// 2. Status line clicks → `ToggleHelp` / `OpenPalette`
+    /// 3. Everything else → `Forward` to active screen
+    ///
+    /// Only `MouseDown(Left)` triggers actions to prevent double-fire.
+    pub fn dispatch(&self, mouse: &MouseEvent) -> MouseAction {
+        // Only respond to left-button press (not release/drag/scroll).
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return MouseAction::Forward;
+        }
+
+        let (mx, my) = (mouse.x, mouse.y);
+
+        // Check tab bar first.
+        let tab_area = self.tab_bar_area.get();
+        if point_in_rect(tab_area, mx, my) {
+            for slot_cell in &self.tab_slots {
+                let slot = slot_cell.get();
+                if let Some(screen) = slot.screen {
+                    if my == slot.y && mx >= slot.x_start && mx < slot.x_end {
+                        return MouseAction::SwitchScreen(screen);
+                    }
+                }
+            }
+        }
+
+        // Check status line.
+        let status_area = self.status_line_area.get();
+        if point_in_rect(status_area, mx, my) {
+            // Status line is a single row. We split it into logical zones:
+            // Left side: help toggle ("?:Help")
+            // Right side: handled by Forward for now.
+            // For the initial implementation, clicking anywhere on the
+            // status line toggles help (matching the "?" keyboard shortcut).
+            return MouseAction::ToggleHelp;
+        }
+
+        MouseAction::Forward
+    }
+}
+
+/// Check whether a point `(x, y)` falls inside a rectangle.
+#[inline]
+fn point_in_rect(rect: Rect, x: u16, y: u16) -> bool {
+    !rect.is_empty()
+        && x >= rect.x
+        && x < rect.x + rect.width
+        && y >= rect.y
+        && y < rect.y + rect.height
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
@@ -344,5 +482,102 @@ mod tests {
                 "constant {c} not classified as StatusToggle"
             );
         }
+    }
+
+    // ── MouseDispatcher tests ────────────────────────────────────────
+
+    fn make_mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            x,
+            y,
+            modifiers: ftui::Modifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn dispatcher_tab_click_routes_to_screen() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        // Register first tab: columns 0..8
+        d.record_tab_slot(0, MailScreenId::Dashboard, 0, 8, 0);
+        // Register second tab: columns 9..18
+        d.record_tab_slot(1, MailScreenId::Messages, 9, 18, 0);
+
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 3, 0);
+        assert_eq!(d.dispatch(&ev), MouseAction::SwitchScreen(MailScreenId::Dashboard));
+
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 12, 0);
+        assert_eq!(d.dispatch(&ev), MouseAction::SwitchScreen(MailScreenId::Messages));
+    }
+
+    #[test]
+    fn dispatcher_tab_gap_forwards() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        d.record_tab_slot(0, MailScreenId::Dashboard, 0, 8, 0);
+        // Column 8 is the separator — no tab owns it.
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 8, 0);
+        // Still in tab bar area but no slot matches — Forward.
+        assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn dispatcher_status_line_click_toggles_help() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 5, 24);
+        assert_eq!(d.dispatch(&ev), MouseAction::ToggleHelp);
+    }
+
+    #[test]
+    fn dispatcher_content_area_forwards() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 40, 12);
+        assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn dispatcher_ignores_non_left_clicks() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        d.record_tab_slot(0, MailScreenId::Dashboard, 0, 8, 0);
+        // Right click on tab area — should forward, not switch.
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Right), 3, 0);
+        assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn dispatcher_ignores_mouse_up() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        d.record_tab_slot(0, MailScreenId::Dashboard, 0, 8, 0);
+        let ev = make_mouse(MouseEventKind::Up(MouseButton::Left), 3, 0);
+        assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn dispatcher_ignores_scroll_on_status() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        let ev = make_mouse(MouseEventKind::ScrollDown, 5, 24);
+        assert_eq!(d.dispatch(&ev), MouseAction::Forward);
+    }
+
+    #[test]
+    fn point_in_rect_boundary() {
+        let r = Rect::new(10, 5, 20, 10);
+        assert!(point_in_rect(r, 10, 5)); // top-left
+        assert!(point_in_rect(r, 29, 14)); // bottom-right (inclusive)
+        assert!(!point_in_rect(r, 30, 5)); // just right of right edge
+        assert!(!point_in_rect(r, 10, 15)); // just below bottom
+        assert!(!point_in_rect(r, 9, 5)); // just left
+    }
+
+    #[test]
+    fn point_in_rect_empty() {
+        let r = Rect::new(0, 0, 0, 0);
+        assert!(!point_in_rect(r, 0, 0));
     }
 }

@@ -185,6 +185,39 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
     }
 }
 
+/// Compute and record per-tab hit slots into the mouse dispatcher.
+///
+/// This mirrors the tab-width logic from [`render_tab_bar`] so that
+/// mouse click coordinates can be mapped back to the correct screen.
+pub fn record_tab_hit_slots(
+    area: Rect,
+    dispatcher: &crate::tui_hit_regions::MouseDispatcher,
+) {
+    let available = area.width;
+    let compact = available < 60;
+    let mut x = area.x;
+
+    for (i, meta) in MAIL_SCREEN_REGISTRY.iter().enumerate() {
+        let number = i + 1;
+        let label = if compact { meta.short_label } else { meta.title };
+        let key_str_len = if number >= 10 { 2 } else { 1 };
+        // Width: space + key + colon + label + space
+        let tab_width = (1 + key_str_len + 1 + label.len() + 1) as u16;
+
+        // Separator before each tab except the first.
+        if i > 0 && x < area.x + available {
+            x += 1;
+        }
+
+        if x + tab_width > area.x + available {
+            break;
+        }
+
+        dispatcher.record_tab_slot(i, meta.id, x, x + tab_width, area.y);
+        x += tab_width;
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Status line
 // ──────────────────────────────────────────────────────────────────────

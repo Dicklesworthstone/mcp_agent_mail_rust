@@ -630,6 +630,8 @@ pub struct MailAppModel {
     /// When a screen is in this map, a fallback error UI is shown instead.
     /// Uses `RefCell` so that `view(&self)` can record panics.
     screen_panics: RefCell<HashMap<MailScreenId, String>>,
+    /// Central mouse dispatcher for shell-level interactions (tab clicks, etc.).
+    mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher,
 }
 
 impl MailAppModel {
@@ -690,6 +692,7 @@ impl MailAppModel {
             resize_detected: Cell::new(false),
             last_view_instant: Cell::new(None),
             screen_panics: RefCell::new(HashMap::new()),
+            mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher::new(),
         }
     }
 
@@ -1982,6 +1985,30 @@ impl Model for MailAppModel {
                     }
                 }
 
+                // Central mouse dispatch for shell-level interactions
+                // (tab clicks, status line). Checked before global keybindings
+                // so that shell regions consume the event and prevent
+                // accidental forwarding to screens.
+                if let Event::Mouse(ref mouse) = *event {
+                    use crate::tui_hit_regions::MouseAction;
+                    match self.mouse_dispatcher.dispatch(mouse) {
+                        MouseAction::SwitchScreen(id) => {
+                            self.activate_screen(id);
+                            return Cmd::none();
+                        }
+                        MouseAction::ToggleHelp => {
+                            self.help_visible = !self.help_visible;
+                            self.help_scroll = 0;
+                            return Cmd::none();
+                        }
+                        MouseAction::OpenPalette => {
+                            self.open_palette();
+                            return Cmd::none();
+                        }
+                        MouseAction::Forward => {}
+                    }
+                }
+
                 // Global keybindings (checked before screen dispatch)
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
@@ -2190,9 +2217,16 @@ impl Model for MailAppModel {
         let chrome = tui_chrome::chrome_layout(area);
         let active_screen = self.screen_manager.active_screen();
 
+        // Cache chrome areas for mouse dispatcher.
+        self.mouse_dispatcher
+            .update_chrome_areas(chrome.tab_bar, chrome.status_line);
+
         // 1. Tab bar (z=1)
         let effects_enabled = self.state.config_snapshot().tui_effects;
         tui_chrome::render_tab_bar(active_screen, effects_enabled, frame, chrome.tab_bar);
+
+        // Record per-tab hit slots for mouse dispatch.
+        tui_chrome::record_tab_hit_slots(chrome.tab_bar, &self.mouse_dispatcher);
 
         // 2. Screen content (z=2)
         if self.screen_panics.borrow().contains_key(&active_screen) {
