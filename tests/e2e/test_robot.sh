@@ -64,6 +64,7 @@ printf "case_id\tcommand\telapsed_ms\n" > "${TIMINGS_FILE}"
 export DATABASE_URL="sqlite:///${DB_PATH}"
 export STORAGE_ROOT
 export AM_INTERFACE_MODE=cli
+ROBOT_AGENT="RedFox"
 
 e2e_log "Work directory: ${WORK}"
 e2e_log "DB path: ${DB_PATH}"
@@ -93,6 +94,9 @@ seed_data() {
 
     {
         echo "$INIT_REQ"
+        sleep 0.2
+        # MCP requires initialized notification before tools/call.
+        echo '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
         sleep 0.2
         # Ensure project
         echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${project}\"}}}"
@@ -134,9 +138,21 @@ seed_data() {
 SEED_RESP="$(seed_data "$DB_PATH" "$PROJECT_PATH")"
 e2e_save_artifact "seed_response.txt" "$SEED_RESP"
 
-# Check if seeding succeeded by looking for errors
-if echo "$SEED_RESP" | grep -q '"isError":true'; then
-    e2e_fail "Data seeding failed - check seed_response.txt"
+# Check if seeding succeeded by looking for errors and expected response IDs.
+if echo "$SEED_RESP" | grep -q '"isError":true\|"error"'; then
+    e2e_fail "Data seeding failed (error payload present) - check seed_response.txt"
+    e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
+    e2e_summary
+    exit 1
+fi
+if ! echo "$SEED_RESP" | grep -q '"id":2'; then
+    e2e_fail "Data seeding failed (missing ensure_project response id=2)"
+    e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
+    e2e_summary
+    exit 1
+fi
+if ! echo "$SEED_RESP" | grep -q '"id":9'; then
+    e2e_fail "Data seeding failed (missing final seed response id=9)"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
@@ -155,9 +171,13 @@ sqlite3 "${DB_PATH}" "REINDEX;" 2>/dev/null || true
 run_robot() {
     local subcommand="$1"
     shift
+    local agent_args=()
+    if [ -n "${ROBOT_AGENT:-}" ]; then
+        agent_args=(--agent "${ROBOT_AGENT}")
+    fi
     local output
     output=$(DATABASE_URL="sqlite:///${DB_PATH}" STORAGE_ROOT="${STORAGE_ROOT}" \
-        AM_INTERFACE_MODE=cli am robot --project "${PROJECT_PATH}" "$subcommand" "$@" 2>&1) || true
+        AM_INTERFACE_MODE=cli am robot --project "${PROJECT_PATH}" "${agent_args[@]}" "$subcommand" "$@" 2>&1) || true
     echo "$output"
 }
 
