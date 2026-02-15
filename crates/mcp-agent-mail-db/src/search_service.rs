@@ -845,13 +845,10 @@ impl TwoTierBridge {
             .search_with_frankensearch_probe(cx, &query.text, limit)
             .await
         {
-            Ok(phases) => {
-                if let Some(results) = select_best_two_tier_results(phases) {
-                    scored_results_to_search_results(results)
-                } else {
-                    self.search(query, limit)
-                }
-            }
+            Ok(phases) => select_best_two_tier_results(phases).map_or_else(
+                || self.search(query, limit),
+                scored_results_to_search_results,
+            ),
             Err(error) => {
                 tracing::warn!(
                     target: "search.semantic",
