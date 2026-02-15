@@ -111,7 +111,7 @@ fn worktrees_required() -> McpError {
     legacy_tool_error(
         "FEATURE_DISABLED",
         "Build slots are disabled. Enable WORKTREES_ENABLED to use this tool.",
-        false,
+        true,
         serde_json::json!({ "feature": "worktrees", "env_var": "WORKTREES_ENABLED" }),
     )
 }

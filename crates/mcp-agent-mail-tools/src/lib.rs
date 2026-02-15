@@ -224,9 +224,9 @@ pub(crate) mod tool_util {
 
     /// Placeholder patterns that indicate unconfigured hooks/settings.
     const PLACEHOLDER_PATTERNS: &[&str] = &[
-        "YOUR_PROJECT",
         "YOUR_PROJECT_PATH",
         "YOUR_PROJECT_KEY",
+        "YOUR_PROJECT",
         "PLACEHOLDER",
         "<PROJECT>",
         "{PROJECT}",

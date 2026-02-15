@@ -43,18 +43,20 @@ pub struct ReservationConflict {
     pub holders: Vec<ConflictHolder>,
 }
 
-/// Conflict holder info
+/// Conflict holder info (matches Python format exactly)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictHolder {
-    pub agent_name: String,
-    pub reservation_id: i64,
+    pub agent: String,
+    pub path_pattern: String,
+    pub exclusive: bool,
     pub expires_ts: String,
 }
 
 #[derive(Debug, Clone)]
 struct PendingConflictHolder {
     agent_id: i64,
-    reservation_id: i64,
+    path_pattern: String,
+    exclusive: bool,
     expires_ts: String,
 }
 
@@ -92,6 +94,36 @@ pub struct RenewedReservation {
     pub path_pattern: String,
     pub old_expires_ts: String,
     pub new_expires_ts: String,
+}
+
+/// Detect suspicious file reservation patterns (matching Python's _detect_suspicious_file_reservation).
+fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
+    let p = pattern.trim();
+    // 1. Too-broad patterns
+    if matches!(p, "*" | "**" | "**/*" | "**/**" | ".") {
+        return Some(format!(
+            "Pattern '{}' is too broad and would reserve the entire project. \
+             Use more specific patterns like 'src/api/*.py' or 'lib/auth/**'.",
+            p
+        ));
+    }
+    // 2. Absolute paths (but not UNC paths starting with //)
+    if p.starts_with('/') && !p.starts_with("//") {
+        return Some(format!(
+            "Pattern '{}' looks like an absolute path. File reservation patterns should be \
+             project-relative (e.g., 'src/module.py' not '/full/path/src/module.py').",
+            p
+        ));
+    }
+    // 3. Very short patterns with wildcards
+    if p.len() <= 2 && p.contains('*') {
+        return Some(format!(
+            "Pattern '{}' is very short and may match more files than intended. \
+             Consider using a more specific pattern.",
+            p
+        ));
+    }
+    None
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
@@ -190,6 +222,13 @@ pub async fn file_reservation_paths(
         ));
     }
 
+    // Warn about suspicious patterns (matching Python's ctx.info behavior)
+    for pattern in &paths {
+        if let Some(warning) = detect_suspicious_file_reservation(pattern) {
+            tracing::warn!("[warn] {}", warning);
+        }
+    }
+
     let ttl = ttl_seconds.unwrap_or(3600).max(0);
     if ttl < 60 {
         tracing::info!(
@@ -205,7 +244,15 @@ pub async fn file_reservation_paths(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Check for conflicts with existing active reservations
@@ -230,7 +277,8 @@ pub async fn file_reservation_paths(
                     res.path_pattern.clone(),
                     ReservationRef {
                         agent_id: res.agent_id,
-                        reservation_id: res.id.unwrap_or(0),
+                        path_pattern: res.path_pattern.clone(),
+                        exclusive: res.exclusive != 0,
                         expires_ts: res.expires_ts,
                     },
                 )
@@ -247,16 +295,27 @@ pub async fn file_reservation_paths(
         if conflict_refs.is_empty() {
             paths_to_grant.push(path);
         } else {
+            // Deterministic ordering keeps API output stable across runs
+            // even when the index scans hash buckets in different orders.
+            let mut holders: Vec<PendingConflictHolder> = conflict_refs
+                .into_iter()
+                .map(|rref| PendingConflictHolder {
+                    agent_id: rref.agent_id,
+                    path_pattern: rref.path_pattern.clone(),
+                    exclusive: rref.exclusive,
+                    expires_ts: micros_to_iso(rref.expires_ts),
+                })
+                .collect();
+            holders.sort_unstable_by(|a, b| {
+                a.agent_id
+                    .cmp(&b.agent_id)
+                    .then_with(|| a.path_pattern.cmp(&b.path_pattern))
+                    .then_with(|| a.exclusive.cmp(&b.exclusive))
+                    .then_with(|| a.expires_ts.cmp(&b.expires_ts))
+            });
             pending_conflicts.push(PendingReservationConflict {
                 path: path.clone(),
-                holders: conflict_refs
-                    .into_iter()
-                    .map(|rref| PendingConflictHolder {
-                        agent_id: rref.agent_id,
-                        reservation_id: rref.reservation_id,
-                        expires_ts: micros_to_iso(rref.expires_ts),
-                    })
-                    .collect(),
+                holders,
             });
         }
     }
@@ -281,11 +340,12 @@ pub async fn file_reservation_paths(
                     .holders
                     .into_iter()
                     .map(|h| ConflictHolder {
-                        agent_name: agent_names
+                        agent: agent_names
                             .get(&h.agent_id)
                             .cloned()
                             .unwrap_or_else(|| format!("agent_{}", h.agent_id)),
-                        reservation_id: h.reservation_id,
+                        path_pattern: h.path_pattern,
+                        exclusive: h.exclusive,
                         expires_ts: h.expires_ts,
                     })
                     .collect(),
@@ -398,7 +458,15 @@ pub async fn release_file_reservations(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Convert paths to slice of &str
@@ -462,7 +530,15 @@ pub async fn renew_file_reservations(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Convert paths to slice of &str
@@ -558,7 +634,15 @@ pub async fn force_release_file_reservation(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
-    let actor = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
+    let actor = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
 
     let reservations = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)
@@ -578,7 +662,6 @@ pub async fn force_release_file_reservation(
             true,
             json!({
                 "file_reservation_id": file_reservation_id,
-                "project": project.human_key,
             }),
         ));
     };
@@ -1157,16 +1240,18 @@ mod tests {
         let r = ReservationConflict {
             path: "src/main.rs".into(),
             holders: vec![ConflictHolder {
-                agent_name: "RedFox".into(),
-                reservation_id: 5,
+                agent: "RedFox".into(),
+                path_pattern: "src/main.rs".into(),
+                exclusive: true,
                 expires_ts: "2026-02-06T03:00:00Z".into(),
             }],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["path"], "src/main.rs");
-        assert_eq!(json["holders"][0]["agent_name"], "RedFox");
-        assert_eq!(json["holders"][0]["reservation_id"], 5);
+        assert_eq!(json["holders"][0]["agent"], "RedFox");
+        assert_eq!(json["holders"][0]["path_pattern"], "src/main.rs");
+        assert_eq!(json["holders"][0]["exclusive"], true);
     }
 
     #[test]
@@ -1224,8 +1309,9 @@ mod tests {
             conflicts: vec![ReservationConflict {
                 path: "lib.rs".into(),
                 holders: vec![ConflictHolder {
-                    agent_name: "GoldHawk".into(),
-                    reservation_id: 7,
+                    agent: "GoldHawk".into(),
+                    path_pattern: "lib.rs".into(),
+                    exclusive: true,
                     expires_ts: "2026-02-06T04:00:00Z".into(),
                 }],
             }],
@@ -1234,7 +1320,7 @@ mod tests {
         let deserialized: ReservationResponse = serde_json::from_str(&json_str).unwrap();
         assert!(deserialized.granted.is_empty());
         assert_eq!(deserialized.conflicts.len(), 1);
-        assert_eq!(deserialized.conflicts[0].holders[0].agent_name, "GoldHawk");
+        assert_eq!(deserialized.conflicts[0].holders[0].agent, "GoldHawk");
     }
 
     // -----------------------------------------------------------------------
@@ -1294,13 +1380,15 @@ mod tests {
             path: "src/**/*.rs".into(),
             holders: vec![
                 ConflictHolder {
-                    agent_name: "RedFox".into(),
-                    reservation_id: 1,
+                    agent: "RedFox".into(),
+                    path_pattern: "src/**/*.rs".into(),
+                    exclusive: true,
                     expires_ts: "2026-02-06T01:00:00Z".into(),
                 },
                 ConflictHolder {
-                    agent_name: "BlueLake".into(),
-                    reservation_id: 2,
+                    agent: "BlueLake".into(),
+                    path_pattern: "src/**/*.rs".into(),
+                    exclusive: false,
                     expires_ts: "2026-02-06T02:00:00Z".into(),
                 },
             ],
@@ -1308,8 +1396,8 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["holders"].as_array().unwrap().len(), 2);
-        assert_eq!(json["holders"][0]["agent_name"], "RedFox");
-        assert_eq!(json["holders"][1]["agent_name"], "BlueLake");
+        assert_eq!(json["holders"][0]["agent"], "RedFox");
+        assert_eq!(json["holders"][1]["agent"], "BlueLake");
     }
 
     // ── Empty response types ──
@@ -1368,5 +1456,59 @@ mod tests {
         assert!(!has_glob_meta("Cargo.toml"));
         assert!(!has_glob_meta("README.md"));
         assert!(!has_glob_meta(""));
+    }
+
+    // ── Suspicious pattern detection (matching Python parity) ──
+
+    #[test]
+    fn too_broad_patterns_detected() {
+        for pat in &["*", "**", "**/*", "**/**", "."] {
+            let warning = detect_suspicious_file_reservation(pat);
+            assert!(warning.is_some(), "expected warning for pattern: {pat}");
+            assert!(
+                warning.as_ref().unwrap().contains("too broad"),
+                "expected 'too broad' in warning for {pat}"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_path_detected() {
+        let warning = detect_suspicious_file_reservation("/full/path/src/module.py");
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("absolute path"));
+    }
+
+    #[test]
+    fn unc_path_not_flagged() {
+        // UNC paths (starting with //) should NOT trigger the absolute path warning
+        let warning = detect_suspicious_file_reservation("//network/share");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn very_short_pattern_detected() {
+        let warning = detect_suspicious_file_reservation("*");
+        // "*" also matches too-broad, so check it returns something
+        assert!(warning.is_some());
+        let warning2 = detect_suspicious_file_reservation("?*");
+        assert!(warning2.is_some());
+        assert!(warning2.unwrap().contains("very short"));
+    }
+
+    #[test]
+    fn normal_patterns_not_suspicious() {
+        for pat in &[
+            "src/api/*.py",
+            "lib/auth/**",
+            "config/settings.yaml",
+            "Cargo.toml",
+        ] {
+            let warning = detect_suspicious_file_reservation(pat);
+            assert!(
+                warning.is_none(),
+                "unexpected warning for normal pattern: {pat}"
+            );
+        }
     }
 }

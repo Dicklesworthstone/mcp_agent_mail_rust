@@ -162,7 +162,7 @@ fn redact_database_url(url: &str) -> String {
 /// Get environment configuration snapshot.
 #[resource(
     uri = "resource://config/environment",
-    description = "Environment configuration snapshot"
+    description = "Inspect the server's current environment and HTTP settings.\n\nWhen to use\n-----------\n- Debugging client connection issues (wrong host/port/path).\n- Verifying which environment (dev/stage/prod) the server is running in.\n\nNotes\n-----\n- This surfaces configuration only; it does not perform live health checks.\n\nReturns\n-------\ndict\n    {\n      \"environment\": str,\n      \"database_url\": str,\n      \"http\": { \"host\": str, \"port\": int, \"path\": str }\n    }\n\nExample (JSON-RPC)\n------------------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://config/environment\"}}\n```"
 )]
 pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
     use mcp_agent_mail_core::Config;
@@ -185,7 +185,7 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
 /// Get environment configuration snapshot (query-aware variant).
 #[resource(
     uri = "resource://config/environment?{query}",
-    description = "Environment configuration snapshot (with query)"
+    description = "Inspect the server's current environment and HTTP settings.\n\nWhen to use\n-----------\n- Debugging client connection issues (wrong host/port/path).\n- Verifying which environment (dev/stage/prod) the server is running in.\n\nNotes\n-----\n- This surfaces configuration only; it does not perform live health checks.\n\nReturns\n-------\ndict\n    {\n      \"environment\": str,\n      \"database_url\": str,\n      \"http\": { \"host\": str, \"port\": int, \"path\": str }\n    }\n\nExample (JSON-RPC)\n------------------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://config/environment\"}}\n```"
 )]
 pub fn config_environment_query(ctx: &McpContext, query: String) -> McpResult<String> {
     let _query = parse_query(&query);
@@ -199,7 +199,7 @@ pub fn config_environment_query(ctx: &McpContext, query: String) -> McpResult<St
 /// Get Git identity resolution for a project.
 #[resource(
     uri = "resource://identity/{project}",
-    description = "Git identity resolution for a project"
+    description = "Inspect identity resolution for a given project path. Returns the slug actually used,\nthe identity mode in effect, canonical path for the selected mode, and git repo facts."
 )]
 pub fn identity_project(_ctx: &McpContext, project: String) -> McpResult<String> {
     let (project_ref, _query) = split_param_and_query(&project);
@@ -265,7 +265,7 @@ pub struct AgentsListResponse {
 /// List agents in a project.
 #[resource(
     uri = "resource://agents/{project_key}",
-    description = "List of agents with profiles in a project"
+    description = "List all registered agents in a project for easy agent discovery.\n\nThis is the recommended way to discover other agents working on a project.\n\nWhen to use\n-----------\n- At the start of a coding session to see who else is working on the project.\n- Before sending messages to discover available recipients.\n- To check if a specific agent is registered before attempting contact.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key (both work).\n\nReturns\n-------\ndict\n    {\n      \"project\": { \"slug\": \"...\", \"human_key\": \"...\" },\n      \"agents\": [\n        {\n          \"name\": \"BackendDev\",\n          \"program\": \"claude-code\",\n          \"model\": \"sonnet-4.5\",\n          \"task_description\": \"API development\",\n          \"inception_ts\": \"2025-10-25T...\",\n          \"last_active_ts\": \"2025-10-25T...\",\n          \"unread_count\": 3\n        },\n        ...\n      ]\n    }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r5\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://agents/backend-abc123\"}}\n```\n\nNotes\n-----\n- Agent names are NOT the same as your program name or user name.\n- Use the returned names when calling tools like whois(), request_contact(), send_message().\n- Agents in different projects cannot see each other - project isolation is enforced."
 )]
 pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<String> {
     let (project_key, _query) = split_param_and_query(&project_key);
@@ -933,7 +933,7 @@ fn build_tool_directory() -> ToolDirectory {
 /// Get tool directory with cluster/capability metadata.
 #[resource(
     uri = "resource://tooling/directory",
-    description = "All tools with cluster/capability metadata"
+    description = "Provide a clustered view of exposed MCP tools to combat option overload.\n\nThe directory groups tools by workflow, outlines primary use cases,\nhighlights nearby alternatives, and shares starter playbooks so agents\ncan focus on the verbs relevant to their immediate task."
 )]
 pub fn tooling_directory(_ctx: &McpContext) -> McpResult<String> {
     let directory = build_tool_directory();
@@ -945,7 +945,7 @@ pub fn tooling_directory(_ctx: &McpContext) -> McpResult<String> {
 /// Get tool directory with cluster/capability metadata (query-aware variant).
 #[resource(
     uri = "resource://tooling/directory?{query}",
-    description = "All tools with cluster/capability metadata (with query)"
+    description = "Provide a clustered view of exposed MCP tools to combat option overload.\n\nThe directory groups tools by workflow, outlines primary use cases,\nhighlights nearby alternatives, and shares starter playbooks so agents\ncan focus on the verbs relevant to their immediate task."
 )]
 pub fn tooling_directory_query(ctx: &McpContext, query: String) -> McpResult<String> {
     let _query = parse_query(&query);
@@ -999,7 +999,7 @@ pub struct ToolSchemasResponse {
 /// Get tool schemas.
 #[resource(
     uri = "resource://tooling/schemas",
-    description = "Tool schemas and JSON definitions"
+    description = "Expose JSON-like parameter schemas for tools/macros to prevent drift.\n\nThis is a lightweight, hand-maintained view focusing on the most error-prone\nparameters and accepted aliases to guide clients."
 )]
 pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
     let config = &Config::get();
@@ -1092,7 +1092,7 @@ pub fn tooling_schemas(_ctx: &McpContext) -> McpResult<String> {
 /// Get tool schemas (query-aware variant).
 #[resource(
     uri = "resource://tooling/schemas?{query}",
-    description = "Tool schemas and JSON definitions (with query)"
+    description = "Expose JSON-like parameter schemas for tools/macros to prevent drift.\n\nThis is a lightweight, hand-maintained view focusing on the most error-prone\nparameters and accepted aliases to guide clients."
 )]
 pub fn tooling_schemas_query(ctx: &McpContext, query: String) -> McpResult<String> {
     let _query = parse_query(&query);
@@ -1121,7 +1121,7 @@ pub struct ToolMetricsResponse {
 /// Get tool usage metrics.
 #[resource(
     uri = "resource://tooling/metrics",
-    description = "Tool call counts and error rates"
+    description = "Expose aggregated tool call/error counts for analysis."
 )]
 pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
     let config = &Config::get();
@@ -1158,7 +1158,7 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
 /// Get tool usage metrics (query-aware variant).
 #[resource(
     uri = "resource://tooling/metrics?{query}",
-    description = "Tool call counts and error rates (with query)"
+    description = "Expose aggregated tool call/error counts for analysis."
 )]
 pub fn tooling_metrics_query(ctx: &McpContext, query: String) -> McpResult<String> {
     let _query = parse_query(&query);
@@ -1258,7 +1258,10 @@ pub struct LocksResponse {
 }
 
 /// Get active archive locks.
-#[resource(uri = "resource://tooling/locks", description = "Active archive locks")]
+#[resource(
+    uri = "resource://tooling/locks",
+    description = "Return lock metadata from the shared archive storage."
+)]
 pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
     let config = &mcp_agent_mail_core::Config::get();
     let lock_info = mcp_agent_mail_storage::collect_lock_status(config).unwrap_or_else(|e| {
@@ -1332,7 +1335,7 @@ pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
 /// Get active archive locks (query-aware variant).
 #[resource(
     uri = "resource://tooling/locks?{query}",
-    description = "Active archive locks (with query)"
+    description = "Return lock metadata from the shared archive storage."
 )]
 pub fn tooling_locks_query(ctx: &McpContext, query: String) -> McpResult<String> {
     let _query = parse_query(&query);
@@ -1663,7 +1666,10 @@ fn apply_projects_list_query_options(
 }
 
 /// List all projects.
-#[resource(uri = "resource://projects", description = "All projects")]
+#[resource(
+    uri = "resource://projects",
+    description = "List all projects known to the server in creation order.\n\nWhen to use\n-----------\n- Discover available projects when a user provides only an agent name.\n- Build UIs that let operators switch context between projects.\n\nReturns\n-------\nlist[dict]\n    Each: { id, slug, human_key, created_at }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r2\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://projects\"}}\n```"
+)]
 pub async fn projects_list(ctx: &McpContext) -> McpResult<String> {
     let pool = get_db_pool()?;
     let rows =
@@ -1686,7 +1692,7 @@ pub async fn projects_list(ctx: &McpContext) -> McpResult<String> {
 /// List all projects (query-aware variant).
 #[resource(
     uri = "resource://projects?{query}",
-    description = "All projects (with query)"
+    description = "List all projects known to the server in creation order.\n\nWhen to use\n-----------\n- Discover available projects when a user provides only an agent name.\n- Build UIs that let operators switch context between projects.\n\nReturns\n-------\nlist[dict]\n    Each: { id, slug, human_key, created_at }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r2\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://projects\"}}\n```"
 )]
 pub async fn projects_list_query(ctx: &McpContext, query: String) -> McpResult<String> {
     let params = parse_query(&query);
@@ -1738,7 +1744,7 @@ pub struct ProjectDetailResponse {
 /// Get project details.
 #[resource(
     uri = "resource://project/{slug}",
-    description = "Project details and stats"
+    description = "Fetch a project and its agents by project slug or human key.\n\nWhen to use\n-----------\n- Populate an \"LDAP-like\" directory for agents in tooling UIs.\n- Determine available agent identities and their metadata before addressing mail.\n\nParameters\n----------\nslug : str\n    Project slug (or human key; both resolve to the same target).\n\nReturns\n-------\ndict\n    Project descriptor including { agents: [...] } with agent profiles.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r3\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://project/backend-abc123\"}}\n```"
 )]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug, _query) = split_param_and_query(&slug);
@@ -1808,7 +1814,7 @@ pub struct ProductProjectDetails {
 /// Get product details.
 #[resource(
     uri = "resource://product/{key}",
-    description = "Product with linked projects"
+    description = "Inspect product and list linked projects."
 )]
 pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String> {
     use mcp_agent_mail_core::Config;
@@ -1914,7 +1920,7 @@ pub struct MessageDetails {
 /// Get full message details.
 #[resource(
     uri = "resource://message/{message_id}",
-    description = "Full message details"
+    description = "Read a single message by id within a project.\n\nWhen to use\n-----------\n- Fetch the canonical body/metadata for rendering in a client after list/search.\n- Retrieve attachments and full details for a given message id.\n\nParameters\n----------\nmessage_id : str\n    Numeric id as a string.\nproject : str\n    Project slug or human key (required for disambiguation).\n\nCommon mistakes\n---------------\n- Omitting `project` when a message id might exist in multiple projects.\n\nReturns\n-------\ndict\n    Full message payload including body and sender name.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r5\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://message/1234?project=/abs/path/backend\"}}\n```"
 )]
 pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<String> {
     let (message_id_str, query) = split_param_and_query(&message_id);
@@ -1996,7 +2002,10 @@ pub struct ThreadDetails {
 }
 
 /// Get thread messages.
-#[resource(uri = "resource://thread/{thread_id}", description = "Thread messages")]
+#[resource(
+    uri = "resource://thread/{thread_id}",
+    description = "List messages for a thread within a project.\n\nWhen to use\n-----------\n- Present a conversation view for a given ticket/thread key.\n- Export a thread for summarization or reporting.\n\nParameters\n----------\nthread_id : str\n    Either a string thread key or a numeric message id to seed the thread.\nproject : str\n    Project slug or human key (required).\ninclude_bodies : bool\n    Include message bodies if true (default false).\n\nReturns\n-------\ndict\n    { project, thread_id, messages: [{...}] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/TKT-123?project=/abs/path/backend&include_bodies=true\"}}\n```\n\nNumeric seed example (message id as thread seed):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/1234?project=/abs/path/backend\"}}\n```"
+)]
 pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<String> {
     let (thread_id_str, query) = split_param_and_query(&thread_id);
 
@@ -2130,7 +2139,7 @@ pub struct InboxResourceResponse {
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://inbox/{agent}",
-    description = "Inbox messages for an agent"
+    description = "Read an agent's inbox for a project.\n\nParameters\n----------\nagent : str\n    Agent name.\nproject : str\n    Project slug or human key (required).\nsince_ts : Optional[str]\n    ISO-8601 timestamp string; only messages newer than this are returned.\nurgent_only : bool\n    If true, limits to importance in {high, urgent}.\ninclude_bodies : bool\n    Include message bodies in results (default false).\nlimit : int\n    Maximum number of messages to return (default 20).\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [...] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&limit=10&urgent_only=true\"}}\n```\nIncremental fetch example (using since_ts):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&since_ts=2025-10-23T15:00:00Z\"}}\n```"
 )]
 pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
@@ -2347,7 +2356,7 @@ pub struct MailboxResponseFull {
 /// Get combined inbox/outbox for an agent.
 #[resource(
     uri = "resource://mailbox/{agent}",
-    description = "Combined inbox and outbox"
+    description = "List recent messages in an agent's mailbox with lightweight Git commit context.\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [{ id, subject, from, created_ts, importance, ack_required, kind, commit: {hexsha, summary} | null }] }"
 )]
 pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
@@ -2440,7 +2449,7 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 /// Get mailbox with recent commits for an agent.
 #[resource(
     uri = "resource://mailbox-with-commits/{agent}",
-    description = "Mailbox entries with commit metadata"
+    description = "List recent messages in an agent's mailbox with commit metadata including diff summaries."
 )]
 pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
@@ -2571,7 +2580,10 @@ pub struct OutboxResponse {
 }
 
 /// Get outbox for an agent.
-#[resource(uri = "resource://outbox/{agent}", description = "Sent messages")]
+#[resource(
+    uri = "resource://outbox/{agent}",
+    description = "List messages sent by the agent, enriched with commit metadata for canonical files."
+)]
 #[allow(clippy::too_many_lines)]
 pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     use mcp_agent_mail_db::sqlmodel::Value;
@@ -2789,7 +2801,7 @@ pub struct ViewResponse {
 /// Get urgent unread messages for an agent.
 #[resource(
     uri = "resource://views/urgent-unread/{agent}",
-    description = "Unread high/urgent messages"
+    description = "Convenience view listing urgent and high-importance messages that are unread for an agent.\n\nParameters\n----------\nagent : str\n    Agent name.\nproject : str\n    Project slug or human key (required).\nlimit : int\n    Max number of messages."
 )]
 pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
@@ -2878,7 +2890,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
 /// Get messages requiring acknowledgement for an agent.
 #[resource(
     uri = "resource://views/ack-required/{agent}",
-    description = "Messages requiring acknowledgement"
+    description = "Convenience view listing messages requiring acknowledgement for an agent where ack is pending.\n\nParameters\n----------\nagent : str\n    Agent name.\nproject : str\n    Project slug or human key (required).\nlimit : int\n    Max number of messages."
 )]
 pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
@@ -3000,7 +3012,7 @@ pub struct StaleAcksResponse {
 /// acknowledged, matching the legacy Python `acks_stale_view` resource.
 #[resource(
     uri = "resource://views/acks-stale/{agent}",
-    description = "Acknowledgements considered stale"
+    description = "List ack-required messages older than a TTL where acknowledgement is still missing.\n\nParameters\n----------\nagent : str\n    Agent name.\nproject : str\n    Project slug or human key (required).\nttl_seconds : Optional[int]\n    Minimum age in seconds to consider a message stale. Defaults to settings.ack_ttl_seconds.\nlimit : int\n    Max number of messages to return."
 )]
 pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
@@ -3105,7 +3117,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
 /// acknowledged, matching the legacy Python `ack_overdue_view` resource.
 #[resource(
     uri = "resource://views/ack-overdue/{agent}",
-    description = "Acknowledgements overdue"
+    description = "List messages requiring acknowledgement older than ttl_minutes without ack."
 )]
 pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
@@ -3484,7 +3496,7 @@ fn retain_active_file_reservations(
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://file_reservations/{slug}",
-    description = "File reservations in a project"
+    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), only returns file_reservations with no `released_ts`.\n\nReturns\n-------\nlist[dict]\n    Each file_reservation with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?active_only=true\"}}\n```\n\nAlso see all historical (including released) file_reservations:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?active_only=false\"}}\n```"
 )]
 pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug_str, query) = split_param_and_query(&slug);

@@ -26,7 +26,8 @@ use crate::pattern_overlap::CompiledPattern;
 #[derive(Debug, Clone)]
 pub(crate) struct ReservationRef {
     pub agent_id: i64,
-    pub reservation_id: i64,
+    pub path_pattern: String,
+    pub exclusive: bool,
     pub expires_ts: i64,
 }
 
@@ -211,10 +212,11 @@ fn first_segment(norm: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
-    fn make_ref(agent_id: i64, reservation_id: i64) -> ReservationRef {
+    fn make_ref(agent_id: i64) -> ReservationRef {
         ReservationRef {
             agent_id,
-            reservation_id,
+            path_pattern: String::new(),
+            exclusive: true,
             expires_ts: 0,
         }
     }
@@ -222,17 +224,17 @@ mod tests {
     #[test]
     fn exact_path_conflict_detected() {
         let idx =
-            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter());
+            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].reservation_id, 10);
+        assert_eq!(conflicts[0].agent_id, 1);
     }
 
     #[test]
     fn exact_path_no_conflict_different_file() {
         let idx =
-            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter());
+            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/lib.rs");
         let conflicts = idx.find_conflicts(&req);
         assert!(conflicts.is_empty());
@@ -240,8 +242,7 @@ mod tests {
 
     #[test]
     fn glob_reservation_matches_exact_request() {
-        let idx =
-            ReservationIndex::build(vec![("src/**".to_string(), make_ref(1, 10))].into_iter());
+        let idx = ReservationIndex::build(vec![("src/**".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
@@ -250,7 +251,7 @@ mod tests {
     #[test]
     fn glob_request_matches_exact_reservation() {
         let idx =
-            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1, 10))].into_iter());
+            ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/**");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
@@ -258,8 +259,7 @@ mod tests {
 
     #[test]
     fn root_glob_reservation_checked_against_all() {
-        let idx =
-            ReservationIndex::build(vec![("**/*.rs".to_string(), make_ref(1, 10))].into_iter());
+        let idx = ReservationIndex::build(vec![("**/*.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
@@ -267,9 +267,8 @@ mod tests {
 
     #[test]
     fn different_prefix_no_conflict() {
-        let idx = ReservationIndex::build(
-            vec![("docs/readme.md".to_string(), make_ref(1, 10))].into_iter(),
-        );
+        let idx =
+            ReservationIndex::build(vec![("docs/readme.md".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert!(conflicts.is_empty());
@@ -279,9 +278,9 @@ mod tests {
     fn multiple_reservations_same_prefix() {
         let idx = ReservationIndex::build(
             vec![
-                ("src/main.rs".to_string(), make_ref(1, 10)),
-                ("src/**/*.rs".to_string(), make_ref(2, 20)),
-                ("docs/**".to_string(), make_ref(3, 30)),
+                ("src/main.rs".to_string(), make_ref(1)),
+                ("src/**/*.rs".to_string(), make_ref(2)),
+                ("docs/**".to_string(), make_ref(3)),
             ]
             .into_iter(),
         );
@@ -289,17 +288,17 @@ mod tests {
         let conflicts = idx.find_conflicts(&req);
         // Should match exact src/main.rs and glob src/**/*.rs, but not docs/**
         assert_eq!(conflicts.len(), 2);
-        let ids: Vec<i64> = conflicts.iter().map(|r| r.reservation_id).collect();
-        assert!(ids.contains(&10));
-        assert!(ids.contains(&20));
+        let ids: Vec<i64> = conflicts.iter().map(|r| r.agent_id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
     }
 
     #[test]
     fn root_glob_request_scans_all_groups() {
         let idx = ReservationIndex::build(
             vec![
-                ("src/main.rs".to_string(), make_ref(1, 10)),
-                ("docs/readme.md".to_string(), make_ref(2, 20)),
+                ("src/main.rs".to_string(), make_ref(1)),
+                ("docs/readme.md".to_string(), make_ref(2)),
             ]
             .into_iter(),
         );
@@ -320,7 +319,7 @@ mod tests {
     #[test]
     fn glob_vs_glob_overlap_detected() {
         let idx =
-            ReservationIndex::build(vec![("src/**/*.rs".to_string(), make_ref(1, 10))].into_iter());
+            ReservationIndex::build(vec![("src/**/*.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/**");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);
@@ -329,9 +328,8 @@ mod tests {
     #[test]
     fn normalized_paths_match() {
         // ./src/main.rs normalizes to src/main.rs
-        let idx = ReservationIndex::build(
-            vec![("./src/main.rs".to_string(), make_ref(1, 10))].into_iter(),
-        );
+        let idx =
+            ReservationIndex::build(vec![("./src/main.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
         let conflicts = idx.find_conflicts(&req);
         assert_eq!(conflicts.len(), 1);

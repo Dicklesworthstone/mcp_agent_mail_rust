@@ -737,7 +737,15 @@ effective_free_bytes={free}"
     )?;
 
     // Resolve sender
-    let sender = resolve_agent(ctx, &pool, project_id, &sender_name, &project.slug, &project.human_key).await?;
+    let sender = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &sender_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let sender_id = sender.id.unwrap_or(0);
 
     // Resolve all recipients (to, cc, bcc) with optional auto-registration
@@ -1371,7 +1379,15 @@ effective_free_bytes={free}"
     }
 
     // Resolve sender
-    let sender = resolve_agent(ctx, &pool, project_id, &sender_name, &project.slug, &project.human_key).await?;
+    let sender = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &sender_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let sender_id = sender.id.unwrap_or(0);
 
     // Resolve original sender name for default recipient
@@ -1434,7 +1450,15 @@ effective_free_bytes={free}"
         SmallVec::with_capacity(bcc_names.len());
 
     for name in &to_names {
-        let agent = resolve_agent(ctx, &pool, project_id, name, &project.slug, &project.human_key).await?;
+        let agent = resolve_agent(
+            ctx,
+            &pool,
+            project_id,
+            name,
+            &project.slug,
+            &project.human_key,
+        )
+        .await?;
         let aid = agent.id.unwrap_or(0);
         if !all_recipients.iter().any(|(id, _)| *id == aid) {
             all_recipients.push((aid, "to".to_string()));
@@ -1442,7 +1466,15 @@ effective_free_bytes={free}"
         resolved_to.push(agent.name);
     }
     for name in &cc_names {
-        let agent = resolve_agent(ctx, &pool, project_id, name, &project.slug, &project.human_key).await?;
+        let agent = resolve_agent(
+            ctx,
+            &pool,
+            project_id,
+            name,
+            &project.slug,
+            &project.human_key,
+        )
+        .await?;
         let aid = agent.id.unwrap_or(0);
         if !all_recipients.iter().any(|(id, _)| *id == aid) {
             all_recipients.push((aid, "cc".to_string()));
@@ -1450,7 +1482,15 @@ effective_free_bytes={free}"
         resolved_cc_recipients.push(agent.name);
     }
     for name in &bcc_names {
-        let agent = resolve_agent(ctx, &pool, project_id, name, &project.slug, &project.human_key).await?;
+        let agent = resolve_agent(
+            ctx,
+            &pool,
+            project_id,
+            name,
+            &project.slug,
+            &project.human_key,
+        )
+        .await?;
         let aid = agent.id.unwrap_or(0);
         if !all_recipients.iter().any(|(id, _)| *id == aid) {
             all_recipients.push((aid, "bcc".to_string()));
@@ -1642,7 +1682,15 @@ pub async fn fetch_inbox(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Parse since_ts if provided (ISO-8601 to micros)
@@ -1746,7 +1794,15 @@ pub async fn mark_message_read(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Idempotent - returns timestamp when read (new or existing)
@@ -1793,7 +1849,15 @@ pub async fn acknowledge_message(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Sets both read_ts and ack_ts - idempotent
