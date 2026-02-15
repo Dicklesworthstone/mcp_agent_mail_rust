@@ -56,6 +56,9 @@ pub mod fastembed;
 #[cfg(feature = "semantic")]
 pub mod auto_init;
 
+#[cfg(feature = "semantic")]
+pub mod fs_bridge;
+
 // Re-export key types
 pub use canonical::{
     CanonPolicy, canonicalize, canonicalize_and_hash, content_hash, strip_markdown,
@@ -148,4 +151,23 @@ pub use fastembed::{
 pub use auto_init::{
     EmbedderInfo as TwoTierEmbedderInfo, TwoTierAvailability, TwoTierContext, get_two_tier_context,
     is_full_two_tier_available, is_two_tier_available,
+};
+
+// frankensearch bridge — re-export conversion utilities and frankensearch types
+#[cfg(feature = "semantic")]
+pub use fs_bridge::{
+    // The frankensearch facade crate itself
+    fs,
+    // Conversion utilities
+    doc_id_from_string, doc_id_to_string, from_fs_config, from_fs_scored_result,
+    from_fs_scored_results, to_fs_config, to_fs_scored_result,
+    // Model tier conversion
+    from_fs_model_tier, to_fs_model_tier,
+    // Sync-to-async embedder adapter
+    SyncEmbedderAdapter,
+    // frankensearch types (Fs-prefixed to avoid name collisions)
+    FsEmbedder, FsEmbedderStack, FsIndexBuilder, FsModelCategory, FsModelInfo, FsModelTier,
+    FsRrfConfig, FsScoredResult, FsSearchPhase, FsTwoTierAvailability, FsTwoTierConfig,
+    FsTwoTierIndex, FsTwoTierMetrics, FsTwoTierSearcher, FsVectorHit, FsVectorIndex,
+    IndexableDocument,
 };
