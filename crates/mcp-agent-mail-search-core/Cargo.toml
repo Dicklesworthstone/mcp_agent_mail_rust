@@ -21,6 +21,12 @@ tracing.workspace = true
 # Core types (config, models)
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 
+# frankensearch: canonical two-tier hybrid search implementation
+frankensearch = { workspace = true, optional = true }
+frankensearch-core = { workspace = true, optional = true }
+frankensearch-embed = { workspace = true, optional = true }
+frankensearch-fusion = { workspace = true, optional = true }
+
 # Optional: Tantivy lexical search engine
 tantivy = { workspace = true, optional = true }
 
@@ -38,6 +44,10 @@ dirs = { workspace = true, optional = true }
 tantivy-engine = ["dep:tantivy"]
 # Enable vector/semantic search engine with two-tier support
 semantic = [
+    "dep:frankensearch",
+    "dep:frankensearch-core",
+    "dep:frankensearch-embed",
+    "dep:frankensearch-fusion",
     "dep:half",
     "dep:wide",
     "dep:safetensors",

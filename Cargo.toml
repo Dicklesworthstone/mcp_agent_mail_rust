@@ -99,7 +99,14 @@ walkdir = "2"
 tantivy = "0.25"
 indexmap = "2"
 
-# Two-tier search dependencies
+# frankensearch: two-tier hybrid search engine
+frankensearch = { path = "../frankensearch/frankensearch", features = ["hybrid"] }
+frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
+frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
+frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
+frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
+
+# Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
 wide = "0.7"
 safetensors = "0.5"
@@ -143,4 +150,5 @@ inherits = "release"     # Benchmarks use same optimizations as release
 [patch.crates-io]
 # Force a single asupersync throughout the dependency graph to avoid
 # type-identity mismatches (Cx/Outcome/etc).
+# Uses /dp/ canonical path to match frankensearch's Cargo.toml.
 asupersync = { path = "../asupersync" }
