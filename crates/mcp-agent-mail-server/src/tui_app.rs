@@ -1286,22 +1286,23 @@ impl MailAppModel {
             self.clipboard
                 .set(text, ClipboardSelection::Clipboard, &mut std::io::stdout());
 
-        if let Ok(()) = result {
-            self.internal_clipboard = Some(text.to_string());
-            self.notifications.notify(
-                Toast::new(format!("Copied: {truncated}"))
-                    .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(2)),
-            );
+        // Always keep an in-process copy, regardless of terminal support.
+        self.internal_clipboard = Some(text.to_string());
+
+        let (message, icon, duration) = if result == Ok(()) {
+            (format!("Copied: {truncated}"), ToastIcon::Info, 2)
         } else {
-            // Fall back to internal clipboard.
-            self.internal_clipboard = Some(text.to_string());
-            self.notifications.notify(
-                Toast::new(format!("Copied (internal): {truncated}"))
-                    .icon(ToastIcon::Warning)
-                    .duration(Duration::from_secs(3)),
-            );
-        }
+            (
+                format!("Copied (internal): {truncated}"),
+                ToastIcon::Warning,
+                3,
+            )
+        };
+        self.notifications.notify(
+            Toast::new(message)
+                .icon(icon)
+                .duration(Duration::from_secs(duration)),
+        );
     }
 
     /// Route an `Execute` operation to the appropriate handler.
