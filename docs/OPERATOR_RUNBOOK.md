@@ -413,6 +413,9 @@ Compatibility-only wrapper behavior:
 | Symptom / Concern | Run This Suite | Expected Artifact Root |
 |-------------------|----------------|------------------------|
 | MCP/API mode drift or deny behavior mismatch | `tests/e2e/test_dual_mode.sh` | `tests/artifacts/dual_mode/<timestamp>/` |
+| TUI startup/bootstrap/token-redaction regressions | `tests/e2e/test_tui_startup.sh` | `tests/artifacts/tui_startup/<timestamp>/` |
+| Browser/WASM state-sync poll+ingress contract regressions | `tests/e2e/test_tui_wasm.sh` | `tests/artifacts/tui_wasm/<timestamp>/` |
+| Accessibility keyboard/contrast/reduced-motion regressions | `tests/e2e/test_tui_a11y.sh` | `tests/artifacts/tui_a11y/<timestamp>/` |
 | TUI resize/reflow/screen rendering regressions | `tests/e2e/test_tui_compat_matrix.sh` | `tests/artifacts/tui_compat_matrix/<timestamp>/` |
 | Explorer/analytics/widgets interaction regressions | `tests/e2e/test_tui_interactions.sh` | `tests/artifacts/tui_interactions/<timestamp>/` |
 | Web UI route/action parity issues | `tests/e2e/test_mail_ui.sh` | `tests/artifacts/mail_ui/<timestamp>/` |
@@ -426,6 +429,15 @@ For any failing suite, validate forensic bundle structure:
 source scripts/e2e_lib.sh
 e2e_validate_bundle_tree tests/artifacts
 ```
+
+### Structured Diagnostics Pointers (Phase 5)
+
+| Suite | Primary Diagnostics File |
+|-------|---------------------------|
+| `tui_wasm` | `tests/artifacts/tui_wasm/<timestamp>/diagnostics/wasm_scenarios.jsonl` |
+| `tui_interaction` | `tests/artifacts/tui_interaction/<timestamp>/diagnostics/pty_scenarios.jsonl` |
+| `tui_interactions` | `tests/artifacts/tui_interactions/<timestamp>/diagnostics/pty_scenarios.jsonl` |
+| `t16_perf_gate` | `tests/artifacts/t16_perf_gate/<timestamp>/diagnostics/perf_gate_scenarios.jsonl` |
 
 ## 8. Diagnostics Collection
 
@@ -549,7 +561,7 @@ bash scripts/e2e_tui_startup.sh --showcase
    `tui_startup`, `search_cockpit`, `tui_interactions`, `security_privacy`,
    `macros`, `tui_compat_matrix`.
 3. Macro playback forensics stage runs:
-   `cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture`.
+   `rch exec -- cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture`.
 4. Teardown writes handoff metadata without deleting artifacts.
 
 ### Handoff Artifacts
@@ -571,7 +583,8 @@ bash scripts/e2e_tui_startup.sh --showcase
 | Missing `pyte` for PTY render emulation | `python3 -m pip install --user pyte` |
 | Missing shell tools (`expect`, `tmux`, `script`) | Install required packages, then re-run showcase command. |
 | A specific suite fails and you need focused rerun | `AM_TUI_SHOWCASE_SUITES=tui_interactions bash scripts/e2e_tui_startup.sh --showcase` |
-| Macro playback forensic step fails | `cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture` |
+| Macro playback forensic step fails | `rch exec -- cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture` |
+| `tui_wasm` records `RCH_REMOTE_DEP_MISMATCH` skips | `rch workers probe --all && rch status && rch queue` then rerun `tests/e2e/test_tui_wasm.sh` |
 | Artifact path mismatch (wrong timestamp) | `ls -1 tests/artifacts/tui_showcase/ | tail -n 5` then open matching `showcase/index.tsv` |
 
 ## 12. Graceful Shutdown
