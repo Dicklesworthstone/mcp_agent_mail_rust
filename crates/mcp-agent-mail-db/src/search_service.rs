@@ -35,8 +35,9 @@ use mcp_agent_mail_search_core::{
 use mcp_agent_mail_search_core::{
     DocKind as SearchDocKind, Embedder, EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue,
     EmbeddingRequest, EmbeddingResult, HashEmbedder, JobMetricsSnapshot, ModelInfo, ModelRegistry,
-    ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, TwoTierAvailability, TwoTierConfig,
-    TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex, VectorIndexConfig, get_two_tier_context,
+    ModelTier, QueueStats, RefreshWorkerConfig, RegistryConfig, ScoredResult, SearchPhase,
+    TwoTierAvailability, TwoTierConfig, TwoTierEntry, TwoTierIndex, VectorFilter, VectorIndex,
+    VectorIndexConfig, get_two_tier_context,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row as SqlRow, Value};
@@ -466,6 +467,57 @@ const fn convert_doc_kind(kind: SearchDocKind) -> DocKind {
 }
 
 #[cfg(feature = "hybrid")]
+fn scored_results_to_search_results(hits: Vec<ScoredResult>) -> Vec<SearchResult> {
+    hits.into_iter()
+        .map(|hit| SearchResult {
+            doc_kind: convert_doc_kind(hit.doc_kind),
+            id: i64::try_from(hit.doc_id).unwrap_or(i64::MAX),
+            project_id: hit.project_id,
+            title: String::new(),
+            body: String::new(),
+            score: Some(f64::from(hit.score)),
+            importance: None,
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            redacted: false,
+            redaction_reason: None,
+        })
+        .collect()
+}
+
+#[cfg(feature = "hybrid")]
+fn select_best_two_tier_results<I>(phases: I) -> Option<Vec<ScoredResult>>
+where
+    I: IntoIterator<Item = SearchPhase>,
+{
+    let mut best: Option<Vec<ScoredResult>> = None;
+
+    for phase in phases {
+        match phase {
+            SearchPhase::Initial { results, .. } => {
+                if best.is_none() {
+                    best = Some(results);
+                }
+            }
+            SearchPhase::Refined { results, .. } => {
+                best = Some(results);
+            }
+            SearchPhase::RefinementFailed { error } => {
+                tracing::debug!(
+                    target: "search.semantic",
+                    error = %error,
+                    "two-tier refinement failed; keeping the best available phase"
+                );
+            }
+        }
+    }
+
+    best
+}
+
+#[cfg(feature = "hybrid")]
 const fn convert_planner_doc_kind(kind: DocKind) -> SearchDocKind {
     match kind {
         DocKind::Message => SearchDocKind::Message,
@@ -694,29 +746,78 @@ impl TwoTierBridge {
             }
         };
 
-        // Search the index (drop lock before converting results)
-        // For now, use simple similarity search on the fast tier
-        // Full progressive refinement will be added in a follow-up
         let hits = self.index().search_fast(&embedding, limit);
+        scored_results_to_search_results(hits)
+    }
 
-        // Convert to SearchResult using metadata from the index
-        hits.into_iter()
-            .map(|hit| SearchResult {
-                doc_kind: convert_doc_kind(hit.doc_kind),
-                id: i64::try_from(hit.doc_id).unwrap_or(i64::MAX),
-                project_id: hit.project_id,
-                title: String::new(), // Index doesn't store full docs
-                body: String::new(),
-                score: Some(f64::from(hit.score)),
-                importance: None,
-                ack_required: None,
-                created_ts: None,
-                thread_id: None,
-                from_agent: None,
-                redacted: false,
-                redaction_reason: None,
-            })
-            .collect()
+    /// Search via the frankensearch probe seam and map phases back to planner results.
+    ///
+    /// Falls back to fast-only search when the probe path is unavailable or fails.
+    pub async fn search_with_frankensearch_probe(
+        &self,
+        cx: &Cx,
+        query: &SearchQuery,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        let ctx = get_two_tier_context();
+
+        // Two-tier bridge requires fast embeddings for both query and indexed docs.
+        if ctx.fast_info().is_none() {
+            tracing::debug!(
+                target: "search.semantic",
+                "fast embedder unavailable, skipping two-tier search"
+            );
+            return Vec::new();
+        }
+
+        // Embed with fast tier for deterministic fallback behavior.
+        let embedding = match ctx.embed_fast(&query.text) {
+            Ok(emb) => emb,
+            Err(e) => {
+                tracing::warn!(
+                    target: "search.semantic",
+                    error = %e,
+                    "failed to embed query with fast tier"
+                );
+                return Vec::new();
+            }
+        };
+
+        let index = self.index();
+
+        if ctx.is_full() {
+            if let Some(searcher) = ctx.create_searcher(&index) {
+                match searcher
+                    .search_with_frankensearch_probe(cx, &query.text, limit)
+                    .await
+                {
+                    Ok(phases) => {
+                        if let Some(results) = select_best_two_tier_results(phases) {
+                            return scored_results_to_search_results(results);
+                        }
+                        tracing::debug!(
+                            target: "search.semantic",
+                            "frankensearch probe returned no usable phases; falling back to fast"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "search.semantic",
+                            error = %e,
+                            "frankensearch probe search failed; falling back to fast"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    target: "search.semantic",
+                    "failed to create two-tier searcher; falling back to fast"
+                );
+            }
+        }
+
+        let hits = index.search_fast(&embedding, limit);
+        scored_results_to_search_results(hits)
     }
 
     /// Add a document to the two-tier index.
@@ -853,6 +954,24 @@ fn try_two_tier_search(query: &SearchQuery, limit: usize) -> Option<Vec<SearchRe
     if let Some(bridge) = get_or_init_two_tier_bridge() {
         if bridge.is_available() {
             return Some(bridge.search(query, limit));
+        }
+    }
+
+    // Fall back to legacy semantic bridge
+    try_semantic_search(query, limit)
+}
+
+#[cfg(feature = "hybrid")]
+async fn try_two_tier_search_with_cx(
+    cx: &Cx,
+    query: &SearchQuery,
+    limit: usize,
+) -> Option<Vec<SearchResult>> {
+    // Use atomic get_or_init pattern to avoid race condition on initialization.
+    // Only one TwoTierBridge instance is ever created under concurrent access.
+    if let Some(bridge) = get_or_init_two_tier_bridge() {
+        if bridge.is_available() {
+            return Some(bridge.search_with_frankensearch_probe(cx, query, limit).await);
         }
     }
 
@@ -1129,8 +1248,9 @@ pub async fn execute_search(
         if let Some(lexical_results) = try_tantivy_search(query) {
             // Try two-tier semantic search first, then fall back to legacy
             #[cfg(feature = "hybrid")]
-            let semantic_results =
-                try_two_tier_search(query, query.effective_limit()).unwrap_or_default();
+            let semantic_results = try_two_tier_search_with_cx(cx, query, query.effective_limit())
+                .await
+                .unwrap_or_default();
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
 
@@ -1742,6 +1862,64 @@ mod tests {
         assert_eq!(hits[0].doc_id, 9);
         assert_eq!(hits[0].doc_kind, SearchDocKind::Message);
         assert_eq!(hits[0].project_id, Some(42));
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_scored(doc_id: u64, score: f32) -> ScoredResult {
+        ScoredResult {
+            idx: doc_id as usize,
+            doc_id,
+            doc_kind: SearchDocKind::Message,
+            project_id: Some(7),
+            score,
+        }
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn select_best_two_tier_results_prefers_refined_phase() {
+        let phases = vec![
+            SearchPhase::Initial {
+                results: vec![make_scored(1, 0.1)],
+                latency_ms: 5,
+            },
+            SearchPhase::Refined {
+                results: vec![make_scored(2, 0.9)],
+                latency_ms: 21,
+            },
+        ];
+
+        let selected =
+            select_best_two_tier_results(phases).expect("expected at least one usable phase");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].doc_id, 2);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn select_best_two_tier_results_keeps_initial_on_refinement_failure() {
+        let phases = vec![
+            SearchPhase::Initial {
+                results: vec![make_scored(11, 0.7)],
+                latency_ms: 6,
+            },
+            SearchPhase::RefinementFailed {
+                error: "quality embedder unavailable".to_string(),
+            },
+        ];
+
+        let selected =
+            select_best_two_tier_results(phases).expect("initial phase should be preserved");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].doc_id, 11);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn select_best_two_tier_results_none_for_empty_iterator() {
+        let phases: Vec<SearchPhase> = Vec::new();
+        assert!(select_best_two_tier_results(phases).is_none());
     }
 
     #[cfg(feature = "hybrid")]
