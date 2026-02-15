@@ -954,6 +954,7 @@ dependencies = [
  "dotenvy",
  "fastembed",
  "flate2",
+ "frankensearch-embed",
  "ftui 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "ftui-extras 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "glob",

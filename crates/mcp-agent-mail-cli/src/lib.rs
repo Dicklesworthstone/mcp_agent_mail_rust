@@ -2371,7 +2371,7 @@ fn handle_serve_http(
     no_auth: bool,
 ) -> CliResult<()> {
     let config = build_http_config(host, port, path, no_auth);
-    mcp_agent_mail_server::run_http(&config)?;
+    mcp_agent_mail_server::run_http_with_tui(&config)?;
     Ok(())
 }
 

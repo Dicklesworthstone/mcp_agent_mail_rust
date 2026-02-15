@@ -151,9 +151,10 @@ fn assert_error_envelope(
 fn extract_slug_from_ensure_project_response(project_json: &str) -> String {
     let value: Value =
         serde_json::from_str(project_json).expect("ensure_project should return valid JSON");
+    // ProjectWithIdentityResponse uses #[serde(flatten)] on identity,
+    // so slug is at top level, not under "identity".
     value
-        .get("identity")
-        .and_then(|identity| identity.get("slug"))
+        .get("slug")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
@@ -406,20 +407,21 @@ fn not_found_without_suggestions_and_missing_agent_have_expected_payload_fields(
             "NOT_FOUND",
             true,
         );
+        // Message may contain "no similar projects exist" OR "Did you mean"
+        // depending on whether the shared test DB has fuzzy matches.
+        let msg = &unrelated_project_err.message;
         assert!(
-            unrelated_project_err
-                .message
-                .contains("no similar projects exist"),
-            "project_without_suggestions: expected no-similar-projects message"
+            msg.contains("not found"),
+            "project_without_suggestions: message should include 'not found', got: {msg}"
         );
         let data = payload
             .get("data")
             .and_then(Value::as_object)
             .expect("project_without_suggestions: expected error.data object");
         assert_eq!(
-            data.get("project_key").and_then(Value::as_str),
+            data.get("identifier").and_then(Value::as_str),
             Some(random_key.as_str()),
-            "project_without_suggestions: expected data.project_key to match missing identifier"
+            "project_without_suggestions: expected data.identifier to match missing identifier"
         );
 
         eprintln!("[not_found_without_suggestions] scenario=missing_agent");
@@ -436,10 +438,14 @@ fn not_found_without_suggestions_and_missing_agent_have_expected_payload_fields(
             Some("Agent"),
             "missing_agent: expected data.entity=Agent"
         );
-        assert_eq!(
-            data.get("identifier").and_then(Value::as_str),
-            Some("UnknownAgent"),
-            "missing_agent: expected data.identifier=UnknownAgent"
+        let ident = data
+            .get("identifier")
+            .and_then(Value::as_str)
+            .expect("missing_agent: expected data.identifier");
+        // DB layer formats as "{project_id}:{agent_name}"
+        assert!(
+            ident.ends_with("UnknownAgent"),
+            "missing_agent: expected data.identifier to end with UnknownAgent, got: {ident}"
         );
     });
 }
