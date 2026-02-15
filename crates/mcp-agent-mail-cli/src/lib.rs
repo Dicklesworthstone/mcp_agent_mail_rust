@@ -485,7 +485,10 @@ pub enum SetupCommand {
         /// Project directory for project-local configs (default: cwd).
         #[arg(long)]
         project_dir: Option<PathBuf>,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
         /// Skip user-level config files (project-local only).
@@ -498,7 +501,10 @@ pub enum SetupCommand {
     /// Show current setup status: detected agents, config state.
     #[command(name = "status")]
     Status {
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
         /// Override port for status check (default: 8765).
@@ -902,6 +908,10 @@ pub enum ArchiveCommand {
     List {
         #[arg(long, short = 'n', default_value_t = 0)]
         limit: i64,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
     },
@@ -1256,7 +1266,10 @@ pub enum MailCommand {
         /// Skip LLM and return raw thread messages.
         #[arg(long)]
         no_llm: bool,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1268,17 +1281,29 @@ pub enum ProductsCommand {
         product_key: Option<String>,
         #[arg(long, short = 'n')]
         name: Option<String>,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Link {
         product_key: String,
         project: String,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Status {
         product_key: String,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1287,6 +1312,10 @@ pub enum ProductsCommand {
         query: String,
         #[arg(long, short = 'l', default_value_t = 20)]
         limit: i64,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1305,6 +1334,10 @@ pub enum ProductsCommand {
         no_bodies: bool,
         #[arg(long)]
         since_ts: Option<String>,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1316,6 +1349,10 @@ pub enum ProductsCommand {
         per_thread_limit: i64,
         #[arg(long)]
         no_llm: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1342,6 +1379,10 @@ pub enum DoctorCommand {
         project: Option<String>,
         #[arg(long, short = 'v')]
         verbose: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
     },
@@ -1355,6 +1396,10 @@ pub enum DoctorCommand {
         backup_dir: Option<PathBuf>,
     },
     Backups {
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
     },
@@ -1495,7 +1540,10 @@ pub enum MacroCommand {
         /// Max inbox messages to fetch.
         #[arg(long, default_value_t = 10)]
         inbox_limit: i32,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1538,7 +1586,10 @@ pub enum MacroCommand {
         /// Max inbox messages to fetch.
         #[arg(long, default_value_t = 10)]
         inbox_limit: i32,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1569,7 +1620,10 @@ pub enum MacroCommand {
         /// Automatically release reservations after granting.
         #[arg(long, default_value_t = false)]
         auto_release: bool,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1618,7 +1672,10 @@ pub enum MacroCommand {
         /// Task description for auto-registration.
         #[arg(long)]
         reg_task: Option<String>,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1628,7 +1685,10 @@ pub enum MacroCommand {
 pub enum ToolingCommand {
     /// List all available MCP tools with cluster and capability metadata.
     Directory {
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1637,32 +1697,47 @@ pub enum ToolingCommand {
         /// Filter to a specific tool name.
         #[arg(long)]
         tool: Option<String>,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// Show tool call counts and error rates.
     Metrics {
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// Show core system metrics (HTTP/DB/Storage/Locks).
     #[command(name = "metrics-core")]
     MetricsCore {
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// Show comprehensive diagnostic report with health metrics and recommendations.
     Diagnostics {
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// Show active archive locks.
     Locks {
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1672,7 +1747,10 @@ pub enum ToolingCommand {
         /// Proceed even if preflight checks fail.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Output as JSON.
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -1879,6 +1957,7 @@ fn handle_default_launch() -> CliResult<()> {
         host: host.clone(),
         path: "/mcp/".to_string(),
         project_dir: Some(cwd),
+        format: None,
         json: false,
         no_user_config: false,
         no_hooks: false,
@@ -2605,15 +2684,16 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
         DoctorCommand::Check {
             project,
             verbose,
+            format,
             json,
-        } => handle_doctor_check(project, verbose, json),
+        } => handle_doctor_check(project, verbose, format, json),
         DoctorCommand::Repair {
             project,
             dry_run,
             yes,
             backup_dir,
         } => handle_doctor_repair(project, dry_run, yes, backup_dir),
-        DoctorCommand::Backups { json } => handle_doctor_backups(json),
+        DoctorCommand::Backups { format, json } => handle_doctor_backups(format, json),
         DoctorCommand::Restore {
             backup_path,
             dry_run,
@@ -2907,10 +2987,12 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
             host,
             path,
             project_dir,
+            format,
             json,
             no_user_config,
             no_hooks,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let pdir = project_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let env_file = pdir.join(".env");
 
@@ -2952,7 +3034,7 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
 
             // Auto-skip hooks if agent_name is empty (hooks generate malformed commands without it)
             let no_hooks = if agent_name_val.is_empty() && !no_hooks {
-                if !json {
+                if matches!(fmt, output::CliOutputFormat::Table) {
                     output::warn(
                         "AGENT_MAIL_AGENT not set — skipping Claude Code hook installation. \
                          Set the env var or use --no-hooks to suppress this warning.",
@@ -2980,13 +3062,10 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
             };
 
             if target_agents.is_empty() {
-                if json {
-                    ftui_runtime::ftui_println!("[]");
-                } else {
-                    output::warn(
-                        "No coding agents detected. Use --agent to specify agents manually.",
-                    );
-                }
+                output::emit_empty(
+                    fmt,
+                    "No coding agents detected. Use --agent to specify agents manually.",
+                );
                 return Ok(());
             }
 
@@ -3013,12 +3092,7 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
 
             let results = setup::run_setup(&params);
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string())
-                );
-            } else {
+            output::emit_output(&results, fmt, || {
                 if dry_run {
                     output::section("Dry run — no files will be modified");
                     ftui_runtime::ftui_println!("");
@@ -3055,15 +3129,17 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 output::success(&format!(
                     "{total_actions} config files processed: {created} created, {updated} updated, {unchanged} unchanged"
                 ));
-            }
+            });
             Ok(())
         }
         SetupCommand::Status {
+            format,
             json,
             port,
             host,
             path,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let pdir = std::env::current_dir().unwrap_or_default();
 
             let params = setup::SetupParams {
@@ -3095,12 +3171,7 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 }
             }
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&statuses).unwrap_or_else(|_| "[]".to_string())
-                );
-            } else {
+            output::emit_output(&statuses, fmt, || {
                 output::section("Agent Setup Status");
                 ftui_runtime::ftui_println!("");
 
@@ -3147,7 +3218,7 @@ fn handle_setup(action: SetupCommand) -> CliResult<()> {
                     }
                 }
                 table.render();
-            }
+            });
             Ok(())
         }
     }
@@ -6783,7 +6854,12 @@ fn handle_projects(action: ProjectsCommand) -> CliResult<()> {
     }
 }
 
-fn handle_doctor_check(project: Option<String>, verbose: bool, json: bool) -> CliResult<()> {
+fn handle_doctor_check(
+    project: Option<String>,
+    verbose: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let config = Config::from_env();
     handle_doctor_check_with(
@@ -6791,6 +6867,7 @@ fn handle_doctor_check(project: Option<String>, verbose: bool, json: bool) -> Cl
         &config.storage_root,
         project,
         verbose,
+        format,
         json,
     )
 }
@@ -6838,6 +6915,7 @@ fn handle_doctor_check_with(
     storage_root: &Path,
     project: Option<String>,
     verbose: bool,
+    format: Option<output::CliOutputFormat>,
     json: bool,
 ) -> CliResult<()> {
     let mut checks: Vec<serde_json::Value> = Vec::new();
@@ -6950,17 +7028,13 @@ fn handle_doctor_check_with(
 
     // Output
     let all_ok = checks.iter().all(|c| c["status"] != "fail");
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let payload = serde_json::json!({
+        "healthy": all_ok,
+        "checks": checks,
+    });
 
-    if json {
-        let output = serde_json::json!({
-            "healthy": all_ok,
-            "checks": checks,
-        });
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
-    } else {
+    if matches!(fmt, output::CliOutputFormat::Table) {
         ftui_runtime::ftui_println!(
             "Doctor check{}:",
             project
@@ -6968,7 +7042,12 @@ fn handle_doctor_check_with(
                 .map(|p| format!(" ({p})"))
                 .unwrap_or_default()
         );
-        for c in &checks {
+        for c in payload
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
             let icon = match c["status"].as_str().unwrap_or("") {
                 "ok" => "OK",
                 "warn" => "WARN",
@@ -6992,6 +7071,8 @@ fn handle_doctor_check_with(
             ftui_runtime::ftui_println!("Some checks failed.");
             return Err(CliError::ExitCode(1));
         }
+    } else {
+        output::emit_output(&payload, fmt, || {});
     }
     Ok(())
 }
@@ -7334,8 +7415,10 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             thread_id,
             per_thread_limit,
             no_llm,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let config = mcp_agent_mail_core::config::Config::from_env();
             let server_url = format!(
                 "http://{}:{}{}",
@@ -7365,11 +7448,8 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 return Err(CliError::ExitCode(2));
             };
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                );
+            if !matches!(fmt, output::CliOutputFormat::Table) {
+                output::emit_output(&payload, fmt, || {});
                 return Ok(());
             }
 
@@ -7883,8 +7963,10 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             reserve_reason,
             reserve_ttl,
             inbox_limit,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             // Validate human_key is absolute
             if !human_key.starts_with('/') {
                 return Err(CliError::InvalidArgument(
@@ -7948,32 +8030,28 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 .await,
             )?;
 
-            if json {
-                let resp = serde_json::json!({
-                    "project": {
-                        "id": pid,
-                        "slug": proj.slug,
-                        "human_key": proj.human_key,
-                        "created_at": mcp_agent_mail_db::micros_to_iso(proj.created_at),
-                    },
-                    "agent": agent_row_to_json(&agent),
-                    "file_reservations": {
-                        "granted": reservations.iter().map(|r| serde_json::json!({
-                            "id": r.id.unwrap_or(0),
-                            "path_pattern": r.path_pattern,
-                            "exclusive": r.exclusive != 0,
-                            "reason": r.reason,
-                            "expires_ts": mcp_agent_mail_db::micros_to_iso(r.expires_ts),
-                        })).collect::<Vec<_>>(),
-                        "conflicts": [],
-                    },
-                    "inbox": inbox.iter().map(|r| inbox_row_to_json(r, false)).collect::<Vec<_>>(),
-                });
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
+            let resp = serde_json::json!({
+                "project": {
+                    "id": pid,
+                    "slug": proj.slug,
+                    "human_key": proj.human_key,
+                    "created_at": mcp_agent_mail_db::micros_to_iso(proj.created_at),
+                },
+                "agent": agent_row_to_json(&agent),
+                "file_reservations": {
+                    "granted": reservations.iter().map(|r| serde_json::json!({
+                        "id": r.id.unwrap_or(0),
+                        "path_pattern": r.path_pattern,
+                        "exclusive": r.exclusive != 0,
+                        "reason": r.reason,
+                        "expires_ts": mcp_agent_mail_db::micros_to_iso(r.expires_ts),
+                    })).collect::<Vec<_>>(),
+                    "conflicts": [],
+                },
+                "inbox": inbox.iter().map(|r| inbox_row_to_json(r, false)).collect::<Vec<_>>(),
+            });
+
+            output::emit_output(&resp, fmt, || {
                 output::success(&format!("Session started for project: {}", proj.slug));
                 output::kv("Agent", &agent.name);
                 output::kv("Program", &program);
@@ -7985,7 +8063,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     );
                 }
                 output::kv("Inbox", &format!("{} message(s)", inbox.len()));
-            }
+            });
             Ok(())
         }
 
@@ -8002,8 +8080,10 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             no_examples,
             inbox_bodies,
             inbox_limit,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let should_register = context::resolve_bool(register, no_register, true);
             let include_examples = context::resolve_bool(examples, no_examples, true);
 
@@ -8086,27 +8166,23 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 .await,
             )?;
 
-            if json {
-                let resp = serde_json::json!({
-                    "project": {
-                        "id": pid,
-                        "slug": proj.slug,
-                        "human_key": proj.human_key,
-                    },
-                    "agent": agent_row_to_json(&agent),
-                    "thread": {
-                        "thread_id": thread_id,
-                        "total_messages": total_messages,
-                        "participants": participants,
-                        "examples": example_msgs,
-                    },
-                    "inbox": inbox.iter().map(|r| inbox_row_to_json(r, inbox_bodies)).collect::<Vec<_>>(),
-                });
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
+            let resp = serde_json::json!({
+                "project": {
+                    "id": pid,
+                    "slug": proj.slug,
+                    "human_key": proj.human_key,
+                },
+                "agent": agent_row_to_json(&agent),
+                "thread": {
+                    "thread_id": thread_id,
+                    "total_messages": total_messages,
+                    "participants": participants,
+                    "examples": example_msgs,
+                },
+                "inbox": inbox.iter().map(|r| inbox_row_to_json(r, inbox_bodies)).collect::<Vec<_>>(),
+            });
+
+            output::emit_output(&resp, fmt, || {
                 output::success(&format!("Thread prepared: {thread_id}"));
                 output::kv("Agent", &agent.name);
                 output::kv("Messages", &total_messages.to_string());
@@ -8123,7 +8199,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     }
                 }
                 output::kv("Inbox", &format!("{} message(s)", inbox.len()));
-            }
+            });
             Ok(())
         }
 
@@ -8136,8 +8212,10 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             no_exclusive,
             reason,
             auto_release,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let is_exclusive = context::resolve_bool(exclusive, no_exclusive, true);
 
             if ttl < 60 {
@@ -8185,28 +8263,24 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 None
             };
 
-            if json {
-                let resp = serde_json::json!({
-                    "file_reservations": {
-                        "granted": reservations.iter().map(|r| serde_json::json!({
-                            "id": r.id.unwrap_or(0),
-                            "path_pattern": r.path_pattern,
-                            "exclusive": r.exclusive != 0,
-                            "reason": r.reason,
-                            "expires_ts": mcp_agent_mail_db::micros_to_iso(r.expires_ts),
-                        })).collect::<Vec<_>>(),
-                        "conflicts": [],
-                    },
-                    "released": released.map(|n| serde_json::json!({
-                        "released": n,
-                        "released_at": mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::timestamps::now_micros()),
-                    })),
-                });
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
+            let resp = serde_json::json!({
+                "file_reservations": {
+                    "granted": reservations.iter().map(|r| serde_json::json!({
+                        "id": r.id.unwrap_or(0),
+                        "path_pattern": r.path_pattern,
+                        "exclusive": r.exclusive != 0,
+                        "reason": r.reason,
+                        "expires_ts": mcp_agent_mail_db::micros_to_iso(r.expires_ts),
+                    })).collect::<Vec<_>>(),
+                    "conflicts": [],
+                },
+                "released": released.map(|n| serde_json::json!({
+                    "released": n,
+                    "released_at": mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::timestamps::now_micros()),
+                })),
+            });
+
+            output::emit_output(&resp, fmt, || {
                 output::success(&format!(
                     "{} reservation(s) granted for {}",
                     reservations.len(),
@@ -8226,7 +8300,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 if let Some(n) = released {
                     output::kv("Released", &n.to_string());
                 }
-            }
+            });
             Ok(())
         }
 
@@ -8245,8 +8319,10 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             reg_program,
             reg_model,
             reg_task,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
@@ -8351,22 +8427,18 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 None
             };
 
-            if json {
-                let resp = serde_json::json!({
-                    "request": {
-                        "from": from,
-                        "from_project": proj.slug,
-                        "to": to,
-                        "to_project": target_proj_slug,
-                    },
-                    "response": response_val,
-                    "welcome_message": welcome_val,
-                });
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
+            let resp = serde_json::json!({
+                "request": {
+                    "from": from,
+                    "from_project": proj.slug,
+                    "to": to,
+                    "to_project": target_proj_slug,
+                },
+                "response": response_val,
+                "welcome_message": welcome_val,
+            });
+
+            output::emit_output(&resp, fmt, || {
                 output::success(&format!("Contact handshake: {from} → {to}"));
                 if auto_accept {
                     output::kv("Status", "approved");
@@ -8376,7 +8448,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 if welcome_val.is_some() {
                     output::kv("Welcome", "sent");
                 }
-            }
+            });
             Ok(())
         }
     }
@@ -10318,7 +10390,7 @@ mod tests {
             Cli::try_parse_from(["am", "archive", "list"]).expect("failed to parse archive list");
         match cli.command.expect("expected command") {
             Commands::Archive {
-                action: ArchiveCommand::List { limit, json },
+                action: ArchiveCommand::List { limit, json, .. },
             } => {
                 assert_eq!(limit, 0);
                 assert!(!json);
@@ -10333,10 +10405,25 @@ mod tests {
             .expect("failed to parse archive list flags");
         match cli.command.expect("expected command") {
             Commands::Archive {
-                action: ArchiveCommand::List { limit, json },
+                action: ArchiveCommand::List { limit, json, .. },
             } => {
                 assert_eq!(limit, 5);
                 assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_archive_list_format_toon() {
+        let cli = Cli::try_parse_from(["am", "archive", "list", "--format", "toon"])
+            .expect("failed to parse archive list format");
+        match cli.command.expect("expected command") {
+            Commands::Archive {
+                action: ArchiveCommand::List { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -10386,6 +10473,7 @@ mod tests {
                         query,
                         limit,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(product_key, "prod-1");
@@ -10427,6 +10515,7 @@ mod tests {
                         no_bodies,
                         since_ts,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(product_key, "prod-1");
@@ -10911,6 +11000,7 @@ mod tests {
             let capture = StdioCapture::install().unwrap();
             handle_archive(ArchiveCommand::List {
                 limit: 0,
+                format: None,
                 json: true,
             })
             .unwrap();
@@ -11451,6 +11541,7 @@ mod tests {
             ProductsCommand::Ensure {
                 product_key: Some("abcdef1234".to_string()),
                 name: Some("My   Product".to_string()),
+                format: None,
                 json: true,
             },
         );
@@ -11489,6 +11580,7 @@ mod tests {
             ProductsCommand::Ensure {
                 product_key: Some("abcdef1234".to_string()),
                 name: None,
+                format: None,
                 json: true,
             },
         );
@@ -11508,6 +11600,7 @@ mod tests {
             ProductsCommand::Link {
                 product_key: "abcdef1234".to_string(),
                 project: proj_alpha_key.clone(),
+                format: None,
                 json: false,
             },
         )
@@ -11520,6 +11613,7 @@ mod tests {
             ProductsCommand::Link {
                 product_key: "abcdef1234".to_string(),
                 project: proj_beta_key.clone(),
+                format: None,
                 json: false,
             },
         )
@@ -11533,6 +11627,7 @@ mod tests {
             &pool,
             ProductsCommand::Status {
                 product_key: "abcdef1234".to_string(),
+                format: None,
                 json: true,
             },
         );
@@ -11557,6 +11652,7 @@ mod tests {
                 product_key: "abcdef1234".to_string(),
                 query: "unicorn".to_string(),
                 limit: 20,
+                format: None,
                 json: true,
             },
         );
@@ -11581,6 +11677,7 @@ mod tests {
                 include_bodies: false,
                 no_bodies: false,
                 since_ts: None,
+                format: None,
                 json: true,
             },
         );
@@ -11607,6 +11704,7 @@ mod tests {
                 include_bodies: false,
                 no_bodies: false,
                 since_ts: None,
+                format: None,
                 json: true,
             },
         );
@@ -11626,6 +11724,7 @@ mod tests {
                 thread_id: "thread-1".to_string(),
                 per_thread_limit: 50,
                 no_llm: true,
+                format: None,
                 json: false,
             },
         );
@@ -11970,11 +12069,13 @@ mod tests {
                     DoctorCommand::Check {
                         project,
                         verbose,
+                        format,
                         json,
                     },
             } => {
                 assert!(project.is_none());
                 assert!(!verbose);
+                assert!(format.is_none());
                 assert!(!json);
             }
             _ => panic!("expected Doctor Check"),
@@ -11991,14 +12092,30 @@ mod tests {
                     DoctorCommand::Check {
                         project,
                         verbose,
+                        format,
                         json,
                     },
             } => {
                 assert_eq!(project.as_deref(), Some("my-proj"));
                 assert!(verbose);
+                assert!(format.is_none());
                 assert!(json);
             }
             _ => panic!("expected Doctor Check"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_check_format_toon() {
+        let cli = Cli::try_parse_from(["am", "doctor", "check", "--format", "toon"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Doctor {
+                action: DoctorCommand::Check { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected Doctor Check, got {other:?}"),
         }
     }
 
@@ -12061,8 +12178,11 @@ mod tests {
         let cli = Cli::try_parse_from(["am", "doctor", "backups"]).unwrap();
         match cli.command.expect("expected command") {
             Commands::Doctor {
-                action: DoctorCommand::Backups { json },
-            } => assert!(!json),
+                action: DoctorCommand::Backups { format, json },
+            } => {
+                assert!(format.is_none());
+                assert!(!json);
+            }
             _ => panic!("expected Doctor Backups"),
         }
     }
@@ -12072,8 +12192,11 @@ mod tests {
         let cli = Cli::try_parse_from(["am", "doctor", "backups", "--json"]).unwrap();
         match cli.command.expect("expected command") {
             Commands::Doctor {
-                action: DoctorCommand::Backups { json },
-            } => assert!(json),
+                action: DoctorCommand::Backups { format, json },
+            } => {
+                assert!(format.is_none());
+                assert!(json);
+            }
             _ => panic!("expected Doctor Backups"),
         }
     }
@@ -13031,6 +13154,7 @@ mod tests {
                         thread_id,
                         per_thread_limit,
                         no_llm,
+                        format,
                         json,
                     },
             } => {
@@ -13038,6 +13162,7 @@ mod tests {
                 assert_eq!(thread_id, "thread-42");
                 assert_eq!(per_thread_limit, 50);
                 assert!(!no_llm);
+                assert!(format.is_none());
                 assert!(!json);
             }
             other => panic!("expected Mail SummarizeThread, got {other:?}"),
@@ -13072,6 +13197,30 @@ mod tests {
                 assert_eq!(per_thread_limit, 10);
                 assert!(no_llm);
                 assert!(json);
+            }
+            other => panic!("expected Mail SummarizeThread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_mail_summarize_thread_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "summarize-thread",
+            "-p",
+            "proj",
+            "t-1",
+            "--format",
+            "toon",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Mail {
+                action: MailCommand::SummarizeThread { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
             }
             other => panic!("expected Mail SummarizeThread, got {other:?}"),
         }
@@ -13166,11 +13315,13 @@ mod tests {
                     ProductsCommand::Ensure {
                         product_key,
                         name,
+                        format,
                         json,
                     },
             } => {
                 assert!(product_key.is_none());
                 assert!(name.is_none());
+                assert!(format.is_none());
                 assert!(!json);
             }
             other => panic!("expected Products Ensure, got {other:?}"),
@@ -13195,11 +13346,13 @@ mod tests {
                     ProductsCommand::Ensure {
                         product_key,
                         name,
+                        format,
                         json,
                     },
             } => {
                 assert_eq!(product_key, Some("pk-1".to_string()));
                 assert_eq!(name, Some("MyProduct".to_string()));
+                assert!(format.is_none());
                 assert!(json);
             }
             other => panic!("expected Products Ensure, got {other:?}"),
@@ -13216,11 +13369,13 @@ mod tests {
                     ProductsCommand::Link {
                         product_key,
                         project,
+                        format,
                         json,
                     },
             } => {
                 assert_eq!(product_key, "pk-1");
                 assert_eq!(project, "proj-1");
+                assert!(format.is_none());
                 assert!(json);
             }
             other => panic!("expected Products Link, got {other:?}"),
@@ -13232,12 +13387,47 @@ mod tests {
         let cli = Cli::try_parse_from(["am", "products", "status", "pk-1"]).unwrap();
         match cli.command.expect("expected command") {
             Commands::Products {
-                action: ProductsCommand::Status { product_key, json },
+                action:
+                    ProductsCommand::Status {
+                        product_key,
+                        format,
+                        json,
+                    },
             } => {
                 assert_eq!(product_key, "pk-1");
+                assert!(format.is_none());
                 assert!(!json); // default
             }
             other => panic!("expected Products Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_products_status_format_toon() {
+        let cli =
+            Cli::try_parse_from(["am", "products", "status", "pk-1", "--format", "toon"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Products {
+                action: ProductsCommand::Status { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected Products Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_tooling_directory_format_toon() {
+        let cli = Cli::try_parse_from(["am", "tooling", "directory", "--format", "toon"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Tooling {
+                action: ToolingCommand::Directory { format, json },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("expected Tooling Directory, got {other:?}"),
         }
     }
 
@@ -13253,6 +13443,7 @@ mod tests {
                         thread_id,
                         per_thread_limit,
                         no_llm,
+                        format,
                         json,
                     },
             } => {
@@ -13260,6 +13451,7 @@ mod tests {
                 assert_eq!(thread_id, "thread-abc");
                 assert_eq!(per_thread_limit, 50); // default
                 assert!(!no_llm);
+                assert!(format.is_none());
                 assert!(!json);
             }
             other => panic!("expected Products SummarizeThread, got {other:?}"),
@@ -13784,7 +13976,7 @@ mod tests {
 
         // Doctor check should succeed on a fresh DB
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, true);
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "doctor check failed: {result:?}");
@@ -13805,7 +13997,7 @@ mod tests {
         handle_migrate_with_database_url(&db_url).expect("migrate");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, true);
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
         let output = capture.drain_to_string();
         assert!(result.is_ok(), "doctor check failed: {result:?}");
 
@@ -13829,7 +14021,7 @@ mod tests {
         handle_migrate_with_database_url(&db_url).expect("migrate");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, true);
+        let result = handle_doctor_check_with(&db_url, dir.path(), None, false, None, true);
         let output = capture.drain_to_string();
         assert!(result.is_ok(), "doctor check failed: {result:?}");
 
@@ -13924,6 +14116,21 @@ mod tests {
     }
 
     #[test]
+    fn clap_parses_beads_ready_format_toon() {
+        let cli = Cli::try_parse_from(["am", "beads", "ready", "--format", "toon"])
+            .expect("failed to parse beads ready");
+        match cli.command.expect("expected command") {
+            Commands::Beads {
+                action: BeadsCommand::Ready { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_parses_beads_list_with_status_filter() {
         let cli =
             Cli::try_parse_from(["am", "beads", "list", "--status", "open", "--priority", "2"])
@@ -13979,6 +14186,35 @@ mod tests {
             } => {
                 assert_eq!(only.as_deref(), Some("claude,codex"));
                 assert!(include_undetected);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_agents_list_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "agents",
+            "list",
+            "--project",
+            "my-proj",
+            "--format",
+            "toon",
+        ])
+        .expect("failed to parse agents list");
+        match cli.command.expect("expected command") {
+            Commands::Agents {
+                action:
+                    AgentsCommand::List {
+                        project_key,
+                        format,
+                        json,
+                    },
+            } => {
+                assert_eq!(project_key, "my-proj");
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -14045,7 +14281,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_backups_with_storage_root(dir.path(), true);
+        let result = handle_doctor_backups_with_storage_root(dir.path(), None, true);
         let output = capture.drain_to_string();
 
         assert!(result.is_ok(), "doctor backups --json failed: {result:?}");
@@ -15180,6 +15416,7 @@ mod tests {
                         reserve_ttl,
                         inbox_limit,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(human_key, "/tmp/proj");
@@ -15192,6 +15429,33 @@ mod tests {
                 assert_eq!(reserve_ttl, 7200);
                 assert_eq!(inbox_limit, 25);
                 assert!(json);
+            }
+            other => panic!("expected Macros StartSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_macros_start_session_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "macros",
+            "start-session",
+            "-p",
+            "/tmp/proj",
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5",
+            "--format",
+            "toon",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Macros {
+                action: MacroCommand::StartSession { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
             }
             other => panic!("expected Macros StartSession, got {other:?}"),
         }
@@ -15482,6 +15746,7 @@ mod tests {
                         reg_model,
                         reg_task,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(project_key, "/tmp/proj");
@@ -15719,6 +15984,23 @@ mod tests {
                 action: ContactsCommand::ListContacts { format, json, .. },
             } => {
                 assert!(format.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected contacts list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_contacts_list_format_toon() {
+        let cli = Cli::try_parse_from([
+            "am", "contacts", "list", "-p", "proj", "-a", "BlueLake", "--format", "toon",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::Contacts {
+                action: ContactsCommand::ListContacts { format, json, .. },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
                 assert!(!json);
             }
             other => panic!("expected contacts list, got {other:?}"),
@@ -18204,7 +18486,11 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                 archive_save_state(&source_db, &storage_root, projects, scrub_preset, label)?;
             Ok(())
         }
-        ArchiveCommand::List { limit, json } => {
+        ArchiveCommand::List {
+            limit,
+            format,
+            json,
+        } => {
             #[derive(Debug, Serialize)]
             struct ArchiveListEntry {
                 file: String,
@@ -18216,6 +18502,7 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                 #[serde(skip_serializing_if = "Option::is_none")]
                 error: Option<String>,
             }
+            let fmt = output::CliOutputFormat::resolve(format, json);
 
             if limit < 0 {
                 return Err(CliError::InvalidArgument(
@@ -18225,14 +18512,13 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
 
             let archive_dir = archive_states_dir(false)?;
             if !archive_dir.exists() {
-                if json {
-                    ftui_runtime::ftui_println!("[]");
-                } else {
-                    ftui_runtime::ftui_println!(
+                output::emit_empty(
+                    fmt,
+                    &format!(
                         "Archive directory {} does not exist yet.",
                         archive_dir.display()
-                    );
-                }
+                    ),
+                );
                 return Ok(());
             }
 
@@ -18251,14 +18537,13 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
 
             if files.is_empty() {
-                if json {
-                    ftui_runtime::ftui_println!("[]");
-                } else {
-                    ftui_runtime::ftui_println!(
+                output::emit_empty(
+                    fmt,
+                    &format!(
                         "No saved mailbox states found under {}.",
                         archive_dir.display()
-                    );
-                }
+                    ),
+                );
                 return Ok(());
             }
 
@@ -18313,38 +18598,32 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                 });
             }
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
-                );
-                return Ok(());
-            }
-
-            ftui_runtime::ftui_println!(
-                "{:<32} {:<25} {:>10} {:<9} {:<20} {}",
-                "File",
-                "Created (UTC)",
-                "Size",
-                "Preset",
-                "Projects",
-                "Notes"
-            );
-            for entry in &entries {
+            output::emit_output(&entries, fmt, || {
                 ftui_runtime::ftui_println!(
                     "{:<32} {:<25} {:>10} {:<9} {:<20} {}",
-                    &entry.file[..entry.file.len().min(32)],
-                    &entry.created_at[..entry.created_at.len().min(25)],
-                    format_bytes(entry.size_bytes),
-                    entry.scrub_preset,
-                    entry.projects.join(", "),
-                    entry.error.clone().unwrap_or_default()
+                    "File",
+                    "Created (UTC)",
+                    "Size",
+                    "Preset",
+                    "Projects",
+                    "Notes"
                 );
-            }
-            ftui_runtime::ftui_println!(
-                "Archives live under {}. Restore with `am archive restore <file>`.",
-                archive_dir.display()
-            );
+                for entry in &entries {
+                    ftui_runtime::ftui_println!(
+                        "{:<32} {:<25} {:>10} {:<9} {:<20} {}",
+                        &entry.file[..entry.file.len().min(32)],
+                        &entry.created_at[..entry.created_at.len().min(25)],
+                        format_bytes(entry.size_bytes),
+                        entry.scrub_preset,
+                        entry.projects.join(", "),
+                        entry.error.clone().unwrap_or_default()
+                    );
+                }
+                ftui_runtime::ftui_println!(
+                    "Archives live under {}. Restore with `am archive restore <file>`.",
+                    archive_dir.display()
+                );
+            });
             Ok(())
         }
         ArchiveCommand::Restore {
@@ -18490,20 +18769,21 @@ fn handle_doctor_repair(
     Ok(())
 }
 
-fn handle_doctor_backups(json: bool) -> CliResult<()> {
+fn handle_doctor_backups(format: Option<output::CliOutputFormat>, json: bool) -> CliResult<()> {
     let config = Config::from_env();
-    handle_doctor_backups_with_storage_root(&config.storage_root, json)
+    handle_doctor_backups_with_storage_root(&config.storage_root, format, json)
 }
 
-fn handle_doctor_backups_with_storage_root(storage_root: &Path, json: bool) -> CliResult<()> {
+fn handle_doctor_backups_with_storage_root(
+    storage_root: &Path,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
     let backup_dir = storage_root.join("backups");
+    let fmt = output::CliOutputFormat::resolve(format, json);
 
     if !backup_dir.exists() {
-        if json {
-            ftui_runtime::ftui_println!("[]");
-        } else {
-            ftui_runtime::ftui_println!("No backups found.");
-        }
+        output::emit_empty(fmt, "No backups found.");
         return Ok(());
     }
 
@@ -18524,23 +18804,22 @@ fn handle_doctor_backups_with_storage_root(storage_root: &Path, json: bool) -> C
     }
     backups.sort_by_key(|x| std::cmp::Reverse(x.2));
 
-    if json {
-        let arr: Vec<serde_json::Value> = backups
-            .iter()
-            .map(|(name, size, _)| serde_json::json!({"name": name, "size": size}))
-            .collect();
-        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
-    } else {
+    let arr: Vec<serde_json::Value> = backups
+        .iter()
+        .map(|(name, size, _)| serde_json::json!({"name": name, "size": size}))
+        .collect();
+
+    output::emit_output(&arr, fmt, || {
         if backups.is_empty() {
-            output::empty_result(false, "No backups found.");
-            return Ok(());
+            output::emit_empty(fmt, "No backups found.");
+            return;
         }
         let mut table = output::CliTable::new(vec!["BACKUP", "SIZE"]);
         for (name, size, _) in &backups {
             table.add_row(vec![name.clone(), format_bytes(*size)]);
         }
         table.render();
-    }
+    });
     Ok(())
 }
 
@@ -19433,8 +19712,10 @@ async fn handle_products_with(
         ProductsCommand::Ensure {
             product_key,
             name,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let key_raw = product_key
                 .as_deref()
                 .or(name.as_deref())
@@ -19483,49 +19764,45 @@ async fn handle_products_with(
                 })
             };
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                );
-                return Ok(());
-            }
-
-            let created_at = payload
-                .get("created_at")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let rows = vec![
-                vec![
-                    "id".to_string(),
-                    payload.get("id").cloned().unwrap_or_default().to_string(),
-                ],
-                vec![
-                    "product_uid".to_string(),
-                    payload
-                        .get("product_uid")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ],
-                vec![
-                    "name".to_string(),
-                    payload
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ],
-                vec!["created_at".to_string(), created_at.to_string()],
-            ];
-            print_table(Some("Product"), &["Field", "Value"], rows);
+            output::emit_output(&payload, fmt, || {
+                let created_at = payload
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let rows = vec![
+                    vec![
+                        "id".to_string(),
+                        payload.get("id").cloned().unwrap_or_default().to_string(),
+                    ],
+                    vec![
+                        "product_uid".to_string(),
+                        payload
+                            .get("product_uid")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ],
+                    vec![
+                        "name".to_string(),
+                        payload
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ],
+                    vec!["created_at".to_string(), created_at.to_string()],
+                ];
+                print_table(Some("Product"), &["Field", "Value"], rows);
+            });
             Ok(())
         }
         ProductsCommand::Link {
             product_key,
             project,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let prod = get_product_by_key(cx, pool, product_key.trim())
                 .await?
                 .ok_or_else(|| CliError::Other(format!("Product '{product_key}' not found")))?;
@@ -19556,32 +19833,31 @@ async fn handle_products_with(
                 "project_slug": proj.slug,
             });
 
-            if json {
+            output::emit_output(&payload, fmt, || {
                 ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    "Linked project '{}' into product '{}' ({}).",
+                    payload
+                        .get("project_slug")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    payload
+                        .get("product_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    payload
+                        .get("product_uid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
                 );
-                return Ok(());
-            }
-
-            ftui_runtime::ftui_println!(
-                "Linked project '{}' into product '{}' ({}).",
-                payload
-                    .get("project_slug")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
-                payload
-                    .get("product_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
-                payload
-                    .get("product_uid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
-            );
+            });
             Ok(())
         }
-        ProductsCommand::Status { product_key, json } => {
+        ProductsCommand::Status {
+            product_key,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let prod = get_product_by_key(cx, pool, product_key.trim())
                 .await?
                 .ok_or_else(|| {
@@ -19617,95 +19893,86 @@ async fn handle_products_with(
                 })).collect::<Vec<_>>(),
             });
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                );
-                return Ok(());
-            }
+            output::emit_output(&payload, fmt, || {
+                let prod_title = payload
+                    .get("product")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|n| format!("Product: {n}"))
+                    .unwrap_or_else(|| "Product".to_string());
 
-            let prod_title = payload
-                .get("product")
-                .and_then(|p| p.get("name"))
-                .and_then(|v| v.as_str())
-                .map(|n| format!("Product: {n}"))
-                .unwrap_or_else(|| "Product".to_string());
-
-            let p = payload.get("product").cloned().unwrap_or_default();
-            let rows = vec![
-                vec![
-                    "id".to_string(),
-                    p.get("id").cloned().unwrap_or_default().to_string(),
-                ],
-                vec![
-                    "product_uid".to_string(),
-                    p.get("product_uid")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ],
-                vec![
-                    "name".to_string(),
-                    p.get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ],
-                vec![
-                    "created_at".to_string(),
-                    p.get("created_at")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ],
-            ];
-            print_table(Some(&prod_title), &["Field", "Value"], rows);
-            ftui_runtime::ftui_println!();
-
-            let proj_rows = payload
-                .get("projects")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| {
+                let p = payload.get("product").cloned().unwrap_or_default();
+                let rows = vec![
                     vec![
+                        "id".to_string(),
                         p.get("id").cloned().unwrap_or_default().to_string(),
-                        p.get("slug")
+                    ],
+                    vec![
+                        "product_uid".to_string(),
+                        p.get("product_uid")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        p.get("human_key")
+                    ],
+                    vec![
+                        "name".to_string(),
+                        p.get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            print_table(
-                Some("Linked Projects"),
-                &["id", "slug", "human_key"],
-                proj_rows,
-            );
+                    ],
+                    vec![
+                        "created_at".to_string(),
+                        p.get("created_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ],
+                ];
+                print_table(Some(&prod_title), &["Field", "Value"], rows);
+                ftui_runtime::ftui_println!();
+
+                let proj_rows = payload
+                    .get("projects")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| {
+                        vec![
+                            p.get("id").cloned().unwrap_or_default().to_string(),
+                            p.get("slug")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            p.get("human_key")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(
+                    Some("Linked Projects"),
+                    &["id", "slug", "human_key"],
+                    proj_rows,
+                );
+            });
             Ok(())
         }
         ProductsCommand::Search {
             product_key,
             query,
             limit,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let Some(sanitized) = mcp_agent_mail_db::queries::sanitize_fts_query(&query) else {
-                if json {
-                    let payload = serde_json::json!({ "result": [] });
-                    ftui_runtime::ftui_println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_default()
-                    );
-                } else {
-                    ftui_runtime::ftui_println!("Query '{query}' cannot produce search results.");
-                }
+                output::emit_empty(
+                    fmt,
+                    &format!("Query '{query}' cannot produce search results."),
+                );
                 return Ok(());
             };
 
@@ -19731,15 +19998,7 @@ async fn handle_products_with(
                 };
             let project_ids = projects.iter().filter_map(|p| p.id).collect::<Vec<_>>();
             if project_ids.is_empty() {
-                if json {
-                    let payload = serde_json::json!({ "result": [] });
-                    ftui_runtime::ftui_println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_default()
-                    );
-                } else {
-                    ftui_runtime::ftui_println!("No results.");
-                }
+                output::emit_empty(fmt, "No results.");
                 return Ok(());
             }
 
@@ -19831,58 +20090,44 @@ async fn handle_products_with(
             }
 
             if out.is_empty() {
-                if json {
-                    let payload = serde_json::json!({ "result": [] });
-                    ftui_runtime::ftui_println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_default()
-                    );
-                } else {
-                    ftui_runtime::ftui_println!("No results.");
-                }
+                output::emit_empty(fmt, "No results.");
                 return Ok(());
             }
 
             let payload = serde_json::json!({ "result": out });
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+            output::emit_output(&payload, fmt, || {
+                let title = format!("Product search: '{query}'");
+                let rows = payload
+                    .get("result")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| {
+                        vec![
+                            r.get("project_id").cloned().unwrap_or_default().to_string(),
+                            r.get("id").cloned().unwrap_or_default().to_string(),
+                            r.get("subject")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            r.get("from")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            r.get("created_ts")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(
+                    Some(&title),
+                    &["project_id", "id", "subject", "from", "created_ts"],
+                    rows,
                 );
-                return Ok(());
-            }
-
-            let title = format!("Product search: '{query}'");
-            let rows = payload
-                .get("result")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| {
-                    vec![
-                        r.get("project_id").cloned().unwrap_or_default().to_string(),
-                        r.get("id").cloned().unwrap_or_default().to_string(),
-                        r.get("subject")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        r.get("from")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        r.get("created_ts")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            print_table(
-                Some(&title),
-                &["project_id", "id", "subject", "from", "created_ts"],
-                rows,
-            );
+            });
             Ok(())
         }
         ProductsCommand::Inbox {
@@ -19894,8 +20139,10 @@ async fn handle_products_with(
             include_bodies,
             no_bodies,
             since_ts,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let urgent_only = resolve_bool(urgent_only, all, false);
             let include_bodies = resolve_bool(include_bodies, no_bodies, false);
 
@@ -20023,60 +20270,50 @@ async fn handle_products_with(
             }
 
             if items.is_empty() {
-                if json {
-                    ftui_runtime::ftui_println!("[]");
-                } else {
-                    ftui_runtime::ftui_println!("No messages found.");
-                }
+                output::emit_empty(fmt, "No messages found.");
                 return Ok(());
             }
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&items).unwrap_or_default()
+            output::emit_output(&items, fmt, || {
+                let title = format!("Inbox for {agent} in product '{product_key}'");
+                let rows = items
+                    .iter()
+                    .map(|r| {
+                        vec![
+                            r.get("project_id").cloned().unwrap_or_default().to_string(),
+                            r.get("id").cloned().unwrap_or_default().to_string(),
+                            r.get("subject")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            r.get("from")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            r.get("importance")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            r.get("created_ts")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(
+                    Some(&title),
+                    &[
+                        "project_id",
+                        "id",
+                        "subject",
+                        "from",
+                        "importance",
+                        "created_ts",
+                    ],
+                    rows,
                 );
-                return Ok(());
-            }
-
-            let title = format!("Inbox for {agent} in product '{product_key}'");
-            let rows = items
-                .iter()
-                .map(|r| {
-                    vec![
-                        r.get("project_id").cloned().unwrap_or_default().to_string(),
-                        r.get("id").cloned().unwrap_or_default().to_string(),
-                        r.get("subject")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        r.get("from")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        r.get("importance")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        r.get("created_ts")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            print_table(
-                Some(&title),
-                &[
-                    "project_id",
-                    "id",
-                    "subject",
-                    "from",
-                    "importance",
-                    "created_ts",
-                ],
-                rows,
-            );
+            });
             Ok(())
         }
         ProductsCommand::SummarizeThread {
@@ -20084,8 +20321,10 @@ async fn handle_products_with(
             thread_id,
             per_thread_limit,
             no_llm,
+            format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
             let server_result = if let Some(url) = server_url {
                 try_call_server_tool(
                     url,
@@ -20112,11 +20351,8 @@ async fn handle_products_with(
                 return Err(CliError::ExitCode(2));
             };
 
-            if json {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                );
+            if !matches!(fmt, output::CliOutputFormat::Table) {
+                output::emit_output(&payload, fmt, || {});
                 return Ok(());
             }
 
@@ -20874,7 +21110,12 @@ fn query_existing_search_fts_triggers(
         .collect())
 }
 
-fn handle_tooling_decommission_fts(force: bool, json_mode: bool) -> CliResult<()> {
+fn handle_tooling_decommission_fts(
+    force: bool,
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let config = Config::from_env();
     let search_index_path = std::path::Path::new(&config.storage_root).join("search_index");
     let engine = config.search_rollout.engine.to_string();
@@ -20973,11 +21214,7 @@ fn handle_tooling_decommission_fts(force: bool, json_mode: bool) -> CliResult<()
         action: action.to_string(),
     };
 
-    if json_mode {
-        let payload = serde_json::to_string_pretty(&report)
-            .map_err(|e| CliError::Other(format!("failed to serialize report: {e}")))?;
-        ftui_runtime::ftui_println!("{payload}");
-    } else {
+    output::emit_output(&report, fmt, || {
         output::section("FTS Decommission Report:");
         output::kv("Action", &report.action);
         output::kv(
@@ -21037,7 +21274,7 @@ fn handle_tooling_decommission_fts(force: bool, json_mode: bool) -> CliResult<()
                 ftui_runtime::ftui_println!("  - {warning}");
             }
         }
-    }
+    });
 
     if report.blocked {
         return Err(CliError::ExitCode(2));
@@ -21047,36 +21284,42 @@ fn handle_tooling_decommission_fts(force: bool, json_mode: bool) -> CliResult<()
 
 fn handle_tooling(action: ToolingCommand) -> CliResult<()> {
     match action {
-        ToolingCommand::Directory { json } => handle_tooling_directory(json),
-        ToolingCommand::Schemas { tool, json } => handle_tooling_schemas(tool, json),
-        ToolingCommand::Metrics { json } => handle_tooling_metrics(json),
-        ToolingCommand::MetricsCore { json } => handle_tooling_metrics_core(json),
-        ToolingCommand::Diagnostics { json } => handle_tooling_diagnostics(json),
-        ToolingCommand::Locks { json } => handle_tooling_locks(json),
-        ToolingCommand::DecommissionFts { force, json } => {
-            handle_tooling_decommission_fts(force, json)
+        ToolingCommand::Directory { format, json } => handle_tooling_directory(format, json),
+        ToolingCommand::Schemas { tool, format, json } => {
+            handle_tooling_schemas(tool, format, json)
         }
+        ToolingCommand::Metrics { format, json } => handle_tooling_metrics(format, json),
+        ToolingCommand::MetricsCore { format, json } => handle_tooling_metrics_core(format, json),
+        ToolingCommand::Diagnostics { format, json } => handle_tooling_diagnostics(format, json),
+        ToolingCommand::Locks { format, json } => handle_tooling_locks(format, json),
+        ToolingCommand::DecommissionFts {
+            force,
+            format,
+            json,
+        } => handle_tooling_decommission_fts(force, format, json),
     }
 }
 
-fn handle_tooling_directory(json_mode: bool) -> CliResult<()> {
+fn handle_tooling_directory(
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let cluster_map = mcp_agent_mail_tools::TOOL_CLUSTER_MAP;
+    let mut clusters: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for &(tool, cluster) in cluster_map {
+        clusters
+            .entry(cluster.to_string())
+            .or_default()
+            .push(tool.to_string());
+    }
+    let val = serde_json::json!({
+        "tool_count": cluster_map.len(),
+        "clusters": clusters,
+    });
 
-    if json_mode {
-        let mut clusters: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        for &(tool, cluster) in cluster_map {
-            clusters
-                .entry(cluster.to_string())
-                .or_default()
-                .push(tool.to_string());
-        }
-        let val = serde_json::json!({
-            "tool_count": cluster_map.len(),
-            "clusters": clusters,
-        });
-        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
-    } else {
+    output::emit_output(&val, fmt, || {
         output::section("Tool Directory:");
         output::kv("Total tools", &cluster_map.len().to_string());
         ftui_runtime::ftui_println!("");
@@ -21086,11 +21329,16 @@ fn handle_tooling_directory(json_mode: bool) -> CliResult<()> {
             table.add_row(vec![tool.to_string(), cluster.to_string()]);
         }
         table.render();
-    }
+    });
     Ok(())
 }
 
-fn handle_tooling_schemas(filter_tool: Option<String>, json_mode: bool) -> CliResult<()> {
+fn handle_tooling_schemas(
+    filter_tool: Option<String>,
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let cluster_map = mcp_agent_mail_tools::TOOL_CLUSTER_MAP;
 
     let mut tools: std::collections::BTreeMap<String, serde_json::Value> =
@@ -21113,20 +21361,19 @@ fn handle_tooling_schemas(filter_tool: Option<String>, json_mode: bool) -> CliRe
         );
     }
 
-    if json_mode {
-        let val = serde_json::json!({
-            "tool_count": tools.len(),
-            "tools": tools,
-        });
-        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
-    } else {
+    let val = serde_json::json!({
+        "tool_count": tools.len(),
+        "tools": tools.clone(),
+    });
+
+    output::emit_output(&val, fmt, || {
         if tools.is_empty() {
             if let Some(ref name) = filter_tool {
-                output::empty_result(false, &format!("Tool not found: {name}"));
+                output::emit_empty(fmt, &format!("Tool not found: {name}"));
             } else {
-                output::empty_result(false, "No tools available.");
+                output::emit_empty(fmt, "No tools available.");
             }
-            return Ok(());
+            return;
         }
 
         output::section("Tool Schemas:");
@@ -21154,45 +21401,47 @@ fn handle_tooling_schemas(filter_tool: Option<String>, json_mode: bool) -> CliRe
             ]);
         }
         table.render();
-    }
+    });
     Ok(())
 }
 
-fn handle_tooling_metrics(json_mode: bool) -> CliResult<()> {
+fn handle_tooling_metrics(
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let snapshot = mcp_agent_mail_tools::tool_metrics_snapshot_full();
     let health = mcp_agent_mail_core::cached_health_level().to_string();
-
-    if json_mode {
-        let entries: Vec<serde_json::Value> = snapshot
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "name": e.name,
-                    "calls": e.calls,
-                    "errors": e.errors,
-                    "cluster": e.cluster,
-                    "latency": {
-                        "p50_ms": e.latency.as_ref().map(|l| l.p50_ms),
-                        "p95_ms": e.latency.as_ref().map(|l| l.p95_ms),
-                        "p99_ms": e.latency.as_ref().map(|l| l.p99_ms),
-                    },
-                })
+    let entries: Vec<serde_json::Value> = snapshot
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name,
+                "calls": e.calls,
+                "errors": e.errors,
+                "cluster": e.cluster,
+                "latency": {
+                    "p50_ms": e.latency.as_ref().map(|l| l.p50_ms),
+                    "p95_ms": e.latency.as_ref().map(|l| l.p95_ms),
+                    "p99_ms": e.latency.as_ref().map(|l| l.p99_ms),
+                },
             })
-            .collect();
-        let val = serde_json::json!({
-            "health_level": health,
-            "tool_count": entries.len(),
-            "tools": entries,
-        });
-        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
-    } else {
+        })
+        .collect();
+    let val = serde_json::json!({
+        "health_level": health,
+        "tool_count": entries.len(),
+        "tools": entries,
+    });
+
+    output::emit_output(&val, fmt, || {
         output::section("Tool Metrics:");
         output::kv("Health level", &health);
         ftui_runtime::ftui_println!("");
 
         if snapshot.is_empty() {
             ftui_runtime::ftui_println!("  No tool metrics recorded yet.");
-            return Ok(());
+            return;
         }
 
         let mut table =
@@ -21232,23 +21481,25 @@ fn handle_tooling_metrics(json_mode: bool) -> CliResult<()> {
                 ftui_runtime::ftui_println!("  {} (p95: {})", s.name, p95);
             }
         }
-    }
+    });
     Ok(())
 }
 
-fn handle_tooling_metrics_core(json_mode: bool) -> CliResult<()> {
+fn handle_tooling_metrics_core(
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let health = mcp_agent_mail_core::cached_health_level().to_string();
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
     let locks = mcp_agent_mail_core::lock_contention_snapshot();
+    let val = serde_json::json!({
+        "health_level": health,
+        "metrics": metrics,
+        "lock_contention": locks,
+    });
 
-    if json_mode {
-        let val = serde_json::json!({
-            "health_level": health,
-            "metrics": metrics,
-            "lock_contention": locks,
-        });
-        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
-    } else {
+    output::emit_output(&val, fmt, || {
         output::section("Core System Metrics:");
         output::kv("Health level", &health);
         ftui_runtime::ftui_println!("");
@@ -21302,11 +21553,15 @@ fn handle_tooling_metrics_core(json_mode: bool) -> CliResult<()> {
             }
             lock_table.render();
         }
-    }
+    });
     Ok(())
 }
 
-fn handle_tooling_diagnostics(json_mode: bool) -> CliResult<()> {
+fn handle_tooling_diagnostics(
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let tools_detail: Vec<serde_json::Value> = mcp_agent_mail_tools::tool_metrics_snapshot()
         .into_iter()
         .filter_map(|e| serde_json::to_value(e).ok())
@@ -21318,9 +21573,7 @@ fn handle_tooling_diagnostics(json_mode: bool) -> CliResult<()> {
 
     let report = mcp_agent_mail_core::DiagnosticReport::build(tools_detail, slow);
 
-    if json_mode {
-        ftui_runtime::ftui_println!("{}", report.to_json());
-    } else {
+    output::emit_output(&report, fmt, || {
         output::section("Diagnostic Report:");
         output::kv("Generated at", &report.generated_at);
         ftui_runtime::ftui_println!("");
@@ -21464,11 +21717,12 @@ fn handle_tooling_diagnostics(json_mode: bool) -> CliResult<()> {
                 ftui_runtime::ftui_println!("    [{}] {}: {}", icon, rec.subsystem, rec.message);
             }
         }
-    }
+    });
     Ok(())
 }
 
-fn handle_tooling_locks(json_mode: bool) -> CliResult<()> {
+fn handle_tooling_locks(format: Option<output::CliOutputFormat>, json_mode: bool) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let config = Config::from_env();
     let lock_info = mcp_agent_mail_storage::collect_lock_status(&config)
         .unwrap_or_else(|_e| serde_json::json!({"archive_root": "", "exists": false, "locks": []}));
@@ -21478,19 +21732,16 @@ fn handle_tooling_locks(json_mode: bool) -> CliResult<()> {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-
-    if json_mode {
-        let val = serde_json::json!({
-            "total": raw_locks.len(),
-            "locks": raw_locks,
-        });
-        ftui_runtime::ftui_println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
-    } else {
+    let val = serde_json::json!({
+        "total": raw_locks.len(),
+        "locks": raw_locks,
+    });
+    output::emit_output(&val, fmt, || {
         output::section("Archive Locks:");
 
         if raw_locks.is_empty() {
-            ftui_runtime::ftui_println!("  No active locks.");
-            return Ok(());
+            output::emit_empty(fmt, "No active locks.");
+            return;
         }
 
         output::kv("Total", &raw_locks.len().to_string());
@@ -21523,7 +21774,7 @@ fn handle_tooling_locks(json_mode: bool) -> CliResult<()> {
             table.add_row(vec![path.to_string(), owner, created]);
         }
         table.render();
-    }
+    });
     Ok(())
 }
 
