@@ -1345,21 +1345,32 @@ fn render_event_log(
         .bg(tp.selection_bg)
         .bold();
 
-    // Build styled text lines with colored severity badges
+    // Build styled text lines with colored severity badges.
+    //
+    // Salience hierarchy:
+    //   - Error/Warn: summary inherits severity color → immediate attention
+    //   - Info: summary plain → standard prominence
+    //   - Debug/Trace: summary dimmed → background noise
+    let meta_style = crate::tui_theme::text_meta(&tp);
     let mut text_lines: Vec<Line> = Vec::with_capacity(viewport.len());
     for (view_idx, entry) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
         let sev = entry.severity;
+        let summary_style = match sev {
+            EventSeverity::Error | EventSeverity::Warn => sev.style(),
+            EventSeverity::Trace => Style::default().fg(tp.text_disabled).dim(),
+            _ => Style::default(),
+        };
         let mut line = Line::from_spans([
-            Span::raw(format!("{:>6} {} ", entry.seq, entry.timestamp)),
+            Span::styled(format!("{:>6} {} ", entry.seq, entry.timestamp), meta_style),
             pulsing_severity_badge(sev, pulse_phase, reduced_motion),
             Span::raw(" "),
             Span::styled(format!("{}", entry.icon), sev.style()),
-            Span::raw(format!(
-                " {:<10} {}",
-                entry.kind.compact_label(),
-                entry.summary
-            )),
+            Span::styled(
+                format!(" {:<10} ", entry.kind.compact_label()),
+                sev.style(),
+            ),
+            Span::styled(entry.summary.to_string(), summary_style),
         ]);
         if Some(abs_idx) == focused_abs_idx {
             line.apply_base_style(focus_style);
@@ -2617,5 +2628,24 @@ mod tests {
         // Compact: Msg, Agents, Req — all operational.
         let compact_labels = ["Msg", "Agents", "Req"];
         assert_eq!(compact_labels[0], "Msg", "messages must lead in compact");
+    }
+
+    // ── Event salience tests ────────────────────────────────────
+
+    #[test]
+    fn event_severity_salience_hierarchy() {
+        use ftui::style::StyleFlags;
+        let has = |s: Style, f: StyleFlags| s.attrs.map_or(false, |a| a.contains(f));
+
+        // Error and Warn should be bold (high salience).
+        assert!(has(EventSeverity::Error.style(), StyleFlags::BOLD));
+        assert!(has(EventSeverity::Warn.style(), StyleFlags::BOLD));
+
+        // Trace should be dim (background noise).
+        assert!(has(EventSeverity::Trace.style(), StyleFlags::DIM));
+
+        // Info and Debug should NOT be bold (standard/subdued).
+        assert!(!has(EventSeverity::Info.style(), StyleFlags::BOLD));
+        assert!(!has(EventSeverity::Debug.style(), StyleFlags::BOLD));
     }
 }
