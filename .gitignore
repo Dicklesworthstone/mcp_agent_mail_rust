@@ -72,6 +72,13 @@ rustc-ice-*.txt
 # Codex build artifacts
 target-codex*/
 
+# Ephemeral agent debug/test artifacts (accidental shell output)
+18
+42
+7
+GoldHawk:
+SilverFox:
+
 # Beads history snapshots
 .beads/.br_history/
 .claude/settings.local.json
