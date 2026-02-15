@@ -253,6 +253,7 @@ impl FsEmbedder for SyncEmbedderAdapter {
 ///
 /// This preserves the error semantics while translating between the two
 /// crates' error enums.
+#[must_use]
 pub fn map_fs_error(err: frankensearch::SearchError) -> crate::error::SearchError {
     match err {
         frankensearch::SearchError::ModelNotFound { name } => {

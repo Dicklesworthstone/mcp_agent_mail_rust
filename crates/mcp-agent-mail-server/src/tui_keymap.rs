@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use ftui::KeyCode;
 use serde::{Deserialize, Serialize};
 
+use crate::tui_screens::{
+    ALL_SCREEN_IDS, ScreenCategory, jump_key_label_for_screen, jump_key_legend, screen_meta,
+};
+
 // ──────────────────────────────────────────────────────────────────────
 // GlobalBinding — structured keybinding definition
 // ──────────────────────────────────────────────────────────────────────
@@ -26,6 +30,8 @@ pub struct GlobalBinding {
     pub text_suppressible: bool,
 }
 
+const JUMP_BINDING_LABEL: &str = "1-9,0";
+
 /// All global keybindings in display order.
 ///
 /// These are processed in `MailAppModel::update` before forwarding events
@@ -33,7 +39,7 @@ pub struct GlobalBinding {
 /// when the active screen or command palette is consuming text input.
 pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
     GlobalBinding {
-        label: "1-8",
+        label: JUMP_BINDING_LABEL,
         action: "Jump to screen",
         text_suppressible: true,
     },
@@ -86,7 +92,7 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
 
 /// Normalize a keybinding label to a set of `KeyCode` values it matches.
 ///
-/// Returns `None` for compound labels like "1-8" or "Ctrl+P" that
+/// Returns `None` for compound labels like "Ctrl+P" that
 /// don't map to a single `KeyCode`.
 #[must_use]
 pub fn label_to_keycodes(label: &str) -> Vec<KeyCode> {
@@ -105,12 +111,16 @@ pub fn label_to_keycodes(label: &str) -> Vec<KeyCode> {
         "Home" => vec![KeyCode::Home],
         "End" => vec![KeyCode::End],
         // Ranges
-        "1-8" => (1..=8)
-            .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap()))
-            .collect(),
         "1-9" => (1..=9)
             .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap()))
             .collect(),
+        "1-9,0" => {
+            let mut out: Vec<KeyCode> = (1..=9)
+                .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap()))
+                .collect();
+            out.push(KeyCode::Char('0'));
+            out
+        }
         // Modifiers (skip — these don't conflict with single-char bindings)
         s if s.starts_with("Ctrl+") => vec![],
         s if s.starts_with("Shift+") => vec![],
@@ -265,7 +275,7 @@ fn default_profile_bindings() -> Vec<ProfileBinding> {
 
 fn vim_profile_bindings() -> Vec<ProfileBinding> {
     vec![
-        pb("jump_screen", "1-8", "Jump to screen", true),
+        pb("jump_screen", JUMP_BINDING_LABEL, "Jump to screen", true),
         pb("next_screen", "Tab", "Next screen", false),
         pb("prev_screen", "Shift+Tab", "Previous screen", false),
         pb("toggle_mode", "m", "Toggle MCP/API mode", true),
@@ -286,7 +296,7 @@ fn vim_profile_bindings() -> Vec<ProfileBinding> {
 
 fn emacs_profile_bindings() -> Vec<ProfileBinding> {
     vec![
-        pb("jump_screen", "1-8", "Jump to screen", true),
+        pb("jump_screen", JUMP_BINDING_LABEL, "Jump to screen", true),
         pb("next_screen", "Tab", "Next screen", false),
         pb("prev_screen", "Shift+Tab", "Previous screen", false),
         pb("toggle_mode", "m", "Toggle MCP/API mode", true),
@@ -329,7 +339,7 @@ const fn pb(
 /// Map a key label to a stable action ID.
 fn action_id_for_label(label: &str) -> &'static str {
     match label {
-        "1-8" | "1-9" => "jump_screen",
+        "1-9" | "1-9,0" => "jump_screen",
         "Tab" => "next_screen",
         "Shift+Tab" => "prev_screen",
         "m" => "toggle_mode",
@@ -341,6 +351,68 @@ fn action_id_for_label(label: &str) -> &'static str {
         "Esc" => "dismiss",
         _ => "unknown",
     }
+}
+
+fn jump_action_description() -> String {
+    let direct_count = ALL_SCREEN_IDS
+        .iter()
+        .filter(|&&id| jump_key_label_for_screen(id).is_some())
+        .count();
+
+    if direct_count >= ALL_SCREEN_IDS.len() {
+        "Jump to screen (direct keys for all screens)".to_string()
+    } else {
+        "Jump to screen (remaining screens available via command palette)".to_string()
+    }
+}
+
+fn navigation_sections() -> Vec<HelpSection> {
+    let mut overview = Vec::new();
+    let mut communication = Vec::new();
+    let mut operations = Vec::new();
+    let mut system = Vec::new();
+
+    for &id in ALL_SCREEN_IDS {
+        let meta = screen_meta(id);
+        let key = jump_key_label_for_screen(id)
+            .unwrap_or("Palette")
+            .to_string();
+        let entry = (key, meta.title.to_string());
+        match meta.category {
+            ScreenCategory::Overview => overview.push(entry),
+            ScreenCategory::Communication => communication.push(entry),
+            ScreenCategory::Operations => operations.push(entry),
+            ScreenCategory::System => system.push(entry),
+        }
+    }
+
+    let mut sections = Vec::new();
+    if !overview.is_empty() {
+        sections.push(HelpSection {
+            title: "Navigate • Overview".to_string(),
+            entries: overview,
+        });
+    }
+    if !communication.is_empty() {
+        sections.push(HelpSection {
+            title: "Navigate • Communication".to_string(),
+            entries: communication,
+        });
+    }
+    if !operations.is_empty() {
+        sections.push(HelpSection {
+            title: "Navigate • Operations".to_string(),
+            entries: operations,
+        });
+    }
+    if !system.is_empty() {
+        sections.push(HelpSection {
+            title: "Navigate • System".to_string(),
+            entries: system,
+        });
+    }
+
+    sections
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -459,11 +531,20 @@ impl KeymapRegistry {
         let base = self.profile.bindings();
         let mut entries = Vec::new();
         for b in &base {
-            let label = self
+            let mut label = self
                 .resolved
                 .get(b.action_id)
                 .map_or_else(|| b.label.to_string(), |(l, _, _)| l.clone());
-            entries.push((label, b.action.to_string()));
+            let mut action = b.action.to_string();
+
+            if b.action_id == "jump_screen" {
+                if label == JUMP_BINDING_LABEL {
+                    label = jump_key_legend();
+                }
+                action = jump_action_description();
+            }
+
+            entries.push((label, action));
         }
         entries
     }
@@ -483,6 +564,8 @@ impl KeymapRegistry {
             title: format!("Global ({})", self.profile.label()),
             entries: global_entries,
         });
+
+        sections.extend(navigation_sections());
 
         // Screen section
         if !screen_bindings.is_empty() {
@@ -615,11 +698,11 @@ mod tests {
 
     #[test]
     fn label_to_keycodes_range() {
-        let codes = label_to_keycodes("1-8");
-        assert_eq!(codes.len(), 8);
+        let codes = label_to_keycodes(JUMP_BINDING_LABEL);
+        assert_eq!(codes.len(), 10);
         assert_eq!(codes[0], KeyCode::Char('1'));
-        assert_eq!(codes[6], KeyCode::Char('7'));
-        assert_eq!(codes[7], KeyCode::Char('8'));
+        assert_eq!(codes[8], KeyCode::Char('9'));
+        assert_eq!(codes[9], KeyCode::Char('0'));
     }
 
     #[test]
@@ -716,10 +799,10 @@ mod tests {
         let critical: Vec<&str> = all_conflicts
             .iter()
             .filter(|c| {
-                // Number keys 1-8 overlap with timeline's "1-9" correlation links.
+                // Number keys overlap with timeline's "1-9" correlation links.
                 // This is handled: timeline only processes 1-9 when the dock is visible,
                 // while global number keys are caught first in tui_app.rs.
-                !c.contains("1-8")
+                !c.contains(JUMP_BINDING_LABEL)
             })
             .map(String::as_str)
             .collect();
@@ -776,7 +859,7 @@ mod tests {
                         binding.label
                     );
                 }
-                "q" | "?" | ":" | "m" | "T" | "1-8" => {
+                "q" | "?" | ":" | "m" | "T" | JUMP_BINDING_LABEL => {
                     assert!(
                         binding.text_suppressible,
                         "{} should be text-suppressible",
@@ -960,9 +1043,12 @@ mod tests {
     fn registry_contextual_help_has_global_section() {
         let reg = KeymapRegistry::default();
         let sections = reg.contextual_help(&[], "Dashboard");
-        assert_eq!(sections.len(), 1); // Only global (no screen bindings)
         assert!(sections[0].title.contains("Global"));
         assert!(sections[0].title.contains("Default"));
+        assert!(
+            sections.iter().any(|s| s.title == "Navigate • Overview"),
+            "expected category-organized navigation sections"
+        );
     }
 
     #[test]
@@ -973,9 +1059,34 @@ mod tests {
             action: "Refresh",
         }];
         let sections = reg.contextual_help(&screen, "Messages");
-        assert_eq!(sections.len(), 2);
-        assert_eq!(sections[1].title, "Messages");
-        assert_eq!(sections[1].entries.len(), 1);
+        let screen_section = sections
+            .iter()
+            .find(|s| s.title == "Messages")
+            .expect("screen-specific section should be present");
+        assert_eq!(screen_section.entries.len(), 1);
+    }
+
+    #[test]
+    fn jump_help_entry_uses_registry_legend() {
+        let reg = KeymapRegistry::default();
+        let entries = reg.help_entries();
+        let jump_entry = entries
+            .iter()
+            .find(|(_, action)| action.starts_with("Jump to screen"))
+            .expect("jump entry should exist");
+        assert_eq!(jump_entry.0, jump_key_legend());
+    }
+
+    #[test]
+    fn contextual_help_navigation_sections_cover_all_screens() {
+        let reg = KeymapRegistry::default();
+        let sections = reg.contextual_help(&[], "Dashboard");
+        let nav_entries = sections
+            .iter()
+            .filter(|s| s.title.starts_with("Navigate •"))
+            .flat_map(|s| s.entries.iter())
+            .count();
+        assert_eq!(nav_entries, ALL_SCREEN_IDS.len());
     }
 
     #[test]

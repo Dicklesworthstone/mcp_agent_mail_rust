@@ -70,6 +70,81 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::Attachments,
 ];
 
+/// Shifted number-row symbols used for direct jump bindings beyond screen 10.
+///
+/// Mapping: `!`=11, `@`=12, `#`=13, `$`=14, ... `(`=19.
+pub const SHIFTED_DIGIT_JUMP_KEYS: &[char] = &['!', '@', '#', '$', '%', '^', '&', '*', '('];
+
+fn screen_from_display_index(idx: usize) -> Option<MailScreenId> {
+    if idx == 0 || idx > ALL_SCREEN_IDS.len() {
+        None
+    } else {
+        Some(ALL_SCREEN_IDS[idx - 1])
+    }
+}
+
+/// Return the direct jump key label for a 1-based display index.
+///
+/// - `1..=9` map to `"1"`..`"9"`
+/// - `10` maps to `"0"`
+/// - `11+` map to shifted symbols (`!`, `@`, `#`, ...)
+#[must_use]
+pub const fn jump_key_label_for_display_index(display_index: usize) -> Option<&'static str> {
+    match display_index {
+        1 => Some("1"),
+        2 => Some("2"),
+        3 => Some("3"),
+        4 => Some("4"),
+        5 => Some("5"),
+        6 => Some("6"),
+        7 => Some("7"),
+        8 => Some("8"),
+        9 => Some("9"),
+        10 => Some("0"),
+        11 => Some("!"),
+        12 => Some("@"),
+        13 => Some("#"),
+        14 => Some("$"),
+        15 => Some("%"),
+        16 => Some("^"),
+        17 => Some("&"),
+        18 => Some("*"),
+        19 => Some("("),
+        _ => None,
+    }
+}
+
+/// Return the direct jump key label for a screen, if one exists.
+#[must_use]
+pub fn jump_key_label_for_screen(id: MailScreenId) -> Option<&'static str> {
+    jump_key_label_for_display_index(id.index() + 1)
+}
+
+/// Parse a jump key character into the corresponding screen.
+///
+/// Supports numeric keys and shifted number-row symbols for 11+ screens.
+#[must_use]
+pub fn screen_from_jump_key(key: char) -> Option<MailScreenId> {
+    if key.is_ascii_digit() {
+        let n = key.to_digit(10).map_or(0, |d| d as usize);
+        return MailScreenId::from_number(n);
+    }
+
+    let shifted_offset = SHIFTED_DIGIT_JUMP_KEYS.iter().position(|&c| c == key)?;
+    screen_from_display_index(11 + shifted_offset)
+}
+
+/// Human-readable key legend for direct jump navigation.
+#[must_use]
+pub fn jump_key_legend() -> String {
+    let mut labels = vec!["1-9".to_string(), "0".to_string()];
+    let extra = ALL_SCREEN_IDS.len().saturating_sub(10);
+    labels.extend((0..extra).filter_map(|offset| {
+        jump_key_label_for_display_index(11 + offset).map(ToString::to_string)
+    }));
+    labels.join(",")
+}
+
 impl MailScreenId {
     /// Returns the 1-based display index.
     #[must_use]
@@ -95,17 +170,14 @@ impl MailScreenId {
         ALL_SCREEN_IDS[(idx + len - 1) % len]
     }
 
-    /// Look up a screen by number key (1..=9, 0=10).
+    /// Look up a screen by numeric jump index.
     ///
-    /// Keys 1-9 map to screens 1-9; key 0 maps to screen 10.
+    /// Keys `1`-`9` map to screens 1-9; key `0` maps to screen 10.
+    /// Values >10 are accepted for translated jump keys (e.g. `!` => 11).
     #[must_use]
     pub fn from_number(n: usize) -> Option<Self> {
         let idx = if n == 0 { 10 } else { n };
-        if idx == 0 || idx > ALL_SCREEN_IDS.len() {
-            None
-        } else {
-            Some(ALL_SCREEN_IDS[idx - 1])
-        }
+        screen_from_display_index(idx)
     }
 }
 
@@ -487,12 +559,54 @@ mod tests {
         assert_eq!(MailScreenId::from_number(9), Some(MailScreenId::Timeline));
         // 0 maps to screen 10
         assert_eq!(MailScreenId::from_number(0), Some(MailScreenId::Projects));
+        assert_eq!(MailScreenId::from_number(11), Some(MailScreenId::Contacts));
     }
 
     #[test]
     fn from_number_invalid() {
         assert_eq!(MailScreenId::from_number(15), None);
         assert_eq!(MailScreenId::from_number(100), None);
+    }
+
+    #[test]
+    fn jump_key_labels_cover_current_registry() {
+        assert_eq!(
+            jump_key_label_for_display_index(1),
+            Some("1"),
+            "screen 1 should use key 1"
+        );
+        assert_eq!(
+            jump_key_label_for_display_index(10),
+            Some("0"),
+            "screen 10 should use key 0"
+        );
+        assert_eq!(
+            jump_key_label_for_display_index(11),
+            Some("!"),
+            "screen 11 should use key !"
+        );
+        assert_eq!(
+            jump_key_label_for_display_index(14),
+            Some("$"),
+            "screen 14 should use key $"
+        );
+    }
+
+    #[test]
+    fn screen_from_jump_key_supports_shifted_symbols() {
+        assert_eq!(screen_from_jump_key('1'), Some(MailScreenId::Dashboard));
+        assert_eq!(screen_from_jump_key('0'), Some(MailScreenId::Projects));
+        assert_eq!(screen_from_jump_key('!'), Some(MailScreenId::Contacts));
+        assert_eq!(screen_from_jump_key('@'), Some(MailScreenId::Explorer));
+        assert_eq!(screen_from_jump_key('#'), Some(MailScreenId::Analytics));
+        assert_eq!(screen_from_jump_key('$'), Some(MailScreenId::Attachments));
+        assert_eq!(screen_from_jump_key(')'), None);
+    }
+
+    #[test]
+    fn jump_key_legend_reflects_screen_count() {
+        let legend = jump_key_legend();
+        assert_eq!(legend, "1-9,0,!,@,#,$");
     }
 
     #[test]
@@ -552,6 +666,10 @@ mod tests {
         for i in 1..=ALL_SCREEN_IDS.len() {
             let id = MailScreenId::from_number(i).expect("valid index");
             assert_eq!(id, ALL_SCREEN_IDS[i - 1]);
+            assert_eq!(
+                jump_key_label_for_screen(id),
+                jump_key_label_for_display_index(i)
+            );
         }
     }
 
