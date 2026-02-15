@@ -1286,24 +1286,21 @@ impl MailAppModel {
             self.clipboard
                 .set(text, ClipboardSelection::Clipboard, &mut std::io::stdout());
 
-        match result {
-            Ok(()) => {
-                self.internal_clipboard = Some(text.to_string());
-                self.notifications.notify(
-                    Toast::new(format!("Copied: {truncated}"))
-                        .icon(ToastIcon::Info)
-                        .duration(Duration::from_secs(2)),
-                );
-            }
-            Err(_) => {
-                // Fall back to internal clipboard.
-                self.internal_clipboard = Some(text.to_string());
-                self.notifications.notify(
-                    Toast::new(format!("Copied (internal): {truncated}"))
-                        .icon(ToastIcon::Warning)
-                        .duration(Duration::from_secs(3)),
-                );
-            }
+        if let Ok(()) = result {
+            self.internal_clipboard = Some(text.to_string());
+            self.notifications.notify(
+                Toast::new(format!("Copied: {truncated}"))
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(2)),
+            );
+        } else {
+            // Fall back to internal clipboard.
+            self.internal_clipboard = Some(text.to_string());
+            self.notifications.notify(
+                Toast::new(format!("Copied (internal): {truncated}"))
+                    .icon(ToastIcon::Warning)
+                    .duration(Duration::from_secs(3)),
+            );
         }
     }
 

@@ -678,8 +678,8 @@ Thanks!";
 
     /// Stable FNV-1a digest for compact golden snapshot assertions.
     fn stable_digest(input: &str) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
         let mut hash = FNV_OFFSET;
         for byte in input.as_bytes() {
             hash ^= u64::from(*byte);

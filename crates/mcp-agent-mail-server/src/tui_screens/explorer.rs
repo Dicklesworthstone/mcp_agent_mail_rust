@@ -1125,10 +1125,10 @@ impl MailScreen for MailExplorerScreen {
 
     fn copyable_content(&self) -> Option<String> {
         let entry = self.entries.get(self.cursor)?;
-        if !entry.body_preview.is_empty() {
-            Some(format!("{}\n\n{}", entry.subject, entry.body_preview))
-        } else {
+        if entry.body_preview.is_empty() {
             Some(entry.subject.clone())
+        } else {
+            Some(format!("{}\n\n{}", entry.subject, entry.body_preview))
         }
     }
 

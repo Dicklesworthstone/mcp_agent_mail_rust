@@ -231,11 +231,7 @@ mod tests {
         assert_eq!(payload["since_seq"], since);
         assert_eq!(payload["to_seq"], since);
         assert_eq!(payload["event_count"], 0);
-        assert!(
-            payload["events"]
-                .as_array()
-                .is_some_and(|events| events.is_empty())
-        );
+        assert!(payload["events"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[test]

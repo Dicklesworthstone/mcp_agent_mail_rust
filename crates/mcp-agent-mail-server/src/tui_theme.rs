@@ -13,7 +13,7 @@ use crate::tui_events::{EventSeverity, MailEventKind};
 static CUSTOM_THEME_OVERRIDE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Active named theme index (0..NAMED_THEME_COUNT). Used by `cycle_named_theme`.
+/// Active named theme index (`0..NAMED_THEME_COUNT`). Used by `cycle_named_theme`.
 static ACTIVE_NAMED_THEME_INDEX: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -21,10 +21,10 @@ static ACTIVE_NAMED_THEME_INDEX: std::sync::atomic::AtomicUsize =
 // Named theme registry
 // ──────────────────────────────────────────────────────────────────────
 
-/// Named themes in cycling order: (config_name, display_name).
+/// Named themes in cycling order: (`config_name`, `display_name`).
 ///
-/// The config_name matches values accepted by `AM_TUI_THEME` / `from_config_name`.
-/// The display_name is shown in the status line and command palette.
+/// The `config_name` matches values accepted by `AM_TUI_THEME` / `from_config_name`.
+/// The `display_name` is shown in the status line and command palette.
 pub const NAMED_THEMES: &[(&str, &str)] = &[
     ("default", "Frankenstein"),
     ("solarized", "Solarized Dark"),
@@ -81,7 +81,8 @@ pub fn active_named_palette() -> TuiThemePalette {
     TuiThemePalette::from_index(active_named_theme_index())
 }
 
-/// Cycle to the next named theme and return `(config_name, display_name, palette)`.
+/// Cycle to the next named theme and return
+/// (`config_name`, `display_name`, `palette`).
 ///
 /// Increments the active index modulo [`NAMED_THEME_COUNT`].
 /// Callers should persist the returned `config_name` to the envfile.
@@ -93,7 +94,8 @@ pub fn cycle_named_theme() -> (&'static str, &'static str, TuiThemePalette) {
     (cfg, display, TuiThemePalette::from_config_name(cfg))
 }
 
-/// Set the active named theme by index and return `(config_name, display_name, palette)`.
+/// Set the active named theme by index and return
+/// (`config_name`, `display_name`, `palette`).
 ///
 /// Used by command palette to select a theme directly.
 pub fn set_named_theme(index: usize) -> (&'static str, &'static str, TuiThemePalette) {
@@ -245,6 +247,7 @@ pub struct TuiThemePalette {
 
 impl TuiThemePalette {
     /// Frankenstein's Monster Theme (Showcase)
+    #[allow(clippy::too_many_lines)] // Literal palette table is clearer than splitting into indirections.
     #[must_use]
     pub const fn frankenstein() -> Self {
         // Palette:
@@ -387,7 +390,7 @@ impl TuiThemePalette {
         let base01 = PackedRgba::rgb(88, 110, 117); // #586e75 — comments/secondary
         let base00 = PackedRgba::rgb(101, 123, 131); // #657b83
         let base0 = PackedRgba::rgb(131, 148, 150); // #839496 — body text
-        let base1 = PackedRgba::rgb(147, 161, 161); // #93a1a1 — emphasis
+        let base_light = PackedRgba::rgb(147, 161, 161); // #93a1a1 — emphasis
         // Solarized accent colors
         let yellow = PackedRgba::rgb(181, 137, 0); // #b58900
         let orange = PackedRgba::rgb(203, 75, 22); // #cb4b16
@@ -400,7 +403,7 @@ impl TuiThemePalette {
 
         Self {
             tab_active_bg: base02,
-            tab_active_fg: base1,
+            tab_active_fg: base_light,
             tab_inactive_bg: base03,
             tab_inactive_fg: base01,
             tab_key_fg: blue,
@@ -424,7 +427,7 @@ impl TuiThemePalette {
             table_row_alt_bg: base02,
 
             selection_bg: PackedRgba::rgb(17, 70, 85),
-            selection_fg: base1,
+            selection_fg: base_light,
 
             severity_ok: green,
             severity_error: red,
@@ -435,7 +438,7 @@ impl TuiThemePalette {
             panel_border_focused: blue,
             panel_border_dim: base00,
             panel_bg: base03,
-            panel_title_fg: base1,
+            panel_title_fg: base_light,
 
             selection_indicator: blue,
             list_hover_bg: PackedRgba::rgb(0, 55, 70),
@@ -445,7 +448,7 @@ impl TuiThemePalette {
             chart_grid: base02,
 
             badge_urgent_bg: red,
-            badge_urgent_fg: base1,
+            badge_urgent_fg: base_light,
             badge_info_bg: base02,
             badge_info_fg: cyan,
 
@@ -464,7 +467,9 @@ impl TuiThemePalette {
             metric_reservations: yellow,
             metric_projects: cyan,
 
-            agent_palette: [blue, green, yellow, orange, violet, cyan, magenta, base1],
+            agent_palette: [
+                blue, green, yellow, orange, violet, cyan, magenta, base_light,
+            ],
 
             contact_approved: green,
             contact_pending: yellow,
@@ -476,7 +481,7 @@ impl TuiThemePalette {
 
             text_muted: base01,
             text_primary: base0,
-            text_secondary: base1,
+            text_secondary: base_light,
             text_disabled: base00,
             bg_deep: base03,
             bg_surface: base02,
@@ -619,6 +624,7 @@ impl TuiThemePalette {
         }
     }
 
+    #[allow(clippy::similar_names)] // Nord palette uses official numbered tokens from spec.
     /// Nord theme based on Arctic Ice Studio's official palette.
     ///
     /// <https://www.nordtheme.com/>
@@ -893,7 +899,7 @@ impl TuiThemePalette {
 
     /// Convert a config name to its index in the named theme registry.
     ///
-    /// Returns 0 (default) for unrecognized names.
+    /// Returns `0` (default) for unrecognized names.
     #[must_use]
     pub fn config_name_to_index(name: &str) -> usize {
         NAMED_THEMES
@@ -2012,7 +2018,7 @@ mod tests {
         }
     }
 
-    /// Named themes have distinct accent colors (no two share the same tab_key_fg).
+    /// Named themes have distinct accent colors (no two share the same `tab_key_fg`).
     #[test]
     fn named_themes_are_visually_distinct() {
         let frank = TuiThemePalette::frankenstein();
@@ -2110,7 +2116,7 @@ mod tests {
         );
     }
 
-    /// Named theme chart_series arrays have 6 distinct colors.
+    /// Named theme `chart_series` arrays have 6 distinct colors.
     #[test]
     fn named_themes_chart_series_are_distinct() {
         let themes: [(&str, TuiThemePalette); 5] = [
@@ -2133,7 +2139,7 @@ mod tests {
         }
     }
 
-    /// Named theme agent_palette arrays have 8 entries.
+    /// Named theme `agent_palette` arrays have 8 entries.
     #[test]
     fn named_themes_agent_palette_complete() {
         let themes: [(&str, TuiThemePalette); 5] = [
@@ -2433,7 +2439,7 @@ mod tests {
         }
     }
 
-    /// Severity colors on panel_bg meet contrast threshold.
+    /// Severity colors on `panel_bg` meet contrast threshold.
     #[test]
     fn named_themes_severity_on_panel_contrast() {
         const MIN_CONTRAST: f64 = 2.5;

@@ -2084,13 +2084,16 @@ impl MailScreen for SearchCockpitScreen {
 
     fn copyable_content(&self) -> Option<String> {
         let entry = self.results.get(self.cursor)?;
-        if let Some(body) = &entry.full_body {
-            Some(format!("{}\n\n{}", entry.title, body))
-        } else if !entry.body_preview.is_empty() {
-            Some(format!("{}\n\n{}", entry.title, entry.body_preview))
-        } else {
-            Some(entry.title.clone())
-        }
+        Some(entry.full_body.as_ref().map_or_else(
+            || {
+                if entry.body_preview.is_empty() {
+                    entry.title.clone()
+                } else {
+                    format!("{}\n\n{}", entry.title, entry.body_preview)
+                }
+            },
+            |body| format!("{}\n\n{}", entry.title, body),
+        ))
     }
 
     fn title(&self) -> &'static str {
