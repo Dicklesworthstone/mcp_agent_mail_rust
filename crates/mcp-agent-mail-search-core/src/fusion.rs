@@ -7,9 +7,13 @@
 //! - Pagination applied after fusion
 
 use std::cmp::Ordering;
+#[cfg(feature = "semantic")]
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "semantic")]
+use crate::fs_bridge::{fs, fs_rrf_fuse, FsRrfConfig, FsScoredResult, FsVectorHit};
 use crate::hybrid_candidates::{CandidateSource, PreparedCandidate};
 
 /// Default RRF constant (k).
@@ -123,18 +127,115 @@ fn rrf_contribution(k: f64, rank: Option<usize>) -> f64 {
     rank.map_or(0.0, |r| 1.0 / (k + r as f64))
 }
 
-/// Fuse prepared candidates using RRF.
-///
-/// # Arguments
-/// * `candidates` - Deduplicated candidates from [`prepare_candidates`](crate::hybrid_candidates::prepare_candidates)
-/// * `config` - RRF configuration
-/// * `offset` - Number of results to skip (for pagination)
-/// * `limit` - Maximum number of results to return
-///
-/// # Returns
-/// Fused results with deterministic ordering and explain payloads.
-#[must_use]
-pub fn fuse_rrf(
+#[cfg(feature = "semantic")]
+const FS_DUMMY_LEX_PREFIX: &str = "__am_rrf_dummy_lex_";
+#[cfg(feature = "semantic")]
+const FS_DUMMY_SEM_PREFIX: &str = "__am_rrf_dummy_sem_";
+
+#[cfg(feature = "semantic")]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn build_fs_lexical_hits(candidates: &[PreparedCandidate]) -> Vec<FsScoredResult> {
+    let max_rank = candidates
+        .iter()
+        .filter_map(|candidate| candidate.lexical_rank)
+        .max()
+        .unwrap_or(0);
+    if max_rank == 0 {
+        return Vec::new();
+    }
+
+    let mut hits: Vec<FsScoredResult> = (0..max_rank)
+        .map(|idx| FsScoredResult {
+            doc_id: format!("{FS_DUMMY_LEX_PREFIX}{idx}"),
+            score: f32::NEG_INFINITY,
+            source: fs::core::types::ScoreSource::Lexical,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(f32::NEG_INFINITY),
+            rerank_score: None,
+            metadata: None,
+        })
+        .collect();
+
+    for candidate in candidates {
+        if let Some(rank) = candidate.lexical_rank {
+            let slot = rank.saturating_sub(1);
+            if slot < hits.len() {
+                hits[slot] = FsScoredResult {
+                    doc_id: candidate.doc_id.to_string(),
+                    score: candidate.lexical_score.unwrap_or(0.0) as f32,
+                    source: fs::core::types::ScoreSource::Lexical,
+                    fast_score: None,
+                    quality_score: None,
+                    lexical_score: candidate.lexical_score.map(|score| score as f32),
+                    rerank_score: None,
+                    metadata: None,
+                };
+            }
+        }
+    }
+
+    hits
+}
+
+#[cfg(feature = "semantic")]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn build_fs_semantic_hits(candidates: &[PreparedCandidate]) -> Vec<FsVectorHit> {
+    let max_rank = candidates
+        .iter()
+        .filter_map(|candidate| candidate.semantic_rank)
+        .max()
+        .unwrap_or(0);
+    if max_rank == 0 {
+        return Vec::new();
+    }
+
+    let mut hits: Vec<FsVectorHit> = (0..max_rank)
+        .map(|idx| FsVectorHit {
+            index: u32::try_from(idx).unwrap_or(u32::MAX),
+            score: f32::NEG_INFINITY,
+            doc_id: format!("{FS_DUMMY_SEM_PREFIX}{idx}"),
+        })
+        .collect();
+
+    for candidate in candidates {
+        if let Some(rank) = candidate.semantic_rank {
+            let slot = rank.saturating_sub(1);
+            if slot < hits.len() {
+                hits[slot] = FsVectorHit {
+                    index: u32::try_from(slot).unwrap_or(u32::MAX),
+                    score: candidate.semantic_score.unwrap_or(0.0) as f32,
+                    doc_id: candidate.doc_id.to_string(),
+                };
+            }
+        }
+    }
+
+    hits
+}
+
+#[cfg(feature = "semantic")]
+fn has_duplicate_source_ranks(candidates: &[PreparedCandidate]) -> bool {
+    let mut lexical_ranks = HashSet::new();
+    let mut semantic_ranks = HashSet::new();
+
+    for candidate in candidates {
+        if let Some(rank) = candidate.lexical_rank {
+            if !lexical_ranks.insert(rank) {
+                return true;
+            }
+        }
+        if let Some(rank) = candidate.semantic_rank {
+            if !semantic_ranks.insert(rank) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn fuse_rrf_legacy(
     candidates: &[PreparedCandidate],
     config: RrfConfig,
     offset: usize,
@@ -176,12 +277,8 @@ pub fn fuse_rrf(
         })
         .collect();
 
-    // Sort by deterministic tie-breaking chain
     fused.sort_by(|a, b| fused_hit_cmp(a, b, config.epsilon));
-
     let total_fused = fused.len();
-
-    // Apply pagination after fusion
     let paginated: Vec<FusedHit> = fused.into_iter().skip(offset).take(limit.max(1)).collect();
 
     FusionResult {
@@ -191,6 +288,116 @@ pub fn fuse_rrf(
         hits: paginated,
         offset_applied: offset,
         limit_applied: limit,
+    }
+}
+
+/// Fuse prepared candidates using RRF.
+///
+/// # Arguments
+/// * `candidates` - Deduplicated candidates from [`prepare_candidates`](crate::hybrid_candidates::prepare_candidates)
+/// * `config` - RRF configuration
+/// * `offset` - Number of results to skip (for pagination)
+/// * `limit` - Maximum number of results to return
+///
+/// # Returns
+/// Fused results with deterministic ordering and explain payloads.
+#[must_use]
+pub fn fuse_rrf(
+    candidates: &[PreparedCandidate],
+    config: RrfConfig,
+    offset: usize,
+    limit: usize,
+) -> FusionResult {
+    #[cfg(feature = "semantic")]
+    {
+        if has_duplicate_source_ranks(candidates) {
+            return fuse_rrf_legacy(candidates, config, offset, limit);
+        }
+
+        let lexical_hits = build_fs_lexical_hits(candidates);
+        let semantic_hits = build_fs_semantic_hits(candidates);
+        let fs_config = FsRrfConfig { k: config.k };
+        let fs_hits = fs_rrf_fuse(
+            &lexical_hits,
+            &semantic_hits,
+            candidates.len(),
+            0,
+            &fs_config,
+        );
+
+        let first_source_by_doc: HashMap<i64, CandidateSource> = candidates
+            .iter()
+            .map(|candidate| (candidate.doc_id, candidate.first_source))
+            .collect();
+
+        let mut fused: Vec<FusedHit> = fs_hits
+            .into_iter()
+            .filter_map(|hit| {
+                let doc_id: i64 = hit.doc_id.parse().ok()?;
+                let lexical_rank = hit.lexical_rank.map(|rank: usize| rank.saturating_add(1));
+                let semantic_rank = hit.semantic_rank.map(|rank: usize| rank.saturating_add(1));
+                let lexical_score = hit.lexical_score.map(f64::from);
+                let semantic_score = hit.semantic_score.map(f64::from);
+                let lexical_contrib = rrf_contribution(config.k, lexical_rank);
+                let semantic_contrib = rrf_contribution(config.k, semantic_rank);
+                let first_source = first_source_by_doc
+                    .get(&doc_id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        if lexical_rank.is_some() {
+                            CandidateSource::Lexical
+                        } else {
+                            CandidateSource::Semantic
+                        }
+                    });
+
+                let source_contributions = vec![
+                    SourceContribution {
+                        source: "lexical".to_string(),
+                        contribution: lexical_contrib,
+                        rank: lexical_rank,
+                    },
+                    SourceContribution {
+                        source: "semantic".to_string(),
+                        contribution: semantic_contrib,
+                        rank: semantic_rank,
+                    },
+                ];
+
+                Some(FusedHit {
+                    doc_id,
+                    rrf_score: hit.rrf_score,
+                    first_source,
+                    explain: FusionExplain {
+                        lexical_rank,
+                        lexical_score,
+                        semantic_rank,
+                        semantic_score,
+                        rrf_score: hit.rrf_score,
+                        source_contributions,
+                    },
+                })
+            })
+            .collect();
+
+        // Preserve existing deterministic tie-break ordering for downstream callers.
+        fused.sort_by(|a, b| fused_hit_cmp(a, b, config.epsilon));
+        let total_fused = fused.len();
+        let paginated: Vec<FusedHit> = fused.into_iter().skip(offset).take(limit.max(1)).collect();
+
+        FusionResult {
+            config,
+            input_count: candidates.len(),
+            total_fused,
+            hits: paginated,
+            offset_applied: offset,
+            limit_applied: limit,
+        }
+    }
+
+    #[cfg(not(feature = "semantic"))]
+    {
+        fuse_rrf_legacy(candidates, config, offset, limit)
     }
 }
 
@@ -243,7 +450,7 @@ pub fn fuse_rrf_default(candidates: &[PreparedCandidate]) -> FusionResult {
 )]
 mod tests {
     use super::*;
-    use crate::hybrid_candidates::{CandidateBudget, CandidateHit, prepare_candidates};
+    use crate::hybrid_candidates::{prepare_candidates, CandidateBudget, CandidateHit};
 
     fn make_candidate(
         doc_id: i64,
@@ -367,12 +574,10 @@ mod tests {
 
         // All lexical docs should pass through
         assert_eq!(result.total_fused, 2);
-        assert!(
-            result
-                .hits
-                .iter()
-                .all(|h| h.explain.semantic_rank.is_none())
-        );
+        assert!(result
+            .hits
+            .iter()
+            .all(|h| h.explain.semantic_rank.is_none()));
     }
 
     #[test]

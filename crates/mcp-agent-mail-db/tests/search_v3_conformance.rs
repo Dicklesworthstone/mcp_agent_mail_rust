@@ -9,7 +9,7 @@
 //! 3. **Scope enforcement**: `execute_search` with scope context produces
 //!    correct verdict counts (Allow, Deny) on V3 paths.
 //! 4. **Product search**: `search_messages_for_product` works with V3 indexing.
-//! 5. **Filter parity**: facets (importance, sender, thread, time_range) produce
+//! 5. **Filter parity**: facets (importance, sender, thread, `time_range`) produce
 //!    consistent filtering in V3 vs legacy.
 //!
 //! Every assertion emits a structured trace:
@@ -320,7 +320,10 @@ fn v3_conformance_engine_routing_legacy() {
     // Operator mode (no scope) should not deny any results
     assert!(
         resp.audit_summary.is_none()
-            || resp.audit_summary.as_ref().map_or(false, |a| a.denied_count == 0),
+            || resp
+                .audit_summary
+                .as_ref()
+                .is_some_and(|a| a.denied_count == 0),
         "operator mode should not deny any results"
     );
 }
@@ -391,7 +394,7 @@ fn v3_conformance_engine_routing_hybrid_degrades() {
 // 3. SCOPE ENFORCEMENT: V3 paths produce correct scope verdicts
 // ════════════════════════════════════════════════════════════════════
 
-/// Scoped search with CallerScoped viewer filters cross-project results.
+/// Scoped search with `CallerScoped` viewer filters cross-project results.
 #[test]
 fn v3_conformance_scope_denies_cross_project() {
     let (pool, _dir) = make_pool();
@@ -479,12 +482,15 @@ fn v3_conformance_operator_mode_no_filtering() {
 
     assert!(
         resp.audit_summary.is_none()
-            || resp.audit_summary.as_ref().map_or(false, |a| a.denied_count == 0),
+            || resp
+                .audit_summary
+                .as_ref()
+                .is_some_and(|a| a.denied_count == 0),
         "operator mode should not deny results"
     );
 }
 
-/// Scoped search audit_summary counts match verdict distribution.
+/// Scoped search `audit_summary` counts match verdict distribution.
 #[test]
 fn v3_conformance_audit_summary_counts() {
     let (pool, _dir) = make_pool();
@@ -865,7 +871,7 @@ fn v3_conformance_combined_facets() {
     }
 }
 
-/// Ranking mode Recency sorts by created_ts descending.
+/// Ranking mode Recency sorts by `created_ts` descending.
 #[test]
 fn v3_conformance_ranking_recency() {
     let (pool, _dir) = make_pool();

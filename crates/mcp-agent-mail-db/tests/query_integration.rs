@@ -968,7 +968,7 @@ fn insert_scope_tantivy_doc(
     insert_tantivy_message_doc(doc_id, project_id, token, sender, thread_id, "normal");
 }
 
-/// Build a ScopeContext for a viewer in a specific project.
+/// Build a `ScopeContext` for a viewer in a specific project.
 fn scope_viewer(agent_id: i64, project_id: i64) -> ScopeContext {
     ScopeContext {
         viewer: Some(ViewerIdentity {
@@ -1372,12 +1372,12 @@ fn v3_lexical_audit_summary_counts_match_verdicts() {
 
     let token = format!("scopeaudit{}", unique_suffix());
     let doc_a_id = 10_600_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
-    let doc_b_id = 10_600_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
+    let denied_doc_id = 10_600_000 + i64::try_from(unique_suffix()).expect("suffix fits i64");
 
     // Doc in project A (visible to viewer in A)
     insert_scope_tantivy_doc(doc_a_id, pid_a, &token, "BlueLake", "thread-audit-a");
     // Doc in project B (cross-project, should be denied)
-    insert_scope_tantivy_doc(doc_b_id, pid_b, &token, "RedFox", "thread-audit-b");
+    insert_scope_tantivy_doc(denied_doc_id, pid_b, &token, "RedFox", "thread-audit-b");
 
     let token_q = token.clone();
     let pool2 = pool.clone();
@@ -1411,10 +1411,10 @@ fn v3_lexical_audit_summary_counts_match_verdicts() {
             let denied_b = audit
                 .entries
                 .iter()
-                .any(|e| e.result_id == doc_b_id && e.verdict == ScopeVerdict::Deny);
+                .any(|e| e.result_id == denied_doc_id && e.verdict == ScopeVerdict::Deny);
             if audit.total_before > 0 {
                 // If both docs were returned by Tantivy, doc_b should be denied
-                let visible_b = resp.results.iter().any(|r| r.result.id == doc_b_id);
+                let visible_b = resp.results.iter().any(|r| r.result.id == denied_doc_id);
                 assert!(
                     !visible_b || denied_b,
                     "cross-project doc_b should be denied or not in results"
