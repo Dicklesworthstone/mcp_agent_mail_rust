@@ -44,20 +44,139 @@ TIMING_REPORT="${E2E_ARTIFACT_DIR}/frame_render_timing.tsv"
     echo -e "case_id\telapsed_ms"
 } > "${TIMING_REPORT}"
 
-run_cargo_with_rch_fallback() {
-    local out_file="$1"
-    shift
-    local -a cargo_args=("$@")
-    local rc=0
+SCENARIO_DIAG_FILE="${E2E_ARTIFACT_DIR}/diagnostics/rendering_scenarios.jsonl"
+CARGO_DIAG_FILE="${E2E_ARTIFACT_DIR}/diagnostics/cargo_runs.jsonl"
+: > "${SCENARIO_DIAG_FILE}"
+: > "${CARGO_DIAG_FILE}"
+
+_SCENARIO_DIAG_ID=""
+_SCENARIO_DIAG_START_MS=0
+_SCENARIO_DIAG_FAIL_BASE=0
+_SCENARIO_DIAG_REASON_CODE="OK"
+_SCENARIO_DIAG_REASON="completed"
+
+diag_rel_path() {
+    local path="$1"
+    if [[ "${path}" == "${E2E_ARTIFACT_DIR}/"* ]]; then
+        printf "%s" "${path#"${E2E_ARTIFACT_DIR}"/}"
+    else
+        printf "%s" "${path}"
+    fi
+}
+
+scenario_diag_begin() {
+    _SCENARIO_DIAG_ID="$1"
+    _SCENARIO_DIAG_START_MS="$(_e2e_now_ms)"
+    _SCENARIO_DIAG_FAIL_BASE="${_E2E_FAIL}"
+    _SCENARIO_DIAG_REASON_CODE="OK"
+    _SCENARIO_DIAG_REASON="completed"
+}
+
+scenario_diag_mark_reason() {
+    local reason_code="$1"
+    local reason="$2"
+    if [ "${_SCENARIO_DIAG_REASON_CODE}" = "OK" ]; then
+        _SCENARIO_DIAG_REASON_CODE="${reason_code}"
+        _SCENARIO_DIAG_REASON="${reason}"
+    fi
+}
+
+scenario_diag_finish() {
+    local elapsed_ms fail_delta status reason_code reason repro_cmd
+    elapsed_ms=$(( $(_e2e_now_ms) - _SCENARIO_DIAG_START_MS ))
+    fail_delta=$(( _E2E_FAIL - _SCENARIO_DIAG_FAIL_BASE ))
+    status="pass"
+    reason_code="${_SCENARIO_DIAG_REASON_CODE}"
+    reason="${_SCENARIO_DIAG_REASON}"
+    if [ "${reason_code}" != "OK" ] || [ "${fail_delta}" -gt 0 ]; then
+        status="fail"
+        if [ "${reason_code}" = "OK" ] && [ "${fail_delta}" -gt 0 ]; then
+            reason_code="ASSERTION_FAILURE"
+            reason="${fail_delta} assertion(s) failed"
+        fi
+    fi
+    repro_cmd="$(e2e_repro_command | tr -d '\n')"
+
+    local artifacts_json="["
+    local first=1
+    local path rel
+    for path in "$@"; do
+        if [ -z "${path}" ]; then
+            continue
+        fi
+        rel="$(diag_rel_path "${path}")"
+        if [ "${first}" -eq 0 ]; then
+            artifacts_json="${artifacts_json},"
+        fi
+        artifacts_json="${artifacts_json}\"$(_e2e_json_escape "${rel}")\""
+        first=0
+    done
+    artifacts_json="${artifacts_json}]"
 
     {
-        echo "[cmd] cargo ${cargo_args[*]}"
-    } >>"${out_file}"
+        printf '{'
+        printf '"schema_version":1,'
+        printf '"suite":"%s",' "$(_e2e_json_escape "$E2E_SUITE")"
+        printf '"scenario_id":"%s",' "$(_e2e_json_escape "$_SCENARIO_DIAG_ID")"
+        printf '"status":"%s",' "$(_e2e_json_escape "$status")"
+        printf '"elapsed_ms":%s,' "$elapsed_ms"
+        printf '"reason_code":"%s",' "$(_e2e_json_escape "$reason_code")"
+        printf '"reason":"%s",' "$(_e2e_json_escape "$reason")"
+        printf '"artifact_paths":%s,' "${artifacts_json}"
+        printf '"repro_command":"%s"' "$(_e2e_json_escape "$repro_cmd")"
+        printf '}\n'
+    } >> "${SCENARIO_DIAG_FILE}"
+}
+
+scenario_fail() {
+    local reason_code="$1"
+    shift
+    local msg="$*"
+    scenario_diag_mark_reason "${reason_code}" "${msg}"
+    e2e_fail "${msg}"
+}
+
+append_cargo_diag() {
+    local case_id="$1"
+    local command_str="$2"
+    local runner="$3"
+    local fallback_local="$4"
+    local rc="$5"
+    local elapsed_ms="$6"
+    local log_path="$7"
+
+    {
+        printf '{'
+        printf '"schema_version":1,'
+        printf '"suite":"%s",' "$(_e2e_json_escape "$E2E_SUITE")"
+        printf '"scenario_id":"%s",' "$(_e2e_json_escape "$case_id")"
+        printf '"command":"%s",' "$(_e2e_json_escape "$command_str")"
+        printf '"runner":"%s",' "$(_e2e_json_escape "$runner")"
+        printf '"fallback_local":%s,' "${fallback_local}"
+        printf '"elapsed_ms":%s,' "${elapsed_ms}"
+        printf '"rc":%s,' "${rc}"
+        printf '"log_path":"%s"' "$(_e2e_json_escape "$(diag_rel_path "${log_path}")")"
+        printf '}\n'
+    } >> "${CARGO_DIAG_FILE}"
+}
+
+run_cargo_with_rch_fallback() {
+    local case_id="$1"
+    local out_file="$2"
+    shift 2
+    local -a cargo_args=("$@")
+    local command_str="cargo ${cargo_args[*]}"
+    local runner="local"
+    local fallback_local="false"
+    local rc=0
+    local started_ms ended_ms elapsed_ms
+
+    started_ms="$(_e2e_now_ms)"
+    printf "[cmd] %s\n" "${command_str}" >>"${out_file}"
 
     if command -v rch >/dev/null 2>&1; then
-        {
-            echo "[runner] rch"
-        } >>"${out_file}"
+        runner="rch"
+        printf "[runner] rch\n" >>"${out_file}"
         set +e
         timeout "${E2E_RCH_TIMEOUT_SECONDS:-240}" \
             rch exec -- cargo "${cargo_args[@]}" >>"${out_file}" 2>&1
@@ -65,24 +184,32 @@ run_cargo_with_rch_fallback() {
         set -e
 
         if [ "${rc}" -ne 0 ] && [ "${E2E_ALLOW_LOCAL_FALLBACK:-1}" = "1" ]; then
-            {
-                echo "[fallback] rch failed or stalled (rc=${rc}); retrying locally"
-                echo "[runner] local"
-            } >>"${out_file}"
+            fallback_local="true"
+            printf "[fallback] rch failed or stalled (rc=%s); retrying locally\n" "${rc}" >>"${out_file}"
+            printf "[runner] local\n" >>"${out_file}"
             set +e
             cargo "${cargo_args[@]}" >>"${out_file}" 2>&1
             rc=$?
             set -e
         fi
     else
-        {
-            echo "[runner] local (rch missing)"
-        } >>"${out_file}"
+        printf "[runner] local (rch missing)\n" >>"${out_file}"
         set +e
         cargo "${cargo_args[@]}" >>"${out_file}" 2>&1
         rc=$?
         set -e
     fi
+
+    ended_ms="$(_e2e_now_ms)"
+    elapsed_ms=$((ended_ms - started_ms))
+    append_cargo_diag \
+        "${case_id}" \
+        "${command_str}" \
+        "${runner}" \
+        "${fallback_local}" \
+        "${rc}" \
+        "${elapsed_ms}" \
+        "${out_file}"
 
     return "${rc}"
 }
@@ -95,6 +222,7 @@ run_render_case() {
     shift 4
     local -a cargo_args=("$@")
 
+    scenario_diag_begin "${case_id}"
     e2e_case_banner "${case_id}"
     e2e_log "description: ${description}"
     e2e_log "fixture payload: ${fixture_payload}"
@@ -104,10 +232,12 @@ run_render_case() {
     e2e_save_artifact "${case_id}_expected.txt" "${expected_render}"
 
     local out_file="${E2E_ARTIFACT_DIR}/${case_id}.log"
+    local fixture_file="${E2E_ARTIFACT_DIR}/${case_id}_fixture.txt"
+    local expected_file="${E2E_ARTIFACT_DIR}/${case_id}_expected.txt"
     local start_ms end_ms elapsed_ms
     start_ms="$(_e2e_now_ms)"
 
-    if run_cargo_with_rch_fallback "${out_file}" "${cargo_args[@]}"; then
+    if run_cargo_with_rch_fallback "${case_id}" "${out_file}" "${cargo_args[@]}"; then
         end_ms="$(_e2e_now_ms)"
         elapsed_ms=$((end_ms - start_ms))
         echo -e "${case_id}\t${elapsed_ms}" >> "${TIMING_REPORT}"
@@ -116,17 +246,18 @@ run_render_case() {
         if grep -q "test result: ok" "${out_file}"; then
             e2e_pass "${case_id}: cargo reported test result ok"
         else
-            e2e_fail "${case_id}: cargo output missing success marker"
+            scenario_fail "MISSING_SUCCESS_MARKER" "${case_id}: cargo output missing success marker"
             tail -n 80 "${out_file}" 2>/dev/null || true
         fi
     else
         end_ms="$(_e2e_now_ms)"
         elapsed_ms=$((end_ms - start_ms))
         echo -e "${case_id}\t${elapsed_ms}" >> "${TIMING_REPORT}"
-        e2e_fail "${description}"
+        scenario_fail "CARGO_COMMAND_FAILED" "${description}"
         e2e_log "command failed for ${case_id}; tail follows"
         tail -n 120 "${out_file}" 2>/dev/null || true
     fi
+    scenario_diag_finish "${fixture_file}" "${expected_file}" "${out_file}" "${CARGO_DIAG_FILE}" "${TIMING_REPORT}"
 }
 
 # Case 1
@@ -202,6 +333,7 @@ run_render_case \
     test -p mcp-agent-mail-server --lib tui_screens::threads::tests::render_full_screen_empty_no_panic -- --nocapture
 
 # Case 10 (composite): 100+ tree build path + render budget gate.
+scenario_diag_begin "case10_tree_perf_budget"
 e2e_case_banner "case10_tree_perf_budget"
 e2e_log "description: large thread-tree render/build performance envelope"
 e2e_log "tree structure: 100-message chain and per-screen render budget enforcement"
@@ -214,17 +346,21 @@ case10_start="$(_e2e_now_ms)"
 
 case10_ok=1
 if ! run_cargo_with_rch_fallback \
+    "case10_tree_perf_budget/tree_build" \
     "${CASE10_LOG_A}" \
     test -p mcp-agent-mail-server --lib tui_screens::threads::tests::tree_100_messages_builds_quickly -- --nocapture; then
     case10_ok=0
+    scenario_diag_mark_reason "TREE_BUILD_FAILED" "tree_100_messages_builds_quickly command failed"
 fi
 
 if [ "${case10_ok}" -eq 1 ]; then
     export MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1
     if ! run_cargo_with_rch_fallback \
+        "case10_tree_perf_budget/perf_budget" \
         "${CASE10_LOG_B}" \
         test -p mcp-agent-mail-server --test tui_perf_baselines perf_screen_render_80x24 -- --nocapture; then
         case10_ok=0
+        scenario_diag_mark_reason "PERF_BUDGET_COMMAND_FAILED" "perf_screen_render_80x24 command failed"
     fi
     unset MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS
 fi
@@ -238,15 +374,22 @@ if [ "${case10_ok}" -eq 1 ]; then
     if grep -q "test result: ok" "${CASE10_LOG_A}" && grep -q "test result: ok" "${CASE10_LOG_B}"; then
         e2e_pass "case10_tree_perf_budget: cargo reported success for both checks"
     else
-        e2e_fail "case10_tree_perf_budget: missing cargo success marker in logs"
+        scenario_fail "MISSING_SUCCESS_MARKER" "case10_tree_perf_budget: missing cargo success marker in logs"
     fi
 else
-    e2e_fail "Tree 100+ build path and/or render budget checks failed"
+    scenario_fail "TREE_PERF_BUDGET_FAILED" "Tree 100+ build path and/or render budget checks failed"
     e2e_log "case10 tree log tail:"
     tail -n 80 "${CASE10_LOG_A}" 2>/dev/null || true
     e2e_log "case10 budget log tail:"
     tail -n 80 "${CASE10_LOG_B}" 2>/dev/null || true
 fi
+scenario_diag_finish \
+    "${E2E_ARTIFACT_DIR}/case10_fixture.txt" \
+    "${E2E_ARTIFACT_DIR}/case10_expected.txt" \
+    "${CASE10_LOG_A}" \
+    "${CASE10_LOG_B}" \
+    "${TIMING_REPORT}" \
+    "${CARGO_DIAG_FILE}"
 
 e2e_save_artifact "frame_render_timing.tsv" "$(cat "${TIMING_REPORT}")"
 
