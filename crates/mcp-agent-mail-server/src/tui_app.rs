@@ -2409,12 +2409,17 @@ fn build_palette_actions_static() -> Vec<ActionItem> {
 
     for &id in ALL_SCREEN_IDS {
         let meta = screen_meta(id);
+        let key_hint = crate::tui_screens::jump_key_label_for_screen(id);
+        let desc = match key_hint {
+            Some(k) => format!("{} [key: {}]", meta.description, k),
+            None => format!("{} [via palette only]", meta.description),
+        };
         out.push(
             ActionItem::new(
                 screen_palette_action_id(id),
                 format!("Go to {}", meta.title),
             )
-            .with_description(meta.description)
+            .with_description(desc)
             .with_tags(&["screen", "navigate"])
             .with_category(screen_palette_category(id)),
         );
@@ -4280,6 +4285,48 @@ mod tests {
             let action_id = screen_palette_action_id(id);
             let round_tripped = screen_from_palette_action_id(action_id);
             assert_eq!(round_tripped, Some(id), "round-trip failed for {id:?}");
+        }
+    }
+
+    /// Guard: every registered screen is reachable by either a direct jump key
+    /// or a command palette entry (or both).
+    #[test]
+    fn every_screen_has_discoverable_jump_path() {
+        let actions = build_palette_actions_static();
+        for &id in ALL_SCREEN_IDS {
+            let has_key = crate::tui_screens::jump_key_label_for_screen(id).is_some();
+            let action_id = screen_palette_action_id(id);
+            let in_palette = actions.iter().any(|a| a.id == action_id);
+            assert!(
+                has_key || in_palette,
+                "screen {id:?} has no jump key and no palette entry"
+            );
+            // Also verify palette entry exists even if key exists (belt and suspenders).
+            assert!(
+                in_palette,
+                "screen {id:?} missing from command palette"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_screen_descriptions_include_key_hint() {
+        let actions = build_palette_actions_static();
+        for &id in ALL_SCREEN_IDS {
+            let action_id = screen_palette_action_id(id);
+            let action = actions.iter().find(|a| a.id == action_id).unwrap();
+            let desc = action.description.as_deref().unwrap_or("");
+            if let Some(key) = crate::tui_screens::jump_key_label_for_screen(id) {
+                assert!(
+                    desc.contains(&format!("[key: {key}]")),
+                    "palette entry for {id:?} should include key hint, got: {desc}"
+                );
+            } else {
+                assert!(
+                    desc.contains("[via palette only]"),
+                    "palette entry for {id:?} should indicate palette-only access, got: {desc}"
+                );
+            }
         }
     }
 
