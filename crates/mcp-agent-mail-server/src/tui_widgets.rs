@@ -5058,7 +5058,7 @@ pub fn generate_system_overview_mermaid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use ftui::GraphemePool;
     use ftui::layout::Rect;
@@ -5351,6 +5351,51 @@ mod tests {
         assert!(
             !thread_diagram.contains("next | part"),
             "subject sanitization should normalize pipe/newline:\n{thread_diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_contact_graph_empty_inputs_emit_valid_empty_graph() {
+        let diagram = generate_contact_graph_mermaid(&[], &[]);
+        assert_eq!(diagram, "graph LR\n", "{diagram}");
+        assert!(
+            ftui_extras::mermaid::parse(&diagram).is_ok(),
+            "empty contact graph should remain parseable:\n{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_contact_graph_50_nodes_stays_under_10ms() {
+        let mut contacts = Vec::new();
+        let mut messages = Vec::new();
+
+        for i in 0_u64..50_u64 {
+            let from = format!("Agent{i}");
+            let to = format!("Agent{}", (i + 1) % 50);
+            contacts.push(contact(&from, &to, "approved"));
+            let message_id = i64::try_from(i + 1).expect("message id fits in i64");
+            messages.push(MailEvent::message_sent(
+                message_id,
+                &from,
+                vec![to],
+                "[br-edpom] perf scenario",
+                "br-edpom",
+                "perf-proj",
+            ));
+        }
+
+        let start = Instant::now();
+        let diagram = generate_contact_graph_mermaid(&contacts, &messages);
+        let elapsed = start.elapsed();
+
+        assert!(
+            ftui_extras::mermaid::parse(&diagram).is_ok(),
+            "50-node contact graph should parse:\n{diagram}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "50-node generation exceeded budget: {} ms",
+            elapsed.as_millis()
         );
     }
 
