@@ -738,6 +738,9 @@ pub struct SearchCockpitScreen {
     focus: Focus,
     active_facet: FacetSlot,
     query_help_visible: bool,
+    /// Query Lab panel visible (toggled by `L`). Hidden by default for
+    /// progressive disclosure — power users can reveal debug state.
+    query_lab_visible: bool,
 
     // Search state
     db_conn: Option<DbConn>,
@@ -799,6 +802,7 @@ impl SearchCockpitScreen {
             focus: Focus::ResultList,
             active_facet: FacetSlot::DocKind,
             query_help_visible: false,
+            query_lab_visible: false,
             db_conn: None,
             db_conn_attempted: false,
             last_query: String::new(),
@@ -1708,6 +1712,7 @@ impl MailScreen for SearchCockpitScreen {
                         self.debounce_remaining = 0;
                     }
                     KeyCode::Char('r') => self.reset_facets(),
+                    KeyCode::Char('L') => self.query_lab_visible = !self.query_lab_visible,
                     KeyCode::Char('I') => self.dock.toggle_visible(),
                     KeyCode::Char(']') => self.dock.grow_dock(),
                     KeyCode::Char('[') => self.dock.shrink_dock(),
@@ -1817,6 +1822,9 @@ impl MailScreen for SearchCockpitScreen {
                                 ));
                             }
                         }
+                    }
+                    KeyCode::Char('L') => {
+                        self.query_lab_visible = !self.query_lab_visible;
                     }
                     KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
                         self.query_input.clear();
@@ -2047,6 +2055,10 @@ impl MailScreen for SearchCockpitScreen {
             HelpEntry {
                 key: "NOT term",
                 action: "Exclude term",
+            },
+            HelpEntry {
+                key: "L",
+                action: "Toggle query lab",
             },
         ]
     }
@@ -2368,7 +2380,11 @@ fn render_query_bar(
             .render(hint_area, frame);
     }
 
-    if inner.height >= 3 {
+    // Chips line: show when query is active or focus is on query bar
+    // (progressive disclosure — hidden when browsing results with no query)
+    let has_active_query = !screen.query_input.value().trim().is_empty();
+    let in_query = matches!(screen.focus, Focus::QueryBar);
+    if inner.height >= 3 && (has_active_query || in_query) {
         let meter = pulse_meter(ui_phase, 8);
         let chips = format!(
             "{}  scope:{}  type:{}  sort:{}  terms:{}",
@@ -2384,7 +2400,7 @@ fn render_query_bar(
             .render(chips_area, frame);
     }
 
-    if inner.height >= 4 {
+    if inner.height >= 4 && (has_active_query || in_query) {
         let telemetry_area = Rect::new(inner.x, inner.y + 3, inner.width, 1);
         Paragraph::new(truncate_str(telemetry, inner.width as usize))
             .style(Style::default().fg(FACET_ACTIVE_FG()))
@@ -2541,15 +2557,17 @@ fn render_facet_rail(
         }
     }
 
-    render_query_lab(frame, inner, screen);
+    if screen.query_lab_visible {
+        render_query_lab(frame, inner, screen);
+    }
 
     // Help hint at bottom
     let help_y = inner.y + inner.height - 1;
     if help_y > inner.y + 11 {
         let hint = if in_rail {
-            "Enter/click:toggle  wheel:facet  r:reset"
+            "Enter:toggle  wheel:facet  r:reset  L:lab"
         } else {
-            "f:facets  mouse:click/wheel"
+            "f:facets  L:query lab  mouse:click/wheel"
         };
         let hint_area = Rect::new(inner.x, help_y, inner.width, 1);
         Paragraph::new(truncate_str(hint, w))
@@ -4228,5 +4246,38 @@ mod tests {
     #[test]
     fn truncate_str_empty_input() {
         assert_eq!(truncate_str("", 5), "");
+    }
+
+    #[test]
+    fn query_lab_hidden_by_default() {
+        let screen = SearchCockpitScreen::new();
+        assert!(!screen.query_lab_visible, "query lab should be hidden by default");
+    }
+
+    #[test]
+    fn l_key_toggles_query_lab() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::ResultList;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        // Press L to show query lab
+        let l_key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('L')));
+        screen.update(&l_key, &state);
+        assert!(screen.query_lab_visible, "L should toggle query lab on");
+
+        // Press L again to hide
+        screen.update(&l_key, &state);
+        assert!(!screen.query_lab_visible, "L should toggle query lab off");
+    }
+
+    #[test]
+    fn l_key_works_in_facet_rail() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.focus = Focus::FacetRail;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        let l_key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('L')));
+        screen.update(&l_key, &state);
+        assert!(screen.query_lab_visible);
     }
 }
