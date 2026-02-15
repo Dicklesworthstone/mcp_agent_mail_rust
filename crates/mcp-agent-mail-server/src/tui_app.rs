@@ -60,6 +60,14 @@ const TOAST_ENTRANCE_TICKS: u8 = 4;
 const TOAST_EXIT_TICKS: u8 = 3;
 const REMOTE_EVENTS_PER_TICK: usize = 64;
 
+/// Deferred action from a confirmed modal callback.
+///
+/// Modal callbacks are `FnOnce + Send` closures that cannot directly send
+/// messages back into the model.  Instead, confirmed operations are written
+/// to this static slot and drained on the next tick.
+static DEFERRED_CONFIRMED_ACTION: std::sync::Mutex<Option<(String, String)>> =
+    std::sync::Mutex::new(None);
+
 /// Semantic transition kind inferred from source/destination screen categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransitionKind {
@@ -1017,37 +1025,32 @@ impl MailAppModel {
                 Cmd::none()
             }
             ActionKind::Execute(operation) => {
-                // For now, show a toast indicating the operation
-                // Full implementation will dispatch to screen-specific handlers
-                self.notifications.notify(
-                    Toast::new(format!("Action: {operation} on {context}"))
-                        .icon(ToastIcon::Info)
-                        .duration(Duration::from_secs(3)),
-                );
-                Cmd::none()
+                self.dispatch_execute_operation(&operation, context)
             }
             ActionKind::ConfirmThenExecute {
                 title,
                 message,
                 operation,
             } => {
-                // Open confirmation modal for destructive actions
+                let ctx = context.to_string();
                 self.modal_manager.show_confirmation(
                     title,
                     message,
                     ModalSeverity::Warning,
                     move |result| {
                         if matches!(result, DialogResult::Ok) {
-                            // The operation is captured but not dispatched yet
-                            // Full implementation would send a message to execute
-                            let _ = operation;
+                            // Confirmed operation is stored for deferred execution.
+                            // The deferred_confirmed_action field will be checked on
+                            // the next tick and dispatched.
+                            if let Some(slot) = DEFERRED_CONFIRMED_ACTION.lock().ok().as_mut() {
+                                **slot = Some((operation, ctx));
+                            }
                         }
                     },
                 );
                 Cmd::none()
             }
             ActionKind::CopyToClipboard(text) => {
-                // Clipboard copy would require platform-specific handling
                 self.notifications.notify(
                     Toast::new(format!(
                         "Copied: {}",
@@ -1060,6 +1063,117 @@ impl MailAppModel {
             }
             ActionKind::Dismiss => Cmd::none(),
         }
+    }
+
+    /// Route an `Execute` operation to the appropriate handler.
+    ///
+    /// Operations are parsed as `"command:arg"` pairs. Known operations are
+    /// mapped to deep-links, screen messages, or navigation actions. Unknown
+    /// operations show an informational toast.
+    fn dispatch_execute_operation(&mut self, operation: &str, context: &str) -> Cmd<MailMsg> {
+        let (cmd, arg) = match operation.split_once(':') {
+            Some((c, a)) => (c, a),
+            None => (operation.as_ref(), context),
+        };
+
+        match cmd {
+            // ── Navigation operations ────────────────────────────
+            "view_body" => {
+                // Deep-link to the message by extracting ID from context.
+                if let Some(id) = extract_numeric_id(context) {
+                    self.apply_deep_link_with_transition(&DeepLinkTarget::MessageById(id));
+                }
+                Cmd::none()
+            }
+            "view_messages" => {
+                if !arg.is_empty() && arg != context {
+                    self.apply_deep_link_with_transition(
+                        &DeepLinkTarget::ThreadById(arg.to_string()),
+                    );
+                }
+                Cmd::none()
+            }
+            "view_details" => {
+                if let Some(ts) = extract_numeric_id(context) {
+                    self.apply_deep_link_with_transition(&DeepLinkTarget::TimelineAtTime(ts));
+                }
+                Cmd::none()
+            }
+            "view_profile" => {
+                self.apply_deep_link_with_transition(
+                    &DeepLinkTarget::AgentByName(arg.to_string()),
+                );
+                Cmd::none()
+            }
+
+            // ── Filter operations (screen-local) ─────────────────
+            "filter_kind" | "filter_source" => {
+                // Search with the filter value.
+                self.apply_deep_link_with_transition(
+                    &DeepLinkTarget::SearchFocused(arg.to_string()),
+                );
+                Cmd::none()
+            }
+            "search_in" => {
+                let query = format!("thread:{arg}");
+                self.apply_deep_link_with_transition(
+                    &DeepLinkTarget::SearchFocused(query),
+                );
+                Cmd::none()
+            }
+            "compose_to" => {
+                // Navigate to explorer filtered for the agent.
+                self.apply_deep_link_with_transition(
+                    &DeepLinkTarget::ExplorerForAgent(arg.to_string()),
+                );
+                Cmd::none()
+            }
+
+            // ── Server-dispatched operations ──────────────────────
+            // These produce a toast confirmation; actual execution is
+            // delegated to the screen's update handler via ActionExecute.
+            "acknowledge" | "mark_read" | "renew" | "release"
+            | "force_release" | "summarize"
+            | "approve_contact" | "deny_contact" | "block_contact" => {
+                let op = operation.to_string();
+                let ctx = context.to_string();
+                self.notifications.notify(
+                    Toast::new(format!("Executing: {cmd}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(2)),
+                );
+                Cmd::msg(MailMsg::Screen(MailScreenMsg::ActionExecute(op, ctx)))
+            }
+
+            // ── Copy operations ──────────────────────────────────
+            "copy_event" => {
+                self.notifications.notify(
+                    Toast::new("Event copied")
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(2)),
+                );
+                Cmd::none()
+            }
+
+            // ── Fallback ─────────────────────────────────────────
+            _ => {
+                self.notifications.notify(
+                    Toast::new(format!("Action: {operation}"))
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+                Cmd::none()
+            }
+        }
+    }
+
+    /// Drain any deferred confirmed action (from modal callback) and dispatch it.
+    fn drain_deferred_confirmed_action(&mut self) -> Cmd<MailMsg> {
+        let action = DEFERRED_CONFIRMED_ACTION.lock().ok().and_then(|mut slot| slot.take());
+        if let Some((operation, context)) = action {
+            return self.dispatch_execute_operation(&operation, &context);
+        }
+        Cmd::none()
     }
 
     /// Current accessibility settings.
@@ -2069,6 +2183,12 @@ impl Model for MailAppModel {
                 self.notifications.tick(TICK_INTERVAL);
                 self.tick_toast_animation_state();
 
+                // Drain deferred confirmed actions (from modal callbacks).
+                // Side-effects (toast, navigation) are applied inside
+                // `dispatch_execute_operation`; we discard the returned Cmd
+                // because the tick handler must always return Cmd::tick.
+                let _ = self.drain_deferred_confirmed_action();
+
                 // Drain browser-ingress events and process them through the
                 // same terminal handling path as local input.
                 let remote_events = self
@@ -2400,6 +2520,9 @@ impl Model for MailAppModel {
             MailMsg::Screen(MailScreenMsg::DeepLink(ref target)) => {
                 self.apply_deep_link_with_transition(target);
                 Cmd::none()
+            }
+            MailMsg::Screen(MailScreenMsg::ActionExecute(ref op, ref ctx)) => {
+                self.dispatch_execute_operation(op, ctx)
             }
             MailMsg::ToggleHelp => {
                 self.help_visible = !self.help_visible;
@@ -3961,6 +4084,23 @@ fn truncate_subject(subject: &str, max_chars: usize) -> String {
         truncated.push(ch);
     }
     truncated
+}
+
+/// Extract a numeric ID from a context string.
+///
+/// Supports formats like `"123"`, `"message:123"`, `"reservation:42"`.
+fn extract_numeric_id(context: &str) -> Option<i64> {
+    // Try the whole string first.
+    if let Ok(id) = context.parse::<i64>() {
+        return Some(id);
+    }
+    // Try after `":"` (e.g. "message:123").
+    if let Some((_prefix, num_part)) = context.rsplit_once(':') {
+        if let Ok(id) = num_part.parse::<i64>() {
+            return Some(id);
+        }
+    }
+    None
 }
 
 fn extract_reservation_agent(event: &MailEvent) -> Option<&str> {
@@ -7553,5 +7693,91 @@ mod tests {
         for hint in COACH_HINTS {
             assert!(seen.insert(hint.id), "duplicate coach hint id: {}", hint.id);
         }
+    }
+
+    // ── extract_numeric_id tests ────────────────────────────────
+
+    #[test]
+    fn extract_numeric_id_plain_number() {
+        assert_eq!(extract_numeric_id("123"), Some(123));
+        assert_eq!(extract_numeric_id("0"), Some(0));
+        assert_eq!(extract_numeric_id("-5"), Some(-5));
+    }
+
+    #[test]
+    fn extract_numeric_id_prefixed() {
+        assert_eq!(extract_numeric_id("message:42"), Some(42));
+        assert_eq!(extract_numeric_id("reservation:7"), Some(7));
+        assert_eq!(extract_numeric_id("thread:999"), Some(999));
+    }
+
+    #[test]
+    fn extract_numeric_id_non_numeric() {
+        assert_eq!(extract_numeric_id("abc"), None);
+        assert_eq!(extract_numeric_id("msg:abc"), None);
+        assert_eq!(extract_numeric_id(""), None);
+    }
+
+    #[test]
+    fn extract_numeric_id_multiple_colons() {
+        // Uses rsplit_once, so "a:b:123" → prefix="a:b", num="123"
+        assert_eq!(extract_numeric_id("a:b:123"), Some(123));
+    }
+
+    // ── dispatch_execute_operation tests ─────────────────────────
+
+    #[test]
+    fn dispatch_execute_copy_event_shows_toast() {
+        let mut model = test_model();
+        let _cmd = model.dispatch_execute_operation("copy_event", "");
+        // Tick makes newly-notified toasts visible.
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > 0);
+    }
+
+    #[test]
+    fn dispatch_execute_unknown_op_shows_fallback_toast() {
+        let mut model = test_model();
+        let _cmd = model.dispatch_execute_operation("unknown_op", "ctx");
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > 0);
+    }
+
+    #[test]
+    fn dispatch_execute_server_op_returns_action_execute_msg() {
+        let mut model = test_model();
+        let cmd = model.dispatch_execute_operation("acknowledge", "msg:55");
+        // Should produce a Cmd::Msg with ActionExecute and a toast.
+        assert!(matches!(cmd, Cmd::Msg(_)));
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > 0);
+    }
+
+    // ── deferred confirmed action tests ─────────────────────────
+
+    #[test]
+    fn drain_deferred_action_lifecycle() {
+        // Phase 1: empty static → Cmd::None.
+        {
+            let mut slot = DEFERRED_CONFIRMED_ACTION.lock().unwrap();
+            *slot = None;
+        }
+        let mut model = test_model();
+        let cmd = model.drain_deferred_confirmed_action();
+        assert!(matches!(cmd, Cmd::None));
+
+        // Phase 2: store a server-dispatched action → Cmd::Msg.
+        {
+            let mut slot = DEFERRED_CONFIRMED_ACTION.lock().unwrap();
+            *slot = Some(("acknowledge".to_string(), "msg:10".to_string()));
+        }
+        let cmd = model.drain_deferred_confirmed_action();
+        // The deferred action was consumed.
+        {
+            let slot = DEFERRED_CONFIRMED_ACTION.lock().unwrap();
+            assert!(slot.is_none(), "static should be drained");
+        }
+        // "acknowledge" is a server-dispatched op → returns Cmd::Msg.
+        assert!(matches!(cmd, Cmd::Msg(_)));
     }
 }

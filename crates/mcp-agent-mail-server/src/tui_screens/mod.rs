@@ -291,6 +291,9 @@ pub enum MailScreenMsg {
     Navigate(MailScreenId),
     /// Navigate to a screen with context (deep-link).
     DeepLink(DeepLinkTarget),
+    /// Execute an action-menu operation on the active screen.
+    /// Contains `(operation, context_id)`.
+    ActionExecute(String, String),
 }
 
 /// Context for deep-link navigation between screens.
