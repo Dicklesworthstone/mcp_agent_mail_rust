@@ -80,12 +80,11 @@ const PYTHON_ONLY_TOOLS: &[&str] = &[
 
 /// Load the Python reference fixture.
 fn load_fixture() -> ToolDescriptionsFixture {
-    let fixture_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/fixtures/tool_descriptions.json");
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/conformance/fixtures/tool_descriptions.json");
     let content = std::fs::read_to_string(&fixture_path)
         .unwrap_or_else(|e| panic!("Failed to read fixture at {}: {e}", fixture_path.display()));
-    serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse fixture JSON: {e}"))
+    serde_json::from_str(&content).unwrap_or_else(|e| panic!("Failed to parse fixture JSON: {e}"))
 }
 
 /// Build a Rust MCP server with all features enabled and return the tool list.
@@ -125,7 +124,9 @@ fn diff_position(expected: &str, actual: &str) -> Option<(usize, String)> {
             let context_start = i.saturating_sub(30);
             let context_end_e = (i + 30).min(expected_chars.len());
             let context_end_a = (i + 30).min(actual_chars.len());
-            let expected_ctx: String = expected_chars[context_start..context_end_e].iter().collect();
+            let expected_ctx: String = expected_chars[context_start..context_end_e]
+                .iter()
+                .collect();
             let actual_ctx: String = actual_chars[context_start..context_end_a].iter().collect();
             return Some((
                 i,
@@ -151,11 +152,7 @@ fn diff_position(expected: &str, actual: &str) -> Option<(usize, String)> {
 }
 
 /// Compare inputSchema properties: property names, types, and required arrays.
-fn compare_input_schemas(
-    tool_name: &str,
-    expected: &Value,
-    actual: &Value,
-) -> Vec<String> {
+fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> Vec<String> {
     let mut errors = Vec::new();
 
     // Compare required arrays
@@ -212,7 +209,9 @@ fn compare_input_schemas(
         actual.get("properties").and_then(|p| p.as_object()),
     ) {
         for prop_name in expected_props.intersection(&actual_props) {
-            if let (Some(exp_prop), Some(act_prop)) = (exp_obj.get(prop_name), act_obj.get(prop_name)) {
+            if let (Some(exp_prop), Some(act_prop)) =
+                (exp_obj.get(prop_name), act_obj.get(prop_name))
+            {
                 // Compare type field
                 let exp_type = exp_prop.get("type");
                 let act_type = act_prop.get("type");
@@ -248,15 +247,10 @@ fn tool_descriptions_match_python_fixture() {
     let rust_tools = get_rust_tools();
 
     // Build lookup maps
-    let python_by_name: BTreeMap<&str, &FixtureTool> = fixture
-        .tools
-        .iter()
-        .map(|t| (t.name.as_str(), t))
-        .collect();
-    let rust_by_name: BTreeMap<String, &Tool> = rust_tools
-        .iter()
-        .map(|t| (t.name.clone(), t))
-        .collect();
+    let python_by_name: BTreeMap<&str, &FixtureTool> =
+        fixture.tools.iter().map(|t| (t.name.as_str(), t)).collect();
+    let rust_by_name: BTreeMap<String, &Tool> =
+        rust_tools.iter().map(|t| (t.name.clone(), t)).collect();
 
     let mut passed = 0u32;
     let mut failed = 0u32;
@@ -274,7 +268,10 @@ fn tool_descriptions_match_python_fixture() {
         let Some(rust_tool) = rust_by_name.get(&py_tool.name) else {
             eprintln!("FAIL: missing in Rust");
             failed += 1;
-            failures.push(format!("[{}] MISSING: tool not registered in Rust server", py_tool.name));
+            failures.push(format!(
+                "[{}] MISSING: tool not registered in Rust server",
+                py_tool.name
+            ));
             continue;
         };
 
@@ -323,9 +320,7 @@ fn tool_descriptions_match_python_fixture() {
 
     if !failures.is_empty() {
         let failure_report = failures.join("\n\n");
-        panic!(
-            "Tool description parity check failed ({failed} failures):\n\n{failure_report}"
-        );
+        panic!("Tool description parity check failed ({failed} failures):\n\n{failure_report}");
     }
 }
 
@@ -337,10 +332,8 @@ fn tool_input_schemas_match_python_fixture() {
     let fixture = load_fixture();
     let rust_tools = get_rust_tools();
 
-    let rust_by_name: BTreeMap<String, &Tool> = rust_tools
-        .iter()
-        .map(|t| (t.name.clone(), t))
-        .collect();
+    let rust_by_name: BTreeMap<String, &Tool> =
+        rust_tools.iter().map(|t| (t.name.clone(), t)).collect();
 
     let mut all_errors: Vec<String> = Vec::new();
     let mut passed = 0u32;
@@ -398,7 +391,8 @@ fn fixture_is_valid() {
     for tool in &fixture.tools {
         assert!(!tool.name.is_empty(), "Tool name must not be empty");
         assert!(
-            tool.input_schema.get("properties").is_some() || tool.input_schema.get("type").is_some(),
+            tool.input_schema.get("properties").is_some()
+                || tool.input_schema.get("type").is_some(),
             "Tool {} must have inputSchema with properties or type",
             tool.name
         );
@@ -548,15 +542,10 @@ fn check_cluster_descriptions(tool_names: &[&str]) {
     let fixture = load_fixture();
     let rust_tools = get_rust_tools();
 
-    let python_by_name: BTreeMap<&str, &FixtureTool> = fixture
-        .tools
-        .iter()
-        .map(|t| (t.name.as_str(), t))
-        .collect();
-    let rust_by_name: BTreeMap<String, &Tool> = rust_tools
-        .iter()
-        .map(|t| (t.name.clone(), t))
-        .collect();
+    let python_by_name: BTreeMap<&str, &FixtureTool> =
+        fixture.tools.iter().map(|t| (t.name.as_str(), t)).collect();
+    let rust_by_name: BTreeMap<String, &Tool> =
+        rust_tools.iter().map(|t| (t.name.clone(), t)).collect();
 
     let mut failures: Vec<String> = Vec::new();
 

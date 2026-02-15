@@ -222,26 +222,258 @@ pub(crate) mod tool_util {
         get_or_create_pool(&cfg).map_err(|e| McpError::internal_error(e.to_string()))
     }
 
+    /// Placeholder patterns that indicate unconfigured hooks/settings.
+    const PLACEHOLDER_PATTERNS: &[&str] = &[
+        "YOUR_PROJECT",
+        "YOUR_PROJECT_PATH",
+        "YOUR_PROJECT_KEY",
+        "PLACEHOLDER",
+        "<PROJECT>",
+        "{PROJECT}",
+        "$PROJECT",
+    ];
+
+    /// Compute similarity ratio between two strings (0.0 to 1.0).
+    ///
+    /// Mimics Python's `difflib.SequenceMatcher.ratio()` which returns
+    /// `2.0 * matching_chars / total_chars`.
+    fn similarity_score(a: &str, b: &str) -> f64 {
+        let a = a.to_ascii_lowercase();
+        let b = b.to_ascii_lowercase();
+        let a_bytes = a.as_bytes();
+        let b_bytes = b.as_bytes();
+        let total = a_bytes.len() + b_bytes.len();
+        if total == 0 {
+            return 1.0;
+        }
+        // LCS-based matching count (same algorithm as SequenceMatcher)
+        let m = a_bytes.len();
+        let n = b_bytes.len();
+        // Use DP for LCS length
+        let mut prev = vec![0u16; n + 1];
+        let mut curr = vec![0u16; n + 1];
+        for i in 1..=m {
+            for j in 1..=n {
+                curr[j] = if a_bytes[i - 1] == b_bytes[j - 1] {
+                    prev[j - 1] + 1
+                } else {
+                    prev[j].max(curr[j - 1])
+                };
+            }
+            std::mem::swap(&mut prev, &mut curr);
+            curr.fill(0);
+        }
+        let lcs_len = prev[n] as f64;
+        2.0 * lcs_len / total as f64
+    }
+
+    /// Find projects with similar slugs/names.
+    async fn find_similar_projects(
+        ctx: &McpContext,
+        pool: &DbPool,
+        identifier: &str,
+        limit: usize,
+        min_score: f64,
+    ) -> Vec<(String, String, f64)> {
+        let slug = mcp_agent_mail_core::slugify(identifier);
+        let out = mcp_agent_mail_db::queries::list_projects(ctx.cx(), pool).await;
+        let projects = match out {
+            asupersync::Outcome::Ok(v) => v,
+            _ => return Vec::new(),
+        };
+        let mut suggestions: Vec<(String, String, f64)> = Vec::new();
+        for p in &projects {
+            let slug_score = similarity_score(&slug, &p.slug);
+            let key_score = if p.human_key.is_empty() {
+                0.0
+            } else {
+                similarity_score(identifier, &p.human_key)
+            };
+            let best = slug_score.max(key_score);
+            if best >= min_score {
+                suggestions.push((p.slug.clone(), p.human_key.clone(), best));
+            }
+        }
+        suggestions.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        suggestions.truncate(limit);
+        suggestions
+    }
+
     pub async fn resolve_project(
         ctx: &McpContext,
         pool: &DbPool,
         project_key: &str,
     ) -> McpResult<mcp_agent_mail_db::ProjectRow> {
+        // 1. Empty/whitespace check
+        if project_key.is_empty() || project_key.trim().is_empty() {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                "Project identifier cannot be empty. Provide a project path like '/data/projects/myproject' or a slug like 'myproject'.",
+                true,
+                json!({"parameter": "project_key", "provided": format!("{project_key:?}")}),
+            ));
+        }
+
+        let raw_identifier = project_key.trim();
+
+        // 2. Placeholder detection
+        let identifier_upper = raw_identifier.to_ascii_uppercase();
+        for pattern in PLACEHOLDER_PATTERNS {
+            if identifier_upper.contains(pattern) || identifier_upper == *pattern {
+                return Err(legacy_tool_error(
+                    "CONFIGURATION_ERROR",
+                    format!(
+                        "Detected placeholder value '{}' instead of a real project path. \
+                         This typically means a hook or integration script hasn't been configured yet. \
+                         Replace placeholder values in your .claude/settings.json or environment variables \
+                         with actual project paths like '/Users/you/projects/myproject'.",
+                        raw_identifier
+                    ),
+                    true,
+                    json!({
+                        "parameter": "project_key",
+                        "provided": raw_identifier,
+                        "detected_placeholder": pattern,
+                        "fix_hint": "Update AGENT_MAIL_PROJECT or project_key in your configuration",
+                    }),
+                ));
+            }
+        }
+
         // Check read cache first (slug lookups only; ensure_project always hits DB)
-        if !project_key.starts_with('/') {
-            if let Some(cached) = mcp_agent_mail_db::read_cache().get_project(project_key) {
+        if !raw_identifier.starts_with('/') {
+            if let Some(cached) = mcp_agent_mail_db::read_cache().get_project(raw_identifier) {
                 return Ok(cached);
             }
         }
-        let out = if project_key.starts_with('/') {
-            mcp_agent_mail_db::queries::ensure_project(ctx.cx(), pool, project_key).await
+        let out = if raw_identifier.starts_with('/') {
+            mcp_agent_mail_db::queries::ensure_project(ctx.cx(), pool, raw_identifier).await
         } else {
-            mcp_agent_mail_db::queries::get_project_by_slug(ctx.cx(), pool, project_key).await
+            mcp_agent_mail_db::queries::get_project_by_slug(ctx.cx(), pool, raw_identifier).await
         };
-        let project = db_outcome_to_mcp_result(out)?;
-        // Populate cache on miss
-        mcp_agent_mail_db::read_cache().put_project(&project);
-        Ok(project)
+
+        match db_outcome_to_mcp_result(out) {
+            Ok(project) => {
+                // Populate cache on miss
+                mcp_agent_mail_db::read_cache().put_project(&project);
+                Ok(project)
+            }
+            Err(e) => {
+                // Only enhance NOT_FOUND errors with fuzzy suggestions
+                let is_not_found = e
+                    .data
+                    .as_ref()
+                    .and_then(|d| d["error"]["type"].as_str())
+                    .is_some_and(|t| t == "NOT_FOUND");
+
+                if !is_not_found {
+                    return Err(e);
+                }
+
+                // 3/4. NOT_FOUND: try fuzzy suggestions
+                let slug = mcp_agent_mail_core::slugify(raw_identifier);
+                let suggestions = find_similar_projects(ctx, pool, raw_identifier, 5, 0.4).await;
+
+                if suggestions.is_empty() {
+                    Err(legacy_tool_error(
+                        "NOT_FOUND",
+                        format!(
+                            "Project '{}' not found and no similar projects exist. \
+                             Use ensure_project to create a new project first. \
+                             Example: ensure_project(human_key='/path/to/your/project')",
+                            raw_identifier
+                        ),
+                        true,
+                        json!({"identifier": raw_identifier, "slug_searched": slug}),
+                    ))
+                } else {
+                    let suggestion_text = suggestions
+                        .iter()
+                        .take(3)
+                        .map(|s| format!("'{}'", s.0))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let suggestions_data: Vec<serde_json::Value> = suggestions
+                        .iter()
+                        .map(|s| {
+                            json!({
+                                "slug": s.0,
+                                "human_key": s.1,
+                                "score": (s.2 * 100.0).round() / 100.0,
+                            })
+                        })
+                        .collect();
+                    Err(legacy_tool_error(
+                        "NOT_FOUND",
+                        format!(
+                            "Project '{}' not found. Did you mean: {}? \
+                             Use ensure_project to create a new project, or check spelling.",
+                            raw_identifier, suggestion_text
+                        ),
+                        true,
+                        json!({
+                            "identifier": raw_identifier,
+                            "slug_searched": slug,
+                            "suggestions": suggestions_data,
+                        }),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Agent placeholder patterns that indicate unconfigured hooks/settings.
+    const AGENT_PLACEHOLDER_PATTERNS: &[&str] = &[
+        "YOUR_AGENT",
+        "YOUR_AGENT_NAME",
+        "AGENT_NAME",
+        "PLACEHOLDER",
+        "<AGENT>",
+        "{AGENT}",
+        "$AGENT",
+    ];
+
+    /// Find agents with similar names in a project.
+    async fn find_similar_agents(
+        ctx: &McpContext,
+        pool: &DbPool,
+        project_id: i64,
+        name: &str,
+        limit: usize,
+        min_score: f64,
+    ) -> Vec<(String, f64)> {
+        let out = mcp_agent_mail_db::queries::list_agents(ctx.cx(), pool, project_id).await;
+        let agents = match out {
+            asupersync::Outcome::Ok(v) => v,
+            _ => return Vec::new(),
+        };
+        let mut suggestions: Vec<(String, f64)> = Vec::new();
+        for a in &agents {
+            let score = similarity_score(name, &a.name);
+            if score >= min_score {
+                suggestions.push((a.name.clone(), score));
+            }
+        }
+        suggestions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        suggestions.truncate(limit);
+        suggestions
+    }
+
+    /// List agent names in a project (up to `limit`).
+    async fn list_project_agent_names(
+        ctx: &McpContext,
+        pool: &DbPool,
+        project_id: i64,
+        limit: usize,
+    ) -> (Vec<String>, usize) {
+        let out = mcp_agent_mail_db::queries::list_agents(ctx.cx(), pool, project_id).await;
+        let agents = match out {
+            asupersync::Outcome::Ok(v) => v,
+            _ => return (Vec::new(), 0),
+        };
+        let total = agents.len();
+        let names: Vec<String> = agents.into_iter().take(limit).map(|a| a.name).collect();
+        (names, total)
     }
 
     pub async fn resolve_agent(
@@ -249,17 +481,162 @@ pub(crate) mod tool_util {
         pool: &DbPool,
         project_id: i64,
         agent_name: &str,
+        project_slug: &str,
+        project_human_key: &str,
     ) -> McpResult<mcp_agent_mail_db::AgentRow> {
+        // 1. Empty/whitespace check
+        if agent_name.is_empty() || agent_name.trim().is_empty() {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "Agent name cannot be empty. Provide a valid agent name for project '{project_human_key}'."
+                ),
+                true,
+                json!({"parameter": "agent_name", "provided": format!("{agent_name:?}"), "project": project_slug}),
+            ));
+        }
+
+        let name = agent_name.trim();
+
+        // 2. Agent placeholder detection
+        let name_upper = name.to_ascii_uppercase();
+        for pattern in AGENT_PLACEHOLDER_PATTERNS {
+            if name_upper.contains(pattern) || name_upper == *pattern {
+                return Err(legacy_tool_error(
+                    "CONFIGURATION_ERROR",
+                    format!(
+                        "Detected placeholder value '{}' instead of a real agent name. \
+                         This typically means a hook or integration script hasn't been configured yet. \
+                         Replace placeholder values with your actual agent name (e.g., 'BlueMountain').",
+                        name
+                    ),
+                    true,
+                    json!({
+                        "parameter": "agent_name",
+                        "provided": name,
+                        "detected_placeholder": pattern,
+                        "fix_hint": "Update AGENT_MAIL_AGENT or agent_name in your configuration",
+                    }),
+                ));
+            }
+        }
+
         // Check read cache first
-        if let Some(cached) = mcp_agent_mail_db::read_cache().get_agent(project_id, agent_name) {
+        if let Some(cached) = mcp_agent_mail_db::read_cache().get_agent(project_id, name) {
             return Ok(cached);
         }
-        let out =
-            mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await;
-        let agent = db_outcome_to_mcp_result(out)?;
-        // Populate cache on miss
-        mcp_agent_mail_db::read_cache().put_agent(&agent);
-        Ok(agent)
+        let out = mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, name).await;
+
+        match db_outcome_to_mcp_result(out) {
+            Ok(agent) => {
+                // Populate cache on miss
+                mcp_agent_mail_db::read_cache().put_agent(&agent);
+                Ok(agent)
+            }
+            Err(e) => {
+                // Only enhance NOT_FOUND errors with suggestions
+                let is_not_found = e
+                    .data
+                    .as_ref()
+                    .and_then(|d| d["error"]["type"].as_str())
+                    .is_some_and(|t| t == "NOT_FOUND");
+
+                if !is_not_found {
+                    return Err(e);
+                }
+
+                // Check for common agent name mistakes
+                let mistake = mcp_agent_mail_core::detect_agent_name_mistake(name);
+                let mistake_hint = mistake
+                    .as_ref()
+                    .map(|(_, msg)| format!("\n\nHINT: {msg}"))
+                    .unwrap_or_default();
+                let mistake_type = mistake.as_ref().map(|(t, _)| *t);
+
+                let suggestions = find_similar_agents(ctx, pool, project_id, name, 5, 0.4).await;
+                let (available_agents, total_agents) =
+                    list_project_agent_names(ctx, pool, project_id, 10).await;
+
+                let error_type = mistake_type.unwrap_or("NOT_FOUND");
+
+                if !suggestions.is_empty() {
+                    // 3. Agent not found WITH suggestions
+                    let suggestion_text = suggestions
+                        .iter()
+                        .take(3)
+                        .map(|s| format!("'{}'", s.0))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let suggestions_data: Vec<serde_json::Value> = suggestions
+                        .iter()
+                        .map(|s| json!({"name": s.0, "score": (s.1 * 100.0).round() / 100.0}))
+                        .collect();
+                    Err(legacy_tool_error(
+                        error_type,
+                        format!(
+                            "Agent '{name}' not found in project '{project_human_key}'. \
+                             Did you mean: {suggestion_text}? \
+                             Agent names are case-insensitive but must match exactly.{mistake_hint}"
+                        ),
+                        true,
+                        json!({
+                            "agent_name": name,
+                            "project": project_slug,
+                            "suggestions": suggestions_data,
+                            "available_agents": available_agents,
+                            "mistake_type": mistake_type,
+                        }),
+                    ))
+                } else if !available_agents.is_empty() {
+                    // 4. Agent not found, agents exist but no match
+                    let agents_list = available_agents
+                        .iter()
+                        .take(5)
+                        .map(|a| format!("'{a}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let more_text = if total_agents > 5 {
+                        format!(" and {} more", total_agents - 5)
+                    } else {
+                        String::new()
+                    };
+                    Err(legacy_tool_error(
+                        error_type,
+                        format!(
+                            "Agent '{name}' not found in project '{project_human_key}'. \
+                             Available agents: {agents_list}{more_text}. \
+                             Use register_agent to create a new agent identity.{mistake_hint}"
+                        ),
+                        true,
+                        json!({
+                            "agent_name": name,
+                            "project": project_slug,
+                            "available_agents": available_agents,
+                            "mistake_type": mistake_type,
+                        }),
+                    ))
+                } else {
+                    // 5. No agents in project
+                    Err(legacy_tool_error(
+                        error_type,
+                        format!(
+                            "Agent '{name}' not found. Project '{project_human_key}' has no registered agents yet. \
+                             Use register_agent to create an agent identity first \
+                             (omit 'name' to auto-generate a valid one). \
+                             Example: register_agent(project_key='{project_slug}', \
+                             program='claude-code', model='opus-4'){mistake_hint}"
+                        ),
+                        true,
+                        json!({
+                            "agent_name": name,
+                            "project": project_slug,
+                            "available_agents": Vec::<String>::new(),
+                            "mistake_type": mistake_type,
+                        }),
+                    ))
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -411,6 +788,120 @@ pub(crate) mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "UNHANDLED_EXCEPTION");
             assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        // -------------------------------------------------------------------
+        // similarity_score
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn similarity_identical_strings() {
+            let score = similarity_score("hello", "hello");
+            assert!((score - 1.0).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn similarity_empty_strings() {
+            let score = similarity_score("", "");
+            assert!((score - 1.0).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn similarity_one_empty() {
+            let score = similarity_score("hello", "");
+            assert!((score - 0.0).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn similarity_case_insensitive() {
+            let score = similarity_score("Hello", "hello");
+            assert!((score - 1.0).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn similarity_similar_strings() {
+            let score = similarity_score("myproject", "my-project");
+            // Should be reasonably high (> 0.8)
+            assert!(score > 0.8);
+        }
+
+        #[test]
+        fn similarity_dissimilar_strings() {
+            let score = similarity_score("abcdef", "xyz123");
+            assert!(score < 0.3);
+        }
+
+        #[test]
+        fn similarity_partial_overlap() {
+            let score = similarity_score("backend", "backend-api");
+            // Should be moderately high
+            assert!(score > 0.6);
+        }
+
+        #[test]
+        fn similarity_is_symmetric() {
+            let s1 = similarity_score("project-a", "project-b");
+            let s2 = similarity_score("project-b", "project-a");
+            assert!((s1 - s2).abs() < f64::EPSILON);
+        }
+
+        // -------------------------------------------------------------------
+        // placeholder detection
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn placeholder_your_project_detected() {
+            for pattern in PLACEHOLDER_PATTERNS {
+                let upper = pattern.to_string();
+                // Direct match
+                assert!(
+                    upper.to_ascii_uppercase().contains(pattern)
+                        || upper.to_ascii_uppercase() == *pattern,
+                    "pattern {pattern} should match itself"
+                );
+            }
+        }
+
+        #[test]
+        fn placeholder_case_insensitive() {
+            let identifier = "your_project";
+            let upper = identifier.to_ascii_uppercase();
+            assert!(
+                PLACEHOLDER_PATTERNS
+                    .iter()
+                    .any(|p| upper.contains(p) || upper == *p),
+                "your_project should match YOUR_PROJECT pattern"
+            );
+        }
+
+        #[test]
+        fn placeholder_substring_match() {
+            let identifier = "prefix_YOUR_PROJECT_suffix";
+            let upper = identifier.to_ascii_uppercase();
+            assert!(
+                PLACEHOLDER_PATTERNS
+                    .iter()
+                    .any(|p| upper.contains(p) || upper == *p),
+                "should detect YOUR_PROJECT as substring"
+            );
+        }
+
+        #[test]
+        fn placeholder_real_path_not_detected() {
+            let real_paths = [
+                "/data/projects/backend",
+                "my-cool-project",
+                "data-projects-api",
+            ];
+            for path in real_paths {
+                let upper = path.to_ascii_uppercase();
+                assert!(
+                    !PLACEHOLDER_PATTERNS
+                        .iter()
+                        .any(|p| upper.contains(p) || upper == *p),
+                    "real path '{path}' should not be flagged as placeholder"
+                );
+            }
         }
     }
 }

@@ -382,7 +382,9 @@ pub async fn fetch_inbox_product(
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         // Skip if agent doesn't exist in this project.
-        let Ok(agent) = resolve_agent(ctx, &pool, project_id, &agent_name).await else {
+        let Ok(agent) =
+            resolve_agent(ctx, &pool, project_id, &agent_name, &p.slug, &p.human_key).await
+        else {
             continue;
         };
         let rows = db_outcome_to_mcp_result(

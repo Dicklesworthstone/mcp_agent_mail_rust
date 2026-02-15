@@ -539,9 +539,24 @@ pub async fn macro_contact_handshake(
         let project = resolve_project(ctx, &pool, &project_key).await?;
         let project_id = project.id.unwrap_or(0);
 
-        let from_row = crate::tool_util::resolve_agent(ctx, &pool, project_id, &from_agent).await?;
-        let mut to_row =
-            crate::tool_util::resolve_agent(ctx, &pool, project_id, &target_agent).await;
+        let from_row = crate::tool_util::resolve_agent(
+            ctx,
+            &pool,
+            project_id,
+            &from_agent,
+            &project.slug,
+            &project.human_key,
+        )
+        .await?;
+        let mut to_row = crate::tool_util::resolve_agent(
+            ctx,
+            &pool,
+            project_id,
+            &target_agent,
+            &project.slug,
+            &project.human_key,
+        )
+        .await;
         if to_row.is_err() {
             let should_register = register_if_missing.unwrap_or(true);
             if should_register {
@@ -557,8 +572,15 @@ pub async fn macro_contact_handshake(
                     None,
                 )
                 .await?;
-                to_row =
-                    crate::tool_util::resolve_agent(ctx, &pool, project_id, &target_agent).await;
+                to_row = crate::tool_util::resolve_agent(
+                    ctx,
+                    &pool,
+                    project_id,
+                    &target_agent,
+                    &project.slug,
+                    &project.human_key,
+                )
+                .await;
             }
         }
         let to_row = to_row.map_err(|_| {

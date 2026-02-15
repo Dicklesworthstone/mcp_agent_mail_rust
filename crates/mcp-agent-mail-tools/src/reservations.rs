@@ -205,7 +205,7 @@ pub async fn file_reservation_paths(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
+    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Check for conflicts with existing active reservations
@@ -398,7 +398,7 @@ pub async fn release_file_reservations(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
+    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Convert paths to slice of &str
@@ -462,7 +462,7 @@ pub async fn renew_file_reservations(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
+    let agent = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
     let agent_id = agent.id.unwrap_or(0);
 
     // Convert paths to slice of &str
@@ -558,7 +558,7 @@ pub async fn force_release_file_reservation(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
-    let actor = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
+    let actor = resolve_agent(ctx, &pool, project_id, &agent_name, &project.slug, &project.human_key).await?;
 
     let reservations = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)

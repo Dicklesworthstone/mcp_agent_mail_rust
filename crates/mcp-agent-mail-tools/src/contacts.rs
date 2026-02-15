@@ -113,8 +113,19 @@ async fn resolve_or_register_sender(
     program: Option<String>,
     model: Option<String>,
     task_description: Option<&str>,
+    project_slug: &str,
+    project_human_key: &str,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
-    match resolve_agent(ctx, pool, project_id, from_agent).await {
+    match resolve_agent(
+        ctx,
+        pool,
+        project_id,
+        from_agent,
+        project_slug,
+        project_human_key,
+    )
+    .await
+    {
         Ok(a) => Ok(a),
         Err(e) if !register_if_missing => Err(e),
         Err(_) => {
@@ -213,6 +224,8 @@ pub async fn request_contact(
         program,
         model,
         task_description.as_deref(),
+        &project.slug,
+        &project.human_key,
     )
     .await?;
 
@@ -221,7 +234,15 @@ pub async fn request_contact(
     let target_project_row = resolve_project(ctx, &pool, &target_project_key).await?;
     let target_project_id = target_project_row.id.unwrap_or(0);
 
-    let to_row = resolve_agent(ctx, &pool, target_project_id, &target_agent_name).await?;
+    let to_row = resolve_agent(
+        ctx,
+        &pool,
+        target_project_id,
+        &target_agent_name,
+        &target_project_row.slug,
+        &target_project_row.human_key,
+    )
+    .await?;
 
     let ttl = ttl_seconds.unwrap_or(604_800).max(60); // 7 days default; min 60s
     let link_row = db_outcome_to_mcp_result(
@@ -339,8 +360,24 @@ pub async fn respond_contact(
     let source_project_row = resolve_project(ctx, &pool, &source_project_key).await?;
     let source_project_id = source_project_row.id.unwrap_or(0);
 
-    let from_row = resolve_agent(ctx, &pool, source_project_id, &from_agent).await?;
-    let to_row = resolve_agent(ctx, &pool, project_id, &to_agent).await?;
+    let from_row = resolve_agent(
+        ctx,
+        &pool,
+        source_project_id,
+        &from_agent,
+        &source_project_row.slug,
+        &source_project_row.human_key,
+    )
+    .await?;
+    let to_row = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &to_agent,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
 
     let ttl = ttl_seconds.unwrap_or(2_592_000).max(60); // 30 days default; min 60s
     let (updated, link_row) = db_outcome_to_mcp_result(
@@ -389,7 +426,15 @@ pub async fn list_contacts(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
     let agent_id = agent.id.unwrap_or(0);
 
     let (outgoing_rows, _incoming_rows) = db_outcome_to_mcp_result(
