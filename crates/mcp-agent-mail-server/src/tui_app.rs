@@ -7757,27 +7757,119 @@ mod tests {
 
     #[test]
     fn drain_deferred_action_lifecycle() {
-        // Phase 1: empty static → Cmd::None.
-        {
-            let mut slot = DEFERRED_CONFIRMED_ACTION.lock().unwrap();
-            *slot = None;
+        fn clear() {
+            match DEFERRED_CONFIRMED_ACTION.lock() {
+                Ok(mut s) => *s = None,
+                Err(e) => *e.into_inner() = None,
+            }
         }
+        fn store(op: &str, ctx: &str) {
+            match DEFERRED_CONFIRMED_ACTION.lock() {
+                Ok(mut s) => *s = Some((op.to_string(), ctx.to_string())),
+                Err(e) => *e.into_inner() = Some((op.to_string(), ctx.to_string())),
+            }
+        }
+        fn is_empty() -> bool {
+            match DEFERRED_CONFIRMED_ACTION.lock() {
+                Ok(s) => s.is_none(),
+                Err(e) => e.into_inner().is_none(),
+            }
+        }
+
+        // Phase 1: empty static → Cmd::None.
+        clear();
         let mut model = test_model();
         let cmd = model.drain_deferred_confirmed_action();
         assert!(matches!(cmd, Cmd::None));
 
         // Phase 2: store a server-dispatched action → Cmd::Msg.
-        {
-            let mut slot = DEFERRED_CONFIRMED_ACTION.lock().unwrap();
-            *slot = Some(("acknowledge".to_string(), "msg:10".to_string()));
-        }
+        store("acknowledge", "msg:10");
         let cmd = model.drain_deferred_confirmed_action();
-        // The deferred action was consumed.
-        {
-            let slot = DEFERRED_CONFIRMED_ACTION.lock().unwrap();
-            assert!(slot.is_none(), "static should be drained");
-        }
-        // "acknowledge" is a server-dispatched op → returns Cmd::Msg.
+        assert!(is_empty(), "static should be drained");
         assert!(matches!(cmd, Cmd::Msg(_)));
+    }
+
+    // ── ConfirmThenExecute end-to-end tests ─────────────────────
+    //
+    // These tests share the global DEFERRED_CONFIRMED_ACTION static, so
+    // they are combined into a single sequential test to avoid races.
+
+    #[test]
+    fn confirm_then_execute_lifecycle() {
+        // Helper: recover from poisoned Mutex.
+        fn clear_deferred() {
+            match DEFERRED_CONFIRMED_ACTION.lock() {
+                Ok(mut slot) => *slot = None,
+                Err(e) => *e.into_inner() = None,
+            }
+        }
+        fn read_deferred() -> Option<(String, String)> {
+            match DEFERRED_CONFIRMED_ACTION.lock() {
+                Ok(slot) => slot.clone(),
+                Err(e) => e.into_inner().clone(),
+            }
+        }
+
+        // ── Phase 1: ConfirmThenExecute shows a modal ────────────
+        clear_deferred();
+        let mut model = test_model();
+        let _cmd = model.dispatch_action_menu_selection(
+            ActionKind::ConfirmThenExecute {
+                title: "Delete?".to_string(),
+                message: "This is destructive".to_string(),
+                operation: "force_release:42".to_string(),
+            },
+            "ctx",
+        );
+        assert!(model.modal_manager.is_active(), "modal should be shown");
+        // Dismiss for next phase.
+        model.modal_manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
+
+        // ── Phase 2: OK stores the deferred action ───────────────
+        clear_deferred();
+        model.dispatch_action_menu_selection(
+            ActionKind::ConfirmThenExecute {
+                title: "Release?".to_string(),
+                message: "Confirm release".to_string(),
+                operation: "release:7".to_string(),
+            },
+            "reservation:7",
+        );
+        model.modal_manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
+        assert!(!model.modal_manager.is_active());
+
+        let stored = read_deferred();
+        let (op, ctx) = stored.as_ref().expect("deferred action should be set");
+        assert_eq!(op, "release:7");
+        assert_eq!(ctx, "reservation:7");
+
+        // ── Phase 3: Cancel does NOT store ───────────────────────
+        clear_deferred();
+        model.dispatch_action_menu_selection(
+            ActionKind::ConfirmThenExecute {
+                title: "Delete?".to_string(),
+                message: "Sure?".to_string(),
+                operation: "force_release:99".to_string(),
+            },
+            "ctx",
+        );
+        model.modal_manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Escape)));
+        assert!(!model.modal_manager.is_active());
+        assert!(read_deferred().is_none(), "cancelled confirm should not store");
+
+        // ── Phase 4: Full lifecycle via tick drain ────────────────
+        clear_deferred();
+        model.dispatch_action_menu_selection(
+            ActionKind::ConfirmThenExecute {
+                title: "Acknowledge?".to_string(),
+                message: "Acknowledge message 55?".to_string(),
+                operation: "acknowledge:55".to_string(),
+            },
+            "msg:55",
+        );
+        model.modal_manager.handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter)));
+        let cmd = model.drain_deferred_confirmed_action();
+        assert!(matches!(cmd, Cmd::Msg(_)), "acknowledge → Cmd::Msg");
+        assert!(read_deferred().is_none(), "static should be drained");
     }
 }
