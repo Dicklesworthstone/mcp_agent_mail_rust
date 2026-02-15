@@ -79,7 +79,7 @@ fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T>
 /// - `inbox_limit`: Max inbox messages to fetch
 #[allow(clippy::too_many_arguments)]
 #[tool(
-    description = "Boot a project session: ensure project, register agent, reserve files, fetch inbox."
+    description = "Macro helper that boots a project session: ensure project, register agent,\noptionally file_reservation paths, and fetch the latest inbox snapshot."
 )]
 pub async fn macro_start_session(
     ctx: &McpContext,
@@ -192,7 +192,7 @@ pub async fn macro_start_session(
 /// - `inbox_limit`: Max inbox messages
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
-    description = "Align with an existing thread: register agent, summarize thread, fetch inbox."
+    description = "Macro helper that aligns an agent with an existing thread by ensuring registration,\nsummarising the thread, and fetching recent inbox context."
 )]
 pub async fn macro_prepare_thread(
     ctx: &McpContext,
@@ -374,7 +374,7 @@ pub async fn macro_prepare_thread(
 /// - `reason`: Reservation reason
 /// - `auto_release`: Release after operation
 #[allow(clippy::too_many_arguments)]
-#[tool(description = "Reserve files and optionally release them at the end.")]
+#[tool(description = "Reserve a set of file paths and optionally release them at the end of the workflow.")]
 pub async fn macro_file_reservation_cycle(
     ctx: &McpContext,
     project_key: String,
@@ -481,7 +481,7 @@ pub async fn macro_file_reservation_cycle(
 /// - `program`: Program for registration
 /// - `model`: Model for registration
 /// - `task_description`: Task for registration
-#[tool(description = "Request contact + optionally approve + send welcome message.")]
+#[tool(description = "Request contact permissions and optionally auto-approve plus send a welcome message.")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn macro_contact_handshake(
     ctx: &McpContext,

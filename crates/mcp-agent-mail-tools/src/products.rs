@@ -100,7 +100,7 @@ pub struct ProductResponse {
 }
 
 /// Ensure a Product exists. If not, create one.
-#[tool(description = "Ensure a Product exists. If not, create one.")]
+#[tool(description = "Ensure a Product exists. If not, create one.\n\n- product_key may be a product_uid or a name\n- If both are absent, error")]
 pub async fn ensure_product(
     ctx: &McpContext,
     product_key: Option<String>,
@@ -335,7 +335,7 @@ pub async fn search_messages_product(
 
 /// Retrieve recent messages for an agent across all projects linked to a product (non-mutating).
 #[tool(
-    description = "Retrieve recent messages for an agent across all projects linked to a product."
+    description = "Retrieve recent messages for an agent across all projects linked to a product (non-mutating)."
 )]
 pub async fn fetch_inbox_product(
     ctx: &McpContext,
@@ -431,7 +431,7 @@ pub async fn fetch_inbox_product(
 }
 
 /// Summarize a thread (by id or thread key) across all projects linked to a product.
-#[tool(description = "Summarize a thread across all projects linked to a product.")]
+#[tool(description = "Summarize a thread (by id or thread key) across all projects linked to a product.")]
 #[allow(clippy::too_many_arguments)]
 pub async fn summarize_thread_product(
     ctx: &McpContext,
