@@ -700,6 +700,57 @@ pub const SELECTION_PREFIX: &str = "▶ ";
 pub const SELECTION_PREFIX_EMPTY: &str = "  ";
 
 // ──────────────────────────────────────────────────────────────────────
+// Semantic typography hierarchy
+// ──────────────────────────────────────────────────────────────────────
+//
+// Six strata of visual importance, from highest to lowest:
+//
+//   1. **Title**   — Screen/section headings. Bold + primary FG.
+//   2. **Section** — Sub-section labels.  Bold + secondary FG.
+//   3. **Primary** — Main content text.  Primary FG, normal weight.
+//   4. **Meta**    — Supporting metadata (timestamps, counts).  Muted FG.
+//   5. **Hint**    — Inline tips, shortcut hints.  Muted FG, dim.
+//   6. **Muted**   — Disabled, de-emphasized.  Disabled FG, dim.
+//
+// Usage: `let s = text_title(&tp);` then apply via `.fg(s.fg).bold()`.
+
+/// Title-level text: screen headings, dialog titles.
+#[must_use]
+pub fn text_title(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.text_primary).bold()
+}
+
+/// Section-level text: panel headings, group labels.
+#[must_use]
+pub fn text_section(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.text_secondary).bold()
+}
+
+/// Primary body text: main content, list items.
+#[must_use]
+pub fn text_primary(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.text_primary)
+}
+
+/// Metadata text: timestamps, IDs, counts, labels.
+#[must_use]
+pub fn text_meta(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.text_muted)
+}
+
+/// Hint text: inline tips, keyboard shortcut hints.
+#[must_use]
+pub fn text_hint(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.text_muted).dim()
+}
+
+/// Muted/disabled text: unavailable items, placeholders.
+#[must_use]
+pub fn text_disabled(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.text_disabled).dim()
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // JSON token style helpers
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1006,5 +1057,69 @@ mod tests {
             theme.admonition_caution.fg.is_some(),
             "admonition_caution should have fg"
         );
+    }
+
+    // ── Semantic typography hierarchy tests ──────────────────────
+
+    #[test]
+    fn typography_hierarchy_has_distinct_strata() {
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let tp = TuiThemePalette::current();
+        let title = text_title(&tp);
+        let section = text_section(&tp);
+        let primary = text_primary(&tp);
+        let meta = text_meta(&tp);
+        let hint = text_hint(&tp);
+        let disabled = text_disabled(&tp);
+
+        // Title and section should have fg set.
+        assert!(title.fg.is_some(), "title needs fg");
+        assert!(section.fg.is_some(), "section needs fg");
+        assert!(primary.fg.is_some(), "primary needs fg");
+        assert!(meta.fg.is_some(), "meta needs fg");
+        assert!(hint.fg.is_some(), "hint needs fg");
+        assert!(disabled.fg.is_some(), "disabled needs fg");
+
+        // Title should be bold.
+        use ftui::style::StyleFlags;
+        let has = |s: &Style, f: StyleFlags| s.attrs.map_or(false, |a| a.contains(f));
+        assert!(has(&title, StyleFlags::BOLD), "title must be bold");
+        assert!(has(&section, StyleFlags::BOLD), "section must be bold");
+
+        // Hint and disabled should be dim.
+        assert!(has(&hint, StyleFlags::DIM), "hint must be dim");
+        assert!(has(&disabled, StyleFlags::DIM), "disabled must be dim");
+
+        // Primary should NOT be bold.
+        assert!(!has(&primary, StyleFlags::BOLD), "primary should not be bold");
+    }
+
+    #[test]
+    fn typography_hierarchy_consistent_across_themes() {
+        for &theme_id in &[
+            ThemeId::CyberpunkAurora,
+            ThemeId::Darcula,
+            ThemeId::NordicFrost,
+            ThemeId::HighContrast,
+        ] {
+            let _guard = ScopedThemeLock::new(theme_id);
+            let tp = TuiThemePalette::current();
+
+            // Every theme must produce valid (non-zero fg) styles.
+            let styles = [
+                ("title", text_title(&tp)),
+                ("section", text_section(&tp)),
+                ("primary", text_primary(&tp)),
+                ("meta", text_meta(&tp)),
+                ("hint", text_hint(&tp)),
+                ("disabled", text_disabled(&tp)),
+            ];
+            for (name, style) in &styles {
+                assert!(
+                    style.fg.is_some(),
+                    "{name} missing fg in theme {theme_id:?}"
+                );
+            }
+        }
     }
 }
