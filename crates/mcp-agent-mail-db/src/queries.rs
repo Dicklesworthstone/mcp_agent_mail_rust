@@ -2103,10 +2103,22 @@ pub fn sanitize_fts_query(query: &str) -> Option<String> {
         result = trimmed_end;
     }
 
+    // Strip SQL comment markers (-- and /*) that have no FTS5 meaning
+    while result.contains("--") {
+        result = result.replace("--", " ");
+    }
+    while result.contains("/*") {
+        result = result.replace("/*", " ");
+    }
+    while result.contains("*/") {
+        result = result.replace("*/", " ");
+    }
+
     // Collapse multiple consecutive spaces
     while result.contains("  ") {
         result = result.replace("  ", " ");
     }
+    let mut result = result.trim().to_string();
 
     // Quote hyphenated tokens to prevent FTS5 from interpreting hyphens as operators.
     // Match: POL-358, FEAT-123, foo-bar-baz (not already quoted)
@@ -5127,6 +5139,17 @@ mod tests {
             sanitize_fts_query("\"build plan\""),
             Some("\"build plan\"".to_string())
         );
+    }
+
+    #[test]
+    fn sanitize_strips_sql_comment_markers() {
+        // Double-dash (SQL line comment)
+        assert_eq!(sanitize_fts_query("--a"), Some("a".to_string()));
+        assert_eq!(sanitize_fts_query("foo -- bar"), Some("foo bar".to_string()));
+        assert!(sanitize_fts_query("--").is_none());
+        // Block comment markers
+        assert_eq!(sanitize_fts_query("foo /* bar"), Some("foo bar".to_string()));
+        assert_eq!(sanitize_fts_query("foo */ bar"), Some("foo bar".to_string()));
     }
 
     #[test]
