@@ -263,8 +263,11 @@ pub(crate) mod tool_util {
             std::mem::swap(&mut prev, &mut curr);
             curr.fill(0);
         }
-        let lcs_len = prev[n] as f64;
-        2.0 * lcs_len / total as f64
+        let lcs_len = f64::from(prev[n]);
+        let Ok(total_u32) = u32::try_from(total) else {
+            return 0.0;
+        };
+        2.0 * lcs_len / f64::from(total_u32)
     }
 
     /// Find projects with similar slugs/names.
@@ -277,9 +280,8 @@ pub(crate) mod tool_util {
     ) -> Vec<(String, String, f64)> {
         let slug = mcp_agent_mail_core::slugify(identifier);
         let out = mcp_agent_mail_db::queries::list_projects(ctx.cx(), pool).await;
-        let projects = match out {
-            asupersync::Outcome::Ok(v) => v,
-            _ => return Vec::new(),
+        let asupersync::Outcome::Ok(projects) = out else {
+            return Vec::new();
         };
         let mut suggestions: Vec<(String, String, f64)> = Vec::new();
         for p in &projects {
@@ -299,6 +301,7 @@ pub(crate) mod tool_util {
         suggestions
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn resolve_project(
         ctx: &McpContext,
         pool: &DbPool,
@@ -323,11 +326,10 @@ pub(crate) mod tool_util {
                 return Err(legacy_tool_error(
                     "CONFIGURATION_ERROR",
                     format!(
-                        "Detected placeholder value '{}' instead of a real project path. \
+                        "Detected placeholder value '{raw_identifier}' instead of a real project path. \
                          This typically means a hook or integration script hasn't been configured yet. \
                          Replace placeholder values in your .claude/settings.json or environment variables \
-                         with actual project paths like '/Users/you/projects/myproject'.",
-                        raw_identifier
+                         with actual project paths like '/Users/you/projects/myproject'."
                     ),
                     true,
                     json!({
@@ -378,10 +380,9 @@ pub(crate) mod tool_util {
                     Err(legacy_tool_error(
                         "NOT_FOUND",
                         format!(
-                            "Project '{}' not found and no similar projects exist. \
+                            "Project '{raw_identifier}' not found and no similar projects exist. \
                              Use ensure_project to create a new project first. \
-                             Example: ensure_project(human_key='/path/to/your/project')",
-                            raw_identifier
+                             Example: ensure_project(human_key='/path/to/your/project')"
                         ),
                         true,
                         json!({"identifier": raw_identifier, "slug_searched": slug}),
@@ -406,9 +407,8 @@ pub(crate) mod tool_util {
                     Err(legacy_tool_error(
                         "NOT_FOUND",
                         format!(
-                            "Project '{}' not found. Did you mean: {}? \
-                             Use ensure_project to create a new project, or check spelling.",
-                            raw_identifier, suggestion_text
+                            "Project '{raw_identifier}' not found. Did you mean: {suggestion_text}? \
+                             Use ensure_project to create a new project, or check spelling."
                         ),
                         true,
                         json!({
@@ -443,9 +443,8 @@ pub(crate) mod tool_util {
         min_score: f64,
     ) -> Vec<(String, f64)> {
         let out = mcp_agent_mail_db::queries::list_agents(ctx.cx(), pool, project_id).await;
-        let agents = match out {
-            asupersync::Outcome::Ok(v) => v,
-            _ => return Vec::new(),
+        let asupersync::Outcome::Ok(agents) = out else {
+            return Vec::new();
         };
         let mut suggestions: Vec<(String, f64)> = Vec::new();
         for a in &agents {
@@ -467,15 +466,15 @@ pub(crate) mod tool_util {
         limit: usize,
     ) -> (Vec<String>, usize) {
         let out = mcp_agent_mail_db::queries::list_agents(ctx.cx(), pool, project_id).await;
-        let agents = match out {
-            asupersync::Outcome::Ok(v) => v,
-            _ => return (Vec::new(), 0),
+        let asupersync::Outcome::Ok(agents) = out else {
+            return (Vec::new(), 0);
         };
         let total = agents.len();
         let names: Vec<String> = agents.into_iter().take(limit).map(|a| a.name).collect();
         (names, total)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn resolve_agent(
         ctx: &McpContext,
         pool: &DbPool,
@@ -505,10 +504,9 @@ pub(crate) mod tool_util {
                 return Err(legacy_tool_error(
                     "CONFIGURATION_ERROR",
                     format!(
-                        "Detected placeholder value '{}' instead of a real agent name. \
+                        "Detected placeholder value '{name}' instead of a real agent name. \
                          This typically means a hook or integration script hasn't been configured yet. \
-                         Replace placeholder values with your actual agent name (e.g., 'BlueMountain').",
-                        name
+                         Replace placeholder values with your actual agent name (e.g., 'BlueMountain')."
                     ),
                     true,
                     json!({

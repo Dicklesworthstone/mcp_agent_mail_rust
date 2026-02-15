@@ -96,31 +96,28 @@ pub struct RenewedReservation {
     pub new_expires_ts: String,
 }
 
-/// Detect suspicious file reservation patterns (matching Python's _detect_suspicious_file_reservation).
+/// Detect suspicious file reservation patterns (matching Python's `_detect_suspicious_file_reservation`).
 fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
     let p = pattern.trim();
     // 1. Too-broad patterns
     if matches!(p, "*" | "**" | "**/*" | "**/**" | ".") {
         return Some(format!(
-            "Pattern '{}' is too broad and would reserve the entire project. \
-             Use more specific patterns like 'src/api/*.py' or 'lib/auth/**'.",
-            p
+            "Pattern '{p}' is too broad and would reserve the entire project. \
+             Use more specific patterns like 'src/api/*.py' or 'lib/auth/**'."
         ));
     }
     // 2. Absolute paths (but not UNC paths starting with //)
     if p.starts_with('/') && !p.starts_with("//") {
         return Some(format!(
-            "Pattern '{}' looks like an absolute path. File reservation patterns should be \
-             project-relative (e.g., 'src/module.py' not '/full/path/src/module.py').",
-            p
+            "Pattern '{p}' looks like an absolute path. File reservation patterns should be \
+             project-relative (e.g., 'src/module.py' not '/full/path/src/module.py')."
         ));
     }
     // 3. Very short patterns with wildcards
     if p.len() <= 2 && p.contains('*') {
         return Some(format!(
-            "Pattern '{}' is very short and may match more files than intended. \
-             Consider using a more specific pattern.",
-            p
+            "Pattern '{p}' is very short and may match more files than intended. \
+             Consider using a more specific pattern."
         ));
     }
     None

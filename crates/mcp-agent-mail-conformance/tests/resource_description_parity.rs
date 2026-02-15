@@ -4,9 +4,14 @@
 //! Conformance tests verifying Rust resource descriptions match the Python reference.
 //! Each Python resource docstring becomes the MCP resource description.
 
-use fastmcp::{Cx, ListResourcesParams, Resource};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+
+/// A unified (uri, description) from both resources and resource templates.
+struct ResourceEntry {
+    uri: String,
+    description: Option<String>,
+}
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -48,31 +53,37 @@ impl Drop for EnvVarGuard {
     }
 }
 
-fn collect_resources() -> Vec<Resource> {
+fn collect_all_resources() -> Vec<ResourceEntry> {
     let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
     let _guard = EnvVarGuard::set(&[
         ("WORKTREES_ENABLED", "true"),
         ("TOOL_FILTER_PROFILE", "full"),
     ]);
-    let cx = Cx::for_testing();
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
-    router
-        .handle_resources_list(
-            &cx,
-            ListResourcesParams {
-                cursor: None,
-                include_tags: None,
-                exclude_tags: None,
-            },
-            None,
-        )
-        .expect("resources/list should succeed")
-        .resources
+
+    let mut entries = Vec::new();
+
+    // Static resources (no path params)
+    for r in router.resources() {
+        entries.push(ResourceEntry {
+            uri: r.uri.clone(),
+            description: r.description.clone(),
+        });
+    }
+
+    // Resource templates (with path params like {agent}, {slug})
+    for t in router.resource_templates() {
+        entries.push(ResourceEntry {
+            uri: t.uri_template.clone(),
+            description: t.description.clone(),
+        });
+    }
+
+    entries
 }
 
 /// Expected description prefixes for key Python-matching resources.
-/// Maps URI pattern (stripped of query variants) to the expected description start.
 fn expected_description_prefixes() -> HashMap<&'static str, &'static str> {
     let mut m = HashMap::new();
     m.insert(
@@ -80,7 +91,7 @@ fn expected_description_prefixes() -> HashMap<&'static str, &'static str> {
         "Inspect the server's current environment and HTTP settings.",
     );
     m.insert(
-        "resource://identity/",
+        "resource://identity/{project}",
         "Inspect identity resolution for a given project path.",
     );
     m.insert(
@@ -104,56 +115,59 @@ fn expected_description_prefixes() -> HashMap<&'static str, &'static str> {
         "List all projects known to the server in creation order.",
     );
     m.insert(
-        "resource://project/",
+        "resource://project/{slug}",
         "Fetch a project and its agents by project slug or human key.",
     );
     m.insert(
-        "resource://agents/",
+        "resource://agents/{project_key}",
         "List all registered agents in a project for easy agent discovery.",
     );
     m.insert(
-        "resource://file_reservations/",
+        "resource://file_reservations/{slug}",
         "List file_reservations for a project, optionally filtering to active-only.",
     );
     m.insert(
-        "resource://message/",
+        "resource://message/{message_id}",
         "Read a single message by id within a project.",
     );
     m.insert(
-        "resource://thread/",
+        "resource://thread/{thread_id}",
         "List messages for a thread within a project.",
     );
-    m.insert("resource://inbox/", "Read an agent's inbox for a project.");
     m.insert(
-        "resource://views/urgent-unread/",
+        "resource://inbox/{agent}",
+        "Read an agent's inbox for a project.",
+    );
+    m.insert(
+        "resource://views/urgent-unread/{agent}",
         "Convenience view listing urgent and high-importance messages that are unread",
     );
     m.insert(
-        "resource://views/ack-required/",
+        "resource://views/ack-required/{agent}",
         "Convenience view listing messages requiring acknowledgement",
     );
     m.insert(
-        "resource://views/acks-stale/",
+        "resource://views/acks-stale/{agent}",
         "List ack-required messages older than a TTL",
     );
     m.insert(
-        "resource://views/ack-overdue/",
+        "resource://views/ack-overdue/{agent}",
         "List messages requiring acknowledgement older than ttl_minutes",
     );
     m.insert(
-        "resource://mailbox/",
+        "resource://mailbox/{agent}",
         "List recent messages in an agent's mailbox with lightweight Git commit context.",
     );
     m.insert(
-        "resource://mailbox-with-commits/",
+        "resource://mailbox-with-commits/{agent}",
         "List recent messages in an agent's mailbox with commit metadata including diff summaries.",
     );
     m.insert(
-        "resource://outbox/",
+        "resource://outbox/{agent}",
         "List messages sent by the agent, enriched with commit metadata",
     );
     m.insert(
-        "resource://product/",
+        "resource://product/{key}",
         "Inspect product and list linked projects.",
     );
     m
@@ -161,33 +175,28 @@ fn expected_description_prefixes() -> HashMap<&'static str, &'static str> {
 
 #[test]
 fn resource_descriptions_match_python_prefixes() {
-    let resources = collect_resources();
+    let all = collect_all_resources();
     let expected = expected_description_prefixes();
 
     eprintln!(
-        "Checking {} resource description prefixes against {} resources",
+        "Checking {} resource description prefixes against {} entries (resources + templates)",
         expected.len(),
-        resources.len()
+        all.len()
     );
 
     let mut matched = 0;
     let mut mismatches: Vec<String> = Vec::new();
 
-    // Debug: list all resource URIs
-    for r in &resources {
-        eprintln!("  resource: {}", r.uri);
-    }
-
-    for (uri_prefix, expected_prefix) in &expected {
-        // Find a resource whose URI starts with this prefix (skip query variants)
-        let resource = resources.iter().find(|r| {
-            let uri = &r.uri;
-            (uri == uri_prefix || uri.starts_with(uri_prefix)) && !uri.contains('?')
+    for (uri_pattern, expected_prefix) in &expected {
+        // Find entry by exact URI or URI template match (skip query variants)
+        let entry = all.iter().find(|e| {
+            let uri = &e.uri;
+            uri == uri_pattern && !uri.contains('?')
         });
 
-        match resource {
-            Some(res) => {
-                let desc = res.description.as_deref().unwrap_or("");
+        match entry {
+            Some(e) => {
+                let desc = e.description.as_deref().unwrap_or("");
                 if desc.starts_with(expected_prefix) {
                     matched += 1;
                 } else {
@@ -197,13 +206,13 @@ fn resource_descriptions_match_python_prefixes() {
                         .position(|(a, b)| a != b)
                         .unwrap_or(desc.len().min(expected_prefix.len()));
                     mismatches.push(format!(
-                        "{uri_prefix}: description mismatch at char {mismatch_idx}\n  expected start: {expected_prefix}\n  actual start:   {}",
+                        "{uri_pattern}: description mismatch at char {mismatch_idx}\n  expected start: {expected_prefix}\n  actual start:   {}",
                         &desc[..desc.len().min(120)]
                     ));
                 }
             }
             None => {
-                mismatches.push(format!("{uri_prefix}: resource not found"));
+                mismatches.push(format!("{uri_pattern}: resource not found"));
             }
         }
     }
@@ -225,15 +234,14 @@ fn resource_descriptions_match_python_prefixes() {
 
 #[test]
 fn agents_resource_description_contains_notes_section() {
-    let resources = collect_resources();
-    let agents_res = resources
+    let all = collect_all_resources();
+    let agents_entry = all
         .iter()
-        .find(|r| r.uri.starts_with("resource://agents/") && !r.uri.contains('?'))
-        .expect("agents resource should exist");
+        .find(|e| e.uri == "resource://agents/{project_key}")
+        .expect("agents resource template should exist");
 
-    let desc = agents_res.description.as_deref().unwrap_or("");
+    let desc = agents_entry.description.as_deref().unwrap_or("");
 
-    // Verify the rich docstring sections exist
     assert!(
         desc.contains("When to use"),
         "agents description should include 'When to use' section"
@@ -254,13 +262,13 @@ fn agents_resource_description_contains_notes_section() {
 
 #[test]
 fn file_reservations_description_contains_why_section() {
-    let resources = collect_resources();
-    let res = resources
+    let all = collect_all_resources();
+    let entry = all
         .iter()
-        .find(|r| r.uri.starts_with("resource://file_reservations/") && !r.uri.contains('?'))
-        .expect("file_reservations resource should exist");
+        .find(|e| e.uri == "resource://file_reservations/{slug}")
+        .expect("file_reservations resource template should exist");
 
-    let desc = res.description.as_deref().unwrap_or("");
+    let desc = entry.description.as_deref().unwrap_or("");
 
     assert!(
         desc.contains("Why this exists"),
