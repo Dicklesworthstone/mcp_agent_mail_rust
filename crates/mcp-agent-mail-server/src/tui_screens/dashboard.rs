@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ftui::Style;
 use ftui::layout::Rect;
@@ -42,6 +42,9 @@ use ftui_widgets::sparkline::Sparkline;
 
 /// Max event log entries kept in scroll-back.
 const EVENT_LOG_CAPACITY: usize = 2000;
+const SHIMMER_WINDOW_MICROS: i64 = 500_000;
+const SHIMMER_MAX_ROWS: usize = 5;
+const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
 
 /// Stat tiles refresh every N ticks (100ms each → 1 s).
 const STAT_REFRESH_TICKS: u64 = 10;
@@ -768,6 +771,7 @@ impl MailScreen for DashboardScreen {
             self.quick_filter,
             self.verbosity,
             inline_anomaly_count,
+            effects_enabled && !self.reduced_motion,
         );
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
             render_trend_panel(
@@ -1400,6 +1404,7 @@ fn render_event_log(
     quick_filter: DashboardQuickFilter,
     verbosity: VerbosityTier,
     inline_anomaly_count: usize,
+    effects_enabled: bool,
 ) {
     if area.height < 3 || area.width < 20 {
         return;
@@ -1462,10 +1467,11 @@ fn render_event_log(
     }
     Paragraph::new(Text::from_line(Line::from_spans(controls))).render(controls_area, frame);
 
+    let shimmer_progresses = dashboard_shimmer_progresses(entries, effects_enabled);
     let mut pane = viewer.borrow_mut();
     pane.clear();
-    pane.push_many(entries.iter().map(|entry| {
-        format!(
+    pane.push_many(entries.iter().enumerate().map(|(idx, entry)| {
+        let line = format!(
             "{:>6} {} {:<3} {} {:<10} {}",
             entry.seq,
             entry.timestamp,
@@ -1473,6 +1479,10 @@ fn render_event_log(
             entry.icon,
             entry.kind.compact_label(),
             entry.summary
+        );
+        shimmer_progresses.get(idx).and_then(|p| *p).map_or_else(
+            || line.clone(),
+            |progress| shimmerize_plain_text(&line, progress, SHIMMER_HIGHLIGHT_WIDTH),
         )
     }));
     pane.scroll_to_bottom();
@@ -1482,6 +1492,102 @@ fn render_event_log(
     if viewer_area.height > 0 {
         pane.render(viewer_area, frame);
     }
+}
+
+fn unix_epoch_micros_now() -> Option<i64> {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_micros();
+    i64::try_from(micros).ok()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn shimmer_progress_for_timestamp(now_micros: i64, timestamp_micros: i64) -> Option<f64> {
+    if timestamp_micros <= 0 {
+        return None;
+    }
+    let age = now_micros - timestamp_micros;
+    if !(0..=SHIMMER_WINDOW_MICROS).contains(&age) {
+        return None;
+    }
+    Some((age as f64 / SHIMMER_WINDOW_MICROS as f64).clamp(0.0, 1.0))
+}
+
+fn dashboard_shimmer_progresses(
+    entries: &[&EventEntry],
+    effects_enabled: bool,
+) -> Vec<Option<f64>> {
+    let mut progresses = vec![None; entries.len()];
+    if !effects_enabled || entries.is_empty() {
+        return progresses;
+    }
+    let Some(now_micros) = unix_epoch_micros_now() else {
+        return progresses;
+    };
+    let mut shimmer_count = 0usize;
+    for idx in (0..entries.len()).rev() {
+        if shimmer_count >= SHIMMER_MAX_ROWS {
+            break;
+        }
+        if let Some(progress) =
+            shimmer_progress_for_timestamp(now_micros, entries[idx].timestamp_micros)
+        {
+            progresses[idx] = Some(progress);
+            shimmer_count += 1;
+        }
+    }
+    progresses
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn shimmer_window_indices(
+    len_chars: usize,
+    progress: f64,
+    width_chars: usize,
+) -> Option<(usize, usize)> {
+    if len_chars == 0 {
+        return None;
+    }
+    let clamped = progress.clamp(0.0, 1.0);
+    let center = ((len_chars.saturating_sub(1)) as f64 * clamped).round() as usize;
+    let width = width_chars.max(1).min(len_chars);
+    let half = width / 2;
+    let start = center.saturating_sub(half);
+    let end = (start + width).min(len_chars);
+    Some((start, end))
+}
+
+fn shimmerize_plain_text(text: &str, progress: f64, width_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let Some((start, end)) = shimmer_window_indices(chars.len(), progress, width_chars) else {
+        return text.to_string();
+    };
+    let mut out = String::with_capacity(text.len() + 2);
+    for (idx, ch) in chars.into_iter().enumerate() {
+        if idx == start {
+            out.push('[');
+        }
+        if idx >= start && idx < end {
+            if ch.is_ascii_lowercase() {
+                out.push(ch.to_ascii_uppercase());
+            } else if ch == ' ' {
+                out.push('·');
+            } else {
+                out.push(ch);
+            }
+        } else {
+            out.push(ch);
+        }
+        if idx + 1 == end {
+            out.push(']');
+        }
+    }
+    out
 }
 
 /// Render the footer stats bar.
@@ -1630,6 +1736,40 @@ mod tests {
     fn format_ts_wraps_at_24h() {
         let micros: i64 = 25 * 3600 * 1_000_000; // 25 hours
         assert_eq!(format_ts(micros), "01:00:00.000");
+    }
+
+    #[test]
+    fn dashboard_shimmer_progress_expires_after_window() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(shimmer_progress_for_timestamp(now, now).is_some());
+        assert!(shimmer_progress_for_timestamp(now, now - SHIMMER_WINDOW_MICROS - 1).is_none());
+    }
+
+    #[test]
+    fn dashboard_shimmer_progress_caps_at_five_entries() {
+        let now = unix_epoch_micros_now().expect("system clock should provide unix micros");
+        let entries: Vec<EventEntry> = (0..8_u64)
+            .map(|idx| EventEntry {
+                kind: MailEventKind::MessageReceived,
+                severity: EventSeverity::Info,
+                seq: idx,
+                timestamp_micros: now - (idx as i64 * 10_000),
+                timestamp: format_ts(now - (idx as i64 * 10_000)),
+                icon: '✉',
+                summary: format!("message-{idx}"),
+            })
+            .collect();
+        let refs: Vec<&EventEntry> = entries.iter().collect();
+        let shimmer = dashboard_shimmer_progresses(&refs, true);
+        assert_eq!(
+            shimmer.iter().filter(|p| p.is_some()).count(),
+            SHIMMER_MAX_ROWS
+        );
+        assert!(
+            dashboard_shimmer_progresses(&refs, false)
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     #[test]

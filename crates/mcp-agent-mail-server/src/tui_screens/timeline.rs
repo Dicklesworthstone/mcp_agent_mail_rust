@@ -8,6 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
@@ -38,6 +39,9 @@ const TIMELINE_CAPACITY: usize = 5000;
 
 /// Page-up/down scroll amount in lines.
 const PAGE_SIZE: usize = 20;
+const SHIMMER_WINDOW_MICROS: i64 = 500_000;
+const SHIMMER_MAX_ROWS: usize = 5;
+const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
 
 // ──────────────────────────────────────────────────────────────────────
 // TimelinePane
@@ -567,13 +571,21 @@ impl MailScreen for TimelineScreen {
         }
     }
 
-    fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         self.last_area.set(area);
         let split = self.dock.split(area);
+        let effects_enabled = state.config_snapshot().tui_effects;
         match self.view_mode {
             TimelineViewMode::Timeline => {
                 let mut list_state = self.list_state.borrow_mut();
-                render_timeline(frame, split.primary, &self.pane, self.dock, &mut list_state);
+                render_timeline(
+                    frame,
+                    split.primary,
+                    &self.pane,
+                    self.dock,
+                    &mut list_state,
+                    effects_enabled,
+                );
             }
             TimelineViewMode::LogViewer => {
                 let mut viewer = self.log_viewer.borrow_mut();
@@ -804,6 +816,7 @@ fn render_timeline(
     pane: &TimelinePane,
     dock: DockLayout,
     list_state: &mut VirtualizedListState,
+    effects_enabled: bool,
 ) {
     let inner_height = area.height.saturating_sub(2) as usize; // borders
     if inner_height == 0 {
@@ -811,7 +824,17 @@ fn render_timeline(
     }
 
     // Collect filtered entries (clones for VirtualizedList).
-    let filtered: Vec<TimelineEntry> = pane.filtered_entries().into_iter().cloned().collect();
+    let mut filtered: Vec<TimelineEntry> = pane.filtered_entries().into_iter().cloned().collect();
+    let shimmer_progresses = timeline_shimmer_progresses(&filtered, effects_enabled);
+    for (idx, shimmer_progress) in shimmer_progresses.into_iter().enumerate() {
+        if let Some(progress) = shimmer_progress {
+            filtered[idx].display.summary = shimmerize_plain_text(
+                &filtered[idx].display.summary,
+                progress,
+                SHIMMER_HIGHLIGHT_WIDTH,
+            );
+        }
+    }
     let total = filtered.len();
     let cursor = pane.cursor.min(total.saturating_sub(1));
 
@@ -854,6 +877,102 @@ fn render_timeline(
         )
         .show_scrollbar(true);
     StatefulWidget::render(&list, inner_area, frame, list_state);
+}
+
+fn unix_epoch_micros_now() -> Option<i64> {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_micros();
+    i64::try_from(micros).ok()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn shimmer_progress_for_timestamp(now_micros: i64, timestamp_micros: i64) -> Option<f64> {
+    if timestamp_micros <= 0 {
+        return None;
+    }
+    let age = now_micros - timestamp_micros;
+    if !(0..=SHIMMER_WINDOW_MICROS).contains(&age) {
+        return None;
+    }
+    Some((age as f64 / SHIMMER_WINDOW_MICROS as f64).clamp(0.0, 1.0))
+}
+
+fn timeline_shimmer_progresses(
+    entries: &[TimelineEntry],
+    effects_enabled: bool,
+) -> Vec<Option<f64>> {
+    let mut progresses = vec![None; entries.len()];
+    if !effects_enabled || entries.is_empty() {
+        return progresses;
+    }
+    let Some(now_micros) = unix_epoch_micros_now() else {
+        return progresses;
+    };
+    let mut shimmer_count = 0usize;
+    for idx in (0..entries.len()).rev() {
+        if shimmer_count >= SHIMMER_MAX_ROWS {
+            break;
+        }
+        if let Some(progress) =
+            shimmer_progress_for_timestamp(now_micros, entries[idx].timestamp_micros)
+        {
+            progresses[idx] = Some(progress);
+            shimmer_count += 1;
+        }
+    }
+    progresses
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn shimmer_window_indices(
+    len_chars: usize,
+    progress: f64,
+    width_chars: usize,
+) -> Option<(usize, usize)> {
+    if len_chars == 0 {
+        return None;
+    }
+    let clamped = progress.clamp(0.0, 1.0);
+    let center = ((len_chars.saturating_sub(1)) as f64 * clamped).round() as usize;
+    let width = width_chars.max(1).min(len_chars);
+    let half = width / 2;
+    let start = center.saturating_sub(half);
+    let end = (start + width).min(len_chars);
+    Some((start, end))
+}
+
+fn shimmerize_plain_text(text: &str, progress: f64, width_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let Some((start, end)) = shimmer_window_indices(chars.len(), progress, width_chars) else {
+        return text.to_string();
+    };
+    let mut out = String::with_capacity(text.len() + 2);
+    for (idx, ch) in chars.into_iter().enumerate() {
+        if idx == start {
+            out.push('[');
+        }
+        if idx >= start && idx < end {
+            if ch.is_ascii_lowercase() {
+                out.push(ch.to_ascii_uppercase());
+            } else if ch == ' ' {
+                out.push('·');
+            } else {
+                out.push(ch);
+            }
+        } else {
+            out.push(ch);
+        }
+        if idx + 1 == end {
+            out.push(']');
+        }
+    }
+    out
 }
 
 fn render_timeline_log_viewer(
@@ -1440,6 +1559,7 @@ mod tests {
             &pane,
             dock,
             &mut list_state,
+            false,
         );
     }
 
@@ -1470,6 +1590,7 @@ mod tests {
             &pane,
             dock,
             &mut list_state,
+            false,
         );
     }
 
@@ -1486,6 +1607,7 @@ mod tests {
             &pane,
             dock,
             &mut list_state,
+            false,
         );
     }
 
@@ -2299,6 +2421,7 @@ mod tests {
             &pane,
             dock,
             &mut list_state,
+            false,
         );
     }
 
@@ -2316,6 +2439,7 @@ mod tests {
             &pane,
             dock,
             &mut list_state,
+            false,
         );
     }
 
@@ -2473,6 +2597,41 @@ mod tests {
         let text = buffer_to_text(&frame.buffer);
         assert!(text.contains("HTTP"), "row text: {text}");
         assert!(text.contains("ERR"), "row text: {text}");
+    }
+
+    #[test]
+    fn timeline_shimmer_progress_expires_after_window() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(shimmer_progress_for_timestamp(now, now).is_some());
+        assert!(shimmer_progress_for_timestamp(now, now - SHIMMER_WINDOW_MICROS - 1).is_none());
+    }
+
+    #[test]
+    fn timeline_shimmer_progress_caps_at_five_entries() {
+        let now = unix_epoch_micros_now().expect("system clock should provide unix micros");
+        let entries: Vec<TimelineEntry> = (0..8_u64)
+            .map(|idx| {
+                let event = make_event(idx);
+                TimelineEntry {
+                    display: format_event(&event),
+                    seq: idx,
+                    timestamp_micros: now - (idx as i64 * 10_000),
+                    source: EventSource::Mail,
+                    severity: EventSeverity::Info,
+                    raw: event,
+                }
+            })
+            .collect();
+        let shimmer = timeline_shimmer_progresses(&entries, true);
+        assert_eq!(
+            shimmer.iter().filter(|p| p.is_some()).count(),
+            SHIMMER_MAX_ROWS
+        );
+        assert!(
+            timeline_shimmer_progresses(&entries, false)
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     // ── Screen logic, density heuristics, and failure paths (br-1xt0m.1.13.8) ──
