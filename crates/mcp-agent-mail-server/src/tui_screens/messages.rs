@@ -165,6 +165,7 @@ impl RenderItem for MessageEntry {
 }
 
 impl MessageEntry {
+    #[allow(clippy::too_many_lines)]
     fn render_row(
         &self,
         area: Rect,
@@ -2049,6 +2050,7 @@ fn unix_epoch_micros_now() -> Option<i64> {
     i64::try_from(micros).ok()
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn shimmer_progress_for_timestamp(now_micros: i64, timestamp_micros: i64) -> Option<f64> {
     if timestamp_micros <= 0 {
         return None;
@@ -2090,6 +2092,11 @@ fn char_index_to_byte_offset(s: &str, char_idx: usize) -> usize {
         .map_or(s.len(), |(byte_idx, _)| byte_idx)
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn subject_shimmer_window(
     subject: &str,
     progress: f64,

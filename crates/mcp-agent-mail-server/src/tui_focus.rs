@@ -37,7 +37,9 @@
 use ftui::{Style, layout::Rect};
 use ftui_extras::theme;
 
-use crate::tui_screens::{ALL_SCREEN_IDS, MailScreenId};
+#[cfg(test)]
+use crate::tui_screens::ALL_SCREEN_IDS;
+use crate::tui_screens::MailScreenId;
 
 // ──────────────────────────────────────────────────────────────────────
 // FocusTarget — identifies a focusable element
@@ -589,7 +591,8 @@ enum Direction {
 }
 
 fn scale_permille(total: u16, permille: u16) -> u16 {
-    ((u32::from(total) * u32::from(permille)) / 1_000) as u16
+    let scaled = (u32::from(total) * u32::from(permille)) / 1_000;
+    u16::try_from(scaled).unwrap_or(u16::MAX)
 }
 
 fn rect_from_template(area: Rect, template: FocusNodeTemplate) -> Rect {
