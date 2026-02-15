@@ -1172,4 +1172,83 @@ mod tests {
             "jump key label in help_entries should be dynamic ({expected}), got: {label}"
         );
     }
+
+    // ── Navigation/discoverability contracts (br-1xt0m.1.13.6) ──
+
+    #[test]
+    fn help_entries_no_duplicate_actions() {
+        let registry = KeymapRegistry::default();
+        let entries = registry.help_entries();
+        let mut seen = std::collections::HashSet::new();
+        for (label, action) in &entries {
+            let key = format!("{label}:{action}");
+            assert!(seen.insert(key.clone()), "duplicate help entry: {key}");
+        }
+    }
+
+    #[test]
+    fn contextual_help_navigation_covers_all_categories() {
+        let registry = KeymapRegistry::default();
+        let sections = registry.contextual_help(&[], "Test", None);
+        let nav_titles: Vec<_> = sections
+            .iter()
+            .filter(|s| s.title.starts_with("Navigate"))
+            .map(|s| s.title.as_str())
+            .collect();
+        for &cat in crate::tui_screens::ScreenCategory::ALL {
+            let cat_label = cat.label();
+            let found = nav_titles.iter().any(|t| t.contains(cat_label));
+            assert!(
+                found,
+                "contextual_help navigation should include category '{cat_label}'"
+            );
+        }
+    }
+
+    #[test]
+    fn all_profiles_produce_valid_help_entries() {
+        for profile in [
+            KeymapProfile::Default,
+            KeymapProfile::Vim,
+            KeymapProfile::Emacs,
+            KeymapProfile::Minimal,
+        ] {
+            let registry = KeymapRegistry::new(profile);
+            let entries = registry.help_entries();
+            assert!(
+                !entries.is_empty(),
+                "{:?} profile should produce non-empty help entries",
+                profile
+            );
+            for (label, action) in &entries {
+                assert!(!label.is_empty(), "{profile:?}: empty label for '{action}'");
+                assert!(!action.is_empty(), "{profile:?}: empty action for '{label}'");
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_help_screen_section_uses_screen_label() {
+        let bindings = vec![crate::tui_screens::HelpEntry {
+            key: "j/k",
+            action: "Scroll",
+        }];
+        let registry = KeymapRegistry::default();
+        let sections = registry.contextual_help(&bindings, "Dashboard", Some("Overview tip"));
+        let screen_section = sections.iter().find(|s| s.title == "Dashboard");
+        assert!(
+            screen_section.is_some(),
+            "contextual_help should include a section titled 'Dashboard'"
+        );
+        let sec = screen_section.unwrap();
+        assert_eq!(
+            sec.description.as_deref(),
+            Some("Overview tip"),
+            "screen section should include the context tip"
+        );
+        assert!(
+            sec.entries.iter().any(|(k, _)| k == "j/k"),
+            "screen section should contain screen-local bindings"
+        );
+    }
 }

@@ -816,4 +816,122 @@ mod tests {
         assert!(!screen.receive_deep_link(&DeepLinkTarget::MessageById(1)));
         assert!(!screen.consumes_text_input());
     }
+
+    // ── Shell Navigation & Discoverability Contracts (br-1xt0m.1.13.6) ──
+
+    #[test]
+    fn jump_key_legend_reflects_14_screens() {
+        let legend = jump_key_legend();
+        assert!(legend.contains("1-9"), "legend should have digits");
+        assert!(legend.contains('0'), "legend should have 0 for screen 10");
+        // With 14 screens, expect shifted symbols for 11-14
+        for sym in ['!', '@', '#', '$'] {
+            assert!(
+                legend.contains(sym),
+                "legend should contain '{sym}' for 14 screens, got: {legend}"
+            );
+        }
+    }
+
+    #[test]
+    fn jump_key_coverage_all_screens() {
+        // Every screen must be reachable by a jump key.
+        for (i, &id) in ALL_SCREEN_IDS.iter().enumerate() {
+            let key = jump_key_label_for_screen(id);
+            assert!(
+                key.is_some(),
+                "screen {i} ({:?}) has no jump key",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn short_labels_fit_in_tab_width() {
+        for meta in MAIL_SCREEN_REGISTRY {
+            assert!(
+                meta.short_label.len() <= 12,
+                "{:?} short_label '{}' exceeds 12 chars",
+                meta.id,
+                meta.short_label,
+            );
+        }
+    }
+
+    #[test]
+    fn screen_descriptions_nonempty_and_actionable() {
+        for meta in MAIL_SCREEN_REGISTRY {
+            assert!(
+                !meta.description.is_empty(),
+                "{:?} has empty description",
+                meta.id
+            );
+            // Description should be a full sentence (starts uppercase, ends with period)
+            let first = meta.description.chars().next().unwrap();
+            assert!(
+                first.is_uppercase(),
+                "{:?} description should start uppercase: '{}'",
+                meta.id,
+                meta.description,
+            );
+        }
+    }
+
+    #[test]
+    fn every_category_represented() {
+        let cats: std::collections::HashSet<_> = MAIL_SCREEN_REGISTRY
+            .iter()
+            .map(|m| m.category)
+            .collect();
+        for &cat in ScreenCategory::ALL {
+            assert!(
+                cats.contains(&cat),
+                "ScreenCategory::{:?} has no assigned screens",
+                cat
+            );
+        }
+    }
+
+    #[test]
+    fn screen_ids_unique_in_registry() {
+        let mut seen = std::collections::HashSet::new();
+        for meta in MAIL_SCREEN_REGISTRY {
+            assert!(
+                seen.insert(meta.id),
+                "duplicate screen id {:?} in MAIL_SCREEN_REGISTRY",
+                meta.id,
+            );
+        }
+    }
+
+    #[test]
+    fn jump_key_labels_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for &id in ALL_SCREEN_IDS {
+            if let Some(key) = jump_key_label_for_screen(id) {
+                assert!(
+                    seen.insert(key),
+                    "duplicate jump key '{key}' for {:?}",
+                    id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn screen_from_jump_key_roundtrips() {
+        // For every screen with a jump key, screen_from_jump_key should return it.
+        for &id in ALL_SCREEN_IDS {
+            if let Some(key_str) = jump_key_label_for_screen(id) {
+                let ch = key_str.chars().next().unwrap();
+                let found = screen_from_jump_key(ch);
+                assert_eq!(
+                    found,
+                    Some(id),
+                    "screen_from_jump_key('{ch}') should return {:?}",
+                    id
+                );
+            }
+        }
+    }
 }
