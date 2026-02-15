@@ -5918,6 +5918,22 @@ mod tests {
     }
 
     #[test]
+    fn bearer_auth_unknown_non_health_path_is_protected() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/not-a-real-path", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 401,
+            "non-health unknown paths must require auth before 404 handling"
+        );
+    }
+
+    #[test]
     fn bearer_auth_requires_exact_header_match() {
         let config = mcp_agent_mail_core::Config {
             http_bearer_token: Some("secret".to_string()),
@@ -5943,6 +5959,14 @@ mod tests {
         );
         let resp_ws = block_on(state.handle(req_ws));
         assert_eq!(resp_ws.status, 401, "whitespace must not be trimmed");
+
+        let req_lower = make_request(
+            Http1Method::Get,
+            "/api/",
+            &[("Authorization", "bearer secret")],
+        );
+        let resp_lower = block_on(state.handle(req_lower));
+        assert_eq!(resp_lower.status, 401, "scheme must match exactly");
     }
 
     #[test]
@@ -5960,6 +5984,24 @@ mod tests {
         assert_eq!(
             resp.status, 401,
             "missing bearer auth must 401 before body parsing"
+        );
+    }
+
+    #[test]
+    fn bearer_auth_runs_before_content_type_validation() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let mut req = make_request(Http1Method::Post, "/api", &[("Content-Type", "text/plain")]);
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 404_i64))
+            .expect("serialize json-rpc");
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 401,
+            "missing bearer auth must 401 before content-type transport validation"
         );
     }
 
