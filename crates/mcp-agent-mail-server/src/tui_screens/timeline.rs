@@ -105,20 +105,29 @@ impl RenderItem for TimelineEntry {
             .fg(tp.selection_fg)
             .bg(tp.selection_bg)
             .bold();
+        let meta_style = crate::tui_theme::text_meta(&tp);
+
+        // Severity-aware summary style: errors/warnings inherit severity
+        // color for rapid triage; trace events are dim to reduce noise.
+        let summary_style = match sev {
+            EventSeverity::Error | EventSeverity::Warn => sev.style(),
+            EventSeverity::Trace => Style::default().fg(tp.text_disabled).dim(),
+            _ => Style::default(),
+        };
 
         let mut line = Line::from_spans([
-            Span::raw(format!(
-                "{marker}{:>6} {} ",
-                self.seq, self.display.timestamp
-            )),
+            Span::styled(
+                format!("{marker}{:>6} {} ", self.seq, self.display.timestamp),
+                meta_style,
+            ),
             sev.styled_badge(),
-            Span::raw(format!(" [{src_badge}] ")),
+            Span::styled(format!(" [{src_badge}] "), meta_style),
             Span::styled(format!("{}", self.display.icon), sev.style()),
-            Span::raw(format!(
-                " {:<10} {}",
-                self.display.kind.compact_label(),
-                self.display.summary
-            )),
+            Span::styled(
+                format!(" {:<10} ", self.display.kind.compact_label()),
+                meta_style,
+            ),
+            Span::styled(self.display.summary.clone(), summary_style),
         ]);
         if selected {
             line.apply_base_style(cursor_style);
@@ -738,13 +747,13 @@ fn preset_for_ratio(ratio: f32) -> DockPreset {
 /// Source badge abbreviation.
 const fn source_badge(src: EventSource) -> &'static str {
     match src {
-        EventSource::Tooling => "TOOL",
+        EventSource::Tooling => "Tool",
         EventSource::Http => "HTTP",
-        EventSource::Mail => "MAIL",
-        EventSource::Reservations => "RESV",
-        EventSource::Lifecycle => "LIFE",
-        EventSource::Database => "DB  ",
-        EventSource::Unknown => "????",
+        EventSource::Mail => "Mail",
+        EventSource::Reservations => "Resv",
+        EventSource::Lifecycle => "Life",
+        EventSource::Database => " DB ",
+        EventSource::Unknown => " ?? ",
     }
 }
 
@@ -829,11 +838,19 @@ fn build_filter_tag(
 ) -> String {
     let mut parts = Vec::new();
     if !kind_filter.is_empty() {
-        let kinds: Vec<_> = kind_filter.iter().map(|k| format!("{k:?}")).collect();
+        let mut kinds: Vec<_> = kind_filter
+            .iter()
+            .map(|k| k.compact_label())
+            .collect();
+        kinds.sort_unstable();
         parts.push(format!("kind:{}", kinds.join(",")));
     }
     if !source_filter.is_empty() {
-        let sources: Vec<_> = source_filter.iter().map(|s| format!("{s:?}")).collect();
+        let mut sources: Vec<_> = source_filter
+            .iter()
+            .map(|s| source_badge(*s).trim())
+            .collect();
+        sources.sort_unstable();
         parts.push(format!("src:{}", sources.join(",")));
     }
     if parts.is_empty() {
@@ -851,6 +868,7 @@ fn build_filter_tag(
 mod tests {
     use super::*;
     use crate::tui_layout::DockPosition;
+    use ftui_harness::buffer_to_text;
 
     fn make_event(_seq: u64) -> MailEvent {
         MailEvent::http_request("GET", "/test", 200, 10, "127.0.0.1")
@@ -1168,13 +1186,13 @@ mod tests {
 
     #[test]
     fn source_badge_values() {
-        assert_eq!(source_badge(EventSource::Tooling), "TOOL");
+        assert_eq!(source_badge(EventSource::Tooling), "Tool");
         assert_eq!(source_badge(EventSource::Http), "HTTP");
-        assert_eq!(source_badge(EventSource::Mail), "MAIL");
-        assert_eq!(source_badge(EventSource::Reservations), "RESV");
-        assert_eq!(source_badge(EventSource::Lifecycle), "LIFE");
-        assert_eq!(source_badge(EventSource::Database), "DB  ");
-        assert_eq!(source_badge(EventSource::Unknown), "????");
+        assert_eq!(source_badge(EventSource::Mail), "Mail");
+        assert_eq!(source_badge(EventSource::Reservations), "Resv");
+        assert_eq!(source_badge(EventSource::Lifecycle), "Life");
+        assert_eq!(source_badge(EventSource::Database), " DB ");
+        assert_eq!(source_badge(EventSource::Unknown), " ?? ");
     }
 
     #[test]
@@ -1189,7 +1207,7 @@ mod tests {
         kinds.insert(MailEventKind::HttpRequest);
         let tag = build_filter_tag(&kinds, &HashSet::new());
         assert!(tag.contains("kind:"));
-        assert!(tag.contains("HttpRequest"));
+        assert!(tag.contains("HTTP"));
     }
 
     #[test]
@@ -2259,5 +2277,60 @@ mod tests {
         };
         let mut screen = TimelineScreen::with_config(&config);
         assert!(!screen.import_layout());
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // br-1xt0m.1.10.4: Timeline semantic encoding and readability
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn source_badges_are_readable_mixed_case() {
+        // Verify source badges use readable mixed-case, not all-caps cryptic abbreviations
+        assert_eq!(source_badge(EventSource::Tooling), "Tool");
+        assert_eq!(source_badge(EventSource::Mail), "Mail");
+        assert_eq!(source_badge(EventSource::Reservations), "Resv");
+        assert_eq!(source_badge(EventSource::Lifecycle), "Life");
+    }
+
+    #[test]
+    fn build_filter_tag_uses_compact_labels() {
+        let mut kinds = HashSet::new();
+        kinds.insert(MailEventKind::MessageSent);
+        let tag = build_filter_tag(&kinds, &HashSet::new());
+        // Should use compact_label ("MsgSent"), not Debug format ("MessageSent")
+        assert!(
+            tag.contains("MsgSent"),
+            "tag should use compact_label: {tag}"
+        );
+
+        let mut sources = HashSet::new();
+        sources.insert(EventSource::Tooling);
+        let tag2 = build_filter_tag(&HashSet::new(), &sources);
+        assert!(
+            tag2.contains("Tool"),
+            "tag should use source badge: {tag2}"
+        );
+    }
+
+    #[test]
+    fn timeline_row_renders_without_panic_on_error_event() {
+        // Error events should render with severity styling (no panic)
+        let event = MailEvent::http_request("GET", "/fail", 500, 10, "127.0.0.1");
+        let display = format_event(&event);
+        let entry = TimelineEntry {
+            seq: 1,
+            timestamp_micros: 1_000_000,
+            source: EventSource::Http,
+            severity: EventSeverity::Error,
+            display,
+            raw: event,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 1, &mut pool);
+        entry.render(Rect::new(0, 0, 80, 1), &mut frame, false);
+        // Should contain HTTP source badge and Error badge
+        let text = buffer_to_text(&frame.buffer);
+        assert!(text.contains("HTTP"), "row text: {text}");
+        assert!(text.contains("ERR"), "row text: {text}");
     }
 }
