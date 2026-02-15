@@ -100,22 +100,53 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
     let mut x = area.x;
     let available = area.width;
 
-    // Determine if we need compact mode (< 60 cols)
+    // Determine width mode:
+    // - Ultra-compact (< 40): key only, no label
+    // - Compact (< 60): short labels
+    // - Normal (>= 60): full titles
+    let ultra_compact = available < 40;
     let compact = available < 60;
+
+    // Track previous category for inter-category separator.
+    let mut prev_category: Option<crate::tui_screens::ScreenCategory> = None;
 
     for (i, meta) in MAIL_SCREEN_REGISTRY.iter().enumerate() {
         let number = i + 1;
-        let label = if compact {
+        let label = if ultra_compact {
+            "" // Key number only
+        } else if compact {
             meta.short_label
         } else {
             meta.title
         };
         let is_active = meta.id == active;
+        let category_changed = prev_category.map_or(i > 0, |c| c != meta.category);
 
         // " 1:Label " — each tab has fixed structure
         let key_str = format!("{number}");
-        // Width: space + key + colon + label + space
-        let tab_width = u16::try_from(1 + key_str.len() + 1 + label.len() + 1).unwrap_or(u16::MAX);
+        // Width: indicator + space + key + colon? + label? + space
+        let has_label = !label.is_empty();
+        let tab_width = if has_label {
+            u16::try_from(1 + key_str.len() + 1 + label.len() + 1).unwrap_or(u16::MAX)
+        } else {
+            // Ultra-compact: " 1 " (space + key + space)
+            u16::try_from(1 + key_str.len() + 1).unwrap_or(u16::MAX)
+        };
+
+        // Inter-tab separator (heavier between categories, lighter within)
+        if i > 0 && x < area.x + available {
+            let (sep_char, sep_fg) = if category_changed {
+                // Wider gap between categories: dim separator
+                ("┃", tp.text_muted)
+            } else {
+                ("│", tp.tab_inactive_fg)
+            };
+            let sep_area = Rect::new(x, area.y, 1, 1);
+            Paragraph::new(sep_char)
+                .style(Style::default().fg(sep_fg).bg(tp.tab_inactive_bg))
+                .render(sep_area, frame);
+            x += 1;
+        }
 
         if x + tab_width > area.x + available {
             break; // Don't overflow
@@ -127,19 +158,6 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
             (tp.tab_inactive_fg, tp.tab_inactive_bg)
         };
 
-        // Inter-tab separator (before each tab except the first)
-        if i > 0 && x < area.x + available {
-            let sep_area = Rect::new(x, area.y, 1, 1);
-            Paragraph::new("│")
-                .style(
-                    Style::default()
-                        .fg(tp.tab_inactive_fg)
-                        .bg(tp.tab_inactive_bg),
-                )
-                .render(sep_area, frame);
-            x += 1;
-        }
-
         let tab_area = Rect::new(x, area.y, tab_width, 1);
 
         let use_gradient = is_active && effects_enabled;
@@ -149,26 +167,38 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
             Style::default().fg(fg).bg(bg)
         };
 
-        let label_span = if use_gradient {
+        let label_span = if use_gradient && has_label {
             // Reserve label width in the base tab row; overlay gradient text below.
             Span::styled(" ".repeat(label.len()), Style::default().bg(bg))
-        } else {
+        } else if has_label {
             Span::styled(label, label_style)
+        } else {
+            Span::styled("", Style::default())
         };
 
         // Use category-specific color for the key number to aid wayfinding.
         let key_fg = category_key_color(meta.category, &tp);
-        let line = Line::from_spans(vec![
-            Span::styled(" ", Style::default().bg(bg)),
-            Span::styled(key_str.as_str(), Style::default().fg(key_fg).bg(bg)),
-            Span::styled(":", Style::default().fg(tp.tab_inactive_fg).bg(bg)),
-            label_span,
-            Span::styled(" ", Style::default().bg(bg)),
-        ]);
 
-        Paragraph::new(Text::from_lines([line])).render(tab_area, frame);
+        // Active tab indicator: bold key with underline for strong contrast.
+        let key_style = if is_active {
+            Style::default().fg(key_fg).bg(bg).bold().underline()
+        } else {
+            Style::default().fg(key_fg).bg(bg)
+        };
 
-        if use_gradient {
+        let mut spans = vec![
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(key_str.as_str(), key_style),
+        ];
+        if has_label {
+            spans.push(Span::styled(":", Style::default().fg(tp.tab_inactive_fg).bg(bg)));
+            spans.push(label_span);
+        }
+        spans.push(Span::styled(" ", Style::default().bg(bg)));
+
+        Paragraph::new(Text::from_lines([Line::from_spans(spans)])).render(tab_area, frame);
+
+        if use_gradient && has_label {
             let gradient =
                 ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.text_secondary)]);
             let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX);
@@ -181,6 +211,7 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
                 .render(Rect::new(label_x, area.y, label_width, 1), frame);
         }
 
+        prev_category = Some(meta.category);
         x += tab_width;
     }
 }
@@ -194,15 +225,27 @@ pub fn record_tab_hit_slots(
     dispatcher: &crate::tui_hit_regions::MouseDispatcher,
 ) {
     let available = area.width;
+    let ultra_compact = available < 40;
     let compact = available < 60;
     let mut x = area.x;
 
     for (i, meta) in MAIL_SCREEN_REGISTRY.iter().enumerate() {
         let number = i + 1;
-        let label = if compact { meta.short_label } else { meta.title };
+        let label = if ultra_compact {
+            ""
+        } else if compact {
+            meta.short_label
+        } else {
+            meta.title
+        };
         let key_str_len = if number >= 10 { 2 } else { 1 };
-        // Width: space + key + colon + label + space
-        let tab_width = (1 + key_str_len + 1 + label.len() + 1) as u16;
+        let has_label = !label.is_empty();
+        #[allow(clippy::cast_possible_truncation)]
+        let tab_width: u16 = if has_label {
+            (1 + key_str_len + 1 + label.len() + 1) as u16
+        } else {
+            (1 + key_str_len + 1) as u16
+        };
 
         // Separator before each tab except the first.
         if i > 0 && x < area.x + available {
@@ -1137,6 +1180,61 @@ mod tests {
             assert!(!meta.title.is_empty());
             assert!(!meta.short_label.is_empty());
             assert!(meta.short_label.len() <= 12);
+        }
+    }
+
+    #[test]
+    fn tab_hit_slots_cover_all_visible_tabs_normal_width() {
+        let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
+        let area = Rect::new(0, 0, 200, 1); // Wide enough for all tabs
+        record_tab_hit_slots(area, &dispatcher);
+        let mut found = 0;
+        for i in 0..ALL_SCREEN_IDS.len() {
+            if dispatcher.tab_slot(i).is_some() {
+                found += 1;
+            }
+        }
+        assert_eq!(found, ALL_SCREEN_IDS.len(), "all tabs should have hit slots at width 200");
+    }
+
+    #[test]
+    fn tab_hit_slots_ultra_compact_fits_more_tabs() {
+        // At 40 cols, compact mode shows short labels; at 30 cols, ultra-compact
+        // shows key-only. Ultra-compact should fit more tabs.
+        let d_compact = crate::tui_hit_regions::MouseDispatcher::new();
+        record_tab_hit_slots(Rect::new(0, 0, 50, 1), &d_compact);
+
+        let d_ultra = crate::tui_hit_regions::MouseDispatcher::new();
+        record_tab_hit_slots(Rect::new(0, 0, 30, 1), &d_ultra);
+
+        let count = |d: &crate::tui_hit_regions::MouseDispatcher| -> usize {
+            (0..ALL_SCREEN_IDS.len())
+                .filter(|&i| d.tab_slot(i).is_some())
+                .count()
+        };
+
+        // Ultra-compact at 30 should fit at least as many as compact at 50.
+        assert!(
+            count(&d_ultra) >= count(&d_compact),
+            "ultra-compact should fit more or equal tabs"
+        );
+    }
+
+    #[test]
+    fn tab_hit_slots_no_overlap() {
+        let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
+        record_tab_hit_slots(Rect::new(0, 0, 200, 1), &dispatcher);
+
+        let mut prev_end: u16 = 0;
+        for i in 0..ALL_SCREEN_IDS.len() {
+            if let Some((x_start, x_end, _y)) = dispatcher.tab_slot(i) {
+                assert!(
+                    x_start >= prev_end,
+                    "tab {i} overlaps previous: starts at {x_start}, prev ended at {prev_end}"
+                );
+                assert!(x_end > x_start, "tab {i} has zero width");
+                prev_end = x_end;
+            }
         }
     }
 }
