@@ -528,9 +528,9 @@ pub fn render_status_line(
                 Style::default().fg(tp.status_fg).bg(tp.status_bg),
             ));
         }
-        // Key hints get special parsing (keys in accent color).
-        if seg.priority == StatusPriority::Low && seg.text.contains('[') && !seg.text.contains("req:") {
-            push_key_hint_spans(&mut spans, &seg.text, &tp);
+        // Key hints get keycap/chip rendering (reverse-video keys).
+        if seg.priority == StatusPriority::Low && seg.text.contains('\x01') {
+            push_keycap_chip_spans(&mut spans, &seg.text, &tp);
         } else {
             let mut style = Style::default().fg(seg.fg).bg(tp.status_bg);
             if seg.bold {
@@ -563,40 +563,6 @@ pub fn render_status_line(
 
     let line = Line::from_spans(spans);
     Paragraph::new(Text::from_lines([line])).render(area, frame);
-}
-
-/// Parse a key-hints string and push styled spans (keys in accent, rest in dim).
-fn push_key_hint_spans<'a>(
-    spans: &mut Vec<ftui::text::Span<'a>>,
-    hints: &'a str,
-    tp: &crate::tui_theme::TuiThemePalette,
-) {
-    use ftui::text::Span;
-    let mut rest = hints;
-    while let Some(open) = rest.find('[') {
-        if open > 0 {
-            spans.push(Span::styled(
-                &rest[..open],
-                Style::default().fg(tp.status_fg).bg(tp.status_bg),
-            ));
-        }
-        rest = &rest[open..];
-        if let Some(close) = rest.find(']') {
-            spans.push(Span::styled(
-                &rest[..=close],
-                Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
-            ));
-            rest = &rest[close + 1..];
-        } else {
-            break;
-        }
-    }
-    if !rest.is_empty() {
-        spans.push(Span::styled(
-            rest,
-            Style::default().fg(tp.status_fg).bg(tp.status_bg),
-        ));
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -808,7 +774,10 @@ pub fn render_help_overlay_sections(
     }
 }
 
-/// Render a single keybinding line: `  [key]  action` (theme-aware).
+/// Render a single keybinding line with keycap style: `  key   action`.
+///
+/// The key is rendered in reverse-video (keycap style) with the action
+/// label right-padded to align with `key_col`.
 fn render_keybinding_line_themed(
     key: &str,
     action: &str,
@@ -819,16 +788,21 @@ fn render_keybinding_line_themed(
 ) {
     use ftui::text::{Line, Span, Text};
 
-    let key_display = format!("  [{key}]");
-    let key_len = u16::try_from(key_display.len()).unwrap_or(key_col);
+    let keycap = format!(" {key} ");
+    // Total width of leading space + keycap
+    let keycap_total = 2 + keycap.len(); // "  " prefix + keycap
+    let key_len = u16::try_from(keycap_total).unwrap_or(key_col);
     let pad_len = key_col.saturating_sub(key_len) as usize;
     let padding = " ".repeat(pad_len);
 
+    let keycap_style = Style::default()
+        .fg(tp.help_bg)
+        .bg(tp.help_key_fg)
+        .bold();
+
     let spans = vec![
-        Span::styled(
-            key_display,
-            Style::default().fg(tp.help_key_fg).bg(tp.help_bg),
-        ),
+        Span::styled("  ", Style::default().bg(tp.help_bg)),
+        Span::styled(keycap, keycap_style),
         Span::styled(padding, Style::default().bg(tp.help_bg)),
         Span::styled(action, Style::default().fg(tp.help_fg).bg(tp.help_bg)),
     ];
@@ -911,13 +885,24 @@ impl ChromePalette {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Key hint bar — context-sensitive shortcut hints
+// Key hint bar — keycap/action-chip style shortcut hints
 // ──────────────────────────────────────────────────────────────────────
+
+/// Width of a single keycap/action chip: ` key ` + ` action` + separator.
+///
+/// Returns the display width (key padded + action + trailing separator).
+fn chip_width(key: &str, action: &str, is_last: bool) -> usize {
+    // ` key ` (reverse-video keycap) + ` action` + ` · ` separator (3 if not last)
+    let keycap = key.len() + 2; // space + key + space
+    let act = 1 + action.len(); // space + action
+    let sep = if is_last { 0 } else { 3 }; // " · "
+    keycap + act + sep
+}
 
 /// Build a compact key hint string from the most important screen bindings.
 ///
 /// Selects up to `max_hints` entries that fit within `max_width` characters,
-/// formatted as `[key] action  [key] action  ...`.
+/// formatted as keycap/action chips: ` key  action · key  action`.
 #[must_use]
 pub fn build_key_hints(
     screen_bindings: &[HelpEntry],
@@ -925,24 +910,96 @@ pub fn build_key_hints(
     max_width: usize,
 ) -> String {
     let mut hints = String::new();
+    let mut used = 0usize;
+    let count = screen_bindings.len().min(max_hints);
 
-    for (count, entry) in screen_bindings.iter().enumerate() {
-        if count >= max_hints {
+    for (i, entry) in screen_bindings.iter().take(count).enumerate() {
+        let is_last = i + 1 >= count
+            || used + chip_width(entry.key, entry.action, false)
+                + chip_width(
+                    screen_bindings.get(i + 1).map_or("", |e| e.key),
+                    screen_bindings.get(i + 1).map_or("", |e| e.action),
+                    true,
+                )
+                > max_width;
+
+        let w = chip_width(entry.key, entry.action, is_last);
+        if used + w > max_width {
             break;
         }
-        let segment = format!("[{}] {} ", entry.key, entry.action);
-        if hints.len() + segment.len() > max_width {
+
+        if !hints.is_empty() {
+            hints.push_str(" \u{00b7} "); // " · "
+        }
+        // Keycap markers — rendered as reverse-video by the span builder.
+        hints.push('\x01'); // SOH marks keycap start
+        hints.push_str(entry.key);
+        hints.push('\x02'); // STX marks keycap end
+        hints.push(' ');
+        hints.push_str(entry.action);
+        used += w;
+
+        if is_last {
             break;
         }
-        hints.push_str(&segment);
     }
 
-    // Trim trailing space
-    let trimmed = hints.trim_end();
-    trimmed.to_string()
+    hints
 }
 
-/// Render a key hint bar into a 1-row area, showing context-sensitive shortcuts.
+/// Push keycap/action-chip styled spans parsed from a `build_key_hints` string.
+///
+/// Keycap regions are delimited by `\x01..\x02` and rendered in reverse-video;
+/// action text is rendered in dim/normal style; separators (`·`) in dim.
+fn push_keycap_chip_spans<'a>(
+    spans: &mut Vec<ftui::text::Span<'a>>,
+    hints: &'a str,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    use ftui::text::Span;
+
+    let keycap_style = Style::default()
+        .fg(tp.status_bg)
+        .bg(tp.tab_key_fg)
+        .bold();
+    let action_style = Style::default().fg(tp.status_fg).bg(tp.status_bg);
+    let sep_style = Style::default()
+        .fg(tp.tab_inactive_fg)
+        .bg(tp.status_bg);
+
+    let mut rest = hints;
+    while !rest.is_empty() {
+        if let Some(start) = rest.find('\x01') {
+            // Text before keycap (separator or leading space)
+            if start > 0 {
+                spans.push(Span::styled(&rest[..start], sep_style));
+            }
+            rest = &rest[start + 1..]; // skip SOH
+            if let Some(end) = rest.find('\x02') {
+                // Keycap: ` key ` in reverse-video
+                let key = &rest[..end];
+                spans.push(Span::styled(
+                    format!(" {key} "),
+                    keycap_style,
+                ));
+                rest = &rest[end + 1..]; // skip STX
+            } else {
+                // Malformed — dump remaining
+                spans.push(Span::styled(rest, action_style));
+                break;
+            }
+        } else {
+            // No more keycaps — remaining is action text / separators
+            spans.push(Span::styled(rest, action_style));
+            break;
+        }
+    }
+}
+
+/// Render a key hint bar into a 1-row area using keycap/action-chip style.
+///
+/// Each binding is rendered as a reverse-video keycap followed by its
+/// action label, separated by middle-dot (`·`) dividers.
 pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, area: Rect) {
     use ftui::text::{Line, Span, Text};
 
@@ -958,37 +1015,9 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
         return;
     }
 
-    // Parse the hint string into styled spans: keys in accent, text in dim
     let mut spans = Vec::new();
     spans.push(Span::styled(" ", Style::default().bg(tp.status_bg)));
-
-    let mut rest = hints.as_str();
-    while let Some(open) = rest.find('[') {
-        // Text before bracket
-        if open > 0 {
-            spans.push(Span::styled(
-                &rest[..open],
-                Style::default().fg(tp.status_fg).bg(tp.status_bg),
-            ));
-        }
-        rest = &rest[open..];
-        if let Some(close) = rest.find(']') {
-            // Key portion: [key]
-            spans.push(Span::styled(
-                &rest[..=close],
-                Style::default().fg(tp.tab_key_fg).bg(tp.status_bg),
-            ));
-            rest = &rest[close + 1..];
-        } else {
-            break;
-        }
-    }
-    if !rest.is_empty() {
-        spans.push(Span::styled(
-            rest,
-            Style::default().fg(tp.status_fg).bg(tp.status_bg),
-        ));
-    }
+    push_keycap_chip_spans(&mut spans, &hints, &tp);
 
     let line = Line::from_spans(spans);
     Paragraph::new(Text::from_lines([line])).render(area, frame);
@@ -1018,7 +1047,9 @@ mod tests {
             action: "Down",
         }];
         let hints = build_key_hints(&bindings, 6, 80);
-        assert_eq!(hints, "[j] Down");
+        // Keycap markers: \x01 key \x02 action
+        assert!(hints.contains("\x01j\x02"));
+        assert!(hints.contains("Down"));
     }
 
     #[test]
@@ -1038,9 +1069,11 @@ mod tests {
             },
         ];
         let hints = build_key_hints(&bindings, 6, 80);
-        assert!(hints.contains("[j] Down"));
-        assert!(hints.contains("[k] Up"));
-        assert!(hints.contains("[q] Quit"));
+        assert!(hints.contains("\x01j\x02 Down"));
+        assert!(hints.contains("\x01k\x02 Up"));
+        assert!(hints.contains("\x01q\x02 Quit"));
+        // Chips separated by middle dot
+        assert!(hints.contains(" \u{00b7} "));
     }
 
     #[test]
@@ -1060,9 +1093,9 @@ mod tests {
             },
         ];
         let hints = build_key_hints(&bindings, 2, 80);
-        assert!(hints.contains("[a] A"));
-        assert!(hints.contains("[b] B"));
-        assert!(!hints.contains("[c] C"));
+        assert!(hints.contains("\x01a\x02 A"));
+        assert!(hints.contains("\x01b\x02 B"));
+        assert!(!hints.contains("\x01c\x02"));
     }
 
     #[test]
@@ -1077,10 +1110,35 @@ mod tests {
                 action: "Navigate up",
             },
         ];
-        // Width too narrow for both
+        // Width too narrow for both chips
         let hints = build_key_hints(&bindings, 6, 20);
-        assert!(hints.contains("[j] Navigate down"));
-        assert!(!hints.contains("[k]"));
+        assert!(hints.contains("\x01j\x02 Navigate down"));
+        assert!(!hints.contains("\x01k\x02"));
+    }
+
+    #[test]
+    fn keycap_chip_spans_produce_reverse_video_keys() {
+        use ftui::text::Span;
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let hints = build_key_hints(
+            &[
+                HelpEntry { key: "j", action: "Down" },
+                HelpEntry { key: "k", action: "Up" },
+            ],
+            6,
+            80,
+        );
+        let mut spans: Vec<Span<'_>> = Vec::new();
+        push_keycap_chip_spans(&mut spans, &hints, &tp);
+        // Should produce at least keycap + action spans for each chip
+        assert!(spans.len() >= 4, "expected >= 4 spans, got {}", spans.len());
+        // First keycap span should be bold (reverse-video keycap)
+        let first_keycap = &spans[0];
+        let attrs = first_keycap.style.and_then(|s| s.attrs).unwrap_or(ftui::style::StyleFlags::NONE);
+        assert!(
+            attrs.contains(ftui::style::StyleFlags::BOLD),
+            "keycap span should be bold"
+        );
     }
 
     // ── ChromePalette tests ─────────────────────────────────────
