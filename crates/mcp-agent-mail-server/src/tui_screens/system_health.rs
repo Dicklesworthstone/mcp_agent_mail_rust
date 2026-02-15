@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use ftui::layout::Rect;
+use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
@@ -57,6 +58,48 @@ impl Level {
             Self::Warn => "WARN",
             Self::Fail => "FAIL",
         }
+    }
+
+    /// Styled badge color for the level (green/amber/red).
+    fn style(self, tp: &crate::tui_theme::TuiThemePalette) -> Style {
+        match self {
+            Self::Ok => crate::tui_theme::text_success(tp),
+            Self::Warn => crate::tui_theme::text_warning(tp),
+            Self::Fail => crate::tui_theme::text_error(tp),
+        }
+    }
+}
+
+/// Build a styled diagnostic line: `  [LEVEL] description  detail`
+fn level_styled_line(
+    level: Level,
+    tp: &crate::tui_theme::TuiThemePalette,
+    description: String,
+    detail: String,
+) -> Line {
+    let badge_style = level.style(tp);
+    let desc_style = crate::tui_theme::text_primary(tp);
+    let detail_style = crate::tui_theme::text_meta(tp);
+    Line::from_spans([
+        Span::raw("  "),
+        Span::styled(format!("[{}]", level.label()), badge_style),
+        Span::raw(" "),
+        Span::styled(description, desc_style),
+        Span::raw("  "),
+        Span::styled(detail, detail_style),
+    ])
+}
+
+/// Human-readable HTTP status description.
+fn format_http_status(status: u16) -> String {
+    match status {
+        200 => "200 OK".to_string(),
+        401 => "401 Unauthorized".to_string(),
+        403 => "403 Forbidden".to_string(),
+        404 => "404 Not Found".to_string(),
+        405 => "405 Method Not Allowed".to_string(),
+        500 => "500 Internal Error".to_string(),
+        _ => status.to_string(),
     }
 }
 
@@ -180,110 +223,162 @@ impl SystemHealthScreen {
         let snap = self.snapshot();
         let effects_enabled = state.config_snapshot().tui_effects;
 
-        let mut body = String::new();
-        let _ = writeln!(body, "Endpoint: {}", snap.endpoint);
-        let _ = writeln!(body, "Web UI:   {}", snap.web_ui_url);
-        let _ = writeln!(
-            body,
-            "Auth:     {} (token_present: {}, len: {})",
-            if snap.auth_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            snap.token_present,
-            snap.token_len
-        );
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let label_style = crate::tui_theme::text_meta(&tp);
+        let value_style = crate::tui_theme::text_primary(&tp);
+        let section_style = crate::tui_theme::text_section(&tp);
+        let hint_style = crate::tui_theme::text_hint(&tp);
+        let accent_style = crate::tui_theme::text_accent(&tp);
+        let action_key_style = crate::tui_theme::text_action_key(&tp);
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        // ── Configuration Section ──
+        lines.push(Line::from_spans([
+            Span::styled("\u{2500}\u{2500} Configuration \u{2500}\u{2500}", section_style),
+        ]));
+
+        lines.push(Line::from_spans([
+            Span::styled("Endpoint:  ", label_style),
+            Span::styled(snap.endpoint.to_string(), value_style),
+        ]));
+        lines.push(Line::from_spans([
+            Span::styled("Web UI:    ", label_style),
+            Span::styled(snap.web_ui_url.to_string(), value_style),
+        ]));
+
+        let auth_text = if snap.auth_enabled { "enabled" } else { "disabled" };
+        let auth_val_style = if snap.auth_enabled {
+            crate::tui_theme::text_success(&tp)
+        } else {
+            crate::tui_theme::text_warning(&tp)
+        };
+        lines.push(Line::from_spans([
+            Span::styled("Auth:      ", label_style),
+            Span::styled(auth_text.to_string(), auth_val_style),
+            Span::styled(
+                format!(" (token: {}, len: {})", snap.token_present, snap.token_len),
+                hint_style,
+            ),
+        ]));
         if snap.auth_enabled && snap.localhost_unauth_allowed {
-            body.push_str("          Note: localhost unauthenticated access is allowed\n");
+            lines.push(Line::from_spans([
+                Span::styled("           ", label_style),
+                Span::styled(
+                    "Note: localhost unauthenticated access allowed".to_string(),
+                    hint_style,
+                ),
+            ]));
         }
-        let _ = writeln!(
-            body,
-            "Checked:  {}",
-            snap.checked_at
-                .map_or_else(|| "(never)".to_string(), |t| t.to_rfc3339())
-        );
 
-        // Uptime
+        let checked = snap
+            .checked_at
+            .map_or_else(|| "(never)".to_string(), |t| t.to_rfc3339());
+        lines.push(Line::from_spans([
+            Span::styled("Checked:   ", label_style),
+            Span::styled(checked, value_style),
+        ]));
+
         let uptime = state.uptime();
-        let _ = writeln!(body, "Uptime:   {}s", uptime.as_secs());
+        lines.push(Line::from_spans([
+            Span::styled("Uptime:    ", label_style),
+            Span::styled(format!("{}s", uptime.as_secs()), value_style),
+        ]));
 
-        body.push_str("\nConnection diagnostics:\n");
+        lines.push(Line::raw(String::new()));
+
+        // ── Connection Diagnostics Section ──
+        lines.push(Line::from_spans([
+            Span::styled(
+                "\u{2500}\u{2500} Connection Diagnostics \u{2500}\u{2500}",
+                section_style,
+            ),
+        ]));
 
         // TCP probe
         if let Some(err) = &snap.tcp_error {
-            let _ = writeln!(
-                body,
-                "- [{}] tcp:{}:{}  {err}",
-                Level::Fail.label(),
-                snap.http_host,
-                snap.http_port
-            );
+            lines.push(level_styled_line(
+                Level::Fail,
+                &tp,
+                format!("TCP {}:{}", snap.http_host, snap.http_port),
+                err.to_string(),
+            ));
         } else {
-            let _ = writeln!(
-                body,
-                "- [{}] tcp:{}:{}  {}ms",
-                Level::Ok.label(),
-                snap.http_host,
-                snap.http_port,
-                snap.tcp_latency_ms.unwrap_or(0)
-            );
+            lines.push(level_styled_line(
+                Level::Ok,
+                &tp,
+                format!("TCP {}:{}", snap.http_host, snap.http_port),
+                format!("{}ms", snap.tcp_latency_ms.unwrap_or(0)),
+            ));
         }
 
         // HTTP probes
         for p in &snap.path_probes {
             if let Some(err) = &p.error {
-                let _ = writeln!(
-                    body,
-                    "- [{}] POST {} ({}) tools/list  {err}",
-                    Level::Fail.label(),
-                    p.path,
-                    p.kind.label()
-                );
+                lines.push(level_styled_line(
+                    Level::Fail,
+                    &tp,
+                    format!("POST {} ({})", p.path, p.kind.label()),
+                    err.to_string(),
+                ));
                 continue;
             }
-            let status = p.status.map_or_else(|| "?".into(), |s| s.to_string());
+            let status = p.status.map_or_else(|| "?".into(), |s| format_http_status(s));
             let latency = p.latency_ms.unwrap_or(0);
             let tools_hint = match p.body_has_tools {
-                Some(true) => "tools=yes",
-                Some(false) => "tools=no",
-                None => "tools=?",
+                Some(true) => "tools: yes",
+                Some(false) => "tools: no",
+                None => "tools: ?",
             };
-            let level = classify_http_probe(&snap, p).label();
-            let _ = writeln!(
-                body,
-                "- [{level}] POST {} ({}) tools/list  status:{} {}ms {tools_hint}",
-                p.path,
-                p.kind.label(),
-                status,
-                latency
-            );
+            let level = classify_http_probe(&snap, p);
+            lines.push(level_styled_line(
+                level,
+                &tp,
+                format!("POST {} ({})", p.path, p.kind.label()),
+                format!("{status}  {latency}ms  {tools_hint}"),
+            ));
         }
 
+        // ── Findings Section ──
         if !snap.lines.is_empty() {
-            body.push_str("\nFindings:\n");
+            lines.push(Line::raw(String::new()));
+            lines.push(Line::from_spans([
+                Span::styled(
+                    "\u{2500}\u{2500} Findings \u{2500}\u{2500}",
+                    section_style,
+                ),
+            ]));
             for line in &snap.lines {
-                let _ = writeln!(
-                    body,
-                    "- [{}] {}: {}",
-                    line.level.label(),
-                    line.name,
-                    line.detail
-                );
+                lines.push(level_styled_line(
+                    line.level,
+                    &tp,
+                    line.name.to_string(),
+                    line.detail.to_string(),
+                ));
                 if let Some(fix) = &line.remediation {
-                    let _ = writeln!(body, "       Fix: {fix}");
+                    lines.push(Line::from_spans([
+                        Span::styled("       Fix: ", accent_style),
+                        Span::styled(fix.to_string(), hint_style),
+                    ]));
                 }
             }
         }
 
-        body.push_str("\nKeys: r refresh | v dashboard\n");
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::from_spans([
+            Span::styled("r", action_key_style),
+            Span::styled(" Refresh  ", hint_style),
+            Span::styled("v", action_key_style),
+            Span::styled(" Dashboard", hint_style),
+        ]));
 
-        let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
             .title("System Health")
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
-        Paragraph::new(body).block(block).render(area, frame);
+        Paragraph::new(Text::from_lines(lines))
+            .block(block)
+            .render(area, frame);
 
         if diagnostics_probe_in_progress(&snap, self.refresh_requested.load(Ordering::Relaxed)) {
             render_probing_indicator(frame, area, state, effects_enabled);
@@ -2007,5 +2102,41 @@ mod tests {
             text.contains("hidden"),
             "expected single-slot overflow annotation, got:\n{text}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // br-1xt0m.1.11.1: Structured diagnostic sections for text mode
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_http_status_common_codes() {
+        assert_eq!(format_http_status(200), "200 OK");
+        assert_eq!(format_http_status(401), "401 Unauthorized");
+        assert_eq!(format_http_status(403), "403 Forbidden");
+        assert_eq!(format_http_status(404), "404 Not Found");
+        assert_eq!(format_http_status(500), "500 Internal Error");
+        assert_eq!(format_http_status(418), "418"); // unknown falls through
+    }
+
+    #[test]
+    fn level_style_returns_severity_colors() {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let ok_style = Level::Ok.style(&tp);
+        let warn_style = Level::Warn.style(&tp);
+        let fail_style = Level::Fail.style(&tp);
+        // Each should be distinct
+        assert_ne!(ok_style, warn_style);
+        assert_ne!(warn_style, fail_style);
+        assert_ne!(ok_style, fail_style);
+    }
+
+    #[test]
+    fn level_styled_line_contains_badge_and_detail() {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let line = level_styled_line(Level::Ok, &tp, "TCP check".into(), "5ms".into());
+        let text: String = line.spans().iter().map(|s| s.as_str()).collect();
+        assert!(text.contains("[OK]"), "line text: {text}");
+        assert!(text.contains("TCP check"), "line text: {text}");
+        assert!(text.contains("5ms"), "line text: {text}");
     }
 }
