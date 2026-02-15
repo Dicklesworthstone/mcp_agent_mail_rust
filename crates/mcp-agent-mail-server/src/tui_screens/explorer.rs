@@ -1323,13 +1323,13 @@ fn render_header(
             || {
                 (
                     truncate_str(&stat_line, w),
-                    Style::default().fg(tp.text_muted),
+                    crate::tui_theme::text_meta(&tp),
                 )
             },
             |err| {
                 (
                     truncate_str(&format!("ERR: {err}"), w),
-                    Style::default().fg(tp.severity_error),
+                    crate::tui_theme::text_error(&tp),
                 )
             },
         );
@@ -1382,9 +1382,9 @@ fn render_filter_rail(
         let marker = if is_active { '>' } else { ' ' };
 
         let label_style = if is_active {
-            Style::default().fg(tp.status_accent)
+            crate::tui_theme::text_facet_active(&tp)
         } else {
-            Style::default().fg(tp.text_muted)
+            crate::tui_theme::text_meta(&tp)
         };
 
         let label_text = format!("{marker} {label}");
@@ -1420,7 +1420,7 @@ fn render_filter_rail(
         };
         let hint_area = Rect::new(inner.x, help_y, inner.width, 1);
         Paragraph::new(truncate_str(hint, w))
-            .style(Style::default().fg(tp.text_muted))
+            .style(crate::tui_theme::text_hint(&tp))
             .render(hint_area, frame);
     }
 }

@@ -385,7 +385,7 @@ impl AgentsScreen {
             return Style::default().fg(tp.selection_fg).bg(tp.selection_bg);
         }
         if !self.reduced_motion && self.stagger_reveal_ticks.contains_key(&agent.name) {
-            return Style::default().fg(tp.text_disabled);
+            return crate::tui_theme::text_disabled(&tp);
         }
 
         let status_color = self.status_color(agent, now_ts);

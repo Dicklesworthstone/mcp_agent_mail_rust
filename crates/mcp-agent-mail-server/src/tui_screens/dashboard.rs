@@ -852,7 +852,7 @@ fn render_gradient_title(frame: &mut Frame<'_>, area: Rect, effects_enabled: boo
 
     let line = Line::from_spans([Span::styled(
         title_text,
-        Style::default().fg(tp.status_accent).bold(),
+        crate::tui_theme::text_accent(&tp),
     )]);
     Paragraph::new(line).render(title_area, frame);
 }

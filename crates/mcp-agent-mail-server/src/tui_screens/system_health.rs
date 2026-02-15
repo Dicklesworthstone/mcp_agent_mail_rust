@@ -302,7 +302,7 @@ impl SystemHealthScreen {
         let content_area = if critical_alerts > 0 && area.height > 1 {
             let tp = crate::tui_theme::TuiThemePalette::current();
             let alert_text = format!("CRITICAL: {critical_alerts} failing health checks");
-            let alert_style = Style::default().fg(tp.severity_critical).bold();
+            let alert_style = crate::tui_theme::text_critical(&tp);
             Paragraph::new(alert_text.as_str())
                 .style(alert_style)
                 .render(Rect::new(area.x, area.y, area.width, 1), frame);
@@ -696,7 +696,7 @@ fn render_probing_indicator(
             .render(render_area, frame);
     } else {
         Paragraph::new(label)
-            .style(Style::default().fg(tp.severity_warn).bold())
+            .style(crate::tui_theme::text_warning(&tp))
             .render(render_area, frame);
     }
 }

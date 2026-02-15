@@ -175,7 +175,7 @@ impl RenderItem for MessageEntry {
         // Importance badge
         let pulse_on = MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed);
         let (badge, badge_style) = match self.importance.as_str() {
-            "high" => ("!", Style::default().fg(tp.severity_warn).bold()),
+            "high" => ("!", crate::tui_theme::text_warning(&tp)),
             "urgent" => {
                 let fg = if pulse_on {
                     tp.badge_urgent_bg
@@ -856,7 +856,7 @@ impl MailScreen for MessageBrowserScreen {
             Block::default()
                 .title("Messages")
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(tp.text_muted))
+                .border_style(crate::tui_theme::text_meta(&tp))
                 .render(area, frame);
             return;
         }
@@ -1317,7 +1317,7 @@ fn render_search_bar(
             );
             let hint_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
             Paragraph::new(truncate_str(&hint, inner.width as usize))
-                .style(Style::default().fg(tp.text_muted))
+                .style(crate::tui_theme::text_hint(&tp))
                 .render(hint_area, frame);
         }
         if inner.height > 2 {
@@ -1798,7 +1798,7 @@ fn render_vertical_scrollbar(
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let track_style = Style::default().fg(tp.text_disabled);
+    let track_style = crate::tui_theme::text_disabled(&tp);
     let thumb_style = Style::default()
         .fg(if focused {
             tp.selection_indicator

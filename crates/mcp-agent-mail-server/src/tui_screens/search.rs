@@ -1852,7 +1852,7 @@ impl MailScreen for SearchCockpitScreen {
             Block::default()
                 .title("Search")
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(tp.text_muted))
+                .border_style(crate::tui_theme::text_meta(&tp))
                 .render(area, frame);
             return;
         }
@@ -3032,7 +3032,7 @@ fn render_vertical_scrollbar(
     }
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let track_style = Style::default().fg(tp.text_disabled);
+    let track_style = crate::tui_theme::text_disabled(&tp);
     let thumb_style = Style::default()
         .fg(if focused {
             tp.selection_indicator

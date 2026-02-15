@@ -137,12 +137,7 @@ impl Default for AnalyticsScreen {
 
 fn severity_style(severity: AnomalySeverity) -> Style {
     let tp = crate::tui_theme::TuiThemePalette::current();
-    match severity {
-        AnomalySeverity::Critical => Style::default().fg(tp.severity_critical).bold(),
-        AnomalySeverity::High => Style::default().fg(tp.severity_warn).bold(),
-        AnomalySeverity::Medium => Style::default().fg(tp.severity_warn),
-        AnomalySeverity::Low => Style::default().fg(tp.severity_ok),
-    }
+    crate::tui_theme::style_for_anomaly_severity(&tp, severity)
 }
 
 const fn severity_badge(severity: AnomalySeverity) -> &'static str {
@@ -177,7 +172,7 @@ fn render_card_list(
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let header = Row::new(vec!["Sev", "Conf", "Headline"])
-        .style(Style::default().fg(tp.panel_title_fg).bold());
+        .style(crate::tui_theme::text_title(&tp));
 
     let rows: Vec<Row> = feed
         .cards
@@ -235,7 +230,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
         Span::raw("  "),
         Span::styled(
             confidence_bar(card.confidence),
-            Style::default().fg(tp.status_accent),
+            crate::tui_theme::text_accent(&tp),
         ),
     ]));
     lines.push(Line::raw(""));
@@ -259,7 +254,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
         lines.push(Line::from_spans(vec![
             Span::styled(
                 "Likely Cause: ",
-                Style::default().fg(tp.severity_warn).bold(),
+                crate::tui_theme::text_warning(&tp),
             ),
             Span::raw(cause),
         ]));
@@ -270,7 +265,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     if !card.next_steps.is_empty() {
         lines.push(Line::styled(
             "Next Steps:",
-            Style::default().fg(tp.severity_ok).bold(),
+            crate::tui_theme::text_success(&tp).bold(),
         ));
         for (i, step) in card.next_steps.iter().enumerate() {
             lines.push(Line::raw(format!("  {}. {step}", i + 1)));
@@ -282,7 +277,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     if !card.deep_links.is_empty() {
         lines.push(Line::styled(
             "Deep Links (Enter to navigate):",
-            Style::default().fg(tp.text_muted),
+            crate::tui_theme::text_meta(&tp),
         ));
         for link in &card.deep_links {
             lines.push(Line::raw(format!("  → {link}")));
@@ -294,7 +289,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
     if !card.supporting_trends.is_empty() {
         lines.push(Line::styled(
             format!("Supporting Trends ({})", card.supporting_trends.len()),
-            Style::default().fg(tp.text_secondary),
+            crate::tui_theme::text_section(&tp),
         ));
         for trend in &card.supporting_trends {
             lines.push(Line::raw(format!(
@@ -313,7 +308,7 @@ fn render_card_detail(frame: &mut Frame<'_>, area: Rect, card: &InsightCard, scr
                 "Supporting Correlations ({})",
                 card.supporting_correlations.len()
             ),
-            Style::default().fg(tp.text_secondary),
+            crate::tui_theme::text_section(&tp),
         ));
         for corr in &card.supporting_correlations {
             lines.push(Line::raw(format!(

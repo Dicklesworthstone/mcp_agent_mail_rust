@@ -751,6 +751,78 @@ pub fn text_disabled(tp: &TuiThemePalette) -> Style {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Semantic state style helpers
+// ──────────────────────────────────────────────────────────────────────
+//
+// Consistent state-based styles for actions, severity indicators, and
+// status badges.  Use these instead of inline `tp.severity_*` access.
+
+/// Accent/action text: primary CTA, active facet, selected action key.
+#[must_use]
+pub fn text_accent(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.status_accent).bold()
+}
+
+/// Error state text: failures, critical alerts.
+#[must_use]
+pub fn text_error(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.severity_error).bold()
+}
+
+/// Success state text: healthy checks, completed items.
+#[must_use]
+pub fn text_success(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.severity_ok)
+}
+
+/// Warning state text: degraded states, elevated thresholds.
+#[must_use]
+pub fn text_warning(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.severity_warn).bold()
+}
+
+/// Critical state text: highest severity, immediate attention.
+#[must_use]
+pub fn text_critical(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.severity_critical).bold()
+}
+
+/// Facet label text: search facet labels, filter category headings.
+#[must_use]
+pub fn text_facet_label(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.text_muted)
+}
+
+/// Facet active text: selected/active facet value.
+#[must_use]
+pub fn text_facet_active(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.status_accent)
+}
+
+/// Action key hint: keyboard shortcut letters in help/status bars.
+#[must_use]
+pub fn text_action_key(tp: &TuiThemePalette) -> Style {
+    Style::default().fg(tp.severity_ok)
+}
+
+/// Style for an [`mcp_agent_mail_core::AnomalySeverity`] level.
+///
+/// Used by the analytics screen and any future anomaly/alert surfaces.
+#[must_use]
+pub fn style_for_anomaly_severity(
+    tp: &TuiThemePalette,
+    severity: mcp_agent_mail_core::AnomalySeverity,
+) -> Style {
+    use mcp_agent_mail_core::AnomalySeverity;
+    match severity {
+        AnomalySeverity::Critical => Style::default().fg(tp.severity_critical).bold(),
+        AnomalySeverity::High => Style::default().fg(tp.severity_warn).bold(),
+        AnomalySeverity::Medium => Style::default().fg(tp.severity_warn),
+        AnomalySeverity::Low => Style::default().fg(tp.severity_ok),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // JSON token style helpers
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1121,5 +1193,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Semantic state style tests ──────────────────────────────
+
+    #[test]
+    fn semantic_state_helpers_produce_valid_styles() {
+        use ftui::style::StyleFlags;
+        let has = |s: &Style, f: StyleFlags| s.attrs.map_or(false, |a| a.contains(f));
+
+        for &theme_id in &ThemeId::ALL {
+            let _guard = ScopedThemeLock::new(theme_id);
+            let tp = TuiThemePalette::current();
+
+            let accent = text_accent(&tp);
+            let error = text_error(&tp);
+            let success = text_success(&tp);
+            let warning = text_warning(&tp);
+            let critical = text_critical(&tp);
+            let facet_label = text_facet_label(&tp);
+            let facet_active = text_facet_active(&tp);
+            let action_key = text_action_key(&tp);
+
+            // All should have fg set.
+            for (name, s) in &[
+                ("accent", &accent),
+                ("error", &error),
+                ("success", &success),
+                ("warning", &warning),
+                ("critical", &critical),
+                ("facet_label", &facet_label),
+                ("facet_active", &facet_active),
+                ("action_key", &action_key),
+            ] {
+                assert!(
+                    s.fg.is_some(),
+                    "{name} missing fg in theme {theme_id:?}"
+                );
+            }
+
+            // Bold expectations.
+            assert!(has(&accent, StyleFlags::BOLD), "accent must be bold in {theme_id:?}");
+            assert!(has(&error, StyleFlags::BOLD), "error must be bold in {theme_id:?}");
+            assert!(has(&warning, StyleFlags::BOLD), "warning must be bold in {theme_id:?}");
+            assert!(has(&critical, StyleFlags::BOLD), "critical must be bold in {theme_id:?}");
+
+            // Success is intentionally NOT bold (lower visual weight).
+            assert!(!has(&success, StyleFlags::BOLD), "success should not be bold in {theme_id:?}");
+        }
+    }
+
+    #[test]
+    fn anomaly_severity_style_maps_correctly() {
+        use mcp_agent_mail_core::AnomalySeverity;
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let tp = TuiThemePalette::current();
+
+        let crit = style_for_anomaly_severity(&tp, AnomalySeverity::Critical);
+        let high = style_for_anomaly_severity(&tp, AnomalySeverity::High);
+        let med = style_for_anomaly_severity(&tp, AnomalySeverity::Medium);
+        let low = style_for_anomaly_severity(&tp, AnomalySeverity::Low);
+
+        // All should produce distinct foreground colors.
+        assert!(crit.fg.is_some());
+        assert!(high.fg.is_some());
+        assert!(med.fg.is_some());
+        assert!(low.fg.is_some());
+
+        // Critical and high should use different base colors.
+        assert_ne!(crit.fg, low.fg, "critical and low should differ");
     }
 }

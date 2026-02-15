@@ -375,7 +375,7 @@ impl MailScreen for ReservationsScreen {
                         .render(alert_area, frame);
                 } else {
                     Paragraph::new(critical_alert.trim_start())
-                        .style(Style::default().fg(tp.severity_critical).bold())
+                        .style(crate::tui_theme::text_critical(&tp))
                         .render(alert_area, frame);
                 }
             }
@@ -411,9 +411,9 @@ impl MailScreen for ReservationsScreen {
                 let style = if Some(i) == self.table_state.selected {
                     Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else if res.released {
-                    Style::default().fg(tp.text_disabled)
+                    crate::tui_theme::text_disabled(&tp)
                 } else if remaining == 0 {
-                    Style::default().fg(tp.severity_error)
+                    crate::tui_theme::text_error(&tp)
                 } else if ratio < 0.2 {
                     Style::default().fg(tp.ttl_warning)
                 } else {
@@ -574,9 +574,9 @@ fn render_ttl_overlays(
         let base_style = if row.selected {
             Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
         } else if row.released {
-            Style::default().fg(tp.text_disabled).bg(tp.bg_deep)
+            crate::tui_theme::text_disabled(&tp).bg(tp.bg_deep)
         } else {
-            Style::default().fg(tp.text_primary).bg(tp.bg_surface)
+            crate::tui_theme::text_primary(&tp).bg(tp.bg_surface)
         };
         let gauge_bg = if row.selected {
             tp.status_accent

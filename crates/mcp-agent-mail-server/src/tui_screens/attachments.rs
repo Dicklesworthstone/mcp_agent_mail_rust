@@ -500,7 +500,7 @@ impl AttachmentExplorerScreen {
 
         let summary_style = if self.text_filter_active {
             let tp = crate::tui_theme::TuiThemePalette::current();
-            Style::default().fg(tp.status_accent)
+            crate::tui_theme::text_facet_active(&tp)
         } else {
             Style::default()
         };
