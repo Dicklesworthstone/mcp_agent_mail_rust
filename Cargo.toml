@@ -25,31 +25,31 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { path = "../fastmcp_rust/crates/fastmcp", package = "fastmcp-rust" }
-fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
-fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
-fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
-fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+fastmcp = { version = "0.2.0", path = "../fastmcp_rust/crates/fastmcp", package = "fastmcp-rust" }
+fastmcp-core = { version = "0.2.0", path = "../fastmcp_rust/crates/fastmcp-core" }
+fastmcp-server = { version = "0.2.0", path = "../fastmcp_rust/crates/fastmcp-server" }
+fastmcp-transport = { version = "0.2.0", path = "../fastmcp_rust/crates/fastmcp-transport" }
+fastmcp-protocol = { version = "0.2.0", path = "../fastmcp_rust/crates/fastmcp-protocol" }
 
 asupersync = { version = "0.2.0", path = "../asupersync", features = ["tls-webpki-roots"] }
 
-sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
-sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-query = { path = "../sqlmodel_rust/crates/sqlmodel-query" }
-sqlmodel-schema = { path = "../sqlmodel_rust/crates/sqlmodel-schema" }
-sqlmodel-session = { path = "../sqlmodel_rust/crates/sqlmodel-session" }
-sqlmodel-pool = { path = "../sqlmodel_rust/crates/sqlmodel-pool" }
-sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
-sqlmodel-frankensqlite = { path = "../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
+sqlmodel = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-core = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-query = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-pool = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-sqlite = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+sqlmodel-frankensqlite = { version = "0.2.0", path = "../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
 
-ftui = { path = "../frankentui/crates/ftui", features = ["crossterm"] }
-ftui-runtime = { path = "../frankentui/crates/ftui-runtime", features = ["crossterm-compat"] }
-ftui-extras = { path = "../frankentui/crates/ftui-extras", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
-ftui-widgets = { path = "../frankentui/crates/ftui-widgets", features = ["debug-overlay", "regex-search"] }
-ftui-harness = { path = "../frankentui/crates/ftui-harness" }
-ftui-render = { path = "../frankentui/crates/ftui-render" }
+ftui = { version = "0.2.0", path = "../frankentui/crates/ftui", features = ["crossterm"] }
+ftui-runtime = { version = "0.2.0", path = "../frankentui/crates/ftui-runtime", features = ["crossterm-compat"] }
+ftui-extras = { version = "0.2.0", path = "../frankentui/crates/ftui-extras", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
+ftui-widgets = { version = "0.2.0", path = "../frankentui/crates/ftui-widgets", features = ["debug-overlay", "regex-search"] }
+ftui-harness = { version = "0.2.0", path = "../frankentui/crates/ftui-harness" }
+ftui-render = { version = "0.2.0", path = "../frankentui/crates/ftui-render" }
 beads_rust = { path = "../beads_rust" }
-toon = { package = "tru", path = "../toon_rust" }
+toon = { version = "0.2.0", package = "tru", path = "../toon_rust" }
 
 # Agent detection (tokio-based upstream; declare optional in crates that use it)
 coding-agent-search = { path = "../coding_agent_session_search" }
