@@ -281,12 +281,20 @@ enum StatusPriority {
     Low = 3,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusEffect {
+    None,
+    LivePulse,
+    RecordingPulse,
+}
+
 /// A semantic segment of the status bar.
 struct StatusSegment {
     priority: StatusPriority,
     text: String,
     fg: PackedRgba,
     bold: bool,
+    effect: StatusEffect,
 }
 
 /// Compute which segments to show given available width.
@@ -298,6 +306,7 @@ struct StatusSegment {
 fn plan_status_segments(
     state: &TuiSharedState,
     active: MailScreenId,
+    recording_active: bool,
     help_visible: bool,
     accessibility: &AccessibilitySettings,
     screen_bindings: &[HelpEntry],
@@ -334,6 +343,7 @@ fn plan_status_segments(
         text: format!(" {}", meta.title),
         fg: tp.status_accent,
         bold: true,
+        effect: StatusEffect::None,
     }];
 
     // Transport mode (High priority)
@@ -342,6 +352,7 @@ fn plan_status_segments(
         text: format!(" {transport_mode}"),
         fg: tp.status_fg,
         bold: false,
+        effect: StatusEffect::None,
     });
 
     // Uptime (Medium priority)
@@ -350,6 +361,7 @@ fn plan_status_segments(
         text: format!(" up:{uptime_str}"),
         fg: tp.status_fg,
         bold: false,
+        effect: StatusEffect::None,
     });
 
     // ── Center segments (centered) ──
@@ -362,6 +374,7 @@ fn plan_status_segments(
             text: format!("err:{error_count}"),
             fg: tp.status_warn,
             bold: true,
+            effect: StatusEffect::None,
         });
     }
 
@@ -371,6 +384,7 @@ fn plan_status_segments(
         text: format!("req:{total} ok:{ok} err:{error_count} avg:{avg_latency}ms"),
         fg: counter_fg,
         bold: false,
+        effect: StatusEffect::None,
     });
 
     // Key hints at Low priority
@@ -383,6 +397,7 @@ fn plan_status_segments(
                 text: hints,
                 fg: tp.status_fg,
                 bold: false,
+                effect: StatusEffect::None,
             });
         }
     }
@@ -394,7 +409,26 @@ fn plan_status_segments(
         text: format!("{help_hint} "),
         fg: tp.tab_key_fg,
         bold: false,
+        effect: StatusEffect::None,
     }];
+
+    right.push(StatusSegment {
+        priority: StatusPriority::Critical,
+        text: "LIVE ".to_string(),
+        fg: tp.status_good,
+        bold: true,
+        effect: StatusEffect::LivePulse,
+    });
+
+    if recording_active {
+        right.push(StatusSegment {
+            priority: StatusPriority::High,
+            text: "REC ".to_string(),
+            fg: tp.status_warn,
+            bold: true,
+            effect: StatusEffect::RecordingPulse,
+        });
+    }
 
     // Toast mute indicator (High priority)
     if toast_muted {
@@ -403,6 +437,7 @@ fn plan_status_segments(
             text: "[muted] ".to_string(),
             fg: tp.status_warn,
             bold: false,
+            effect: StatusEffect::None,
         });
     }
 
@@ -413,6 +448,7 @@ fn plan_status_segments(
             text: "[fx off] ".to_string(),
             fg: tp.status_warn,
             bold: false,
+            effect: StatusEffect::None,
         });
     }
 
@@ -435,6 +471,7 @@ fn plan_status_segments(
                 text: label,
                 fg: tp.status_fg,
                 bold: false,
+                effect: StatusEffect::None,
             });
         }
     }
@@ -447,6 +484,7 @@ fn plan_status_segments(
             text: format!("{theme} "),
             fg: tp.status_fg,
             bold: false,
+            effect: StatusEffect::None,
         });
     }
 
@@ -482,6 +520,7 @@ fn plan_status_segments(
 pub fn render_status_line(
     state: &TuiSharedState,
     active: MailScreenId,
+    recording_active: bool,
     help_visible: bool,
     accessibility: &AccessibilitySettings,
     screen_bindings: &[HelpEntry],
@@ -490,6 +529,7 @@ pub fn render_status_line(
     area: Rect,
 ) {
     use ftui::text::{Line, Span, Text};
+    use ftui_extras::text_effects::{StyledText, TextEffect};
 
     let tp = crate::tui_theme::TuiThemePalette::current();
 
@@ -500,6 +540,7 @@ pub fn render_status_line(
     let (left, center, right) = plan_status_segments(
         state,
         active,
+        recording_active,
         help_visible,
         accessibility,
         screen_bindings,
@@ -520,6 +561,10 @@ pub fn render_status_line(
     let right_width: u16 = right.iter().map(|s| s.text.len() as u16).sum();
 
     let mut spans: Vec<Span<'_>> = Vec::with_capacity(16);
+    let mut effect_overlays: Vec<(u16, u16, StatusEffect, PackedRgba, String)> = Vec::new();
+    let mut cursor_x = area.x;
+    let effects_enabled = state.config_snapshot().tui_effects && !accessibility.reduced_motion;
+    let animation_time = state.uptime().as_secs_f64();
 
     // Left segments
     for seg in &left {
@@ -528,6 +573,7 @@ pub fn render_status_line(
             style = style.bold();
         }
         spans.push(Span::styled(seg.text.as_str(), style));
+        cursor_x = cursor_x.saturating_add(u16::try_from(seg.text.len()).unwrap_or(u16::MAX));
     }
 
     // Center padding + center segments
@@ -540,12 +586,14 @@ pub fn render_status_line(
                 " ".repeat(left_pad as usize),
                 bg_style,
             ));
+            cursor_x = cursor_x.saturating_add(left_pad);
         }
     } else if center_width == 0 {
         // No center — push right to the far right.
         let gap = area.width.saturating_sub(left_width + right_width);
         if gap > 0 {
             spans.push(Span::styled(" ".repeat(gap as usize), bg_style));
+            cursor_x = cursor_x.saturating_add(gap);
         }
     }
 
@@ -555,6 +603,7 @@ pub fn render_status_line(
                 " | ",
                 Style::default().fg(tp.status_fg).bg(tp.status_bg),
             ));
+            cursor_x = cursor_x.saturating_add(3);
         }
         // Key hints get keycap/chip rendering (reverse-video keys).
         if seg.priority == StatusPriority::Low && seg.text.contains('\x01') {
@@ -566,6 +615,7 @@ pub fn render_status_line(
             }
             spans.push(Span::styled(seg.text.as_str(), style));
         }
+        cursor_x = cursor_x.saturating_add(u16::try_from(seg.text.len()).unwrap_or(u16::MAX));
     }
 
     // Right padding
@@ -577,6 +627,7 @@ pub fn render_status_line(
                 " ".repeat(right_pad as usize),
                 bg_style,
             ));
+            cursor_x = cursor_x.saturating_add(right_pad);
         }
     }
 
@@ -586,11 +637,45 @@ pub fn render_status_line(
         if seg.bold {
             style = style.bold();
         }
+        let seg_width = u16::try_from(seg.text.len()).unwrap_or(u16::MAX);
+        if effects_enabled && seg.effect != StatusEffect::None && seg_width > 0 {
+            effect_overlays.push((cursor_x, seg_width, seg.effect, seg.fg, seg.text.clone()));
+        }
         spans.push(Span::styled(seg.text.as_str(), style));
+        cursor_x = cursor_x.saturating_add(seg_width);
     }
 
     let line = Line::from_spans(spans);
     Paragraph::new(Text::from_lines([line])).render(area, frame);
+
+    if effects_enabled {
+        for (x, width, effect, color, label_with_space) in effect_overlays {
+            let label = label_with_space.trim_end();
+            if label.is_empty() {
+                continue;
+            }
+            let label_width = u16::try_from(label.len())
+                .unwrap_or(u16::MAX)
+                .min(width);
+            let effect = match effect {
+                StatusEffect::LivePulse => TextEffect::Pulse {
+                    speed: 2.0 / 3.0,
+                    min_alpha: 0.35,
+                },
+                StatusEffect::RecordingPulse => TextEffect::Pulse {
+                    speed: 2.0 / 3.0,
+                    min_alpha: 0.20,
+                },
+                StatusEffect::None => continue,
+            };
+            StyledText::new(label)
+                .effect(effect)
+                .base_color(color)
+                .bold()
+                .time(animation_time)
+                .render(Rect::new(x, area.y, label_width, 1), frame);
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1406,6 +1491,7 @@ mod tests {
             &state,
             MailScreenId::Dashboard,
             false,
+            false,
             &a11y,
             &[],
             false,
@@ -1429,6 +1515,7 @@ mod tests {
             &state,
             MailScreenId::Dashboard,
             false,
+            false,
             &a11y,
             &[],
             false,
@@ -1451,6 +1538,7 @@ mod tests {
         let (left, center, right) = plan_status_segments(
             &state,
             MailScreenId::Dashboard,
+            false,
             false,
             &a11y,
             &[],
@@ -1478,6 +1566,7 @@ mod tests {
             &state,
             MailScreenId::Dashboard,
             false,
+            false,
             &a11y,
             &[],
             false,
@@ -1504,6 +1593,7 @@ mod tests {
         let (left, center, right) = plan_status_segments(
             &state,
             MailScreenId::Dashboard,
+            false,
             false,
             &a11y,
             &[],
@@ -1537,6 +1627,7 @@ mod tests {
             &state,
             MailScreenId::Dashboard,
             false,
+            false,
             &a11y,
             &[],
             false,
@@ -1564,6 +1655,7 @@ mod tests {
             &state,
             MailScreenId::Dashboard,
             false,
+            false,
             &a11y,
             &[],
             false,
@@ -1586,6 +1678,7 @@ mod tests {
             &state,
             MailScreenId::Dashboard,
             false,
+            false,
             &a11y,
             &[],
             false,
@@ -1594,6 +1687,7 @@ mod tests {
         let (left_160, center_160, right_160) = plan_status_segments(
             &state,
             MailScreenId::Dashboard,
+            false,
             false,
             &a11y,
             &[],
@@ -1673,6 +1767,7 @@ mod tests {
         let (_, _, right) = plan_status_segments(
             &state,
             MailScreenId::Dashboard,
+            false,
             false,
             &a11y,
             &[],

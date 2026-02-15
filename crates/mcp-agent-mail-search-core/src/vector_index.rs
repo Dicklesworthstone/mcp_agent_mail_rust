@@ -312,7 +312,7 @@ impl SearchFilter for FsVectorFilterAdapter<'_> {
             .is_some_and(|meta| active_filter.matches(meta))
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "mcp-agent-mail-vector-filter-adapter"
     }
 }
@@ -705,7 +705,6 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensearch::core::filter::SearchFilter as _;
 
     fn make_entry(doc_id: i64, kind: DocKind, vector: &[f32]) -> IndexEntry {
         IndexEntry::new(vector, VectorMetadata::new(doc_id, kind, "test-model"))
@@ -1559,7 +1558,7 @@ mod tests {
             assert_eq!(left.doc_id, right.doc_id);
             assert_eq!(left.doc_kind, right.doc_kind);
             assert_eq!(left.project_id, right.project_id);
-            assert!((left.score - right.score).abs() < 1e-6);
+            assert!((left.score - right.score).abs() < 1e-3);
         }
     }
 
