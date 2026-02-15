@@ -273,6 +273,14 @@ impl MouseDispatcher {
         }
     }
 
+    /// Return a tab slot's position as `(x_start, x_end, y)`, if registered.
+    pub fn tab_slot(&self, index: usize) -> Option<(u16, u16, u16)> {
+        self.tab_slots.get(index).and_then(|cell| {
+            let slot = cell.get();
+            slot.screen.map(|_| (slot.x_start, slot.x_end, slot.y))
+        })
+    }
+
     /// Dispatch a mouse event through the shell priority chain.
     ///
     /// Priority order (highest first):
@@ -318,8 +326,11 @@ impl MouseDispatcher {
 }
 
 /// Check whether a point `(x, y)` falls inside a rectangle.
+///
+/// Returns `false` for empty (zero-area) rectangles.
 #[inline]
-fn point_in_rect(rect: Rect, x: u16, y: u16) -> bool {
+#[must_use]
+pub fn point_in_rect(rect: Rect, x: u16, y: u16) -> bool {
     !rect.is_empty()
         && x >= rect.x
         && x < rect.x + rect.width

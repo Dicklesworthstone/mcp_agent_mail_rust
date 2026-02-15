@@ -2228,6 +2228,17 @@ impl Model for MailAppModel {
         // Record per-tab hit slots for mouse dispatch.
         tui_chrome::record_tab_hit_slots(chrome.tab_bar, &self.mouse_dispatcher);
 
+        // Register per-tab hit regions in the frame's hit grid.
+        for (i, meta) in crate::tui_screens::MAIL_SCREEN_REGISTRY.iter().enumerate() {
+            if let Some(slot) = self.mouse_dispatcher.tab_slot(i) {
+                let tab_rect = Rect::new(slot.0, slot.2, slot.1 - slot.0, 1);
+                frame.register_hit_region(
+                    tab_rect,
+                    crate::tui_hit_regions::tab_hit_id(meta.id),
+                );
+            }
+        }
+
         // 2. Screen content (z=2)
         if self.screen_panics.borrow().contains_key(&active_screen) {
             let msg = self.screen_panics.borrow().get(&active_screen).cloned().unwrap_or_default();
@@ -2242,6 +2253,12 @@ impl Model for MailAppModel {
                 self.screen_panics.borrow_mut().insert(active_screen, msg);
             }
         }
+
+        // Register pane hit region for the active screen's content area.
+        frame.register_hit_region(
+            chrome.content,
+            crate::tui_hit_regions::pane_hit_id(active_screen),
+        );
         if let Some(transition) = self.screen_transition {
             render_screen_transition_overlay(transition, chrome.content, frame);
         }
