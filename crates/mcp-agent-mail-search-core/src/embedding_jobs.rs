@@ -930,6 +930,60 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FlakyBatchEmbedder {
+        info: ModelInfo,
+        fail_batches_remaining: AtomicUsize,
+    }
+
+    impl FlakyBatchEmbedder {
+        fn new(dimension: usize, fail_batches: usize) -> Self {
+            Self {
+                info: ModelInfo::new(
+                    "flaky-fast",
+                    "Flaky Fast",
+                    ModelTier::Fast,
+                    dimension,
+                    4096,
+                )
+                .with_available(true),
+                fail_batches_remaining: AtomicUsize::new(fail_batches),
+            }
+        }
+    }
+
+    impl Embedder for FlakyBatchEmbedder {
+        fn embed(&self, text: &str) -> SearchResult<EmbeddingResult> {
+            Ok(EmbeddingResult::new(
+                vec![0.5_f32; self.info.dimension],
+                self.info.id.clone(),
+                ModelTier::Fast,
+                Duration::from_millis(1),
+                crate::canonical::content_hash(text),
+            ))
+        }
+
+        fn embed_batch(&self, texts: &[&str]) -> SearchResult<Vec<EmbeddingResult>> {
+            let should_fail = self
+                .fail_batches_remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            if should_fail {
+                return Err(crate::error::SearchError::Timeout(
+                    "synthetic transient timeout".to_owned(),
+                ));
+            }
+
+            texts.iter().map(|text| self.embed(text)).collect()
+        }
+
+        fn model_info(&self) -> &ModelInfo {
+            &self.info
+        }
+    }
+
     #[derive(Default)]
     struct MockLifecycle {
         rebuild_calls: AtomicUsize,
@@ -1120,6 +1174,43 @@ mod tests {
         // Hash embedder produces hash-only embeddings, which are skipped
         assert_eq!(result.skipped, 2);
         assert_eq!(result.succeeded, 0);
+    }
+
+    #[test]
+    fn runner_retries_transient_batch_failure_then_converges() {
+        let config = EmbeddingJobConfig {
+            batch_size: 4,
+            max_retries: 2,
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
+        let queue = Arc::new(EmbeddingQueue::with_config(config.clone()));
+        let embedder = Arc::new(FlakyBatchEmbedder::new(4, 1));
+        let index = Arc::new(RwLock::new(VectorIndex::new(VectorIndexConfig {
+            dimension: 4,
+            ..Default::default()
+        })));
+
+        assert!(queue.enqueue(make_request(42)));
+
+        let runner = EmbeddingJobRunner::new(config, queue.clone(), embedder, index);
+
+        let first = runner.process_batch().expect("first batch should complete");
+        assert_eq!(first.retryable, 1);
+        assert_eq!(first.failed, 0);
+        assert_eq!(queue.stats().retry_count, 1);
+
+        let second = runner
+            .process_batch()
+            .expect("retry batch should converge successfully");
+        assert_eq!(second.succeeded, 1);
+        assert_eq!(second.retryable, 0);
+        assert_eq!(queue.len(), 0);
+
+        let snapshot = runner.metrics().snapshot();
+        assert_eq!(snapshot.total_retryable, 1);
+        assert_eq!(snapshot.total_succeeded, 1);
+        assert_eq!(snapshot.total_failed, 0);
     }
 
     // ── BatchResult ──
