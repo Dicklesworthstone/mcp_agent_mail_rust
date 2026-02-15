@@ -359,23 +359,28 @@ impl RenderItem for SearchResultRow {
             .bg(tp.selection_bg)
             .bold();
 
-        // Doc type badge
-        let type_badge = match self.entry.doc_kind {
-            DocKind::Message => "M",
-            DocKind::Agent => "A",
-            DocKind::Project => "P",
-            DocKind::Thread => "T",
+        let meta_style = crate::tui_theme::text_meta(&tp);
+        let accent_style = crate::tui_theme::text_accent(&tp);
+        let warning_style = crate::tui_theme::text_warning(&tp);
+        let primary_style = crate::tui_theme::text_primary(&tp);
+
+        // Doc type badge with semantic color
+        let (type_badge, type_style) = match self.entry.doc_kind {
+            DocKind::Message => ("M", primary_style),
+            DocKind::Agent => ("A", accent_style),
+            DocKind::Project => ("P", meta_style),
+            DocKind::Thread => ("T", meta_style),
         };
 
-        // Importance badge
-        let imp_badge = match self.entry.importance.as_deref() {
-            Some("urgent") => "!!",
-            Some("high") => "!",
-            _ => " ",
+        // Importance badge with severity color
+        let (imp_badge, imp_style) = match self.entry.importance.as_deref() {
+            Some("urgent") => ("!!", crate::tui_theme::text_critical(&tp)),
+            Some("high") => ("! ", warning_style),
+            _ => ("  ", meta_style),
         };
 
         // Score or date prefix
-        let meta = if self.sort_direction == SortDirection::Relevance {
+        let meta_text = if self.sort_direction == SortDirection::Relevance {
             self.entry
                 .score
                 .map_or_else(|| "      ".to_string(), |s| format!("{s:>5.2} "))
@@ -393,26 +398,29 @@ impl RenderItem for SearchResultRow {
             )
         };
 
-        // Build prefix: marker, type badge, importance, meta
-        let prefix = format!("{marker}[{type_badge}]{imp_badge:>2} {meta}");
-        let prefix_len = prefix.chars().count();
+        // Build prefix with styled spans
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::raw(marker.to_string()));
+        spans.push(Span::styled(format!("[{type_badge}]"), type_style));
+        spans.push(Span::styled(imp_badge.to_string(), imp_style));
+        spans.push(Span::styled(meta_text, meta_style));
+
+        let prefix_len = spans.iter().map(|s| s.as_str().chars().count()).sum::<usize>();
 
         // Title with remaining space
         let title_space = w.saturating_sub(prefix_len);
         let title = truncate_str(&self.entry.title, title_space);
 
-        // Build line with optional highlighting
+        // Title with optional highlighting
         let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::raw(prefix));
 
         if self.highlight_terms.is_empty() {
-            spans.push(Span::raw(title));
+            spans.push(Span::styled(title, primary_style));
         } else {
             spans.extend(highlight_spans(
                 &title,
                 &self.highlight_terms,
-                None,
+                Some(primary_style),
                 highlight_style,
             ));
         }
@@ -2934,45 +2942,79 @@ fn render_detail(
 
     let label_style = Style::default().fg(FACET_LABEL_FG());
     let highlight_style = Style::default().fg(RESULT_CURSOR_FG()).bold();
+    let value_style = crate::tui_theme::text_primary(&tp);
+    let accent_style = crate::tui_theme::text_accent(&tp);
+
+    // Helper: build a label+value line with consistent styling.
+    let styled_field = |label: &str, value: String| -> Line {
+        Line::from_spans([
+            Span::styled(label.to_string(), label_style),
+            Span::styled(value, value_style),
+        ])
+    };
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::raw(format!("Type:    {:?}", entry.doc_kind)));
+
+    // Type with human-readable label
+    let type_label = match entry.doc_kind {
+        DocKind::Message => "Message",
+        DocKind::Agent => "Agent",
+        DocKind::Project => "Project",
+        DocKind::Thread => "Thread",
+    };
+    lines.push(styled_field("Type:       ", type_label.to_string()));
 
     let mut title_spans: Vec<Span<'static>> = Vec::new();
-    title_spans.push(Span::styled("Title:   ".to_string(), label_style));
+    title_spans.push(Span::styled("Title:      ".to_string(), label_style));
     title_spans.extend(highlight_spans(
         &entry.title,
         highlight_terms,
-        None,
+        Some(value_style),
         highlight_style,
     ));
     lines.push(Line::from_spans(title_spans));
 
-    lines.push(Line::raw(format!("ID:      #{}", entry.id)));
+    lines.push(styled_field("ID:         ", format!("#{}", entry.id)));
 
     if let Some(ref agent) = entry.from_agent {
-        lines.push(Line::raw(format!("From:    {agent}")));
+        lines.push(Line::from_spans([
+            Span::styled("From:       ".to_string(), label_style),
+            Span::styled(agent.to_string(), accent_style),
+        ]));
     }
     if let Some(ref tid) = entry.thread_id {
-        lines.push(Line::raw(format!("Thread:  {tid}")));
+        lines.push(styled_field("Thread:     ", tid.to_string()));
     }
     if let Some(ref imp) = entry.importance {
-        lines.push(Line::raw(format!("Import.: {imp}")));
+        let imp_style = match imp.as_str() {
+            "urgent" => crate::tui_theme::text_critical(&tp),
+            "high" => crate::tui_theme::text_warning(&tp),
+            _ => value_style,
+        };
+        lines.push(Line::from_spans([
+            Span::styled("Importance: ".to_string(), label_style),
+            Span::styled(imp.to_string(), imp_style),
+        ]));
     }
     if let Some(ack) = entry.ack_required {
-        lines.push(Line::raw(format!(
-            "Ack:     {}",
-            if ack { "required" } else { "no" }
-        )));
+        let (ack_text, ack_style) = if ack {
+            ("required", accent_style)
+        } else {
+            ("no", value_style)
+        };
+        lines.push(Line::from_spans([
+            Span::styled("Ack:        ".to_string(), label_style),
+            Span::styled(ack_text.to_string(), ack_style),
+        ]));
     }
     if let Some(ts) = entry.created_ts {
-        lines.push(Line::raw(format!("Time:    {}", micros_to_iso(ts))));
+        lines.push(styled_field("Time:       ", micros_to_iso(ts)));
     }
     if let Some(pid) = entry.project_id {
-        lines.push(Line::raw(format!("Project: #{pid}")));
+        lines.push(styled_field("Project:    ", format!("#{pid}")));
     }
     if let Some(score) = entry.score {
-        lines.push(Line::raw(format!("Score:   {score:.3}")));
+        lines.push(styled_field("Score:      ", format!("{score:.3}")));
     }
 
     // Markdown preview section (messages with full body) or plain preview fallback.
@@ -2995,7 +3037,7 @@ fn render_detail(
         lines.push(Line::from_spans(highlight_spans(
             &entry.body_preview,
             highlight_terms,
-            None,
+            Some(value_style),
             highlight_style,
         )));
     }
@@ -4306,5 +4348,82 @@ mod tests {
         assert_eq!(ScopeMode::Global.label(), "Global");
         assert_eq!(ScopeMode::Project.label(), "Project");
         assert_eq!(ScopeMode::Product.label(), "Product");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // br-1xt0m.1.10.3: Result/Inspector hierarchy and highlight strategy
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn result_row_has_styled_type_badge() {
+        let entry = ResultEntry {
+            id: 1,
+            doc_kind: DocKind::Message,
+            title: "Test".to_string(),
+            body_preview: String::new(),
+            full_body: None,
+            score: None,
+            importance: Some("urgent".to_string()),
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            project_id: None,
+        };
+        let row = SearchResultRow {
+            entry,
+            highlight_terms: vec![],
+            sort_direction: SortDirection::NewestFirst,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(60, 1, &mut pool);
+        row.render(Rect::new(0, 0, 60, 1), &mut frame, false);
+        let text = buffer_to_text(&frame.buffer);
+        // Should contain type badge [M] and importance !!
+        assert!(text.contains("[M]"), "row text: {text}");
+        assert!(text.contains("!!"), "row text: {text}");
+    }
+
+    #[test]
+    fn detail_inspector_shows_explicit_type_label() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(60, 25, &mut pool);
+        let entry = make_msg_entry();
+        render_detail(
+            &mut frame,
+            Rect::new(0, 0, 60, 25),
+            Some(&entry),
+            0,
+            &[],
+            true,
+        );
+        let text = buffer_to_text(&frame.buffer);
+        // Should show "Message" not "Message" from Debug format
+        assert!(text.contains("Message"), "detail text: {text}");
+        // Should show full "Importance" label, not "Import."
+        assert!(text.contains("Importance:"), "detail text: {text}");
+    }
+
+    #[test]
+    fn detail_inspector_highlights_title() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(60, 25, &mut pool);
+        let entry = make_msg_entry();
+        let terms = vec![QueryTerm {
+            text: "test".to_string(),
+            kind: QueryTermKind::Word,
+            negated: false,
+        }];
+        render_detail(
+            &mut frame,
+            Rect::new(0, 0, 60, 25),
+            Some(&entry),
+            0,
+            &terms,
+            true,
+        );
+        let text = buffer_to_text(&frame.buffer);
+        assert!(text.contains("Title:"), "detail text: {text}");
+        assert!(text.contains("Test subject"), "detail text: {text}");
     }
 }
